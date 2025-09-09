@@ -1,0 +1,8 @@
+[build]
+target = "wasm32-wasip1"
+
+[target.wasm32-wasip1]
+# Use Viceroy to run wasm built from binaries in this crate or dependents.
+# Points to the demo service config by default.
+runner = "viceroy run -C ../../examples/anyedge-fastly-demo/fastly.toml -- "
+

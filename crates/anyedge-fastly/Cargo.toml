@@ -1,0 +1,19 @@
+[package]
+name = "anyedge-fastly"
+version = "0.1.0"
+edition = "2021"
+description = "Fastly adapter for AnyEdge"
+
+[features]
+# Enable real Fastly integration when the dependency is available.
+fastly = ["dep:fastly", "dep:log-fastly", "dep:log", "dep:fern", "dep:chrono", "dep:percent-encoding"]
+
+[dependencies]
+anyedge-core = { path = "../anyedge-core" }
+# Optional until we wire the real runtime; version placeholder.
+fastly = { version = "0.11", optional = true }
+log-fastly = { version = "0.11", optional = true }
+log = { version = "0.4", optional = true }
+fern = { version = "0.7", optional = true }
+chrono = { version = "0.4", features = ["clock"], optional = true }
+percent-encoding = { version = "2", optional = true }

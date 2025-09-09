@@ -1,0 +1,12 @@
+[package]
+name = "anyedge-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core abstractions for AnyEdge: write once, run on many edges"
+
+[dependencies]
+http = "1"
+log = "0.4"
+
+[features]
+default = []

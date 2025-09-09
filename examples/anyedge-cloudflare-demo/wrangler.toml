@@ -1,0 +1,9 @@
+name = "anyedge-cloudflare-demo"
+main = "build/worker/shim.mjs"
+compatibility_date = "2023-05-01"
+
+[build]
+# Requires `worker-build` during local dev/deploy:
+# cargo install worker-build
+command = "worker-build --release"
+

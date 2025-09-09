@@ -1,0 +1,16 @@
+[package]
+name = "anyedge-fastly-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyedge-fastly = { path = "../../crates/anyedge-fastly", features = ["fastly"] }
+anyedge-core = { path = "../../crates/anyedge-core" }
+log = "0.4"
+
+[dev-dependencies]
+reqwest = { version = "0.11", features = ["blocking"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fastly = "0.11"

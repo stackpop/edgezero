@@ -1,0 +1,18 @@
+[package]
+name = "anyedge-cli"
+version = "0.1.0"
+edition = "2021"
+description = "AnyEdge CLI: build and deploy to multiple edge providers"
+
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
+anyedge-core = { path = "../anyedge-core" }
+log = "0.4"
+
+# Optional: use the shared app-lib for `anyedge dev` in this workspace
+anyedge-app-lib = { path = "../../examples/app-lib", package = "anyedge-app-lib", optional = true }
+
+[features]
+default = ["cli", "dev-example"]
+cli = ["dep:clap"]
+dev-example = ["dep:anyedge-app-lib"]

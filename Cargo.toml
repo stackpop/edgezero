@@ -1,0 +1,20 @@
+[workspace]
+members = [
+  "crates/anyedge-core",
+  "crates/anyedge-fastly",
+  "crates/anyedge-std",
+  "crates/anyedge-cloudflare",
+  "crates/anyedge-cli",
+  "examples/app-lib",
+  "examples/anyedge-fastly-demo",
+  "examples/anyedge-cloudflare-demo",
+]
+resolver = "2"
+
+# Keep default members minimal to allow offline builds of core + example logic
+default-members = [
+  "crates/anyedge-core",
+]
+
+#[patch.crates-io]
+# No global patches required currently; keep this section empty/commented for future pinning
