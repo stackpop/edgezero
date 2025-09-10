@@ -1,0 +1,18 @@
+# {{name}}
+
+This is a multi-crate AnyEdge app scaffold.
+
+- `crates/{{proj_core}}`: shared core library exposing `build_app()`.
+- `crates/{{proj_fastly}}`: Fastly Compute@Edge binary.
+- `crates/{{proj_cloudflare}}`: Cloudflare Workers binary.
+
+## Dev
+
+- Fastly (local):
+  - `cd crates/{{proj_fastly}}`
+  - `fastly compute serve`
+
+- Cloudflare (local):
+  - `cd crates/{{proj_cloudflare}}`
+  - `wrangler dev` (requires `cargo install worker-build`)
+

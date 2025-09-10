@@ -1,0 +1,13 @@
+[workspace]
+members = [
+  "crates/{{proj_core}}",
+  "crates/{{proj_fastly}}",
+  "crates/{{proj_cloudflare}}",
+]
+resolver = "2"
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"
+

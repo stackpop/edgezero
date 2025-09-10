@@ -1,0 +1,15 @@
+[package]
+name = "{{proj_cloudflare}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "{{proj_cloudflare}}"
+path = "src/main.rs"
+
+[dependencies]
+{{proj_core}} = { path = "../{{proj_core}}" }
+{{dep_anyedge_cloudflare}}
+worker = "0.6"
+

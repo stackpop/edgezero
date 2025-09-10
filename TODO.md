@@ -8,6 +8,7 @@ High-level backlog and decisions to drive the next milestones.
 - [ ] Fastly demo: add optional backend example to validate `req.send("backend")`
 - [ ] Core: `Response::json<T: serde::Serialize>` behind `serde` feature
 - [x] Core: helper to fetch all header values for a name (multi-value support)
+- [ ] Core: utility to serve embedded static files via `include_str!`/`include_bytes!` with proper Content-Type and HEAD (no body) handling
 - [ ] Docs: document header/method/status mapping to `http` crate
 - [x] Docs: clean stale references to removed hello example from README/targets
 - [ ] Docs: add RouteOptions + streaming policy section (examples done; expand README section)

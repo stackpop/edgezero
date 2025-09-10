@@ -1,5 +1,7 @@
-AnyEdge Context (Save for Restart)
-=================================
+AnyEdge Agents Guide
+====================
+
+This guide orients coding agents (e.g., Codex CLI) working in this repo. It consolidates the previous CONTEXT.md so agents can quickly understand the APIs, file layout, and run instructions.
 
 Key Decisions & APIs
 --------------------
@@ -47,12 +49,25 @@ How to Run
 ----------
 - Core tests: `cargo test -p anyedge-core`
 - Workspace check: `cargo check --workspace`
-- Dev server: `cargo run -p anyedge-cli -- dev` → http://127.0.0.1:8787 (`/stream` supported)
+- Dev server: `cargo run -p anyedge-cli --features cli -- dev` → http://127.0.0.1:8787 (`/stream` supported)
 - Fastly demo:
   - `cd examples/anyedge-fastly-demo`
   - `fastly compute serve`
   - Env: `ANYEDGE_FASTLY_LOG_ENDPOINT=<endpoint>`
 - Cloudflare: mapping implemented; add a minimal example with `wrangler` in a follow‑up.
+
+Best Practices
+--------------
+- Code style: target stable Rust; run `cargo fmt` and `cargo clippy -p anyedge-*` locally; avoid `unwrap()`/`expect()` on request paths; prefer explicit error mapping to HTTP 5xx via adapters.
+- Feature gates: keep core synchronous; introduce async behind feature flags (e.g., `async-client`, `workers`). Provider specifics live in adapter crates, not core.
+- Routing semantics: HEAD mirrors GET status/headers and clears bodies; OPTIONS returns 204 with `Allow`; 405 includes `Allow` and adds `HEAD` if `GET` exists.
+- Streaming policy: for streaming responses, do not set `Content-Length`; prefer 8–32 KiB chunk sizes; avoid mixing body bytes and a stream simultaneously.
+- Headers: use `with_header` to replace and `append_header` for multi-values; rely on `http` crate casing/types; keep header mutation minimal.
+- Static assets: embed with `include_bytes!`/`include_str!`; set `Content-Type` from extension; on HEAD return headers only; add `ETag` from bytes (e.g., hash) and support `If-None-Match` → 304; optionally set `Cache-Control`; leave compression to providers.
+- Logging: initialize once (`anyedge_fastly::init_logger` or `anyedge_std::init_logger`); avoid logging sensitive data; keep log volume low on hot paths.
+- Testing: add unit tests for core behavior; adapter tests should verify header/body mapping and content-length/streaming; keep tests deterministic.
+- Cross‑provider: avoid OS-specific behavior in core; guard with `cfg`; ensure identical semantics across Fastly/Cloudflare for methods, headers, bodies.
+- Docs & backlog: when adding capabilities, update `README.md`/`AGENTS.md` if semantics change and record follow-ups in `TODO.md`.
 
 Policies & Behaviors
 --------------------

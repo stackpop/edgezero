@@ -1,0 +1,19 @@
+use anyedge_core::{App, Request, Response, Method};
+
+pub fn build_app() -> App {
+    let mut app = App::new();
+    app.get("/", |_req: Request| Response::ok().text("Hello from AnyEdge 👋"));
+    app
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn root_ok() {
+        let app = build_app();
+        let res = app.handle(Request::new(Method::GET, "/"));
+        assert_eq!(res.status.as_u16(), 200);
+    }
+}
+

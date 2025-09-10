@@ -1,0 +1,15 @@
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+use fastly::{Error, Request, Response};
+
+#[cfg(all(target_arch = "wasm32", target_os = "wasi"))]
+#[fastly::main]
+pub fn main(req: Request) -> Result<Response, Error> {
+    let app = {{proj_core}}::build_app();
+    Ok(anyedge_fastly::handle(&app, req))
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi")))]
+fn main() {
+    println!("Build for wasm32-wasip1 to run on Fastly.");
+}
+

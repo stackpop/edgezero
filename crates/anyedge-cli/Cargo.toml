@@ -8,6 +8,8 @@ description = "AnyEdge CLI: build and deploy to multiple edge providers"
 clap = { version = "4", features = ["derive"], optional = true }
 anyedge-core = { path = "../anyedge-core" }
 log = "0.4"
+handlebars = "6"
+serde_json = "1.0"
 
 # Optional: use the shared app-lib for `anyedge dev` in this workspace
 anyedge-app-lib = { path = "../../examples/app-lib", package = "anyedge-app-lib", optional = true }
