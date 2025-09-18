@@ -1,9 +1,14 @@
-use {{proj_core}}::build_app;
+use {{proj_core}}::App;
+use anyedge_controller::Hooks;
 use worker::*;
 
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    let app = build_app();
+    let app = App::build_app();
     anyedge_cloudflare::handle(&app, req, env, ctx).await
 }
 
+#[cfg(not(all(target_arch = "wasm32")))]
+fn main() {
+    eprintln!("Run `wrangler dev` or target wasm32-unknown-unknown to execute this example.");
+}

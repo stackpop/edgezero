@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-pub use http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+pub use http::{header, Extensions, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -11,6 +11,7 @@ pub struct Request {
     pub params: HashMap<String, String>,
     pub ctx: HashMap<String, String>,
     pub query_params: HashMap<String, String>,
+    pub extensions: Extensions,
 }
 
 impl Request {
@@ -23,6 +24,7 @@ impl Request {
             params: HashMap::new(),
             ctx: HashMap::new(),
             query_params: HashMap::new(),
+            extensions: Extensions::new(),
         }
     }
 

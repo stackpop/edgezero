@@ -12,15 +12,15 @@
 //! }
 //! ```
 
-#[cfg(feature = "workers")]
+#[cfg(feature = "cloudflare")]
 pub mod app;
-#[cfg(feature = "workers")]
+#[cfg(feature = "cloudflare")]
 pub mod http;
 pub mod proxy;
-#[cfg(not(feature = "workers"))]
+#[cfg(not(feature = "cloudflare"))]
 mod stub;
 
-#[cfg(feature = "workers")]
+#[cfg(feature = "cloudflare")]
 pub use app::handle;
-#[cfg(not(feature = "workers"))]
+#[cfg(not(feature = "cloudflare"))]
 pub use stub::handle;

@@ -6,5 +6,9 @@ publish = false
 
 [dependencies]
 {{dep_anyedge_core}}
+{{dep_anyedge_controller}}
+serde = { version = "1", features = ["derive"] }
 log = "0.4"
 
+[dev-dependencies]
+futures = "0.3"

@@ -1,6 +1,0 @@
-[build]
-target = "wasm32-wasip1"
-
-[target.wasm32-wasip1]
-# Use Viceroy to run the produced wasm binary with the provided Fastly config
-runner = "viceroy run -C fastly.toml -- "

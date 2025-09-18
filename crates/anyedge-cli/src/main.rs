@@ -7,6 +7,8 @@ mod dev_server;
 #[cfg(feature = "cli")]
 mod generator;
 #[cfg(feature = "cli")]
+mod provider;
+#[cfg(feature = "cli")]
 mod scaffold;
 
 #[cfg(feature = "cli")]
@@ -23,10 +25,22 @@ fn main() {
             }
         }
         Command::Build { provider } => {
-            println!("[anyedge] build for provider: {} (TODO)", provider);
+            if let Err(err) = handle_build(&provider) {
+                eprintln!("[anyedge] build error: {err}");
+                std::process::exit(1);
+            }
         }
         Command::Deploy { provider } => {
-            println!("[anyedge] deploy to provider: {} (TODO)", provider);
+            if let Err(err) = handle_deploy(&provider) {
+                eprintln!("[anyedge] deploy error: {err}");
+                std::process::exit(1);
+            }
+        }
+        Command::Serve { provider } => {
+            if let Err(err) = handle_serve(&provider) {
+                eprintln!("[anyedge] serve error: {err}");
+                std::process::exit(1);
+            }
         }
         Command::Dev => {
             dev_server::run_dev();
@@ -37,4 +51,19 @@ fn main() {
 #[cfg(not(feature = "cli"))]
 fn main() {
     eprintln!("anyedge-cli built without `cli` feature. Rebuild with `--features cli`.");
+}
+
+#[cfg(feature = "cli")]
+fn handle_build(provider: &str) -> Result<(), String> {
+    provider::Provider::parse(provider)?.build()
+}
+
+#[cfg(feature = "cli")]
+fn handle_deploy(provider: &str) -> Result<(), String> {
+    provider::Provider::parse(provider)?.deploy()
+}
+
+#[cfg(feature = "cli")]
+fn handle_serve(provider: &str) -> Result<(), String> {
+    provider::Provider::parse(provider)?.serve()
 }

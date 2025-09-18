@@ -54,7 +54,7 @@ impl Router {
         });
     }
 
-    pub fn route(&self, req: Request) -> Response {
+    pub async fn route(&self, req: Request) -> Response {
         // Collect all routes that match the path
         let mut candidates: Vec<(&Route, HashMap<String, String>)> = Vec::new();
         for route in &self.routes {
@@ -79,7 +79,7 @@ impl Router {
             if route.method == desired {
                 let mut req2 = req.clone();
                 req2.params = params.clone();
-                let mut res = route.handler.handle(req2);
+                let mut res = route.handler.call(req2).await;
                 if is_head {
                     res.clear_body();
                 }
@@ -138,7 +138,8 @@ fn parse_segments(path: &str) -> Vec<Segment> {
 }
 
 fn match_path(segments: &[Segment], path: &str) -> Option<HashMap<String, String>> {
-    let parts: Vec<&str> = path
+    let path_only = path.split('?').next().unwrap_or(path);
+    let parts: Vec<&str> = path_only
         .trim_matches('/')
         .split('/')
         .filter(|s| !s.is_empty())
@@ -168,7 +169,7 @@ mod tests {
     fn router_static_route_matches() {
         let mut app = App::new();
         app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = app.handle(Request::new(Method::GET, "/hi"));
+        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/hi")));
         assert_eq!(res.status.as_u16(), 200);
         assert_eq!(String::from_utf8(res.body).unwrap(), "hi");
     }
@@ -180,7 +181,46 @@ mod tests {
             let id = req.param("id").unwrap_or("");
             Response::ok().text(id)
         });
-        let res = app.handle(Request::new(Method::GET, "/users/42"));
+        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/users/42")));
+        assert_eq!(res.status.as_u16(), 200);
+        assert_eq!(String::from_utf8(res.body).unwrap(), "42");
+    }
+
+    #[test]
+    fn router_route_resolution_respects_registration_order() {
+        let mut app = App::new();
+        app.get("/users/:id", |_req: Request| Response::ok().text("param"));
+        app.get("/users/settings", |_req: Request| {
+            Response::ok().text("static")
+        });
+
+        let res =
+            futures::executor::block_on(app.handle(Request::new(Method::GET, "/users/settings")));
+        assert_eq!(res.status.as_u16(), 200);
+        assert_eq!(String::from_utf8(res.body).unwrap(), "param");
+
+        // Register static first to ensure deterministic preference
+        let mut app2 = App::new();
+        app2.get("/users/settings", |_req: Request| {
+            Response::ok().text("static")
+        });
+        app2.get("/users/:id", |_req: Request| Response::ok().text("param"));
+        let res2 =
+            futures::executor::block_on(app2.handle(Request::new(Method::GET, "/users/settings")));
+        assert_eq!(res2.status.as_u16(), 200);
+        assert_eq!(String::from_utf8(res2.body).unwrap(), "static");
+    }
+
+    #[test]
+    fn router_param_route_ignores_query_component() {
+        let mut app = App::new();
+        app.get("/users/:id", |req: Request| {
+            let id = req.param("id").unwrap_or("");
+            Response::ok().text(id)
+        });
+        let mut req = Request::new(Method::GET, "/users/42?foo=bar");
+        req.query_params.insert("foo".into(), "bar".into());
+        let res = futures::executor::block_on(app.handle(req));
         assert_eq!(res.status.as_u16(), 200);
         assert_eq!(String::from_utf8(res.body).unwrap(), "42");
     }
@@ -188,7 +228,7 @@ mod tests {
     #[test]
     fn not_found_when_path_missing() {
         let app = App::new();
-        let res = app.handle(Request::new(Method::GET, "/nope"));
+        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/nope")));
         assert_eq!(res.status.as_u16(), 404);
     }
 
@@ -196,7 +236,7 @@ mod tests {
     fn method_not_allowed_with_allow_header() {
         let mut app = App::new();
         app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = app.handle(Request::new(Method::POST, "/hi"));
+        let res = futures::executor::block_on(app.handle(Request::new(Method::POST, "/hi")));
         assert_eq!(res.status.as_u16(), 405);
         let allow = res
             .headers
@@ -214,7 +254,7 @@ mod tests {
     fn options_returns_allow_header() {
         let mut app = App::new();
         app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = app.handle(Request::new(Method::OPTIONS, "/hi"));
+        let res = futures::executor::block_on(app.handle(Request::new(Method::OPTIONS, "/hi")));
         assert_eq!(res.status.as_u16(), 204);
         let allow = res
             .headers
@@ -230,7 +270,7 @@ mod tests {
     fn head_behaves_like_get_without_body() {
         let mut app = App::new();
         app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = app.handle(Request::new(Method::HEAD, "/hi"));
+        let res = futures::executor::block_on(app.handle(Request::new(Method::HEAD, "/hi")));
         assert_eq!(res.status.as_u16(), 200);
         assert_eq!(res.body.len(), 0);
     }
@@ -245,7 +285,7 @@ mod tests {
             crate::app::RouteOptions::streaming(),
         );
 
-        let mut res = app.handle(Request::new(Method::GET, "/s"));
+        let mut res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/s")));
         assert_eq!(res.status.as_u16(), 200);
         assert!(res.is_streaming());
         assert_eq!(res.content_len(), None);
@@ -253,8 +293,8 @@ mod tests {
         assert!(res.body.is_empty());
         let collected = if let Some(mut it) = res.stream.take() {
             let mut all = Vec::new();
-            for c in &mut it {
-                all.extend_from_slice(&c);
+            while let Some(chunk) = it.next() {
+                all.extend_from_slice(&chunk);
             }
             all
         } else {
@@ -272,7 +312,7 @@ mod tests {
             |_req: Request| Response::ok().with_chunks(vec![b"part1".to_vec(), b"part2".to_vec()]),
             crate::app::RouteOptions::buffered(),
         );
-        let res = app.handle(Request::new(Method::GET, "/b"));
+        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/b")));
         assert_eq!(res.status.as_u16(), 500);
         assert!(!res.is_streaming());
         assert_eq!(

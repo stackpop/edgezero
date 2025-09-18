@@ -23,6 +23,9 @@ pub mod logging;
 #[cfg(feature = "fastly")]
 pub mod proxy;
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 #[cfg(not(feature = "fastly"))]
 mod stub;
 

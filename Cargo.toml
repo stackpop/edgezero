@@ -5,9 +5,11 @@ members = [
   "crates/anyedge-std",
   "crates/anyedge-cloudflare",
   "crates/anyedge-cli",
-  "examples/app-lib",
-  "examples/anyedge-fastly-demo",
-  "examples/anyedge-cloudflare-demo",
+  "crates/anyedge-macros",
+  "crates/anyedge-controller",
+  "examples/app-demo/crates/app-demo-core",
+  "examples/app-demo/crates/app-demo-fastly",
+  "examples/app-demo/crates/app-demo-cloudflare",
 ]
 resolver = "2"
 

@@ -1,8 +1,8 @@
 use anyedge_core::App;
 
 #[derive(Debug)]
-pub struct WorkersUnavailable;
+pub struct CloudflareUnavailable;
 
 pub fn handle(_app: &App, _req: (), _env: (), _ctx: ()) -> () {
-    // No-op placeholder; building without `workers` feature.
+    // No-op placeholder; building without `cloudflare` feature.
 }

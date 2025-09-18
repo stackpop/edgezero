@@ -1,19 +1,73 @@
-use anyedge_core::{App, Request, Response, Method};
+use anyedge_controller::{action, get, post, AppRoutes, Hooks, Path, RequestJson, Responder, Routes, Text};
+use anyedge_core::{middleware::Logger, App as AnyEdgeApp, Response};
 
-pub fn build_app() -> App {
-    let mut app = App::new();
-    app.get("/", |_req: Request| Response::ok().text("Hello from AnyEdge 👋"));
-    app
+#[derive(serde::Deserialize)]
+struct EchoParams {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EchoBody {
+    name: String,
+}
+
+#[action]
+async fn root() -> impl Responder {
+    Text::new("Hello from AnyEdge 👋")
+}
+
+#[action]
+async fn echo(Path(params): Path<EchoParams>) -> impl Responder {
+    let EchoParams { name } = params;
+    Text::new(format!("Hello, {}!", name))
+}
+
+#[action]
+async fn echo_json(RequestJson(body): RequestJson<EchoBody>) -> impl Responder {
+    Text::new(format!("Hello, {}!", body.name))
+}
+
+#[action]
+async fn stream() -> Response {
+    let chunks = (0..3)
+        .map(|i| format!("chunk {}\n", i).into_bytes())
+        .collect::<Vec<_>>();
+    Response::ok()
+        .with_header("Content-Type", "text/plain; charset=utf-8")
+        .with_chunks(chunks)
+}
+
+pub struct App;
+
+impl Hooks for App {
+    fn configure(app: &mut AnyEdgeApp) {
+        app.middleware(Logger);
+    }
+
+    fn routes() -> AppRoutes {
+        AppRoutes::with_default_routes().add_route(routes())
+    }
+}
+
+
+fn routes() -> Routes {
+    Routes::new()
+        .add("/", get(root()))
+        .add("/echo/:name", get(echo()))
+        .add("/echo", post(echo_json()))
+        .add("/stream", get(stream()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyedge_core::{Method, Request};
+    use futures::executor::block_on;
+
     #[test]
     fn root_ok() {
-        let app = build_app();
-        let res = app.handle(Request::new(Method::GET, "/"));
+        let app = App::build_app();
+        let res = block_on(app.handle(Request::new(Method::GET, "/")));
         assert_eq!(res.status.as_u16(), 200);
     }
 }
-

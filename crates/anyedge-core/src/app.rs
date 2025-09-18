@@ -1,14 +1,17 @@
 use crate::http::{Request, Response};
-use crate::middleware::Middleware;
+use crate::middleware::{Middleware, MiddlewareFuture, Next};
 use crate::router::Router;
 
 /// Application builder and request dispatcher.
 ///
 /// Compose middleware and register routes, then call [`App::handle`] with
 /// provider-specific requests converted to core [`crate::http::Request`].
+type StateInjector = Box<dyn Fn(&mut Request) + Send + Sync>;
+
 pub struct App {
     router: Router,
     middleware: Vec<Box<dyn Middleware + Send + Sync>>,
+    state_injectors: Vec<StateInjector>,
 }
 
 impl Default for App {
@@ -23,6 +26,7 @@ impl App {
         Self {
             router: Router::new(),
             middleware: Vec::new(),
+            state_injectors: Vec::new(),
         }
     }
 
@@ -80,15 +84,35 @@ impl App {
     // Note: For advanced route configuration (e.g., streaming/buffered policy), use `route_with`.
 
     /// Dispatch a request through middleware and router to produce a response.
-    pub fn handle(&self, req: Request) -> Response {
-        fn call_chain(app: &App, idx: usize, req: Request) -> Response {
-            if idx >= app.middleware.len() {
-                return app.router.route(req);
+    pub async fn handle(&self, req: Request) -> Response {
+        fn inject_state(app: &App, mut req: Request) -> Request {
+            for injector in &app.state_injectors {
+                injector(&mut req);
             }
-            let next = |req: Request| call_chain(app, idx + 1, req);
-            app.middleware[idx].handle(req, &next)
+            req
         }
-        call_chain(self, 0, req)
+        let req = inject_state(self, req);
+        self.run_chain(0, req).await
+    }
+
+    pub(crate) fn run_chain<'a>(&'a self, idx: usize, req: Request) -> MiddlewareFuture<'a> {
+        if idx >= self.middleware.len() {
+            return Box::pin(self.router.route(req));
+        }
+        let next = Next::new(self, idx + 1);
+        self.middleware[idx].handle(req, next)
+    }
+
+    /// Attach state that will be cloned into every request's extensions.
+    pub fn with_state<T>(&mut self, value: T) -> &mut Self
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.state_injectors
+            .push(Box::new(move |req: &mut Request| {
+                req.extensions.insert(value.clone());
+            }));
+        self
     }
 
     /// Initialize logging for this process using the provided strategy.

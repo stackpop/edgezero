@@ -1,4 +1,8 @@
-use anyedge_core::{App, Method, Request};
+use anyedge_controller::Hooks;
+#[cfg(not(feature = "dev-example"))]
+use anyedge_controller::{action, get, post, Path, RequestJson, Responder, Routes, Text};
+use anyedge_core::{App, Method, Request, Response};
+use futures::executor::block_on;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -11,19 +15,58 @@ pub fn run_dev() {
 }
 
 // Build an App for dev:
-// - If built with `dev-example`, use the shared app-lib in this workspace.
+// - If built with `dev-example`, use the shared demo core in this workspace.
 // - Otherwise, provide a tiny default app.
 fn build_dev_app() -> App {
     #[cfg(feature = "dev-example")]
     {
-        anyedge_app_lib::build_app()
+        app_demo_core::DemoApp::build_app()
     }
     #[cfg(not(feature = "dev-example"))]
     {
         let mut app = App::new();
-        app.get("/", |_req| anyedge_core::Response::ok().text("AnyEdge dev server"));
+        dev_routes().apply(&mut app);
         app
     }
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[action]
+async fn dev_root() -> impl Responder {
+    Text::new("AnyEdge dev server")
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[derive(serde::Deserialize)]
+struct EchoParams {
+    name: String,
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[action]
+async fn dev_echo(Path(params): Path<EchoParams>) -> impl Responder {
+    let EchoParams { name } = params;
+    Text::new(format!("hello {name}"))
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[derive(serde::Deserialize)]
+struct EchoBody {
+    name: String,
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[action]
+async fn dev_echo_json(RequestJson(body): RequestJson<EchoBody>) -> impl Responder {
+    Text::new(format!("json hello {}", body.name))
+}
+
+#[cfg(not(feature = "dev-example"))]
+fn dev_routes() -> Routes {
+    Routes::new()
+        .add("/", get(dev_root()))
+        .add("/echo/:name", get(dev_echo()))
+        .add("/echo", post(dev_echo_json()))
 }
 
 fn run_local_server(addr: &str, app: App) -> std::io::Result<()> {
@@ -79,13 +122,13 @@ fn handle_conn(stream: &mut TcpStream, app: &App) -> std::io::Result<()> {
             req.append_header(k.trim(), v.trim());
         }
     }
-    let res = app.handle(req);
+    let res = block_on(app.handle(req));
 
     write_response(stream, res)?;
     Ok(())
 }
 
-fn write_response(stream: &mut TcpStream, res: anyedge_core::Response) -> std::io::Result<()> {
+fn write_response(stream: &mut TcpStream, res: Response) -> std::io::Result<()> {
     let status = res.status.as_u16();
     let reason = match status {
         200 => "OK",
@@ -131,4 +174,3 @@ fn write_response(stream: &mut TcpStream, res: anyedge_core::Response) -> std::i
     }
     Ok(())
 }
-

@@ -1,7 +1,18 @@
+# compiled output
+bin/
+pkg/
 target/
-**/*.rs.bk
-Cargo.lock
-.DS_Store
-.idea/
-.vscode/
 
+# env
+.env
+
+# OS
+.DS_Store
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.specstory

@@ -1,0 +1,18 @@
+[package]
+name = "app-demo-fastly"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "app-demo-fastly"
+path = "src/main.rs"
+
+[dependencies]
+app-demo-core = { path = "../app-demo-core" }
+anyedge-fastly = { path = "../../../../crates/anyedge-fastly", features = ["fastly"] }
+log = "0.4"
+anyedge-controller = { path = "../../../../crates/anyedge-controller" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fastly = "0.11.0"

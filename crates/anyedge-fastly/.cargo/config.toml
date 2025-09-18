@@ -1,8 +1,7 @@
 [build]
 target = "wasm32-wasip1"
 
-[target.wasm32-wasip1]
+[target.'cfg(target_arch = "wasm32")']
 # Use Viceroy to run wasm built from binaries in this crate or dependents.
 # Points to the demo service config by default.
-runner = "viceroy run -C ../../examples/anyedge-fastly-demo/fastly.toml -- "
-
+runner = "viceroy run -C ../../examples/app-demo/crates/app-demo-fastly/fastly.toml -- "

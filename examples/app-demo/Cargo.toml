@@ -1,0 +1,7 @@
+[workspace]
+members = [
+  "crates/app-demo-core",
+  "crates/app-demo-fastly",
+  "crates/app-demo-cloudflare",
+]
+resolver = "2"

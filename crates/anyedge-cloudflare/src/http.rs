@@ -1,10 +1,10 @@
-#[cfg(feature = "workers")]
+#[cfg(feature = "cloudflare")]
 use worker::{Headers, Method as WMethod, Request as WRequest, Response as WResponse};
 
 use anyedge_core::{header, HeaderName, HeaderValue, Method, Request, Response};
 use std::collections::HashMap;
 
-#[cfg(feature = "workers")]
+#[cfg(feature = "cloudflare")]
 pub async fn to_anyedge_request(mut req: WRequest) -> worker::Result<Request> {
     let method = map_method(req.method());
     let url = req.url()?;
@@ -34,7 +34,7 @@ pub async fn to_anyedge_request(mut req: WRequest) -> worker::Result<Request> {
     Ok(areq)
 }
 
-#[cfg(feature = "workers")]
+#[cfg(feature = "cloudflare")]
 pub fn from_anyedge_response(res: Response) -> worker::Result<WResponse> {
     let status = res.status.as_u16() as u16;
     let body_len = res.body.len();
@@ -58,7 +58,7 @@ pub fn from_anyedge_response(res: Response) -> worker::Result<WResponse> {
 
 // No stub definitions here; see `stub.rs` for feature-disabled builds.
 
-#[cfg(feature = "workers")]
+#[cfg(feature = "cloudflare")]
 fn map_method(m: WMethod) -> Method {
     match m {
         WMethod::Get => Method::GET,
@@ -72,7 +72,7 @@ fn map_method(m: WMethod) -> Method {
     }
 }
 
-#[cfg(all(test, feature = "workers"))]
+#[cfg(all(test, feature = "cloudflare"))]
 mod tests {
     use super::*;
 
@@ -90,7 +90,7 @@ mod tests {
         let res = Response::new(201)
             .with_header("X-Test", "ok")
             .with_body(b"hello".to_vec());
-        let wr = from_anyedge_response(res).expect("workers response");
+        let wr = from_anyedge_response(res).expect("cloudflare response");
         assert_eq!(wr.status_code(), 201);
         let hdrs = wr.headers();
         assert_eq!(hdrs.get("X-Test").unwrap().as_deref(), Some("ok"));

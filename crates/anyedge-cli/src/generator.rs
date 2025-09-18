@@ -39,7 +39,18 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
 
     // Resolve path dependencies to anyedge crates if building inside this repo
     let cwd = std::env::current_dir().unwrap();
-    let dep_core = resolve_dep_line(&core_dir, &cwd, "crates/anyedge-core", "anyedge-core = \"0.1\"");
+    let dep_core = resolve_dep_line(
+        &core_dir,
+        &cwd,
+        "crates/anyedge-core",
+        "anyedge-core = \"0.1\"",
+    );
+    let dep_controller = resolve_dep_line(
+        &core_dir,
+        &cwd,
+        "crates/anyedge-controller",
+        "anyedge-controller = \"0.1\"",
+    );
     let dep_fastly = resolve_dep_line(
         &fastly_dir,
         &cwd,
@@ -50,7 +61,7 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         &cloudflare_dir,
         &cwd,
         "crates/anyedge-cloudflare",
-        "anyedge-cloudflare = { version = \"0.1\", features = [\"workers\"] }",
+        "anyedge-cloudflare = { version = \"0.1\", features = [\"cloudflare\"] }",
     );
 
     // Prepare template data
@@ -60,6 +71,7 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         "proj_fastly": fastly_name,
         "proj_cloudflare": cloudflare_name,
         "dep_anyedge_core": dep_core,
+        "dep_anyedge_controller": dep_controller,
         "dep_anyedge_fastly": dep_fastly,
         "dep_anyedge_cloudflare": dep_cloudflare,
     });
@@ -77,28 +89,60 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
     write_tmpl(&hbs, "core_src_lib_rs", &data, &core_dir.join("src/lib.rs"))?;
 
     // Fastly crate
-    write_tmpl(&hbs, "fastly_Cargo_toml", &data, &fastly_dir.join("Cargo.toml"))?;
-    write_tmpl(&hbs, "fastly_src_main_rs", &data, &fastly_dir.join("src/main.rs"))?;
+    write_tmpl(
+        &hbs,
+        "fastly_Cargo_toml",
+        &data,
+        &fastly_dir.join("Cargo.toml"),
+    )?;
+    write_tmpl(
+        &hbs,
+        "fastly_src_main_rs",
+        &data,
+        &fastly_dir.join("src/main.rs"),
+    )?;
     write_tmpl(
         &hbs,
         "fastly_cargo_config_toml",
         &data,
         &fastly_dir.join(".cargo/config.toml"),
     )?;
-    write_tmpl(&hbs, "fastly_fastly_toml", &data, &fastly_dir.join("fastly.toml"))?;
+    write_tmpl(
+        &hbs,
+        "fastly_fastly_toml",
+        &data,
+        &fastly_dir.join("fastly.toml"),
+    )?;
 
     // Cloudflare crate
-    write_tmpl(&hbs, "cf_Cargo_toml", &data, &cloudflare_dir.join("Cargo.toml"))?;
-    write_tmpl(&hbs, "cf_src_main_rs", &data, &cloudflare_dir.join("src/main.rs"))?;
+    write_tmpl(
+        &hbs,
+        "cf_Cargo_toml",
+        &data,
+        &cloudflare_dir.join("Cargo.toml"),
+    )?;
+    write_tmpl(
+        &hbs,
+        "cf_src_main_rs",
+        &data,
+        &cloudflare_dir.join("src/main.rs"),
+    )?;
     write_tmpl(
         &hbs,
         "cf_cargo_config_toml",
         &data,
         &cloudflare_dir.join(".cargo/config.toml"),
     )?;
-    write_tmpl(&hbs, "cf_wrangler_toml", &data, &cloudflare_dir.join("wrangler.toml"))?;
+    write_tmpl(
+        &hbs,
+        "cf_wrangler_toml",
+        &data,
+        &cloudflare_dir.join("wrangler.toml"),
+    )?;
 
-    println!("[anyedge] created new multi-crate app at {}", out_dir.display());
+    println!(
+        "[anyedge] created new multi-crate app at {}",
+        out_dir.display()
+    );
     Ok(())
 }
-

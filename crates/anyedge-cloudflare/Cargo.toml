@@ -5,9 +5,8 @@ edition = "2021"
 description = "Cloudflare Workers adapter for AnyEdge"
 
 [features]
-workers = ["dep:worker"]
+cloudflare = ["dep:worker"]
 
 [dependencies]
 anyedge-core = { path = "../anyedge-core" }
 worker = { version = "0.6", optional = true }
-

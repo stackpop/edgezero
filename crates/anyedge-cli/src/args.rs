@@ -21,6 +21,11 @@ pub enum Command {
         #[arg(long, default_value = "fastly")]
         provider: String,
     },
+    /// Run a local simulation (provider-specific)
+    Serve {
+        #[arg(long, default_value = "fastly")]
+        provider: String,
+    },
     /// Run a local simulation (if available)
     Dev,
 }
@@ -36,4 +41,3 @@ pub struct NewArgs {
     #[arg(long)]
     pub local_core: bool,
 }
-

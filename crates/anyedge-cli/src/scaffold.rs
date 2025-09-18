@@ -2,21 +2,69 @@ use handlebars::Handlebars;
 
 pub fn register_templates(hbs: &mut Handlebars) {
     // Root
-    hbs.register_template_string("root_Cargo_toml", include_str!("templates/root/Cargo.toml.hbs")).unwrap();
-    hbs.register_template_string("root_README_md", include_str!("templates/root/README.md.hbs")).unwrap();
+    hbs.register_template_string(
+        "root_Cargo_toml",
+        include_str!("templates/root/Cargo.toml.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "root_README_md",
+        include_str!("templates/root/README.md.hbs"),
+    )
+    .unwrap();
     // Core
-    hbs.register_template_string("core_Cargo_toml", include_str!("templates/core/Cargo.toml.hbs")).unwrap();
-    hbs.register_template_string("core_src_lib_rs", include_str!("templates/core/src/lib.rs.hbs")).unwrap();
+    hbs.register_template_string(
+        "core_Cargo_toml",
+        include_str!("templates/core/Cargo.toml.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "core_src_lib_rs",
+        include_str!("templates/core/src/lib.rs.hbs"),
+    )
+    .unwrap();
     // Fastly
-    hbs.register_template_string("fastly_Cargo_toml", include_str!("templates/fastly/Cargo.toml.hbs")).unwrap();
-    hbs.register_template_string("fastly_src_main_rs", include_str!("templates/fastly/src/main.rs.hbs")).unwrap();
-    hbs.register_template_string("fastly_cargo_config_toml", include_str!("templates/fastly/.cargo/config.toml.hbs")).unwrap();
-    hbs.register_template_string("fastly_fastly_toml", include_str!("templates/fastly/fastly.toml.hbs")).unwrap();
+    hbs.register_template_string(
+        "fastly_Cargo_toml",
+        include_str!("templates/fastly/Cargo.toml.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "fastly_src_main_rs",
+        include_str!("templates/fastly/src/main.rs.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "fastly_cargo_config_toml",
+        include_str!("templates/fastly/.cargo/config.toml.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "fastly_fastly_toml",
+        include_str!("templates/fastly/fastly.toml.hbs"),
+    )
+    .unwrap();
     // Cloudflare
-    hbs.register_template_string("cf_Cargo_toml", include_str!("templates/cloudflare/Cargo.toml.hbs")).unwrap();
-    hbs.register_template_string("cf_src_main_rs", include_str!("templates/cloudflare/src/main.rs.hbs")).unwrap();
-    hbs.register_template_string("cf_cargo_config_toml", include_str!("templates/cloudflare/.cargo/config.toml.hbs")).unwrap();
-    hbs.register_template_string("cf_wrangler_toml", include_str!("templates/cloudflare/wrangler.toml.hbs")).unwrap();
+    hbs.register_template_string(
+        "cf_Cargo_toml",
+        include_str!("templates/cloudflare/Cargo.toml.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "cf_src_main_rs",
+        include_str!("templates/cloudflare/src/main.rs.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "cf_cargo_config_toml",
+        include_str!("templates/cloudflare/.cargo/config.toml.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "cf_wrangler_toml",
+        include_str!("templates/cloudflare/wrangler.toml.hbs"),
+    )
+    .unwrap();
 }
 
 pub fn write_tmpl(
@@ -25,7 +73,9 @@ pub fn write_tmpl(
     data: &serde_json::Value,
     out_path: &std::path::Path,
 ) -> std::io::Result<()> {
-    if let Some(parent) = out_path.parent() { std::fs::create_dir_all(parent)?; }
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let rendered = hbs
         .render(name, data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
@@ -67,11 +117,16 @@ pub fn resolve_dep_line(
             let features = if cname == "anyedge-fastly" {
                 " , features = [\"fastly\"]"
             } else if cname == "anyedge-cloudflare" {
-                " , features = [\"workers\"]"
+                " , features = [\"cloudflare\"]"
             } else {
                 ""
             };
-            return format!("{} = {{ path = \"{}\"{} }}", cname, dep_path.display(), features);
+            return format!(
+                "{} = {{ path = \"{}\"{} }}",
+                cname,
+                dep_path.display(),
+                features
+            );
         }
     }
     fallback.to_string()
@@ -102,4 +157,3 @@ pub fn relative_to(from: &std::path::Path, to: &std::path::Path) -> Option<Strin
     }
     Some(ups)
 }
-
