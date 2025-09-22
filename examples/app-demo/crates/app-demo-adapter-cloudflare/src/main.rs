@@ -1,0 +1,19 @@
+#![cfg_attr(target_arch = "wasm32", no_main)]
+
+#[cfg(target_arch = "wasm32")]
+use app_demo_core::DemoApp;
+#[cfg(target_arch = "wasm32")]
+use worker::*;
+
+#[cfg(target_arch = "wasm32")]
+#[event(fetch)]
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let app = DemoApp::build_app();
+    anyedge_adapter_cloudflare::init_logger().expect("init cloudflare logger");
+    anyedge_adapter_cloudflare::dispatch(&app, req, env, ctx).await
+}
+
+#[cfg(not(all(target_arch = "wasm32")))]
+fn main() {
+    eprintln!("Run `wrangler dev` or target wasm32-unknown-unknown to execute this example.");
+}

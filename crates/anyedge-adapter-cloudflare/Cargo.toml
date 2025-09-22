@@ -1,0 +1,25 @@
+[package]
+name = "anyedge-adapter-cloudflare"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[features]
+default = []
+cloudflare = ["dep:worker"]
+
+[dependencies]
+anyedge-core = { path = "../anyedge-core" }
+async-trait = { workspace = true }
+brotli = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+worker = { version = "0.6", default-features = false, features = ["http"], optional = true }
+wasm-bindgen-test = "0.3"
+
+[dev-dependencies]
+web-sys = { version = "0.3", features = ["Window", "Response", "Request", "Headers", "ReadableStream", "Blob"]     }

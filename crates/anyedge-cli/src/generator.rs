@@ -24,8 +24,8 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
     // Create base dirs for multi-crate workspace
     let crates_dir = out_dir.join("crates");
     let core_name = format!("{}-core", name);
-    let fastly_name = format!("{}-fastly", name);
-    let cloudflare_name = format!("{}-cloudflare", name);
+    let fastly_name = format!("{}-adapter-fastly", name);
+    let cloudflare_name = format!("{}-adapter-cloudflare", name);
 
     let core_dir = crates_dir.join(&core_name);
     let fastly_dir = crates_dir.join(&fastly_name);
@@ -39,29 +39,35 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
 
     // Resolve path dependencies to anyedge crates if building inside this repo
     let cwd = std::env::current_dir().unwrap();
-    let dep_core = resolve_dep_line(
+    let dep_core_lib = resolve_dep_line(
         &core_dir,
         &cwd,
         "crates/anyedge-core",
         "anyedge-core = \"0.1\"",
     );
-    let dep_controller = resolve_dep_line(
-        &core_dir,
+    let dep_core_fastly = resolve_dep_line(
+        &fastly_dir,
         &cwd,
-        "crates/anyedge-controller",
-        "anyedge-controller = \"0.1\"",
+        "crates/anyedge-core",
+        "anyedge-core = \"0.1\"",
+    );
+    let dep_core_cloudflare = resolve_dep_line(
+        &cloudflare_dir,
+        &cwd,
+        "crates/anyedge-core",
+        "anyedge-core = \"0.1\"",
     );
     let dep_fastly = resolve_dep_line(
         &fastly_dir,
         &cwd,
-        "crates/anyedge-fastly",
-        "anyedge-fastly = { version = \"0.1\", features = [\"fastly\"] }",
+        "crates/anyedge-adapter-fastly",
+        "anyedge-adapter-fastly = { version = \"0.1\", features = [\"fastly\"] }",
     );
     let dep_cloudflare = resolve_dep_line(
         &cloudflare_dir,
         &cwd,
-        "crates/anyedge-cloudflare",
-        "anyedge-cloudflare = { version = \"0.1\", features = [\"cloudflare\"] }",
+        "crates/anyedge-adapter-cloudflare",
+        "anyedge-adapter-cloudflare = { version = \"0.1\", features = [\"cloudflare\"] }",
     );
 
     // Prepare template data
@@ -70,10 +76,11 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         "proj_core": core_name,
         "proj_fastly": fastly_name,
         "proj_cloudflare": cloudflare_name,
-        "dep_anyedge_core": dep_core,
-        "dep_anyedge_controller": dep_controller,
-        "dep_anyedge_fastly": dep_fastly,
-        "dep_anyedge_cloudflare": dep_cloudflare,
+        "dep_anyedge_core": dep_core_lib,
+        "dep_anyedge_core_fastly": dep_core_fastly,
+        "dep_anyedge_core_cloudflare": dep_core_cloudflare,
+        "dep_anyedge_adapter_fastly": dep_fastly,
+        "dep_anyedge_adapter_cloudflare": dep_cloudflare,
     });
 
     // Render all templates

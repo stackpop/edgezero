@@ -1,15 +1,30 @@
 [package]
 name = "anyedge-core"
-version = "0.1.0"
-edition = "2021"
-description = "Core abstractions for AnyEdge: write once, run on many edges"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
 
 [dependencies]
-http = "1"
-log = "0.4"
-
-[features]
-default = []
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+async-stream = { workspace = true }
+async-compression = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+matchit = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+thiserror = { workspace = true }
+tower-service = { workspace = true }
+tracing = { workspace = true }
+validator = { workspace = true }
+anyedge-macros = { path = "../anyedge-macros" }
 
 [dev-dependencies]
-futures = "0.3"
+brotli = { workspace = true }
+flate2 = { workspace = true }

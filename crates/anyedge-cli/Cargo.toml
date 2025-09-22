@@ -5,19 +5,18 @@ edition = "2021"
 description = "AnyEdge CLI: build and deploy to multiple edge providers"
 
 [dependencies]
-clap = { version = "4", features = ["derive"], optional = true }
-anyedge-core = { path = "../anyedge-core" }
-anyedge-controller = { path = "../anyedge-controller" }
-anyedge-fastly = { path = "../anyedge-fastly", features = ["cli"] }
-serde = { version = "1", features = ["derive"] }
-log = "0.4"
-handlebars = "6"
-serde_json = "1.0"
-futures = "0.3"
+anyedge-adapter-fastly = { workspace = true, features = ["cli"] }
+anyedge-core = { workspace = true}
 app-demo-core = { path = "../../examples/app-demo/crates/app-demo-core", package = "app-demo-core", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+futures = { workspace = true }
+handlebars = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true}
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [features]
 default = ["cli", "dev-example"]

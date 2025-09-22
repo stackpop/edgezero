@@ -10,9 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 {{proj_core}} = { path = "../{{proj_core}}" }
-{{dep_anyedge_fastly}}
 log = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+{{dep_anyedge_core_fastly}}
+{{dep_anyedge_adapter_fastly}}
 fastly = "0.11"
-

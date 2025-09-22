@@ -1,8 +1,10 @@
-use anyedge_controller::{
-    action, get, post, AppRoutes, Hooks, Path, RequestJson, Responder, Routes, State, Text,
-};
-use anyedge_core::{middleware::Logger, App, Request, Response};
 use std::sync::Arc;
+
+use anyedge_core::{
+    action, Body, EdgeError, Json, Path, RequestContext, Response, RouterService, StatusCode, Text,
+};
+use bytes::Bytes;
+use futures::{stream, StreamExt};
 
 #[derive(serde::Deserialize)]
 struct EchoParams {
@@ -15,40 +17,40 @@ struct EchoBody {
 }
 
 #[action]
-async fn root() -> impl Responder {
+async fn root() -> Text<&'static str> {
     Text::new("AnyEdge Demo App")
 }
 
-#[action]
-async fn echo(Path(params): Path<EchoParams>) -> impl Responder {
-    let EchoParams { name } = params;
-    Text::new(format!("Hello, {}!", name))
+#[anyedge_core::action]
+async fn echo(Path(params): Path<EchoParams>) -> Text<String> {
+    Text::new(format!("Hello, {}!", params.name))
 }
 
-#[action]
-async fn headers(req: Request) -> impl Responder {
-    let ua = req.header("User-Agent").unwrap_or("(unknown)");
-    Text::new(format!("ua={}", ua))
+async fn headers(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
+    let ua = ctx
+        .request()
+        .headers()
+        .get("User-Agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("(unknown)");
+    Ok(Text::new(format!("ua={}", ua)))
 }
 
-#[action]
+#[anyedge_core::action]
 async fn stream() -> Response {
-    let chunks: Vec<Vec<u8>> = (0..5)
-        .map(|i| format!("chunk {}\n", i).into_bytes())
-        .collect();
-    Response::ok()
-        .with_header("Content-Type", "text/plain; charset=utf-8")
-        .with_chunks(chunks)
+    let body =
+        Body::stream(stream::iter(0..5).map(|index| Bytes::from(format!("chunk {}\n", index))));
+
+    anyedge_core::response_builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(body)
+        .expect("static stream response")
 }
 
-#[action]
-async fn echo_json(RequestJson(body): RequestJson<EchoBody>) -> impl Responder {
+#[anyedge_core::action]
+async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
     Text::new(format!("Hello, {}!", body.name))
-}
-
-#[action]
-async fn info(State(info): State<AppInfo>) -> impl Responder {
-    Text::new(format!("App: {}", info.name))
 }
 
 pub struct AppInfo {
@@ -57,47 +59,68 @@ pub struct AppInfo {
 
 pub struct DemoApp;
 
-impl Hooks for DemoApp {
-    fn configure(app: &mut App) {
-        app.middleware(Logger);
-        app.with_state(Arc::new(AppInfo {
-            name: "AnyEdge".into(),
-        }));
-    }
-
-    fn routes() -> AppRoutes {
-        AppRoutes::with_default_routes().add_route(routes())
+impl DemoApp {
+    pub fn build_app() -> anyedge_core::App {
+        build_app_with_info(AppInfo {
+            name: "AnyEdge".to_string(),
+        })
     }
 }
 
-pub fn routes() -> Routes {
-    Routes::new()
-        .add("/", get(root()))
-        .add("/echo/:name", get(echo()))
-        .add("/headers", get(headers()))
-        .add("/stream", get(stream()))
-        .add("/echo", post(echo_json()))
-        .add("/info", get(info()))
+pub fn build_app_with_info(info: AppInfo) -> anyedge_core::App {
+    let info = Arc::new(info);
+    let router = build_router(info);
+    anyedge_core::App::new(router)
+}
+
+pub fn build_router(info: Arc<AppInfo>) -> RouterService {
+    RouterService::builder()
+        .get("/", root)
+        .get("/echo/{name}", echo)
+        .get("/headers", headers)
+        .get("/stream", stream)
+        .post("/echo", echo_json)
+        .get("/info", {
+            let info = Arc::clone(&info);
+            move |_ctx: RequestContext| {
+                let info = Arc::clone(&info);
+                async move { Ok::<_, EdgeError>(Text::new(format!("App: {}", info.name))) }
+            }
+        })
+        .build()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyedge_core::{Method, Request};
+    use anyedge_core::{request_builder, Body, Method};
     use futures::executor::block_on;
 
     #[test]
     fn root_ok() {
         let app = DemoApp::build_app();
-        let res = block_on(app.handle(Request::new(Method::GET, "/")));
-        assert_eq!(res.status.as_u16(), 200);
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(app.router().oneshot(request));
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
-    fn info_reads_state_async() {
+    fn info_reads_state() {
         let app = DemoApp::build_app();
-        let res = block_on(app.handle(Request::new(Method::GET, "/info")));
-        assert_eq!(res.status.as_u16(), 200);
-        assert_eq!(String::from_utf8(res.body).unwrap(), "App: AnyEdge");
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/info")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(app.router().oneshot(request));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().into_bytes();
+        assert_eq!(body.as_ref(), b"App: AnyEdge");
     }
 }

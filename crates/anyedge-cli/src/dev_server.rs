@@ -1,101 +1,47 @@
-use anyedge_controller::Hooks;
-#[cfg(not(feature = "dev-example"))]
-use anyedge_controller::{action, get, post, Path, RequestJson, Responder, Routes, Text};
-use anyedge_core::{App, Method, Request, Response};
-use futures::executor::block_on;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Duration;
+
+#[cfg(not(feature = "dev-example"))]
+use anyedge_core::{action, Text};
+use anyedge_core::{request_builder, Body, HeaderName, HeaderValue, Method, RouterService, Uri};
+use futures::{executor::block_on, pin_mut, StreamExt};
+
+#[cfg(feature = "dev-example")]
+use app_demo_core::DemoApp;
 
 pub fn run_dev() {
     println!("[anyedge] dev: starting local server on http://127.0.0.1:8787");
-    let app = build_dev_app();
-    if let Err(e) = run_local_server("127.0.0.1:8787", app) {
-        eprintln!("[anyedge] dev server error: {e}");
+    let router = build_dev_router();
+    if let Err(err) = run_local_server("127.0.0.1:8787", router) {
+        eprintln!("[anyedge] dev server error: {err}");
     }
 }
 
-// Build an App for dev:
-// - If built with `dev-example`, use the shared demo core in this workspace.
-// - Otherwise, provide a tiny default app.
-fn build_dev_app() -> App {
-    #[cfg(feature = "dev-example")]
-    {
-        app_demo_core::DemoApp::build_app()
-    }
-    #[cfg(not(feature = "dev-example"))]
-    {
-        let mut app = App::new();
-        dev_routes().apply(&mut app);
-        app
-    }
-}
-
-#[cfg(not(feature = "dev-example"))]
-#[action]
-async fn dev_root() -> impl Responder {
-    Text::new("AnyEdge dev server")
-}
-
-#[cfg(not(feature = "dev-example"))]
-#[derive(serde::Deserialize)]
-struct EchoParams {
-    name: String,
-}
-
-#[cfg(not(feature = "dev-example"))]
-#[action]
-async fn dev_echo(Path(params): Path<EchoParams>) -> impl Responder {
-    let EchoParams { name } = params;
-    Text::new(format!("hello {name}"))
-}
-
-#[cfg(not(feature = "dev-example"))]
-#[derive(serde::Deserialize)]
-struct EchoBody {
-    name: String,
-}
-
-#[cfg(not(feature = "dev-example"))]
-#[action]
-async fn dev_echo_json(RequestJson(body): RequestJson<EchoBody>) -> impl Responder {
-    Text::new(format!("json hello {}", body.name))
-}
-
-#[cfg(not(feature = "dev-example"))]
-fn dev_routes() -> Routes {
-    Routes::new()
-        .add("/", get(dev_root()))
-        .add("/echo/:name", get(dev_echo()))
-        .add("/echo", post(dev_echo_json()))
-}
-
-fn run_local_server(addr: &str, app: App) -> std::io::Result<()> {
+fn run_local_server(addr: &str, router: RouterService) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    // Simple, blocking server. Handle connections sequentially to avoid threading and borrowing issues.
     for stream in listener.incoming() {
         let mut stream = stream?;
-        if let Err(e) = handle_conn(&mut stream, &app) {
-            eprintln!("[anyedge] conn error: {e}");
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        if let Err(err) = handle_conn(&mut stream, router.clone()) {
+            eprintln!("[anyedge] conn error: {err}");
         }
     }
     Ok(())
 }
 
-fn handle_conn(stream: &mut TcpStream, app: &App) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+fn handle_conn(stream: &mut TcpStream, router: RouterService) -> std::io::Result<()> {
     let mut buf = [0u8; 8192];
     let mut read = 0usize;
-    // Read until we find \r\n\r\n or buffer fills
+    // Read until CRLF CRLF or buffer fills
     loop {
         let n = stream.read(&mut buf[read..])?;
         if n == 0 {
             break;
         }
         read += n;
-        if read >= 4 {
-            if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
+        if read >= 4 && buf[..read].windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
         }
         if read == buf.len() {
             break;
@@ -106,71 +52,116 @@ fn handle_conn(stream: &mut TcpStream, app: &App) -> std::io::Result<()> {
     let mut lines = req_text.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("GET");
-    let path = parts.next().unwrap_or("/");
+    let method_token = parts.next().unwrap_or("GET");
+    let path_token = parts.next().unwrap_or("/");
 
-    let mut req = Request::new(
-        Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET),
-        path.to_string(),
-    );
-    // Headers
+    let method = Method::from_bytes(method_token.as_bytes()).unwrap_or(Method::GET);
+    let uri = path_token
+        .parse::<Uri>()
+        .unwrap_or_else(|_| "/".parse::<Uri>().expect("static URI"));
+
+    let mut req = request_builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .map_err(std::io::Error::other)?;
+
     for line in lines {
         if line.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            req.append_header(k.trim(), v.trim());
+        if let Some((name, value)) = line.split_once(':') {
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.trim().as_bytes()),
+                HeaderValue::from_str(value.trim()),
+            ) {
+                req.headers_mut().append(header_name, header_value);
+            }
         }
     }
-    let res = block_on(app.handle(req));
 
-    write_response(stream, res)?;
+    let response = block_on(router.oneshot(req));
+    write_response(stream, response)
+}
+
+fn write_response(stream: &mut TcpStream, response: anyedge_core::Response) -> std::io::Result<()> {
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let reason = status.canonical_reason().unwrap_or("OK");
+
+    let mut out = Vec::new();
+    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status.as_u16(), reason).as_bytes());
+
+    let mut has_content_length = false;
+    for (name, value) in parts.headers.iter() {
+        if name.as_str().eq_ignore_ascii_case("content-length") {
+            has_content_length = true;
+        }
+        out.extend_from_slice(
+            format!("{}: {}\r\n", name.as_str(), value.to_str().unwrap_or("")).as_bytes(),
+        );
+    }
+
+    let body_bytes = match body {
+        Body::Once(bytes) => bytes,
+        Body::Stream(stream_body) => {
+            let collected = block_on(async move {
+                let mut buf = Vec::new();
+                pin_mut!(stream_body);
+                while let Some(chunk) = stream_body.next().await {
+                    let chunk = chunk.map_err(|err| std::io::Error::other(err.to_string()))?;
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok::<Vec<u8>, std::io::Error>(buf)
+            })?;
+            collected.into()
+        }
+    };
+
+    if !has_content_length {
+        out.extend_from_slice(format!("Content-Length: {}\r\n", body_bytes.len()).as_bytes());
+    }
+
+    out.extend_from_slice(b"\r\n");
+    stream.write_all(&out)?;
+    stream.write_all(body_bytes.as_ref())?;
     Ok(())
 }
 
-fn write_response(stream: &mut TcpStream, res: Response) -> std::io::Result<()> {
-    let status = res.status.as_u16();
-    let reason = match status {
-        200 => "OK",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "OK",
-    };
-    let mut out = Vec::new();
-    out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, reason).as_bytes());
-    let mut has_len = false;
-    for (k, v) in res.headers.iter() {
-        if k.as_str().eq_ignore_ascii_case("content-length") {
-            has_len = true;
-        }
-        out.extend_from_slice(
-            format!("{}: {}\r\n", k.as_str(), v.to_str().unwrap_or("")).as_bytes(),
-        );
+fn build_dev_router() -> RouterService {
+    #[cfg(feature = "dev-example")]
+    {
+        DemoApp::build_app().into_router()
     }
-    if let Some(mut iter) = res.stream {
-        if !res
-            .headers
-            .iter()
-            .any(|(k, _)| k.as_str().eq_ignore_ascii_case("transfer-encoding"))
-        {
-            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
-        stream.write_all(&out)?;
-        for chunk in &mut iter {
-            let line = format!("{:X}\r\n", chunk.len());
-            stream.write_all(line.as_bytes())?;
-            stream.write_all(&chunk)?;
-            stream.write_all(b"\r\n")?;
-        }
-        stream.write_all(b"0\r\n\r\n")?;
-    } else {
-        if !has_len {
-            out.extend_from_slice(format!("Content-Length: {}\r\n", res.body.len()).as_bytes());
-        }
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(&res.body);
-        stream.write_all(&out)?;
+
+    #[cfg(not(feature = "dev-example"))]
+    {
+        default_router()
     }
-    Ok(())
+}
+
+#[cfg(not(feature = "dev-example"))]
+fn default_router() -> RouterService {
+    RouterService::builder()
+        .get("/", dev_root)
+        .get("/echo/{name}", dev_echo)
+        .build()
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[derive(serde::Deserialize)]
+struct EchoParams {
+    name: String,
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[action]
+async fn dev_root() -> Text<&'static str> {
+    Text::new("AnyEdge dev server")
+}
+
+#[cfg(not(feature = "dev-example"))]
+#[action]
+async fn dev_echo(Path(params): anyedge_core::Path<EchoParams>) -> Text<String> {
+    Text::new(format!("hello {}", params.name))
 }

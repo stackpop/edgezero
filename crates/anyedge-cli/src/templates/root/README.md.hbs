@@ -1,10 +1,10 @@
 # {{name}}
 
-This is a multi-crate AnyEdge app scaffold.
+This workspace demonstrates a multi-target AnyEdge app.
 
-- `crates/{{proj_core}}`: shared controller-based library exposing `build_app()` (built with `anyedge-controller`).
-- `crates/{{proj_fastly}}`: Fastly Compute@Edge binary.
-- `crates/{{proj_cloudflare}}`: Cloudflare Workers binary.
+- `crates/{{proj_core}}`: reusable application logic built with `anyedge-core`.
+- `crates/{{proj_fastly}}`: Fastly Compute@Edge entrypoint.
+- `crates/{{proj_cloudflare}}`: Cloudflare Workers entrypoint.
 
 ## Dev
 

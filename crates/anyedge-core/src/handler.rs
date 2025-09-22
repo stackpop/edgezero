@@ -1,40 +1,38 @@
-use crate::http::{Request, Response};
 use std::future::Future;
-use std::pin::Pin;
+use std::sync::Arc;
 
-pub type HandlerFuture<'a> = Pin<Box<dyn Future<Output = Response> + Send + 'a>>;
+use crate::{EdgeError, HandlerFuture, IntoResponse, RequestContext};
 
-pub trait IntoHandlerFuture {
-    fn into_handler_future(self) -> HandlerFuture<'static>;
+pub trait DynHandler: Send + Sync {
+    fn call(&self, ctx: RequestContext) -> HandlerFuture;
 }
 
-impl IntoHandlerFuture for Response {
-    fn into_handler_future(self) -> HandlerFuture<'static> {
-        Box::pin(async move { self })
-    }
-}
-
-impl<Fut> IntoHandlerFuture for Fut
+impl<F, Fut, Res> DynHandler for F
 where
-    Fut: Future<Output = Response> + Send + 'static,
+    F: Fn(RequestContext) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Res, EdgeError>> + 'static,
+    Res: IntoResponse,
 {
-    fn into_handler_future(self) -> HandlerFuture<'static> {
-        Box::pin(self)
+    fn call(&self, ctx: RequestContext) -> HandlerFuture {
+        let fut = (self)(ctx);
+        Box::pin(async move {
+            let response = fut.await?.into_response();
+            Ok(response)
+        })
     }
 }
 
-pub trait Handler: Send + Sync + 'static {
-    fn call<'a>(&'a self, req: Request) -> HandlerFuture<'a>;
+pub type BoxHandler = Arc<dyn DynHandler>;
+
+pub trait IntoHandler {
+    fn into_handler(self) -> BoxHandler;
 }
 
-impl<F, O> Handler for F
+impl<H> IntoHandler for H
 where
-    F: Fn(Request) -> O + Send + Sync + 'static,
-    O: IntoHandlerFuture + 'static,
+    H: DynHandler + Sized + 'static,
 {
-    fn call<'a>(&'a self, req: Request) -> HandlerFuture<'a> {
-        (self)(req).into_handler_future()
+    fn into_handler(self) -> BoxHandler {
+        Arc::new(self)
     }
 }
-
-pub type BoxHandler = Box<dyn Handler + Send + Sync>;

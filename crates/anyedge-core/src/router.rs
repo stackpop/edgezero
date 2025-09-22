@@ -1,323 +1,363 @@
-use log;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::handler::{BoxHandler, Handler};
-use crate::http::{header, Method, Request, Response};
+use matchit::Router as PathRouter;
+use tower_service::Service;
 
-pub struct Router {
-    routes: Vec<Route>,
+use crate::{
+    BoxHandler, BoxMiddleware, EdgeError, HandlerFuture, IntoResponse, Method, Middleware, Next,
+    PathParams, Request, RequestContext, Response,
+};
+
+#[derive(Default)]
+pub struct RouterBuilder {
+    routes: HashMap<Method, PathRouter<RouteEntry>>,
+    middlewares: Vec<BoxMiddleware>,
 }
 
-struct Route {
-    method: Method,
-    segments: Vec<Segment>,
-    handler: BoxHandler,
-    mode: BodyMode,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-enum Segment {
-    Static(String),
-    Param(String),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum BodyMode {
-    Auto,
-    Streaming,
-    Buffered,
-}
-
-impl Default for Router {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Router {
+impl RouterBuilder {
     pub fn new() -> Self {
-        Self { routes: Vec::new() }
+        Self::default()
     }
 
-    pub fn add<H>(&mut self, method: Method, path: &str, handler: H, mode: BodyMode)
+    pub fn route<H>(mut self, path: &str, method: Method, handler: H) -> Self
     where
-        H: Handler,
+        H: crate::IntoHandler,
     {
-        log::info!("Adding route: {} {}", method.as_str(), path);
-
-        let segments = parse_segments(path);
-        self.routes.push(Route {
-            method,
-            segments,
-            handler: Box::new(handler),
-            mode,
-        });
+        self.add_route(path, method, handler);
+        self
     }
 
-    pub async fn route(&self, req: Request) -> Response {
-        // Collect all routes that match the path
-        let mut candidates: Vec<(&Route, HashMap<String, String>)> = Vec::new();
-        for route in &self.routes {
-            if let Some(params) = match_path(&route.segments, &req.path) {
-                candidates.push((route, params));
+    pub fn get<H>(self, path: &str, handler: H) -> Self
+    where
+        H: crate::IntoHandler,
+    {
+        self.route(path, Method::GET, handler)
+    }
+
+    pub fn post<H>(self, path: &str, handler: H) -> Self
+    where
+        H: crate::IntoHandler,
+    {
+        self.route(path, Method::POST, handler)
+    }
+
+    pub fn put<H>(self, path: &str, handler: H) -> Self
+    where
+        H: crate::IntoHandler,
+    {
+        self.route(path, Method::PUT, handler)
+    }
+
+    pub fn delete<H>(self, path: &str, handler: H) -> Self
+    where
+        H: crate::IntoHandler,
+    {
+        self.route(path, Method::DELETE, handler)
+    }
+
+    pub fn middleware<M>(mut self, middleware: M) -> Self
+    where
+        M: Middleware,
+    {
+        self.middlewares.push(Arc::new(middleware));
+        self
+    }
+
+    pub fn middleware_arc(mut self, middleware: BoxMiddleware) -> Self {
+        self.middlewares.push(middleware);
+        self
+    }
+
+    pub fn build(self) -> RouterService {
+        RouterService::new(self.routes, self.middlewares)
+    }
+
+    fn add_route<H>(&mut self, path: &str, method: Method, handler: H)
+    where
+        H: crate::IntoHandler,
+    {
+        let router = self.routes.entry(method).or_default();
+
+        router
+            .insert(
+                path,
+                RouteEntry {
+                    handler: handler.into_handler(),
+                },
+            )
+            .unwrap_or_else(|err| panic!("duplicate route definition for {}: {}", path, err));
+    }
+}
+
+#[derive(Clone)]
+pub struct RouterService {
+    inner: Arc<RouterInner>,
+}
+
+impl RouterService {
+    fn new(
+        routes: HashMap<Method, PathRouter<RouteEntry>>,
+        middlewares: Vec<BoxMiddleware>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RouterInner {
+                routes,
+                middlewares,
+            }),
+        }
+    }
+
+    pub fn builder() -> RouterBuilder {
+        RouterBuilder::new()
+    }
+
+    pub async fn oneshot(&self, request: Request) -> Response {
+        let mut service = self.clone();
+        match service.call(request).await {
+            Ok(response) => response,
+            Err(err) => err.into_response(),
+        }
+    }
+}
+
+struct RouterInner {
+    routes: HashMap<Method, PathRouter<RouteEntry>>,
+    middlewares: Vec<BoxMiddleware>,
+}
+
+enum RouteMatch<'a> {
+    Found(&'a RouteEntry, PathParams),
+    MethodNotAllowed(Vec<Method>),
+    NotFound,
+}
+
+impl RouterInner {
+    async fn dispatch(&self, request: Request) -> Result<Response, EdgeError> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_string();
+
+        match self.find_route(&method, &path) {
+            RouteMatch::Found(entry, params) => {
+                let ctx = RequestContext::new(request, params);
+                let next = Next::new(&self.middlewares, entry.handler.as_ref());
+                next.run(ctx).await
+            }
+            RouteMatch::MethodNotAllowed(mut allowed) => {
+                allowed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                Err(EdgeError::method_not_allowed(&method, &allowed))
+            }
+            RouteMatch::NotFound => Err(EdgeError::not_found(path)),
+        }
+    }
+
+    fn find_route(&self, method: &Method, path: &str) -> RouteMatch<'_> {
+        if let Some(router) = self.routes.get(method) {
+            if let Ok(matched) = router.at(path) {
+                let params = PathParams::new(
+                    matched
+                        .params
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                );
+                return RouteMatch::Found(matched.value, params);
             }
         }
-        if candidates.is_empty() {
-            return Response::not_found();
+
+        let mut allowed = HashSet::new();
+        for (candidate_method, router) in &self.routes {
+            if router.at(path).is_ok() {
+                allowed.insert(candidate_method.clone());
+            }
         }
 
-        // HEAD behaves like GET with no body
-        let is_head = req.method == Method::HEAD;
-        let desired = if is_head {
-            Method::GET
+        if allowed.is_empty() {
+            RouteMatch::NotFound
         } else {
-            req.method.clone()
-        };
-
-        // Find a matching method among candidates
-        for (route, params) in &candidates {
-            if route.method == desired {
-                let mut req2 = req.clone();
-                req2.params = params.clone();
-                let mut res = route.handler.call(req2).await;
-                if is_head {
-                    res.clear_body();
-                }
-                // Apply body mode policy
-                match route.mode {
-                    BodyMode::Auto => return res,
-                    BodyMode::Streaming => return res.into_streaming(),
-                    BodyMode::Buffered => {
-                        if res.is_streaming() {
-                            return Response::new(500).text("Streaming not allowed for this route");
-                        } else {
-                            return res;
-                        }
-                    }
-                }
-            }
+            RouteMatch::MethodNotAllowed(allowed.into_iter().collect())
         }
-
-        // If method is OPTIONS, return Allow header with 204
-        let mut methods: BTreeSet<String> = BTreeSet::new();
-        let mut has_get = false;
-        for (route, _) in &candidates {
-            if route.method == Method::GET {
-                has_get = true;
-            }
-            methods.insert(route.method.as_str().to_string());
-        }
-        if has_get {
-            methods.insert("HEAD".to_string());
-        }
-        methods.insert("OPTIONS".to_string());
-        let allow = methods.into_iter().collect::<Vec<_>>().join(", ");
-
-        if req.method == Method::OPTIONS {
-            return Response::new(204).with_header(header::ALLOW, allow);
-        }
-
-        Response::new(405)
-            .with_header(header::ALLOW, allow)
-            .text("Method Not Allowed")
     }
 }
 
-fn parse_segments(path: &str) -> Vec<Segment> {
-    path.trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            if let Some(param_name) = s.strip_prefix(':') {
-                Segment::Param(param_name.to_string())
-            } else {
-                Segment::Static(s.to_string())
-            }
-        })
-        .collect()
+impl Service<Request> for RouterService {
+    type Response = Response;
+    type Error = EdgeError;
+    type Future = HandlerFuture;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.dispatch(request).await })
+    }
 }
 
-fn match_path(segments: &[Segment], path: &str) -> Option<HashMap<String, String>> {
-    let path_only = path.split('?').next().unwrap_or(path);
-    let parts: Vec<&str> = path_only
-        .trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    if parts.len() != segments.len() {
-        return None;
-    }
-    let mut params = HashMap::new();
-    for (seg, part) in segments.iter().zip(parts.iter()) {
-        match seg {
-            Segment::Static(s) if s == part => {}
-            Segment::Static(_) => return None,
-            Segment::Param(name) => {
-                params.insert(name.clone(), (*part).to_string());
-            }
+struct RouteEntry {
+    handler: BoxHandler,
+}
+
+impl Clone for RouteEntry {
+    fn clone(&self) -> Self {
+        Self {
+            handler: Arc::clone(&self.handler),
         }
     }
-    Some(params)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{App, Method, Request, Response};
+    use crate::{Body, EdgeError, HeaderValue, Method, RequestContext, StatusCode};
+    use futures::executor::block_on;
+    use serde::Deserialize;
+    use serde_json::json;
 
     #[test]
-    fn router_static_route_matches() {
-        let mut app = App::new();
-        app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/hi")));
-        assert_eq!(res.status.as_u16(), 200);
-        assert_eq!(String::from_utf8(res.body).unwrap(), "hi");
+    fn route_matches_path_params() {
+        #[derive(Deserialize)]
+        struct Params {
+            id: String,
+        }
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let params: Params = ctx.path()?;
+            Ok(format!("hello {}", params.id))
+        }
+
+        let service = RouterService::builder().get("/hello/{id}", handler).build();
+
+        let request = crate::request_builder()
+            .method(Method::GET)
+            .uri("/hello/world")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.clone().call(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().as_bytes(), b"hello world");
     }
 
     #[test]
-    fn router_param_route_extracts() {
-        let mut app = App::new();
-        app.get("/users/:id", |req: Request| {
-            let id = req.param("id").unwrap_or("");
-            Response::ok().text(id)
-        });
-        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/users/42")));
-        assert_eq!(res.status.as_u16(), 200);
-        assert_eq!(String::from_utf8(res.body).unwrap(), "42");
+    fn extracts_query_params() {
+        #[derive(Deserialize)]
+        struct QueryParams {
+            page: u8,
+        }
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let params: QueryParams = ctx.query()?;
+            Ok(format!("page={}", params.page))
+        }
+
+        let service = RouterService::builder().get("/items", handler).build();
+
+        let request = crate::request_builder()
+            .method(Method::GET)
+            .uri("/items?page=3")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.clone().call(request)).expect("response");
+        assert_eq!(response.body().as_bytes(), b"page=3");
     }
 
     #[test]
-    fn router_route_resolution_respects_registration_order() {
-        let mut app = App::new();
-        app.get("/users/:id", |_req: Request| Response::ok().text("param"));
-        app.get("/users/settings", |_req: Request| {
-            Response::ok().text("static")
-        });
+    fn parses_json_payload() {
+        #[derive(Deserialize)]
+        struct Input {
+            name: String,
+        }
 
-        let res =
-            futures::executor::block_on(app.handle(Request::new(Method::GET, "/users/settings")));
-        assert_eq!(res.status.as_u16(), 200);
-        assert_eq!(String::from_utf8(res.body).unwrap(), "param");
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let payload: Input = ctx.json()?;
+            Ok(format!("hi {}", payload.name))
+        }
 
-        // Register static first to ensure deterministic preference
-        let mut app2 = App::new();
-        app2.get("/users/settings", |_req: Request| {
-            Response::ok().text("static")
-        });
-        app2.get("/users/:id", |_req: Request| Response::ok().text("param"));
-        let res2 =
-            futures::executor::block_on(app2.handle(Request::new(Method::GET, "/users/settings")));
-        assert_eq!(res2.status.as_u16(), 200);
-        assert_eq!(String::from_utf8(res2.body).unwrap(), "static");
+        let service = RouterService::builder().post("/greet", handler).build();
+
+        let body = Body::json(&json!({ "name": "edge" })).expect("json");
+
+        let request = crate::request_builder()
+            .method(Method::POST)
+            .uri("/greet")
+            .header("content-type", HeaderValue::from_static("application/json"))
+            .body(body)
+            .expect("request");
+
+        let response = block_on(service.clone().call(request)).expect("response");
+        assert_eq!(response.body().as_bytes(), b"hi edge");
     }
 
     #[test]
-    fn router_param_route_ignores_query_component() {
-        let mut app = App::new();
-        app.get("/users/:id", |req: Request| {
-            let id = req.param("id").unwrap_or("");
-            Response::ok().text(id)
-        });
-        let mut req = Request::new(Method::GET, "/users/42?foo=bar");
-        req.query_params.insert("foo".into(), "bar".into());
-        let res = futures::executor::block_on(app.handle(req));
-        assert_eq!(res.status.as_u16(), 200);
-        assert_eq!(String::from_utf8(res.body).unwrap(), "42");
+    fn returns_method_not_allowed() {
+        async fn handler(_ctx: RequestContext) -> Result<(), EdgeError> {
+            Ok(())
+        }
+
+        let service = RouterService::builder().post("/submit", handler).build();
+
+        let request = crate::request_builder()
+            .method(Method::GET)
+            .uri("/submit")
+            .body(Body::empty())
+            .expect("request");
+
+        let error = block_on(service.clone().call(request)).expect_err("error");
+        assert_eq!(error.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[test]
-    fn not_found_when_path_missing() {
-        let app = App::new();
-        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/nope")));
-        assert_eq!(res.status.as_u16(), 404);
+    fn returns_not_found() {
+        let service = RouterService::builder().build();
+        let request = crate::request_builder()
+            .method(Method::GET)
+            .uri("/missing")
+            .body(Body::empty())
+            .expect("request");
+
+        let error = block_on(service.clone().call(request)).expect_err("error");
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
-    fn method_not_allowed_with_allow_header() {
-        let mut app = App::new();
-        app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = futures::executor::block_on(app.handle(Request::new(Method::POST, "/hi")));
-        assert_eq!(res.status.as_u16(), 405);
-        let allow = res
-            .headers
-            .get(header::ALLOW)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(allow.contains("GET"));
-        assert!(allow.contains("HEAD"));
-        assert!(allow.contains("OPTIONS"));
-    }
+    fn streams_body_through_router() {
+        use bytes::Bytes;
+        use futures_util::stream;
+        use futures_util::StreamExt;
 
-    #[test]
-    fn options_returns_allow_header() {
-        let mut app = App::new();
-        app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = futures::executor::block_on(app.handle(Request::new(Method::OPTIONS, "/hi")));
-        assert_eq!(res.status.as_u16(), 204);
-        let allow = res
-            .headers
-            .get(header::ALLOW)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(allow.contains("GET") && allow.contains("HEAD") && allow.contains("OPTIONS"));
-    }
+        async fn handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
+            let chunks = stream::iter(vec![
+                Bytes::from_static(b"chunk-one\n"),
+                Bytes::from_static(b"chunk-two\n"),
+            ]);
 
-    #[test]
-    fn head_behaves_like_get_without_body() {
-        let mut app = App::new();
-        app.get("/hi", |_req: Request| Response::ok().text("hi"));
-        let res = futures::executor::block_on(app.handle(Request::new(Method::HEAD, "/hi")));
-        assert_eq!(res.status.as_u16(), 200);
-        assert_eq!(res.body.len(), 0);
-    }
+            Ok((StatusCode::OK, Body::stream(chunks)).into_response())
+        }
 
-    #[test]
-    fn streaming_route_coerces_buffered_body_to_streaming() {
-        let mut app = App::new();
-        app.route_with(
-            Method::GET,
-            "/s",
-            |_req: Request| Response::ok().with_body("hello"),
-            crate::app::RouteOptions::streaming(),
-        );
+        let service = RouterService::builder().get("/stream", handler).build();
 
-        let mut res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/s")));
-        assert_eq!(res.status.as_u16(), 200);
-        assert!(res.is_streaming());
-        assert_eq!(res.content_len(), None);
-        // Body should be empty and data provided via stream iterator
-        assert!(res.body.is_empty());
-        let collected = if let Some(mut it) = res.stream.take() {
-            let mut all = Vec::new();
-            while let Some(chunk) = it.next() {
-                all.extend_from_slice(&chunk);
+        let request = crate::request_builder()
+            .method(Method::GET)
+            .uri("/stream")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.clone().call(request)).expect("response");
+        let mut stream = response.into_body().into_stream().expect("stream body");
+        let collected = block_on(async {
+            let mut acc = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.expect("chunk");
+                acc.extend_from_slice(&chunk);
             }
-            all
-        } else {
-            Vec::new()
-        };
-        assert_eq!(String::from_utf8(collected).unwrap(), "hello");
-    }
-
-    #[test]
-    fn buffered_route_rejects_streaming_handlers() {
-        let mut app = App::new();
-        app.route_with(
-            Method::GET,
-            "/b",
-            |_req: Request| Response::ok().with_chunks(vec![b"part1".to_vec(), b"part2".to_vec()]),
-            crate::app::RouteOptions::buffered(),
-        );
-        let res = futures::executor::block_on(app.handle(Request::new(Method::GET, "/b")));
-        assert_eq!(res.status.as_u16(), 500);
-        assert!(!res.is_streaming());
-        assert_eq!(
-            String::from_utf8(res.body).unwrap(),
-            "Streaming not allowed for this route"
-        );
+            acc
+        });
+        assert_eq!(collected, b"chunk-one\nchunk-two\n");
     }
 }

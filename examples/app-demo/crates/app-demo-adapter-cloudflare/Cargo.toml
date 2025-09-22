@@ -1,0 +1,19 @@
+[package]
+name = "app-demo-adapter-cloudflare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "app-demo-adapter-cloudflare"
+path = "src/main.rs"
+
+[features]
+default = ["cloudflare"]
+cloudflare = ["dep:anyedge-adapter-cloudflare"]
+
+[dependencies]
+app-demo-core = { workspace = true }
+anyedge-adapter-cloudflare = { workspace = true, features = ["cloudflare"], optional = true }
+worker = { workspace = true }
+anyedge-core = { workspace = true }

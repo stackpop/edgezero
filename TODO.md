@@ -32,13 +32,13 @@ High-level backlog and decisions to drive the next milestones.
   - [x] Map Fastly Request -> `anyedge-core::Request`
   - [x] Map `anyedge-core::Response` -> Fastly Response (headers/body)
   - [x] Handle binary/text bodies and content-length
-  - [x] Example: runnable Fastly demo (`examples/app-demo/crates/app-demo-fastly`) with wasm32-wasip1 target and explicit logger init
+  - [x] Example: runnable Fastly demo (`examples/app-demo/crates/app-demo-adapter-fastly`) with wasm32-wasip1 target and explicit logger init
   - [x] Streaming: native streaming on Fastly via `stream_to_client` (wasm32-wasip1), buffered fallback elsewhere
 - [ ] Cloudflare Workers adapter MVP
   - [x] Basic mapping: Workers Request -> AnyEdge Request
   - [x] Basic mapping: AnyEdge Response -> Workers Response (buffered bodies)
   - [ ] Streaming behavior (ReadableStream) and backpressure
-  - [ ] Example: deploy sample with `wrangler` (`examples/app-demo/crates/app-demo-cloudflare`)
+  - [ ] Example: deploy sample with `wrangler` (`examples/app-demo/crates/app-demo-adapter-cloudflare`)
 - [ ] CLI
   - [x] `anyedge new <name>`: scaffold an app (lib with `build_app()`)
   - [ ] `anyedge build --provider fastly|cloudflare`
@@ -74,7 +74,7 @@ High-level backlog and decisions to drive the next milestones.
 ### Familiarization Summary
 - AnyEdge centres around `anyedge-core`, which provides provider-neutral HTTP primitives, routing, middleware, logging, and proxy abstractions; adapters reuse these types to stay DRY.
 - Controller ergonomics live in `anyedge-controller` plus `anyedge-macros`, offering `#[action]` functions that extract typed inputs and return `Responder`s.
-- Provider adapters (`anyedge-fastly`, `anyedge-cloudflare`) are feature-gated; each exposes `handle` plus logging/proxy helpers while delegating behaviour to the core crate.
+- Provider adapters (`anyedge-adapter-fastly`, `anyedge-adapter-cloudflare`) are feature-gated; each exposes `handle` plus logging/proxy helpers while delegating behaviour to the core crate.
 - Supporting crates include `anyedge-std` for stdout logging, `anyedge-cli` for dev server + scaffolding, and demo workspaces under `examples/app-demo` to validate provider flows.
 - Workspace `Cargo.toml` keeps default members lean (core only) to support offline builds; additional crates are opt-in via features when targeting specific providers.
 
@@ -162,7 +162,7 @@ High-level backlog and decisions to drive the next milestones.
 - [x] Record the changes and remaining caveats in TODO review section with timestamp.
 
 ## Review (2025-09-19 16:05 UTC)
-- Trimmed `scripts/run_tests.sh` to a test-only flow: workspace tests (excluding `app-demo-fastly`), Fastly CLI tests, and wasm32 `fastly` feature tests run from the adapter crate.
+- Trimmed `scripts/run_tests.sh` to a test-only flow: workspace tests (excluding `app-demo-adapter-fastly`), Fastly CLI tests, and wasm32 `fastly` feature tests run from the adapter crate.
 - Added failure guidance when Viceroy cannot access macOS keychain certificates; users can set `SSL_CERT_FILE` or run where a keychain is available before retrying.
 - Command still surfaces the Fastly wasm failure in this sandbox (certificate issue), but other suites pass; no additional code changes required.
 
@@ -207,3 +207,160 @@ High-level backlog and decisions to drive the next milestones.
 - Added per-route body mode to controller `RouteSpec`/`RouteEntry`, enabling callers to supply `RouteOptions` (e.g. streaming/buffered) that are preserved when applying routes to the core app.
 - Introduced `RouteSet::push_entry` helper so nested/merged route sets keep their body configuration.
 - Extended controller tests to cover streaming coercion and buffered rejection paths via the new API; `cargo test -p anyedge-controller` passes.
+
+## Review (2025-09-19 01:28 UTC)
+- Rebuilt `app-demo-core` against the redesigned `anyedge-core` by wiring routes through `RouterService::builder`, swapping controller extractors for `anyedge_core` equivalents, and preserving the streaming example via `Body::stream`.
+- Updated Fastly and Cloudflare entrypoints to rely on the adapter `dispatch` helpers, returning converted fallback responses when adapter conversion fails so we avoid propagating runtime errors.
+- Tests: `cargo test -p app-demo-core`, `cargo check -p app-demo-adapter-fastly`; Cloudflare host build (`cargo check -p app-demo-adapter-cloudflare`) still fails in `worker` 0.0.24 because `js_sys::Iterator` lacks `unwrap` on this toolchain—matches the prior dev warning and needs upstream crate updates for host checks.
+- Assumptions: routing defaults (no auto OPTIONS) remain acceptable for the demo; Cloudflare fallback uses `Response::error` to surface adapter failures until `worker` exposes richer constructors.
+
+## Review (2025-09-19 01:47 UTC)
+- Removed the `worker_logger` dependency (source of the legacy `worker 0.0.24` transitive pull) and replaced it with a minimal `console_log!`-backed logger inside `anyedge-adapter-cloudflare`, so host builds only compile the current `worker 0.6` tree.
+- Updated the Fastly/Cloudflare demos to call the adapter crates directly (correct crate ids) and gated the Cloudflare fetch handler behind `target_arch = "wasm32"` so x86 test builds don’t require Worker-only APIs.
+- Docs now reference the new logging flow, and `cargo test` across the workspace succeeds after the change.
+
+## Codex Plan (2025-09-19 - App Demo Migration to Redesigned Core)
+- [x] Audit the app-demo crates to map controller-era APIs to the redesigned `anyedge-core` interfaces.
+- [x] Refactor `app-demo-core` handlers and routing to the new builder/extractor patterns, keeping streaming coverage intact.
+- [x] Update Fastly/Cloudflare entrypoints (and related metadata) so they compile against the redesigned core hooks.
+- [x] Run targeted tests for the app-demo crates and prepare review notes for TODO.md.
+
+## Codex Plan (2025-09-19 - Restore `cargo test` Host Compilation)
+- [x] Pinpoint the dependency pulling in `worker 0.0.24` and decide whether to remove or upgrade it so builds only use `worker 0.6.x`.
+- [x] Adjust the Cloudflare adapter to drop the outdated logger dependency (or replace it) while keeping logging behaviour sensible.
+- [x] Ensure workspace manifests stop requesting the older crate and update docs if they reference it.
+- [x] Re-run `cargo test` (or equivalent host checks) to confirm the build completes, then capture the outcome in TODO review notes.
+
+## Codex Plan (2025-09-19 - Fastly Adapter Logger Module)
+- [x] Add a dedicated `logger.rs` to the Fastly adapter mirroring the Cloudflare structure.
+- [x] Re-export the new logger helper from `lib.rs` and update call sites if needed.
+- [x] Ensure any docs or templates referencing Fastly logging stay accurate.
+- [x] Run `cargo test` to confirm the refactor behaves as before.
+
+## Review (2025-09-19 01:50 UTC)
+- Split Fastly logging into a `logger.rs` module (mirroring Cloudflare) and re-exported it from the adapter, keeping `log_fastly` usage behind the wasm+feature gate.
+- No call-site changes were required—existing demos already target `anyedge_adapter_fastly::init_logger()`—but the shared structure makes the adapters consistent.
+- `cargo test` still passes; the `log_fastly` manifest warning persists (pre-existing).
+
+## Codex Plan (2025-09-19 - Code Coverage Investigation)
+- [x] Survey current test command usage to see if any coverage tooling is documented or scripted.
+- [x] Evaluate Rust-friendly coverage options (e.g. `cargo llvm-cov`, `grcov`) for compatibility with the workspace (wasm targets, feature flags).
+- [x] Prototype a coverage run on a representative crate (likely `anyedge-core`) to gauge feasibility and capture required tooling steps.
+- [x] Summarize recommended approach, prerequisites, and open questions in TODO review notes.
+
+## Review (2025-09-19 01:56 UTC)
+- Confirmed coverage isn’t wired into existing scripts; `scripts/run_tests.sh` strictly runs host + wasm tests without instrumentation.
+- Verified `cargo-llvm-cov` is available via `asdf` and works against host crates: `cargo llvm-cov --package anyedge-core --lcov --output-path target/coverage/anyedge-core.lcov` produced an LCOV file and summary (~52% line coverage for `anyedge-core`, `proc` modules currently untested).
+- Suggested path forward: document `cargo llvm-cov` usage (including creating `target/coverage/`), limit runs to host-capable crates, and treat wasm-only crates as out-of-scope unless a wasm coverage workflow is introduced.
+- Next steps could include adding a helper script and/or CI job if coverage reporting becomes a target metric.
+
+## Codex Plan (2025-09-19 - Core Coverage Backfill)
+- [x] Expand unit tests for `anyedge_core::RequestContext` to cover extraction success/failure, JSON/form parsing, and path/query edge cases.
+- [x] Add tests for `anyedge_core::EdgeError` constructors and conversion paths, ensuring status codes + messages are asserted.
+- [x] Exercise middleware chaining (`middleware.rs`) with mock handlers to cover both middleware execution and early returns.
+- [x] Write targeted tests for `Body` conversions (streaming JSON failure, `into_bytes` panic guard, etc.) and `Response` helper methods.
+- [x] Introduce extractor/responder tests to lift coverage in `extractor.rs` and `responder.rs`.
+- [x] Add compile-fail or snapshot tests for the `anyedge-macros::action` proc macro to cover unsupported inputs.
+- [x] Run `cargo llvm-cov --package anyedge-core` (and any new test suites) to validate coverage improvements.
+
+## Review (2025-09-19 02:08 UTC)
+- Added focused unit tests across `anyedge-core` for request contexts (path/query/json/form), error helpers, middleware chaining, bodies/responses, extractors, and responders; mirrored coverage for the `#[action]` macro via direct `expand_action_impl` assertions.
+- Reworked Clockflare/Fastly-specific comparisons where necessary (stringy path params, async middleware helpers) so the new tests reflect real behaviour.
+- `cargo test` passes, and `cargo llvm-cov --package anyedge-core --summary-only` now reports ~69% line coverage (up from ~52%); extractor/macro modules remain partially uncovered but key runtime surfaces are exercised.
+
+## Codex Plan (2025-09-19 - App Demo Workspace Dependencies)
+- [x] Switch app-demo crates to consume workspace-shared dependencies (`{ workspace = true }`) for core libraries and tooling.
+- [x] Ensure root `Cargo.toml` workspace dependencies cover the required crates (adding any missing entries).
+- [x] Update adapter/demo crate manifests to drop redundant version/specification lines in favour of workspace references.
+- [x] Run `cargo test` (or targeted checks) to confirm builds remain healthy.
+
+## Review (2025-09-19 02:12 UTC)
+- Added workspace dependency bindings for `anyedge-core`, adapters, demos, `fastly`, and `worker` in the root manifest, then pointed the app-demo crates at them so they share versions with the framework.
+- Demo manifests now rely on `{ workspace = true }` for `anyedge-adapter-*`, `app-demo-core`, `log`, `serde`, `fastly`, and `worker`, removing bespoke paths/versions.
+- `cargo test` passes across the workspace after the manifest refactors.
+
+## Codex Plan (2025-09-19 - Fastly SDK 0.11 Migration)
+- [ ] Update the Fastly adapter to compile against `fastly` 0.11 APIs (request building, async streaming, response conversion).
+- [ ] Adjust logging helper to the new log-fastly builder API.
+- [ ] Ensure proxy tests/builds pass for streaming + compression paths.
+- [ ] Verify the app demos compile for `wasm32-wasip1` with the updated SDK.
+
+## Review (2025-09-19 02:35 UTC)
+- Temporary stopgap: adapter builds against Fastly 0.11 by buffering request/response bodies and wiring a new logging helper; wasm demo (`cargo build -p app-demo-adapter-fastly --target wasm32-wasip1`) and `cargo test` now succeed.
+- Regression: streaming proxy behaviour (and streaming decompression) is currently disabled because bodies are buffered; follow-up work is required to restore async streaming under the new SDK.
+
+## Review (2025-09-19 07:35 UTC)
+- Updated `anyedge_adapter_fastly::dispatch` to surface `fastly::Error` directly; demo entrypoints can now return `dispatch(&app, req)` without hand-rolling fallback responses.
+- Header and request conversions match the Fastly 0.11 API, `cargo test` and `cargo build -p app-demo-adapter-fastly --target wasm32-wasip1` remain green.
+
+## Codex Plan (2025-09-20 - Wasm Runner Docs)
+- [x] Identify the best documentation spot (likely `README.md`) for Wasmtime/Viceroy installation instructions.
+- [x] Draft concise install steps for Wasmtime and Viceroy, ensuring commands work on macOS/Linux.
+- [x] Update the chosen doc section with the new prerequisites and cross-check formatting/links.
+
+## Codex Plan (2025-09-20 - Fastly Wasm Test Investigation)
+- [x] Reproduce the failing Fastly wasm tests via `cargo test --features fastly --target wasm32-wasip1` in `crates/anyedge-adapter-fastly`.
+- [x] Inspect recent Fastly runtime changes to pinpoint incompatibilities (target env, required runner, feature flags).
+- [x] Identify minimal fixes or configuration adjustments to get wasm tests passing again (no implementation yet).
+- [x] Summarize findings and proposed solution in response; note blockers if unresolved.
+
+## Review (2025-09-20 21:30 UTC)
+- Added Wasmtime/Viceroy installation guidance plus runner instructions to `README.md` so wasm tests list their runtime prerequisites explicitly.
+- Reproduced the Fastly wasm test failure: Viceroy runner aborts with “No keychain is available” while loading native certs, preventing tests from executing.
+- Proposed using Wasmtime as the `wasm32-wasip1` test runner (via env override or `.cargo/config` adjustment) or configuring Viceroy to skip the system trust store; left implementation for follow-up.
+- Logged the failing `cargo test` output in `debug.md` for future reference; no code changes were made to the adapter runtime itself.
+
+## Codex Plan (2025-09-20 - Async Compression Adapters)
+- [x] Add `async-compression` dependency (using workspace versioning) and wire it into Fastly/Cloudflare adapter manifests.
+- [x] Refactor Fastly adapter response/body decoding to use `GzipDecoder`/`BrotliDecoder` from `async-compression`, removing custom `flate2` state machines.
+- [x] Mirror the same decompression helper in the Cloudflare adapter so both adapters share behaviour.
+- [x] Run targeted tests (`cargo test --features fastly`, `cargo test --features cloudflare`) to confirm gzip/brotli decoding paths.
+- [x] Update docs (if needed) to reflect the new dependency or behaviour.
+
+## Review (2025-09-20 22:05 UTC)
+- Added `async-compression` as a workspace dependency and enabled it in both adapter manifests to centralise gzip/brotli handling.
+- Replaced the bespoke `flate2`/`brotli` state machines in Fastly and Cloudflare adapters with shared `GzipDecoder`/`BrotliDecoder` pipelines over `StreamReader`.
+- Host-side adapter tests pass (`cargo test -p anyedge-adapter-fastly`, `cargo test -p anyedge-adapter-cloudflare`); wasm targets still require platform runners but behaviour is unchanged.
+- Documentation already covered gzip/brotli support, so no content updates were necessary beyond noting the new dependency in review.
+
+## Codex Plan (2025-09-20 - Core Compression Helpers)
+- [x] Introduce a compression helper module in `anyedge-core` that exposes shared gzip/brotli decoding for `TryStream<Result<Vec<u8>>>` inputs.
+- [x] Update Fastly adapter to use the new core helper instead of its local `decode_*` implementations.
+- [x] Update Cloudflare adapter to use the same helper, removing duplicate code and imports.
+- [x] Add unit tests in `anyedge-core` covering gzip/brotli decoding via the helper.
+- [x] Re-run adapter/core tests to confirm everything compiles and passes.
+
+## Review (2025-09-20 22:45 UTC)
+- Added `compression.rs` to `anyedge-core` exposing shared `decode_gzip_stream`/`decode_brotli_stream` helpers over `async-compression`, plus unit tests that confirm round-tripping gzip and brotli blocks.
+- Fastly and Cloudflare adapters now call the core helpers, removing duplicated decoder loops and dropping their direct `async-compression` dependency.
+- Workspace dependencies updated (`async-stream` shared, `futures` promoted for core) and host tests pass (`cargo test -p anyedge-core`, `cargo test -p anyedge-adapter-fastly`, `cargo test -p anyedge-adapter-cloudflare`).
+
+## Codex Plan (2025-09-20 - Cloudflare Wasm MapErr Fix)
+- [x] Restore the `TryStreamExt` import in the Cloudflare adapter so `map_err` resolves for wasm builds.
+- [x] Run `cargo test --features cloudflare --target wasm32-wasip1 -- --nocapture` to confirm the wasm build clears (runner failures aside).
+
+## Review (2025-09-20 22:58 UTC)
+- Re-added `futures_util::TryStreamExt` to the Cloudflare adapter so `ByteStream::map_err` compiles for wasm targets.
+- `cargo test --features cloudflare --target wasm32-wasip1 -- --nocapture` now builds the wasm binary; execution still fails under Wasmtime because Workers headers rely on wasm-bindgen imports unavailable in this runtime, which matches prior expectations.
+
+## Codex Plan (2025-09-20 - Cloudflare Demo Build Fix)
+- [x] Add the missing `main` entrypoint in `examples/app-demo/crates/app-demo-adapter-cloudflare/src/main.rs` (call the adapter handler).
+- [x] Bring `anyedge_core::response::IntoResponse` into scope or adjust error handling so `EdgeError` converts correctly.
+- [x] Drop unused `Write` import in the Cloudflare adapter after the refactor.
+- [x] Re-run `cargo build -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown` to confirm the demo compiles.
+
+## Review (2025-09-20 23:10 UTC)
+- Added `#![cfg_attr(target_arch = "wasm32", no_main)]` and imported `anyedge_core::IntoResponse` so the Cloudflare demo binary compiles to wasm without missing entrypoint errors; error handling now converts `EdgeError` via `into_response`.
+- Cleaned up the Cloudflare adapter’s stale `Write` import and set the demo crate to depend on `anyedge-core` explicitly.
+- `cargo build -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown` completes successfully (only standard warnings remain).
+
+## Codex Plan (2025-09-20 - Cloudflare Entry Simplification)
+- [x] Update Cloudflare adapter `dispatch` to return `worker::Result` so callers can propagate errors directly.
+- [x] Simplify the demo entrypoint to mirror the Fastly example (build app, init logger, call `dispatch`).
+- [x] Rebuild the Cloudflare demo for wasm to confirm no regressions.
+
+## Review (2025-09-20 23:25 UTC)
+- `anyedge_adapter_cloudflare::dispatch` now returns `worker::Result<Response>` after converting internal `EdgeError`s to `worker::Error`, eliminating the need for a separate helper.
+- The Cloudflare demo entrypoint matches the Fastly style: build the app, init the logger, and await `dispatch`.
+- `cargo build -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown` stays green (standard brotli warning only).
+- Updated CLI templates so newly scaffolded apps use `anyedge_adapter_fastly::dispatch` / `anyedge_adapter_cloudflare::dispatch` with logger init, matching the demos.

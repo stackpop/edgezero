@@ -1,4 +1,4 @@
-use anyedge_fastly::cli;
+use anyedge_adapter_fastly::cli;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {

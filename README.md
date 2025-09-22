@@ -1,176 +1,167 @@
-# AnyEdge
+# AnyEdge Prototype
 
-Build edge apps in Rust once and run them across providers. AnyEdge supplies a unified HTTP surface, routing, middleware, and adapter crates for Fastly Compute@Edge and Cloudflare Workers, plus tooling for local iteration.
+AnyEdge is an experiment in writing HTTP workloads once and deploying them to
+multiple edge providers. The crates in this workspace stay runtime-agnostic
+(Tokio free, no OS primitives) so they can compile cleanly to WebAssembly
+targets such as Fastly Compute@Edge and Cloudflare Workers.
 
-## Highlights
+## Workspace layout
 
-- Provider-agnostic `Request`/`Response`, router, and middleware in `anyedge-core`.
-- Adapter crates (`anyedge-fastly`, `anyedge-cloudflare`) that translate provider requests to core types with minimal glue.
-- `anyedge-controller` + `anyedge-macros` provide a controller DSL (`#[action]`) with typed extractors (`Path`, `Query`, `Json`, plus `ValidatedPath`/`ValidatedQuery`/`ValidatedJson` for `validator` support), `Hooks`, and the `AppRoutes` builder on top of `anyedge-core`.
-- CLI skeleton with a dev server and scaffolding hooks.
-- Example apps and demos to validate streaming, headers, and proxy behaviour.
+- `crates/anyedge-core` – routing, request/response primitives, middleware
+  chaining, extractor utilities built on `http`, `tower::Service`, and
+  `matchit`, plus a `anyedge-macros` companion crate for the `#[action]`
+  attribute. Handlers use matchit 0.8’s `{param}` syntax (for example
+  `/hello/{name}`) and can opt into extractor arguments like `Json<T>` or
+  `ValidatedQuery<T>`. The crate re-exports common HTTP primitives (`Method`,
+  `StatusCode`, `HeaderMap`, etc.) so downstream code can avoid depending on the
+  underlying `http` version directly.
+- `crates/anyedge-adapter-fastly` – converts Fastly request/response types into
+  the shared `anyedge-core` model and exposes a `FastlyRequestContext` with
+  provider metadata.
+- `crates/anyedge-adapter-cloudflare` – the Cloudflare Workers counterpart,
+  returning a `CloudflareRequestContext` so handlers can reach the Workers `Env`
+  and `Context`.
+- `examples/anyedge-demo/anyedge-demo-core` – shared router plus a
+  `anyedge-demo-local` binary for quick local iteration.
+- `examples/anyedge-demo/anyedge-demo-fastly` – Fastly deployment target
+  that reuses the shared router through the adapter crate.
+- `examples/anyedge-demo/anyedge-demo-cloudflare` – Cloudflare Workers entry
+  point driven by the same router.
 
-## Repository Layout
+## Quick start
 
-- `crates/anyedge-core` – core HTTP types, router, middleware, logging facade.
-- `crates/anyedge-fastly` – Fastly adapter + logging/proxy helpers (`fastly` feature).
-- `crates/anyedge-cloudflare` – Cloudflare Workers adapter (`cloudflare` feature).
-- `crates/anyedge-std` – stdout logger for local/native execution.
-- `crates/anyedge-cli` – CLI + dev server + project scaffolding.
-- `examples/app-demo` – multi-crate example (core + Fastly + Cloudflare under `crates/`) used by the CLI dev server.
+```bash
+# Run the local demo handlers against a few synthetic requests
+cargo run -p anyedge-demo-core --bin anyedge-demo-local
 
-## Core Building Blocks
-
-- `anyedge-controller` + `anyedge-macros` (preferred) – build typed controllers with `#[action]`, extracting params/bodies safely and registering route sets onto an `App`.
-- `anyedge_core::App` – the lower-level router/middleware surface. You can still call `app.get/route_with` directly when you need full control.
-- Router – path pattern matching (`/users/:id`), verb dispatch, HEAD/OPTIONS semantics, body-mode enforcement.
-- HTTP types – provider-neutral headers, query maps, optional streaming bodies (`Response::with_chunks`).
-- Logging facade – register once per process (`Logging::set_initializer`, `init_logging`).
-
-### Streaming
-
-
-`Response::with_chunks` accepts an iterator of `Vec<u8>`; adapters map this to provider streaming primitives. Non-streaming builds fallback to buffering while keeping the API consistent.
-
-### Route Options
-
-- Default helpers (`App::get/post/put/delete`) use automatic body policy.
-- `route_with(method, path, handler, RouteOptions)` lets you enforce `streaming()` or `buffered()` behaviour.
-
-## Quick Start
-
-1. Install Rust (stable) and desired provider CLIs (Fastly CLI, Cloudflare `wrangler`).
-2. Clone the repo and run `cargo test --workspace` to confirm the toolchain setup.
-3. Build an app using controllers (see below), then start the CLI dev server: `cargo run -p anyedge-cli --features cli -- dev` and navigate to http://127.0.0.1:8787.
-4. Explore the Fastly or Cloudflare demos as described below.
-
-## Using the Adapters
-
-### Fastly Compute@Edge
-
-```rust
-use anyedge_controller::Hooks;
-use my_app::DemoApp;
-
-#[fastly::main]
-fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    let app = DemoApp::build_app();
-    anyedge_fastly::init_logger("<endpoint>", log::LevelFilter::Info, true)?;
-    Ok(anyedge_fastly::handle(&app, req))
-}
+# Execute the full test suite
+cargo test
 ```
 
-- Requires enabling the `fastly` feature on `anyedge-fastly`.
-- Supports native streaming on wasm32-wasip1 via `stream_to_client`, with buffered fallback for native builds.
-- Proxy helper (`anyedge_fastly::register_proxy`) bridges `anyedge_core::Proxy` to Fastly backends.
-
-### Cloudflare Workers
+The local demo now includes a `/stream` route that yields multiple chunks to
+illustrate streaming bodies end-to-end, and showcases the macro/extractor flow:
 
 ```rust
-use anyedge_cloudflare::handle;
-use anyedge_controller::Hooks;
-use my_app::DemoApp;
-
-#[event(fetch)]
-pub async fn main(req: worker::Request, env: worker::Env, ctx: worker::Context) -> worker::Result<worker::Response> {
-    let app = DemoApp::build_app();
-    handle(&app, req, env, ctx).await
-}
-```
-
-- Enable the `cloudflare` feature on `anyedge-cloudflare`.
-- Currently buffers responses; streaming integration via `ReadableStream` is on the roadmap.
-
-## Building Apps with Controllers
-
-```rust
-use anyedge_controller::{
-    action, get, post, AppRoutes, Hooks, Path, RequestJson, Responder, Routes, Text,
-};
-use anyedge_core::App;
-
 #[derive(serde::Deserialize)]
-struct SlugParams {
-    slug: String,
+struct EchoBody {
+    name: String,
 }
 
-#[derive(serde::Deserialize)]
-struct CreateNote {
-    title: String,
-}
-
-#[action]
-fn list(path: Path<SlugParams>) -> impl Responder {
-    let SlugParams { slug } = path.into_inner();
-    Text::new(format!("list:{}", slug))
-}
-
-#[action]
-fn create(RequestJson(body): RequestJson<CreateNote>) -> impl Responder {
-    Text::new(format!("created:{}", body.title))
-}
-
-pub struct DemoApp;
-
-impl Hooks for DemoApp {
-    fn configure(app: &mut App) {
-        app.middleware(anyedge_core::middleware::Logger);
-    }
-
-    fn routes() -> AppRoutes {
-        AppRoutes::with_default_routes()
-            .prefix("/api")
-            .add_route(
-                anyedge_controller::Routes::new()
-                    .add("/notes/:slug", get(list()))
-                    .add("/notes", post(create())),
-            )
-    }
+#[anyedge_core::action]
+async fn echo(Json(payload): Json<EchoBody>) -> impl Responder {
+    Text::new(format!("Hello, {}!", payload.name))
 }
 ```
-
-Most users should start with this controller layer and `Hooks`; drop down to `app.route_with(...)` only for specialised behaviour.
-
-`Hooks::configure` runs before routes are applied, giving you a single place to register middleware, shared state, or other app setup.
-
-## CLI
-
-```
-# Minimal dev server using the shared example app
-cargo run -p anyedge-cli --features cli -- dev
-
-# Scaffold a new edge app (work in progress)
-cargo run -p anyedge-cli -- new my-edge-app --dir target/tmp
-```
-
-The CLI bundles a Hotwire-free dev server (chunked streaming) and will grow `build` / `deploy` flows.
-
-## Example Apps
-
-### Example Workspace (`examples/app-demo`)
-
-- `app-demo-core`: shared controller-based library with demo routes.
-- `app-demo-fastly`: Fastly Compute@Edge binary (`fastly compute serve`).
-- `app-demo-cloudflare`: Cloudflare Workers binary (`wrangler dev`).
 
 ## Logging
 
-- Fastly: `anyedge_fastly::init_logger(endpoint, LevelFilter, echo_stdout)` integrates with Fastly log streaming.
-- Native/local: `anyedge_std::init_logger(LevelFilter, echo_stdout)` outputs to stdout using `fern` formatting.
-- For advanced scenarios, register a custom initializer through `anyedge_core::Logging` once per process.
+`anyedge-core` relies on the standard `log` facade. Platform adapters expose helper
+functions so you can install the right backend when your app boots:
 
-## Development & Testing
+- Fastly: call `anyedge_adapter_fastly::init_logger()` (wraps `log_fastly`).
+- Cloudflare Workers: call `anyedge_adapter_cloudflare::init_logger()` (logs via
+  Workers `console_log!`).
+- Other targets: initialise a fallback logger such as `simple_logger` before building
+  your app.
 
-- `cargo test --workspace` – run all unit tests.
-- `cargo test -p anyedge-core` – focus on core routing/HTTP logic.
-- `cargo fmt` and `cargo clippy --workspace` – keep formatting and linting consistent.
-- When adding features, mirror coverage in the demos or CLI dev server to prevent adapter drift.
+The demo hooks call those helpers automatically so the `anyedge_demo_*` binaries pick
+up the appropriate logger without extra boilerplate.
 
-## Roadmap
+## Provider builds
 
-- Cloudflare streaming support via `ReadableStream`.
-- CLI `build`/`deploy` commands that wrap provider tooling.
-- `Response::json<T>` helper (serde-gated) for ergonomic responses.
-- Expanded proxy APIs (async-friendly) for Workers-style fetch.
+Fastly Compute@Edge (requires `wasm32-wasip1` target and the `fastly` SDK):
 
-See `TODO.md` for detailed design notes and task tracking.
+```bash
+rustup target add wasm32-wasip1
+cd anyedge/crates/anyedge-adapter-fastly
+cargo build -p anyedge-demo-fastly --features fastly --target wasm32-wasip1
+# Serve locally with the Fastly CLI (requires running from the demo crate so `fastly.toml` is found)
+fastly compute serve -C examples/app-demo/crates/app-demo-adapter-fastly \
+```
+
+Cloudflare Workers (requires `wasm32-unknown-unknown` target):
+
+```bash
+rustup target add wasm32-unknown-unknown
+cd anyedge/crates/anyedged-adapter-cloudflare
+cargo build -p anyedge-demo-cloudflare --features cloudflare --target wasm32-unknown-unknown
+```
+
+Both binaries rely on their adapter crates to translate platform request/response
+shapes and to stash provider metadata in the request extensions so handlers can
+access platform-specific APIs.
+
+## Path parameters
+
+`anyedge-core` uses matchit 0.8+. Define parameters with `{name}` segments
+(`/blog/{slug}`) and catch-alls with `{*rest}`. Legacy Axum-style `:name`
+segments are intentionally unsupported.
+
+## Streaming responses
+
+Handlers can return `Body::stream` to yield response chunks progressively. The
+router keeps the stream intact all the way to the adapters; today both the
+Fastly and Cloudflare bridges buffer chunks sequentially while writing to the
+provider runtime APIs, so long-lived streams remain compatible with Wasm
+targets. Responses compressed with gzip or brotli are transparently
+decoded before they reach handlers so you can reformat or transform the
+payload before sending it downstream.
+
+## Proxying upstream services
+
+`anyedge-core` exposes a `ProxyService` abstraction that adapters implement.
+On Fastly it uses dynamic backends (created at runtime) while on Cloudflare it
+relies on the Workers `fetch` API. Both paths support streaming and gzip/brotli
+decoding out of the box, making it easy to transform proxied responses.
+
+The demo crate now includes reusable helpers — `proxy_to` and `proxy_to_with`
+— that wrap `ProxyRequest::from_request` and the correct `ProxyClient` for the
+current compile target. The helpers make it trivial to adjust headers or other
+per-request metadata before forwarding.
+
+- `GET /proxy` proxies to a fixed upstream URL to showcase the happy path.
+- `GET /proxy/header?header=value` injects a custom header before forwarding,
+  demonstrating how to use `proxy_to_with` for on-the-fly request decoration.
+- The local build uses a synthetic proxy client so you can iterate without edge
+  credentials. Fastly / Cloudflare builds automatically pick up the matching
+  proxy client when compiled with `fastly` or `cloudflare`.
+
+## Testing
+
+Unit tests live next to the modules they exercise. Run the entire suite with
+`cargo test`, or scope to a single crate via `cargo test -p anyedge-core`.
+The adapter crates include lightweight host-side tests that validate context
+insertion and URI parsing without needing the Wasm toolchains.
+
+### Wasm runners (Fastly / WASI)
+
+Some adapter tests target `wasm32-wasip1`; Cargo needs a Wasm runtime to execute
+the generated binaries. Install the following tools before running those tests:
+
+- Wasmtime (executes `wasm32-wasip1` tests)
+  - macOS: `brew install wasmtime`
+  - Linux: `curl https://wasmtime.dev/install.sh -sSf | bash`
+  - Windows: follow <https://wasmtime.dev/> for the MSI/winget installers
+- Viceroy (Fastly’s local Compute@Edge simulator)
+  - macOS: `brew install fastly/tap/viceroy`
+  - Linux & Windows: download the latest release archive from
+    <https://github.com/fastly/Viceroy/releases>, extract it, and place the
+    binary on your `PATH`
+
+Tell Cargo to use Wasmtime when running the wasm tests:
+
+```bash
+export CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir=."
+cargo test -p anyedge-adapter-fastly --features fastly --target wasm32-wasip1
+```
+
+Streaming responses are covered in the `anyedge-core` router tests and in the
+Fastly adapter tests to ensure chunked bodies make it to the provider output.
+
+## Next steps
+
+- Flesh out provider adapters with richer request contexts (fetch/KV helpers).
+- Offer dedicated extractor types (`Path<T>`, `Query<T>`, `Json<T>`) on top of
+  `RequestContext` for ergonomic handlers.
+- Prototype a local development shim so the same router can process real HTTP
+  traffic on a laptop while mimicking Fastly/Cloudflare behaviours.

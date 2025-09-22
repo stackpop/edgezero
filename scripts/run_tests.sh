@@ -31,14 +31,14 @@ section() {
 }
 
 section "Workspace Tests"
-run cargo test --workspace --exclude app-demo-fastly
+run cargo test --workspace
 
 section "Fastly CLI Tests"
-run cargo test -p anyedge-fastly --no-default-features --features cli
+run cargo test -p anyedge-adapter-fastly --no-default-features --features cli
 
 section "Fastly Wasm Tests"
 (
-  cd crates/anyedge-fastly
+  cd crates/anyedge-adapter-fastly
   run cargo test --features fastly --target wasm32-wasip1 -- --nocapture
 )
 

@@ -78,7 +78,7 @@ pub fn write_tmpl(
     }
     let rendered = hbs
         .render(name, data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     std::fs::write(out_path, rendered)
 }
 
@@ -114,9 +114,9 @@ pub fn resolve_dep_line(
             let dep_path = std::path::Path::new(&rel).join(repo_rel_crate);
             // For fastly/cloudflare crates we still want features; detect by crate name
             let cname = crate_name_from_repo_path(repo_rel_crate);
-            let features = if cname == "anyedge-fastly" {
+            let features = if cname == "anyedge-adapter-fastly" {
                 " , features = [\"fastly\"]"
-            } else if cname == "anyedge-cloudflare" {
+            } else if cname == "anyedge-adapter-cloudflare" {
                 " , features = [\"cloudflare\"]"
             } else {
                 ""
