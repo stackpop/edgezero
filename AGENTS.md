@@ -38,12 +38,12 @@ route definitions must use matchit 0.8 style
   Tests for adapter behaviour live beside those modules.
 
 ## Examples
-the demo crates under `examples/anyedge-demo/` share router
-  logic via `anyedge-demo-core`. Local smoke testing can continue to use
-  `cargo run -p anyedge-demo-core --bin anyedge-demo-local`. The demo crate
-  now exposes a `/proxy` handler; when targeting Fastly or Cloudflare, enable
-  the corresponding feature (`fastly` / `cloudflare`) so the
-  platform proxy client is wired in.
+the demo crates under `examples/app-demo/` share router
+  logic via `app-demo-core`. Local smoke testing flows through
+  `cargo run -p anyedge-cli -- dev`, which serves the demo router on
+  http://127.0.0.1:8787 when the default features (including `dev-example`) are enabled.
+  Build provider targets with `app-demo-adapter-fastly` / `app-demo-adapter-cloudflare`
+  when you need Fastly or Cloudflare binaries.
 
 ## Style– prefer colocating tests with implementation modules, favour
 async/await-friendly code that compiles to Wasm, and avoid runtime-specific
@@ -60,11 +60,11 @@ dependencies like Tokio.
   fall back to something like `simple_logger` for local builds.
 
 ## Proxy helpers
-- The demo crate exposes `proxy_to` / `proxy_to_with` helpers; reuse them when
-  wiring new proxy routes so platform-specific clients continue to swap in
-  automatically.
+- Use `anyedge_core::ProxyService` with the adapter clients
+  (`anyedge_adapter_fastly::FastlyProxyClient`, `anyedge_adapter_cloudflare::CloudflareProxyClient`)
+  when wiring proxy routes so streaming and compression handling stay consistent.
 - Keep synthetic local proxy behaviour lightweight so examples can run without
-  Fastly/Cloudflare credentials.
+  Fastly/Cloudflare credentials; rely on the proxy test clients in `anyedge-core` for unit coverage.
 
 When in doubt, keep changes minimal, document behaviour in `README.md`, and
 ensure the workspace stays Wasm-friendly.

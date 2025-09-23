@@ -10,7 +10,7 @@ use log::LevelFilter;
 #[fastly::main]
 pub fn main(req: Request) -> Result<Response, Error> {
     let app = DemoApp::build_app();
-    anyedge_adapter_fastly::init_logger("stdout", LevelFilter::Info, true)
+    anyedge_adapter_fastly::init_logger("app-demo", LevelFilter::Info, true)
         .expect("init fastly logger");
     anyedge_adapter_fastly::dispatch(&app, req)
 }

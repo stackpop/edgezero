@@ -131,7 +131,10 @@ fn write_response(stream: &mut TcpStream, response: anyedge_core::Response) -> s
 fn build_dev_router() -> RouterService {
     #[cfg(feature = "dev-example")]
     {
-        DemoApp::build_app().into_router()
+        use anyedge_core::Hooks;
+
+        let demo_app = DemoApp::build_app();
+        demo_app.router().clone()
     }
 
     #[cfg(not(feature = "dev-example"))]
