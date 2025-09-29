@@ -1,6 +1,9 @@
 use crate::response::from_core_response;
 use crate::CloudflareRequestContext;
-use anyedge_core::{request_builder, App, Body, EdgeError, Method as CoreMethod, Request, Uri};
+use anyedge_core::app::App;
+use anyedge_core::body::Body;
+use anyedge_core::error::EdgeError;
+use anyedge_core::http::{request_builder, Method as CoreMethod, Request, Uri};
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
@@ -27,11 +30,11 @@ pub async fn into_core_request(
         builder = builder.header(name.as_str(), value);
     }
 
-    let bytes = req.bytes().await.map_err(|err| EdgeError::internal(err))?;
+    let bytes = req.bytes().await.map_err(EdgeError::internal)?;
 
     let mut request = builder
         .body(Body::from(bytes))
-        .map_err(|err| EdgeError::internal(err))?;
+        .map_err(EdgeError::internal)?;
 
     CloudflareRequestContext::insert(&mut request, env, ctx);
     Ok(request)

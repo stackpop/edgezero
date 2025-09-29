@@ -13,3 +13,6 @@ anyedge-core = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -8,7 +8,7 @@ license = { workspace = true }
 [features]
 default = []
 cli = ["dep:toml", "dep:walkdir"]
-fastly = ["dep:fastly", "dep:log-fastly"]
+fastly = ["dep:fastly", "dep:log-fastly", "dep:toml"]
 
 [dependencies]
 anyedge-core = { path = "../anyedge-core" }

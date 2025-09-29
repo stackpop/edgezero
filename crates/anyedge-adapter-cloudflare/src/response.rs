@@ -1,4 +1,6 @@
-use anyedge_core::{Body, EdgeError, Response};
+use anyedge_core::body::Body;
+use anyedge_core::error::EdgeError;
+use anyedge_core::http::Response;
 use futures_util::StreamExt;
 use worker::{Error as WorkerError, Response as CfResponse};
 
@@ -6,9 +8,7 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
     let (parts, body) = response.into_parts();
 
     let cf_response = match body {
-        Body::Once(bytes) => {
-            CfResponse::from_bytes(bytes.to_vec()).map_err(|err| EdgeError::internal(err))?
-        }
+        Body::Once(bytes) => CfResponse::from_bytes(bytes.to_vec()).map_err(EdgeError::internal)?,
         Body::Stream(stream) => {
             let worker_stream = stream
                 .map(|res| match res {
@@ -16,7 +16,7 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
                     Err(err) => Err(WorkerError::RustError(err.to_string())),
                 })
                 .boxed_local();
-            CfResponse::from_stream(worker_stream).map_err(|err| EdgeError::internal(err))?
+            CfResponse::from_stream(worker_stream).map_err(EdgeError::internal)?
         }
     };
 
@@ -26,7 +26,7 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
         if let Ok(value_str) = value.to_str() {
             headers
                 .set(name.as_str(), value_str)
-                .map_err(|err| EdgeError::internal(err))?;
+                .map_err(EdgeError::internal)?;
         }
     }
     Ok(cf_response)
@@ -35,7 +35,8 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyedge_core::{response_builder, Body};
+    use anyedge_core::body::Body;
+    use anyedge_core::http::response_builder;
     use bytes::Bytes;
     use futures_util::{stream, StreamExt};
 

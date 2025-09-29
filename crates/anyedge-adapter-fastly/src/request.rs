@@ -1,6 +1,9 @@
 use std::io::Read;
 
-use anyedge_core::{request_builder, App, Body, EdgeError, Request};
+use anyedge_core::app::App;
+use anyedge_core::body::Body;
+use anyedge_core::error::EdgeError;
+use anyedge_core::http::{request_builder, Request};
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 
@@ -18,12 +21,11 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
 
     let mut body = req.take_body();
     let mut bytes = Vec::new();
-    body.read_to_end(&mut bytes)
-        .map_err(|err| EdgeError::internal(err))?;
+    body.read_to_end(&mut bytes).map_err(EdgeError::internal)?;
 
     let mut request = builder
         .body(Body::from(bytes))
-        .map_err(|err| EdgeError::internal(err))?;
+        .map_err(EdgeError::internal)?;
 
     let context = FastlyRequestContext {
         client_ip: req.get_client_ip_addr(),

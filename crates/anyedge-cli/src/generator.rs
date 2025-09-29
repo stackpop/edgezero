@@ -57,13 +57,25 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         "crates/anyedge-core",
         "anyedge-core = \"0.1\"",
     );
-    let dep_fastly = resolve_dep_line(
+    let dep_fastly_base = resolve_dep_line(
+        &fastly_dir,
+        &cwd,
+        "crates/anyedge-adapter-fastly",
+        "anyedge-adapter-fastly = \"0.1\"",
+    );
+    let dep_fastly_wasm = resolve_dep_line(
         &fastly_dir,
         &cwd,
         "crates/anyedge-adapter-fastly",
         "anyedge-adapter-fastly = { version = \"0.1\", features = [\"fastly\"] }",
     );
-    let dep_cloudflare = resolve_dep_line(
+    let dep_cloudflare_base = resolve_dep_line(
+        &cloudflare_dir,
+        &cwd,
+        "crates/anyedge-adapter-cloudflare",
+        "anyedge-adapter-cloudflare = \"0.1\"",
+    );
+    let dep_cloudflare_wasm = resolve_dep_line(
         &cloudflare_dir,
         &cwd,
         "crates/anyedge-adapter-cloudflare",
@@ -79,8 +91,10 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         "dep_anyedge_core": dep_core_lib,
         "dep_anyedge_core_fastly": dep_core_fastly,
         "dep_anyedge_core_cloudflare": dep_core_cloudflare,
-        "dep_anyedge_adapter_fastly": dep_fastly,
-        "dep_anyedge_adapter_cloudflare": dep_cloudflare,
+        "dep_anyedge_adapter_fastly": dep_fastly_base,
+        "dep_anyedge_adapter_fastly_wasm": dep_fastly_wasm,
+        "dep_anyedge_adapter_cloudflare": dep_cloudflare_base,
+        "dep_anyedge_adapter_cloudflare_wasm": dep_cloudflare_wasm,
     });
 
     // Render all templates
@@ -89,6 +103,12 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
 
     // Root workspace files
     write_tmpl(&hbs, "root_Cargo_toml", &data, &out_dir.join("Cargo.toml"))?;
+    write_tmpl(
+        &hbs,
+        "root_anyedge_toml",
+        &data,
+        &out_dir.join("anyedge.toml"),
+    )?;
     write_tmpl(&hbs, "root_README_md", &data, &out_dir.join("README.md"))?;
 
     // Core crate

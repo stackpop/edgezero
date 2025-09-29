@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use validator::Validate;
 
-use crate::{EdgeError, HeaderMap, RequestContext};
+use crate::context::RequestContext;
+use crate::error::EdgeError;
+use crate::http::HeaderMap;
 
 #[async_trait(?Send)]
 pub trait FromRequest: Sized {
@@ -315,9 +317,10 @@ impl<T> ValidatedForm<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        request_builder, Body, HeaderValue, Method, PathParams, RequestContext, StatusCode,
-    };
+    use crate::body::Body;
+    use crate::context::RequestContext;
+    use crate::http::{request_builder, HeaderValue, Method, StatusCode};
+    use crate::params::PathParams;
     use futures::executor::block_on;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;

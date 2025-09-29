@@ -2,11 +2,9 @@ use anyhow::Error as AnyError;
 use serde_json::json;
 use thiserror::Error;
 
-use crate::{
-    header::CONTENT_TYPE,
-    response::{response_with_body, IntoResponse},
-    Body, HeaderValue, Method, StatusCode,
-};
+use crate::body::Body;
+use crate::http::{header::CONTENT_TYPE, HeaderValue, Method, Response, StatusCode};
+use crate::response::{response_with_body, IntoResponse};
 
 /// Application-level error that carries an HTTP status code.
 #[derive(Debug, Error)]
@@ -100,7 +98,7 @@ impl EdgeError {
 }
 
 impl IntoResponse for EdgeError {
-    fn into_response(self) -> crate::Response {
+    fn into_response(self) -> Response {
         let payload = json!({
             "error": {
                 "status": self.status().as_u16(),
@@ -120,7 +118,7 @@ impl IntoResponse for EdgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Method;
+    use crate::http::Method;
 
     #[test]
     fn bad_request_sets_status_and_message() {

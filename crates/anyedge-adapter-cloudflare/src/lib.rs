@@ -41,7 +41,7 @@ pub trait AppExt {
 }
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-impl AppExt for anyedge_core::App {
+impl AppExt for anyedge_core::app::App {
     fn dispatch<'a>(
         &'a self,
         req: worker::Request,
@@ -52,4 +52,15 @@ impl AppExt for anyedge_core::App {
     > {
         Box::pin(crate::request::dispatch(self, req, env, ctx))
     }
+}
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub async fn run_app<A: anyedge_core::app::Hooks>(
+    req: worker::Request,
+    env: worker::Env,
+    ctx: worker::Context,
+) -> Result<worker::Response, worker::Error> {
+    init_logger().expect("init cloudflare logger");
+    let app = A::build_app();
+    dispatch(&app, req, env, ctx).await
 }

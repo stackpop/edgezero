@@ -4,17 +4,16 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 
-use crate::{DynHandler, EdgeError, RequestContext};
+use crate::context::RequestContext;
+use crate::error::EdgeError;
+use crate::handler::DynHandler;
+use crate::http::Response;
 
 pub type BoxMiddleware = Arc<dyn Middleware>;
 
 #[async_trait(?Send)]
 pub trait Middleware: Send + Sync + 'static {
-    async fn handle(
-        &self,
-        ctx: RequestContext,
-        next: Next<'_>,
-    ) -> Result<crate::Response, EdgeError>;
+    async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError>;
 }
 
 pub struct Next<'a> {
@@ -30,7 +29,7 @@ impl<'a> Next<'a> {
         }
     }
 
-    pub async fn run(self, ctx: RequestContext) -> Result<crate::Response, EdgeError> {
+    pub async fn run(self, ctx: RequestContext) -> Result<Response, EdgeError> {
         if let Some((head, tail)) = self.middlewares.split_first() {
             head.handle(ctx, Next::new(tail, self.handler)).await
         } else {
@@ -43,11 +42,7 @@ pub struct RequestLogger;
 
 #[async_trait(?Send)]
 impl Middleware for RequestLogger {
-    async fn handle(
-        &self,
-        ctx: RequestContext,
-        next: Next<'_>,
-    ) -> Result<crate::Response, EdgeError> {
+    async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let method = ctx.request().method().clone();
         let path = ctx.request().uri().path().to_string();
         let start = Instant::now();
@@ -103,13 +98,9 @@ where
 impl<F, Fut> Middleware for FnMiddleware<F>
 where
     F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<crate::Response, EdgeError>>,
+    Fut: Future<Output = Result<Response, EdgeError>>,
 {
-    async fn handle(
-        &self,
-        ctx: RequestContext,
-        next: Next<'_>,
-    ) -> Result<crate::Response, EdgeError> {
+    async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         (self.f)(ctx, next).await
     }
 }
@@ -117,7 +108,7 @@ where
 pub fn middleware_fn<F, Fut>(f: F) -> FnMiddleware<F>
 where
     F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<crate::Response, EdgeError>>,
+    Fut: Future<Output = Result<Response, EdgeError>>,
 {
     FnMiddleware::new(f)
 }
@@ -125,10 +116,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        handler::IntoHandler, request_builder, response::response_with_body, Body, Method,
-        PathParams, Response, StatusCode,
-    };
+    use crate::body::Body;
+    use crate::handler::IntoHandler;
+    use crate::http::{request_builder, Method, Response, StatusCode};
+    use crate::params::PathParams;
+    use crate::response::response_with_body;
     use futures::executor::block_on;
     use std::sync::{Arc, Mutex};
 

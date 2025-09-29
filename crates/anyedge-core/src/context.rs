@@ -1,4 +1,7 @@
-use crate::{Body, EdgeError, PathParams, Request};
+use crate::body::Body;
+use crate::error::EdgeError;
+use crate::http::Request;
+use crate::params::PathParams;
 use serde::de::DeserializeOwned;
 
 /// Request context exposed to handlers and middleware.
@@ -80,7 +83,8 @@ impl RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{request_builder, Method, PathParams, StatusCode};
+    use crate::http::{request_builder, Method, StatusCode};
+    use crate::params::PathParams;
     use bytes::Bytes;
     use futures::stream;
     use serde::{Deserialize, Serialize};

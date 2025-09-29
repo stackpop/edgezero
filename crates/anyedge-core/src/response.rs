@@ -1,6 +1,7 @@
-use crate::{
+use crate::body::Body;
+use crate::http::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
-    Body, HeaderValue, Response, StatusCode,
+    HeaderValue, Response, StatusCode,
 };
 
 /// Convert common return types into `Response`.
@@ -68,7 +69,9 @@ where
 }
 
 pub fn response_with_body(status: StatusCode, body: Body) -> Response {
-    let mut builder = crate::response_builder().status(status);
+    use crate::http::response_builder;
+
+    let mut builder = response_builder().status(status);
 
     if let Body::Once(ref bytes) = body {
         if !bytes.is_empty() {

@@ -1,8 +1,12 @@
 mod handlers {
-    use anyedge_core::{
-        action, Body, EdgeError, HeaderName, HeaderValue, IntoResponse, Json, Path, PathParams,
-        RequestContext, Response, StatusCode, Text,
-    };
+    use anyedge_core::action;
+    use anyedge_core::body::Body;
+    use anyedge_core::context::RequestContext;
+    use anyedge_core::error::EdgeError;
+    use anyedge_core::extractor::{Json, Path};
+    use anyedge_core::http::{self, header::{HeaderName, HeaderValue}, Response, StatusCode};
+    use anyedge_core::params::PathParams;
+    use anyedge_core::response::{IntoResponse, Text};
     use bytes::Bytes;
     use futures::{stream, StreamExt};
     use std::collections::HashMap;
@@ -44,7 +48,7 @@ mod handlers {
             index
         ))));
 
-        anyedge_core::response_builder()
+        anyedge_core::http::response_builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; charset=utf-8")
             .body(body)
@@ -59,7 +63,8 @@ mod handlers {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use anyedge_core::{request_builder, Body, Method};
+        use anyedge_core::body::Body;
+        use anyedge_core::http::{request_builder, Method};
         use futures::executor::block_on;
 
         #[test]
@@ -173,58 +178,6 @@ mod handlers {
     }
 }
 
-mod app {
-    use super::handlers::{echo, echo_json, headers, root, stream};
-    use anyedge_core::{App, EdgeError, Hooks, RequestContext, RouterService, Text};
-    use std::sync::Arc;
+anyedge_core::app!("../../anyedge.toml");
 
-    pub struct AppInfo {
-        pub name: String,
-    }
-
-    pub struct DemoApp;
-
-    impl DemoApp {
-        pub fn build_app() -> App {
-            <Self as Hooks>::build_app()
-        }
-    }
-
-    impl Hooks for DemoApp {
-        fn routes() -> RouterService {
-            let info = Arc::new(AppInfo {
-                name: Self::name().to_string(),
-            });
-            build_router(info)
-        }
-
-        fn name() -> &'static str {
-            "{{name}}"
-        }
-    }
-
-    pub fn build_app_with_info(info: AppInfo) -> App {
-        let info = Arc::new(info);
-        let router = build_router(Arc::clone(&info));
-        App::with_name(router, info.name.clone())
-    }
-
-    pub fn build_router(info: Arc<AppInfo>) -> RouterService {
-        RouterService::builder()
-            .get("/", root)
-            .get("/echo/{name}", echo)
-            .get("/headers", headers)
-            .get("/stream", stream)
-            .post("/echo", echo_json)
-            .get("/info", {
-                let info = Arc::clone(&info);
-                move |_ctx: RequestContext| {
-                    let info = Arc::clone(&info);
-                    async move { Ok::<_, EdgeError>(Text::new(format!("App: {}", info.name))) }
-                }
-            })
-            .build()
-    }
-}
-
-pub use crate::app::{build_app_with_info, build_router, AppInfo, DemoApp};
+pub use handlers::*;

@@ -8,11 +8,17 @@ publish = false
 name = "{{proj_fastly}}"
 path = "src/main.rs"
 
+[features]
+default = []
+fastly = ["anyedge-adapter-fastly/fastly"]
+
 [dependencies]
 {{proj_core}} = { path = "../{{proj_core}}" }
-log = "0.4"
+log = { workspace = true }
+{{dep_anyedge_adapter_fastly}}
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 {{dep_anyedge_core_fastly}}
-{{dep_anyedge_adapter_fastly}}
-fastly = "0.11"
+{{dep_anyedge_adapter_fastly_wasm}}
+fastly = { workspace = true }
+once_cell = { workspace = true }

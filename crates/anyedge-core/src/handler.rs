@@ -1,7 +1,10 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use crate::{EdgeError, HandlerFuture, IntoResponse, RequestContext};
+use crate::context::RequestContext;
+use crate::error::EdgeError;
+use crate::http::HandlerFuture;
+use crate::response::IntoResponse;
 
 pub trait DynHandler: Send + Sync {
     fn call(&self, ctx: RequestContext) -> HandlerFuture;

@@ -1,18 +1,14 @@
-// Note: even when targeting wasm32-wasip1, `target_os` remains `wasi`.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
 #[cfg(target_arch = "wasm32")]
-use app_demo_core::DemoApp;
+use app_demo_core::App;
 #[cfg(target_arch = "wasm32")]
 use fastly::{Error, Request, Response};
-#[cfg(target_arch = "wasm32")]
-use log::LevelFilter;
 
 #[cfg(target_arch = "wasm32")]
 #[fastly::main]
 pub fn main(req: Request) -> Result<Response, Error> {
-    let app = DemoApp::build_app();
-    anyedge_adapter_fastly::init_logger("app-demo", LevelFilter::Info, true)
-        .expect("init fastly logger");
-    anyedge_adapter_fastly::dispatch(&app, req)
+    anyedge_adapter_fastly::run_app::<App>(include_str!("../../../anyedge.toml"), req)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

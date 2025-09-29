@@ -10,14 +10,15 @@ path = "src/main.rs"
 
 [features]
 default = []
-fastly = ["dep:anyedge-adapter-fastly"]
+fastly = ["anyedge-adapter-fastly/fastly"]
 
 [dependencies]
 app-demo-core = { workspace = true }
-anyedge-adapter-fastly = { workspace = true, optional = true}
+anyedge-adapter-fastly = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 anyedge-core = { workspace = true }
 anyedge-adapter-fastly = { workspace = true, features = ["fastly"] }
-fastly = {workspace = true }
+fastly = { workspace = true }
+once_cell = { workspace = true }

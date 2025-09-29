@@ -1,4 +1,4 @@
-use crate::RouterService;
+use crate::router::RouterService;
 
 const DEFAULT_APP_NAME: &str = "AnyEdge App";
 
@@ -76,5 +76,62 @@ pub trait Hooks {
         let mut app = App::with_name(Self::routes(), Self::name());
         Self::configure(&mut app);
         app
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::Body;
+    use crate::context::RequestContext;
+    use crate::error::EdgeError;
+    use crate::http::{request_builder, Method, StatusCode};
+    use futures::executor::block_on;
+    use tower_service::Service;
+
+    fn empty_router() -> RouterService {
+        RouterService::builder().build()
+    }
+
+    #[test]
+    fn default_app_uses_constant_name() {
+        let app = App::new(empty_router());
+        assert_eq!(app.name(), App::default_name());
+    }
+
+    struct TestHooks;
+
+    impl Hooks for TestHooks {
+        fn routes() -> RouterService {
+            async fn handler(_ctx: RequestContext) -> Result<String, EdgeError> {
+                Ok("ok".to_string())
+            }
+
+            RouterService::builder().get("/test", handler).build()
+        }
+
+        fn configure(app: &mut App) {
+            app.set_name("configured");
+        }
+
+        fn name() -> &'static str {
+            "hooks-name"
+        }
+    }
+
+    #[test]
+    fn build_app_invokes_hooks_for_routes_and_configuration() {
+        let app = TestHooks::build_app();
+        assert_eq!(app.name(), "configured");
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(app.router().clone().call(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().as_bytes(), b"ok");
     }
 }

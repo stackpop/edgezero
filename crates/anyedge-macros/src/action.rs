@@ -54,7 +54,7 @@ pub(crate) fn expand_action_impl(
         let ty = &pat_type.ty;
         let var_ident = format_ident!("__arg{}", index);
         extract_stmts.push(quote! {
-            let #var_ident = <#ty as ::anyedge_core::FromRequest>::from_request(&__ctx).await?;
+            let #var_ident = <#ty as ::anyedge_core::extractor::FromRequest>::from_request(&__ctx).await?;
         });
         arg_idents.push(var_ident);
     }
@@ -64,11 +64,11 @@ pub(crate) fn expand_action_impl(
 
         #(#attrs)*
         #vis async fn #ident(
-            __ctx: ::anyedge_core::RequestContext,
-        ) -> ::std::result::Result<::anyedge_core::Response, ::anyedge_core::EdgeError> {
+            __ctx: ::anyedge_core::context::RequestContext,
+        ) -> ::std::result::Result<::anyedge_core::http::Response, ::anyedge_core::error::EdgeError> {
             #(#extract_stmts)*
             let result = #inner_ident(#(#arg_idents),*).await;
-            ::anyedge_core::Responder::respond(result)
+            ::anyedge_core::responder::Responder::respond(result)
         }
     };
 
@@ -88,10 +88,10 @@ mod tests {
     #[test]
     fn wraps_async_function() {
         let input = quote! {
-            async fn demo(ctx: ::anyedge_core::RequestContext) -> ::anyedge_core::Response {
-                ::anyedge_core::response_builder()
-                    .status(::anyedge_core::StatusCode::OK)
-                .body(::anyedge_core::Body::empty())
+            async fn demo(ctx: ::anyedge_core::context::RequestContext) -> ::anyedge_core::http::Response {
+                ::anyedge_core::http::response_builder()
+                    .status(::anyedge_core::http::StatusCode::OK)
+                .body(::anyedge_core::body::Body::empty())
                     .unwrap()
             }
         };
@@ -99,7 +99,7 @@ mod tests {
         let rendered = render(output);
         assert!(rendered.contains("__demo_inner"));
         assert!(rendered.contains("fn demo"));
-        assert!(rendered.contains("Responder :: respond"));
+        assert!(rendered.contains("responder :: Responder :: respond"));
     }
 
     #[test]

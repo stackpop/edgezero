@@ -1,7 +1,8 @@
-use anyedge_core::{
-    decode_brotli_stream, decode_gzip_stream, header, Body, EdgeError, HeaderMap, HeaderValue,
-    Method, ProxyClient, ProxyRequest, ProxyResponse, Uri,
-};
+use anyedge_core::body::Body;
+use anyedge_core::compression::{decode_brotli_stream, decode_gzip_stream};
+use anyedge_core::error::EdgeError;
+use anyedge_core::http::{header, HeaderMap, HeaderValue, Method, Uri};
+use anyedge_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -25,14 +26,10 @@ impl ProxyClient for FastlyProxyClient {
         let fastly_request = build_fastly_request(method, &uri, headers)?;
         let (mut streaming_body, pending_request) = fastly_request
             .send_async_streaming(backend.name())
-            .map_err(|err| EdgeError::internal(err))?;
+            .map_err(EdgeError::internal)?;
         forward_request_body(body, &mut streaming_body).await?;
-        streaming_body
-            .finish()
-            .map_err(|err| EdgeError::internal(err))?;
-        let mut fastly_response = pending_request
-            .wait()
-            .map_err(|err| EdgeError::internal(err))?;
+        streaming_body.finish().map_err(EdgeError::internal)?;
+        let mut fastly_response = pending_request.wait().map_err(EdgeError::internal)?;
 
         let mut proxy_response = convert_response(&mut fastly_response)?;
         proxy_response
@@ -76,7 +73,7 @@ async fn forward_request_body(
             if !bytes.is_empty() {
                 streaming_body
                     .write_all(bytes.as_ref())
-                    .map_err(|err| EdgeError::internal(err))?;
+                    .map_err(EdgeError::internal)?;
             }
         }
         Body::Stream(mut stream) => {
@@ -84,14 +81,12 @@ async fn forward_request_body(
                 let chunk = chunk.map_err(EdgeError::internal)?;
                 streaming_body
                     .write_all(&chunk)
-                    .map_err(|err| EdgeError::internal(err))?;
+                    .map_err(EdgeError::internal)?;
             }
         }
     }
 
-    streaming_body
-        .flush()
-        .map_err(|err| EdgeError::internal(err))?;
+    streaming_body.flush().map_err(EdgeError::internal)?;
 
     Ok(())
 }
@@ -115,7 +110,7 @@ fn ensure_backend(uri: &Uri) -> Result<Backend, EdgeError> {
             if uri.scheme_str() == Some("https") {
                 builder = builder.enable_ssl();
             }
-            builder.finish().map_err(|err| EdgeError::internal(err))
+            builder.finish().map_err(EdgeError::internal)
         }
     }
 }

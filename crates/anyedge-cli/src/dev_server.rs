@@ -3,12 +3,16 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 #[cfg(not(feature = "dev-example"))]
-use anyedge_core::{action, Text};
-use anyedge_core::{request_builder, Body, HeaderName, HeaderValue, Method, RouterService, Uri};
+use anyedge_core::action;
+use anyedge_core::body::Body;
+use anyedge_core::http::{
+    request_builder, HeaderName, HeaderValue, Method, Response as CoreResponse, Uri,
+};
+use anyedge_core::router::RouterService;
 use futures::{executor::block_on, pin_mut, StreamExt};
 
 #[cfg(feature = "dev-example")]
-use app_demo_core::DemoApp;
+use app_demo_core::App;
 
 pub fn run_dev() {
     println!("[anyedge] dev: starting local server on http://127.0.0.1:8787");
@@ -84,7 +88,7 @@ fn handle_conn(stream: &mut TcpStream, router: RouterService) -> std::io::Result
     write_response(stream, response)
 }
 
-fn write_response(stream: &mut TcpStream, response: anyedge_core::Response) -> std::io::Result<()> {
+fn write_response(stream: &mut TcpStream, response: CoreResponse) -> std::io::Result<()> {
     let (parts, body) = response.into_parts();
     let status = parts.status;
     let reason = status.canonical_reason().unwrap_or("OK");
@@ -131,9 +135,9 @@ fn write_response(stream: &mut TcpStream, response: anyedge_core::Response) -> s
 fn build_dev_router() -> RouterService {
     #[cfg(feature = "dev-example")]
     {
-        use anyedge_core::Hooks;
+        use anyedge_core::app::Hooks;
 
-        let demo_app = DemoApp::build_app();
+        let demo_app = App::build_app();
         demo_app.router().clone()
     }
 
@@ -165,6 +169,6 @@ async fn dev_root() -> Text<&'static str> {
 
 #[cfg(not(feature = "dev-example"))]
 #[action]
-async fn dev_echo(Path(params): anyedge_core::Path<EchoParams>) -> Text<String> {
+async fn dev_echo(Path(params): anyedge_core::extractor::Path<EchoParams>) -> Text<String> {
     Text::new(format!("hello {}", params.name))
 }

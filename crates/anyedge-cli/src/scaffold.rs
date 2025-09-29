@@ -8,6 +8,11 @@ pub fn register_templates(hbs: &mut Handlebars) {
     )
     .unwrap();
     hbs.register_template_string(
+        "root_anyedge_toml",
+        include_str!("templates/root/anyedge.toml.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
         "root_README_md",
         include_str!("templates/root/README.md.hbs"),
     )

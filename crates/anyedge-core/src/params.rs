@@ -25,3 +25,49 @@ impl PathParams {
         serde_json::from_value(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    fn params(map: &[(&str, &str)]) -> PathParams {
+        let inner = map
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        PathParams::new(inner)
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct StringParams {
+        id: String,
+    }
+
+    #[test]
+    fn get_returns_expected_value() {
+        let params = params(&[("id", "7")]);
+        assert_eq!(params.get("id"), Some("7"));
+        assert_eq!(params.get("missing"), None);
+    }
+
+    #[test]
+    fn deserialize_converts_to_target_type() {
+        let params = params(&[("id", "42")]);
+        let parsed: StringParams = params.deserialize().expect("params");
+        assert_eq!(parsed, StringParams { id: "42".into() });
+    }
+
+    #[test]
+    fn deserialize_propagates_errors() {
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct NumericParams {
+            id: u32,
+        }
+
+        let params = params(&[("id", "not-a-number")]);
+        let result: Result<NumericParams, _> = params.deserialize();
+        assert!(result.is_err());
+    }
+}

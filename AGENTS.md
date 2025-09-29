@@ -60,7 +60,7 @@ dependencies like Tokio.
   fall back to something like `simple_logger` for local builds.
 
 ## Proxy helpers
-- Use `anyedge_core::ProxyService` with the adapter clients
+- Use `anyedge_core::proxy::ProxyService` with the adapter clients
   (`anyedge_adapter_fastly::FastlyProxyClient`, `anyedge_adapter_cloudflare::CloudflareProxyClient`)
   when wiring proxy routes so streaming and compression handling stay consistent.
 - Keep synthetic local proxy behaviour lightweight so examples can run without

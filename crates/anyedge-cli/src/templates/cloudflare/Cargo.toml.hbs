@@ -8,10 +8,16 @@ publish = false
 name = "{{proj_cloudflare}}"
 path = "src/main.rs"
 
+[features]
+default = ["cloudflare"]
+cloudflare = ["anyedge-adapter-cloudflare/cloudflare"]
+
 [dependencies]
 {{proj_core}} = { path = "../{{proj_core}}" }
-worker = "0.6"
+{{dep_anyedge_adapter_cloudflare}}
+anyedge-core = { workspace = true }
+worker = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 {{dep_anyedge_core_cloudflare}}
-{{dep_anyedge_adapter_cloudflare}}
+{{dep_anyedge_adapter_cloudflare_wasm}}

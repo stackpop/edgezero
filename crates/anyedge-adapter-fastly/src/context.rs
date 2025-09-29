@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-use anyedge_core::Request;
+use anyedge_core::http::Request;
 
 /// Fastly-specific context data stored on each request.
 #[derive(Clone, Debug)]
@@ -21,7 +21,8 @@ impl FastlyRequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyedge_core::{request_builder, Body};
+    use anyedge_core::body::Body;
+    use anyedge_core::http::request_builder;
     use std::net::IpAddr;
     use std::str::FromStr;
 

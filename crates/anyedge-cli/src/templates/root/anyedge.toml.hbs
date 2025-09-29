@@ -1,0 +1,81 @@
+# This manifest describes the shared AnyEdge application and its provider adapters.
+
+[app]
+name = "{{name}}"
+middleware = ["anyedge_core::middleware::RequestLogger"]
+version = "0.1.0"
+kind = "http"
+entry = "crates/{{proj_core}}"
+
+[[triggers.http]]
+id = "root"
+path = "/"
+methods = ["GET"]
+handler = "{{proj_core}}::handlers::root"
+providers = ["fastly", "cloudflare"]
+description = "Default health-check endpoint"
+
+[[triggers.http]]
+id = "echo"
+path = "/echo/{name}"
+methods = ["GET"]
+handler = "{{proj_core}}::handlers::echo"
+providers = ["fastly", "cloudflare"]
+
+[[triggers.http]]
+id = "stream"
+path = "/stream"
+methods = ["GET"]
+handler = "{{proj_core}}::handlers::stream"
+providers = ["fastly", "cloudflare"]
+body-mode = "stream"
+
+[environment]
+
+[[environment.variables]]
+name = "API_BASE_URL"
+description = "Base URL for upstream API calls"
+env = "API_BASE_URL"
+value = "https://example.com/api"
+
+[[environment.secrets]]
+name = "API_TOKEN"
+description = "Secret token used when calling the upstream API"
+providers = ["fastly", "cloudflare"]
+env = "API_TOKEN"
+
+[providers.fastly.adapter]
+crate = "crates/{{proj_fastly}}"
+manifest = "crates/{{proj_fastly}}/fastly.toml"
+
+[providers.fastly.build]
+target = "wasm32-wasip1"
+profile = "release"
+features = ["fastly"]
+
+[providers.fastly.commands]
+build = "cargo build --release --target wasm32-wasip1 -p {{proj_fastly}}"
+serve = "fastly compute serve -C crates/{{proj_fastly}}"
+deploy = "fastly compute deploy -C crates/{{proj_fastly}}"
+
+[providers.cloudflare.adapter]
+crate = "crates/{{proj_cloudflare}}"
+manifest = "crates/{{proj_cloudflare}}/wrangler.toml"
+
+[providers.cloudflare.build]
+target = "wasm32-unknown-unknown"
+profile = "release"
+features = ["cloudflare"]
+
+[providers.cloudflare.commands]
+build = "cargo build --release --target wasm32-unknown-unknown -p {{proj_cloudflare}}"
+serve = "wrangler dev --config crates/{{proj_cloudflare}}/wrangler.toml"
+deploy = "wrangler publish --config crates/{{proj_cloudflare}}/wrangler.toml"
+
+[logging.fastly]
+endpoint = "stdout"
+level = "info"
+echo_stdout = true
+
+[logging.cloudflare]
+level = "info"

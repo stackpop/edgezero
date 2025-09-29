@@ -1,4 +1,6 @@
-use crate::{EdgeError, IntoResponse, Response};
+use crate::error::EdgeError;
+use crate::http::Response;
+use crate::response::IntoResponse;
 
 pub trait Responder: Sized {
     fn respond(self) -> Result<Response, EdgeError>;
@@ -25,7 +27,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Body, StatusCode};
+    use crate::body::Body;
+    use crate::http::StatusCode;
 
     #[test]
     fn responder_for_into_response_types() {

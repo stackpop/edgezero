@@ -1,7 +1,8 @@
-use anyedge_core::{
-    decode_brotli_stream, decode_gzip_stream, header, Body, EdgeError, HeaderMap, HeaderName,
-    HeaderValue, Method, ProxyClient, ProxyRequest, ProxyResponse, StatusCode, Uri,
-};
+use anyedge_core::body::Body;
+use anyedge_core::compression::{decode_brotli_stream, decode_gzip_stream};
+use anyedge_core::error::EdgeError;
+use anyedge_core::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+use anyedge_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, LocalBoxStream, StreamExt};
@@ -22,7 +23,7 @@ impl ProxyClient for CloudflareProxyClient {
         let mut cf_response = Fetch::Request(cf_request)
             .send()
             .await
-            .map_err(|err| EdgeError::internal(err))?;
+            .map_err(EdgeError::internal)?;
 
         let mut proxy_response = convert_response(&mut cf_response).await?;
         proxy_response
@@ -46,8 +47,7 @@ async fn build_cf_request(
 
     attach_body(&mut init, body)?;
 
-    let request = CfRequest::new_with_init(&uri.to_string(), &init)
-        .map_err(|err| EdgeError::internal(err))?;
+    let request = CfRequest::new_with_init(&uri.to_string(), &init).map_err(EdgeError::internal)?;
     Ok(request)
 }
 
@@ -59,8 +59,7 @@ fn attach_body(init: &mut RequestInit, body: Body) -> Result<(), EdgeError> {
             }
             let chunk = bytes.to_vec();
             let stream = stream::once(async move { Ok::<Vec<u8>, JsValue>(chunk) }).boxed_local();
-            let worker_body =
-                WorkerBody::from_stream(stream).map_err(|err| EdgeError::internal(err))?;
+            let worker_body = WorkerBody::from_stream(stream).map_err(EdgeError::internal)?;
             if let Some(readable) = worker_body.into_inner() {
                 init.with_body(Some(JsValue::from(readable)));
             }
@@ -72,8 +71,7 @@ fn attach_body(init: &mut RequestInit, body: Body) -> Result<(), EdgeError> {
                     Err(err) => Err(JsValue::from_str(&err.to_string())),
                 })
                 .boxed_local();
-            let worker_body =
-                WorkerBody::from_stream(mapped).map_err(|err| EdgeError::internal(err))?;
+            let worker_body = WorkerBody::from_stream(mapped).map_err(EdgeError::internal)?;
             if let Some(readable) = worker_body.into_inner() {
                 init.with_body(Some(JsValue::from(readable)));
             }
@@ -84,8 +82,7 @@ fn attach_body(init: &mut RequestInit, body: Body) -> Result<(), EdgeError> {
 }
 
 async fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse, EdgeError> {
-    let status =
-        StatusCode::from_u16(cf_response.status_code()).map_err(|err| EdgeError::internal(err))?;
+    let status = StatusCode::from_u16(cf_response.status_code()).map_err(EdgeError::internal)?;
     let mut proxy_response = ProxyResponse::new(status, Body::empty());
 
     let mut encoding = None;
@@ -102,9 +99,7 @@ async fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse,
         }
     }
 
-    let worker_stream = cf_response
-        .stream()
-        .map_err(|err| EdgeError::internal(err))?;
+    let worker_stream = cf_response.stream().map_err(EdgeError::internal)?;
 
     let chunk_stream: ChunkStream = worker_stream.map_err(worker_error_to_io).boxed_local();
     let body_stream = transform_stream(chunk_stream, encoding.as_deref());

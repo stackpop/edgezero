@@ -1,4 +1,6 @@
-use anyedge_core::{Body, EdgeError, Response, Uri};
+use anyedge_core::body::Body;
+use anyedge_core::error::EdgeError;
+use anyedge_core::http::{Response, Uri};
 use fastly::Response as FastlyResponse;
 use futures_util::StreamExt;
 use std::io::Write;
@@ -13,9 +15,7 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
             let mut fastly_body = fastly::Body::new();
             while let Some(chunk) = futures::executor::block_on(stream.next()) {
                 let chunk = chunk.map_err(EdgeError::internal)?;
-                fastly_body
-                    .write_all(&chunk)
-                    .map_err(|err| EdgeError::internal(err))?;
+                fastly_body.write_all(&chunk).map_err(EdgeError::internal)?;
             }
             fastly_response.set_body(fastly_body);
         }
@@ -36,7 +36,8 @@ pub fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyedge_core::{response_builder, Body};
+    use anyedge_core::body::Body;
+    use anyedge_core::http::response_builder;
     use bytes::Bytes;
     use futures_util::stream;
 

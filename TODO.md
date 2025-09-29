@@ -3,29 +3,42 @@
 High-level backlog and decisions to drive the next milestones.
 
 ## Queue (near-term)
-- [x] CLI: `anyedge build --provider fastly` to package a Fastly Compute@Edge artifact
-- [x] CLI: `anyedge deploy --provider fastly` using Fastly CLI/API
-- [ ] Fastly demo: add optional backend example to validate `req.send("backend")`
+
+### High Priority
+- [ ] CI: add `fmt`, `clippy`, and `test` workflows
+- [ ] CLI: `anyedge build --provider fastly|cloudflare`
+- [ ] CLI: `anyedge deploy --provider fastly|cloudflare`
 - [ ] Core: `Response::json<T: serde::Serialize>` behind `serde` feature
-- [x] Core: helper to fetch all header values for a name (multi-value support)
+- [ ] Fastly proxy: add tests for backend send + header/body mapping
+- [ ] Cloudflare streaming: map `Response::with_chunks` to `ReadableStream` with backpressure
+- [ ] Cloudflare demo: add minimal `wrangler` example and verify `wrangler dev`
+- [ ] Core proxy: add async fetch facade (feature `async-client`) and implement Cloudflare proxy
+
+### Medium Priority
+- [ ] Fastly demo: add optional backend example to validate `req.send("backend")`
 - [ ] Core: utility to serve embedded static files via `include_str!`/`include_bytes!` with proper Content-Type and HEAD (no body) handling
 - [ ] Docs: document header/method/status mapping to `http` crate
-- [x] Docs: clean stale references to removed hello example from README/targets
 - [ ] Docs: add RouteOptions + streaming policy section (examples done; expand README section)
+
+### Completed / Ongoing Maintenance
+- [x] CLI: `anyedge build --provider fastly` to package a Fastly Compute@Edge artifact
+- [x] CLI: `anyedge deploy --provider fastly` using Fastly CLI/API
+- [x] Core: helper to fetch all header values for a name (multi-value support)
+- [x] Docs: clean stale references to removed hello example from README/targets
 - [x] Docs: highlight controller-based workflow and update examples
 - [x] Controllers: add `anyedge-controller` + `anyedge-macros` with typed extractors and `#[action]` helpers
-- [ ] CI: add `fmt`, `clippy`, and `test` workflows
-- [ ] Cloudflare demo: add minimal `wrangler` example and verify `wrangler dev`
-- [ ] Cloudflare streaming: map `Response::with_chunks` to `ReadableStream` with backpressure
-- [ ] Core proxy: add async fetch facade (feature `async-client`) and implement Cloudflare proxy
-- [ ] Fastly proxy: add tests for backend send + header/body mapping
 
 ## Test Coverage Plan (2025-09-18)
+- [ ] Adapters: introduce Fastly/Cloudflare mapping tests (headers, streaming, proxy failure) to catch glue regressions.
+- [ ] Adapters: assert error-path mapping for Fastly/Cloudflare request conversion and re-enable the ignored Cloudflare response header test.
+- [ ] CLI: add integration tests for `anyedge new` scaffolding, feature-flag builds, and `dev` fallback app.
+- [ ] CLI: cover `dev_server`, generator, and template scaffolding flows with tempdir-based integration tests to guard manual HTTP parsing and shell commands.
+- [ ] CI: verify feature combinations (without `dev-example`, `json`, `form`) compile and run basic smoke tests.
+- [ ] Macros: add trybuild coverage for `app!` manifest expansion (route/middleware generation and error surfacing).
+- [x] Core: unit-test `App::build_app`/`Hooks` wiring and `PathParams::deserialize` edge cases beyond indirect coverage. *(Added targeted unit tests in `crates/anyedge-core/src/app.rs` and `crates/anyedge-core/src/params.rs`.)*
+- [x] Coverage hygiene: consolidate duplicate router/extractor request-parsing tests and share adapter contract fixtures to reduce redundant maintenance. *(Router duplicates trimmed; extractor suite now owns request parsing checks.)*
 - [x] Router: add regression cases for overlapping routes, prefix/nest behaviour, and BodyMode error handling (`Streaming` vs `Buffered`).
 - [x] Controller: cover negative paths (`State<T>` missing, `ValidatedJson` errors) and assert returned status/body.
-- [ ] Adapters: introduce Fastly/Cloudflare mapping tests (headers, streaming, proxy failure) to catch glue regressions.
-- [ ] CLI: add integration tests for `anyedge new` scaffolding, feature-flag builds, and `dev` fallback app.
-- [ ] CI: verify feature combinations (without `dev-example`, `json`, `form`) compile and run basic smoke tests.
 
 ## Milestones
 - [ ] Fastly adapter MVP
@@ -65,6 +78,12 @@ High-level backlog and decisions to drive the next milestones.
   - [ ] Example cookbook
 - [ ] CI
   - [ ] Run `cargo fmt`, `cargo clippy`, and tests
+
+## Roadmap (2025-09-24)
+- [x] Adapter stability: formalise the provider adapter contract (request/response mapping, streaming guarantees, proxy hooks) and capture it in shared docs + integration tests so new targets plug in safely. (`docs/provider-adapter-contract.md`, Fastly contract tests under `crates/anyedge-adapter-fastly/tests/contract.rs`, Cloudflare contract tests under `crates/anyedge-adapter-cloudflare/tests/contract.rs`, manifest schema in `docs/manifest.md`)
+- [ ] Provider additions: prototype a third adapter (e.g. AWS Lambda@Edge or Vercel Edge Functions) using the stabilized adapter API to validate cross-provider abstractions.
+- [x] Manifest ergonomics: design an `anyedge.toml` schema that mirrors Spin’s manifest convenience (route triggers, env/secrets, build targets) while remaining provider-agnostic; update CLI scaffolding accordingly. (`crates/anyedge-cli/src/manifest.rs`, templates in `crates/anyedge-cli/src/templates/root/anyedge.toml.hbs`, doc `docs/manifest.md`, app-demo manifest `examples/app-demo/anyedge.toml`)
+- [ ] Tooling parity: extend `anyedge-cli` with template/plugin style commands (similar to Spin templates) to streamline new app scaffolds and provider-specific wiring.
 
 ## Codex Plan (2024-05-07)
 - [x] Review repository guides (`README.md`, `AGENTS.md`) to capture stated goals and workflows.
@@ -255,8 +274,8 @@ High-level backlog and decisions to drive the next milestones.
 - Next steps could include adding a helper script and/or CI job if coverage reporting becomes a target metric.
 
 ## Codex Plan (2025-09-19 - Core Coverage Backfill)
-- [x] Expand unit tests for `anyedge_core::RequestContext` to cover extraction success/failure, JSON/form parsing, and path/query edge cases.
-- [x] Add tests for `anyedge_core::EdgeError` constructors and conversion paths, ensuring status codes + messages are asserted.
+- [x] Expand unit tests for `anyedge_core::context::RequestContext` to cover extraction success/failure, JSON/form parsing, and path/query edge cases.
+- [x] Add tests for `anyedge_core::error::EdgeError` constructors and conversion paths, ensuring status codes + messages are asserted.
 - [x] Exercise middleware chaining (`middleware.rs`) with mock handlers to cover both middleware execution and early returns.
 - [x] Write targeted tests for `Body` conversions (streaming JSON failure, `into_bytes` panic guard, etc.) and `Response` helper methods.
 - [x] Introduce extractor/responder tests to lift coverage in `extractor.rs` and `responder.rs`.
@@ -350,7 +369,7 @@ High-level backlog and decisions to drive the next milestones.
 - [x] Re-run `cargo build -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown` to confirm the demo compiles.
 
 ## Review (2025-09-20 23:10 UTC)
-- Added `#![cfg_attr(target_arch = "wasm32", no_main)]` and imported `anyedge_core::IntoResponse` so the Cloudflare demo binary compiles to wasm without missing entrypoint errors; error handling now converts `EdgeError` via `into_response`.
+- Added `#![cfg_attr(target_arch = "wasm32", no_main)]` and imported `anyedge_core::response::IntoResponse` so the Cloudflare demo binary compiles to wasm without missing entrypoint errors; error handling now converts `EdgeError` via `into_response`.
 - Cleaned up the Cloudflare adapter’s stale `Write` import and set the demo crate to depend on `anyedge-core` explicitly.
 - `cargo build -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown` completes successfully (only standard warnings remain).
 

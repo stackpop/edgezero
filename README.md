@@ -44,7 +44,9 @@ The demo routes showcase core features:
 Handlers stay concise by using the `#[action]` macro re-exported from `anyedge-core`:
 
 ```rust
-use anyedge_core::{action, Json, Text};
+use anyedge_core::action;
+use anyedge_core::extractor::Json;
+use anyedge_core::response::Text;
 
 #[derive(serde::Deserialize)]
 struct EchoBody {
@@ -58,6 +60,12 @@ async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
 ```
 
 ## CLI tooling
+
+The CLI and adapters now expect an `anyedge.toml` manifest alongside your workspace. The manifest
+describes the shared app (entry crate, optional middleware list, routes, providers, and logging)
+so Fastly/Cloudflare binaries, the CLI, and any local tooling all agree on configuration. The demo
+manifest lives in `examples/app-demo/anyedge.toml`, and the scaffolder emits the same structure for
+new projects.
 
 The `anyedge-cli` crate produces the `anyedge` binary (enabled by the `cli` feature). Run it locally with `cargo run -p anyedge-cli -- <command>`. Key subcommands:
 
@@ -79,7 +87,9 @@ functions so you can install the right backend when your app boots:
 - Other targets: initialise a fallback logger such as `simple_logger` before building
   your app.
 
-The demo adapters call those helpers automatically so the Fastly and Cloudflare binaries pick up the appropriate logger without extra boilerplate.
+The helper `run_app::<App>(include_str!("path/to/anyedge.toml"), req)` in
+`anyedge-adapter-fastly` and the Cloudflare equivalent encapsulate manifest loading and logger
+initialisation, so the adapters you scaffold only need to call the helper from `main`.
 
 ## Provider builds
 
@@ -113,6 +123,15 @@ Both adapters translate provider request/response shapes into the shared `anyedg
 (`/blog/{slug}`) and catch-alls with `{*rest}`. Legacy Axum-style `:name`
 segments are intentionally unsupported.
 
+## Route listing
+
+Enable `RouterBuilder::enable_route_listing()` when you want a quick view of the
+registered routes. It injects a JSON endpoint at
+`DEFAULT_ROUTE_LISTING_PATH` (defaults to `/__anyedge/routes`) that returns an
+array of `{ "method": "GET", "path": "/..." }` entries for every handler.
+Use `RouterBuilder::enable_route_listing_at("/debug/routes")` to expose the
+listing at a custom path.
+
 ## Streaming responses
 
 Handlers can return `Body::stream` to yield response chunks progressively. The
@@ -128,7 +147,8 @@ payload before sending it downstream.
 `anyedge-core` ships with `ProxyRequest`, `ProxyResponse`, and the `ProxyService<C>` wrapper so edge adapters can forward traffic while reusing the same handler logic:
 
 ```rust
-use anyedge_core::{ProxyRequest, ProxyService, Uri};
+use anyedge_core::http::Uri;
+use anyedge_core::proxy::{ProxyRequest, ProxyService};
 
 let target: Uri = "https://example.com/api".parse()?;
 let proxy_request = ProxyRequest::from_request(request, target);
@@ -176,3 +196,8 @@ Fastly adapter tests to ensure chunked bodies make it to the provider output.
   `RequestContext` for ergonomic handlers.
 - Prototype a local development shim so the same router can process real HTTP
   traffic on a laptop while mimicking Fastly/Cloudflare behaviours.
+- Documented provider adapter contract so new targets can reuse the shared
+  expectations (`docs/provider-adapter-contract.md`), mirrored contract tests
+  for Fastly/Cloudflare (`crates/anyedge-adapter-fastly/tests/contract.rs`,
+  `crates/anyedge-adapter-cloudflare/tests/contract.rs`), and introduced the
+  `anyedge.toml` schema for application manifests (`docs/manifest.md`).

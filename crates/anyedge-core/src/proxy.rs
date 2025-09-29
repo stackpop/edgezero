@@ -2,9 +2,10 @@ use std::fmt;
 
 use async_trait::async_trait;
 
-use crate::{
-    response_builder, Body, EdgeError, Extensions, HeaderMap, Method, Request, Response,
-    StatusCode, Uri,
+use crate::body::Body;
+use crate::error::EdgeError;
+use crate::http::{
+    response_builder, Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri,
 };
 
 /// Outbound request description for a proxy operation.
@@ -183,7 +184,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Body, HeaderValue, Method, StatusCode, Uri};
+    use crate::body::Body;
+    use crate::http::{request_builder, HeaderValue, Method, StatusCode, Uri};
     use bytes::Bytes;
     use futures::executor::block_on;
     use futures_util::{stream, StreamExt};
@@ -225,7 +227,7 @@ mod tests {
 
     #[test]
     fn proxy_forward_roundtrips() {
-        let request = crate::request_builder()
+        let request = request_builder()
             .method(Method::GET)
             .uri("/local")
             .header("x-demo", "true")
@@ -241,7 +243,7 @@ mod tests {
 
     #[test]
     fn proxy_forward_preserves_streaming_body() {
-        let request = crate::request_builder()
+        let request = request_builder()
             .method(Method::GET)
             .uri("/local-stream")
             .body(Body::empty())
