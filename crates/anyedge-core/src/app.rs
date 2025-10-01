@@ -54,7 +54,7 @@ impl App {
     }
 }
 
-/// Trait implemented by application hook providers.
+/// Trait implemented by application hook adapters.
 pub trait Hooks {
     /// Allow implementations to mutate the freshly constructed application before use.
     /// The default implementation performs no changes.

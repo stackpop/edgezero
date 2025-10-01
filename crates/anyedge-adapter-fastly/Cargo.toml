@@ -7,15 +7,17 @@ license = { workspace = true }
 
 [features]
 default = []
-cli = ["dep:toml", "dep:walkdir"]
+cli = ["dep:anyedge-adapter", "dep:ctor", "dep:toml", "dep:walkdir"]
 fastly = ["dep:fastly", "dep:log-fastly", "dep:toml"]
 
 [dependencies]
 anyedge-core = { path = "../anyedge-core" }
+anyedge-adapter = { path = "../anyedge-adapter", optional = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 brotli = { workspace = true }
 bytes = { workspace = true }
+ctor = { workspace = true, optional = true }
 fastly = { workspace = true, optional = true }
 flate2 = { workspace = true }
 futures = { workspace = true }

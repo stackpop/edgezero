@@ -3,16 +3,8 @@
 This workspace demonstrates a multi-target AnyEdge app.
 
 - `crates/{{proj_core}}`: reusable application logic built with `anyedge-core`.
-- `crates/{{proj_fastly}}`: Fastly Compute@Edge entrypoint.
-- `crates/{{proj_cloudflare}}`: Cloudflare Workers entrypoint.
+{{{readme_adapter_crates}}}
 
 ## Dev
 
-- Fastly (local):
-  - `cd crates/{{proj_fastly}}`
-  - `fastly compute serve`
-
-- Cloudflare (local):
-  - `cd crates/{{proj_cloudflare}}`
-  - `wrangler dev` (requires `cargo install worker-build`)
-
+{{{readme_adapter_dev}}}

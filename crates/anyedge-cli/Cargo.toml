@@ -2,11 +2,13 @@
 name = "anyedge-cli"
 version = "0.1.0"
 edition = "2021"
-description = "AnyEdge CLI: build and deploy to multiple edge providers"
+description = "AnyEdge CLI: build and deploy to multiple edge adapters"
 
 [dependencies]
-anyedge-adapter-fastly = { workspace = true, features = ["cli"] }
-anyedge-core = { workspace = true}
+anyedge-core = { workspace = true }
+anyedge-adapter = { path = "../anyedge-adapter" }
+anyedge-adapter-cloudflare = { workspace = true, features = ["cli"], optional = true }
+anyedge-adapter-fastly = { workspace = true, features = ["cli"], optional = true }
 app-demo-core = { path = "../../examples/app-demo/crates/app-demo-core", package = "app-demo-core", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 futures = { workspace = true }
@@ -16,10 +18,18 @@ serde = { workspace = true }
 serde_json = { workspace = true}
 toml = { workspace = true }
 
+[build-dependencies]
+toml = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 
 [features]
-default = ["cli", "dev-example"]
+default = [
+    "cli",
+    "dev-example",
+    "anyedge-adapter-fastly",
+    "anyedge-adapter-cloudflare",
+]
 cli = ["dep:clap"]
 dev-example = ["dep:app-demo-core"]

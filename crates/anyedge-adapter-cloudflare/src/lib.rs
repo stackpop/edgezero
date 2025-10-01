@@ -1,5 +1,8 @@
 //! Adapter helpers for Cloudflare Workers.
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]

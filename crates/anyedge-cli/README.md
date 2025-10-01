@@ -1,6 +1,6 @@
 # anyedge-cli
 
-Command-line tooling for the AnyEdge framework. The CLI handles scaffolding, local development, and (soon) build/deploy flows across edge providers.
+Command-line tooling for the AnyEdge framework. The CLI handles scaffolding, local development, and (soon) build/deploy flows across edge adapters.
 
 ## Feature Flags & Optional Demo Dependency
 
@@ -29,9 +29,9 @@ _(summaries only; see `anyedge --help` for details)_
 
 - `anyedge new <name>` – Scaffold a new AnyEdge project (templates still evolving).
 - `anyedge dev` – Serve the demo app locally (uses the `dev-example` feature by default).
-- `anyedge build --provider fastly` – Compile the Fastly crate to `wasm32-wasip1` and drop the artifact in `pkg/`.
-- `anyedge deploy --provider fastly` – Invoke the Fastly CLI (`fastly compute deploy`) from the detected Fastly crate.
-- `anyedge serve --provider fastly` – Run `fastly compute serve` in the Fastly crate directory for local testing (requires Fastly CLI).
+- `anyedge build --adapter fastly` – Compile the Fastly crate to `wasm32-wasip1` and drop the artifact in `pkg/`.
+- `anyedge deploy --adapter fastly` – Invoke the Fastly CLI (`fastly compute deploy`) from the detected Fastly crate.
+- `anyedge serve --adapter fastly` – Run `fastly compute serve` in the Fastly crate directory for local testing (requires Fastly CLI).
 
 ## Developing the CLI
 

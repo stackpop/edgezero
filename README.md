@@ -1,7 +1,7 @@
 # AnyEdge Prototype
 
 AnyEdge is an experiment in writing HTTP workloads once and deploying them to
-multiple edge providers. The crates in this workspace stay runtime-agnostic
+multiple edge adapters. The crates in this workspace stay runtime-agnostic
 (Tokio free, no OS primitives) so they can compile cleanly to WebAssembly
 targets such as Fastly Compute@Edge and Cloudflare Workers.
 
@@ -11,7 +11,7 @@ targets such as Fastly Compute@Edge and Cloudflare Workers.
 - `crates/anyedge-macros` - procedural macros that power `#[anyedge_core::action]` and related derive helpers.
 - `crates/anyedge-adapter-fastly` - Fastly Compute@Edge bridge that maps Fastly request/response types into the shared model and exposes `FastlyRequestContext` plus logging conveniences.
 - `crates/anyedge-adapter-cloudflare` - Cloudflare Workers bridge providing `CloudflareRequestContext` and logger bootstrap helpers.
-- `crates/anyedge-cli` - CLI for project scaffolding, the local dev server, and provider-aware build/deploy helpers. Ships with an optional demo dependency.
+- `crates/anyedge-cli` - CLI for project scaffolding, the local dev server, and adapter-aware build/deploy helpers. Ships with an optional demo dependency.
 - `examples/app-demo` - reference application built on the shared router. Includes `crates/app-demo-core` (routes), `crates/app-demo-adapter-fastly` (Fastly binary + `fastly.toml`), and `crates/app-demo-adapter-cloudflare` (Workers entrypoint + `wrangler.toml`).
 
 ## Quick start
@@ -62,7 +62,7 @@ async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
 ## CLI tooling
 
 The CLI and adapters now expect an `anyedge.toml` manifest alongside your workspace. The manifest
-describes the shared app (entry crate, optional middleware list, routes, providers, and logging)
+describes the shared app (entry crate, optional middleware list, routes, adapters, and logging)
 so Fastly/Cloudflare binaries, the CLI, and any local tooling all agree on configuration. The demo
 manifest lives in `examples/app-demo/anyedge.toml`, and the scaffolder emits the same structure for
 new projects.
@@ -70,11 +70,11 @@ new projects.
 The `anyedge-cli` crate produces the `anyedge` binary (enabled by the `cli` feature). Run it locally with `cargo run -p anyedge-cli -- <command>`. Key subcommands:
 
 - `anyedge dev` - starts the local HTTP server (uses the demo router when `dev-example` is enabled).
-- `anyedge build --provider fastly` - builds the Fastly example to `wasm32-wasip1` and copies the artifact into `anyedge/pkg/`.
-- `anyedge serve --provider fastly` - shells out to `fastly compute serve` after locating the Fastly manifest.
-- `anyedge deploy --provider fastly` - wraps `fastly compute deploy`.
+- `anyedge build --adapter fastly` - builds the Fastly example to `wasm32-wasip1` and copies the artifact into `anyedge/pkg/`.
+- `anyedge serve --adapter fastly` - shells out to `fastly compute serve` after locating the Fastly manifest.
+- `anyedge deploy --adapter fastly` - wraps `fastly compute deploy`.
 
-Fastly is the only provider wired into the CLI today; add new providers by extending `anyedge_adapter_*::cli`.
+Fastly is the only adapter wired into the CLI today; add new adapters by extending `anyedge_adapter_*::cli`.
 
 ## Logging
 
@@ -100,8 +100,8 @@ rustup target add wasm32-wasip1
 cd anyedge/examples/app-demo
 cargo build -p app-demo-adapter-fastly --target wasm32-wasip1 --features fastly
 # or from the workspace root:
-cargo run -p anyedge-cli -- build --provider fastly
-cargo run -p anyedge-cli -- serve --provider fastly
+cargo run -p anyedge-cli -- build --adapter fastly
+cargo run -p anyedge-cli -- serve --adapter fastly
 ```
 
 The CLI helpers locate `fastly.toml`, build the Wasm artifact, place it in `anyedge/pkg/`, and run `fastly compute serve` from `examples/app-demo/crates/app-demo-adapter-fastly`.
@@ -155,7 +155,7 @@ let proxy_request = ProxyRequest::from_request(request, target);
 let response = ProxyService::new(client).forward(proxy_request).await?;
 ```
 
-Use the adapter-specific clients (`anyedge_adapter_fastly::FastlyProxyClient` and `anyedge_adapter_cloudflare::CloudflareProxyClient`) when compiling for those providers, and swap in lightweight test clients during unit tests. The proxy helpers preserve streaming bodies and transparently decode gzip or brotli payloads before they reach your handler.
+Use the adapter-specific clients (`anyedge_adapter_fastly::FastlyProxyClient` and `anyedge_adapter_cloudflare::CloudflareProxyClient`) when compiling for those adapters, and swap in lightweight test clients during unit tests. The proxy helpers preserve streaming bodies and transparently decode gzip or brotli payloads before they reach your handler.
 
 ## Testing
 
@@ -191,13 +191,12 @@ Fastly adapter tests to ensure chunked bodies make it to the provider output.
 
 ## Next steps
 
-- Flesh out provider adapters with richer request contexts (fetch/KV helpers).
-- Offer dedicated extractor types (`Path<T>`, `Query<T>`, `Json<T>`) on top of
-  `RequestContext` for ergonomic handlers.
-- Prototype a local development shim so the same router can process real HTTP
-  traffic on a laptop while mimicking Fastly/Cloudflare behaviours.
-- Documented provider adapter contract so new targets can reuse the shared
-  expectations (`docs/provider-adapter-contract.md`), mirrored contract tests
+- Expand multi-provider support:
+  - Finalise Cloudflare streaming/backpressure behaviour and ship the demo Wranger flow.
+  - Extend the CLI build/deploy commands so both Fastly and Cloudflare share the same UX.
+- Finish out the manifest-driven ergonomics by adding helpers such as `Response::json<T>` and static-asset serving utilities to `anyedge-core`.
+- Harden CI (fmt/clippy/test) and feature matrices using the new GitHub workflows.
+- Grow the adapter contract documentation/tests to keep additional edge targets aligned.
   for Fastly/Cloudflare (`crates/anyedge-adapter-fastly/tests/contract.rs`,
   `crates/anyedge-adapter-cloudflare/tests/contract.rs`), and introduced the
   `anyedge.toml` schema for application manifests (`docs/manifest.md`).

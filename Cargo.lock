@@ -67,9 +67,9 @@ dependencies = [
 
 [[package]]
 name = "anstyle"
-version = "1.0.11"
+version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "862ed96ca487e809f1c8e5a8447f6ee2cf102f846893800b20cebdf541fc6bbd"
+checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
 
 [[package]]
 name = "anstyle-parse"
@@ -101,17 +101,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyedge-adapter"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+]
+
+[[package]]
 name = "anyedge-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
+ "anyedge-adapter",
  "anyedge-core",
  "async-trait",
- "brotli 3.5.0",
+ "brotli",
  "bytes",
+ "ctor",
  "flate2",
  "futures",
  "futures-util",
  "log",
+ "toml",
+ "walkdir",
  "wasm-bindgen-test",
  "web-sys",
  "worker",
@@ -121,12 +132,14 @@ dependencies = [
 name = "anyedge-adapter-fastly"
 version = "0.1.0"
 dependencies = [
+ "anyedge-adapter",
  "anyedge-core",
  "async-stream",
  "async-trait",
- "brotli 3.5.0",
+ "brotli",
  "bytes",
  "chrono",
+ "ctor",
  "fastly",
  "fern",
  "flate2",
@@ -143,6 +156,8 @@ dependencies = [
 name = "anyedge-cli"
 version = "0.1.0"
 dependencies = [
+ "anyedge-adapter",
+ "anyedge-adapter-cloudflare",
  "anyedge-adapter-fastly",
  "anyedge-core",
  "app-demo-core",
@@ -165,7 +180,7 @@ dependencies = [
  "async-compression",
  "async-stream",
  "async-trait",
- "brotli 3.5.0",
+ "brotli",
  "bytes",
  "flate2",
  "futures",
@@ -335,34 +350,13 @@ dependencies = [
 
 [[package]]
 name = "brotli"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d640d25bc63c50fb1f0b545ffd80207d2e10a4c965530809b40ba3386825c391"
-dependencies = [
- "alloc-no-stdlib",
- "alloc-stdlib",
- "brotli-decompressor 2.5.1",
-]
-
-[[package]]
-name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4bd8b9603c7aa97359dbd97ecf258968c95f3adddd6db2f7e7a5bef101c84560"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
- "brotli-decompressor 5.0.0",
-]
-
-[[package]]
-name = "brotli-decompressor"
-version = "2.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e2e4afe60d7dd600fdd3de8d0f08c2b7ec039712e3b6137ff98b7004e82de4f"
-dependencies = [
- "alloc-no-stdlib",
- "alloc-stdlib",
+ "brotli-decompressor",
 ]
 
 [[package]]
@@ -468,7 +462,7 @@ version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef8a506ec4b81c460798f572caead636d57d3d7e940f998160f52bd254bf2d23"
 dependencies = [
- "brotli 8.0.2",
+ "brotli",
  "compression-core",
  "flate2",
  "memchr",
@@ -513,6 +507,22 @@ dependencies = [
  "generic-array",
  "typenum",
 ]
+
+[[package]]
+name = "ctor"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67773048316103656a637612c4a62477603b777d91d9c62ff2290f9cde178fdb"
+dependencies = [
+ "ctor-proc-macro",
+ "dtor",
+]
+
+[[package]]
+name = "ctor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
 
 [[package]]
 name = "darling"
@@ -627,6 +637,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
+name = "dtor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e58a0764cddb55ab28955347b45be00ade43d4d6f3ba4bf3dc354e4ec9432934"
+dependencies = [
+ "dtor-proc-macro",
+]
+
+[[package]]
+name = "dtor-proc-macro"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -660,9 +685,9 @@ dependencies = [
 
 [[package]]
 name = "fastly"
-version = "0.11.6"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32bf4378516eedd385f5d78f265435a1c4168bc89d5ee8d8841585c65bc50a34"
+checksum = "2fe8293b6527b6fe6aeebc2537090df1559575576b186b385edae99f66ae7f9f"
 dependencies = [
  "anyhow",
  "bytes",
@@ -688,9 +713,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-macros"
-version = "0.11.6"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d660b3a381c826932eae09717b7590ad26040e97b1f5f9bf4f38ec0b3ad5bf3"
+checksum = "6d7a23cdbb1c124489391fcafcb495d4da78c391fddf76b26d1256aa933c88f9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -699,9 +724,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-shared"
-version = "0.11.6"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a88b1ac0732d9e909b351f7bd5c734a9d7d05ca9d74b716cc904726451c029f7"
+checksum = "65cb35dfef3dd1b12449335e180864aac22d89276c9a05b120477210a2129367"
 dependencies = [
  "bitflags 1.3.2",
  "http",
@@ -709,9 +734,9 @@ dependencies = [
 
 [[package]]
 name = "fastly-sys"
-version = "0.11.6"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce393925aac0c1a7728c2c5a43d8c53e8ed63730a2c369504b71dacb8211bbf"
+checksum = "d3cac96c4861c380e37fd2eb533d87e5a78fb5f48fddc5530e71409bf18a1c06"
 dependencies = [
  "bitflags 1.3.2",
  "fastly-shared",
@@ -727,9 +752,9 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fern"
-version = "0.6.2"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9f0c14694cbd524c8720dd69b0e3179344f04ebb5f90f2e4a440c6ea3b2f1ee"
+checksum = "4316185f709b23713e41e3195f90edef7fb00c3ed4adc79769cf09cc762a3b29"
 dependencies = [
  "log",
 ]
@@ -1152,9 +1177,9 @@ checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
 
 [[package]]
 name = "log-fastly"
-version = "0.11.6"
+version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fa0391b647223c283ffb32926af22dff22e08313b5866c37b8b7036ce7a9d1d"
+checksum = "0d57e7222d2441392bd70ebccc39cfc122af424ac6cd7359785c5bc35b8bc838"
 dependencies = [
  "fastly",
  "log",
@@ -1402,9 +1427,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.40"
+version = "1.0.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
+checksum = "ce25767e7b499d1b604768e7cde645d14cc8584231ea6b295e9c9eb22c02e1d1"
 dependencies = [
  "proc-macro2",
 ]

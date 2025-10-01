@@ -1,8 +1,7 @@
 [workspace]
 members = [
   "crates/{{proj_core}}",
-  "crates/{{proj_fastly}}",
-  "crates/{{proj_cloudflare}}",
+{{{workspace_members}}}
 ]
 resolver = "2"
 
@@ -10,4 +9,3 @@ resolver = "2"
 debug = 1
 codegen-units = 1
 lto = "fat"
-

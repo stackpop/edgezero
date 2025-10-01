@@ -13,18 +13,22 @@ pub enum Command {
     New(NewArgs),
     /// Build the project for a target edge
     Build {
-        #[arg(long, default_value = "fastly")]
-        provider: String,
+        #[arg(long = "adapter", required = true)]
+        adapter: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        adapter_args: Vec<String>,
     },
     /// Deploy to a target edge
     Deploy {
-        #[arg(long, default_value = "fastly")]
-        provider: String,
+        #[arg(long = "adapter", required = true)]
+        adapter: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        adapter_args: Vec<String>,
     },
-    /// Run a local simulation (provider-specific)
+    /// Run a local simulation (adapter-specific)
     Serve {
-        #[arg(long, default_value = "fastly")]
-        provider: String,
+        #[arg(long = "adapter", required = true)]
+        adapter: String,
     },
     /// Run a local simulation (if available)
     Dev,

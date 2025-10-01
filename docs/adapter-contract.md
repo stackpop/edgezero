@@ -111,16 +111,18 @@ response, and streaming guarantees as the Fastly tests.
 
 ## Onboarding new adapters
 
-When bringing up another provider:
+When bringing up another adapter:
 
 1. Implement request/response conversion functions that follow the rules above.  
-2. Provide a context type exposing the provider's metadata and insert it in
+2. Provide a context type exposing the adapter's metadata and insert it in
    `into_core_request`.  
 3. Implement a `dispatch` wrapper plus logging helper.  
 4. Wire up a `ProxyClient` that streams bodies and normalises encodings.  
-5. Copy the contract test suite, swapping in the new provider types. Ensure the
-   tests are gated to the target architecture if the provider SDK does not
-   compile for native hosts.
+5. Copy the contract test suite, swapping in the new adapter types. Ensure the
+   tests are gated to the target architecture if the adapter SDK does not
+   compile for native hosts.  
+6. Register the adapter with `anyedge-adapter::register_adapter` (typically in a
+   `cli` module using the `ctor` crate) so the CLI can discover it dynamically.
 
 Adapters that fulfil these steps can be dropped into the AnyEdge CLI without
 requiring changes to application code.

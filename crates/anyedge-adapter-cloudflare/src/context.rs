@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyedge_core::http::Request;
 use worker::{Context, Env};
 
-/// Provider-specific context stored alongside each request to expose Worker APIs.
+/// Adapter-specific context stored alongside each request to expose Worker APIs.
 #[derive(Clone, Debug)]
 pub struct CloudflareRequestContext {
     env: Arc<Env>,

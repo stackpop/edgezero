@@ -10,28 +10,28 @@ id = "root"
 path = "/"
 methods = ["GET"]
 handler = "app_demo_core::handlers::root"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 
 [[triggers.http]]
 id = "echo"
 path = "/echo/{name}"
 methods = ["GET"]
 handler = "app_demo_core::handlers::echo"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 
 [[triggers.http]]
 id = "headers"
 path = "/headers"
 methods = ["GET"]
 handler = "app_demo_core::handlers::headers"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 
 [[triggers.http]]
 id = "stream"
 path = "/stream"
 methods = ["GET"]
 handler = "app_demo_core::handlers::stream"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 body-mode = "stream"
 
 [[triggers.http]]
@@ -39,14 +39,14 @@ id = "echo_json"
 path = "/echo"
 methods = ["POST"]
 handler = "app_demo_core::handlers::echo_json"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 
 [[triggers.http]]
 id = "routes"
 path = "/__anyedge/routes"
 methods = ["GET"]
 handler = "app_demo_core::handlers::list_routes"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 
 [environment]
 
@@ -59,33 +59,33 @@ value = "https://example.com/api"
 [[environment.secrets]]
 name = "API_TOKEN"
 description = "Example secret placeholder."
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 env = "API_TOKEN"
 
-[providers.fastly.adapter]
+[adapters.fastly.adapter]
 crate = "crates/app-demo-adapter-fastly"
 manifest = "crates/app-demo-adapter-fastly/fastly.toml"
 
-[providers.fastly.build]
+[adapters.fastly.build]
 target = "wasm32-wasip1"
 profile = "release"
 features = ["fastly"]
 
-[providers.fastly.commands]
+[adapters.fastly.commands]
 build = "cargo build --release --target wasm32-wasip1 -p app-demo-adapter-fastly"
 serve = "fastly compute serve -C crates/app-demo-adapter-fastly"
 deploy = "fastly compute deploy -C crates/app-demo-adapter-fastly"
 
-[providers.cloudflare.adapter]
+[adapters.cloudflare.adapter]
 crate = "crates/app-demo-adapter-cloudflare"
 manifest = "crates/app-demo-adapter-cloudflare/wrangler.toml"
 
-[providers.cloudflare.build]
+[adapters.cloudflare.build]
 target = "wasm32-unknown-unknown"
 profile = "release"
 features = ["cloudflare"]
 
-[providers.cloudflare.commands]
+[adapters.cloudflare.commands]
 build = "cargo build --release --target wasm32-unknown-unknown -p app-demo-adapter-cloudflare"
 serve = "wrangler dev --config crates/app-demo-adapter-cloudflare/wrangler.toml"
 deploy = "wrangler deploy --config crates/app-demo-adapter-cloudflare/wrangler.toml"

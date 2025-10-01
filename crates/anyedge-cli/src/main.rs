@@ -1,13 +1,13 @@
 //! AnyEdge CLI.
 
 #[cfg(feature = "cli")]
+mod adapter;
+#[cfg(feature = "cli")]
 mod args;
 #[cfg(feature = "cli")]
 mod dev_server;
 #[cfg(feature = "cli")]
 mod generator;
-#[cfg(feature = "cli")]
-mod provider;
 #[cfg(feature = "cli")]
 mod scaffold;
 
@@ -31,20 +31,26 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Command::Build { provider } => {
-            if let Err(err) = handle_build(&provider) {
+        Command::Build {
+            adapter,
+            adapter_args,
+        } => {
+            if let Err(err) = handle_build(&adapter, &adapter_args) {
                 eprintln!("[anyedge] build error: {err}");
                 std::process::exit(1);
             }
         }
-        Command::Deploy { provider } => {
-            if let Err(err) = handle_deploy(&provider) {
+        Command::Deploy {
+            adapter,
+            adapter_args,
+        } => {
+            if let Err(err) = handle_deploy(&adapter, &adapter_args) {
                 eprintln!("[anyedge] deploy error: {err}");
                 std::process::exit(1);
             }
         }
-        Command::Serve { provider } => {
-            if let Err(err) = handle_serve(&provider) {
+        Command::Serve { adapter } => {
+            if let Err(err) = handle_serve(&adapter) {
                 eprintln!("[anyedge] serve error: {err}");
                 std::process::exit(1);
             }
@@ -61,45 +67,60 @@ fn main() {
 }
 
 #[cfg(feature = "cli")]
-fn handle_build(provider: &str) -> Result<(), String> {
+fn handle_build(adapter_name: &str, adapter_args: &[String]) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
-    ensure_provider_defined(provider, manifest.as_ref())?;
-    provider::execute(provider, provider::Action::Build, manifest.as_ref())
+    ensure_adapter_defined(adapter_name, manifest.as_ref())?;
+    adapter::execute(
+        adapter_name,
+        adapter::Action::Build,
+        manifest.as_ref(),
+        adapter_args,
+    )
 }
 
 #[cfg(feature = "cli")]
-fn handle_deploy(provider: &str) -> Result<(), String> {
+fn handle_deploy(adapter_name: &str, adapter_args: &[String]) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
-    ensure_provider_defined(provider, manifest.as_ref())?;
-    provider::execute(provider, provider::Action::Deploy, manifest.as_ref())
+    ensure_adapter_defined(adapter_name, manifest.as_ref())?;
+    adapter::execute(
+        adapter_name,
+        adapter::Action::Deploy,
+        manifest.as_ref(),
+        adapter_args,
+    )
 }
 
 #[cfg(feature = "cli")]
-fn handle_serve(provider: &str) -> Result<(), String> {
+fn handle_serve(adapter_name: &str) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
-    ensure_provider_defined(provider, manifest.as_ref())?;
-    provider::execute(provider, provider::Action::Serve, manifest.as_ref())
+    ensure_adapter_defined(adapter_name, manifest.as_ref())?;
+    adapter::execute(
+        adapter_name,
+        adapter::Action::Serve,
+        manifest.as_ref(),
+        &[] as &[String],
+    )
 }
 
 #[cfg(feature = "cli")]
-fn ensure_provider_defined(
-    provider: &str,
+fn ensure_adapter_defined(
+    adapter_name: &str,
     manifest: Option<&ManifestLoader>,
 ) -> Result<(), String> {
     if let Some(manifest) = manifest {
-        if manifest.manifest().providers.contains_key(provider) {
+        if manifest.manifest().adapters.contains_key(adapter_name) {
             return Ok(());
         }
-        let available: Vec<String> = manifest.manifest().providers.keys().cloned().collect();
+        let available: Vec<String> = manifest.manifest().adapters.keys().cloned().collect();
         if available.is_empty() {
             Err(format!(
-                "provider `{}` is not configured in anyedge.toml (no providers defined)",
-                provider
+                "adapter `{}` is not configured in anyedge.toml (no adapters defined)",
+                adapter_name
             ))
         } else {
             Err(format!(
-                "provider `{}` is not configured in anyedge.toml (available: {})",
-                provider,
+                "adapter `{}` is not configured in anyedge.toml (available: {})",
+                adapter_name,
                 available.join(", ")
             ))
         }

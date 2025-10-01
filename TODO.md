@@ -6,8 +6,8 @@ High-level backlog and decisions to drive the next milestones.
 
 ### High Priority
 - [ ] CI: add `fmt`, `clippy`, and `test` workflows
-- [ ] CLI: `anyedge build --provider fastly|cloudflare`
-- [ ] CLI: `anyedge deploy --provider fastly|cloudflare`
+- [ ] CLI: `anyedge build --adapter fastly|cloudflare`
+- [ ] CLI: `anyedge deploy --adapter fastly|cloudflare`
 - [ ] Core: `Response::json<T: serde::Serialize>` behind `serde` feature
 - [ ] Fastly proxy: add tests for backend send + header/body mapping
 - [ ] Cloudflare streaming: map `Response::with_chunks` to `ReadableStream` with backpressure
@@ -21,8 +21,8 @@ High-level backlog and decisions to drive the next milestones.
 - [ ] Docs: add RouteOptions + streaming policy section (examples done; expand README section)
 
 ### Completed / Ongoing Maintenance
-- [x] CLI: `anyedge build --provider fastly` to package a Fastly Compute@Edge artifact
-- [x] CLI: `anyedge deploy --provider fastly` using Fastly CLI/API
+- [x] CLI: `anyedge build --adapter fastly` to package a Fastly Compute@Edge artifact
+- [x] CLI: `anyedge deploy --adapter fastly` using Fastly CLI/API
 - [x] Core: helper to fetch all header values for a name (multi-value support)
 - [x] Docs: clean stale references to removed hello example from README/targets
 - [x] Docs: highlight controller-based workflow and update examples
@@ -54,8 +54,8 @@ High-level backlog and decisions to drive the next milestones.
   - [ ] Example: deploy sample with `wrangler` (`examples/app-demo/crates/app-demo-adapter-cloudflare`)
 - [ ] CLI
   - [x] `anyedge new <name>`: scaffold an app (lib with `build_app()`)
-  - [ ] `anyedge build --provider fastly|cloudflare`
-  - [ ] `anyedge deploy --provider fastly|cloudflare`
+  - [ ] `anyedge build --adapter fastly|cloudflare`
+  - [ ] `anyedge deploy --adapter fastly|cloudflare`
   - [ ] `anyedge dev` improvements: better HTTP parsing, hot-reload
 - [ ] Config
   - [ ] `anyedge.toml`: app name, routes, provider-specific settings
@@ -80,7 +80,7 @@ High-level backlog and decisions to drive the next milestones.
   - [ ] Run `cargo fmt`, `cargo clippy`, and tests
 
 ## Roadmap (2025-09-24)
-- [x] Adapter stability: formalise the provider adapter contract (request/response mapping, streaming guarantees, proxy hooks) and capture it in shared docs + integration tests so new targets plug in safely. (`docs/provider-adapter-contract.md`, Fastly contract tests under `crates/anyedge-adapter-fastly/tests/contract.rs`, Cloudflare contract tests under `crates/anyedge-adapter-cloudflare/tests/contract.rs`, manifest schema in `docs/manifest.md`)
+- [x] Adapter stability: formalise the provider adapter contract (request/response mapping, streaming guarantees, proxy hooks) and capture it in shared docs + integration tests so new targets plug in safely. (`docs/adapter-contract.md`, Fastly contract tests under `crates/anyedge-adapter-fastly/tests/contract.rs`, Cloudflare contract tests under `crates/anyedge-adapter-cloudflare/tests/contract.rs`, manifest schema in `docs/manifest.md`)
 - [ ] Provider additions: prototype a third adapter (e.g. AWS Lambda@Edge or Vercel Edge Functions) using the stabilized adapter API to validate cross-provider abstractions.
 - [x] Manifest ergonomics: design an `anyedge.toml` schema that mirrors Spin’s manifest convenience (route triggers, env/secrets, build targets) while remaining provider-agnostic; update CLI scaffolding accordingly. (`crates/anyedge-cli/src/manifest.rs`, templates in `crates/anyedge-cli/src/templates/root/anyedge.toml.hbs`, doc `docs/manifest.md`, app-demo manifest `examples/app-demo/anyedge.toml`)
 - [ ] Tooling parity: extend `anyedge-cli` with template/plugin style commands (similar to Spin templates) to streamline new app scaffolds and provider-specific wiring.
@@ -95,7 +95,7 @@ High-level backlog and decisions to drive the next milestones.
 - Controller ergonomics live in `anyedge-controller` plus `anyedge-macros`, offering `#[action]` functions that extract typed inputs and return `Responder`s.
 - Provider adapters (`anyedge-adapter-fastly`, `anyedge-adapter-cloudflare`) are feature-gated; each exposes `handle` plus logging/proxy helpers while delegating behaviour to the core crate.
 - Supporting crates include `anyedge-std` for stdout logging, `anyedge-cli` for dev server + scaffolding, and demo workspaces under `examples/app-demo` to validate provider flows.
-- Workspace `Cargo.toml` keeps default members lean (core only) to support offline builds; additional crates are opt-in via features when targeting specific providers.
+- Workspace `Cargo.toml` keeps default members lean (core only) to support offline builds; additional crates are opt-in via features when targeting specific adapters.
 
 ## Open Design Questions (for later pickup)
 - Provider priorities: focus on Fastly Compute@Edge, then Cloudflare Workers.
@@ -140,8 +140,8 @@ High-level backlog and decisions to drive the next milestones.
 - Validator helpers now cover path, query, and JSON via `Validated*` types only.
 
 ## Review (2025-09-18 03:08 UTC)
-- Implemented `anyedge build|deploy --provider fastly` by wiring cargo wasm32 builds and Fastly CLI invocation in the CLI.
-- Documented optional `dev-example` dependency in `anyedge-cli/README.md` and added error handling for unsupported providers.
+- Implemented `anyedge build|deploy --adapter fastly` by wiring cargo wasm32 builds and Fastly CLI invocation in the CLI.
+- Documented optional `dev-example` dependency in `anyedge-cli/README.md` and added error handling for unsupported adapters.
 - Verified builds with `cargo test -p anyedge-cli`.
 
 ## Review (2025-09-18 03:27 UTC)

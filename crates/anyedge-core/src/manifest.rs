@@ -62,7 +62,7 @@ pub struct Manifest {
     pub environment: ManifestEnvironment,
     #[serde(default)]
     #[validate(nested)]
-    pub providers: BTreeMap<String, ManifestProvider>,
+    pub adapters: BTreeMap<String, ManifestAdapter>,
     #[serde(default)]
     #[validate(nested)]
     pub logging: ManifestLogging,
@@ -77,22 +77,22 @@ impl Manifest {
         self.root.as_deref()
     }
 
-    pub fn logging_for(&self, provider: &str) -> Option<&ResolvedLoggingConfig> {
-        self.logging_resolved.get(provider)
+    pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
+        self.logging_resolved.get(adapter)
     }
 
-    pub fn logging_or_default(&self, provider: &str) -> ResolvedLoggingConfig {
-        self.logging_for(provider).cloned().unwrap_or_default()
+    pub fn logging_or_default(&self, adapter: &str) -> ResolvedLoggingConfig {
+        self.logging_for(adapter).cloned().unwrap_or_default()
     }
 
-    pub fn environment_for(&self, provider: &str) -> ResolvedEnvironment {
-        let provider_lower = provider.to_ascii_lowercase();
+    pub fn environment_for(&self, adapter: &str) -> ResolvedEnvironment {
+        let adapter_lower = adapter.to_ascii_lowercase();
 
         let variables = self
             .environment
             .variables
             .iter()
-            .filter(|binding| binding.applies_to_provider(&provider_lower))
+            .filter(|binding| binding.applies_to_adapter(&adapter_lower))
             .map(ResolvedEnvironmentBinding::from_manifest)
             .collect();
 
@@ -100,7 +100,7 @@ impl Manifest {
             .environment
             .secrets
             .iter()
-            .filter(|binding| binding.applies_to_provider(&provider_lower))
+            .filter(|binding| binding.applies_to_adapter(&adapter_lower))
             .map(ResolvedEnvironmentBinding::from_manifest)
             .collect();
 
@@ -114,9 +114,9 @@ impl Manifest {
     fn finalize(&mut self) {
         self.logging_resolved = self
             .logging
-            .providers
+            .adapters
             .iter()
-            .map(|(provider, cfg)| (provider.clone(), ResolvedLoggingConfig::from_manifest(cfg)))
+            .map(|(adapter, cfg)| (adapter.clone(), ResolvedLoggingConfig::from_manifest(cfg)))
             .collect();
     }
 }
@@ -153,7 +153,7 @@ pub struct ManifestHttpTrigger {
     #[serde(default)]
     pub methods: Vec<HttpMethod>,
     #[serde(default)]
-    pub providers: Vec<String>,
+    pub adapters: Vec<String>,
     #[serde(default)]
     #[validate(length(min = 1))]
     pub description: Option<String>,
@@ -190,7 +190,7 @@ pub struct ManifestBinding {
     #[validate(length(min = 1))]
     pub description: Option<String>,
     #[serde(default)]
-    pub providers: Vec<String>,
+    pub adapters: Vec<String>,
     #[serde(default)]
     #[validate(length(min = 1))]
     pub env: Option<String>,
@@ -199,13 +199,13 @@ pub struct ManifestBinding {
 }
 
 impl ManifestBinding {
-    fn applies_to_provider(&self, provider: &str) -> bool {
-        if self.providers.is_empty() {
+    fn applies_to_adapter(&self, adapter: &str) -> bool {
+        if self.adapters.is_empty() {
             return true;
         }
-        self.providers
+        self.adapters
             .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(provider))
+            .any(|candidate| candidate.eq_ignore_ascii_case(adapter))
     }
 
     fn env_key(&self) -> String {
@@ -239,20 +239,20 @@ pub struct ResolvedEnvironment {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
-pub struct ManifestProvider {
+pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
-    pub adapter: ManifestProviderAdapter,
+    pub adapter: ManifestAdapterDefinition,
     #[serde(default)]
     #[validate(nested)]
-    pub build: ManifestProviderBuild,
+    pub build: ManifestAdapterBuild,
     #[serde(default)]
     #[validate(nested)]
-    pub commands: ManifestProviderCommands,
+    pub commands: ManifestAdapterCommands,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
-pub struct ManifestProviderAdapter {
+pub struct ManifestAdapterDefinition {
     #[serde(rename = "crate")]
     #[serde(default)]
     #[validate(length(min = 1))]
@@ -263,7 +263,7 @@ pub struct ManifestProviderAdapter {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
-pub struct ManifestProviderBuild {
+pub struct ManifestAdapterBuild {
     #[serde(default)]
     #[validate(length(min = 1))]
     pub target: Option<String>,
@@ -275,7 +275,7 @@ pub struct ManifestProviderBuild {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
-pub struct ManifestProviderCommands {
+pub struct ManifestAdapterCommands {
     #[serde(default)]
     #[validate(length(min = 1))]
     pub build: Option<String>,
@@ -291,7 +291,7 @@ pub struct ManifestProviderCommands {
 pub struct ManifestLogging {
     #[serde(flatten)]
     #[validate(nested)]
-    pub providers: BTreeMap<String, ManifestLoggingConfig>,
+    pub adapters: BTreeMap<String, ManifestLoggingConfig>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone, Validate)]
@@ -495,7 +495,7 @@ handler = "demo::echo"
 [[environment.variables]]
 name = "API_BASE_URL"
 value = "https://example.com"
-providers = ["fastly"]
+adapters = ["fastly"]
 
 [[environment.secrets]]
 name = "API_TOKEN"
@@ -511,7 +511,7 @@ env = "APP_TOKEN"
     }
 
     #[test]
-    fn environment_resolves_for_providers() {
+    fn environment_resolves_for_adapters() {
         let loader = ManifestLoader::load_from_str(SAMPLE);
         let manifest = loader.manifest();
 

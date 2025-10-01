@@ -19,7 +19,7 @@ id = "root"
 path = "/"
 methods = ["GET"]
 handler = "demo_core::handlers::root"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 body-mode = "buffered"
 
 [environment]
@@ -31,31 +31,31 @@ value = "https://example.com/api"
 
 [[environment.secrets]]
 name = "API_TOKEN"
-providers = ["fastly", "cloudflare"]
+adapters = ["fastly", "cloudflare"]
 env = "API_TOKEN"
 
-[providers.fastly.adapter]
+[adapters.fastly.adapter]
 crate = "crates/demo-adapter-fastly"
 manifest = "crates/demo-adapter-fastly/fastly.toml"
 
-[providers.fastly.build]
+[adapters.fastly.build]
 target = "wasm32-wasip1"
 profile = "release"
 
-[providers.fastly.commands]
+[adapters.fastly.commands]
 build = "cargo build --release --target wasm32-wasip1 -p demo-adapter-fastly"
 serve = "fastly compute serve -C crates/demo-adapter-fastly"
 deploy = "fastly compute deploy -C crates/demo-adapter-fastly"
 
-[providers.cloudflare.adapter]
+[adapters.cloudflare.adapter]
 crate = "crates/demo-adapter-cloudflare"
 manifest = "crates/demo-adapter-cloudflare/wrangler.toml"
 
-[providers.cloudflare.build]
+[adapters.cloudflare.build]
 target = "wasm32-unknown-unknown"
 profile = "release"
 
-[providers.cloudflare.commands]
+[adapters.cloudflare.commands]
 build = "cargo build --release --target wasm32-unknown-unknown -p demo-adapter-cloudflare"
 serve = "wrangler dev --config crates/demo-adapter-cloudflare/wrangler.toml"
 deploy = "wrangler publish --config crates/demo-adapter-cloudflare/wrangler.toml"
@@ -103,12 +103,12 @@ Defines HTTP routes and their handlers. Fields:
 - `path`: URI template understood by `anyedge-core`.
 - `methods`: Allowed HTTP methods (defaults to `GET` if omitted).
 - `handler`: Path to the handler function (for reference/documentation).
-- `providers`: Which adapters expose the route. Empty means “all providers”.
+- `adapters`: Which adapters expose the route. Empty means “all adapters”.
 - `body-mode`: Either `buffered` or `stream` to document expected behaviour.
 
 ### `[environment]`
 
-Declares environment variables and secrets shared across providers. Each entry
+Declares environment variables and secrets shared across adapters. Each entry
 supports a human-friendly description, the upstream environment key (`env`,
 defaulting to the `name`), an optional default `value`, and a provider filter.
 When running provider commands through `anyedge-cli`, variables with a default
@@ -116,14 +116,14 @@ When running provider commands through `anyedge-cli`, variables with a default
 in the environment; missing secrets will cause the command to abort with a
 helpful error message.
 
-### `[providers.<name>]`
+### `[adapters.<name>]`
 
 Describes how a provider adapter is built and invoked.
 
-- `[providers.<name>.adapter]`: Points at the adapter crate and any provider
+- `[adapters.<name>.adapter]`: Points at the adapter crate and any provider
   manifest (e.g. `fastly.toml`, `wrangler.toml`).
-- `[providers.<name>.build]`: Build target, profile, and optional feature list.
-- `[providers.<name>.commands]`: Convenience commands for build/serve/deploy.
+- `[adapters.<name>.build]`: Build target, profile, and optional feature list.
+- `[adapters.<name>.commands]`: Convenience commands for build/serve/deploy.
 
 ### `[logging.<provider>]`
 
@@ -157,18 +157,18 @@ commands.
 
 ## CLI integration
 
-`anyedge build|serve|deploy --provider <name>` looks up the provider entry in
-`anyedge.toml`. If a `[providers.<name>.commands]` block supplies a `build`,
+`anyedge build|serve|deploy --adapter <name>` looks up the provider entry in
+`anyedge.toml`. If a `[adapters.<name>.commands]` block supplies a `build`,
 `serve`, or `deploy` command, the CLI executes it from the manifest directory.
 This allows each adapter to decide how artifacts are produced (for example,
 invoking `cargo build --target wasm32-wasip1` for Fastly or `wrangler dev` for
 Cloudflare). When commands are omitted, the CLI falls back to the built-in
-helpers shipped with the providers (currently the Fastly adapter).
+helpers shipped with the adapters (currently the Fastly adapter).
 
 The example app under `examples/app-demo` ships an `anyedge.toml` manifest that
 drives both runtime routing and CLI commands. `app-demo-core` reads the manifest
 at startup to register HTTP routes (rather than hard-coding paths in Rust), and
-running `anyedge build --provider fastly` from the workspace root invokes the
+running `anyedge build --adapter fastly` from the workspace root invokes the
 Fastly build command specified in the manifest.
 
 ## Generating routers via macro

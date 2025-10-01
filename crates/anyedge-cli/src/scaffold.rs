@@ -1,3 +1,4 @@
+use anyedge_adapter::scaffold;
 use handlebars::Handlebars;
 
 pub fn register_templates(hbs: &mut Handlebars) {
@@ -28,48 +29,13 @@ pub fn register_templates(hbs: &mut Handlebars) {
         include_str!("templates/core/src/lib.rs.hbs"),
     )
     .unwrap();
-    // Fastly
-    hbs.register_template_string(
-        "fastly_Cargo_toml",
-        include_str!("templates/fastly/Cargo.toml.hbs"),
-    )
-    .unwrap();
-    hbs.register_template_string(
-        "fastly_src_main_rs",
-        include_str!("templates/fastly/src/main.rs.hbs"),
-    )
-    .unwrap();
-    hbs.register_template_string(
-        "fastly_cargo_config_toml",
-        include_str!("templates/fastly/.cargo/config.toml.hbs"),
-    )
-    .unwrap();
-    hbs.register_template_string(
-        "fastly_fastly_toml",
-        include_str!("templates/fastly/fastly.toml.hbs"),
-    )
-    .unwrap();
-    // Cloudflare
-    hbs.register_template_string(
-        "cf_Cargo_toml",
-        include_str!("templates/cloudflare/Cargo.toml.hbs"),
-    )
-    .unwrap();
-    hbs.register_template_string(
-        "cf_src_main_rs",
-        include_str!("templates/cloudflare/src/main.rs.hbs"),
-    )
-    .unwrap();
-    hbs.register_template_string(
-        "cf_cargo_config_toml",
-        include_str!("templates/cloudflare/.cargo/config.toml.hbs"),
-    )
-    .unwrap();
-    hbs.register_template_string(
-        "cf_wrangler_toml",
-        include_str!("templates/cloudflare/wrangler.toml.hbs"),
-    )
-    .unwrap();
+    // Adapter-specific templates
+    for adapter in scaffold::registered_blueprints() {
+        for template in adapter.template_registrations {
+            hbs.register_template_string(template.name, template.contents)
+                .expect("register adapter template");
+        }
+    }
 }
 
 pub fn write_tmpl(
@@ -112,25 +78,28 @@ pub fn resolve_dep_line(
     repo_root: &std::path::Path,
     repo_rel_crate: &str,
     fallback: &str,
+    features: &[&str],
 ) -> String {
     let candidate = repo_root.join(repo_rel_crate);
     if candidate.exists() {
         if let Some(rel) = relative_to(from_dir, repo_root) {
             let dep_path = std::path::Path::new(&rel).join(repo_rel_crate);
-            // For fastly/cloudflare crates we still want features; detect by crate name
             let cname = crate_name_from_repo_path(repo_rel_crate);
-            let features = if cname == "anyedge-adapter-fastly" {
-                " , features = [\"fastly\"]"
-            } else if cname == "anyedge-adapter-cloudflare" {
-                " , features = [\"cloudflare\"]"
+            let feature_fragment = if features.is_empty() {
+                String::new()
             } else {
-                ""
+                let joined = features
+                    .iter()
+                    .map(|f| format!("\"{}\"", f))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(", features = [{}]", joined)
             };
             return format!(
                 "{} = {{ path = \"{}\"{} }}",
                 cname,
                 dep_path.display(),
-                features
+                feature_fragment
             );
         }
     }
