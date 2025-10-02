@@ -1,0 +1,11 @@
+# This file describes a Fastly Compute package. To learn more visit:
+# https://www.fastly.com/documentation/reference/compute/fastly-toml
+
+authors = []
+description = ""
+language = "rust"
+manifest_version = 3
+name = "app-demo-adapter-fastly"
+service_id = ""
+
+[local_server]

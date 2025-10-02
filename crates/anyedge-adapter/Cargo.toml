@@ -1,0 +1,10 @@
+[package]
+name = "anyedge-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Adapter registry and traits for AnyEdge adapters"
+
+[dependencies]
+once_cell = { workspace = true }
+
+[dev-dependencies]

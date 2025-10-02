@@ -1,0 +1,11 @@
+[package]
+name = "{{proj_core}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+{{dep_anyedge_core}}
+bytes = "1"
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+serde = { version = "1", features = ["derive"] }

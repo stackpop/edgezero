@@ -1,0 +1,11 @@
+[workspace]
+members = [
+  "crates/{{proj_core}}",
+{{{workspace_members}}}
+]
+resolver = "2"
+
+[profile.release]
+debug = 1
+codegen-units = 1
+lto = "fat"

@@ -1,0 +1,18 @@
+[package]
+name = "app-demo-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "app_demo_core"
+path = "src/lib.rs"
+
+[dependencies]
+anyedge-core = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
