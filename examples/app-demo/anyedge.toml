@@ -91,7 +91,7 @@ serve = "wrangler dev --config crates/app-demo-adapter-cloudflare/wrangler.toml"
 deploy = "wrangler deploy --config crates/app-demo-adapter-cloudflare/wrangler.toml"
 
 [logging.fastly]
-endpoint = "app-demo"
+endpoint = "app_demo_log"
 level = "info"
 echo_stdout = true
 

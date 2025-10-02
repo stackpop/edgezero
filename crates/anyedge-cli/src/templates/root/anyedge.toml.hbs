@@ -11,7 +11,7 @@ entry = "crates/{{proj_core}}"
 id = "root"
 path = "/"
 methods = ["GET"]
-handler = "{{proj_core}}::handlers::root"
+handler = "{{proj_core_mod}}::handlers::root"
 adapters = [{{{adapter_list}}}]
 description = "Default health-check endpoint"
 
@@ -19,16 +19,30 @@ description = "Default health-check endpoint"
 id = "echo"
 path = "/echo/{name}"
 methods = ["GET"]
-handler = "{{proj_core}}::handlers::echo"
+handler = "{{proj_core_mod}}::handlers::echo"
 adapters = [{{{adapter_list}}}]
 
 [[triggers.http]]
 id = "stream"
 path = "/stream"
 methods = ["GET"]
-handler = "{{proj_core}}::handlers::stream"
+handler = "{{proj_core_mod}}::handlers::stream"
 adapters = [{{{adapter_list}}}]
 body-mode = "stream"
+
+[[triggers.http]]
+id = "headers"
+path = "/headers"
+methods = ["GET"]
+handler = "{{proj_core_mod}}::handlers::headers"
+adapters = [{{{adapter_list}}}]
+
+[[triggers.http]]
+id = "echo_json"
+path = "/echo"
+methods = ["POST"]
+handler = "{{proj_core_mod}}::handlers::echo_json"
+adapters = [{{{adapter_list}}}]
 
 [environment]
 

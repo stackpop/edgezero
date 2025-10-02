@@ -1,6 +1,5 @@
 use anyedge_core::action;
 use anyedge_core::body::Body;
-use anyedge_core::error::EdgeError;
 use anyedge_core::extractor::{Headers, Json, Path};
 use anyedge_core::http::{self, Response, StatusCode};
 use anyedge_core::response::Text;
@@ -19,7 +18,7 @@ pub(crate) struct EchoBody {
 
 #[action]
 pub(crate) async fn root() -> Text<&'static str> {
-    Text::new("AnyEdge Demo App")
+    Text::new("{{name}} app")
 }
 
 #[action]
@@ -38,8 +37,10 @@ pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
 
 #[action]
 pub(crate) async fn stream() -> Response {
-    let body =
-        Body::stream(stream::iter(0..5).map(|index| Bytes::from(format!("chunk {}\n", index))));
+    let body = Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!(
+        "chunk {}\n",
+        index
+    ))));
 
     http::response_builder()
         .status(StatusCode::OK)
@@ -53,43 +54,15 @@ pub(crate) async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
     Text::new(format!("Hello, {}!", body.name))
 }
 
-#[derive(serde::Serialize)]
-struct RouteSummary {
-    method: String,
-    path: String,
-}
-
-#[action]
-pub(crate) async fn list_routes() -> Result<Response, EdgeError> {
-    let routes = crate::build_router().routes();
-    let payload: Vec<RouteSummary> = routes
-        .into_iter()
-        .map(|route| RouteSummary {
-            method: route.method().as_str().to_string(),
-            path: route.path().to_string(),
-        })
-        .collect();
-
-    let body = Body::json(&payload).map_err(EdgeError::internal)?;
-    let response = http::response_builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(body)
-        .map_err(EdgeError::internal)?;
-
-    Ok(response)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyedge_core::body::Body;
     use anyedge_core::context::RequestContext;
-    use anyedge_core::http::header::{HeaderName, HeaderValue};
     use anyedge_core::http::{request_builder, Method, StatusCode};
+    use anyedge_core::http::header::{HeaderName, HeaderValue};
     use anyedge_core::params::PathParams;
     use anyedge_core::response::IntoResponse;
-    use anyedge_core::router::DEFAULT_ROUTE_LISTING_PATH;
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
 
@@ -98,7 +71,7 @@ mod tests {
         let ctx = empty_context("/");
         let response = block_on(root(ctx)).expect("handler ok").into_response();
         let bytes = response.into_body().into_bytes();
-        assert_eq!(bytes.as_ref(), b"AnyEdge Demo App");
+        assert_eq!(bytes.as_ref(), b"{{name}} app");
     }
 
     #[test]
@@ -128,7 +101,10 @@ mod tests {
         let response = block_on(stream(ctx)).expect("handler ok");
         assert_eq!(response.status(), StatusCode::OK);
 
-        let mut chunks = response.into_body().into_stream().expect("stream body");
+        let mut chunks = response
+            .into_body()
+            .into_stream()
+            .expect("stream body");
         let collected = block_on(async {
             let mut buf = Vec::new();
             while let Some(chunk) = chunks.next().await {
@@ -139,35 +115,19 @@ mod tests {
         });
         assert_eq!(
             String::from_utf8(collected).expect("utf8"),
-            "chunk 0\nchunk 1\nchunk 2\nchunk 3\nchunk 4\n"
+            "chunk 0\nchunk 1\nchunk 2\n"
         );
     }
 
     #[test]
     fn echo_json_formats_payload() {
-        let ctx = context_with_json("/echo", r#"{"name":"Edge"}"#);
-        let response = block_on(echo_json(ctx))
-            .expect("handler ok")
-            .into_response();
+        let ctx = context_with_json(
+            "/echo",
+            r#"{"name":"Edge"}"#,
+        );
+        let response = block_on(echo_json(ctx)).expect("handler ok").into_response();
         let bytes = response.into_body().into_bytes();
         assert_eq!(bytes.as_ref(), b"Hello, Edge!");
-    }
-
-    #[test]
-    fn list_routes_returns_manifest_entries() {
-        let ctx = empty_context(DEFAULT_ROUTE_LISTING_PATH);
-        let response = block_on(list_routes(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let payload: serde_json::Value =
-            serde_json::from_slice(response.body().as_bytes()).expect("json payload");
-        let routes = payload.as_array().expect("array");
-        assert!(routes.iter().any(|entry| {
-            entry["method"] == "GET" && entry["path"] == DEFAULT_ROUTE_LISTING_PATH
-        }));
-        assert!(routes
-            .iter()
-            .any(|entry| { entry["method"] == "GET" && entry["path"] == "/echo/{name}" }));
     }
 
     fn empty_context(path: &str) -> RequestContext {
@@ -192,7 +152,11 @@ mod tests {
         RequestContext::new(request, PathParams::new(map))
     }
 
-    fn context_with_header(path: &str, header: HeaderName, value: HeaderValue) -> RequestContext {
+    fn context_with_header(
+        path: &str,
+        header: HeaderName,
+        value: HeaderValue,
+    ) -> RequestContext {
         let mut request = request_builder()
             .method(Method::GET)
             .uri(path)

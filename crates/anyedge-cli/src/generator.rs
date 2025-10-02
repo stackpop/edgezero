@@ -1,11 +1,15 @@
 use crate::args::NewArgs;
-use crate::scaffold::{register_templates, resolve_dep_line, sanitize_crate_name, write_tmpl};
+use crate::scaffold::{
+    register_templates, resolve_dep_line, sanitize_crate_name, write_tmpl, ResolvedDependency,
+};
 use anyedge_adapter::scaffold;
 use anyedge_adapter::scaffold::AdapterBlueprint;
 use handlebars::Handlebars;
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::process::Command;
 
 struct AdapterContext<'a> {
     blueprint: &'a AdapterBlueprint,
@@ -37,15 +41,52 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
 
     fs::create_dir_all(core_dir.join("src"))?;
 
+    let mut workspace_dependencies: BTreeMap<String, String> = BTreeMap::new();
+    workspace_dependencies
+        .entry("bytes".to_string())
+        .or_insert_with(|| "bytes = \"1\"".to_string());
+    workspace_dependencies
+        .entry("futures".to_string())
+        .or_insert_with(|| {
+            "futures = { version = \"0.3\", default-features = false, features = [\"std\", \"executor\"] }"
+                .to_string()
+        });
+    workspace_dependencies
+        .entry("serde".to_string())
+        .or_insert_with(|| "serde = { version = \"1\", features = [\"derive\"] }".to_string());
+    workspace_dependencies
+        .entry("log".to_string())
+        .or_insert_with(|| "log = \"0.4\"".to_string());
+    workspace_dependencies
+        .entry("worker".to_string())
+        .or_insert_with(|| {
+            "worker = { version = \"0.6\", default-features = false, features = [\"http\"] }"
+                .to_string()
+        });
+    workspace_dependencies
+        .entry("fastly".to_string())
+        .or_insert_with(|| "fastly = \"0.11\"".to_string());
+    workspace_dependencies
+        .entry("once_cell".to_string())
+        .or_insert_with(|| "once_cell = \"1\"".to_string());
+
     // Resolve path dependencies to anyedge crates if building inside this repo
     let cwd = std::env::current_dir().unwrap();
-    let dep_core_lib = resolve_dep_line(
-        &core_dir,
+    let ResolvedDependency {
+        name: core_dep_name,
+        workspace_line: core_workspace_line,
+        crate_line: core_crate_line,
+    } = resolve_dep_line(
+        &out_dir,
         &cwd,
         "crates/anyedge-core",
-        "anyedge-core = \"0.1\"",
+        "anyedge-core = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-core\", default-features = false }",
         &[],
     );
+    workspace_dependencies
+        .entry(core_dep_name)
+        .or_insert(core_workspace_line);
+    let project_module_name = name.replace('-', "_");
     let mut adapter_contexts = Vec::new();
     let mut adapter_ids = Vec::new();
     let mut workspace_members = Vec::new();
@@ -67,14 +108,13 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         data_entries.push((format!("proj_{}", blueprint.id), crate_name.clone()));
 
         for dep in blueprint.dependencies {
-            let resolved = resolve_dep_line(
-                adapter_dir.as_path(),
-                &cwd,
-                dep.repo_crate,
-                dep.fallback,
-                dep.features,
-            );
-            data_entries.push((dep.key.to_string(), resolved));
+            let ResolvedDependency {
+                name,
+                workspace_line,
+                crate_line,
+            } = resolve_dep_line(&out_dir, &cwd, dep.repo_crate, dep.fallback, dep.features);
+            workspace_dependencies.entry(name).or_insert(workspace_line);
+            data_entries.push((dep.key.to_string(), crate_line));
         }
 
         let crate_dir_rel = format!("crates/{}", crate_name);
@@ -128,7 +168,14 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
 
         let mut logging_section = String::new();
         writeln!(logging_section, "[logging.{}]", blueprint.id).unwrap();
-        if let Some(endpoint) = blueprint.logging.endpoint {
+        if blueprint.id == "fastly" {
+            writeln!(
+                logging_section,
+                "endpoint = \"{}_log\"",
+                project_module_name
+            )
+            .unwrap();
+        } else if let Some(endpoint) = blueprint.logging.endpoint {
             writeln!(logging_section, "endpoint = \"{}\"", endpoint).unwrap();
         }
         writeln!(logging_section, "level = \"{}\"", blueprint.logging.level).unwrap();
@@ -176,9 +223,13 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
 
     // Prepare template data map
     let mut data = Map::new();
-    data.insert("name".into(), Value::String(name));
+    data.insert("name".into(), Value::String(name.clone()));
+    let core_module_name = core_name.replace('-', "_");
+    let project_module_name = name.replace('-', "_");
     data.insert("proj_core".into(), Value::String(core_name.clone()));
-    data.insert("dep_anyedge_core".into(), Value::String(dep_core_lib));
+    data.insert("proj_core_mod".into(), Value::String(core_module_name));
+    data.insert("proj_mod".into(), Value::String(project_module_name));
+    data.insert("dep_anyedge_core".into(), Value::String(core_crate_line));
 
     let adapter_list_str = adapter_ids
         .iter()
@@ -210,6 +261,16 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         }
     }
 
+    let workspace_dep_lines = workspace_dependencies
+        .values()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    data.insert(
+        "workspace_dependencies".into(),
+        Value::String(workspace_dep_lines),
+    );
+
     let data_value = Value::Object(data.clone());
 
     // Render all templates
@@ -235,6 +296,12 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         &data_value,
         &out_dir.join("README.md"),
     )?;
+    write_tmpl(
+        &hbs,
+        "root_gitignore",
+        &data_value,
+        &out_dir.join(".gitignore"),
+    )?;
 
     // Core crate
     write_tmpl(
@@ -249,6 +316,12 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
         &data_value,
         &core_dir.join("src/lib.rs"),
     )?;
+    write_tmpl(
+        &hbs,
+        "core_src_handlers_rs",
+        &data_value,
+        &core_dir.join("src/handlers.rs"),
+    )?;
 
     for context in &adapter_contexts {
         for file in context.blueprint.files {
@@ -259,6 +332,17 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
                 &context.dir.join(file.output),
             )?;
         }
+    }
+
+    if let Err(err) = Command::new("git")
+        .arg("init")
+        .current_dir(&out_dir)
+        .status()
+    {
+        eprintln!(
+            "[anyedge] warning: failed to initialize git repository: {}",
+            err
+        );
     }
 
     println!(

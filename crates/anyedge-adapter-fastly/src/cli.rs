@@ -142,19 +142,21 @@ static FASTLY_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_anyedge_core_fastly",
         repo_crate: "crates/anyedge-core",
-        fallback: "anyedge-core = \"0.1\"",
+        fallback: "anyedge-core = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-core\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_anyedge_adapter_fastly",
         repo_crate: "crates/anyedge-adapter-fastly",
-        fallback: "anyedge-adapter-fastly = \"0.1\"",
+        fallback:
+            "anyedge-adapter-fastly = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-adapter-fastly\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_anyedge_adapter_fastly_wasm",
         repo_crate: "crates/anyedge-adapter-fastly",
-        fallback: "anyedge-adapter-fastly = { version = \"0.1\", features = [\"fastly\"] }",
+        fallback:
+            "anyedge-adapter-fastly = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
         features: &["fastly"],
     },
 ];
