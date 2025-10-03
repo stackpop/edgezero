@@ -156,3 +156,37 @@ pub fn relative_to(from: &std::path::Path, to: &std::path::Path) -> Option<Strin
     }
     Some(ups)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use handlebars::Handlebars;
+
+    #[test]
+    fn register_templates_registers_all_known_templates() {
+        let mut hbs = Handlebars::new();
+        register_templates(&mut hbs);
+
+        for name in [
+            "root_Cargo_toml",
+            "root_anyedge_toml",
+            "root_README_md",
+            "root_gitignore",
+            "core_Cargo_toml",
+            "core_src_lib_rs",
+            "core_src_handlers_rs",
+        ] {
+            assert!(hbs.has_template(name), "missing template {name}");
+        }
+
+        for blueprint in scaffold::registered_blueprints() {
+            for template in blueprint.template_registrations {
+                assert!(
+                    hbs.has_template(template.name),
+                    "adapter template {} not registered",
+                    template.name
+                );
+            }
+        }
+    }
+}
