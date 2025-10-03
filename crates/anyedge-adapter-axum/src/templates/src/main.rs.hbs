@@ -1,0 +1,8 @@
+use {{proj_core_mod}}::App;
+
+fn main() {
+    if let Err(err) = anyedge_adapter_axum::run_app::<App>(include_str!("../../../anyedge.toml")) {
+        eprintln!("axum adapter failed: {err}");
+        std::process::exit(1);
+    }
+}

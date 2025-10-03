@@ -2,6 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use anyedge_adapter::cli_support::{
+    find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
+};
 use anyedge_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -226,7 +229,7 @@ fn register_ctor() {
 }
 
 fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
-    if let Some(found) = find_manifest_upwards(start) {
+    if let Some(found) = find_manifest_upwards(start, "fastly.toml") {
         return Ok(found);
     }
 
@@ -258,52 +261,6 @@ fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
     });
 
     Ok(candidates.remove(0))
-}
-
-fn find_manifest_upwards(start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(dir) = current {
-        let candidate = dir.join("fastly.toml");
-        if candidate.exists() && dir.join("Cargo.toml").exists() {
-            return Some(candidate);
-        }
-        current = dir.parent();
-    }
-    None
-}
-
-fn read_package_name(manifest: &Path) -> Result<String, String> {
-    let contents = fs::read_to_string(manifest)
-        .map_err(|e| format!("failed to read {}: {e}", manifest.display()))?;
-    let table: toml::Value = toml::from_str(&contents)
-        .map_err(|e| format!("failed to parse {}: {e}", manifest.display()))?;
-    if let Some(name) = table
-        .get("package")
-        .and_then(|pkg| pkg.get("name"))
-        .and_then(|name| name.as_str())
-    {
-        return Ok(name.to_string());
-    }
-    if let Some(name) = table.get("name").and_then(|value| value.as_str()) {
-        return Ok(name.to_string());
-    }
-    Err(format!(
-        "package.name or name missing from {}",
-        manifest.display()
-    ))
-}
-
-fn find_workspace_root(dir: &Path) -> PathBuf {
-    let mut current: Option<&Path> = Some(dir);
-    let mut candidate: Option<PathBuf> = None;
-
-    while let Some(path) = current {
-        if path.join("Cargo.toml").exists() {
-            candidate = Some(path.to_path_buf());
-        }
-        current = path.parent();
-    }
-    candidate.unwrap_or_else(|| dir.to_path_buf())
 }
 
 fn locate_artifact(
@@ -348,25 +305,10 @@ fn locate_artifact(
     ))
 }
 
-fn path_distance(a: &Path, b: &Path) -> usize {
-    let a_components: Vec<_> = a.components().collect();
-    let b_components: Vec<_> = b.components().collect();
-
-    let mut common = 0;
-    for (ac, bc) in a_components.iter().zip(&b_components) {
-        if ac == bc {
-            common += 1;
-        } else {
-            break;
-        }
-    }
-
-    (a_components.len() - common) + (b_components.len() - common)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyedge_adapter::cli_support::read_package_name;
     use tempfile::tempdir;
 
     #[test]

@@ -47,6 +47,12 @@ build = "cargo build --release --target wasm32-wasip1 -p demo-adapter-fastly"
 serve = "fastly compute serve -C crates/demo-adapter-fastly"
 deploy = "fastly compute deploy -C crates/demo-adapter-fastly"
 
+[adapters.fastly.logging]
+endpoint = "stdout"
+level = "info"
+echo_stdout = true
+
+
 [adapters.cloudflare.adapter]
 crate = "crates/demo-adapter-cloudflare"
 manifest = "crates/demo-adapter-cloudflare/wrangler.toml"
@@ -60,12 +66,7 @@ build = "cargo build --release --target wasm32-unknown-unknown -p demo-adapter-c
 serve = "wrangler dev --config crates/demo-adapter-cloudflare/wrangler.toml"
 deploy = "wrangler publish --config crates/demo-adapter-cloudflare/wrangler.toml"
 
-[logging.fastly]
-endpoint = "stdout"
-level = "info"
-echo_stdout = true
-
-[logging.cloudflare]
+[adapters.cloudflare.logging]
 level = "info"
 ```
 
@@ -125,9 +126,13 @@ Describes how a provider adapter is built and invoked.
 - `[adapters.<name>.build]`: Build target, profile, and optional feature list.
 - `[adapters.<name>.commands]`: Convenience commands for build/serve/deploy.
 
-### `[logging.<provider>]`
+The AnyEdge CLI will, when present, run these commands for `build`, `serve`,
+and `deploy` before falling back to the adapter's built-in behaviour. That lets
+you customise provider tooling (e.g. add flags) without recompiling the CLI.
 
-Optional logging configuration per provider. Current fields:
+### `[adapters.<provider>.logging]`
+
+Optional logging configuration nested under each adapter. Current fields:
 
 - `endpoint` (Fastly only): Name passed to `init_logger` (defaults to `stdout`).
 - `level`: Log level (`trace`, `debug`, `info`, `warn`, `error`, `off`). Defaults to `info`.
