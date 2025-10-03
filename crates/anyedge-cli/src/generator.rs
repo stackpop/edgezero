@@ -67,7 +67,6 @@ struct AdapterArtifacts {
     adapter_ids: Vec<String>,
     workspace_members: Vec<String>,
     manifest_sections: String,
-    logging_sections: String,
     readme_adapter_crates: String,
     readme_adapter_dev: String,
 }
@@ -122,7 +121,10 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "serde = { version = \"1\", features = [\"derive\"] }".to_string(),
     );
     deps.insert("log".to_string(), "log = \"0.4\"".to_string());
-    deps.insert("simple_logger".to_string(), "simple_logger = \"4\"".to_string());
+    deps.insert(
+        "simple_logger".to_string(),
+        "simple_logger = \"4\"".to_string(),
+    );
     deps.insert(
         "worker".to_string(),
         "worker = { version = \"0.6\", default-features = false, features = [\"http\"] }"
@@ -168,7 +170,6 @@ fn collect_adapter_data(
     let mut adapter_ids = Vec::new();
     let mut workspace_members = Vec::new();
     let mut manifest_sections = String::new();
-    let mut logging_sections = String::new();
     let mut readme_adapter_crates = String::new();
     let mut readme_adapter_dev = String::new();
 
@@ -250,23 +251,28 @@ fn collect_adapter_data(
         )
         .unwrap();
 
-        let mut logging_section = String::new();
-        writeln!(logging_section, "[logging.{}]", blueprint.id).unwrap();
+        manifest_section.push('\n');
+        writeln!(manifest_section, "[adapters.{}.logging]", blueprint.id).unwrap();
         if blueprint.id == "fastly" {
-            writeln!(logging_section, "endpoint = \"{}_log\"", layout.project_mod).unwrap();
+            writeln!(
+                manifest_section,
+                "endpoint = \"{}_log\"",
+                layout.project_mod
+            )
+            .unwrap();
         } else if let Some(endpoint) = blueprint.logging.endpoint {
-            writeln!(logging_section, "endpoint = \"{}\"", endpoint).unwrap();
+            writeln!(manifest_section, "endpoint = \"{}\"", endpoint).unwrap();
         }
-        writeln!(logging_section, "level = \"{}\"", blueprint.logging.level).unwrap();
+        writeln!(manifest_section, "level = \"{}\"", blueprint.logging.level).unwrap();
         if let Some(echo_stdout) = blueprint.logging.echo_stdout {
             writeln!(
-                logging_section,
+                manifest_section,
                 "echo_stdout = {}",
                 if echo_stdout { "true" } else { "false" }
             )
             .unwrap();
         }
-        logging_section.push('\n');
+        manifest_section.push('\n');
 
         let description = blueprint
             .readme
@@ -288,8 +294,6 @@ fn collect_adapter_data(
         readme_adapter_dev.push('\n');
 
         manifest_sections.push_str(&manifest_section);
-        logging_sections.push_str(&logging_section);
-
         workspace_members.push(format!("  \"crates/{}\",", crate_name));
         adapter_ids.push(blueprint.id.to_string());
 
@@ -305,7 +309,6 @@ fn collect_adapter_data(
         adapter_ids,
         workspace_members,
         manifest_sections,
-        logging_sections,
         readme_adapter_crates,
         readme_adapter_dev,
     })
@@ -344,10 +347,6 @@ fn build_base_data(
     data.insert(
         "adapter_manifest_sections".into(),
         Value::String(artifacts.manifest_sections.clone()),
-    );
-    data.insert(
-        "logging_sections".into(),
-        Value::String(artifacts.logging_sections.clone()),
     );
     data.insert(
         "readme_adapter_crates".into(),

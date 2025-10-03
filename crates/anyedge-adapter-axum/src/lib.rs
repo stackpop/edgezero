@@ -4,7 +4,7 @@
 mod server;
 
 #[cfg(feature = "axum")]
-pub use server::{AnyEdgeAxumService, AxumDevServer, AxumDevServerConfig};
+pub use server::{run_app, AnyEdgeAxumService, AxumDevServer, AxumDevServerConfig};
 
 #[cfg(feature = "cli")]
 pub mod cli;

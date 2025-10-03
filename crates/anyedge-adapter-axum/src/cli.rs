@@ -55,7 +55,7 @@ static AXUM_DEPENDENCIES: &[DependencySpec] = &[
         key: "dep_anyedge_adapter_axum",
         repo_crate: "crates/anyedge-adapter-axum",
         fallback:
-            "anyedge-adapter-axum = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-adapter-axum\", default-features = false, features = [\"server\"] }",
+            "anyedge-adapter-axum = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-adapter-axum\", default-features = false }",
         features: &["axum"],
     },
 ];

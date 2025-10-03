@@ -112,12 +112,24 @@ impl Manifest {
     }
 
     fn finalize(&mut self) {
-        self.logging_resolved = self
-            .logging
-            .adapters
-            .iter()
-            .map(|(adapter, cfg)| (adapter.clone(), ResolvedLoggingConfig::from_manifest(cfg)))
-            .collect();
+        let mut resolved = BTreeMap::new();
+
+        for (adapter, cfg) in &self.adapters {
+            if cfg.logging.is_specified() {
+                resolved.insert(
+                    adapter.clone(),
+                    ResolvedLoggingConfig::from_manifest(&cfg.logging),
+                );
+            }
+        }
+
+        for (adapter, cfg) in &self.logging.adapters {
+            resolved
+                .entry(adapter.clone())
+                .or_insert_with(|| ResolvedLoggingConfig::from_manifest(cfg));
+        }
+
+        self.logging_resolved = resolved;
     }
 }
 
@@ -249,6 +261,9 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub commands: ManifestAdapterCommands,
+    #[serde(default)]
+    #[validate(nested)]
+    pub logging: ManifestLoggingConfig,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -335,6 +350,12 @@ impl ResolvedLoggingConfig {
             resolved.echo_stdout = Some(echo_stdout);
         }
         resolved
+    }
+}
+
+impl ManifestLoggingConfig {
+    fn is_specified(&self) -> bool {
+        self.level.is_some() || self.endpoint.is_some() || self.echo_stdout.is_some()
     }
 }
 

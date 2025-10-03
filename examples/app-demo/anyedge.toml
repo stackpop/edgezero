@@ -76,6 +76,11 @@ build = "cargo build --release --target wasm32-wasip1 -p app-demo-adapter-fastly
 serve = "fastly compute serve -C crates/app-demo-adapter-fastly"
 deploy = "fastly compute deploy -C crates/app-demo-adapter-fastly"
 
+[adapters.fastly.logging]
+endpoint = "app_demo_log"
+level = "info"
+echo_stdout = true
+
 [adapters.cloudflare.adapter]
 crate = "crates/app-demo-adapter-cloudflare"
 manifest = "crates/app-demo-adapter-cloudflare/wrangler.toml"
@@ -90,6 +95,9 @@ build = "cargo build --release --target wasm32-unknown-unknown -p app-demo-adapt
 serve = "wrangler dev --config crates/app-demo-adapter-cloudflare/wrangler.toml"
 deploy = "wrangler deploy --config crates/app-demo-adapter-cloudflare/wrangler.toml"
 
+[adapters.cloudflare.logging]
+level = "info"
+
 [adapters.axum.adapter]
 crate = "crates/app-demo-adapter-axum"
 manifest = "crates/app-demo-adapter-axum/axum.toml"
@@ -103,14 +111,6 @@ build = "cargo build -p app-demo-adapter-axum"
 serve = "cargo run -p app-demo-adapter-axum"
 deploy = "# configure deployment for Axum"
 
-[logging.fastly]
-endpoint = "app_demo_log"
-level = "info"
-echo_stdout = true
-
-[logging.cloudflare]
-level = "info"
-
-[logging.axum]
+[adapters.axum.logging]
 level = "info"
 echo_stdout = true

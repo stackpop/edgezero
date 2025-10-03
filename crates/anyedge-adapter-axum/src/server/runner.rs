@@ -6,7 +6,11 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tower::{service_fn, Service};
 
+use anyedge_core::app::Hooks;
+use anyedge_core::manifest::ManifestLoader;
 use anyedge_core::router::RouterService;
+use log::LevelFilter;
+use simple_logger::SimpleLogger;
 
 use super::service::AnyEdgeAxumService;
 
@@ -90,4 +94,23 @@ impl AxumDevServer {
 
         Ok(())
     }
+}
+
+pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
+    let manifest = ManifestLoader::load_from_str(manifest_src);
+    let logging = manifest.manifest().logging_or_default("axum");
+
+    let level: LevelFilter = logging.level.into();
+    let level = if logging.echo_stdout.unwrap_or(true) {
+        level
+    } else {
+        LevelFilter::Off
+    };
+
+    SimpleLogger::new().with_level(level).init().ok();
+
+    let app = A::build_app();
+    let router = app.router().clone();
+
+    AxumDevServer::new(router).run()
 }

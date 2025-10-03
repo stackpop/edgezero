@@ -123,6 +123,8 @@ dependencies = [
  "futures",
  "futures-util",
  "http",
+ "log",
+ "simple_logger",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
