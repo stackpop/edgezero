@@ -28,7 +28,6 @@ tempfile = { workspace = true }
 [features]
 default = [
     "cli",
-    "dev-example",
     "anyedge-adapter-axum",
     "anyedge-adapter-fastly",
     "anyedge-adapter-cloudflare",

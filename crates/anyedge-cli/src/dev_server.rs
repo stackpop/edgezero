@@ -1,12 +1,17 @@
 #![cfg(feature = "anyedge-adapter-axum")]
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyedge_adapter_axum::{AxumDevServer, AxumDevServerConfig};
+use anyedge_core::manifest::ManifestLoader;
 use anyedge_core::router::RouterService;
 
+use crate::adapter;
+use crate::adapter::Action;
+
 #[cfg(not(feature = "dev-example"))]
-use anyedge_core::{action, extractor::Path, responder::Text};
+use anyedge_core::{action, extractor::Path, response::Text};
 
 #[cfg(feature = "dev-example")]
 use anyedge_core::app::Hooks;
@@ -14,6 +19,12 @@ use anyedge_core::app::Hooks;
 use app_demo_core::App;
 
 pub fn run_dev() {
+    match try_run_manifest_axum() {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(err) => eprintln!("[anyedge] dev manifest error: {err}"),
+    }
+
     let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
     println!(
         "[anyedge] dev: starting local server on http://{}:{}",
@@ -70,4 +81,31 @@ async fn dev_root() -> Text<&'static str> {
 #[action]
 async fn dev_echo(Path(params): Path<EchoParams>) -> Text<String> {
     Text::new(format!("hello {}", params.name))
+}
+
+fn try_run_manifest_axum() -> Result<bool, String> {
+    let manifest = match load_manifest_optional()? {
+        Some(manifest) => manifest,
+        None => return Ok(false),
+    };
+
+    if manifest.manifest().adapters.contains_key("axum") {
+        adapter::execute("axum", Action::Serve, Some(&manifest), &[])
+            .map_err(|err| format!("serve command failed: {err}"))?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
+    let path = std::env::var("ANYEDGE_MANIFEST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("anyedge.toml"));
+
+    match ManifestLoader::from_path(&path) {
+        Ok(manifest) => Ok(Some(manifest)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("failed to load {}: {err}", path.display())),
+    }
 }

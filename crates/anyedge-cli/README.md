@@ -9,7 +9,7 @@ The crate exposes two cargo features:
 | Feature        | Description                                              | Enabled by default |
 |----------------|----------------------------------------------------------|--------------------|
 | `cli`          | Builds the command-line interface (`anyedge` binary).    | ✅                 |
-| `dev-example`  | Pulls in `examples/app-demo/app-demo-core` so `anyedge dev` can boot the bundled demo app. Disable this if you want to ship the CLI without the example workspace. | ✅ (for local dev) |
+| `dev-example`  | Pulls in `examples/app-demo/app-demo-core` so `anyedge dev` can boot the bundled demo app. Enable only when you want the sample router available. | ❌ |
 
 When you just need the CLI functionality (e.g. packaging for distribution), build without the demo feature:
 
@@ -17,10 +17,10 @@ When you just need the CLI functionality (e.g. packaging for distribution), buil
 cargo build -p anyedge-cli --no-default-features --features cli
 ```
 
-For contributors, the default feature set keeps `dev-example` turned on, allowing `anyedge dev` to run the demo app out of the box:
+For contributors working on the demo, enable the extra feature:
 
 ```bash
-cargo run -p anyedge-cli --features cli -- dev
+cargo run -p anyedge-cli --features "cli,dev-example" -- dev
 ```
 
 ## Commands
@@ -28,7 +28,7 @@ cargo run -p anyedge-cli --features cli -- dev
 _(summaries only; see `anyedge --help` for details)_
 
 - `anyedge new <name>` – Scaffold a new AnyEdge project (templates still evolving).
-- `anyedge dev` – Serve the demo app locally (uses the `dev-example` feature by default).
+- `anyedge dev` – Serve the current project locally (add `--features dev-example` to run the bundled demo).
 - `anyedge build --adapter fastly` – Compile the Fastly crate to `wasm32-wasip1` and drop the artifact in `pkg/`.
 - `anyedge deploy --adapter fastly` – Invoke the Fastly CLI (`fastly compute deploy`) from the detected Fastly crate.
 - `anyedge serve --adapter fastly` – Run `fastly compute serve` in the Fastly crate directory for local testing (requires Fastly CLI).

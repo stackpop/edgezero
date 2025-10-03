@@ -115,7 +115,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "futures = { version = \"0.3\", default-features = false, features = [\"std\", \"executor\"] }"
             .to_string(),
     );
-    deps.insert("axum".to_string(), "axum = \"0.7\"".to_string());
+    deps.insert("axum".to_string(), "axum = \"0.8\"".to_string());
     deps.insert(
         "serde".to_string(),
         "serde = { version = \"1\", features = [\"derive\"] }".to_string(),

@@ -35,10 +35,12 @@ curl http://127.0.0.1:8787/echo/alice
 cargo test
 
 # Optional: explore the demo project bundled with this repo
-cargo run -p anyedge-cli -- dev
+cargo run -p anyedge-cli --features dev-example -- dev
 ```
 
-The CLI enables the `dev-example` feature by default, so running `anyedge dev` inside this repository boots the demo router from `examples/app-demo`. Disable the example dependency with `cargo run -p anyedge-cli --no-default-features --features cli -- dev` to spin up a stub router instead.
+To run the demo router from `examples/app-demo`, enable the optional
+`dev-example` feature as shown above. Without that feature the CLI always loads
+the manifest in your current project directory.
 
 The demo routes showcase core features:
 
@@ -78,7 +80,7 @@ new projects.
 The `anyedge-cli` crate produces the `anyedge` binary (enabled by the `cli` feature). Run it locally with `cargo run -p anyedge-cli -- <command>`. Key subcommands:
 
 - `anyedge new` - scaffolds a fully wired workspace (pass `--adapters` to pick your targets).
-- `anyedge dev` - starts the local Axum HTTP server (uses the demo router when `dev-example` is enabled).
+- `anyedge dev` - starts the local Axum HTTP server using the current project's manifest (pass `--features dev-example` when running from this repository to boot the demo app).
 - `anyedge build --adapter fastly` - builds the Fastly example to `wasm32-wasip1` and copies the artifact into `anyedge/pkg/`.
 - `anyedge serve --adapter fastly` - shells out to `fastly compute serve` after locating the Fastly manifest.
 - `anyedge deploy --adapter fastly` - wraps `fastly compute deploy`.

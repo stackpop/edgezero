@@ -40,10 +40,10 @@ route definitions must use matchit 0.8 style
 ## Examples
 the demo crates under `examples/app-demo/` share router
   logic via `app-demo-core`. Local smoke testing flows through
-  `cargo run -p anyedge-cli -- dev`, which serves the demo router on
-  http://127.0.0.1:8787 when the default features (including `dev-example`) are enabled.
-  Build provider targets with `app-demo-adapter-fastly` / `app-demo-adapter-cloudflare`
-  when you need Fastly or Cloudflare binaries.
+  `cargo run -p anyedge-cli --features dev-example -- dev`, which serves the demo
+  router on http://127.0.0.1:8787. Build provider targets with
+  `app-demo-adapter-fastly` / `app-demo-adapter-cloudflare` when you need Fastly
+  or Cloudflare binaries.
 
 ## Style– prefer colocating tests with implementation modules, favour
 async/await-friendly code that compiles to Wasm, and avoid runtime-specific

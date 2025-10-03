@@ -126,6 +126,10 @@ Describes how a provider adapter is built and invoked.
 - `[adapters.<name>.build]`: Build target, profile, and optional feature list.
 - `[adapters.<name>.commands]`: Convenience commands for build/serve/deploy.
 
+The AnyEdge CLI will, when present, run these commands for `build`, `serve`,
+and `deploy` before falling back to the adapter's built-in behaviour. That lets
+you customise provider tooling (e.g. add flags) without recompiling the CLI.
+
 ### `[adapters.<provider>.logging]`
 
 Optional logging configuration nested under each adapter. Current fields:
