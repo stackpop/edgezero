@@ -1,0 +1,34 @@
+[package]
+name = "anyedge-adapter-axum"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[features]
+default = ["axum"]
+axum = ["dep:axum", "dep:tokio", "dep:tower", "dep:futures-util"]
+cli = ["dep:anyedge-adapter", "anyedge-adapter/cli", "dep:ctor", "dep:toml", "dep:walkdir"]
+
+[dependencies]
+anyhow = { workspace = true }
+anyedge-core = { path = "../anyedge-core" }
+anyedge-adapter = { path = "../anyedge-adapter", optional = true, features = ["cli"] }
+axum = { workspace = true, optional = true }
+bytes = { workspace = true }
+ctor = { workspace = true, optional = true }
+futures = { workspace = true }
+futures-util = { workspace = true, optional = true }
+http = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tracing = { workspace = true }
+toml = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+axum = { workspace = true, features = ["macros"] }
+tempfile = { workspace = true }

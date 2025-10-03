@@ -1,0 +1,25 @@
+use anyhow::Context;
+use anyedge_adapter_axum::AxumDevServer;
+use anyedge_core::app::Hooks;
+use {{proj_core_mod}}::App;
+use log::LevelFilter;
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("anyedge axum adapter failed: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    simple_logger::SimpleLogger::new()
+        .with_level(LevelFilter::Info)
+        .init()
+        .ok();
+
+    let app = App::build_app();
+    let router = app.router().clone();
+
+    let server = AxumDevServer::new(router);
+    server.run().context("dev server")
+}

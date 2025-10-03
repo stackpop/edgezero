@@ -1,0 +1,20 @@
+[package]
+name = "app-demo-adapter-axum"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "app-demo-adapter-axum"
+path = "src/main.rs"
+
+[dependencies]
+app-demo-core = { workspace = true }
+anyedge-core = { workspace = true }
+anyhow = { workspace = true }
+anyedge-adapter-axum = { workspace = true, features = ["axum"] }
+axum = { workspace = true }
+log = { workspace = true }
+simple_logger = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = { workspace = true }

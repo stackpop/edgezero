@@ -4,7 +4,7 @@
 mod adapter;
 #[cfg(feature = "cli")]
 mod args;
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", feature = "anyedge-adapter-axum"))]
 mod dev_server;
 #[cfg(feature = "cli")]
 mod generator;
@@ -56,7 +56,18 @@ fn main() {
             }
         }
         Command::Dev => {
-            dev_server::run_dev();
+            #[cfg(feature = "anyedge-adapter-axum")]
+            {
+                dev_server::run_dev();
+            }
+
+            #[cfg(not(feature = "anyedge-adapter-axum"))]
+            {
+                eprintln!(
+                    "anyedge-cli built without `anyedge-adapter-axum`; rebuild with that feature to use `anyedge dev`."
+                );
+                std::process::exit(1);
+            }
         }
     }
 }

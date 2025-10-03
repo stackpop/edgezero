@@ -1,0 +1,4 @@
+[adapter]
+crate = "app-demo-adapter-axum"
+crate_dir = "."
+port = 8787

@@ -110,16 +110,19 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
 fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     let mut deps = BTreeMap::new();
     deps.insert("bytes".to_string(), "bytes = \"1\"".to_string());
+    deps.insert("anyhow".to_string(), "anyhow = \"1\"".to_string());
     deps.insert(
         "futures".to_string(),
         "futures = { version = \"0.3\", default-features = false, features = [\"std\", \"executor\"] }"
             .to_string(),
     );
+    deps.insert("axum".to_string(), "axum = \"0.7\"".to_string());
     deps.insert(
         "serde".to_string(),
         "serde = { version = \"1\", features = [\"derive\"] }".to_string(),
     );
     deps.insert("log".to_string(), "log = \"0.4\"".to_string());
+    deps.insert("simple_logger".to_string(), "simple_logger = \"4\"".to_string());
     deps.insert(
         "worker".to_string(),
         "worker = { version = \"0.6\", default-features = false, features = [\"http\"] }"
@@ -127,6 +130,11 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     );
     deps.insert("fastly".to_string(), "fastly = \"0.11\"".to_string());
     deps.insert("once_cell".to_string(), "once_cell = \"1\"".to_string());
+    deps.insert(
+        "tokio".to_string(),
+        "tokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }".to_string(),
+    );
+    deps.insert("tracing".to_string(), "tracing = \"0.1\"".to_string());
     deps
 }
 
