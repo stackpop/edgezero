@@ -149,19 +149,21 @@ static CLOUDFLARE_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_anyedge_core_cloudflare",
         repo_crate: "crates/anyedge-core",
-        fallback: "anyedge-core = \"0.1\"",
+        fallback: "anyedge-core = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-core\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_anyedge_adapter_cloudflare",
         repo_crate: "crates/anyedge-adapter-cloudflare",
-        fallback: "anyedge-adapter-cloudflare = \"0.1\"",
+        fallback:
+            "anyedge-adapter-cloudflare = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-adapter-cloudflare\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_anyedge_adapter_cloudflare_wasm",
         repo_crate: "crates/anyedge-adapter-cloudflare",
-        fallback: "anyedge-adapter-cloudflare = { version = \"0.1\", features = [\"cloudflare\"] }",
+        fallback:
+            "anyedge-adapter-cloudflare = { git = \"ssh://git@github.com/stackpop/anyedge.git\", package = \"anyedge-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
         features: &["cloudflare"],
     },
 ];

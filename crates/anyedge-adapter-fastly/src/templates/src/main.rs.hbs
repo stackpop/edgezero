@@ -3,7 +3,7 @@
 #[cfg(target_arch = "wasm32")]
 use fastly::{Error, Request, Response};
 #[cfg(target_arch = "wasm32")]
-use {{proj_core}}::App;
+use {{proj_core_mod}}::App;
 #[cfg(target_arch = "wasm32")]
 #[fastly::main]
 pub fn main(req: Request) -> Result<Response, Error> {

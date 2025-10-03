@@ -18,6 +18,11 @@ pub fn register_templates(hbs: &mut Handlebars) {
         include_str!("templates/root/README.md.hbs"),
     )
     .unwrap();
+    hbs.register_template_string(
+        "root_gitignore",
+        include_str!("templates/root/gitignore.hbs"),
+    )
+    .unwrap();
     // Core
     hbs.register_template_string(
         "core_Cargo_toml",
@@ -27,6 +32,11 @@ pub fn register_templates(hbs: &mut Handlebars) {
     hbs.register_template_string(
         "core_src_lib_rs",
         include_str!("templates/core/src/lib.rs.hbs"),
+    )
+    .unwrap();
+    hbs.register_template_string(
+        "core_src_handlers_rs",
+        include_str!("templates/core/src/handlers.rs.hbs"),
     )
     .unwrap();
     // Adapter-specific templates
@@ -73,37 +83,52 @@ pub fn sanitize_crate_name(input: &str) -> String {
     }
 }
 
+pub struct ResolvedDependency {
+    pub name: String,
+    pub workspace_line: String,
+    pub crate_line: String,
+}
+
 pub fn resolve_dep_line(
-    from_dir: &std::path::Path,
+    workspace_dir: &std::path::Path,
     repo_root: &std::path::Path,
     repo_rel_crate: &str,
     fallback: &str,
     features: &[&str],
-) -> String {
+) -> ResolvedDependency {
+    let crate_name = crate_name_from_repo_path(repo_rel_crate).to_string();
     let candidate = repo_root.join(repo_rel_crate);
-    if candidate.exists() {
-        if let Some(rel) = relative_to(from_dir, repo_root) {
+    let workspace_line = if candidate.exists() {
+        if let Some(rel) = relative_to(workspace_dir, repo_root) {
             let dep_path = std::path::Path::new(&rel).join(repo_rel_crate);
-            let cname = crate_name_from_repo_path(repo_rel_crate);
-            let feature_fragment = if features.is_empty() {
-                String::new()
-            } else {
-                let joined = features
-                    .iter()
-                    .map(|f| format!("\"{}\"", f))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(", features = [{}]", joined)
-            };
-            return format!(
-                "{} = {{ path = \"{}\"{} }}",
-                cname,
-                dep_path.display(),
-                feature_fragment
-            );
+            format!("{} = {{ path = \"{}\" }}", crate_name, dep_path.display())
+        } else {
+            fallback.to_string()
         }
+    } else {
+        fallback.to_string()
+    };
+
+    let feature_fragment = if features.is_empty() {
+        String::new()
+    } else {
+        let joined = features
+            .iter()
+            .map(|f| format!("\"{}\"", f))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(", features = [{}]", joined)
+    };
+    let crate_line = format!(
+        "{} = {{ workspace = true{} }}",
+        crate_name, feature_fragment
+    );
+
+    ResolvedDependency {
+        name: crate_name,
+        workspace_line,
+        crate_line,
     }
-    fallback.to_string()
 }
 
 fn crate_name_from_repo_path(p: &str) -> &str {
