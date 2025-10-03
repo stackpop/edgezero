@@ -223,4 +223,23 @@ mod tests {
 
         std::env::remove_var("ANYEDGE_TEST_SECRET");
     }
+
+    #[test]
+    fn shell_escape_quotes_and_spaces() {
+        assert_eq!(super::shell_escape("plain"), "plain");
+        assert_eq!(super::shell_escape("with space"), "'with space'");
+        assert_eq!(super::shell_escape("needs'quote"), "'needs'\"'\"'quote'");
+        assert_eq!(super::shell_escape(""), "''");
+    }
+
+    #[test]
+    fn shell_join_combines_arguments_with_escaping() {
+        let args = vec![
+            "plain".to_string(),
+            "with space".to_string(),
+            "needs'quote".to_string(),
+        ];
+        let joined = super::shell_join(&args);
+        assert_eq!(joined, "plain 'with space' 'needs'\"'\"'quote'");
+    }
 }

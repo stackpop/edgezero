@@ -45,3 +45,51 @@ pub struct NewArgs {
     #[arg(long)]
     pub local_core: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_new_command_with_defaults() {
+        let args = Args::try_parse_from(["anyedge", "new", "demo-app"]).expect("parse new");
+        match args.cmd {
+            Command::New(new_args) => {
+                assert_eq!(new_args.name, "demo-app");
+                assert!(new_args.dir.is_none());
+                assert!(!new_args.local_core);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_build_command_with_passthrough_args() {
+        let args = Args::try_parse_from([
+            "anyedge",
+            "build",
+            "--adapter",
+            "fastly",
+            "--",
+            "--flag",
+            "value",
+        ])
+        .expect("parse build");
+        match args.cmd {
+            Command::Build {
+                adapter,
+                adapter_args,
+            } => {
+                assert_eq!(adapter, "fastly");
+                assert_eq!(adapter_args, vec!["--flag", "value"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_required_adapter_returns_error() {
+        assert!(Args::try_parse_from(["anyedge", "build"]).is_err());
+    }
+}
