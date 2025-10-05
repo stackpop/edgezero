@@ -2,6 +2,7 @@ use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::Request;
 use crate::params::PathParams;
+use crate::proxy::ProxyHandle;
 use serde::de::DeserializeOwned;
 
 /// Request context exposed to handlers and middleware.
@@ -78,6 +79,10 @@ impl RequestContext {
             )),
         }
     }
+
+    pub fn proxy_handle(&self) -> Option<ProxyHandle> {
+        self.request.extensions().get::<ProxyHandle>().cloned()
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +90,8 @@ mod tests {
     use super::*;
     use crate::http::{request_builder, Method, StatusCode};
     use crate::params::PathParams;
+    use crate::proxy::{ProxyClient, ProxyHandle, ProxyRequest, ProxyResponse};
+    use async_trait::async_trait;
     use bytes::Bytes;
     use futures::stream;
     use serde::{Deserialize, Serialize};
@@ -215,5 +222,29 @@ mod tests {
         assert!(err
             .message()
             .contains("streaming bodies are not supported for form extraction"));
+    }
+
+    struct DummyClient;
+
+    #[async_trait(?Send)]
+    impl ProxyClient for DummyClient {
+        async fn send(&self, _request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
+            Ok(ProxyResponse::new(StatusCode::OK, Body::empty()))
+        }
+    }
+
+    #[test]
+    fn proxy_handle_is_retrieved_when_present() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/proxy")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ProxyHandle::with_client(DummyClient));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.proxy_handle().is_some());
     }
 }

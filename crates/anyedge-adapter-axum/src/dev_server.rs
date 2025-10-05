@@ -12,7 +12,7 @@ use anyedge_core::router::RouterService;
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
-use super::service::AnyEdgeAxumService;
+use crate::service::AnyEdgeAxumService;
 
 /// Configuration used when running the dev server embedding AnyEdge into Axum.
 #[derive(Clone)]
@@ -75,6 +75,7 @@ impl AxumDevServer {
             let mut svc = service.clone();
             async move { svc.call(req).await }
         }));
+        let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
 
         let shutdown = if config.enable_ctrl_c {
             Some(async {
@@ -84,7 +85,7 @@ impl AxumDevServer {
             None
         };
 
-        let server = axum::serve(listener, router.into_make_service());
+        let server = axum::serve(listener, make_service);
         if let Some(shutdown) = shutdown {
             let server = server.with_graceful_shutdown(shutdown);
             server.await.context("axum server error")?;

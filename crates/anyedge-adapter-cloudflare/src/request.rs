@@ -1,9 +1,11 @@
+use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
 use crate::CloudflareRequestContext;
 use anyedge_core::app::App;
 use anyedge_core::body::Body;
 use anyedge_core::error::EdgeError;
 use anyedge_core::http::{request_builder, Method as CoreMethod, Request, Uri};
+use anyedge_core::proxy::ProxyHandle;
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
@@ -37,6 +39,9 @@ pub async fn into_core_request(
         .map_err(EdgeError::internal)?;
 
     CloudflareRequestContext::insert(&mut request, env, ctx);
+    request
+        .extensions_mut()
+        .insert(ProxyHandle::with_client(CloudflareProxyClient));
     Ok(request)
 }
 

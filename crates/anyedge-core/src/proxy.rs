@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -153,6 +154,35 @@ impl fmt::Debug for ProxyResponse {
         f.debug_struct("ProxyResponse")
             .field("status", &self.status)
             .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct ProxyHandle {
+    client: Arc<dyn ProxyClient>,
+}
+
+impl ProxyHandle {
+    pub fn new(client: Arc<dyn ProxyClient>) -> Self {
+        Self { client }
+    }
+
+    pub fn with_client<C>(client: C) -> Self
+    where
+        C: ProxyClient + 'static,
+    {
+        Self {
+            client: Arc::new(client),
+        }
+    }
+
+    pub fn client(&self) -> Arc<dyn ProxyClient> {
+        Arc::clone(&self.client)
+    }
+
+    pub async fn forward(&self, request: ProxyRequest) -> Result<Response, EdgeError> {
+        let response = self.client.send(request).await?;
+        Ok(response.into_response())
     }
 }
 
