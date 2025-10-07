@@ -10,7 +10,8 @@ use tower::Service;
 
 use anyedge_core::router::RouterService;
 
-use super::convert::{into_axum_response, into_core_request};
+use crate::request::into_core_request;
+use crate::response::into_axum_response;
 
 /// Tower service that adapts AnyEdge router requests to Axum/Hyper compatible responses.
 #[derive(Clone)]
@@ -43,5 +44,33 @@ impl Service<Request<AxumBody>> for AnyEdgeAxumService {
             let response = into_axum_response(core_response);
             Ok(response)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyedge_core::body::Body;
+    use anyedge_core::context::RequestContext;
+    use anyedge_core::error::EdgeError;
+    use anyedge_core::http::{response_builder, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_request_to_router() {
+        let router = RouterService::builder()
+            .get("/", |_ctx: RequestContext| async move {
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("ok"))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let mut service = AnyEdgeAxumService::new(router);
+
+        let request = Request::builder().uri("/").body(AxumBody::empty()).unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

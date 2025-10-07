@@ -44,6 +44,14 @@ methods = ["POST"]
 handler = "{{proj_core_mod}}::handlers::echo_json"
 adapters = [{{{adapter_list}}}]
 
+
+[[triggers.http]]
+id = "proxy_demo"
+path = "/proxy/{*rest}"
+methods = ["GET", "POST"]
+handler = "{{proj_core_mod}}::handlers::proxy_demo"
+adapters = [{{{adapter_list}}}]
+
 [environment]
 
 [[environment.variables]]

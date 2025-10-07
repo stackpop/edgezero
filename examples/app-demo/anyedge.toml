@@ -48,6 +48,13 @@ methods = ["GET"]
 handler = "app_demo_core::handlers::list_routes"
 adapters = ["fastly", "cloudflare", "axum"]
 
+[[triggers.http]]
+id = "proxy_demo"
+path = "/proxy/{*rest}"
+methods = ["GET", "POST"]
+handler = "app_demo_core::handlers::proxy_demo"
+adapters = ["fastly", "cloudflare", "axum"]
+
 [environment]
 
 [[environment.variables]]

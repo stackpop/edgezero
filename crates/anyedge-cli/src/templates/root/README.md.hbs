@@ -5,6 +5,19 @@ This workspace demonstrates a multi-target AnyEdge app.
 - `crates/{{proj_core}}`: reusable application logic built with `anyedge-core`.
 {{{readme_adapter_crates}}}
 
+## Routes
+
+- `GET /` – simple text health check
+- `GET /echo/{name}` – path parameter echo
+- `GET /headers` – prints the incoming `user-agent`
+- `GET /stream` – emits a short streamed response body
+- `POST /echo` – echoes JSON payloads
+- `GET|POST /proxy/{*rest}` – forwards requests to `API_BASE_URL`, falling back to a 501 when the active adapter does not expose a proxy client
+
 ## Dev
 
 {{{readme_adapter_dev}}}
+
+## Configuration
+
+Environment variables are declared in `anyedge.toml`. Set `API_BASE_URL` to the upstream origin you want `/proxy/...` to target and provide adapter-specific secrets (for example `API_TOKEN`) when deploying.

@@ -1,11 +1,15 @@
 use anyedge_core::action;
 use anyedge_core::body::Body;
+use anyedge_core::context::RequestContext;
 use anyedge_core::error::EdgeError;
 use anyedge_core::extractor::{Headers, Json, Path};
-use anyedge_core::http::{self, Response, StatusCode};
+use anyedge_core::http::{self, Response, StatusCode, Uri};
+use anyedge_core::proxy::ProxyRequest;
 use anyedge_core::response::Text;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
+
+const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 
 #[derive(serde::Deserialize)]
 pub(crate) struct EchoParams {
@@ -80,18 +84,72 @@ pub(crate) async fn list_routes() -> Result<Response, EdgeError> {
     Ok(response)
 }
 
+#[derive(serde::Deserialize)]
+struct ProxyPath {
+    #[serde(default)]
+    rest: String,
+}
+
+pub(crate) async fn proxy_demo(ctx: RequestContext) -> Result<Response, EdgeError> {
+    let params: ProxyPath = ctx.path()?;
+    let proxy_handle = ctx.proxy_handle();
+    let request = ctx.into_request();
+    let target = build_proxy_target(&params.rest, request.uri())?;
+    let proxy_request = ProxyRequest::from_request(request, target);
+    if let Some(handle) = proxy_handle {
+        handle.forward(proxy_request).await
+    } else {
+        proxy_not_available_response()
+    }
+}
+
+fn build_proxy_target(rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> {
+    let base = std::env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_string());
+    let mut target = base.trim_end_matches('/').to_string();
+    let trimmed_rest = rest.trim_start_matches('/');
+    if !trimmed_rest.is_empty() {
+        target.push('/');
+        target.push_str(trimmed_rest);
+    }
+
+    if let Some(query) = original_uri.query() {
+        if !query.is_empty() {
+            target.push('?');
+            target.push_str(query);
+        }
+    }
+
+    target
+        .parse::<Uri>()
+        .map_err(|err| EdgeError::bad_request(format!("invalid proxy target URI: {err}")))
+}
+
+fn proxy_not_available_response() -> Result<Response, EdgeError> {
+    let body = Body::text(
+        "proxy example is not enabled for this adapter build; enable a proxy-capable adapter",
+    );
+    http::response_builder()
+        .status(StatusCode::NOT_IMPLEMENTED)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(body)
+        .map_err(EdgeError::internal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyedge_core::body::Body;
     use anyedge_core::context::RequestContext;
     use anyedge_core::http::header::{HeaderName, HeaderValue};
-    use anyedge_core::http::{request_builder, Method, StatusCode};
+    use anyedge_core::http::{request_builder, Method, StatusCode, Uri};
     use anyedge_core::params::PathParams;
+    use anyedge_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use anyedge_core::response::IntoResponse;
     use anyedge_core::router::DEFAULT_ROUTE_LISTING_PATH;
+    use async_trait::async_trait;
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
+    use std::env;
 
     #[test]
     fn root_returns_static_body() {
@@ -168,6 +226,63 @@ mod tests {
         assert!(routes
             .iter()
             .any(|entry| { entry["method"] == "GET" && entry["path"] == "/echo/{name}" }));
+    }
+
+    #[test]
+    fn build_proxy_target_merges_rest_and_query() {
+        env::set_var("API_BASE_URL", "https://example.com/api");
+        let original = Uri::from_static("/proxy/status?foo=bar");
+        let target = super::build_proxy_target("status/200", &original).expect("target uri");
+        assert_eq!(
+            target.to_string(),
+            "https://example.com/api/status/200?foo=bar"
+        );
+        env::remove_var("API_BASE_URL");
+    }
+
+    #[test]
+    fn proxy_demo_without_proxy_support_returns_placeholder() {
+        env::set_var("API_BASE_URL", "https://example.com/api");
+
+        let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
+        let response = block_on(proxy_demo(ctx)).expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        env::remove_var("API_BASE_URL");
+    }
+
+    struct TestProxyClient;
+
+    #[async_trait(?Send)]
+    impl ProxyClient for TestProxyClient {
+        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
+            let (_method, uri, _headers, _body, _) = request.into_parts();
+            assert!(uri.to_string().contains("status/201"));
+            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
+        }
+    }
+
+    #[test]
+    fn proxy_demo_uses_injected_proxy_handle() {
+        env::set_var("API_BASE_URL", "https://example.com/api");
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/proxy/status/201")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ProxyHandle::with_client(TestProxyClient));
+
+        let mut params = HashMap::new();
+        params.insert("rest".to_string(), "status/201".to_string());
+        let ctx = RequestContext::new(request, PathParams::new(params));
+
+        let response = block_on(proxy_demo(ctx)).expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        env::remove_var("API_BASE_URL");
     }
 
     fn empty_context(path: &str) -> RequestContext {

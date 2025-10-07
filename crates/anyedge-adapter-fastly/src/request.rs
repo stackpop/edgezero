@@ -4,9 +4,11 @@ use anyedge_core::app::App;
 use anyedge_core::body::Body;
 use anyedge_core::error::EdgeError;
 use anyedge_core::http::{request_builder, Request};
+use anyedge_core::proxy::ProxyHandle;
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 
+use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
 use crate::FastlyRequestContext;
 
@@ -31,6 +33,9 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
         client_ip: req.get_client_ip_addr(),
     };
     FastlyRequestContext::insert(&mut request, context);
+    request
+        .extensions_mut()
+        .insert(ProxyHandle::with_client(FastlyProxyClient));
 
     Ok(request)
 }
