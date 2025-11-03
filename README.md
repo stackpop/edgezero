@@ -209,15 +209,3 @@ cargo test -p anyedge-adapter-fastly --features fastly --target wasm32-wasip1
 
 Streaming responses are covered in the `anyedge-core` router tests and in the
 Fastly adapter tests to ensure chunked bodies make it to the provider output.
-
-## Next steps
-
-- Expand multi-provider support:
-  - Finalise Cloudflare streaming/backpressure behaviour and ship the demo Wranger flow.
-  - Extend the CLI build/deploy commands so both Fastly and Cloudflare share the same UX.
-- Finish out the manifest-driven ergonomics by adding helpers such as `Response::json<T>` and static-asset serving utilities to `anyedge-core`.
-- Harden CI (fmt/clippy/test) and feature matrices using the new GitHub workflows.
-- Grow the adapter contract documentation/tests to keep additional edge targets aligned.
-  for Fastly/Cloudflare (`crates/anyedge-adapter-fastly/tests/contract.rs`,
-  `crates/anyedge-adapter-cloudflare/tests/contract.rs`), and introduced the
-  `anyedge.toml` schema for application manifests (`docs/manifest.md`).
