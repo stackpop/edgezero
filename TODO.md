@@ -6,10 +6,10 @@ High-level backlog and decisions to drive the next milestones.
 
 ### High Priority
 - [ ] CI: add `fmt`, `clippy`, and `test` workflows
-- [ ] CLI: `anyedge build --adapter fastly|cloudflare`
-- [ ] CLI: `anyedge deploy --adapter fastly|cloudflare`
-- [ ] Core: `Response::json<T: serde::Serialize>` behind `serde` feature
-- [ ] Fastly proxy: add tests for backend send + header/body mapping
+- [x] CLI: `anyedge build --adapter fastly|cloudflare`
+- [x] CLI: `anyedge deploy --adapter fastly|cloudflare`
+- [x] Core: `Response::json<T: serde::Serialize>` behind `serde` feature
+- [x] Fastly proxy: add tests for backend send + header/body mapping
 - [ ] Cloudflare streaming: map `Response::with_chunks` to `ReadableStream` with backpressure
 - [ ] Cloudflare demo: add minimal `wrangler` example and verify `wrangler dev`
 - [ ] Core proxy: add async fetch facade (feature `async-client`) and implement Cloudflare proxy
