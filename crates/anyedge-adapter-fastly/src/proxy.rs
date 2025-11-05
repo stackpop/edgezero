@@ -46,7 +46,7 @@ fn build_fastly_request(
 ) -> Result<FastlyRequest, EdgeError> {
     let mut fastly_request = FastlyRequest::new(
         method.clone(),
-        uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"),
+        uri.to_string(),
     );
     fastly_request.set_method(method);
 
@@ -103,7 +103,14 @@ fn ensure_backend(uri: &Uri) -> Result<Backend, EdgeError> {
 
     let name = backend_name(&target, uri.scheme_str());
 
-    match Backend::from_name(&name) {
+    let host_with_port = match port {
+        Some(p) => format!("{}:{}", host, p),
+        None => host.to_string(),
+    };
+
+    let builder = Backend::builder(&name, &host_with_port).override_host(host);
+
+    match builder.finish() {
         Ok(backend) => Ok(backend),
         Err(_) => {
             let mut builder = Backend::builder(&name, &target);
