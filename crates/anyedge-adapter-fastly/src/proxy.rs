@@ -44,10 +44,7 @@ fn build_fastly_request(
     uri: &Uri,
     headers: HeaderMap,
 ) -> Result<FastlyRequest, EdgeError> {
-    let mut fastly_request = FastlyRequest::new(
-        method.clone(),
-        uri.to_string(),
-    );
+    let mut fastly_request = FastlyRequest::new(method.clone(), uri.to_string());
     fastly_request.set_method(method);
 
     for (name, value) in headers.iter() {
