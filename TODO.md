@@ -8,7 +8,7 @@ High-level backlog and decisions to drive the next milestones.
 - [ ] Core: `Response::json<T: serde::Serialize>` behind `serde` feature
 - [ ] Fastly proxy: add tests for backend send + header/body mapping
 - [ ] Cloudflare streaming: map `Response::with_chunks` to `ReadableStream` with backpressure
-- [ ] Core proxy: add async fetch facade (feature `async-client`) and implement Cloudflare proxy
+- [ ] Core proxy: add async fetch facade (feature `async-client`) and implement Cloudflare proxy async fetch facade (feature `async-client`) and implement Cloudflare proxy
 
 ### Medium Priority
 - [ ] Fastly demo: add optional backend example to validate `req.send("backend")`
