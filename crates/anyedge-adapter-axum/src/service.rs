@@ -3,8 +3,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use axum::body::Body;
 use axum::body::Body as AxumBody;
 use axum::http::{Request, Response};
+use http::StatusCode;
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
@@ -37,7 +39,15 @@ impl Service<Request<AxumBody>> for AnyEdgeAxumService {
     fn call(&mut self, request: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
         Box::pin(async move {
-            let core_request = into_core_request(request);
+            let core_request = match into_core_request(request).await {
+                Ok(req) => req,
+                Err(e) => {
+                    let mut err_response = Response::new(Body::from(e.to_string()));
+                    *err_response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+
+                    return Ok(err_response);
+                }
+            };
             let core_response = task::block_in_place(move || {
                 Handle::current().block_on(router.oneshot(core_request))
             });
