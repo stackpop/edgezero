@@ -2,6 +2,44 @@
 
 High-level backlog and decisions to drive the next milestones.
 
+## Current Task (expand_action_impl coverage + cleanup)
+- [x] Audit `expand_action_impl` behaviour to list any untested code paths or edge cases (e.g., tuple destructuring errors, non-RC tuple structs, extractor invocation).
+- [x] Add focused tests in `crates/anyedge-macros/src/action.rs` to cover the missing scenarios while keeping contract unchanged.
+- [x] Simplify the implementation if warranted (e.g., helper extraction, clearer error handling) without altering observable behaviour; highlight the deltas in the review section.
+- [x] Run `cargo test` workspace-wide and note results.
+- [x] Record a new review entry summarising the changes, assumptions, and outstanding items.
+
+## Review (2025-11-07 17:52:45 UTC)
+- Summary: Extracted RequestContext pattern normalisation into a helper for clearer error aggregation and broadened the macro tests to cover attribute arguments, self receivers, tuple binding mistakes, and extractor codegen so `expand_action_impl` remains well-specified.
+- Assumptions: String-matching the generated `FromRequest` call stays stable because we don't plan to rename that trait or method; tuple destructuring for RequestContext will continue to expect a single binding.
+- Outstanding: None; `cargo test` (workspace) succeeded after the new tests.
+
+## Current Task (template proxy_demo parity)
+- [x] Update `crates/anyedge-cli/src/templates/core/src/handlers.rs.hbs` so the generated `proxy_demo` matches the example handler (`#[action]` + `RequestContext(ctx): RequestContext` binding).
+- [x] Run `cargo test` to ensure the template change doesn’t break the workspace.
+- [x] Capture a review entry summarising the template update and any follow-ups.
+
+## Review (2025-11-07 17:55:17 UTC)
+- Summary: Aligned the CLI template’s `proxy_demo` definition with the app demo (now tagged with `#[action]` and destructuring `RequestContext`) so generated projects inherit the same extractor ergonomics.
+- Assumptions: Template consumers expect the proxy route to behave like the example app; no additional template files reference the old signature.
+- Outstanding: None; `cargo test` across the workspace passed after the template tweak.
+
+## Current Task (RequestContext pattern support)
+- [x] Teach the `#[action]` macro to accept tuple-struct style parameters like `RequestContext(ctx): RequestContext` by normalising that pattern to the owned context argument (ensure the same ownership semantics and keep duplicate checks).
+- [x] Update the `proxy_demo` handler in `examples/app-demo/crates/app-demo-core/src/handlers.rs` to demonstrate the new binding style.
+- [x] Run `cargo test` for the workspace and fix any regressions.
+- [x] Append a new review entry (summary, assumptions, outstanding items) once the change is complete.
+
+## Review (2025-11-07 17:48:52 UTC)
+- Summary: Normalised `RequestContext` parameters passed through `#[action]` so tuple-style bindings (e.g. `RequestContext(ctx): RequestContext`) collapse to the owned context, added regression tests covering the pattern, and showcased the syntax on `proxy_demo`.
+- Assumptions: Only one owned `RequestContext` parameter should exist per handler; tuple-style bindings only contain a single pattern element.
+- Outstanding: None; `cargo test` passed for the entire workspace (no warnings after the final iteration).
+
+## Review (2025-11-07 17:39:28 UTC)
+- Summary: Extended `#[action]` to accept a single `RequestContext` parameter (with duplicate detection and helper tests) and applied the attribute to `proxy_demo`, relying on the original handler logic.
+- Assumptions: `RequestContext` parameters are owned values (no reference variants needed) and only one is expected per handler.
+- Outstanding: None; `cargo test` across the workspace passed after the macro test adjustment.
+
 ## Queue (near-term)
 
 ### High Priority

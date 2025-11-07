@@ -65,7 +65,8 @@ pub(crate) async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
     Text::new(format!("Hello, {}!", body.name))
 }
 
-pub(crate) async fn proxy_demo(ctx: RequestContext) -> Result<Response, EdgeError> {
+#[action]
+pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let proxy_handle = ctx.proxy_handle();
     let request = ctx.into_request();
