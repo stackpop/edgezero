@@ -90,7 +90,8 @@ struct ProxyPath {
     rest: String,
 }
 
-pub(crate) async fn proxy_demo(ctx: RequestContext) -> Result<Response, EdgeError> {
+#[action]
+pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let proxy_handle = ctx.proxy_handle();
     let request = ctx.into_request();
