@@ -6,6 +6,8 @@ use anyedge_core::proxy::ProxyHandle;
 use axum::body::Body as AxumBody;
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::Request;
+use http::HeaderValue;
+use http::header::CONTENT_TYPE;
 
 use crate::context::AxumRequestContext;
 use crate::proxy::AxumProxyClient;
@@ -15,8 +17,8 @@ use crate::proxy::AxumProxyClient;
 pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest, String> {
     let (parts, body) = request.into_parts();
 
-    let body = match parts.headers.get("content-type") {
-        Some(value) if value == "application/json" => {
+    let body = match parts.headers.get(CONTENT_TYPE) {
+        Some(value) if is_json_content_type(value) => {
             let bytes = axum::body::to_bytes(body, usize::MAX)
                 .await
                 .map_err(|e| format!("Failed to convert body into bytes: {e}"))?;
@@ -51,6 +53,28 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
         .insert(ProxyHandle::with_client(AxumProxyClient::default()));
 
     Ok(core_request)
+}
+
+fn is_json_content_type(value: &HeaderValue) -> bool {
+    let Ok(raw) = value.to_str() else {
+        return false;
+    };
+
+    let media_type = raw.split(';').next().map(str::trim).unwrap_or("");
+    if media_type.eq_ignore_ascii_case("application/json") {
+        return true;
+    }
+
+    let Some((ty, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+
+    if !ty.eq_ignore_ascii_case("application") {
+        return false;
+    }
+
+    let subtype = subtype.trim();
+    subtype.len() >= 5 && subtype[subtype.len() - 5..].eq_ignore_ascii_case("+json")
 }
 
 #[cfg(test)]
@@ -142,4 +166,25 @@ mod tests {
 
         assert!(matches!(core_request.body(), Body::Stream(_)));
     }
+
+
+    #[test]
+    fn test_is_json_content_type() {
+        assert!(is_json_content_type(&HeaderValue::from_static("application/json")));
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "application/json; charset=utf-8"
+        )));
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "application/vnd.api+json"
+        )));
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "APPLICATION/VND.CUSTOM+JSON; CHARSET=UTF-8"
+        )));
+
+        assert!(!is_json_content_type(&HeaderValue::from_static("text/json")));
+        assert!(!is_json_content_type(&HeaderValue::from_static(
+            "application/json+xml"
+        )));
+    }
+
 }
