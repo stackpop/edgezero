@@ -6,8 +6,8 @@ use anyedge_core::proxy::ProxyHandle;
 use axum::body::Body as AxumBody;
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::Request;
-use http::HeaderValue;
 use http::header::CONTENT_TYPE;
+use http::HeaderValue;
 
 use crate::context::AxumRequestContext;
 use crate::proxy::AxumProxyClient;
@@ -167,10 +167,11 @@ mod tests {
         assert!(matches!(core_request.body(), Body::Stream(_)));
     }
 
-
     #[test]
     fn test_is_json_content_type() {
-        assert!(is_json_content_type(&HeaderValue::from_static("application/json")));
+        assert!(is_json_content_type(&HeaderValue::from_static(
+            "application/json"
+        )));
         assert!(is_json_content_type(&HeaderValue::from_static(
             "application/json; charset=utf-8"
         )));
@@ -181,10 +182,11 @@ mod tests {
             "APPLICATION/VND.CUSTOM+JSON; CHARSET=UTF-8"
         )));
 
-        assert!(!is_json_content_type(&HeaderValue::from_static("text/json")));
+        assert!(!is_json_content_type(&HeaderValue::from_static(
+            "text/json"
+        )));
         assert!(!is_json_content_type(&HeaderValue::from_static(
             "application/json+xml"
         )));
     }
-
 }
