@@ -1,0 +1,16 @@
+[package]
+name = "edgezero-adapter"
+version = "0.1.0"
+edition = "2021"
+description = "Adapter registry and traits for EdgeZero adapters"
+
+[features]
+default = []
+cli = ["dep:toml"]
+
+[dependencies]
+once_cell = { workspace = true }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

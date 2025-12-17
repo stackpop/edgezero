@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "crates/anyedge-adapter-axum",
-    "crates/anyedge-adapter-cloudflare",
-    "crates/anyedge-adapter-fastly",
-    "crates/anyedge-adapter",
-    "crates/anyedge-cli",
-    "crates/anyedge-core",
-    "crates/anyedge-macros",
+    "crates/edgezero-adapter-axum",
+    "crates/edgezero-adapter-cloudflare",
+    "crates/edgezero-adapter-fastly",
+    "crates/edgezero-adapter",
+    "crates/edgezero-cli",
+    "crates/edgezero-core",
+    "crates/edgezero-macros",
     "examples/app-demo/crates/app-demo-adapter-cloudflare",
     "examples/app-demo/crates/app-demo-adapter-axum",
     "examples/app-demo/crates/app-demo-core",
@@ -17,15 +17,15 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-authors = ["AnyEdge Team <dev@anyedge.dev>"]
+authors = ["EdgeZero Team <dev@edgezero.dev>"]
 license = "Apache-2.0"
 
 [workspace.dependencies]
-anyedge-adapter-axum = { path = "crates/anyedge-adapter-axum", default-features = false }
-anyedge-adapter-cloudflare = { path = "crates/anyedge-adapter-cloudflare", default-features = false }
-anyedge-adapter-fastly = { path = "crates/anyedge-adapter-fastly", default-features = false }
-anyedge-adapter = { path = "crates/anyedge-adapter" }
-anyedge-core = { path = "crates/anyedge-core", default-features = false }
+edgezero-adapter-axum = { path = "crates/edgezero-adapter-axum", default-features = false }
+edgezero-adapter-cloudflare = { path = "crates/edgezero-adapter-cloudflare", default-features = false }
+edgezero-adapter-fastly = { path = "crates/edgezero-adapter-fastly", default-features = false }
+edgezero-adapter = { path = "crates/edgezero-adapter" }
+edgezero-core = { path = "crates/edgezero-core", default-features = false }
 anyhow = "1"
 app-demo-core = { path = "examples/app-demo/crates/app-demo-core" }
 async-compression = { version = "0.4", features = ["futures-io", "gzip", "brotli"] }

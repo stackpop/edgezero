@@ -1,0 +1,29 @@
+[package]
+name = "edgezero-adapter-cloudflare"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[features]
+default = []
+cloudflare = ["dep:worker"]
+cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:walkdir"]
+
+[dependencies]
+edgezero-core = { path = "../edgezero-core" }
+edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = ["cli"] }
+async-trait = { workspace = true }
+brotli = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+ctor = { workspace = true, optional = true }
+worker = { version = "0.6", default-features = false, features = ["http"], optional = true }
+walkdir = { workspace = true, optional = true }
+wasm-bindgen-test = "0.3"
+
+[dev-dependencies]
+web-sys = { version = "0.3", features = ["Window", "Response", "Request", "Headers", "ReadableStream", "Blob"]     }

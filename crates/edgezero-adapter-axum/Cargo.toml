@@ -1,0 +1,38 @@
+[package]
+name = "edgezero-adapter-axum"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[features]
+default = ["axum"]
+axum = ["dep:axum", "dep:tokio", "dep:tower", "dep:futures-util", "dep:reqwest"]
+cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:toml", "dep:walkdir"]
+
+[dependencies]
+edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = ["cli"] }
+edgezero-core = { path = "../edgezero-core" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true, optional = true }
+bytes = { workspace = true }
+ctor = { workspace = true, optional = true }
+futures = { workspace = true }
+futures-util = { workspace = true, optional = true }
+http = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true, optional = true }
+simple_logger = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tracing = { workspace = true }
+walkdir = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

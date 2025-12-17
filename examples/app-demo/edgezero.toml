@@ -1,0 +1,123 @@
+[app]
+name = "app-demo"
+version = "0.1.0"
+kind = "http"
+entry = "crates/app-demo-core"
+middleware = ["edgezero_core::middleware::RequestLogger"]
+
+[[triggers.http]]
+id = "root"
+path = "/"
+methods = ["GET"]
+handler = "app_demo_core::handlers::root"
+adapters = ["fastly", "cloudflare", "axum"]
+
+[[triggers.http]]
+id = "echo"
+path = "/echo/{name}"
+methods = ["GET"]
+handler = "app_demo_core::handlers::echo"
+adapters = ["fastly", "cloudflare", "axum"]
+
+[[triggers.http]]
+id = "headers"
+path = "/headers"
+methods = ["GET"]
+handler = "app_demo_core::handlers::headers"
+adapters = ["fastly", "cloudflare", "axum"]
+
+[[triggers.http]]
+id = "stream"
+path = "/stream"
+methods = ["GET"]
+handler = "app_demo_core::handlers::stream"
+adapters = ["fastly", "cloudflare", "axum"]
+body-mode = "stream"
+
+[[triggers.http]]
+id = "echo_json"
+path = "/echo"
+methods = ["POST"]
+handler = "app_demo_core::handlers::echo_json"
+adapters = ["fastly", "cloudflare", "axum"]
+
+[[triggers.http]]
+id = "routes"
+path = "/__edgezero/routes"
+methods = ["GET"]
+handler = "app_demo_core::handlers::list_routes"
+adapters = ["fastly", "cloudflare", "axum"]
+
+[[triggers.http]]
+id = "proxy_demo"
+path = "/proxy/{*rest}"
+methods = ["GET", "POST"]
+handler = "app_demo_core::handlers::proxy_demo"
+adapters = ["fastly", "cloudflare", "axum"]
+
+[environment]
+
+[[environment.variables]]
+name = "API_BASE_URL"
+description = "Example upstream base (unused in demo)."
+env = "API_BASE_URL"
+value = "https://example.com/api"
+
+[[environment.secrets]]
+name = "API_TOKEN"
+description = "Example secret placeholder."
+adapters = ["fastly", "cloudflare", "axum"]
+env = "API_TOKEN"
+
+[adapters.fastly.adapter]
+crate = "crates/app-demo-adapter-fastly"
+manifest = "crates/app-demo-adapter-fastly/fastly.toml"
+
+[adapters.fastly.build]
+target = "wasm32-wasip1"
+profile = "release"
+features = ["fastly"]
+
+[adapters.fastly.commands]
+build = "cargo build --release --target wasm32-wasip1 -p app-demo-adapter-fastly"
+serve = "fastly compute serve -C crates/app-demo-adapter-fastly"
+deploy = "fastly compute deploy -C crates/app-demo-adapter-fastly"
+
+[adapters.fastly.logging]
+endpoint = "app_demo_log"
+level = "info"
+echo_stdout = true
+
+[adapters.cloudflare.adapter]
+crate = "crates/app-demo-adapter-cloudflare"
+manifest = "crates/app-demo-adapter-cloudflare/wrangler.toml"
+
+[adapters.cloudflare.build]
+target = "wasm32-unknown-unknown"
+profile = "release"
+features = ["cloudflare"]
+
+[adapters.cloudflare.commands]
+build = "cargo build --release --target wasm32-unknown-unknown -p app-demo-adapter-cloudflare"
+serve = "wrangler dev --config crates/app-demo-adapter-cloudflare/wrangler.toml"
+deploy = "wrangler deploy --config crates/app-demo-adapter-cloudflare/wrangler.toml"
+
+[adapters.cloudflare.logging]
+level = "info"
+
+[adapters.axum.adapter]
+crate = "crates/app-demo-adapter-axum"
+manifest = "crates/app-demo-adapter-axum/axum.toml"
+
+[adapters.axum.build]
+target = "native"
+profile = "dev"
+
+[adapters.axum.commands]
+build = "cargo build -p app-demo-adapter-axum"
+serve = "cargo run -p app-demo-adapter-axum"
+deploy = "# configure deployment for Axum"
+
+[adapters.axum.logging]
+level = "info"
+echo_stdout = true

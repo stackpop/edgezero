@@ -1,11 +1,11 @@
-use anyedge_core::action;
-use anyedge_core::body::Body;
-use anyedge_core::context::RequestContext;
-use anyedge_core::error::EdgeError;
-use anyedge_core::extractor::{Headers, Json, Path};
-use anyedge_core::http::{self, Response, StatusCode, Uri};
-use anyedge_core::proxy::ProxyRequest;
-use anyedge_core::response::Text;
+use edgezero_core::action;
+use edgezero_core::body::Body;
+use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
+use edgezero_core::extractor::{Headers, Json, Path};
+use edgezero_core::http::{self, Response, StatusCode, Uri};
+use edgezero_core::proxy::ProxyRequest;
+use edgezero_core::response::Text;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
 
@@ -23,7 +23,7 @@ pub(crate) struct EchoBody {
 
 #[action]
 pub(crate) async fn root() -> Text<&'static str> {
-    Text::new("AnyEdge Demo App")
+    Text::new("EdgeZero Demo App")
 }
 
 #[action]
@@ -139,14 +139,14 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyedge_core::body::Body;
-    use anyedge_core::context::RequestContext;
-    use anyedge_core::http::header::{HeaderName, HeaderValue};
-    use anyedge_core::http::{request_builder, Method, StatusCode, Uri};
-    use anyedge_core::params::PathParams;
-    use anyedge_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
-    use anyedge_core::response::IntoResponse;
-    use anyedge_core::router::DEFAULT_ROUTE_LISTING_PATH;
+    use edgezero_core::body::Body;
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::http::header::{HeaderName, HeaderValue};
+    use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
+    use edgezero_core::params::PathParams;
+    use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
+    use edgezero_core::response::IntoResponse;
+    use edgezero_core::router::DEFAULT_ROUTE_LISTING_PATH;
     use async_trait::async_trait;
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
@@ -157,7 +157,7 @@ mod tests {
         let ctx = empty_context("/");
         let response = block_on(root(ctx)).expect("handler ok").into_response();
         let bytes = response.into_body().into_bytes();
-        assert_eq!(bytes.as_ref(), b"AnyEdge Demo App");
+        assert_eq!(bytes.as_ref(), b"EdgeZero Demo App");
     }
 
     #[test]
