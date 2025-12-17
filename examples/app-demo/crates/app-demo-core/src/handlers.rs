@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
@@ -6,7 +7,6 @@ use edgezero_core::extractor::{Headers, Json, Path};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
-use bytes::Bytes;
 use futures::{stream, StreamExt};
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
@@ -139,6 +139,7 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
@@ -147,7 +148,6 @@ mod tests {
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse;
     use edgezero_core::router::DEFAULT_ROUTE_LISTING_PATH;
-    use async_trait::async_trait;
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
     use std::env;

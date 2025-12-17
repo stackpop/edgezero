@@ -35,9 +35,9 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::http::response_builder;
-    use bytes::Bytes;
     use futures_util::{stream, StreamExt};
 
     #[test]

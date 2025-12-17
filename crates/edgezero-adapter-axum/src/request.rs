@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
 
-use edgezero_core::body::Body;
-use edgezero_core::http::Request as CoreRequest;
-use edgezero_core::proxy::ProxyHandle;
 use axum::body::Body as AxumBody;
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::Request;
+use edgezero_core::body::Body;
+use edgezero_core::http::Request as CoreRequest;
+use edgezero_core::proxy::ProxyHandle;
 use http::header::CONTENT_TYPE;
 use http::HeaderValue;
 

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
@@ -10,7 +11,6 @@ use edgezero_adapter::scaffold::{
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
 use edgezero_adapter::{register_adapter, Adapter, AdapterAction};
-use ctor::ctor;
 use walkdir::WalkDir;
 
 const TARGET_TRIPLE: &str = "wasm32-unknown-unknown";

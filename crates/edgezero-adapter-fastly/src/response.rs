@@ -36,9 +36,9 @@ pub fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::http::response_builder;
-    use bytes::Bytes;
     use futures_util::stream;
 
     #[test]

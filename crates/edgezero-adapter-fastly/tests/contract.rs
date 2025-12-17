@@ -1,5 +1,6 @@
 #![cfg(all(feature = "fastly", target_arch = "wasm32"))]
 
+use bytes::Bytes;
 use edgezero_adapter_fastly::{
     dispatch, from_core_response, into_core_request, FastlyRequestContext,
 };
@@ -9,7 +10,6 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{response_builder, Method, Response, StatusCode};
 use edgezero_core::router::RouterService;
-use bytes::Bytes;
 use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
 use fastly::Request as FastlyRequest;
 use futures::stream;

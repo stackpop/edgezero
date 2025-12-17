@@ -1,11 +1,11 @@
+use async_stream::try_stream;
+use async_trait::async_trait;
+use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderValue, Method, Uri};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
-use async_stream::try_stream;
-use async_trait::async_trait;
-use bytes::Bytes;
 use fastly::{
     http::body::StreamingBody, Backend, Request as FastlyRequest, Response as FastlyResponse,
 };

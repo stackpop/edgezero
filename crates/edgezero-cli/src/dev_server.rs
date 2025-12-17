@@ -14,9 +14,9 @@ use crate::adapter::Action;
 use edgezero_core::{action, extractor::Path, response::Text};
 
 #[cfg(feature = "dev-example")]
-use edgezero_core::app::Hooks;
-#[cfg(feature = "dev-example")]
 use app_demo_core::App;
+#[cfg(feature = "dev-example")]
+use edgezero_core::app::Hooks;
 
 pub fn run_dev() {
     match try_run_manifest_axum() {

@@ -1,10 +1,10 @@
 use std::time::Duration;
 
+use async_trait::async_trait;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderName, HeaderValue, Method, StatusCode};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
-use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{header, Client};
 

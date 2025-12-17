@@ -1,12 +1,12 @@
 #![cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 
+use bytes::Bytes;
 use edgezero_adapter_cloudflare::{
     dispatch, from_core_response, into_core_request, CloudflareRequestContext,
 };
 use edgezero_core::{
     response_builder, App, Body, EdgeError, Method, RequestContext, RouterService, StatusCode,
 };
-use bytes::Bytes;
 use futures::stream;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
