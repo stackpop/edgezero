@@ -10,10 +10,10 @@ path = "src/main.rs"
 
 [features]
 default = ["cloudflare"]
-cloudflare = ["anyedge-adapter-cloudflare/cloudflare"]
+cloudflare = ["edgezero-adapter-cloudflare/cloudflare"]
 
 [dependencies]
 app-demo-core = { workspace = true }
-anyedge-adapter-cloudflare = { workspace = true }
-anyedge-core = { workspace = true }
+edgezero-adapter-cloudflare = { workspace = true }
+edgezero-core = { workspace = true }
 worker = { workspace = true }

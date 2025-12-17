@@ -92,145 +92,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyedge-adapter"
-version = "0.1.0"
-dependencies = [
- "once_cell",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "anyedge-adapter-axum"
-version = "0.1.0"
-dependencies = [
- "anyedge-adapter",
- "anyedge-core",
- "anyhow",
- "async-trait",
- "axum",
- "bytes",
- "ctor",
- "futures",
- "futures-util",
- "http",
- "log",
- "reqwest",
- "simple_logger",
- "tempfile",
- "thiserror 2.0.17",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "walkdir",
-]
-
-[[package]]
-name = "anyedge-adapter-cloudflare"
-version = "0.1.0"
-dependencies = [
- "anyedge-adapter",
- "anyedge-core",
- "async-trait",
- "brotli",
- "bytes",
- "ctor",
- "flate2",
- "futures",
- "futures-util",
- "log",
- "walkdir",
- "wasm-bindgen-test",
- "web-sys",
- "worker",
-]
-
-[[package]]
-name = "anyedge-adapter-fastly"
-version = "0.1.0"
-dependencies = [
- "anyedge-adapter",
- "anyedge-core",
- "async-stream",
- "async-trait",
- "brotli",
- "bytes",
- "chrono",
- "ctor",
- "fastly",
- "fern",
- "flate2",
- "futures",
- "futures-util",
- "log",
- "log-fastly",
- "tempfile",
- "walkdir",
-]
-
-[[package]]
-name = "anyedge-cli"
-version = "0.1.0"
-dependencies = [
- "anyedge-adapter",
- "anyedge-adapter-axum",
- "anyedge-adapter-cloudflare",
- "anyedge-adapter-fastly",
- "anyedge-core",
- "app-demo-core",
- "clap",
- "futures",
- "handlebars",
- "log",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
-]
-
-[[package]]
-name = "anyedge-core"
-version = "0.1.0"
-dependencies = [
- "anyedge-macros",
- "anyhow",
- "async-compression",
- "async-stream",
- "async-trait",
- "brotli",
- "bytes",
- "flate2",
- "futures",
- "futures-util",
- "http",
- "http-body",
- "log",
- "matchit 0.9.0",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror 2.0.17",
- "toml",
- "tower-service",
- "tracing",
- "validator",
-]
-
-[[package]]
-name = "anyedge-macros"
-version = "0.1.0"
-dependencies = [
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "syn 2.0.108",
- "toml",
- "validator",
-]
-
-[[package]]
 name = "anyhow"
 version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -240,11 +101,11 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 name = "app-demo-adapter-axum"
 version = "0.1.0"
 dependencies = [
- "anyedge-adapter-axum",
- "anyedge-core",
  "anyhow",
  "app-demo-core",
  "axum",
+ "edgezero-adapter-axum",
+ "edgezero-core",
  "log",
  "simple_logger",
  "tokio",
@@ -255,9 +116,9 @@ dependencies = [
 name = "app-demo-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
- "anyedge-adapter-cloudflare",
- "anyedge-core",
  "app-demo-core",
+ "edgezero-adapter-cloudflare",
+ "edgezero-core",
  "worker",
 ]
 
@@ -265,9 +126,9 @@ dependencies = [
 name = "app-demo-adapter-fastly"
 version = "0.1.0"
 dependencies = [
- "anyedge-adapter-fastly",
- "anyedge-core",
  "app-demo-core",
+ "edgezero-adapter-fastly",
+ "edgezero-core",
  "fastly",
  "log",
  "once_cell",
@@ -277,9 +138,9 @@ dependencies = [
 name = "app-demo-core"
 version = "0.1.0"
 dependencies = [
- "anyedge-core",
  "async-trait",
  "bytes",
+ "edgezero-core",
  "futures",
  "serde",
  "serde_json",
@@ -760,6 +621,145 @@ name = "dtor-proc-macro"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
+
+[[package]]
+name = "edgezero-adapter"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "edgezero-adapter-axum"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "bytes",
+ "ctor",
+ "edgezero-adapter",
+ "edgezero-core",
+ "futures",
+ "futures-util",
+ "http",
+ "log",
+ "reqwest",
+ "simple_logger",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "edgezero-adapter-cloudflare"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "brotli",
+ "bytes",
+ "ctor",
+ "edgezero-adapter",
+ "edgezero-core",
+ "flate2",
+ "futures",
+ "futures-util",
+ "log",
+ "walkdir",
+ "wasm-bindgen-test",
+ "web-sys",
+ "worker",
+]
+
+[[package]]
+name = "edgezero-adapter-fastly"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "brotli",
+ "bytes",
+ "chrono",
+ "ctor",
+ "edgezero-adapter",
+ "edgezero-core",
+ "fastly",
+ "fern",
+ "flate2",
+ "futures",
+ "futures-util",
+ "log",
+ "log-fastly",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
+name = "edgezero-cli"
+version = "0.1.0"
+dependencies = [
+ "app-demo-core",
+ "clap",
+ "edgezero-adapter",
+ "edgezero-adapter-axum",
+ "edgezero-adapter-cloudflare",
+ "edgezero-adapter-fastly",
+ "edgezero-core",
+ "futures",
+ "handlebars",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "edgezero-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-stream",
+ "async-trait",
+ "brotli",
+ "bytes",
+ "edgezero-macros",
+ "flate2",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body",
+ "log",
+ "matchit 0.9.0",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.17",
+ "toml",
+ "tower-service",
+ "tracing",
+ "validator",
+]
+
+[[package]]
+name = "edgezero-macros"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.108",
+ "toml",
+ "validator",
+]
 
 [[package]]
 name = "either"

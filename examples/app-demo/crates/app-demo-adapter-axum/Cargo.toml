@@ -10,9 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 app-demo-core = { workspace = true }
-anyedge-core = { workspace = true }
+edgezero-core = { workspace = true }
 anyhow = { workspace = true }
-anyedge-adapter-axum = { workspace = true, features = ["axum"] }
+edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 axum = { workspace = true }
 log = { workspace = true }
 simple_logger = { workspace = true }

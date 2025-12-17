@@ -1,0 +1,32 @@
+[package]
+name = "edgezero-adapter-fastly"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[features]
+default = []
+cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:walkdir"]
+fastly = ["dep:fastly", "dep:log-fastly"]
+
+[dependencies]
+edgezero-core = { path = "../edgezero-core" }
+edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = ["cli"] }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+brotli = { workspace = true }
+bytes = { workspace = true }
+ctor = { workspace = true, optional = true }
+fastly = { workspace = true, optional = true }
+flate2 = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+log-fastly = { workspace = true, optional = true }
+fern = { workspace = true }
+chrono = { workspace = true }
+walkdir = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,23 @@
+[package]
+name = "{{proj_cloudflare}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "{{proj_cloudflare}}"
+path = "src/main.rs"
+
+[features]
+default = ["cloudflare"]
+cloudflare = ["edgezero-adapter-cloudflare/cloudflare"]
+
+[dependencies]
+{{proj_core}} = { path = "../{{proj_core}}" }
+{{{dep_edgezero_adapter_cloudflare}}}
+edgezero-core = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+{{{dep_edgezero_core_cloudflare}}}
+{{{dep_edgezero_adapter_cloudflare_wasm}}}
+worker = { workspace = true }

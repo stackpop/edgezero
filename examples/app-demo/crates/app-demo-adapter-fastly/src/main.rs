@@ -8,7 +8,7 @@ use fastly::{Error, Request, Response};
 #[cfg(target_arch = "wasm32")]
 #[fastly::main]
 pub fn main(req: Request) -> Result<Response, Error> {
-    anyedge_adapter_fastly::run_app::<App>(include_str!("../../../anyedge.toml"), req)
+    edgezero_adapter_fastly::run_app::<App>(include_str!("../../../edgezero.toml"), req)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

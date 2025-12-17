@@ -1,8 +1,8 @@
-# anyedge.toml Manifest
+# edgezero.toml Manifest
 
-The `anyedge.toml` file describes an AnyEdge application, mirroring the
+The `edgezero.toml` file describes an EdgeZero application, mirroring the
 ergonomics of Spin's manifest while remaining provider agnostic. New workspaces
-scaffolded with `anyedge new` now include this manifest by default.
+scaffolded with `edgezero new` now include this manifest by default.
 
 ## Top-level structure
 
@@ -12,7 +12,7 @@ name = "demo"
 version = "0.1.0"
 kind = "http"
 entry = "crates/demo-core"
-middleware = ["anyedge_core::middleware::RequestLogger"]
+middleware = ["edgezero_core::middleware::RequestLogger"]
 
 [[triggers.http]]
 id = "root"
@@ -75,7 +75,7 @@ level = "info"
 Metadata about the application: the display name, the crate that exposes the router (`entry`),
 and an optional `middleware = ["path::to::Middleware"]` list of zero-argument constructors
 that are registered before routes are added. Each entry must resolve to a type or function
-implementing `anyedge_core::middleware::Middleware`, letting global behaviour (logging, CORS, auth guards,
+implementing `edgezero_core::middleware::Middleware`, letting global behaviour (logging, CORS, auth guards,
 etc.) live alongside the manifest instead of being hard-wired in Rust.
 
 ### `app.middleware`
@@ -88,7 +88,7 @@ in order before the request is handed to route handlers. For example:
 name = "app-demo"
 entry = "crates/app-demo-core"
 middleware = [
-  "anyedge_core::middleware::RequestLogger",
+  "edgezero_core::middleware::RequestLogger",
   "app_demo_core::cors::Cors"
 ]
 ```
@@ -101,7 +101,7 @@ implements `Middleware`.
 Defines HTTP routes and their handlers. Fields:
 
 - `id`: Stable identifier for the route (optional but useful for tooling).
-- `path`: URI template understood by `anyedge-core`.
+- `path`: URI template understood by `edgezero-core`.
 - `methods`: Allowed HTTP methods (defaults to `GET` if omitted).
 - `handler`: Path to the handler function (for reference/documentation).
 - `adapters`: Which adapters expose the route. Empty means “all adapters”.
@@ -112,7 +112,7 @@ Defines HTTP routes and their handlers. Fields:
 Declares environment variables and secrets shared across adapters. Each entry
 supports a human-friendly description, the upstream environment key (`env`,
 defaulting to the `name`), an optional default `value`, and a provider filter.
-When running provider commands through `anyedge-cli`, variables with a default
+When running provider commands through `edgezero-cli`, variables with a default
 `value` are injected into the child process and secrets must already be present
 in the environment; missing secrets will cause the command to abort with a
 helpful error message.
@@ -126,7 +126,7 @@ Describes how a provider adapter is built and invoked.
 - `[adapters.<name>.build]`: Build target, profile, and optional feature list.
 - `[adapters.<name>.commands]`: Convenience commands for build/serve/deploy.
 
-The AnyEdge CLI will, when present, run these commands for `build`, `serve`,
+The EdgeZero CLI will, when present, run these commands for `build`, `serve`,
 and `deploy` before falling back to the adapter's built-in behaviour. That lets
 you customise provider tooling (e.g. add flags) without recompiling the CLI.
 
@@ -145,7 +145,7 @@ adapters can obtain provider-specific settings via
 level while leaving optional values available for provider-specific defaults at
 runtime.
 
-Manifest parsing lives in `anyedge-core::manifest`, and CLI commands now verify
+Manifest parsing lives in `edgezero-core::manifest`, and CLI commands now verify
 that a provider is declared before invoking adapter-specific tooling. Additional
 provider metadata (extra environment bindings, secrets per provider, extra
 commands) can be layered under these sections without breaking existing tooling
@@ -155,30 +155,30 @@ thanks to permissive deserialisation defaults.
 and handlers, well-formed logging levels, etc.) so mistakes are caught early at
 startup or during macro expansion.
 
-`anyedge-core::ManifestLoader` provides a shared parser so applications can load
+`edgezero-core::ManifestLoader` provides a shared parser so applications can load
 the manifest at runtime. The demo app uses this loader to build its router from
 the manifest, and the CLI reuses the same types when executing provider
 commands.
 
 ## CLI integration
 
-`anyedge build|serve|deploy --adapter <name>` looks up the provider entry in
-`anyedge.toml`. If a `[adapters.<name>.commands]` block supplies a `build`,
+`edgezero build|serve|deploy --adapter <name>` looks up the provider entry in
+`edgezero.toml`. If a `[adapters.<name>.commands]` block supplies a `build`,
 `serve`, or `deploy` command, the CLI executes it from the manifest directory.
 This allows each adapter to decide how artifacts are produced (for example,
 invoking `cargo build --target wasm32-wasip1` for Fastly or `wrangler dev` for
 Cloudflare). When commands are omitted, the CLI falls back to the built-in
 helpers shipped with the adapters (currently the Fastly adapter).
 
-The example app under `examples/app-demo` ships an `anyedge.toml` manifest that
+The example app under `examples/app-demo` ships an `edgezero.toml` manifest that
 drives both runtime routing and CLI commands. `app-demo-core` reads the manifest
 at startup to register HTTP routes (rather than hard-coding paths in Rust), and
-running `anyedge build --adapter fastly` from the workspace root invokes the
+running `edgezero build --adapter fastly` from the workspace root invokes the
 Fastly build command specified in the manifest.
 
 ## Generating routers via macro
 
-Use `anyedge_core::app!("path/to/anyedge.toml", AppName);` inside your
+Use `edgezero_core::app!("path/to/edgezero.toml", AppName);` inside your
 crate to generate a `Hooks` implementation and `build_router` function directly
 from the manifest. The `AppName` argument is optional; when omitted the macro
 emits a struct named `App`. The macro understands the HTTP trigger list (including
@@ -190,7 +190,7 @@ shows the minimal usage:
 ```rust
 mod handlers;
 
-anyedge_core::app!("../../anyedge.toml");
+edgezero_core::app!("../../edgezero.toml");
 ```
 
 Handlers referenced in the manifest can therefore use either `crate::` or the

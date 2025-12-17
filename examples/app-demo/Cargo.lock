@@ -51,101 +51,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyedge-adapter-axum"
-version = "0.1.0"
-dependencies = [
- "anyedge-core",
- "anyhow",
- "async-trait",
- "axum 0.8.6",
- "bytes",
- "futures",
- "futures-util",
- "http",
- "log",
- "reqwest",
- "simple_logger 5.1.0",
- "thiserror 2.0.16",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "anyedge-adapter-cloudflare"
-version = "0.1.0"
-dependencies = [
- "anyedge-core",
- "async-trait",
- "brotli",
- "bytes",
- "flate2",
- "futures",
- "futures-util",
- "log",
- "wasm-bindgen-test",
- "worker",
-]
-
-[[package]]
-name = "anyedge-adapter-fastly"
-version = "0.1.0"
-dependencies = [
- "anyedge-core",
- "async-stream",
- "async-trait",
- "brotli",
- "bytes",
- "chrono",
- "fastly",
- "fern",
- "flate2",
- "futures",
- "futures-util",
- "log",
- "log-fastly",
-]
-
-[[package]]
-name = "anyedge-core"
-version = "0.1.0"
-dependencies = [
- "anyedge-macros",
- "anyhow",
- "async-compression",
- "async-stream",
- "async-trait",
- "bytes",
- "futures",
- "futures-util",
- "http",
- "http-body",
- "log",
- "matchit 0.8.4",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "thiserror 2.0.16",
- "toml",
- "tower-service",
- "tracing",
- "validator",
-]
-
-[[package]]
-name = "anyedge-macros"
-version = "0.1.0"
-dependencies = [
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "syn 2.0.106",
- "toml",
- "validator",
-]
-
-[[package]]
 name = "anyhow"
 version = "1.0.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -155,11 +60,11 @@ checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 name = "app-demo-adapter-axum"
 version = "0.1.0"
 dependencies = [
- "anyedge-adapter-axum",
- "anyedge-core",
  "anyhow",
  "app-demo-core",
  "axum 0.7.9",
+ "edgezero-adapter-axum",
+ "edgezero-core",
  "log",
  "simple_logger 4.3.3",
  "tokio",
@@ -170,9 +75,9 @@ dependencies = [
 name = "app-demo-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
- "anyedge-adapter-cloudflare",
- "anyedge-core",
  "app-demo-core",
+ "edgezero-adapter-cloudflare",
+ "edgezero-core",
  "worker",
 ]
 
@@ -180,9 +85,9 @@ dependencies = [
 name = "app-demo-adapter-fastly"
 version = "0.1.0"
 dependencies = [
- "anyedge-adapter-fastly",
- "anyedge-core",
  "app-demo-core",
+ "edgezero-adapter-fastly",
+ "edgezero-core",
  "fastly",
  "log",
  "once_cell",
@@ -192,8 +97,9 @@ dependencies = [
 name = "app-demo-core"
 version = "0.1.0"
 dependencies = [
- "anyedge-core",
+ "async-trait",
  "bytes",
+ "edgezero-core",
  "futures",
  "serde",
  "serde_json",
@@ -605,6 +511,101 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
+name = "edgezero-adapter-axum"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum 0.8.6",
+ "bytes",
+ "edgezero-core",
+ "futures",
+ "futures-util",
+ "http",
+ "log",
+ "reqwest",
+ "simple_logger 5.1.0",
+ "thiserror 2.0.16",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "edgezero-adapter-cloudflare"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "brotli",
+ "bytes",
+ "edgezero-core",
+ "flate2",
+ "futures",
+ "futures-util",
+ "log",
+ "wasm-bindgen-test",
+ "worker",
+]
+
+[[package]]
+name = "edgezero-adapter-fastly"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "brotli",
+ "bytes",
+ "chrono",
+ "edgezero-core",
+ "fastly",
+ "fern",
+ "flate2",
+ "futures",
+ "futures-util",
+ "log",
+ "log-fastly",
+]
+
+[[package]]
+name = "edgezero-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "edgezero-macros",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body",
+ "log",
+ "matchit 0.9.0",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.16",
+ "toml",
+ "tower-service",
+ "tracing",
+ "validator",
+]
+
+[[package]]
+name = "edgezero-macros"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "proc-macro2",
+ "quote",
+ "serde",
+ "syn 2.0.106",
+ "toml",
+ "validator",
+]
 
 [[package]]
 name = "either"
@@ -1229,6 +1230,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "matchit"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ea5f97102eb9e54ab99fb70bb175589073f554bdadfb74d9bd656482ea73e2a"
+
+[[package]]
 name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1460,7 +1467,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2407,7 +2414,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
