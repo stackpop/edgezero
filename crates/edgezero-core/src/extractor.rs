@@ -1,6 +1,7 @@
 use std::ops::{Deref, DerefMut};
 
 use async_trait::async_trait;
+use http::header;
 use serde::de::DeserializeOwned;
 use validator::Validate;
 
@@ -106,6 +107,50 @@ impl DerefMut for Headers {
 
 impl Headers {
     pub fn into_inner(self) -> HeaderMap {
+        self.0
+    }
+}
+
+/// Extracts the effective host from the request.
+///
+/// Checks headers in this order:
+/// 1. `X-Forwarded-Host` - set by reverse proxies/load balancers
+/// 2. `Host` - standard HTTP host header
+/// 3. Falls back to "localhost" if neither is present
+///
+/// # Example
+/// ```ignore
+/// #[action]
+/// pub async fn handler(Host(host): Host) -> Response {
+///     // host contains the effective hostname
+/// }
+/// ```
+pub struct Host(pub String);
+
+#[async_trait(?Send)]
+impl FromRequest for Host {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        let headers = ctx.request().headers();
+        let host = headers
+            .get("x-forwarded-host")
+            .or_else(|| headers.get(header::HOST))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost")
+            .to_string();
+        Ok(Host(host))
+    }
+}
+
+impl Deref for Host {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Host {
+    pub fn into_inner(self) -> String {
         self.0
     }
 }
@@ -373,10 +418,9 @@ mod tests {
     #[test]
     fn json_extractor_propagates_errors() {
         let ctx = ctx(Body::from("not json"), PathParams::default());
-        let err = match block_on(Json::<Payload>::from_request(&ctx)) {
-            Ok(_) => panic!("expected error"),
-            Err(err) => err,
-        };
+        let err = block_on(Json::<Payload>::from_request(&ctx))
+            .err()
+            .expect("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -384,10 +428,9 @@ mod tests {
     fn validated_json_rejects_invalid_payloads() {
         let body = Body::json(&ValidatedPayload { name: "".into() }).expect("json");
         let ctx = ctx(body, PathParams::default());
-        let err = match block_on(ValidatedJson::<ValidatedPayload>::from_request(&ctx)) {
-            Ok(_) => panic!("expected validation error"),
-            Err(err) => err,
-        };
+        let err = block_on(ValidatedJson::<ValidatedPayload>::from_request(&ctx))
+            .err()
+            .expect("expected validation error");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -409,5 +452,365 @@ mod tests {
             headers.get("x-test").and_then(|v| v.to_str().ok()).unwrap(),
             "value"
         );
+    }
+
+    // Query extractor tests
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct QueryParams {
+        page: Option<u32>,
+        q: Option<String>,
+    }
+
+    fn ctx_with_query(query: &str) -> RequestContext {
+        let uri = format!("/test?{}", query);
+        let request = request_builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
+    }
+
+    #[test]
+    fn query_extractor_parses_params() {
+        let ctx = ctx_with_query("page=5&q=hello");
+        let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
+        assert_eq!(query.page, Some(5));
+        assert_eq!(query.q.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn query_extractor_handles_missing_optional_params() {
+        let ctx = ctx_with_query("page=1");
+        let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
+        assert_eq!(query.page, Some(1));
+        assert_eq!(query.q, None);
+    }
+
+    #[test]
+    fn query_extractor_handles_empty_query() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
+        assert_eq!(query.page, None);
+        assert_eq!(query.q, None);
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedQueryParams {
+        #[validate(range(min = 1, max = 100))]
+        page: u32,
+    }
+
+    #[test]
+    fn validated_query_accepts_valid_params() {
+        let ctx = ctx_with_query("page=50");
+        let query =
+            block_on(ValidatedQuery::<ValidatedQueryParams>::from_request(&ctx)).expect("query");
+        assert_eq!(query.page, 50);
+    }
+
+    #[test]
+    fn validated_query_rejects_invalid_params() {
+        let ctx = ctx_with_query("page=200");
+        let err = block_on(ValidatedQuery::<ValidatedQueryParams>::from_request(&ctx))
+            .err()
+            .expect("expected validation error");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // Form extractor tests
+    fn ctx_with_form(body: &str) -> RequestContext {
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_string()))
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct FormData {
+        username: String,
+        age: Option<u32>,
+    }
+
+    #[test]
+    fn form_extractor_parses_urlencoded_body() {
+        let ctx = ctx_with_form("username=alice&age=30");
+        let form = block_on(Form::<FormData>::from_request(&ctx)).expect("form");
+        assert_eq!(form.username, "alice");
+        assert_eq!(form.age, Some(30));
+    }
+
+    #[test]
+    fn form_extractor_handles_missing_optional_fields() {
+        let ctx = ctx_with_form("username=bob");
+        let form = block_on(Form::<FormData>::from_request(&ctx)).expect("form");
+        assert_eq!(form.username, "bob");
+        assert_eq!(form.age, None);
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedFormData {
+        #[validate(length(min = 3))]
+        username: String,
+    }
+
+    #[test]
+    fn validated_form_accepts_valid_data() {
+        let ctx = ctx_with_form("username=alice");
+        let form = block_on(ValidatedForm::<ValidatedFormData>::from_request(&ctx)).expect("form");
+        assert_eq!(form.username, "alice");
+    }
+
+    #[test]
+    fn validated_form_rejects_invalid_data() {
+        let ctx = ctx_with_form("username=ab");
+        let err = block_on(ValidatedForm::<ValidatedFormData>::from_request(&ctx))
+            .err()
+            .expect("expected validation error");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // ValidatedPath tests
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedPathParams {
+        #[validate(length(min = 1, max = 10))]
+        id: String,
+    }
+
+    #[test]
+    fn validated_path_accepts_valid_params() {
+        let ctx = ctx(Body::empty(), params(&[("id", "abc123")]));
+        let path =
+            block_on(ValidatedPath::<ValidatedPathParams>::from_request(&ctx)).expect("path");
+        assert_eq!(path.id, "abc123");
+    }
+
+    #[test]
+    fn validated_path_rejects_invalid_params() {
+        let ctx = ctx(Body::empty(), params(&[("id", "this-id-is-way-too-long")]));
+        let err = block_on(ValidatedPath::<ValidatedPathParams>::from_request(&ctx))
+            .err()
+            .expect("expected validation error");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // Deref/DerefMut and into_inner tests
+    #[test]
+    fn json_deref_and_into_inner() {
+        let json = Json(Payload {
+            name: "test".into(),
+        });
+        assert_eq!(json.name, "test"); // Deref
+        let inner = json.into_inner();
+        assert_eq!(inner.name, "test");
+    }
+
+    #[test]
+    fn json_deref_mut() {
+        let mut json = Json(Payload { name: "old".into() });
+        json.name = "new".into(); // DerefMut
+        assert_eq!(json.name, "new");
+    }
+
+    #[test]
+    fn query_deref_and_into_inner() {
+        let query = Query(QueryParams {
+            page: Some(1),
+            q: None,
+        });
+        assert_eq!(query.page, Some(1)); // Deref
+        let inner = query.into_inner();
+        assert_eq!(inner.page, Some(1));
+    }
+
+    #[test]
+    fn query_deref_mut() {
+        let mut query = Query(QueryParams {
+            page: Some(1),
+            q: None,
+        });
+        query.page = Some(2); // DerefMut
+        assert_eq!(query.page, Some(2));
+    }
+
+    #[test]
+    fn path_deref_and_into_inner() {
+        let path = Path(PathPayload { id: "123".into() });
+        assert_eq!(path.id, "123"); // Deref
+        let inner = path.into_inner();
+        assert_eq!(inner.id, "123");
+    }
+
+    #[test]
+    fn path_deref_mut() {
+        let mut path = Path(PathPayload { id: "old".into() });
+        path.id = "new".into(); // DerefMut
+        assert_eq!(path.id, "new");
+    }
+
+    #[test]
+    fn form_deref_and_into_inner() {
+        let form = Form(FormData {
+            username: "alice".into(),
+            age: Some(25),
+        });
+        assert_eq!(form.username, "alice"); // Deref
+        let inner = form.into_inner();
+        assert_eq!(inner.username, "alice");
+    }
+
+    #[test]
+    fn form_deref_mut() {
+        let mut form = Form(FormData {
+            username: "alice".into(),
+            age: None,
+        });
+        form.age = Some(30); // DerefMut
+        assert_eq!(form.age, Some(30));
+    }
+
+    #[test]
+    fn headers_deref_and_into_inner() {
+        let mut map = HeaderMap::new();
+        map.insert("x-custom", HeaderValue::from_static("value"));
+        let headers = Headers(map);
+        assert!(headers.get("x-custom").is_some()); // Deref
+        let inner = headers.into_inner();
+        assert!(inner.get("x-custom").is_some());
+    }
+
+    #[test]
+    fn headers_deref_mut() {
+        let mut headers = Headers(HeaderMap::new());
+        headers.insert("x-new", HeaderValue::from_static("value")); // DerefMut
+        assert!(headers.get("x-new").is_some());
+    }
+
+    #[test]
+    fn validated_json_deref_and_into_inner() {
+        let json = ValidatedJson(ValidatedPayload {
+            name: "test".into(),
+        });
+        assert_eq!(json.name, "test"); // Deref
+        let inner = json.into_inner();
+        assert_eq!(inner.name, "test");
+    }
+
+    #[test]
+    fn validated_json_deref_mut() {
+        let mut json = ValidatedJson(ValidatedPayload { name: "old".into() });
+        json.name = "new".into(); // DerefMut
+        assert_eq!(json.name, "new");
+    }
+
+    #[test]
+    fn validated_query_into_inner() {
+        let query = ValidatedQuery(ValidatedQueryParams { page: 10 });
+        assert_eq!(query.page, 10); // Deref
+        let inner = query.into_inner();
+        assert_eq!(inner.page, 10);
+    }
+
+    #[test]
+    fn validated_query_deref_mut() {
+        let mut query = ValidatedQuery(ValidatedQueryParams { page: 10 });
+        query.page = 20; // DerefMut
+        assert_eq!(query.page, 20);
+    }
+
+    #[test]
+    fn validated_path_into_inner() {
+        let path = ValidatedPath(ValidatedPathParams { id: "abc".into() });
+        assert_eq!(path.id, "abc"); // Deref
+        let inner = path.into_inner();
+        assert_eq!(inner.id, "abc");
+    }
+
+    #[test]
+    fn validated_path_deref_mut() {
+        let mut path = ValidatedPath(ValidatedPathParams { id: "old".into() });
+        path.id = "new".into(); // DerefMut
+        assert_eq!(path.id, "new");
+    }
+
+    #[test]
+    fn validated_form_into_inner() {
+        let form = ValidatedForm(ValidatedFormData {
+            username: "alice".into(),
+        });
+        assert_eq!(form.username, "alice"); // Deref
+        let inner = form.into_inner();
+        assert_eq!(inner.username, "alice");
+    }
+
+    #[test]
+    fn validated_form_deref_mut() {
+        let mut form = ValidatedForm(ValidatedFormData {
+            username: "old".into(),
+        });
+        form.username = "new".into(); // DerefMut
+        assert_eq!(form.username, "new");
+    }
+
+    // Host extractor tests
+    #[test]
+    fn host_extractor_uses_x_forwarded_host_first() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .headers_mut()
+            .insert("host", HeaderValue::from_static("internal.local"));
+        request
+            .headers_mut()
+            .insert("x-forwarded-host", HeaderValue::from_static("example.com"));
+        let ctx = RequestContext::new(request, PathParams::default());
+        let host = block_on(Host::from_request(&ctx)).expect("host");
+        assert_eq!(host.0, "example.com");
+    }
+
+    #[test]
+    fn host_extractor_falls_back_to_host_header() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .headers_mut()
+            .insert("host", HeaderValue::from_static("example.com"));
+        let ctx = RequestContext::new(request, PathParams::default());
+        let host = block_on(Host::from_request(&ctx)).expect("host");
+        assert_eq!(host.0, "example.com");
+    }
+
+    #[test]
+    fn host_extractor_uses_default_when_no_headers() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        let host = block_on(Host::from_request(&ctx)).expect("host");
+        assert_eq!(host.0, "localhost");
+    }
+
+    #[test]
+    fn host_deref_and_into_inner() {
+        let host = Host("example.com".to_string());
+        assert_eq!(&*host, "example.com"); // Deref
+        let inner = host.into_inner();
+        assert_eq!(inner, "example.com");
     }
 }

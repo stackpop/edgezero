@@ -144,6 +144,7 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
     use futures_util::StreamExt;
+    use std::io;
 
     #[test]
     fn collect_stream_body() {
@@ -165,6 +166,24 @@ mod tests {
     }
 
     #[test]
+    fn from_stream_maps_errors() {
+        let stream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"ok")),
+            Err(io::Error::new(io::ErrorKind::Other, "boom")),
+        ]);
+        let body = Body::from_stream(stream);
+        let mut stream = body.into_stream().expect("stream");
+        let (first, second) = block_on(async {
+            let first = stream.next().await.expect("first").expect("ok");
+            let second = stream.next().await.expect("second");
+            (first, second)
+        });
+        assert_eq!(first, Bytes::from_static(b"ok"));
+        let err = second.expect_err("error");
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
     fn to_json_fails_for_streaming_body() {
         let body = Body::stream(futures_util::stream::iter(vec![
             Bytes::from_static(b"{"),
@@ -180,5 +199,49 @@ mod tests {
         )]));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.into_bytes()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn as_bytes_panics_for_stream() {
+        let body = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
+            b"data",
+        )]));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_bytes()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn into_stream_returns_none_for_buffered_body() {
+        let body = Body::from("payload");
+        assert!(body.into_stream().is_none());
+    }
+
+    #[test]
+    fn is_stream_returns_false_for_buffered_body() {
+        let body = Body::from("payload");
+        assert!(!body.is_stream());
+    }
+
+    #[test]
+    fn default_body_is_empty() {
+        let body = Body::default();
+        assert!(body.as_bytes().is_empty());
+    }
+
+    #[test]
+    fn debug_formats_both_body_variants() {
+        let buffered = Body::from("payload");
+        let buffered_debug = format!("{:?}", buffered);
+        assert!(buffered_debug.contains("Body::Once"));
+
+        let stream = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(b"chunk")]));
+        let stream_debug = format!("{:?}", stream);
+        assert!(stream_debug.contains("Body::Stream"));
+    }
+
+    #[test]
+    fn from_vec_u8_builds_buffered_body() {
+        let body = Body::from(vec![1u8, 2u8, 3u8]);
+        assert_eq!(body.as_bytes(), &[1u8, 2u8, 3u8]);
     }
 }

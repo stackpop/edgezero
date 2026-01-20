@@ -119,4 +119,25 @@ mod tests {
         let response = response_with_body(StatusCode::OK, Body::empty());
         assert!(response.headers().get(CONTENT_LENGTH).is_none());
     }
+
+    #[test]
+    fn text_wrapper_builds_response() {
+        let response = Text::new("hello").into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().as_bytes(), b"hello");
+    }
+
+    #[test]
+    fn unit_type_sets_no_content() {
+        let response = ().into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.body().as_bytes().is_empty());
+    }
+
+    #[test]
+    fn status_code_tuple_overrides_status() {
+        let response = (StatusCode::CREATED, "created").into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.body().as_bytes(), b"created");
+    }
 }

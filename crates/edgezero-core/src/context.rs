@@ -88,7 +88,7 @@ impl RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{request_builder, Method, StatusCode};
+    use crate::http::{request_builder, HeaderValue, Method, StatusCode, Uri};
     use crate::params::PathParams;
     use crate::proxy::{ProxyClient, ProxyHandle, ProxyRequest, ProxyResponse};
     use async_trait::async_trait;
@@ -124,6 +124,8 @@ mod tests {
         let ctx = ctx("/items/42", Body::empty(), params(&[("id", "42")]));
         let parsed: PathData = ctx.path().expect("path parameters");
         assert_eq!(parsed, PathData { id: "42".into() });
+        let serialized = serde_json::to_string(&parsed).expect("serialize");
+        assert!(serialized.contains("42"));
     }
 
     #[test]
@@ -133,11 +135,10 @@ mod tests {
         struct NumericPath {
             id: u32,
         }
+        let debug = format!("{:?}", NumericPath { id: 0 });
+        assert!(debug.contains('0'));
         let ctx = ctx("/items/foo", Body::empty(), params(&[("id", "foo")]));
-        let err = match ctx.path::<NumericPath>() {
-            Ok(_) => panic!("expected error"),
-            Err(err) => err,
-        };
+        let err = ctx.path::<NumericPath>().expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(err.message().contains("invalid path parameters"));
     }
@@ -154,12 +155,25 @@ mod tests {
     }
 
     #[test]
+    fn query_defaults_to_empty_when_missing() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Query {
+            page: Option<u8>,
+        }
+        let ctx = ctx("/items", Body::empty(), PathParams::default());
+        let parsed: Query = ctx.query().expect("query");
+        assert_eq!(parsed.page, None);
+    }
+
+    #[test]
     fn invalid_query_returns_bad_request() {
         #[allow(dead_code)]
         #[derive(Debug, Deserialize)]
         struct Query {
             page: u8,
         }
+        let debug = format!("{:?}", Query { page: 0 });
+        assert!(debug.contains('0'));
         let ctx = ctx("/items?page=foo", Body::empty(), PathParams::default());
         let err = ctx.query::<Query>().expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
@@ -210,6 +224,33 @@ mod tests {
                 name: "demo".into()
             }
         );
+        let debug = format!("{:?}", parsed);
+        assert!(debug.contains("demo"));
+    }
+
+    #[test]
+    fn invalid_form_returns_bad_request() {
+        #[allow(dead_code)]
+        #[derive(Deserialize)]
+        struct FormData {
+            age: u8,
+        }
+        let body = Body::from("age=not-a-number");
+        let ctx = ctx("/submit", body, PathParams::default());
+        let err = ctx
+            .form::<FormData>()
+            .err()
+            .expect("expected error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert!(err.message().contains("invalid form payload"));
+    }
+
+    #[test]
+    fn form_value_deserialises_successfully() {
+        let body = Body::from("name=demo");
+        let ctx = ctx("/submit", body, PathParams::default());
+        let parsed: serde_json::Value = ctx.form().expect("form data");
+        assert_eq!(parsed.get("name").and_then(|value| value.as_str()), Some("demo"));
     }
 
     #[test]
@@ -246,5 +287,34 @@ mod tests {
 
         let ctx = RequestContext::new(request, PathParams::default());
         assert!(ctx.proxy_handle().is_some());
+    }
+
+    #[test]
+    fn request_context_accessors_return_expected_values() {
+        let mut ctx = ctx("/items/123", Body::from("payload"), params(&[("id", "123")]));
+        assert_eq!(ctx.request().uri().path(), "/items/123");
+        ctx.request_mut()
+            .headers_mut()
+            .insert("x-test", HeaderValue::from_static("value"));
+        assert_eq!(
+            ctx.request()
+                .headers()
+                .get("x-test")
+                .and_then(|v| v.to_str().ok()),
+            Some("value")
+        );
+        assert_eq!(ctx.path_params().get("id"), Some("123"));
+        assert_eq!(ctx.body().as_bytes(), b"payload");
+
+        let request = ctx.into_request();
+        assert_eq!(request.uri().path(), "/items/123");
+    }
+
+    #[test]
+    fn proxy_handle_forwards_with_dummy_client() {
+        let handle = ProxyHandle::with_client(DummyClient);
+        let request = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
+        let response = futures::executor::block_on(handle.forward(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::Error as AnyError;
+use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
 
@@ -97,6 +98,10 @@ impl EdgeError {
     }
 }
 
+fn json_or_text<T: Serialize>(payload: &T) -> Body {
+    Body::json(payload).unwrap_or_else(|_| Body::text("internal error"))
+}
+
 impl IntoResponse for EdgeError {
     fn into_response(self) -> Response {
         let payload = json!({
@@ -106,7 +111,7 @@ impl IntoResponse for EdgeError {
             }
         });
 
-        let body = Body::json(&payload).unwrap_or_else(|_| Body::text("internal error"));
+        let body = json_or_text(&payload);
         let mut response = response_with_body(self.status(), body);
         response
             .headers_mut()
@@ -119,6 +124,7 @@ impl IntoResponse for EdgeError {
 mod tests {
     use super::*;
     use crate::http::Method;
+    use serde::ser;
 
     #[test]
     fn bad_request_sets_status_and_message() {
@@ -140,6 +146,45 @@ mod tests {
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message().contains("internal error: boom"));
         assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn not_found_sets_status_and_message() {
+        let err = EdgeError::not_found("/missing");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(err.message().contains("/missing"));
+    }
+
+    #[test]
+    fn validation_sets_status_and_message() {
+        let err = EdgeError::validation("invalid input");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.message(), "invalid input");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn method_not_allowed_handles_empty_allowed_list() {
+        let err = EdgeError::method_not_allowed(&Method::GET, &[]);
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(err.message().contains("(none)"));
+    }
+
+    #[test]
+    fn json_or_text_falls_back_on_serialization_error() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(ser::Error::custom("boom"))
+            }
+        }
+
+        let body = json_or_text(&FailingSerialize);
+        assert_eq!(body.as_bytes(), b"internal error");
     }
 
     #[test]
