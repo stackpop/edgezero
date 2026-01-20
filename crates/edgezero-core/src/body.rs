@@ -169,7 +169,7 @@ mod tests {
     fn from_stream_maps_errors() {
         let stream = futures_util::stream::iter(vec![
             Ok(Bytes::from_static(b"ok")),
-            Err(io::Error::new(io::ErrorKind::Other, "boom")),
+            Err(io::Error::other("boom")),
         ]);
         let body = Body::from_stream(stream);
         let mut stream = body.into_stream().expect("stream");
