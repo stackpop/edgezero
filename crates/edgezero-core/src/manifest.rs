@@ -710,18 +710,15 @@ methods = ["HEAD"]
 
     #[test]
     fn http_method_rejects_invalid_value() {
-        let err = toml::from_str::<ManifestHttpTrigger>(
-            "path = \"/\"\nmethods = [\"FETCH\"]",
-        )
-        .expect_err("invalid method");
+        let err = toml::from_str::<ManifestHttpTrigger>("path = \"/\"\nmethods = [\"FETCH\"]")
+            .expect_err("invalid method");
         assert!(err.to_string().contains("unsupported HTTP method"));
     }
 
     #[test]
     fn http_method_rejects_non_string_value() {
-        let err =
-            toml::from_str::<ManifestHttpTrigger>("path = \"/\"\nmethods = [1]")
-                .expect_err("invalid method");
+        let err = toml::from_str::<ManifestHttpTrigger>("path = \"/\"\nmethods = [1]")
+            .expect_err("invalid method");
         assert!(err.to_string().contains("invalid type"));
     }
 
@@ -775,18 +772,15 @@ body-mode = "stream"
 
     #[test]
     fn body_mode_rejects_invalid_value() {
-        let err = toml::from_str::<ManifestHttpTrigger>(
-            "path = \"/\"\nbody-mode = \"chunked\"",
-        )
-        .expect_err("invalid body mode");
+        let err = toml::from_str::<ManifestHttpTrigger>("path = \"/\"\nbody-mode = \"chunked\"")
+            .expect_err("invalid body mode");
         assert!(err.to_string().contains("unsupported body mode"));
     }
 
     #[test]
     fn body_mode_rejects_non_string_value() {
-        let err =
-            toml::from_str::<ManifestHttpTrigger>("path = \"/\"\nbody-mode = 1")
-                .expect_err("invalid body mode");
+        let err = toml::from_str::<ManifestHttpTrigger>("path = \"/\"\nbody-mode = 1")
+            .expect_err("invalid body mode");
         assert!(err.to_string().contains("invalid type"));
     }
 
@@ -824,9 +818,8 @@ level = "off"
 
     #[test]
     fn log_level_rejects_invalid_value() {
-        let err =
-            toml::from_str::<ManifestLoggingConfig>("level = \"loud\"")
-                .expect_err("invalid log level");
+        let err = toml::from_str::<ManifestLoggingConfig>("level = \"loud\"")
+            .expect_err("invalid log level");
         assert!(err
             .to_string()
             .contains("logging level must be trace, debug, info, warn, error, or off"));
@@ -835,8 +828,7 @@ level = "off"
     #[test]
     fn log_level_rejects_non_string_value() {
         let err =
-            toml::from_str::<ManifestLoggingConfig>("level = 123")
-                .expect_err("invalid log level");
+            toml::from_str::<ManifestLoggingConfig>("level = 123").expect_err("invalid log level");
         assert!(err.to_string().contains("invalid type"));
     }
 

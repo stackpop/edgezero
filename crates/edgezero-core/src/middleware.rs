@@ -210,19 +210,17 @@ mod tests {
     #[test]
     fn next_runs_handler_without_middlewares() {
         let handler = ok_handler.into_handler();
-        let response = block_on(Next::new(&[], handler.as_ref()).run(empty_context()))
-            .expect("response");
+        let response =
+            block_on(Next::new(&[], handler.as_ref()).run(empty_context())).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
     fn request_logger_passes_through_success() {
         let handler = ok_handler.into_handler();
-        let response = block_on(RequestLogger.handle(
-            empty_context(),
-            Next::new(&[], handler.as_ref()),
-        ))
-        .expect("response");
+        let response =
+            block_on(RequestLogger.handle(empty_context(), Next::new(&[], handler.as_ref())))
+                .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -232,11 +230,8 @@ mod tests {
             Err::<Response, EdgeError>(EdgeError::bad_request("boom"))
         })
         .into_handler();
-        let err = block_on(RequestLogger.handle(
-            empty_context(),
-            Next::new(&[], handler.as_ref()),
-        ))
-        .expect_err("error");
+        let err = block_on(RequestLogger.handle(empty_context(), Next::new(&[], handler.as_ref())))
+            .expect_err("error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     }
 

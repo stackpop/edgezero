@@ -227,10 +227,7 @@ mod integration_tests {
         }
     }
 
-    async fn send_with_retry<F>(
-        client: &reqwest::Client,
-        mut make_request: F,
-    ) -> reqwest::Response
+    async fn send_with_retry<F>(client: &reqwest::Client, mut make_request: F) -> reqwest::Response
     where
         F: FnMut(&reqwest::Client) -> reqwest::RequestBuilder,
     {

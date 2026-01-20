@@ -234,7 +234,9 @@ mod tests {
         let buffered_debug = format!("{:?}", buffered);
         assert!(buffered_debug.contains("Body::Once"));
 
-        let stream = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(b"chunk")]));
+        let stream = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
+            b"chunk",
+        )]));
         let stream_debug = format!("{:?}", stream);
         assert!(stream_debug.contains("Body::Stream"));
     }

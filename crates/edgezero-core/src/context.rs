@@ -237,10 +237,7 @@ mod tests {
         }
         let body = Body::from("age=not-a-number");
         let ctx = ctx("/submit", body, PathParams::default());
-        let err = ctx
-            .form::<FormData>()
-            .err()
-            .expect("expected error");
+        let err = ctx.form::<FormData>().err().expect("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         assert!(err.message().contains("invalid form payload"));
     }
@@ -250,7 +247,10 @@ mod tests {
         let body = Body::from("name=demo");
         let ctx = ctx("/submit", body, PathParams::default());
         let parsed: serde_json::Value = ctx.form().expect("form data");
-        assert_eq!(parsed.get("name").and_then(|value| value.as_str()), Some("demo"));
+        assert_eq!(
+            parsed.get("name").and_then(|value| value.as_str()),
+            Some("demo")
+        );
     }
 
     #[test]
@@ -291,7 +291,11 @@ mod tests {
 
     #[test]
     fn request_context_accessors_return_expected_values() {
-        let mut ctx = ctx("/items/123", Body::from("payload"), params(&[("id", "123")]));
+        let mut ctx = ctx(
+            "/items/123",
+            Body::from("payload"),
+            params(&[("id", "123")]),
+        );
         assert_eq!(ctx.request().uri().path(), "/items/123");
         ctx.request_mut()
             .headers_mut()

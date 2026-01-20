@@ -337,8 +337,8 @@ mod tests {
     use crate::context::RequestContext;
     use crate::error::EdgeError;
     use crate::http::{request_builder, Method, Request, Response, StatusCode};
-    use crate::response::response_with_body;
     use crate::params::PathParams;
+    use crate::response::response_with_body;
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
     use serde::{Deserialize, Serialize};
@@ -460,8 +460,8 @@ mod tests {
         }
 
         let builder = response_builder().header("bad\nname", "value");
-        let err = build_listing_response(&Payload { ok: true }, builder)
-            .expect_err("expected error");
+        let err =
+            build_listing_response(&Payload { ok: true }, builder).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
