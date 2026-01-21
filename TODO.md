@@ -488,3 +488,91 @@ High-level backlog and decisions to drive the next milestones.
 - Summary: Extended `#[action]` to accept a single `RequestContext` parameter (with duplicate detection and helper tests) and applied the attribute to `proxy_demo`, relying on the original handler logic.
 - Assumptions: `RequestContext` parameters are owned values (no reference variants needed) and only one is expected per handler.
 - Outstanding: None; `cargo test` across the workspace passed after the macro test adjustment.
+
+## Codex Plan (2026-01-09 - Review new tests + coverage)
+
+- [x] Locate recently added/changed tests and note their intent and scope.
+- [x] Review test quality for gaps, brittle assertions, or missing scenarios.
+- [x] Evaluate whether coverage measurement is warranted and how to run it here.
+- [x] Record findings and recommendations in the Review section with timestamp.
+
+## Review (2026-01-09 05:47 UTC)
+
+- Summary: Reviewed the recent test additions across `edgezero-core`, `edgezero-macros`, and adapter modules (notably the Axum dev-server/proxy integration tests) to assess coverage intent, reliability, and gaps; no code changes were made.
+- Assumptions: The tests reviewed reflect the “recently added” scope the request referenced; wasm adapter coverage remains out-of-scope for host-only runs.
+- Outstanding: Potential flakiness risks in Axum dev-server integration tests (fixed ports + sleep); coverage gaps noted in response for streaming preservation, invalid manifest cases, and macro output brittleness.
+
+## Codex Plan (2026-01-09 - Harden axum dev-server tests + add coverage helper)
+
+- [x] Update Axum dev-server integration tests to use ephemeral ports and a readiness check instead of fixed ports + sleep.
+- [x] Add a `cargo llvm-cov` helper (script and/or CI step) scoped to host-capable crates, documenting the command path.
+- [x] Run `cargo test` after code changes.
+- [x] Record changes, assumptions, and any remaining gaps in the Review section with timestamp.
+
+## Review (2026-01-09 05:57 UTC)
+
+- Summary: Reworked the Axum dev-server integration tests to bind an ephemeral listener and retry requests instead of relying on fixed ports + sleeps, added a host-only coverage helper script (`scripts/run_coverage.sh`) with README instructions, and confirmed `cargo test` passes.
+- Assumptions: Coverage runs remain host-only (defaulting to `edgezero-core`) unless `EDGEZERO_COVERAGE_PACKAGES` is provided; wasm-only crates are still excluded from coverage runs.
+- Outstanding: None.
+
+## Codex Plan (2026-01-09 - Add HTML coverage output)
+
+- [x] Update `scripts/run_coverage.sh` to emit an HTML report (LCOV -> HTML) when `genhtml` is available.
+- [x] Document the HTML output location and fallback behavior in `README.md`.
+- [x] Run `cargo test` after code changes.
+- [x] Record changes, assumptions, and any remaining gaps in the Review section with timestamp.
+
+## Review (2026-01-09 06:05 UTC)
+
+- Summary: Updated `scripts/run_coverage.sh` to emit per-crate HTML reports when `genhtml` is available and documented the output location in `README.md`; `cargo test` remains green.
+- Assumptions: HTML generation depends on `genhtml` (lcov); without it the script still writes LCOV files and prints install guidance.
+- Outstanding: None.
+
+## Codex Plan (2026-01-09 - Auto-discover crates for coverage)
+
+- [x] Update `scripts/run_coverage.sh` to auto-discover workspace packages (e.g., via `cargo metadata`) when `EDGEZERO_COVERAGE_PACKAGES` is unset.
+- [x] Ensure the script skips non-library targets that cannot be covered on host (and document behavior).
+- [x] Update README coverage instructions accordingly.
+- [x] Run `cargo test` after code changes.
+- [x] Record changes, assumptions, and any remaining gaps in the Review section with timestamp.
+
+## Review (2026-01-09 06:10 UTC)
+
+- Summary: `scripts/run_coverage.sh` now auto-discovers workspace packages via `cargo metadata` when `EDGEZERO_COVERAGE_PACKAGES` is unset, defaulting to lib/proc-macro crates unless `EDGEZERO_COVERAGE_INCLUDE_BINS=1` is set; README coverage guidance updated and `cargo test` still passes.
+- Assumptions: Auto-discovery relies on `python3` for JSON parsing; binary-only coverage remains opt-in to avoid host-incompatible targets.
+- Outstanding: None.
+
+## Review (2026-01-09 06:19 UTC)
+
+- Summary: Fixed `scripts/run_coverage.sh` auto-discovery to pipe `cargo metadata` into `python -c` correctly, ran the script successfully, and re-ran `cargo test` after the change.
+- Assumptions: `python3` remains available for JSON parsing; `genhtml` is installed for HTML output.
+- Outstanding: None.
+
+## Review (2026-01-09 16:22 UTC)
+
+- Summary: Added a buffered form test for `RequestContext::form::<serde_json::Value>` to cover the remaining `context.rs` line gap; `cargo test -p edgezero-core` and `cargo llvm-cov -p edgezero-core --show-missing-lines` now report 100% line coverage for `edgezero-core`.
+- Assumptions: Line coverage (not region coverage) is the target for this pass.
+- Outstanding: None.
+
+## Codex Plan (2026-01-09 - Edgezero-core 100% coverage push)
+
+- [x] Re-run `cargo llvm-cov -p edgezero-core --no-deps --show-missing-lines` to confirm the current uncovered lines.
+- [x] Add targeted unit tests in `edgezero-core` to cover uncovered branches (App, Body, Context, Error, Manifest, Middleware, Response, Router, Handler/Http if needed) and refactor test-only branches that artificially lower coverage.
+- [x] Fix test compilation errors surfaced by the coverage run (expect_err Debug bounds in extractor/manifest tests; middleware type inference/lifetime issues).
+- [x] Identify the remaining uncovered `edgezero-core` lines (currently in `context.rs`) and add minimal coverage for them.
+- [x] Re-run coverage and `cargo test` to verify 100% line coverage for `edgezero-core`.
+- [x] Document changes, assumptions, and any remaining gaps in the Review section with timestamp.
+
+## Codex Plan (2026-01-09 - Investigate cargo test failure)
+
+- [x] Run `cargo test` to capture the failing crate/test output.
+- [x] Inspect the failing module(s) to identify the smallest fix or adjustment.
+- [x] Apply the minimal code/test change needed to resolve the failure.
+- [x] Re-run the relevant tests (`cargo test` and/or `cargo test -p <crate>`) to confirm.
+- [x] Record the outcome, assumptions, and any remaining issues in the Review section with timestamp.
+
+## Review (2026-01-09 16:28 UTC)
+
+- Summary: Added `tempfile` as a dev-dependency for `edgezero-macros` so the included manifest tests compile, and `cargo test` now passes across the workspace.
+- Assumptions: Keeping manifest tests in the macro crate is acceptable for now; we rely on workspace-level `tempfile` versioning.
+- Outstanding: None.

@@ -30,3 +30,4 @@ log = { workspace = true }
 [dev-dependencies]
 brotli = { workspace = true }
 flate2 = { workspace = true }
+tempfile = { workspace = true }

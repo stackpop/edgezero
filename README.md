@@ -185,6 +185,29 @@ Unit tests live next to the modules they exercise. Run the entire suite with
 The adapter crates include lightweight host-side tests that validate context
 insertion and URI parsing without needing the Wasm toolchains.
 
+### Coverage (host-only)
+
+Host-only coverage uses `cargo llvm-cov` and writes LCOV output under
+`target/coverage/`. Install the tooling and run the helper script:
+
+```bash
+cargo install cargo-llvm-cov
+rustup component add llvm-tools-preview
+./scripts/run_coverage.sh
+```
+
+If `genhtml` (from `lcov`) is available, the script also writes HTML output
+under `target/coverage/<package>-html/`.
+
+When `EDGEZERO_COVERAGE_PACKAGES` is unset, the script auto-discovers workspace
+packages that expose a `lib` or `proc-macro` target. Set
+`EDGEZERO_COVERAGE_INCLUDE_BINS=1` to include binary-only packages. To target
+specific crates, set `EDGEZERO_COVERAGE_PACKAGES`:
+
+```bash
+EDGEZERO_COVERAGE_PACKAGES="edgezero-core edgezero-adapter-axum" ./scripts/run_coverage.sh
+```
+
 ### Wasm runners (Fastly / WASI)
 
 Some adapter tests target `wasm32-wasip1`; Cargo needs a Wasm runtime to execute

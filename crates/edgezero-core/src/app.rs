@@ -134,4 +134,20 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body().as_bytes(), b"ok");
     }
+
+    struct DefaultHooks;
+
+    impl Hooks for DefaultHooks {
+        fn routes() -> RouterService {
+            RouterService::builder().build()
+        }
+    }
+
+    #[test]
+    fn default_hooks_use_default_name_and_into_router() {
+        let app = DefaultHooks::build_app();
+        assert_eq!(app.name(), App::default_name());
+        let router = app.into_router();
+        assert!(router.routes().is_empty());
+    }
 }
