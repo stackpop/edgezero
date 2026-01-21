@@ -111,18 +111,15 @@ impl Headers {
     }
 }
 
-/// Extracts the effective host from the request.
+/// Extracts the host from the standard `Host` header.
 ///
-/// Checks headers in this order:
-/// 1. `X-Forwarded-Host` - set by reverse proxies/load balancers
-/// 2. `Host` - standard HTTP host header
-/// 3. Falls back to "localhost" if neither is present
+/// Falls back to "localhost" if the header is not present.
 ///
 /// # Example
 /// ```ignore
 /// #[action]
 /// pub async fn handler(Host(host): Host) -> Response {
-///     // host contains the effective hostname
+///     // host contains the hostname from the Host header
 /// }
 /// ```
 pub struct Host(pub String);
@@ -132,8 +129,7 @@ impl FromRequest for Host {
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let headers = ctx.request().headers();
         let host = headers
-            .get("x-forwarded-host")
-            .or_else(|| headers.get(header::HOST))
+            .get(header::HOST)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("localhost")
             .to_string();
@@ -150,6 +146,52 @@ impl Deref for Host {
 }
 
 impl Host {
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+/// Extracts the effective host from the request, checking forwarded headers first.
+///
+/// Checks headers in this order:
+/// 1. `X-Forwarded-Host` - set by reverse proxies/load balancers
+/// 2. `Host` - standard HTTP host header
+/// 3. Falls back to "localhost" if neither is present
+///
+/// Use this extractor when your application is behind a reverse proxy or load balancer.
+///
+/// # Example
+/// ```ignore
+/// #[action]
+/// pub async fn handler(ForwardedHost(host): ForwardedHost) -> Response {
+///     // host contains the effective hostname (X-Forwarded-Host or Host)
+/// }
+/// ```
+pub struct ForwardedHost(pub String);
+
+#[async_trait(?Send)]
+impl FromRequest for ForwardedHost {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        let headers = ctx.request().headers();
+        let host = headers
+            .get("x-forwarded-host")
+            .or_else(|| headers.get(header::HOST))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost")
+            .to_string();
+        Ok(ForwardedHost(host))
+    }
+}
+
+impl Deref for ForwardedHost {
+    type Target = String;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl ForwardedHost {
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -762,7 +804,22 @@ mod tests {
 
     // Host extractor tests
     #[test]
-    fn host_extractor_uses_x_forwarded_host_first() {
+    fn host_extractor_uses_host_header() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .headers_mut()
+            .insert("host", HeaderValue::from_static("example.com"));
+        let ctx = RequestContext::new(request, PathParams::default());
+        let host = block_on(Host::from_request(&ctx)).expect("host");
+        assert_eq!(host.0, "example.com");
+    }
+
+    #[test]
+    fn host_extractor_ignores_x_forwarded_host() {
         let mut request = request_builder()
             .method(Method::GET)
             .uri("/test")
@@ -776,22 +833,7 @@ mod tests {
             .insert("x-forwarded-host", HeaderValue::from_static("example.com"));
         let ctx = RequestContext::new(request, PathParams::default());
         let host = block_on(Host::from_request(&ctx)).expect("host");
-        assert_eq!(host.0, "example.com");
-    }
-
-    #[test]
-    fn host_extractor_falls_back_to_host_header() {
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/test")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .headers_mut()
-            .insert("host", HeaderValue::from_static("example.com"));
-        let ctx = RequestContext::new(request, PathParams::default());
-        let host = block_on(Host::from_request(&ctx)).expect("host");
-        assert_eq!(host.0, "example.com");
+        assert_eq!(host.0, "internal.local");
     }
 
     #[test]
@@ -809,6 +851,60 @@ mod tests {
     #[test]
     fn host_deref_and_into_inner() {
         let host = Host("example.com".to_string());
+        assert_eq!(&*host, "example.com"); // Deref
+        let inner = host.into_inner();
+        assert_eq!(inner, "example.com");
+    }
+
+    // ForwardedHost extractor tests
+    #[test]
+    fn forwarded_host_extractor_uses_x_forwarded_host_first() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .headers_mut()
+            .insert("host", HeaderValue::from_static("internal.local"));
+        request
+            .headers_mut()
+            .insert("x-forwarded-host", HeaderValue::from_static("example.com"));
+        let ctx = RequestContext::new(request, PathParams::default());
+        let host = block_on(ForwardedHost::from_request(&ctx)).expect("host");
+        assert_eq!(host.0, "example.com");
+    }
+
+    #[test]
+    fn forwarded_host_extractor_falls_back_to_host_header() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .headers_mut()
+            .insert("host", HeaderValue::from_static("example.com"));
+        let ctx = RequestContext::new(request, PathParams::default());
+        let host = block_on(ForwardedHost::from_request(&ctx)).expect("host");
+        assert_eq!(host.0, "example.com");
+    }
+
+    #[test]
+    fn forwarded_host_extractor_uses_default_when_no_headers() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        let host = block_on(ForwardedHost::from_request(&ctx)).expect("host");
+        assert_eq!(host.0, "localhost");
+    }
+
+    #[test]
+    fn forwarded_host_deref_and_into_inner() {
+        let host = ForwardedHost("example.com".to_string());
         assert_eq!(&*host, "example.com"); // Deref
         let inner = host.into_inner();
         assert_eq!(inner, "example.com");
