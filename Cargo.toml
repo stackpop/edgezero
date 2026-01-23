@@ -63,4 +63,4 @@ tower-service = "0.3"
 tracing = "0.1"
 validator = { version = "0.20", features = ["derive"] }
 walkdir = { version = "2" }
-worker = { version = "0.6", features = ["http"] }
+worker = { version = "0.7", features = ["http"] }
