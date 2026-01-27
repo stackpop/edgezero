@@ -25,7 +25,7 @@ edgezero/
 - **Routing** - `RouterService` with path parameter matching via `matchit`
 - **Request/Response** - Portable `http::Request` and `http::Response` types
 - **Body** - Unified body type supporting buffered and streaming modes
-- **Extractors** - `Json<T>`, `Path<T>`, `Query<T>`, `ValidatedQuery<T>`
+- **Extractors** - `Json<T>`, `Path<T>`, `Query<T>`, `Form<T>`, `Headers`, and `Validated*` variants
 - **Middleware** - Composable middleware chain with async support
 - **Manifest** - `edgezero.toml` parsing and validation
 - **Compression** - Shared gzip/brotli stream decoders
@@ -117,16 +117,14 @@ Adapters translate between provider-specific types and the portable core model:
 
 ## Feature Flags
 
-EdgeZero uses feature flags for optional functionality:
+Adapter crates use feature flags to gate provider SDKs and CLI integration:
 
-| Feature | Crate | Purpose |
-|---------|-------|---------|
-| `json` | edgezero-core | JSON extractor/responder support |
-| `form` | edgezero-core | Form data extraction |
-| `validator` | edgezero-core | Validated extractors |
-| `fastly` | edgezero-adapter-fastly | Fastly SDK integration |
-| `cloudflare` | edgezero-adapter-cloudflare | Workers SDK integration |
-| `dev-example` | edgezero-cli | Bundled demo app for development |
+| Feature       | Crate                       | Purpose                                |
+| ------------- | --------------------------- | -------------------------------------- |
+| `fastly`      | edgezero-adapter-fastly     | Fastly SDK integration                 |
+| `cloudflare`  | edgezero-adapter-cloudflare | Workers SDK integration                |
+| `cli`         | adapter crates              | Register adapters and scaffolding data |
+| `dev-example` | edgezero-cli                | Bundled demo app for development       |
 
 ## Next Steps
 

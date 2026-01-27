@@ -9,8 +9,6 @@ New workspaces scaffolded with `edgezero new` include this manifest by default. 
 ```toml
 [app]
 name = "my-app"
-version = "0.1.0"
-kind = "http"
 entry = "crates/my-app-core"
 middleware = ["edgezero_core::middleware::RequestLogger"]
 
@@ -34,19 +32,15 @@ The `[app]` section defines application metadata:
 ```toml
 [app]
 name = "demo"
-version = "0.1.0"
-kind = "http"
 entry = "crates/demo-core"
 middleware = ["edgezero_core::middleware::RequestLogger"]
 ```
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Display name for the application |
-| `version` | No | Semantic version |
-| `kind` | No | Application type (currently only `http`) |
-| `entry` | Yes | Path to the core crate containing handlers |
-| `middleware` | No | List of middleware to apply globally |
+| Field        | Required | Description                                                          |
+| ------------ | -------- | -------------------------------------------------------------------- |
+| `name`       | No       | Display name for the application (defaults to "EdgeZero App")        |
+| `entry`      | No       | Path to the core crate containing handlers (recommended for tooling) |
+| `middleware` | No       | List of middleware to apply globally                                 |
 
 ### Middleware
 
@@ -61,6 +55,7 @@ middleware = [
 ```
 
 Each item must be:
+
 - A publicly accessible path
 - Either a unit struct or zero-argument constructor
 - Implementing `edgezero_core::middleware::Middleware`
@@ -85,14 +80,15 @@ adapters = ["fastly", "cloudflare"]
 body-mode = "buffered"
 ```
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `id` | No | Stable identifier for tooling |
-| `path` | Yes | URI template (`{param}` for params, `{*rest}` for catch-all) |
-| `methods` | No | Allowed HTTP methods (defaults to `GET`) |
-| `handler` | Yes | Path to handler function |
-| `adapters` | No | Which adapters expose this route (empty = all) |
-| `body-mode` | No | `buffered` or `stream` |
+| Field         | Required | Description                                                  |
+| ------------- | -------- | ------------------------------------------------------------ |
+| `id`          | No       | Stable identifier for tooling                                |
+| `path`        | Yes      | URI template (`{param}` for params, `{*rest}` for catch-all) |
+| `methods`     | No       | Allowed HTTP methods (defaults to `GET`)                     |
+| `handler`     | No       | Path to handler function (required for `app!` route wiring)  |
+| `adapters`    | No       | Which adapters expose this route (empty = all)               |
+| `description` | No       | Human-readable description for docs or tooling               |
+| `body-mode`   | No       | `buffered` or `stream`                                       |
 
 ## Environment Section
 
@@ -114,22 +110,24 @@ env = "API_TOKEN"
 
 ### Variables
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Variable name in application |
-| `env` | No | Environment key (defaults to `name`) |
-| `value` | No | Default value |
-| `adapters` | No | Limit to specific adapters |
+| Field         | Required | Description                          |
+| ------------- | -------- | ------------------------------------ |
+| `name`        | Yes      | Variable name in application         |
+| `description` | No       | Human-readable description           |
+| `env`         | No       | Environment key (defaults to `name`) |
+| `value`       | No       | Default value                        |
+| `adapters`    | No       | Limit to specific adapters           |
 
 Variables with a default `value` are injected when running CLI commands.
 
 ### Secrets
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `name` | Yes | Secret name in application |
-| `env` | No | Environment key (defaults to `name`) |
-| `adapters` | No | Limit to specific adapters |
+| Field         | Required | Description                          |
+| ------------- | -------- | ------------------------------------ |
+| `name`        | Yes      | Secret name in application           |
+| `description` | No       | Human-readable description           |
+| `env`         | No       | Environment key (defaults to `name`) |
+| `adapters`    | No       | Limit to specific adapters           |
 
 Secrets must be present in the environment; missing secrets abort CLI commands with an error.
 
@@ -159,44 +157,47 @@ echo_stdout = true
 
 ### Adapter Metadata
 
-| Field | Description |
-|-------|-------------|
-| `crate` | Path to adapter crate |
+| Field      | Description                                            |
+| ---------- | ------------------------------------------------------ |
+| `crate`    | Path to adapter crate                                  |
 | `manifest` | Path to provider manifest (fastly.toml, wrangler.toml) |
 
 ### Build Configuration
 
-| Field | Description |
-|-------|-------------|
-| `target` | Rust compilation target |
-| `profile` | Build profile (`release`, `dev`) |
-| `features` | Cargo features to enable |
+| Field      | Description                      |
+| ---------- | -------------------------------- |
+| `target`   | Rust compilation target          |
+| `profile`  | Build profile (`release`, `dev`) |
+| `features` | Cargo features to enable         |
 
 ### Commands
 
-| Field | Description |
-|-------|-------------|
-| `build` | Command for `edgezero build --adapter <name>` |
-| `serve` | Command for `edgezero serve --adapter <name>` |
+| Field    | Description                                    |
+| -------- | ---------------------------------------------- |
+| `build`  | Command for `edgezero build --adapter <name>`  |
+| `serve`  | Command for `edgezero serve --adapter <name>`  |
 | `deploy` | Command for `edgezero deploy --adapter <name>` |
 
 When commands are omitted, the CLI falls back to built-in adapter helpers.
 
 ### Logging
 
-| Field | Adapters | Description |
-|-------|----------|-------------|
-| `endpoint` | Fastly | Log endpoint name |
-| `level` | All | Log level: `trace`, `debug`, `info`, `warn`, `error`, `off` |
-| `echo_stdout` | Fastly | Mirror logs to stdout |
+Logging can be configured per adapter under `[adapters.<name>.logging]` or via a top-level
+`[logging.<name>]` block. If both are present, the adapter-specific block takes precedence.
+
+| Field         | Adapters     | Description                                                 |
+| ------------- | ------------ | ----------------------------------------------------------- |
+| `endpoint`    | Fastly       | Log endpoint name                                           |
+| `level`       | All          | Log level: `trace`, `debug`, `info`, `warn`, `error`, `off` |
+| `echo_stdout` | Fastly, Axum | Mirror logs to stdout                                       |
+
+Note: Cloudflare logging is not wired to a built-in logger yet.
 
 ## Full Example
 
 ```toml
 [app]
 name = "my-app"
-version = "0.1.0"
-kind = "http"
 entry = "crates/my-app-core"
 middleware = [
   "edgezero_core::middleware::RequestLogger",
@@ -288,10 +289,11 @@ edgezero_core::app!("../../edgezero.toml");
 ```
 
 The macro:
+
 - Parses HTTP triggers
 - Generates route registration
 - Wires middleware from the manifest
-- Creates the `App` struct with `build()` method
+- Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
 
 ### ManifestLoader
 
@@ -299,17 +301,25 @@ Load the manifest programmatically:
 
 ```rust
 use edgezero_core::manifest::ManifestLoader;
+use std::path::Path;
 
-let manifest = ManifestLoader::load("edgezero.toml")?;
-println!("App name: {}", manifest.app.name);
+let manifest = ManifestLoader::from_path(Path::new("edgezero.toml"))?;
+let app_name = manifest
+    .manifest()
+    .app
+    .name
+    .as_deref()
+    .unwrap_or("EdgeZero App");
+println!("App name: {}", app_name);
 ```
 
 ## Validation
 
 `ManifestLoader` validates:
-- Non-empty trigger paths and handlers
-- Well-formed logging levels
-- Required fields present
+
+- Non-empty string fields when present (names, paths, commands)
+- Supported HTTP methods and `body-mode` values
+- Well-formed logging levels and adapter logging config
 
 Errors are surfaced at startup or during macro expansion.
 

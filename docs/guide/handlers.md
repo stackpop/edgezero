@@ -24,6 +24,7 @@ async fn create_user(Json(body): Json<CreateUser>) -> Text<String> {
 ```
 
 The macro:
+
 - Generates the `FromRequest` boilerplate for each extractor
 - Handles async execution
 - Converts the return type into a proper response
@@ -120,25 +121,76 @@ async fn create_post(ValidatedJson(body): ValidatedJson<CreatePost>) -> Text<Str
 
 If validation fails, EdgeZero automatically returns a 400 Bad Request with error details.
 
+### Headers
+
+Extract request headers directly:
+
+```rust
+use edgezero_core::extractor::Headers;
+
+#[action]
+async fn check_auth(Headers(headers): Headers) -> Text<String> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none");
+    Text::new(format!("Auth: {}", token))
+}
+```
+
+### Form Data
+
+Parse URL-encoded form bodies:
+
+```rust
+use edgezero_core::extractor::Form;
+
+#[derive(serde::Deserialize)]
+struct ContactForm {
+    name: String,
+    email: String,
+}
+
+#[action]
+async fn submit_form(Form(data): Form<ContactForm>) -> Text<String> {
+    Text::new(format!("Received from: {}", data.email))
+}
+```
+
+Use `ValidatedForm<T>` for form data with validation, and `ValidatedPath<T>` for validated path parameters.
+
 ### Request Context
 
-Access the full request context for headers, method, URI, etc:
+For full request access, handlers can receive `RequestContext` directly (no `#[action]` needed):
 
 ```rust
 use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
 
-#[action]
-async fn inspect(RequestContext(ctx): RequestContext) -> Text<String> {
-    let method = ctx.method();
-    let path = ctx.uri().path();
-    let user_agent = ctx.headers()
+async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
+    let method = ctx.request().method();
+    let path = ctx.request().uri().path();
+    let user_agent = ctx.request().headers()
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
-    
-    Text::new(format!("{} {} from {}", method, path, user_agent))
+
+    Ok(Text::new(format!("{} {} from {}", method, path, user_agent)))
 }
 ```
+
+`RequestContext` provides these methods:
+
+| Method           | Returns                                    |
+| ---------------- | ------------------------------------------ |
+| `request()`      | `&Request` - full HTTP request             |
+| `path_params()`  | `&PathParams` - raw path parameters        |
+| `path::<T>()`    | Deserialize path params to `T`             |
+| `query::<T>()`   | Deserialize query string to `T`            |
+| `json::<T>()`    | Deserialize JSON body to `T`               |
+| `form::<T>()`    | Deserialize form body to `T`               |
+| `body()`         | `&Body` - raw request body                 |
+| `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
 
 ## Response Types
 
@@ -155,8 +207,12 @@ async fn hello() -> Text<&'static str> {
 
 ### JSON Responses
 
+Build JSON responses using `Body::json`:
+
 ```rust
-use edgezero_core::response::Json;
+use edgezero_core::body::Body;
+use edgezero_core::http::{Response, StatusCode};
+use edgezero_core::error::EdgeError;
 
 #[derive(serde::Serialize)]
 struct User {
@@ -165,8 +221,15 @@ struct User {
 }
 
 #[action]
-async fn get_user() -> Json<User> {
-    Json(User { id: 1, name: "Alice".into() })
+async fn get_user() -> Result<Response, EdgeError> {
+    let user = User { id: 1, name: "Alice".into() };
+    let body = Body::json(&user).map_err(EdgeError::internal)?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap())
 }
 ```
 
@@ -185,14 +248,19 @@ async fn not_found() -> (StatusCode, Text<&'static str>) {
 ### Custom Headers
 
 ```rust
-use edgezero_core::http::{HeaderMap, HeaderValue};
-use edgezero_core::response::Text;
+use edgezero_core::body::Body;
+use edgezero_core::http::{HeaderValue, Response, StatusCode};
 
 #[action]
-async fn with_headers() -> (HeaderMap, Text<&'static str>) {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-custom", HeaderValue::from_static("value"));
-    (headers, Text::new("Response with custom header"))
+async fn with_headers() -> Response {
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::from("Response with custom header"))
+        .unwrap();
+    response
+        .headers_mut()
+        .insert("x-custom", HeaderValue::from_static("value"));
+    response
 }
 ```
 
@@ -206,9 +274,8 @@ async fn update_user(
     Path(id): Path<u64>,
     Query(params): Query<UpdateOptions>,
     Json(body): Json<UpdateUser>,
-) -> Json<User> {
-    // All three extractors are available
-    Json(User { id, name: body.name })
+) -> Text<String> {
+    Text::new(format!("Updated user {} with name {}", id, body.name))
 }
 ```
 
@@ -216,12 +283,12 @@ async fn update_user(
 
 Extractors return `EdgeError` on failure, which automatically converts to appropriate HTTP responses:
 
-| Error | Status Code |
-|-------|-------------|
-| JSON parse error | 400 Bad Request |
-| Validation error | 400 Bad Request |
-| Missing path param | 500 Internal Server Error |
-| Type conversion error | 400 Bad Request |
+| Error                 | Status Code              |
+| --------------------- | ------------------------ |
+| JSON parse error      | 400 Bad Request          |
+| Validation error      | 422 Unprocessable Entity |
+| Missing path param    | 400 Bad Request          |
+| Type conversion error | 400 Bad Request          |
 
 For custom error handling, return `Result`:
 
@@ -229,11 +296,92 @@ For custom error handling, return `Result`:
 use edgezero_core::error::EdgeError;
 
 #[action]
-async fn fallible(Json(body): Json<Request>) -> Result<Json<Response>, EdgeError> {
+async fn fallible(Json(body): Json<MyRequest>) -> Result<Text<String>, EdgeError> {
     if body.invalid {
         return Err(EdgeError::bad_request("Invalid request"));
     }
-    Ok(Json(Response { success: true }))
+    Ok(Text::new("Success"))
+}
+```
+
+### EdgeError Methods
+
+`EdgeError` provides factory methods for common HTTP errors:
+
+```rust
+use edgezero_core::error::EdgeError;
+
+// Client errors
+EdgeError::bad_request("Invalid input")           // 400
+EdgeError::not_found("/missing/path")             // 404
+EdgeError::method_not_allowed(&method, &allowed)  // 405
+EdgeError::validation("Field too short")          // 422
+
+// Server errors
+EdgeError::internal("Unexpected failure")         // 500
+EdgeError::internal(some_error)                   // 500 (from any error type)
+```
+
+## Custom Extractors
+
+Implement the `FromRequest` trait to create custom extractors:
+
+```rust
+use async_trait::async_trait;
+use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
+use edgezero_core::extractor::FromRequest;
+
+pub struct BearerToken(pub String);
+
+#[async_trait(?Send)]
+impl FromRequest for BearerToken {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        let header = ctx.request().headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| EdgeError::bad_request("Missing Authorization header"))?;
+
+        let token = header
+            .strip_prefix("Bearer ")
+            .ok_or_else(|| EdgeError::bad_request("Invalid Bearer token format"))?;
+
+        Ok(BearerToken(token.to_string()))
+    }
+}
+
+// Use in handlers:
+#[action]
+async fn protected(BearerToken(token): BearerToken) -> Text<String> {
+    Text::new(format!("Authenticated with token: {}...", &token[..8]))
+}
+```
+
+## Custom Response Types
+
+Implement `IntoResponse` for custom response types:
+
+```rust
+use edgezero_core::body::Body;
+use edgezero_core::http::{Response, StatusCode};
+use edgezero_core::response::IntoResponse;
+
+pub struct HtmlResponse(pub String);
+
+impl IntoResponse for HtmlResponse {
+    fn into_response(self) -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/html; charset=utf-8")
+            .body(Body::from(self.0))
+            .unwrap()
+    }
+}
+
+// Use in handlers:
+#[action]
+async fn page() -> HtmlResponse {
+    HtmlResponse("<h1>Hello</h1>".to_string())
 }
 ```
 

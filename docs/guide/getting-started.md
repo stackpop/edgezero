@@ -4,7 +4,7 @@ This guide walks you through creating your first EdgeZero application.
 
 ## Prerequisites
 
-- Rust toolchain (1.70+)
+- Rust toolchain (stable; see `.tool-versions` in the repo)
 - For Fastly: `wasm32-wasip1` target and the Fastly CLI
 - For Cloudflare: `wasm32-unknown-unknown` target and Wrangler
 
@@ -18,15 +18,15 @@ cargo install --path crates/edgezero-cli
 
 ## Create a New Project
 
-Scaffold a new EdgeZero app targeting your preferred adapters:
+Scaffold a new EdgeZero app:
 
 ```bash
-# Create an app with Fastly, Cloudflare, and Axum adapters
-edgezero new my-app --adapters fastly cloudflare axum
+edgezero new my-app
 cd my-app
 ```
 
 This generates a workspace with:
+
 - `crates/my-app-core` - Your shared handlers and routing logic
 - `crates/my-app-adapter-fastly` - Fastly Compute entrypoint
 - `crates/my-app-adapter-cloudflare` - Cloudflare Workers entrypoint

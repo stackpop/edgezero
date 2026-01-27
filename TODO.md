@@ -88,6 +88,7 @@ High-level backlog and decisions to drive the next milestones.
 - [ ] Provider additions: prototype a third adapter (e.g. AWS Lambda@Edge or Vercel Edge Functions) using the stabilized adapter API to validate cross-provider abstractions.
 - [x] Manifest ergonomics: design an `edgezero.toml` schema that mirrors Spin’s manifest convenience (route triggers, env/secrets, build targets) while remaining provider-agnostic; update CLI scaffolding accordingly. (`crates/edgezero-cli/src/manifest.rs`, templates in `crates/edgezero-cli/src/templates/root/edgezero.toml.hbs`, doc `docs/manifest.md`, app-demo manifest `examples/app-demo/edgezero.toml`)
 - [ ] Tooling parity: extend `edgezero-cli` with template/plugin style commands (similar to Spin templates) to streamline new app scaffolds and provider-specific wiring.
+- [ ] CLI parity backlog: add `edgezero --list-adapters`, standardize exit codes, search up for `edgezero.toml`, respect `RUST_LOG` for dev output, and bake in hot reload for `edgezero dev`.
 
 ## Open Design Questions (for later pickup)
 
@@ -488,3 +489,63 @@ High-level backlog and decisions to drive the next milestones.
 - Summary: Extended `#[action]` to accept a single `RequestContext` parameter (with duplicate detection and helper tests) and applied the attribute to `proxy_demo`, relying on the original handler logic.
 - Assumptions: `RequestContext` parameters are owned values (no reference variants needed) and only one is expected per handler.
 - Outstanding: None; `cargo test` across the workspace passed after the macro test adjustment.
+
+## Codex Plan (2026-01-27 - Documentation Exposure Review)
+
+- [x] Diff `main` vs current branch to scope doc-related changes.
+- [x] Review updated/new docs for redundancy, inconsistency, missing coverage, and verbosity.
+- [x] Check overall documentation thoroughness and note gaps vs the framework surface area.
+- [x] Compile review findings with file references and prioritized severity.
+
+## Review (2026-01-27 00:20:19 UTC)
+
+- Summary: Compared `main` against the `feature/vitepress` branch, audited the new VitePress guide set plus CLI/adapter docs, and assembled a prioritized findings list focused on inaccuracies, redundancy, missing coverage, and verbosity.
+- Assumptions: Documentation review targets current source behavior (not proposed future APIs); adapter contract expectations should reflect existing Fastly/Cloudflare/Axum implementations unless explicitly labeled aspirational.
+- Outstanding: None (review-only; no code changes applied).
+
+## Review (2026-01-27 00:50:51 UTC)
+
+- Summary: Aligned guide content with current EdgeZero APIs (App::build_app, adapter entrypoints, middleware signature, proxy clients), corrected routing/streaming/handlers/CLI details, and refreshed manifest/logging docs; added the missing CLI/dev features list to the roadmap.
+- Assumptions: Docs now reflect current behavior for Fastly/Cloudflare/Axum adapters and the CLI; future features are captured explicitly in the roadmap rather than implied in guides.
+- Outstanding: None (docs-only updates).
+
+## Review (2026-01-27 01:02:05 UTC)
+
+- Summary: Condensed the proxying guide into a single end-to-end example that uses adapter proxy handles, and added short logging-status callouts to the Fastly, Cloudflare, and Axum adapter docs.
+- Assumptions: The proxy handle approach is the preferred public pattern; adapter logging notes should stay concise and match current defaults.
+- Outstanding: None (docs-only updates).
+
+## Review (2026-01-27 01:05:18 UTC)
+
+- Summary: Added a dedicated `docs/guide/roadmap.md` page containing the current roadmap and design questions, and linked it in the VitePress sidebar.
+- Assumptions: The roadmap page mirrors `TODO.md` and is a public-facing summary of ongoing planning work.
+- Outstanding: None (docs-only updates).
+
+## Review (2026-01-27 01:09:04 UTC)
+
+- Summary: Expanded the roadmap page with doc/CLI alignment gaps found during review and added an explicit Spin support item.
+- Assumptions: The new roadmap bullets are directional and do not imply implementation order.
+- Outstanding: None (docs-only updates).
+
+## Codex Plan (2026-01-27 - Roadmap Doc Page)
+
+- [x] Add a dedicated roadmap page under `docs/guide/roadmap.md`.
+- [x] Populate it with the roadmap content (including the CLI parity backlog list).
+- [x] Wire the roadmap page into the VitePress sidebar/navigation.
+
+## Codex Plan (2026-01-27 - Roadmap Findings + Spin Support)
+
+- [x] Add the key doc/CLI gaps found during the review to the roadmap page.
+- [x] Add an explicit roadmap item for Spin support (define scope at the doc level).
+
+## Codex Plan (2026-01-27 - Proxying Snippet + Adapter Logging Callout)
+
+- [x] Condense proxying guide into a single end-to-end example using adapter proxy handles.
+- [x] Add a short logging status callout to the adapter docs (Axum/Cloudflare/Fastly).
+
+## Codex Plan (2026-01-27 - Docs Alignment + Roadmap Additions)
+
+- [x] Update guides to reflect current APIs (App::build_app, adapter entrypoints, middleware signature, proxy client usage).
+- [x] Correct routing, streaming, handlers, and CLI reference docs to match current behavior.
+- [x] Refresh configuration docs to align with manifest schema and loader APIs.
+- [x] Add missing-feature backlog (list-adapters, exit codes, manifest search-up, RUST_LOG, hot reload) to the roadmap section.

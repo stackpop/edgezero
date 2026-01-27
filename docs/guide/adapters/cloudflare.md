@@ -9,7 +9,7 @@ Deploy EdgeZero applications to Cloudflare Workers using WebAssembly.
 
 ## Project Setup
 
-When scaffolding with `edgezero new my-app --adapters cloudflare`, you get:
+When scaffolding with `edgezero new my-app`, the Cloudflare adapter includes:
 
 ```
 crates/my-app-adapter-cloudflare/
@@ -37,15 +37,15 @@ command = "cargo build --release --target wasm32-unknown-unknown"
 The Cloudflare entrypoint wires the adapter:
 
 ```rust
-use edgezero_adapter_cloudflare::{dispatch, init_logger};
+use edgezero_adapter_cloudflare::dispatch;
+use edgezero_core::app::Hooks;
 use my_app_core::App;
 use worker::*;
 
 #[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-    init_logger();
-    let app = App::build();
-    dispatch(&app, req).await
+async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let app = App::build_app();
+    dispatch(&app, req, env, ctx).await
 }
 ```
 
@@ -93,8 +93,9 @@ Cloudflare Workers use the global `fetch` API for outbound requests:
 
 ```rust
 use edgezero_adapter_cloudflare::CloudflareProxyClient;
+use edgezero_core::proxy::ProxyService;
 
-let client = CloudflareProxyClient::new();
+let client = CloudflareProxyClient;
 let response = ProxyService::new(client).forward(request).await?;
 ```
 
@@ -102,40 +103,31 @@ Unlike Fastly, there's no backend configuration needed - Workers can fetch any U
 
 ## Logging
 
-Cloudflare Workers log via `console.log`. Initialize the logger:
+EdgeZero does not install a Cloudflare logger by default. Use your preferred logger (for example
+`console_log` or your own `log` implementation), and view output in Wrangler or the Cloudflare
+dashboard.
 
-```rust
-use edgezero_adapter_cloudflare::init_logger;
-
-fn main() {
-    init_logger();
-}
-```
-
-Configure logging level in `edgezero.toml`:
-
-```toml
-[adapters.cloudflare.logging]
-level = "info"
-```
-
-View logs in the Wrangler output or Cloudflare dashboard.
+::: tip Logging status
+Cloudflare logging is opt-in; install a logger (such as `console_log`) in your entrypoint if you
+need structured output.
+:::
 
 ## Context Access
 
-Access Cloudflare-specific APIs via the request context:
+Access Cloudflare-specific APIs via the request context extensions:
 
 ```rust
+use edgezero_core::context::RequestContext;
 use edgezero_adapter_cloudflare::CloudflareRequestContext;
 
-#[action]
-async fn handler(RequestContext(ctx): RequestContext) -> Response<Body> {
-    if let Some(cf_ctx) = ctx.extensions().get::<CloudflareRequestContext>() {
+async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
+    if let Some(cf_ctx) = CloudflareRequestContext::get(ctx.request()) {
         // Access Cloudflare-specific data
-        let cf = cf_ctx.cf();
+        let env = cf_ctx.env();
+        let ctx = cf_ctx.ctx();
         // ...
     }
-    
+
     // ...
 }
 ```
@@ -181,24 +173,9 @@ bindings = [
 
 ## Streaming
 
-Cloudflare Workers support streaming via `ReadableStream`:
+Cloudflare Workers support streaming via `ReadableStream`. The adapter automatically converts `Body::stream` to Cloudflare's streaming format.
 
-```rust
-#[action]
-async fn stream() -> Response<Body> {
-    let stream = async_stream::stream! {
-        for i in 0..100 {
-            yield Ok::<_, std::io::Error>(format!("chunk {}\n", i).into_bytes());
-        }
-    };
-    
-    Response::builder()
-        .body(Body::stream(stream))
-        .unwrap()
-}
-```
-
-The adapter converts EdgeZero streams to Cloudflare's `ReadableStream` format.
+See the [Streaming guide](/guide/streaming) for examples and patterns.
 
 ## Testing
 
@@ -212,35 +189,17 @@ Note: Some tests require `wasm-bindgen-test-runner` for execution.
 
 ## Manifest Configuration
 
-Full `edgezero.toml` Cloudflare configuration:
-
-```toml
-[adapters.cloudflare.adapter]
-crate = "crates/my-app-adapter-cloudflare"
-manifest = "crates/my-app-adapter-cloudflare/wrangler.toml"
-
-[adapters.cloudflare.build]
-target = "wasm32-unknown-unknown"
-profile = "release"
-
-[adapters.cloudflare.commands]
-build = "cargo build --release --target wasm32-unknown-unknown -p my-app-adapter-cloudflare"
-serve = "wrangler dev --config crates/my-app-adapter-cloudflare/wrangler.toml"
-deploy = "wrangler publish --config crates/my-app-adapter-cloudflare/wrangler.toml"
-
-[adapters.cloudflare.logging]
-level = "info"
-```
+Configure the Cloudflare adapter in `edgezero.toml`. See [Configuration](/guide/configuration) for the full manifest reference.
 
 ## Comparison with Fastly
 
-| Feature | Cloudflare Workers | Fastly Compute |
-|---------|-------------------|----------------|
-| Target | `wasm32-unknown-unknown` | `wasm32-wasip1` |
-| Outbound requests | Global `fetch` | Named backends |
-| Storage | KV, Durable Objects, R2 | KV Store, Object Store |
-| Logging | `console.log` | Log endpoints |
-| CLI | Wrangler | Fastly CLI |
+| Feature           | Cloudflare Workers       | Fastly Compute         |
+| ----------------- | ------------------------ | ---------------------- |
+| Target            | `wasm32-unknown-unknown` | `wasm32-wasip1`        |
+| Outbound requests | Global `fetch`           | Named backends         |
+| Storage           | KV, Durable Objects, R2  | KV Store, Object Store |
+| Logging           | `console.log`            | Log endpoints          |
+| CLI               | Wrangler                 | Fastly CLI             |
 
 ## Next Steps
 

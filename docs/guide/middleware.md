@@ -7,28 +7,37 @@ EdgeZero supports composable middleware for cross-cutting concerns like logging,
 Middleware implements the `Middleware` trait:
 
 ```rust
-use edgezero_core::middleware::Middleware;
-use edgezero_core::http::{Request, Response};
-use edgezero_core::body::Body;
+use async_trait::async_trait;
+use edgezero_core::context::RequestContext;
+use edgezero_core::error::EdgeError;
+use edgezero_core::http::Response;
+use edgezero_core::middleware::{Middleware, Next};
 
 pub struct RequestLogger;
 
+#[async_trait(?Send)]
 impl Middleware for RequestLogger {
     async fn handle(
         &self,
-        req: Request<Body>,
-        next: impl FnOnce(Request<Body>) -> futures::future::BoxFuture<'static, Response<Body>> + Send,
-    ) -> Response<Body> {
-        let method = req.method().clone();
-        let path = req.uri().path().to_string();
-        
-        log::info!("--> {} {}", method, path);
-        
-        let response = next(req).await;
-        
-        log::info!("<-- {} {} {}", method, path, response.status());
-        
-        response
+        ctx: RequestContext,
+        next: Next<'_>,
+    ) -> Result<Response, EdgeError> {
+        let method = ctx.request().method().clone();
+        let path = ctx.request().uri().path().to_string();
+        let start = std::time::Instant::now();
+
+        let response = next.run(ctx).await?;
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            "request method={} path={} status={} elapsed_ms={:.2}",
+            method,
+            path,
+            response.status().as_u16(),
+            elapsed_ms
+        );
+
+        Ok(response)
     }
 }
 ```
@@ -61,7 +70,7 @@ use edgezero_core::router::RouterService;
 let router = RouterService::builder()
     .middleware(RequestLogger)
     .middleware(CorsMiddleware::default())
-    .route(Method::GET, "/hello", hello)
+    .get("/hello", hello)
     .build();
 ```
 
@@ -86,26 +95,28 @@ pub struct AuthMiddleware {
     secret: String,
 }
 
+#[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(
         &self,
-        req: Request<Body>,
-        next: impl FnOnce(Request<Body>) -> futures::future::BoxFuture<'static, Response<Body>> + Send,
-    ) -> Response<Body> {
+        ctx: RequestContext,
+        next: Next<'_>,
+    ) -> Result<Response, EdgeError> {
         // Check authorization header
-        let auth_header = req.headers().get("authorization");
-        
+        let auth_header = ctx.request().headers().get("authorization");
+
         match auth_header {
             Some(value) if self.verify_token(value) => {
                 // Token valid, continue to handler
-                next(req).await
+                next.run(ctx).await
             }
             _ => {
                 // Return 401 Unauthorized
-                Response::builder()
+                let response = Response::builder()
                     .status(401)
                     .body(Body::from("Unauthorized"))
-                    .unwrap()
+                    .map_err(EdgeError::internal)?;
+                Ok(response)
             }
         }
     }
@@ -119,19 +130,22 @@ pub struct CorsMiddleware {
     allowed_origins: Vec<String>,
 }
 
+#[async_trait(?Send)]
 impl Middleware for CorsMiddleware {
     async fn handle(
         &self,
-        req: Request<Body>,
-        next: impl FnOnce(Request<Body>) -> futures::future::BoxFuture<'static, Response<Body>> + Send,
-    ) -> Response<Body> {
-        let origin = req.headers()
+        ctx: RequestContext,
+        next: Next<'_>,
+    ) -> Result<Response, EdgeError> {
+        let origin = ctx
+            .request()
+            .headers()
             .get("origin")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        
-        let mut response = next(req).await;
-        
+
+        let mut response = next.run(ctx).await?;
+
         if let Some(origin) = origin {
             if self.allowed_origins.contains(&origin) {
                 response.headers_mut().insert(
@@ -140,8 +154,8 @@ impl Middleware for CorsMiddleware {
                 );
             }
         }
-        
-        response
+
+        Ok(response)
     }
 }
 ```
@@ -151,23 +165,24 @@ impl Middleware for CorsMiddleware {
 ```rust
 pub struct TimingMiddleware;
 
+#[async_trait(?Send)]
 impl Middleware for TimingMiddleware {
     async fn handle(
         &self,
-        req: Request<Body>,
-        next: impl FnOnce(Request<Body>) -> futures::future::BoxFuture<'static, Response<Body>> + Send,
-    ) -> Response<Body> {
+        ctx: RequestContext,
+        next: Next<'_>,
+    ) -> Result<Response, EdgeError> {
         let start = std::time::Instant::now();
-        
-        let mut response = next(req).await;
-        
+
+        let mut response = next.run(ctx).await?;
+
         let duration = start.elapsed();
         response.headers_mut().insert(
             "x-response-time",
             format!("{}ms", duration.as_millis()).parse().unwrap(),
         );
-        
-        response
+
+        Ok(response)
     }
 }
 ```
@@ -180,18 +195,19 @@ Middleware can short-circuit the chain by not calling `next`:
 impl Middleware for RateLimiter {
     async fn handle(
         &self,
-        req: Request<Body>,
-        next: impl FnOnce(Request<Body>) -> futures::future::BoxFuture<'static, Response<Body>> + Send,
-    ) -> Response<Body> {
-        if self.is_rate_limited(&req) {
+        ctx: RequestContext,
+        next: Next<'_>,
+    ) -> Result<Response, EdgeError> {
+        if self.is_rate_limited(&ctx) {
             // Don't call next - return immediately
-            return Response::builder()
+            let response = Response::builder()
                 .status(429)
                 .body(Body::from("Too Many Requests"))
-                .unwrap();
+                .map_err(EdgeError::internal)?;
+            return Ok(response);
         }
-        
-        next(req).await
+
+        next.run(ctx).await
     }
 }
 ```
@@ -200,8 +216,8 @@ impl Middleware for RateLimiter {
 
 EdgeZero provides these middleware out of the box:
 
-| Middleware | Purpose |
-|------------|---------|
+| Middleware      | Purpose                                        |
+| --------------- | ---------------------------------------------- |
 | `RequestLogger` | Logs request method, path, and response status |
 
 ## Next Steps

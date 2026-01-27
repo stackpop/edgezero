@@ -22,17 +22,18 @@ EdgeZero separates your application into layers:
 3. **Entrypoints** - Minimal main functions that wire the adapter to your core app
 
 This architecture means you can:
+
 - Develop locally with the Axum adapter's dev server
 - Test your handlers in isolation without provider SDKs
 - Deploy the same logic to multiple edge platforms
 
 ## Supported Platforms
 
-| Platform | Target | Status |
-|----------|--------|--------|
-| Fastly Compute@Edge | `wasm32-wasip1` | Stable |
-| Cloudflare Workers | `wasm32-unknown-unknown` | Stable |
-| Axum/Tokio (native) | Native host | Stable |
+| Platform            | Target                   | Status |
+| ------------------- | ------------------------ | ------ |
+| Fastly Compute@Edge | `wasm32-wasip1`          | Stable |
+| Cloudflare Workers  | `wasm32-unknown-unknown` | Stable |
+| Axum/Tokio (native) | Native host              | Stable |
 
 ## Use Cases
 

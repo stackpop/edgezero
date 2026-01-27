@@ -12,7 +12,7 @@ The Axum adapter provides:
 
 ## Project Setup
 
-When scaffolding with `edgezero new my-app --adapters axum`, you get:
+When scaffolding with `edgezero new my-app`, the Axum adapter includes:
 
 ```
 crates/my-app-adapter-axum/
@@ -28,20 +28,16 @@ The Axum entrypoint wires the adapter:
 
 ```rust
 use edgezero_adapter_axum::AxumDevServer;
+use edgezero_core::app::Hooks;
 use my_app_core::App;
 
-#[tokio::main]
-async fn main() {
-    // Initialize standard logging
-    env_logger::init();
-    
-    let app = App::build();
-    
-    AxumDevServer::new(app)
-        .bind("127.0.0.1:8787")
-        .run()
-        .await
-        .unwrap();
+fn main() {
+    let app = App::build_app();
+    let router = app.router().clone();
+    if let Err(err) = AxumDevServer::new(router).run() {
+        eprintln!("axum adapter failed: {err}");
+        std::process::exit(1);
+    }
 }
 ```
 
@@ -53,11 +49,7 @@ The `edgezero dev` command uses the Axum adapter:
 edgezero dev
 ```
 
-This starts a server at `http://127.0.0.1:8787` with:
-
-- Hot reload support (via cargo watch integration)
-- Standard logging to stdout
-- Full handler debugging
+This starts a server at `http://127.0.0.1:8787` with standard logging to stdout.
 
 ### Manual Start
 
@@ -91,8 +83,9 @@ The Axum adapter provides a native HTTP client for proxying:
 
 ```rust
 use edgezero_adapter_axum::AxumProxyClient;
+use edgezero_core::proxy::ProxyService;
 
-let client = AxumProxyClient::new();
+let client = AxumProxyClient::default();
 let response = ProxyService::new(client).forward(request).await?;
 ```
 
@@ -100,29 +93,13 @@ This uses `reqwest` under the hood for outbound HTTP requests.
 
 ## Logging
 
-Use any standard Rust logging implementation:
+The Axum adapter's `run_app` helper installs `simple_logger` and reads logging configuration
+from `edgezero.toml` (level and `echo_stdout`). If you want a different logger, wire your own
+entrypoint using `App::build_app()` and `AxumDevServer`.
 
-```rust
-use log::{info, error};
-
-#[tokio::main]
-async fn main() {
-    // Simple logger
-    env_logger::init();
-    
-    // Or use tracing
-    // tracing_subscriber::fmt::init();
-    
-    info!("Starting server...");
-}
-```
-
-Configure log levels via environment variable:
-
-```bash
-RUST_LOG=info edgezero dev
-RUST_LOG=my_app=debug,edgezero_core=info edgezero dev
-```
+::: tip Logging status
+`run_app` wires logging automatically; custom entrypoints should install a logger explicitly.
+:::
 
 ## Testing
 
@@ -132,19 +109,20 @@ The Axum adapter enables standard Rust testing:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::app::Hooks;
     use edgezero_core::http::{Request, Method};
-    
+
     #[tokio::test]
     async fn test_handler() {
-        let app = App::build();
+        let app = App::build_app();
         let router = app.router();
-        
+
         let request = Request::builder()
             .method(Method::GET)
             .uri("/hello")
             .body(Body::empty())
             .unwrap();
-        
+
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), 200);
     }
@@ -176,28 +154,11 @@ CMD ["my-app-adapter-axum"]
 
 ## Configuration
 
-Configure the dev server in `axum.toml`:
+Configure the Axum adapter in `edgezero.toml`. See [Configuration](/guide/configuration) for the full
+manifest reference.
 
-```toml
-[server]
-host = "127.0.0.1"
-port = 8787
-
-[logging]
-level = "info"
-```
-
-Or via `edgezero.toml`:
-
-```toml
-[adapters.axum.adapter]
-crate = "crates/my-app-adapter-axum"
-manifest = "crates/my-app-adapter-axum/axum.toml"
-
-[adapters.axum.commands]
-build = "cargo build --release -p my-app-adapter-axum"
-serve = "cargo run -p my-app-adapter-axum"
-```
+The `axum.toml` file is used by the Axum CLI helper to locate the crate and display the port.
+The runtime currently binds to `127.0.0.1:8787` regardless of the `axum.toml` port value.
 
 ## Development Workflow
 
@@ -212,14 +173,14 @@ A typical development workflow:
 
 ## Differences from Edge Adapters
 
-| Aspect | Axum | Fastly/Cloudflare |
-|--------|------|-------------------|
-| Compilation | Native | Wasm |
-| Cold start | ~0ms | ~0ms (Wasm) |
-| Memory | Unlimited | 128MB typical |
-| Filesystem | Full access | Sandboxed |
-| Network | Direct | Backend/fetch |
-| Concurrency | Multi-threaded | Single-threaded |
+| Aspect      | Axum           | Fastly/Cloudflare |
+| ----------- | -------------- | ----------------- |
+| Compilation | Native         | Wasm              |
+| Cold start  | ~0ms           | ~0ms (Wasm)       |
+| Memory      | Unlimited      | 128MB typical     |
+| Filesystem  | Full access    | Sandboxed         |
+| Network     | Direct         | Backend/fetch     |
+| Concurrency | Multi-threaded | Single-threaded   |
 
 ::: tip Development Parity
 While Axum provides a convenient development environment, always test on actual edge platforms before deploying. Some edge-specific features (KV stores, geolocation) aren't available in the Axum adapter.

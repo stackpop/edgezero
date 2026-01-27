@@ -10,7 +10,7 @@ Deploy EdgeZero applications to Fastly's Compute@Edge platform using WebAssembly
 
 ## Project Setup
 
-When scaffolding with `edgezero new my-app --adapters fastly`, you get:
+When scaffolding with `edgezero new my-app`, the Fastly adapter includes:
 
 ```
 crates/my-app-adapter-fastly/
@@ -41,14 +41,14 @@ authors = ["you@example.com"]
 The Fastly entrypoint wires the adapter:
 
 ```rust
-use edgezero_adapter_fastly::{dispatch, init_logger};
+use edgezero_adapter_fastly::dispatch;
+use edgezero_core::app::Hooks;
 use my_app_core::App;
 
 #[fastly::main]
-async fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    init_logger();
-    let app = App::build();
-    dispatch(&app, req).await
+fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
+    let app = App::build_app();
+    dispatch(&app, req)
 }
 ```
 
@@ -94,41 +94,20 @@ fastly compute deploy
 
 ## Backends
 
-Fastly routes outbound requests through named backends. Configure them in `fastly.toml`:
-
-```toml
-[local_server.backends]
-  [local_server.backends."api"]
-  url = "https://api.example.com"
-  
-  [local_server.backends."cdn"]
-  url = "https://cdn.example.com"
-```
-
-Use backends in your proxy code:
+EdgeZero's Fastly proxy client uses **dynamic backends** derived from the target URI (host + scheme).
+You do not need to predeclare backends in `fastly.toml` for EdgeZero proxying.
 
 ```rust
 use edgezero_adapter_fastly::FastlyProxyClient;
+use edgezero_core::proxy::ProxyService;
 
-let client = FastlyProxyClient::new("api");
+let client = FastlyProxyClient;
 let response = ProxyService::new(client).forward(request).await?;
 ```
 
 ## Logging
 
-Fastly uses endpoint-based logging. Initialize the logger in your entrypoint:
-
-```rust
-use edgezero_adapter_fastly::init_logger;
-
-fn main() {
-    init_logger(); // Uses stdout by default
-    // or with custom endpoint:
-    // init_logger_with_endpoint("my-logging-endpoint");
-}
-```
-
-Configure logging in `edgezero.toml`:
+Fastly uses endpoint-based logging. Configure logging in `edgezero.toml`:
 
 ```toml
 [adapters.fastly.logging]
@@ -137,46 +116,45 @@ level = "info"
 echo_stdout = true
 ```
 
-## Context Access
-
-Access Fastly-specific APIs via the request context:
+To initialize logging manually, call `init_logger` with explicit settings:
 
 ```rust
+use edgezero_adapter_fastly::init_logger;
+use log::LevelFilter;
+
+fn main() {
+    init_logger("stdout", LevelFilter::Info, true).expect("init logger");
+}
+```
+
+::: tip Logging status
+Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
+:::
+
+## Context Access
+
+Access Fastly-specific APIs via the request context extensions:
+
+```rust
+use edgezero_core::context::RequestContext;
 use edgezero_adapter_fastly::FastlyRequestContext;
 
-#[action]
-async fn handler(RequestContext(ctx): RequestContext) -> Response<Body> {
+async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
     // Access Fastly context from extensions
-    if let Some(fastly_ctx) = ctx.extensions().get::<FastlyRequestContext>() {
-        let client_ip = fastly_ctx.client_ip();
-        let geo = fastly_ctx.geo();
+    if let Some(fastly_ctx) = FastlyRequestContext::get(ctx.request()) {
+        let client_ip = fastly_ctx.client_ip;
         // ...
     }
-    
+
     // ...
 }
 ```
 
 ## Streaming
 
-Fastly supports native streaming via `stream_to_client`:
+Fastly supports native streaming via `stream_to_client`. The adapter automatically converts `Body::stream` to Fastly's streaming APIs.
 
-```rust
-#[action]
-async fn stream() -> Response<Body> {
-    let stream = async_stream::stream! {
-        for i in 0..100 {
-            yield Ok::<_, std::io::Error>(format!("chunk {}\n", i).into_bytes());
-        }
-    };
-    
-    Response::builder()
-        .body(Body::stream(stream))
-        .unwrap()
-}
-```
-
-The adapter automatically uses Fastly's streaming APIs for optimal performance.
+See the [Streaming guide](/guide/streaming) for examples and patterns.
 
 ## Testing
 
@@ -196,27 +174,7 @@ If Viceroy reports keychain access errors on macOS, use Wasmtime as the test run
 
 ## Manifest Configuration
 
-Full `edgezero.toml` Fastly configuration:
-
-```toml
-[adapters.fastly.adapter]
-crate = "crates/my-app-adapter-fastly"
-manifest = "crates/my-app-adapter-fastly/fastly.toml"
-
-[adapters.fastly.build]
-target = "wasm32-wasip1"
-profile = "release"
-
-[adapters.fastly.commands]
-build = "cargo build --release --target wasm32-wasip1 -p my-app-adapter-fastly"
-serve = "fastly compute serve -C crates/my-app-adapter-fastly"
-deploy = "fastly compute deploy -C crates/my-app-adapter-fastly"
-
-[adapters.fastly.logging]
-endpoint = "stdout"
-level = "info"
-echo_stdout = true
-```
+Configure the Fastly adapter in `edgezero.toml`. See [Configuration](/guide/configuration) for the full manifest reference.
 
 ## Next Steps
 

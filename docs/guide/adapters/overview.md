@@ -7,7 +7,7 @@ Adapters bridge provider-specific HTTP primitives into EdgeZero's portable model
 Adapters translate provider-specific HTTP primitives into the portable `App` in `edgezero-core`. They must:
 
 - Preserve request semantics
-- Stream responses without buffering
+- Stream responses without buffering where the provider supports it
 - Expose provider context
 - Offer a proxy bridge so handlers can forward traffic without knowing which platform they are on
 
@@ -18,7 +18,7 @@ Each adapter exposes an `into_core_request` helper that accepts the provider's r
 - **Preserve the HTTP method** exactly (`GET`, `POST`, etc.)
 - **Parse the full URI** (path and query string) into an `http::Uri`. Reject invalid URIs with `EdgeError::bad_request`
 - **Copy all headers** into the core request. Provider-specific headers may be filtered only when they clash with platform defaults
-- **Consume the request body** into an `edgezero_core::body::Body`. If the provider offers a streaming API, it should be exposed via `Body::Stream`; otherwise a single buffered chunk is acceptable
+- **Consume the request body** into an `edgezero_core::body::Body`. Adapters may buffer inbound bodies today; streaming input should be preserved where available
 - **Insert a provider context struct** (e.g., `FastlyRequestContext`) into the request extensions. The context should expose metadata such as client IP addresses or environment handles so handlers can reach platform APIs
 
 ## Response Conversion
@@ -37,7 +37,7 @@ Adapters surface a `dispatch` function that bridges from the provider event loop
 1. Convert the incoming provider request with `into_core_request`
 2. Await the router future
 3. Convert the resulting `Response` back into the provider type
-4. Map any `EdgeError` into the provider's error type so failures surface as HTTP 5xx responses instead of panicking
+4. Map any `EdgeError` into the provider's error type so failures surface as provider errors (often 5xx) instead of panicking
 
 This helper is what demo entrypoints and adapters call when wiring their platform-specific main functions.
 
@@ -48,12 +48,14 @@ Adapters implement `edgezero_core::proxy::ProxyClient` so handlers can forward o
 - Accept a `ProxyRequest` created with `ProxyRequest::from_request`
 - Build and send an outbound provider request, reusing headers and streaming the body without buffering
 - Convert the provider response into a `ProxyResponse`, again preserving streaming behaviour and normalising encodings
-- Attach a diagnostic header (e.g., `x-edgezero-proxy`) identifying which adapter forwarded the call
+- Attach a diagnostic header (e.g., `x-edgezero-proxy`) identifying which adapter forwarded the call (Fastly and Cloudflare do this today)
 - Surface provider errors as `EdgeError::internal` so applications can decide how to respond
 
 ## Logging Initialisation
 
-Each adapter exports an `init_logger` helper for platform-specific logging backends (`log_fastly` or `console_log!`). Applications should call it before building the router. New adapters should provide a comparable helper so apps consistently opt into logging.
+Each adapter exports an `init_logger` helper for platform-specific logging backends. Fastly wires
+`log_fastly`, Cloudflare currently no-ops, and Axum uses `simple_logger` in its `run_app` helper.
+New adapters should provide a comparable helper so apps consistently opt into logging.
 
 ## Contract Tests
 
@@ -98,8 +100,8 @@ Adapters that fulfil these steps can be dropped into the EdgeZero CLI without re
 
 ## Available Adapters
 
-| Adapter | Platform | Target | Status |
-|---------|----------|--------|--------|
-| [Fastly](/guide/adapters/fastly) | Fastly Compute@Edge | `wasm32-wasip1` | Stable |
-| [Cloudflare](/guide/adapters/cloudflare) | Cloudflare Workers | `wasm32-unknown-unknown` | Stable |
-| [Axum](/guide/adapters/axum) | Native (Tokio) | Host | Stable |
+| Adapter                                  | Platform            | Target                   | Status |
+| ---------------------------------------- | ------------------- | ------------------------ | ------ |
+| [Fastly](/guide/adapters/fastly)         | Fastly Compute@Edge | `wasm32-wasip1`          | Stable |
+| [Cloudflare](/guide/adapters/cloudflare) | Cloudflare Workers  | `wasm32-unknown-unknown` | Stable |
+| [Axum](/guide/adapters/axum)             | Native (Tokio)      | Host                     | Stable |

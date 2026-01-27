@@ -27,22 +27,22 @@ edgezero new <name> [options]
 ```
 
 **Arguments:**
+
 - `<name>` - Project name (used for directory and crate names)
 
 **Options:**
-- `--adapters <list>` - Comma-separated adapters to include (default: `fastly,cloudflare,axum`)
+
+- `--dir <path>` - Directory to create the project in (default: current directory)
+- `--local-core` - Use local path dependency for edgezero-core (development only)
 
 **Examples:**
 
 ```bash
-# Create project with all adapters
+# Create project with all registered adapters
 edgezero new my-app
 
-# Create project with specific adapters
-edgezero new my-app --adapters fastly,axum
-
-# Create project with only Cloudflare
-edgezero new my-app --adapters cloudflare
+# Create in a specific directory
+edgezero new my-app --dir /path/to/projects
 ```
 
 **Generated structure:**
@@ -53,37 +53,30 @@ my-app/
 ├── edgezero.toml
 ├── crates/
 │   ├── my-app-core/
-│   ├── my-app-adapter-fastly/    (if --adapters includes fastly)
-│   ├── my-app-adapter-cloudflare/ (if --adapters includes cloudflare)
-│   └── my-app-adapter-axum/      (if --adapters includes axum)
+│   ├── my-app-adapter-fastly/
+│   ├── my-app-adapter-cloudflare/
+│   └── my-app-adapter-axum/
 ```
+
+The scaffolder includes all adapters registered at CLI build time.
 
 ### edgezero dev
 
 Start the local development server:
 
 ```bash
-edgezero dev [options]
+edgezero dev
 ```
 
-**Options:**
-- `--port <port>` - Port to listen on (default: 8787)
-- `--host <host>` - Host to bind to (default: 127.0.0.1)
-
-**Examples:**
+**Example:**
 
 ```bash
-# Start dev server with defaults
 edgezero dev
-
-# Start on custom port
-edgezero dev --port 3000
-
-# Bind to all interfaces
-edgezero dev --host 0.0.0.0
+# Server starts at http://127.0.0.1:8787
 ```
 
-The dev server uses the Axum adapter and reads configuration from `edgezero.toml`.
+If `edgezero.toml` defines an Axum adapter command, `edgezero dev` delegates to it. Otherwise it
+starts the built-in dev server (default routes).
 
 ### edgezero build
 
@@ -94,6 +87,7 @@ edgezero build --adapter <name>
 ```
 
 **Arguments:**
+
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `axum`)
 
 **Examples:**
@@ -120,6 +114,7 @@ edgezero serve --adapter <name>
 ```
 
 **Arguments:**
+
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `axum`)
 
 **Examples:**
@@ -136,6 +131,7 @@ edgezero serve --adapter axum
 ```
 
 **Provider behavior:**
+
 - **Fastly**: Runs `fastly compute serve`
 - **Cloudflare**: Runs `wrangler dev`
 - **Axum**: Runs `cargo run -p <adapter-crate>`
@@ -149,6 +145,7 @@ edgezero deploy --adapter <name>
 ```
 
 **Arguments:**
+
 - `--adapter <name>` - Target adapter (`fastly`, `cloudflare`)
 
 **Examples:**
@@ -162,6 +159,7 @@ edgezero deploy --adapter cloudflare
 ```
 
 **Provider behavior:**
+
 - **Fastly**: Runs `fastly compute deploy`
 - **Cloudflare**: Runs `wrangler publish`
 
@@ -173,35 +171,23 @@ The `axum` adapter doesn't support `deploy` - use standard container/binary depl
 
 The CLI respects these environment variables:
 
-| Variable | Description |
-|----------|-------------|
-| `RUST_LOG` | Log level for dev server |
+| Variable            | Description                                 |
+| ------------------- | ------------------------------------------- |
 | `EDGEZERO_MANIFEST` | Path to manifest (default: `edgezero.toml`) |
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | General error |
-| 2 | Missing configuration |
-| 3 | Build failure |
-| 4 | Missing adapter |
 
 ## Working Directory
 
-All commands expect to run from the project root where `edgezero.toml` is located. The CLI searches up the directory tree for the manifest if not found in the current directory.
+All commands expect to run from the project root where `edgezero.toml` is located. If the file is
+missing, the CLI falls back to built-in adapters (when compiled in) instead of manifest-driven
+commands.
 
 ## Adapter Discovery
 
-Adapters register themselves via the `edgezero-adapter` registry. The CLI discovers available adapters at runtime:
+Adapters register themselves via the `edgezero-adapter` registry at build time. There is currently
+no `edgezero --list-adapters` command; the scaffolder includes all adapters that were compiled in.
 
-```bash
-# List available adapters
-edgezero --list-adapters
-```
+Built-in adapters (default CLI build):
 
-Built-in adapters:
 - `fastly` - Fastly Compute@Edge
 - `cloudflare` - Cloudflare Workers
 - `axum` - Native Axum/Tokio
@@ -215,6 +201,7 @@ error: target may not be installed
 ```
 
 Install the required target:
+
 ```bash
 rustup target add wasm32-wasip1      # For Fastly
 rustup target add wasm32-unknown-unknown  # For Cloudflare
@@ -222,14 +209,9 @@ rustup target add wasm32-unknown-unknown  # For Cloudflare
 
 ### Manifest Not Found
 
-```
-error: edgezero.toml not found
-```
-
-Ensure you're in the project root or set `EDGEZERO_MANIFEST`:
-```bash
-EDGEZERO_MANIFEST=/path/to/edgezero.toml edgezero dev
-```
+If you rely on manifest-driven commands, ensure `edgezero.toml` exists or set `EDGEZERO_MANIFEST`.
+When no manifest is present, the CLI falls back to built-in adapter implementations (if compiled
+in) instead of using manifest commands.
 
 ### Provider CLI Not Found
 
@@ -238,6 +220,7 @@ error: fastly: command not found
 ```
 
 Install the provider CLI:
+
 - Fastly: https://developer.fastly.com/learning/compute/
 - Cloudflare: `npm install -g wrangler`
 

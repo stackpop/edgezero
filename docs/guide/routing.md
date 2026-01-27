@@ -20,16 +20,28 @@ methods = ["GET", "POST"]
 handler = "my_app_core::handlers::echo"
 ```
 
-You can also build routes programmatically:
+You can also build routes programmatically using convenience methods:
+
+```rust
+use edgezero_core::router::RouterService;
+
+let router = RouterService::builder()
+    .get("/hello", hello_handler)
+    .get("/echo/{name}", echo_handler)
+    .post("/echo", echo_json_handler)
+    .build();
+```
+
+Or with explicit method specification:
 
 ```rust
 use edgezero_core::router::RouterService;
 use edgezero_core::http::Method;
 
 let router = RouterService::builder()
-    .route(Method::GET, "/hello", hello_handler)
-    .route(Method::GET, "/echo/{name}", echo_handler)
-    .route(Method::POST, "/echo", echo_json_handler)
+    .route("/hello", Method::GET, hello_handler)
+    .route("/echo/{name}", Method::GET, echo_handler)
+    .route("/echo", Method::POST, echo_json_handler)
     .build();
 ```
 
@@ -91,11 +103,12 @@ handler = "my_app_core::handlers::resource"
 Or programmatically:
 
 ```rust
-router
-    .route(Method::GET, "/resource", get_resource)
-    .route(Method::POST, "/resource", create_resource)
-    .route(Method::PUT, "/resource/{id}", update_resource)
-    .route(Method::DELETE, "/resource/{id}", delete_resource)
+RouterService::builder()
+    .get("/resource", get_resource)
+    .post("/resource", create_resource)
+    .put("/resource/{id}", update_resource)
+    .delete("/resource/{id}", delete_resource)
+    .build()
 ```
 
 EdgeZero automatically returns `405 Method Not Allowed` for requests that match a path but use an unsupported method.
@@ -107,7 +120,7 @@ Enable route listing for debugging:
 ```rust
 let router = RouterService::builder()
     .enable_route_listing()
-    .route(Method::GET, "/hello", hello)
+    .get("/hello", hello)
     .build();
 ```
 
@@ -131,10 +144,10 @@ RouterService::builder()
 
 EdgeZero uses matchit's path syntax:
 
-| Pattern | Example | Matches |
-|---------|---------|---------|
-| `/static` | `/static` | Exact match only |
-| `/{param}` | `/users/{id}` | Single segment: `/users/123` |
+| Pattern     | Example          | Matches                      |
+| ----------- | ---------------- | ---------------------------- |
+| `/static`   | `/static`        | Exact match only             |
+| `/{param}`  | `/users/{id}`    | Single segment: `/users/123` |
 | `/{*catch}` | `/files/{*path}` | Rest of path: `/files/a/b/c` |
 
 ::: warning Legacy Syntax
@@ -143,19 +156,9 @@ Axum-style `:name` parameters are **not supported**. Use `{name}` instead.
 
 ## Route Priority
 
-Routes are matched in registration order. More specific routes should be registered before catch-alls:
-
-```rust
-// Good: specific route first
-router
-    .route(Method::GET, "/users/me", get_current_user)
-    .route(Method::GET, "/users/{id}", get_user_by_id)
-
-// Bad: catch-all shadows specific routes
-router
-    .route(Method::GET, "/users/{id}", get_user_by_id)
-    .route(Method::GET, "/users/me", get_current_user)  // Never reached!
-```
+Routes are matched by specificity (static segments first, then parameters, then catch-alls). If two
+routes have the same specificity, the first registered wins. Avoid ambiguous patterns that share
+the same shape (for example, two routes that both look like `/users/{id}`).
 
 ## Next Steps
 

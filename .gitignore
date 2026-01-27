@@ -10,6 +10,7 @@ target/
 .DS_Store
 
 # IDE - VSCode
+.claude/
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json

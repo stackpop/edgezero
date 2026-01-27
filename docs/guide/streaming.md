@@ -10,18 +10,19 @@ Use `Body::stream` to yield response chunks progressively:
 use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::http::Response;
+use bytes::Bytes;
 use futures::stream;
 
 #[action]
-async fn stream_data() -> Response<Body> {
+async fn stream_data() -> Response {
     let chunks = vec![
-        Ok::<_, std::io::Error>(vec![b'H', b'e', b'l', b'l', b'o']),
-        Ok(vec![b' ']),
-        Ok(vec![b'W', b'o', b'r', b'l', b'd']),
+        Bytes::from_static(b"Hello"),
+        Bytes::from_static(b" "),
+        Bytes::from_static(b"World"),
     ];
-    
+
     let body = Body::stream(stream::iter(chunks));
-    
+
     Response::builder()
         .status(200)
         .header("content-type", "text/plain")
@@ -44,19 +45,17 @@ The router keeps streams intact through the adapter layer:
 Stream events to clients with SSE:
 
 ```rust
-use futures::stream::StreamExt;
+use bytes::Bytes;
 
 #[action]
-async fn events() -> Response<Body> {
+async fn events() -> Response {
     let events = async_stream::stream! {
         for i in 0..10 {
-            yield Ok::<_, std::io::Error>(
-                format!("data: Event {}\n\n", i).into_bytes()
-            );
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let payload = format!("data: Event {}\n\n", i);
+            yield Bytes::from(payload);
         }
     };
-    
+
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
@@ -68,7 +67,8 @@ async fn events() -> Response<Body> {
 
 ## Body Modes
 
-Routes can specify their body handling mode in the manifest:
+Routes can specify their body handling mode in the manifest. This is parsed today and reserved
+for future enforcement by adapters and router helpers:
 
 ```toml
 [[triggers.http]]
@@ -78,10 +78,10 @@ handler = "my_app::handlers::upload"
 body-mode = "buffered"  # or "stream"
 ```
 
-| Mode | Behavior |
-|------|----------|
-| `buffered` | Body is fully read into memory before handler runs |
-| `stream` | Body is passed as a stream for progressive processing |
+| Mode       | Behavior                                              |
+| ---------- | ----------------------------------------------------- |
+| `buffered` | Body is fully read into memory before handler runs    |
+| `stream`   | Body is passed as a stream for progressive processing |
 
 ## Transparent Decompression
 
@@ -114,9 +114,9 @@ When the response size is unknown, EdgeZero uses chunked transfer encoding:
 
 ```rust
 #[action]
-async fn dynamic_content() -> Response<Body> {
+async fn dynamic_content() -> Response {
     let stream = generate_content_stream();
-    
+
     // No Content-Length header needed
     Response::builder()
         .status(200)
