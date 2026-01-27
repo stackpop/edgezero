@@ -88,6 +88,7 @@ High-level backlog and decisions to drive the next milestones.
 - [ ] Provider additions: prototype a third adapter (e.g. AWS Lambda@Edge or Vercel Edge Functions) using the stabilized adapter API to validate cross-provider abstractions.
 - [x] Manifest ergonomics: design an `edgezero.toml` schema that mirrors Spin’s manifest convenience (route triggers, env/secrets, build targets) while remaining provider-agnostic; update CLI scaffolding accordingly. (`crates/edgezero-cli/src/manifest.rs`, templates in `crates/edgezero-cli/src/templates/root/edgezero.toml.hbs`, doc `docs/manifest.md`, app-demo manifest `examples/app-demo/edgezero.toml`)
 - [ ] Tooling parity: extend `edgezero-cli` with template/plugin style commands (similar to Spin templates) to streamline new app scaffolds and provider-specific wiring.
+- [ ] CLI parity backlog: add `edgezero --list-adapters`, standardize exit codes, search up for `edgezero.toml`, respect `RUST_LOG` for dev output, and bake in hot reload for `edgezero dev`.
 
 ## Open Design Questions (for later pickup)
 
@@ -489,90 +490,113 @@ High-level backlog and decisions to drive the next milestones.
 - Assumptions: `RequestContext` parameters are owned values (no reference variants needed) and only one is expected per handler.
 - Outstanding: None; `cargo test` across the workspace passed after the macro test adjustment.
 
-## Codex Plan (2026-01-09 - Review new tests + coverage)
+## Codex Plan (2026-01-27 - Documentation Exposure Review)
 
-- [x] Locate recently added/changed tests and note their intent and scope.
-- [x] Review test quality for gaps, brittle assertions, or missing scenarios.
-- [x] Evaluate whether coverage measurement is warranted and how to run it here.
-- [x] Record findings and recommendations in the Review section with timestamp.
+- [x] Diff `main` vs current branch to scope doc-related changes.
+- [x] Review updated/new docs for redundancy, inconsistency, missing coverage, and verbosity.
+- [x] Check overall documentation thoroughness and note gaps vs the framework surface area.
+- [x] Compile review findings with file references and prioritized severity.
 
-## Review (2026-01-09 05:47 UTC)
+## Review (2026-01-27 00:20:19 UTC)
 
-- Summary: Reviewed the recent test additions across `edgezero-core`, `edgezero-macros`, and adapter modules (notably the Axum dev-server/proxy integration tests) to assess coverage intent, reliability, and gaps; no code changes were made.
-- Assumptions: The tests reviewed reflect the “recently added” scope the request referenced; wasm adapter coverage remains out-of-scope for host-only runs.
-- Outstanding: Potential flakiness risks in Axum dev-server integration tests (fixed ports + sleep); coverage gaps noted in response for streaming preservation, invalid manifest cases, and macro output brittleness.
+- Summary: Compared `main` against the `feature/vitepress` branch, audited the new VitePress guide set plus CLI/adapter docs, and assembled a prioritized findings list focused on inaccuracies, redundancy, missing coverage, and verbosity.
+- Assumptions: Documentation review targets current source behavior (not proposed future APIs); adapter contract expectations should reflect existing Fastly/Cloudflare/Axum implementations unless explicitly labeled aspirational.
+- Outstanding: None (review-only; no code changes applied).
 
-## Codex Plan (2026-01-09 - Harden axum dev-server tests + add coverage helper)
+## Review (2026-01-27 00:50:51 UTC)
 
-- [x] Update Axum dev-server integration tests to use ephemeral ports and a readiness check instead of fixed ports + sleep.
-- [x] Add a `cargo llvm-cov` helper (script and/or CI step) scoped to host-capable crates, documenting the command path.
-- [x] Run `cargo test` after code changes.
-- [x] Record changes, assumptions, and any remaining gaps in the Review section with timestamp.
+- Summary: Aligned guide content with current EdgeZero APIs (App::build_app, adapter entrypoints, middleware signature, proxy clients), corrected routing/streaming/handlers/CLI details, and refreshed manifest/logging docs; added the missing CLI/dev features list to the roadmap.
+- Assumptions: Docs now reflect current behavior for Fastly/Cloudflare/Axum adapters and the CLI; future features are captured explicitly in the roadmap rather than implied in guides.
+- Outstanding: None (docs-only updates).
 
-## Review (2026-01-09 05:57 UTC)
+## Review (2026-01-27 01:02:05 UTC)
 
-- Summary: Reworked the Axum dev-server integration tests to bind an ephemeral listener and retry requests instead of relying on fixed ports + sleeps, added a host-only coverage helper script (`scripts/run_coverage.sh`) with README instructions, and confirmed `cargo test` passes.
-- Assumptions: Coverage runs remain host-only (defaulting to `edgezero-core`) unless `EDGEZERO_COVERAGE_PACKAGES` is provided; wasm-only crates are still excluded from coverage runs.
-- Outstanding: None.
+- Summary: Condensed the proxying guide into a single end-to-end example that uses adapter proxy handles, and added short logging-status callouts to the Fastly, Cloudflare, and Axum adapter docs.
+- Assumptions: The proxy handle approach is the preferred public pattern; adapter logging notes should stay concise and match current defaults.
+- Outstanding: None (docs-only updates).
 
-## Codex Plan (2026-01-09 - Add HTML coverage output)
+## Review (2026-01-27 01:05:18 UTC)
 
-- [x] Update `scripts/run_coverage.sh` to emit an HTML report (LCOV -> HTML) when `genhtml` is available.
-- [x] Document the HTML output location and fallback behavior in `README.md`.
-- [x] Run `cargo test` after code changes.
-- [x] Record changes, assumptions, and any remaining gaps in the Review section with timestamp.
+- Summary: Added a dedicated `docs/guide/roadmap.md` page containing the current roadmap and design questions, and linked it in the VitePress sidebar.
+- Assumptions: The roadmap page mirrors `TODO.md` and is a public-facing summary of ongoing planning work.
+- Outstanding: None (docs-only updates).
 
-## Review (2026-01-09 06:05 UTC)
+## Review (2026-01-27 01:09:04 UTC)
 
-- Summary: Updated `scripts/run_coverage.sh` to emit per-crate HTML reports when `genhtml` is available and documented the output location in `README.md`; `cargo test` remains green.
-- Assumptions: HTML generation depends on `genhtml` (lcov); without it the script still writes LCOV files and prints install guidance.
-- Outstanding: None.
+- Summary: Expanded the roadmap page with doc/CLI alignment gaps found during review and added an explicit Spin support item.
+- Assumptions: The new roadmap bullets are directional and do not imply implementation order.
+- Outstanding: None (docs-only updates).
 
-## Codex Plan (2026-01-09 - Auto-discover crates for coverage)
+## Codex Plan (2026-01-27 - Post-Merge Docs Review)
 
-- [x] Update `scripts/run_coverage.sh` to auto-discover workspace packages (e.g., via `cargo metadata`) when `EDGEZERO_COVERAGE_PACKAGES` is unset.
-- [x] Ensure the script skips non-library targets that cannot be covered on host (and document behavior).
-- [x] Update README coverage instructions accordingly.
-- [x] Run `cargo test` after code changes.
-- [x] Record changes, assumptions, and any remaining gaps in the Review section with timestamp.
+- [x] Diff `main` vs current branch to scope doc-related changes post-merge.
+- [x] Re-review docs for redundancy, inconsistencies, missing coverage, thoroughness, and verbosity.
+- [x] Summarize findings with file references and prioritized issues.
 
-## Review (2026-01-09 06:10 UTC)
+## Review (2026-01-27 01:40:07 UTC)
 
-- Summary: `scripts/run_coverage.sh` now auto-discovers workspace packages via `cargo metadata` when `EDGEZERO_COVERAGE_PACKAGES` is unset, defaulting to lib/proc-macro crates unless `EDGEZERO_COVERAGE_INCLUDE_BINS=1` is set; README coverage guidance updated and `cargo test` still passes.
-- Assumptions: Auto-discovery relies on `python3` for JSON parsing; binary-only coverage remains opt-in to avoid host-incompatible targets.
-- Outstanding: None.
+- Summary: Re-ran the post-merge documentation audit against `main`, flagging the top doc/behavior mismatches (CLI flags, trigger adapter filtering, Fastly backend wording) plus missing manifest field coverage and CLI passthrough docs.
+- Assumptions: Review targets current runtime behavior; undocumented manifest fields and adapter filters should be explicitly labeled as reserved/ignored if they remain unimplemented.
+- Outstanding: None (review-only; no code changes applied).
 
-## Review (2026-01-09 06:19 UTC)
+## Codex Plan (2026-01-27 - Docs Fixes After Review)
 
-- Summary: Fixed `scripts/run_coverage.sh` auto-discovery to pipe `cargo metadata` into `python -c` correctly, ran the script successfully, and re-ran `cargo test` after the change.
-- Assumptions: `python3` remains available for JSON parsing; `genhtml` is installed for HTML output.
-- Outstanding: None.
+- [x] Align CLI usage docs with actual flags (`edgezero new`, passthrough args) and remove/replace unsupported examples.
+- [x] Reconcile adapter/proxy docs (Cloudflare vs Fastly outbound request wording; adapter filtering behavior).
+- [x] Document or mark reserved manifest fields (`app.version`, `app.kind`) and trim duplicate CLI install instructions.
+- [x] Summarize changes with file references in TODO review entry.
 
-## Review (2026-01-09 16:22 UTC)
+## Review (2026-01-27 01:58:05 UTC)
 
-- Summary: Added a buffered form test for `RequestContext::form::<serde_json::Value>` to cover the remaining `context.rs` line gap; `cargo test -p edgezero-core` and `cargo llvm-cov -p edgezero-core --show-missing-lines` now report 100% line coverage for `edgezero-core`.
-- Assumptions: Line coverage (not region coverage) is the target for this pass.
-- Outstanding: None.
+- Summary: Aligned CLI and configuration docs with actual flags and manifest behavior, clarified Fastly/Cloudflare outbound request wording, and trimmed duplicate CLI install guidance; captured test failures in `debug.md`.
+- Assumptions: Manifest `version` and `kind` remain reserved fields until the parser is extended; adapter filters stay informational unless `app!` adds enforcement.
+- Outstanding: `cargo test` failed in `edgezero-adapter-axum` integration tests due to local port bind permissions (see `debug.md`).
 
-## Codex Plan (2026-01-09 - Edgezero-core 100% coverage push)
+## Review (2026-01-27 02:13:01 UTC)
 
-- [x] Re-run `cargo llvm-cov -p edgezero-core --no-deps --show-missing-lines` to confirm the current uncovered lines.
-- [x] Add targeted unit tests in `edgezero-core` to cover uncovered branches (App, Body, Context, Error, Manifest, Middleware, Response, Router, Handler/Http if needed) and refactor test-only branches that artificially lower coverage.
-- [x] Fix test compilation errors surfaced by the coverage run (expect_err Debug bounds in extractor/manifest tests; middleware type inference/lifetime issues).
-- [x] Identify the remaining uncovered `edgezero-core` lines (currently in `context.rs`) and add minimal coverage for them.
-- [x] Re-run coverage and `cargo test` to verify 100% line coverage for `edgezero-core`.
-- [x] Document changes, assumptions, and any remaining gaps in the Review section with timestamp.
+- Summary: Cleaned the roadmap to focus on forward-looking items, moved completed work into a "Completed (Recent)" section, removed the stale date header, and tightened Spin wording to "mirror" rather than "match."
+- Assumptions: The completed items reflect the current docs/tests baseline; future roadmap entries should be updated as features land.
+- Outstanding: `cargo test` failed in `edgezero-adapter-axum` integration tests due to local port bind permissions (see `debug.md`).
 
-## Codex Plan (2026-01-09 - Investigate cargo test failure)
+## Review (2026-01-27 02:17:12 UTC)
 
-- [x] Run `cargo test` to capture the failing crate/test output.
-- [x] Inspect the failing module(s) to identify the smallest fix or adjustment.
-- [x] Apply the minimal code/test change needed to resolve the failure.
-- [x] Re-run the relevant tests (`cargo test` and/or `cargo test -p <crate>`) to confirm.
-- [x] Record the outcome, assumptions, and any remaining issues in the Review section with timestamp.
+- Summary: Pruned the open design questions to only unresolved items, and moved resolved topics (platform focus, adapter mapping rules) into the completed section.
+- Assumptions: Remaining open questions reflect genuine policy decisions rather than already-shipped behavior.
+- Outstanding: `cargo test` failed in `edgezero-adapter-axum` integration tests due to local port bind permissions (see `debug.md`).
 
-## Review (2026-01-09 16:28 UTC)
+## Codex Plan (2026-01-27 - Roadmap Cleanup)
 
-- Summary: Added `tempfile` as a dev-dependency for `edgezero-macros` so the included manifest tests compile, and `cargo test` now passes across the workspace.
-- Assumptions: Keeping manifest tests in the macro crate is acceptable for now; we rely on workspace-level `tempfile` versioning.
-- Outstanding: None.
+- [x] Audit `docs/guide/roadmap.md` for redundancy, stale dating, and overlapping bullets.
+- [x] Restructure the roadmap into clearer groupings (e.g., near-term vs later, or by theme) and tighten wording.
+- [x] Keep Spin-related intent but ensure it reads as “mirrors” and does not overpromise; remove any duplicate items.
+- [x] Update TODO review entry with summary and file references.
+
+## Codex Plan (2026-01-27 - Open Design Questions Cleanup)
+
+- [x] Review `docs/guide/roadmap.md` "Open Design Questions" and identify which are already resolved.
+- [x] Remove resolved items or move them into "Completed (Recent)" with brief phrasing.
+- [x] Keep only genuinely open questions, tightening wording to avoid duplication.
+- [x] Update TODO review entry with summary and file references.
+
+## Codex Plan (2026-01-27 - Roadmap Doc Page)
+
+- [x] Add a dedicated roadmap page under `docs/guide/roadmap.md`.
+- [x] Populate it with the roadmap content (including the CLI parity backlog list).
+- [x] Wire the roadmap page into the VitePress sidebar/navigation.
+
+## Codex Plan (2026-01-27 - Roadmap Findings + Spin Support)
+
+- [x] Add the key doc/CLI gaps found during the review to the roadmap page.
+- [x] Add an explicit roadmap item for Spin support (define scope at the doc level).
+
+## Codex Plan (2026-01-27 - Proxying Snippet + Adapter Logging Callout)
+
+- [x] Condense proxying guide into a single end-to-end example using adapter proxy handles.
+- [x] Add a short logging status callout to the adapter docs (Axum/Cloudflare/Fastly).
+
+## Codex Plan (2026-01-27 - Docs Alignment + Roadmap Additions)
+
+- [x] Update guides to reflect current APIs (App::build_app, adapter entrypoints, middleware signature, proxy client usage).
+- [x] Correct routing, streaming, handlers, and CLI reference docs to match current behavior.
+- [x] Refresh configuration docs to align with manifest schema and loader APIs.
+- [x] Add missing-feature backlog (list-adapters, exit codes, manifest search-up, RUST_LOG, hot reload) to the roadmap section.

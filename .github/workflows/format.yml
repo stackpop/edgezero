@@ -1,4 +1,4 @@
-name: "Run Format"
+name: 'Run Format'
 
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
       - name: Set up rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
       - name: Fetch dependencies (locked)
@@ -49,3 +49,34 @@ jobs:
 
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  format-docs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: docs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Retrieve Node.js version
+        id: node-version
+        working-directory: .
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: docs/package.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run Prettier (check)
+        run: npm run format
