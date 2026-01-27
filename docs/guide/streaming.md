@@ -45,6 +45,9 @@ The router keeps streams intact through the adapter layer:
 Stream events to clients with SSE:
 
 ```rust
+use edgezero_core::action;
+use edgezero_core::body::Body;
+use edgezero_core::http::Response;
 use bytes::Bytes;
 
 #[action]

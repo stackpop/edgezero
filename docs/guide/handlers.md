@@ -159,6 +159,27 @@ async fn submit_form(Form(data): Form<ContactForm>) -> Text<String> {
 
 Use `ValidatedForm<T>` for form data with validation, and `ValidatedPath<T>` for validated path parameters.
 
+### Host Extractors
+
+Extract the hostname from request headers:
+
+```rust
+use edgezero_core::extractor::{Host, ForwardedHost};
+
+// Extract from the Host header (falls back to "localhost")
+#[action]
+async fn check_host(Host(host): Host) -> Text<String> {
+    Text::new(format!("Host: {}", host))
+}
+
+// Extract from X-Forwarded-Host first, then Host header
+// Use this when behind a reverse proxy or load balancer
+#[action]
+async fn check_forwarded(ForwardedHost(host): ForwardedHost) -> Text<String> {
+    Text::new(format!("Effective host: {}", host))
+}
+```
+
 ### Request Context
 
 For full request access, handlers can receive `RequestContext` directly (no `#[action]` needed):
@@ -190,6 +211,7 @@ async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
 | `json::<T>()`    | Deserialize JSON body to `T`               |
 | `form::<T>()`    | Deserialize form body to `T`               |
 | `body()`         | `&Body` - raw request body                 |
+| `into_request()` | `Request` - consume context, take request  |
 | `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
 
 ## Response Types

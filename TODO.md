@@ -527,6 +527,57 @@ High-level backlog and decisions to drive the next milestones.
 - Assumptions: The new roadmap bullets are directional and do not imply implementation order.
 - Outstanding: None (docs-only updates).
 
+## Codex Plan (2026-01-27 - Post-Merge Docs Review)
+
+- [x] Diff `main` vs current branch to scope doc-related changes post-merge.
+- [x] Re-review docs for redundancy, inconsistencies, missing coverage, thoroughness, and verbosity.
+- [x] Summarize findings with file references and prioritized issues.
+
+## Review (2026-01-27 01:40:07 UTC)
+
+- Summary: Re-ran the post-merge documentation audit against `main`, flagging the top doc/behavior mismatches (CLI flags, trigger adapter filtering, Fastly backend wording) plus missing manifest field coverage and CLI passthrough docs.
+- Assumptions: Review targets current runtime behavior; undocumented manifest fields and adapter filters should be explicitly labeled as reserved/ignored if they remain unimplemented.
+- Outstanding: None (review-only; no code changes applied).
+
+## Codex Plan (2026-01-27 - Docs Fixes After Review)
+
+- [x] Align CLI usage docs with actual flags (`edgezero new`, passthrough args) and remove/replace unsupported examples.
+- [x] Reconcile adapter/proxy docs (Cloudflare vs Fastly outbound request wording; adapter filtering behavior).
+- [x] Document or mark reserved manifest fields (`app.version`, `app.kind`) and trim duplicate CLI install instructions.
+- [x] Summarize changes with file references in TODO review entry.
+
+## Review (2026-01-27 01:58:05 UTC)
+
+- Summary: Aligned CLI and configuration docs with actual flags and manifest behavior, clarified Fastly/Cloudflare outbound request wording, and trimmed duplicate CLI install guidance; captured test failures in `debug.md`.
+- Assumptions: Manifest `version` and `kind` remain reserved fields until the parser is extended; adapter filters stay informational unless `app!` adds enforcement.
+- Outstanding: `cargo test` failed in `edgezero-adapter-axum` integration tests due to local port bind permissions (see `debug.md`).
+
+## Review (2026-01-27 02:13:01 UTC)
+
+- Summary: Cleaned the roadmap to focus on forward-looking items, moved completed work into a "Completed (Recent)" section, removed the stale date header, and tightened Spin wording to "mirror" rather than "match."
+- Assumptions: The completed items reflect the current docs/tests baseline; future roadmap entries should be updated as features land.
+- Outstanding: `cargo test` failed in `edgezero-adapter-axum` integration tests due to local port bind permissions (see `debug.md`).
+
+## Review (2026-01-27 02:17:12 UTC)
+
+- Summary: Pruned the open design questions to only unresolved items, and moved resolved topics (platform focus, adapter mapping rules) into the completed section.
+- Assumptions: Remaining open questions reflect genuine policy decisions rather than already-shipped behavior.
+- Outstanding: `cargo test` failed in `edgezero-adapter-axum` integration tests due to local port bind permissions (see `debug.md`).
+
+## Codex Plan (2026-01-27 - Roadmap Cleanup)
+
+- [x] Audit `docs/guide/roadmap.md` for redundancy, stale dating, and overlapping bullets.
+- [x] Restructure the roadmap into clearer groupings (e.g., near-term vs later, or by theme) and tighten wording.
+- [x] Keep Spin-related intent but ensure it reads as “mirrors” and does not overpromise; remove any duplicate items.
+- [x] Update TODO review entry with summary and file references.
+
+## Codex Plan (2026-01-27 - Open Design Questions Cleanup)
+
+- [x] Review `docs/guide/roadmap.md` "Open Design Questions" and identify which are already resolved.
+- [x] Remove resolved items or move them into "Completed (Recent)" with brief phrasing.
+- [x] Keep only genuinely open questions, tightening wording to avoid duplication.
+- [x] Update TODO review entry with summary and file references.
+
 ## Codex Plan (2026-01-27 - Roadmap Doc Page)
 
 - [x] Add a dedicated roadmap page under `docs/guide/roadmap.md`.

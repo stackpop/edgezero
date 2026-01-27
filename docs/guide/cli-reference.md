@@ -4,17 +4,7 @@ The `edgezero` CLI provides commands for scaffolding, development, building, and
 
 ## Installation
 
-Install from the workspace:
-
-```bash
-cargo install --path crates/edgezero-cli
-```
-
-Or from a published crate:
-
-```bash
-cargo install edgezero-cli
-```
+Follow the [Getting Started](/guide/getting-started) guide to install the CLI.
 
 ## Commands
 
@@ -104,6 +94,12 @@ edgezero build --adapter axum
 ```
 
 The command executes the `build` command from `[adapters.<name>.commands]` in `edgezero.toml`, or falls back to the built-in adapter helper.
+
+Any arguments after `--` are forwarded to the adapter command:
+
+```bash
+edgezero build --adapter fastly -- --flag value
+```
 
 ### edgezero serve
 

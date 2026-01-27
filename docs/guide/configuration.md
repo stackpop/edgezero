@@ -40,6 +40,8 @@ middleware = ["edgezero_core::middleware::RequestLogger"]
 | ------------ | -------- | -------------------------------------------------------------------- |
 | `name`       | No       | Display name for the application (defaults to "EdgeZero App")        |
 | `entry`      | No       | Path to the core crate containing handlers (recommended for tooling) |
+| `version`    | No       | Reserved for future compatibility; currently ignored                 |
+| `kind`       | No       | Reserved for future compatibility; currently ignored                 |
 | `middleware` | No       | List of middleware to apply globally                                 |
 
 ### Middleware
@@ -86,9 +88,13 @@ body-mode = "buffered"
 | `path`        | Yes      | URI template (`{param}` for params, `{*rest}` for catch-all) |
 | `methods`     | No       | Allowed HTTP methods (defaults to `GET`)                     |
 | `handler`     | No       | Path to handler function (required for `app!` route wiring)  |
-| `adapters`    | No       | Which adapters expose this route (empty = all)               |
+| `adapters`    | No       | Intended adapter filter (metadata; `app!` currently ignores) |
 | `description` | No       | Human-readable description for docs or tooling               |
 | `body-mode`   | No       | `buffered` or `stream`                                       |
+
+::: tip Adapter filters
+The `adapters` field is currently metadata for tooling; `app!` wires all triggers regardless of adapter.
+:::
 
 ## Environment Section
 

@@ -91,6 +91,8 @@ Response Flow:
 ### Authentication
 
 ```rust
+use edgezero_core::body::Body;
+
 pub struct AuthMiddleware {
     secret: String,
 }
@@ -192,6 +194,8 @@ impl Middleware for TimingMiddleware {
 Middleware can short-circuit the chain by not calling `next`:
 
 ```rust
+use edgezero_core::body::Body;
+
 impl Middleware for RateLimiter {
     async fn handle(
         &self,

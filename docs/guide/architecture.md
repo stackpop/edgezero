@@ -25,7 +25,7 @@ edgezero/
 - **Routing** - `RouterService` with path parameter matching via `matchit`
 - **Request/Response** - Portable `http::Request` and `http::Response` types
 - **Body** - Unified body type supporting buffered and streaming modes
-- **Extractors** - `Json<T>`, `Path<T>`, `Query<T>`, `Form<T>`, `Headers`, and `Validated*` variants
+- **Extractors** - `Json<T>`, `Path<T>`, `Query<T>`, `Form<T>`, `Headers`, `Host`, `ForwardedHost`, and `Validated*` variants
 - **Middleware** - Composable middleware chain with async support
 - **Manifest** - `edgezero.toml` parsing and validation
 - **Compression** - Shared gzip/brotli stream decoders

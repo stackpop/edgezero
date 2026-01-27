@@ -193,13 +193,13 @@ Configure the Cloudflare adapter in `edgezero.toml`. See [Configuration](/guide/
 
 ## Comparison with Fastly
 
-| Feature           | Cloudflare Workers       | Fastly Compute         |
-| ----------------- | ------------------------ | ---------------------- |
-| Target            | `wasm32-unknown-unknown` | `wasm32-wasip1`        |
-| Outbound requests | Global `fetch`           | Named backends         |
-| Storage           | KV, Durable Objects, R2  | KV Store, Object Store |
-| Logging           | `console.log`            | Log endpoints          |
-| CLI               | Wrangler                 | Fastly CLI             |
+| Feature           | Cloudflare Workers       | Fastly Compute                      |
+| ----------------- | ------------------------ | ----------------------------------- |
+| Target            | `wasm32-unknown-unknown` | `wasm32-wasip1`                     |
+| Outbound requests | Global `fetch`           | Dynamic backends (derived from URI) |
+| Storage           | KV, Durable Objects, R2  | KV Store, Object Store              |
+| Logging           | `console.log`            | Log endpoints                       |
+| CLI               | Wrangler                 | Fastly CLI                          |
 
 ## Next Steps
 

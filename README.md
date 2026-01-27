@@ -9,7 +9,7 @@ Production-ready toolkit for portable edge HTTP workloads. Write once, deploy to
 cargo install --path crates/edgezero-cli
 
 # Create a new project
-edgezero new my-app --adapters fastly cloudflare axum
+edgezero new my-app
 cd my-app
 
 # Start the dev server
