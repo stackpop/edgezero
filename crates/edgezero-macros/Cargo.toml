@@ -16,3 +16,6 @@ serde = { workspace = true, features = ["derive"] }
 syn = { version = "2", features = ["full"] }
 toml = { workspace = true }
 validator = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

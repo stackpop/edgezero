@@ -353,6 +353,258 @@ mod tests {
         .unwrap();
 
         let result = read_axum_project(&root.join("axum.toml"));
+        match result {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(e.contains("must be between 1 and 65535")),
+        }
+    }
+
+    #[test]
+    fn read_axum_project_rejects_zero_port() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nport = 0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let result = read_axum_project(&root.join("axum.toml"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_axum_project_rejects_negative_port() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nport = -1\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let result = read_axum_project(&root.join("axum.toml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_axum_project_rejects_missing_adapter_table() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("axum.toml"), "[other]\nkey = \"value\"\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let result = read_axum_project(&root.join("axum.toml"));
+        match result {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(e.contains("adapter table missing")),
+        }
+    }
+
+    #[test]
+    fn read_axum_project_rejects_missing_crate_dir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("axum.toml"), "[adapter]\ncrate = \"demo\"\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let result = read_axum_project(&root.join("axum.toml"));
+        match result {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(e.contains("crate_dir missing")),
+        }
+    }
+
+    #[test]
+    fn read_axum_project_rejects_missing_cargo_toml() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let subdir = root.join("subdir");
+        fs::create_dir_all(&subdir).unwrap();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \"subdir\"\n",
+        )
+        .unwrap();
+        // No Cargo.toml in subdir
+
+        let result = read_axum_project(&root.join("axum.toml"));
+        match result {
+            Ok(_) => panic!("expected error"),
+            Err(e) => assert!(e.contains("Cargo.toml missing")),
+        }
+    }
+
+    #[test]
+    fn read_axum_project_falls_back_to_package_name() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // No crate key in adapter table
+        fs::write(root.join("axum.toml"), "[adapter]\ncrate_dir = \".\"\n").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"my-package\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        assert_eq!(project.crate_name, "my-package");
+    }
+
+    #[test]
+    fn read_axum_project_with_relative_crate_dir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let adapter_dir = root.join("crates/my-adapter");
+        fs::create_dir_all(&adapter_dir).unwrap();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"my-adapter\"\ncrate_dir = \"crates/my-adapter\"\n",
+        )
+        .unwrap();
+        fs::write(
+            adapter_dir.join("Cargo.toml"),
+            "[package]\nname = \"my-adapter\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        assert_eq!(project.crate_name, "my-adapter");
+        assert_eq!(project.crate_dir, adapter_dir);
+    }
+
+    #[test]
+    fn read_axum_project_accepts_max_valid_port() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nport = 65535\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        assert_eq!(project.port, 65535);
+    }
+
+    #[test]
+    fn read_axum_project_accepts_min_valid_port() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nport = 1\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        assert_eq!(project.port, 1);
+    }
+
+    #[test]
+    fn find_axum_manifest_returns_error_when_not_found() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Create an empty directory with a Cargo.toml but no axum.toml
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let result = find_axum_manifest(root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("could not locate axum.toml"));
+    }
+
+    #[test]
+    fn find_axum_manifest_finds_in_current_dir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\n",
+        )
+        .unwrap();
+
+        let found = find_axum_manifest(root).expect("manifest");
+        assert_eq!(found, root.join("axum.toml"));
+    }
+
+    #[test]
+    fn find_axum_manifest_finds_closest() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let nested = root.join("level1/level2");
+        fs::create_dir_all(&nested).unwrap();
+
+        // Create axum.toml at root
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"root\"\ncrate_dir = \".\"\n",
+        )
+        .unwrap();
+
+        // Create axum.toml at level1
+        fs::write(
+            root.join("level1/Cargo.toml"),
+            "[package]\nname = \"level1\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("level1/axum.toml"),
+            "[adapter]\ncrate = \"level1\"\ncrate_dir = \".\"\n",
+        )
+        .unwrap();
+
+        // Search from level2, should find level1's axum.toml (closer)
+        let found = find_axum_manifest(&nested).expect("manifest");
+        assert_eq!(found, root.join("level1/axum.toml"));
+    }
+
+    #[test]
+    fn deploy_returns_error() {
+        let result = deploy(&[]);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("does not define a deploy command"));
+    }
+
+    #[test]
+    fn adapter_name_is_axum() {
+        assert_eq!(AXUM_ADAPTER.name(), "axum");
+    }
+
+    #[test]
+    fn blueprint_has_correct_id() {
+        assert_eq!(AXUM_BLUEPRINT.id, "axum");
+        assert_eq!(AXUM_BLUEPRINT.display_name, "Axum");
     }
 }

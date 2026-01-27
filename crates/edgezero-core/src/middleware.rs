@@ -162,6 +162,10 @@ mod tests {
         RequestContext::new(request, PathParams::default())
     }
 
+    async fn ok_handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
+        Ok(response_with_body(StatusCode::OK, Body::empty()))
+    }
+
     #[test]
     fn middleware_chain_runs_in_order() {
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -195,14 +199,59 @@ mod tests {
 
     #[test]
     fn middleware_can_short_circuit() {
-        let handler = (|_ctx: RequestContext| async move {
-            Ok::<Response, EdgeError>(response_with_body(StatusCode::OK, Body::empty()))
-        })
-        .into_handler();
+        let handler = ok_handler.into_handler();
 
         let middlewares: Vec<BoxMiddleware> = vec![Arc::new(ShortCircuit) as BoxMiddleware];
         let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn next_runs_handler_without_middlewares() {
+        let handler = ok_handler.into_handler();
+        let response =
+            block_on(Next::new(&[], handler.as_ref()).run(empty_context())).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn request_logger_passes_through_success() {
+        let handler = ok_handler.into_handler();
+        let response =
+            block_on(RequestLogger.handle(empty_context(), Next::new(&[], handler.as_ref())))
+                .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn request_logger_propagates_error() {
+        let handler = (|_ctx: RequestContext| async move {
+            Err::<Response, EdgeError>(EdgeError::bad_request("boom"))
+        })
+        .into_handler();
+        let err = block_on(RequestLogger.handle(empty_context(), Next::new(&[], handler.as_ref())))
+            .expect_err("error");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn middleware_fn_executes_closure() {
+        let called = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&called);
+        let middleware = middleware_fn(move |_ctx, _next| {
+            let flag = Arc::clone(&flag);
+            async move {
+                *flag.lock().unwrap() = true;
+                Ok(response_with_body(StatusCode::OK, Body::empty()))
+            }
+        });
+
+        let handler = ok_handler.into_handler();
+        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(middleware) as BoxMiddleware];
+        let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(*called.lock().unwrap());
     }
 }

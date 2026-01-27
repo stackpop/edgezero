@@ -9,11 +9,12 @@ target/
 # OS
 .DS_Store
 
-# IDE - VSCode
-.claude/
+# Editors
+.claude
+.idea
+.specstory
 .vscode/*
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-.specstory
