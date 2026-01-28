@@ -7,10 +7,6 @@ members = [
     "crates/edgezero-cli",
     "crates/edgezero-core",
     "crates/edgezero-macros",
-    "examples/app-demo/crates/app-demo-adapter-cloudflare",
-    "examples/app-demo/crates/app-demo-adapter-axum",
-    "examples/app-demo/crates/app-demo-core",
-    "examples/app-demo/crates/app-demo-adapter-fastly",
 ]
 resolver = "2"
 
