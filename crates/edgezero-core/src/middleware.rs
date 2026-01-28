@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 use async_trait::async_trait;
 
