@@ -105,14 +105,23 @@ fn ensure_backend(uri: &Uri) -> Result<Backend, EdgeError> {
         None => host.to_string(),
     };
 
-    let builder = Backend::builder(&name, &host_with_port).override_host(host);
+    let mut builder = Backend::builder(&name, &host_with_port).override_host(host);
+    if uri.scheme_str() == Some("https") {
+        builder = builder
+            .enable_ssl()
+            .sni_hostname(host)
+            .check_certificate(host);
+    }
 
     match builder.finish() {
         Ok(backend) => Ok(backend),
         Err(_) => {
             let mut builder = Backend::builder(&name, &target);
             if uri.scheme_str() == Some("https") {
-                builder = builder.enable_ssl();
+                builder = builder
+                    .enable_ssl()
+                    .sni_hostname(host)
+                    .check_certificate(host);
             }
             builder.finish().map_err(EdgeError::internal)
         }
