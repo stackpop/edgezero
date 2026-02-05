@@ -7,11 +7,8 @@ members = [
     "crates/edgezero-cli",
     "crates/edgezero-core",
     "crates/edgezero-macros",
-    "examples/app-demo/crates/app-demo-adapter-cloudflare",
-    "examples/app-demo/crates/app-demo-adapter-axum",
-    "examples/app-demo/crates/app-demo-core",
-    "examples/app-demo/crates/app-demo-adapter-fastly",
 ]
+exclude = ["examples/app-demo"]
 resolver = "2"
 
 [workspace.package]
@@ -22,7 +19,6 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
-app-demo-core = { path = "examples/app-demo/crates/app-demo-core" }
 async-compression = { version = "0.4", features = [
     "futures-io",
     "gzip",
@@ -67,5 +63,5 @@ tower-service = "0.3"
 tracing = "0.1"
 validator = { version = "0.20", features = ["derive"] }
 walkdir = { version = "2" }
-worker = { version = "0.7", features = ["http"] }
 web-time = "1"
+worker = { version = "0.7", features = ["http"] }

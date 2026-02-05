@@ -1,1 +1,32 @@
-# Workspace configuration removed to merge with root workspace
+[workspace]
+members = [
+    "crates/app-demo-core",
+    "crates/app-demo-adapter-fastly",
+    "crates/app-demo-adapter-cloudflare",
+    "crates/app-demo-adapter-axum",
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"
+app-demo-core = { path = "crates/app-demo-core" }
+async-trait = "0.1"
+axum = "0.7"
+bytes = "1"
+edgezero-adapter-axum = { path = "../../crates/edgezero-adapter-axum" }
+edgezero-adapter-cloudflare = { path = "../../crates/edgezero-adapter-cloudflare" }
+edgezero-adapter-fastly = { path = "../../crates/edgezero-adapter-fastly" }
+edgezero-core = { path = "../../crates/edgezero-core" }
+fastly = "0.11"
+futures = { version = "0.3", default-features = false, features = [
+    "std",
+    "executor",
+] }
+log = "0.4"
+once_cell = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simple_logger = "4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+worker = { version = "0.7", default-features = false, features = ["http"] }
