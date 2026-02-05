@@ -7,7 +7,8 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderValue, Method, Uri};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
 use fastly::{
-    http::body::StreamingBody, Backend, Request as FastlyRequest, Response as FastlyResponse,
+    error::anyhow, http::body::StreamingBody, Backend, Request as FastlyRequest,
+    Response as FastlyResponse,
 };
 use futures_util::stream::{BoxStream, StreamExt};
 use std::io::{self, Write};
@@ -105,11 +106,7 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
 
     // Human-readable name: backend_{scheme}_{host}_{port} with dots/colons sanitised
     let name_base = format!("{}_{}_{}", scheme, host, target_port);
-    let backend_name = format!(
-        "{}{}",
-        BACKEND_PREFIX,
-        name_base.replace(['.', ':'], "_")
-    );
+    let backend_name = format!("{}{}", BACKEND_PREFIX, name_base.replace(['.', ':'], "_"));
 
     let mut builder = Backend::builder(&backend_name, &host_with_port)
         .override_host(host)
@@ -140,9 +137,11 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
                 log::debug!("reusing existing dynamic backend: {}", backend_name);
                 Ok(backend_name)
             } else {
-                Err(EdgeError::internal(format!(
+                Err(EdgeError::internal(anyhow!(
                     "dynamic backend creation failed ({} -> {}): {}",
-                    backend_name, host_with_port, msg
+                    backend_name,
+                    host_with_port,
+                    msg
                 )))
             }
         }
