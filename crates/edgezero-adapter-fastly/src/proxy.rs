@@ -122,12 +122,12 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
             .enable_ssl()
             .sni_hostname(host)
             .check_certificate(host);
-        log::info!("enable ssl for backend: {}", backend_name);
+        log::debug!("enable ssl for backend: {}", backend_name);
     }
 
     match builder.finish() {
         Ok(_) => {
-            log::info!(
+            log::debug!(
                 "created dynamic backend: {} -> {}",
                 backend_name,
                 host_with_port
@@ -137,7 +137,7 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("NameInUse") || msg.contains("already in use") {
-                log::info!("reusing existing dynamic backend: {}", backend_name);
+                log::debug!("reusing existing dynamic backend: {}", backend_name);
                 Ok(backend_name)
             } else {
                 Err(EdgeError::internal(format!(
