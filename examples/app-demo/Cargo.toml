@@ -1,9 +1,9 @@
 [workspace]
 members = [
-  "crates/app-demo-core",
-  "crates/app-demo-adapter-fastly",
-  "crates/app-demo-adapter-cloudflare",
-  "crates/app-demo-adapter-axum",
+    "crates/app-demo-core",
+    "crates/app-demo-adapter-fastly",
+    "crates/app-demo-adapter-cloudflare",
+    "crates/app-demo-adapter-axum",
 ]
 resolver = "2"
 
@@ -18,7 +18,10 @@ edgezero-adapter-cloudflare = { path = "../../crates/edgezero-adapter-cloudflare
 edgezero-adapter-fastly = { path = "../../crates/edgezero-adapter-fastly" }
 edgezero-core = { path = "../../crates/edgezero-core" }
 fastly = "0.11"
-futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+futures = { version = "0.3", default-features = false, features = [
+    "std",
+    "executor",
+] }
 log = "0.4"
 once_cell = "1"
 serde = { version = "1", features = ["derive"] }
