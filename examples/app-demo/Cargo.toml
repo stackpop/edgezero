@@ -7,6 +7,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+license = "Apache-2.0"
+
 [workspace.dependencies]
 anyhow = "1"
 app-demo-core = { path = "crates/app-demo-core" }

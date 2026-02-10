@@ -2,6 +2,7 @@
 name = "edgezero-adapter"
 version = "0.1.0"
 edition = "2021"
+license = { workspace = true }
 description = "Adapter registry and traits for EdgeZero adapters"
 
 [features]

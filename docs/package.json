@@ -2,7 +2,7 @@
   "name": "edgezero-docs",
   "version": "1.0.0",
   "description": "Documentation site for EdgeZero",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "vitepress dev",
