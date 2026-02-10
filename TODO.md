@@ -100,7 +100,7 @@ High-level backlog and decisions to drive the next milestones.
 - Dev UX: integrate a local hyper server behind a feature vs. keeping zero-deps TCP server.
 - Packaging/deploy: preferred tooling (Fastly CLI/API; AWS SAM/CDK or native Lambda tooling).
 - Config format: TOML/JSON/YAML; env overlays.
-- License and contribution guidelines.
+- ~~License and contribution guidelines.~~ License set to Apache-2.0.
 
 ## Execution Log
 
@@ -600,3 +600,16 @@ High-level backlog and decisions to drive the next milestones.
 - [x] Correct routing, streaming, handlers, and CLI reference docs to match current behavior.
 - [x] Refresh configuration docs to align with manifest schema and loader APIs.
 - [x] Add missing-feature backlog (list-adapters, exit codes, manifest search-up, RUST_LOG, hot reload) to the roadmap section.
+
+## Codex Plan (2026-02-10 - License Metadata Consistency)
+
+- [x] Canonicalize the Apache-2.0 `LICENSE` appendix URL wording to match standard text.
+- [x] Regenerate `docs/package-lock.json` metadata so the root package license matches `docs/package.json`.
+- [x] Standardize license wording in user-facing docs (`README.md`, docs footer) for consistency.
+- [x] Run `cargo test` and record outcomes in a review entry with timestamp.
+
+## Review (2026-02-10 14:08:30 PST)
+
+- Summary: Canonicalized Apache-2.0 appendix wording in `LICENSE`, aligned docs package root license metadata by regenerating `docs/package-lock.json`, and standardized user-facing license text to "Apache License 2.0" in `README.md` and `docs/.vitepress/config.mts`.
+- Assumptions: Keeping transitive dependency `license` fields unchanged in `docs/package-lock.json` is correct; only the root package license needed alignment.
+- Outstanding: No functional issues found; `cargo test` passes when run without sandbox socket restrictions.
