@@ -4,7 +4,6 @@
 use app_demo_core::App;
 #[cfg(target_arch = "wasm32")]
 use fastly::{Error, Request, Response};
-
 #[cfg(target_arch = "wasm32")]
 #[fastly::main]
 pub fn main(req: Request) -> Result<Response, Error> {

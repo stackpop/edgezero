@@ -127,7 +127,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     );
     deps.insert(
         "worker".to_string(),
-        "worker = { version = \"0.6\", default-features = false, features = [\"http\"] }"
+        "worker = { version = \"0.7\", default-features = false, features = [\"http\"] }"
             .to_string(),
     );
     deps.insert("fastly".to_string(), "fastly = \"0.11\"".to_string());
@@ -153,7 +153,7 @@ fn resolve_core_dependency(
         &layout.out_dir,
         cwd,
         "crates/edgezero-core",
-        "edgezero-core = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
+        "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
         &[],
     );
 
@@ -246,8 +246,8 @@ fn collect_adapter_data(
         manifest_section.push('\n');
         writeln!(
             manifest_section,
-            "[adapters.{}.commands]\nbuild = \"{}\"\nserve = \"{}\"\ndeploy = \"{}\"\n",
-            blueprint.id, build_cmd, serve_cmd, deploy_cmd
+            "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n",
+            blueprint.id, build_cmd, deploy_cmd, serve_cmd
         )
         .unwrap();
 
@@ -289,7 +289,7 @@ fn collect_adapter_data(
             let formatted = step
                 .replace("{crate}", &crate_name)
                 .replace("{crate_dir}", &crate_dir_rel);
-            readme_adapter_dev.push_str(&format!("  - `{}`\n", formatted));
+            readme_adapter_dev.push_str(&format!("  - {}\n", formatted));
         }
         readme_adapter_dev.push('\n');
 

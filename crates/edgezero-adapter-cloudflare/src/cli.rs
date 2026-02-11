@@ -116,6 +116,10 @@ static CLOUDFLARE_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
         contents: include_str!("templates/Cargo.toml.hbs"),
     },
     TemplateRegistration {
+        name: "cf_src_lib_rs",
+        contents: include_str!("templates/src/lib.rs.hbs"),
+    },
+    TemplateRegistration {
         name: "cf_src_main_rs",
         contents: include_str!("templates/src/main.rs.hbs"),
     },
@@ -135,6 +139,10 @@ static CLOUDFLARE_FILE_SPECS: &[AdapterFileSpec] = &[
         output: "Cargo.toml",
     },
     AdapterFileSpec {
+        template: "cf_src_lib_rs",
+        output: "src/lib.rs",
+    },
+    AdapterFileSpec {
         template: "cf_src_main_rs",
         output: "src/main.rs",
     },
@@ -152,21 +160,21 @@ static CLOUDFLARE_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_core_cloudflare",
         repo_crate: "crates/edgezero-core",
-        fallback: "edgezero-core = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
+        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_cloudflare",
         repo_crate: "crates/edgezero-adapter-cloudflare",
         fallback:
-            "edgezero-adapter-cloudflare = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
+            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_cloudflare_wasm",
         repo_crate: "crates/edgezero-adapter-cloudflare",
         fallback:
-            "edgezero-adapter-cloudflare = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
+            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
         features: &["cloudflare"],
     },
 ];
@@ -188,9 +196,9 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &["cloudflare"],
     },
     commands: CommandTemplates {
-        build: "cargo build --release --target wasm32-unknown-unknown -p {crate}",
-        serve: "wrangler dev --config {crate_dir}/wrangler.toml",
-        deploy: "wrangler publish --config {crate_dir}/wrangler.toml",
+        build: "wrangler build --cwd {crate_dir}",
+        deploy: "wrangler deploy --cwd {crate_dir}",
+        serve: "wrangler dev --cwd {crate_dir}",
     },
     logging: LoggingDefaults {
         endpoint: None,
@@ -200,7 +208,7 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     readme: ReadmeInfo {
         description: "{display} entrypoint.",
         dev_heading: "{display} (local)",
-        dev_steps: &["cd {crate_dir}", "wrangler dev"],
+        dev_steps: &["`edgezero-cli serve --adapter cloudflare`"],
     },
     run_module: "edgezero_adapter_cloudflare",
 };

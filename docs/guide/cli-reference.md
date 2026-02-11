@@ -157,7 +157,7 @@ edgezero deploy --adapter cloudflare
 **Provider behavior:**
 
 - **Fastly**: Runs `fastly compute deploy`
-- **Cloudflare**: Runs `wrangler publish`
+- **Cloudflare**: Runs `wrangler deploy`
 
 ::: warning
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.

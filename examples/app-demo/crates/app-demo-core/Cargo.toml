@@ -5,13 +5,9 @@ edition = "2021"
 license.workspace = true
 publish = false
 
-[lib]
-name = "app_demo_core"
-path = "src/lib.rs"
-
 [dependencies]
-edgezero-core = { workspace = true }
 bytes = { workspace = true }
+edgezero-core = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 

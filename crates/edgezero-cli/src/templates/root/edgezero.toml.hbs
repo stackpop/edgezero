@@ -52,18 +52,18 @@ methods = ["GET", "POST"]
 handler = "{{proj_core_mod}}::handlers::proxy_demo"
 adapters = [{{{adapter_list}}}]
 
-[environment]
-
-[[environment.variables]]
-name = "API_BASE_URL"
-description = "Base URL for upstream API calls"
-env = "API_BASE_URL"
-value = "https://example.com/api"
-
-[[environment.secrets]]
-name = "API_TOKEN"
-description = "Secret token used when calling the upstream API"
-adapters = [{{{adapter_list}}}]
-env = "API_TOKEN"
+# [environment]
+#
+# [[environment.variables]]
+# name = "API_BASE_URL"
+# description = "Base URL for upstream API calls"
+# env = "API_BASE_URL"
+# value = "https://example.com/api"
+#
+# [[environment.secrets]]
+# name = "API_TOKEN"
+# description = "Secret token used when calling the upstream API"
+# adapters = [{{{adapter_list}}}]
+# env = "API_TOKEN"
 
 {{{adapter_manifest_sections}}}

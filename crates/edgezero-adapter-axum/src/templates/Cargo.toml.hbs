@@ -10,10 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 {{proj_core}} = { path = "../{{proj_core}}" }
-{{{dep_edgezero_adapter_axum}}}
-edgezero-core = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
+{{{dep_edgezero_adapter_axum}}}
+edgezero-core = { workspace = true }
 log = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

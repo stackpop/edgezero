@@ -265,9 +265,9 @@ target = "wasm32-unknown-unknown"
 profile = "release"
 
 [adapters.cloudflare.commands]
-build = "cargo build --release --target wasm32-unknown-unknown -p my-app-adapter-cloudflare"
-serve = "wrangler dev --config crates/my-app-adapter-cloudflare/wrangler.toml"
-deploy = "wrangler publish --config crates/my-app-adapter-cloudflare/wrangler.toml"
+build = "wrangler build --cwd crates/my-app-adapter-cloudflare"
+serve = "wrangler dev --cwd crates/my-app-adapter-cloudflare"
+deploy = "wrangler deploy --cwd crates/my-app-adapter-cloudflare"
 
 [adapters.cloudflare.logging]
 level = "info"

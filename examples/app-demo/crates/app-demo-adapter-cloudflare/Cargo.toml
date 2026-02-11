@@ -9,12 +9,20 @@ publish = false
 name = "app-demo-adapter-cloudflare"
 path = "src/main.rs"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
 [features]
 default = ["cloudflare"]
 cloudflare = ["edgezero-adapter-cloudflare/cloudflare"]
 
 [dependencies]
-app-demo-core = { workspace = true }
+app-demo-core = { path = "../app-demo-core" }
 edgezero-adapter-cloudflare = { workspace = true }
+edgezero-core = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+edgezero-adapter-cloudflare = { workspace = true, features = ["cloudflare"] }
 edgezero-core = { workspace = true }
 worker = { workspace = true }

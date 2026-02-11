@@ -21,9 +21,15 @@ pub(crate) struct EchoBody {
     pub(crate) name: String,
 }
 
+#[derive(serde::Deserialize)]
+struct ProxyPath {
+    #[serde(default)]
+    rest: String,
+}
+
 #[action]
 pub(crate) async fn root() -> Text<&'static str> {
-    Text::new("EdgeZero Demo App")
+    Text::new("app-demo app")
 }
 
 #[action]
@@ -43,7 +49,7 @@ pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
 #[action]
 pub(crate) async fn stream() -> Response {
     let body =
-        Body::stream(stream::iter(0..5).map(|index| Bytes::from(format!("chunk {}\n", index))));
+        Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!("chunk {}\n", index))));
 
     http::response_builder()
         .status(StatusCode::OK)
@@ -57,39 +63,6 @@ pub(crate) async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
     Text::new(format!("Hello, {}!", body.name))
 }
 
-#[derive(serde::Serialize)]
-struct RouteSummary {
-    method: String,
-    path: String,
-}
-
-#[action]
-pub(crate) async fn list_routes() -> Result<Response, EdgeError> {
-    let routes = crate::build_router().routes();
-    let payload: Vec<RouteSummary> = routes
-        .into_iter()
-        .map(|route| RouteSummary {
-            method: route.method().as_str().to_string(),
-            path: route.path().to_string(),
-        })
-        .collect();
-
-    let body = Body::json(&payload).map_err(EdgeError::internal)?;
-    let response = http::response_builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/json")
-        .body(body)
-        .map_err(EdgeError::internal)?;
-
-    Ok(response)
-}
-
-#[derive(serde::Deserialize)]
-struct ProxyPath {
-    #[serde(default)]
-    rest: String,
-}
-
 #[action]
 pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
@@ -97,6 +70,7 @@ pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Re
     let request = ctx.into_request();
     let target = build_proxy_target(&params.rest, request.uri())?;
     let proxy_request = ProxyRequest::from_request(request, target);
+
     if let Some(handle) = proxy_handle {
         handle.forward(proxy_request).await
     } else {
@@ -147,7 +121,6 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse;
-    use edgezero_core::router::DEFAULT_ROUTE_LISTING_PATH;
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
     use std::env;
@@ -157,7 +130,7 @@ mod tests {
         let ctx = empty_context("/");
         let response = block_on(root(ctx)).expect("handler ok").into_response();
         let bytes = response.into_body().into_bytes();
-        assert_eq!(bytes.as_ref(), b"EdgeZero Demo App");
+        assert_eq!(bytes.as_ref(), b"app-demo app");
     }
 
     #[test]
@@ -198,7 +171,7 @@ mod tests {
         });
         assert_eq!(
             String::from_utf8(collected).expect("utf8"),
-            "chunk 0\nchunk 1\nchunk 2\nchunk 3\nchunk 4\n"
+            "chunk 0\nchunk 1\nchunk 2\n"
         );
     }
 
@@ -213,27 +186,10 @@ mod tests {
     }
 
     #[test]
-    fn list_routes_returns_manifest_entries() {
-        let ctx = empty_context(DEFAULT_ROUTE_LISTING_PATH);
-        let response = block_on(list_routes(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let payload: serde_json::Value =
-            serde_json::from_slice(response.body().as_bytes()).expect("json payload");
-        let routes = payload.as_array().expect("array");
-        assert!(routes.iter().any(|entry| {
-            entry["method"] == "GET" && entry["path"] == DEFAULT_ROUTE_LISTING_PATH
-        }));
-        assert!(routes
-            .iter()
-            .any(|entry| { entry["method"] == "GET" && entry["path"] == "/echo/{name}" }));
-    }
-
-    #[test]
-    fn build_proxy_target_merges_rest_and_query() {
+    fn build_proxy_target_merges_segments_and_query() {
         env::set_var("API_BASE_URL", "https://example.com/api");
         let original = Uri::from_static("/proxy/status?foo=bar");
-        let target = super::build_proxy_target("status/200", &original).expect("target uri");
+        let target = build_proxy_target("status/200", &original).expect("target uri");
         assert_eq!(
             target.to_string(),
             "https://example.com/api/status/200?foo=bar"
@@ -242,13 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn proxy_demo_without_proxy_support_returns_placeholder() {
+    fn proxy_demo_without_handle_returns_placeholder() {
         env::set_var("API_BASE_URL", "https://example.com/api");
-
         let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-
         env::remove_var("API_BASE_URL");
     }
 
@@ -264,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_demo_uses_injected_proxy_handle() {
+    fn proxy_demo_uses_injected_handle() {
         env::set_var("API_BASE_URL", "https://example.com/api");
 
         let mut request = request_builder()

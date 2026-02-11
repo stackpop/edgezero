@@ -10,11 +10,11 @@ name = "app-demo-adapter-axum"
 path = "src/main.rs"
 
 [dependencies]
-app-demo-core = { workspace = true }
-edgezero-core = { workspace = true }
+app-demo-core = { path = "../app-demo-core" }
 anyhow = { workspace = true }
-edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 axum = { workspace = true }
+edgezero-adapter-axum = { workspace = true, features = ["axum"] }
+edgezero-core = { workspace = true }
 log = { workspace = true }
 simple_logger = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
