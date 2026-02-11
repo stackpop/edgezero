@@ -8,6 +8,10 @@ publish = false
 name = "{{proj_cloudflare}}"
 path = "src/main.rs"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/main.rs"
+
 [features]
 default = ["cloudflare"]
 cloudflare = ["edgezero-adapter-cloudflare/cloudflare"]

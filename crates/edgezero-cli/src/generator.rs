@@ -127,7 +127,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     );
     deps.insert(
         "worker".to_string(),
-        "worker = { version = \"0.6\", default-features = false, features = [\"http\"] }"
+        "worker = { version = \"0.7\", default-features = false, features = [\"http\"] }"
             .to_string(),
     );
     deps.insert("fastly".to_string(), "fastly = \"0.11\"".to_string());
@@ -289,7 +289,7 @@ fn collect_adapter_data(
             let formatted = step
                 .replace("{crate}", &crate_name)
                 .replace("{crate_dir}", &crate_dir_rel);
-            readme_adapter_dev.push_str(&format!("  - `{}`\n", formatted));
+            readme_adapter_dev.push_str(&format!("  - {}\n", formatted));
         }
         readme_adapter_dev.push('\n');
 

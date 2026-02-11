@@ -189,8 +189,8 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     },
     commands: CommandTemplates {
         build: "cargo build --release --target wasm32-unknown-unknown -p {crate}",
-        serve: "wrangler dev --config {crate_dir}/wrangler.toml",
-        deploy: "wrangler publish --config {crate_dir}/wrangler.toml",
+        serve: "cd {crate_dir} && wrangler dev",
+        deploy: "cd {crate_dir} && wrangler publish",
     },
     logging: LoggingDefaults {
         endpoint: None,
@@ -200,7 +200,10 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     readme: ReadmeInfo {
         description: "{display} entrypoint.",
         dev_heading: "{display} (local)",
-        dev_steps: &["cd {crate_dir}", "wrangler dev"],
+        dev_steps: &[
+            "`cd {crate_dir}`",
+            "`wrangler dev` or `edgezero-cli serve --adapter cloudflare`",
+        ],
     },
     run_module: "edgezero_adapter_cloudflare",
 };
