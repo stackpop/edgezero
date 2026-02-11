@@ -145,21 +145,21 @@ static FASTLY_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_core_fastly",
         repo_crate: "crates/edgezero-core",
-        fallback: "edgezero-core = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
+        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_fastly",
         repo_crate: "crates/edgezero-adapter-fastly",
         fallback:
-            "edgezero-adapter-fastly = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false }",
+            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_fastly_wasm",
         repo_crate: "crates/edgezero-adapter-fastly",
         fallback:
-            "edgezero-adapter-fastly = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
+            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
         features: &["fastly"],
     },
 ];
@@ -181,9 +181,9 @@ static FASTLY_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &["fastly"],
     },
     commands: CommandTemplates {
-        build: "cargo build --release --target wasm32-wasip1 -p {crate}",
-        serve: "fastly compute serve -C {crate_dir}",
+        build: "fastly compute build -C {crate_dir}",
         deploy: "fastly compute deploy -C {crate_dir}",
+        serve: "fastly compute serve -C {crate_dir}",
     },
     logging: LoggingDefaults {
         endpoint: Some("stdout"),
@@ -193,10 +193,7 @@ static FASTLY_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     readme: ReadmeInfo {
         description: "{display} entrypoint.",
         dev_heading: "{display} (local)",
-        dev_steps: &[
-            "`cd {crate_dir}`",
-            "`fastly compute serve` or `edgezero-cli serve --adapter fastly`",
-        ],
+        dev_steps: &["`cd {crate_dir}`", "`edgezero-cli serve --adapter fastly`"],
     },
     run_module: "edgezero_adapter_fastly",
 };

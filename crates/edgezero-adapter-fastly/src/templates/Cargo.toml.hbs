@@ -14,11 +14,11 @@ fastly = ["edgezero-adapter-fastly/fastly"]
 
 [dependencies]
 {{proj_core}} = { path = "../{{proj_core}}" }
-log = { workspace = true }
 {{{dep_edgezero_adapter_fastly}}}
+log = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-{{{dep_edgezero_core_fastly}}}
 {{{dep_edgezero_adapter_fastly_wasm}}}
+{{{dep_edgezero_core_fastly}}}
 fastly = { workspace = true }
 once_cell = { workspace = true }

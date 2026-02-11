@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-path = "src/main.rs"
+path = "src/lib.rs"
 
 [features]
 default = ["cloudflare"]
@@ -22,6 +22,6 @@ cloudflare = ["edgezero-adapter-cloudflare/cloudflare"]
 edgezero-core = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-{{{dep_edgezero_core_cloudflare}}}
 {{{dep_edgezero_adapter_cloudflare_wasm}}}
+{{{dep_edgezero_core_cloudflare}}}
 worker = { workspace = true }

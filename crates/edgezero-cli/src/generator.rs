@@ -153,7 +153,7 @@ fn resolve_core_dependency(
         &layout.out_dir,
         cwd,
         "crates/edgezero-core",
-        "edgezero-core = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
+        "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
         &[],
     );
 
@@ -246,8 +246,8 @@ fn collect_adapter_data(
         manifest_section.push('\n');
         writeln!(
             manifest_section,
-            "[adapters.{}.commands]\nbuild = \"{}\"\nserve = \"{}\"\ndeploy = \"{}\"\n",
-            blueprint.id, build_cmd, serve_cmd, deploy_cmd
+            "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n",
+            blueprint.id, build_cmd, deploy_cmd, serve_cmd
         )
         .unwrap();
 

@@ -2,6 +2,7 @@
 bin/
 pkg/
 target/
+.wrangler/
 
 # env
 .env

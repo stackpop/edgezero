@@ -14,12 +14,12 @@ default = []
 fastly = ["edgezero-adapter-fastly/fastly"]
 
 [dependencies]
-app-demo-core = { workspace = true }
+app-demo-core = { path = "../app-demo-core" }
 edgezero-adapter-fastly = { workspace = true }
 log = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-edgezero-core = { workspace = true }
 edgezero-adapter-fastly = { workspace = true, features = ["fastly"] }
+edgezero-core = { workspace = true }
 fastly = { workspace = true }
 once_cell = { workspace = true }

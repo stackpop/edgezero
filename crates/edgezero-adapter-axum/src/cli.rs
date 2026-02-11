@@ -48,14 +48,14 @@ static AXUM_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_core_axum",
         repo_crate: "crates/edgezero-core",
-        fallback: "edgezero-core = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\" }",
+        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\" }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_axum",
         repo_crate: "crates/edgezero-adapter-axum",
         fallback:
-            "edgezero-adapter-axum = { git = \"ssh://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-axum\", default-features = false }",
+            "edgezero-adapter-axum = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-axum\", default-features = false }",
         features: &["axum"],
     },
 ];

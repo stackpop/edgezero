@@ -5,6 +5,7 @@ Deploy EdgeZero applications to Cloudflare Workers using WebAssembly.
 ## Prerequisites
 
 - [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/install-and-update/)
+- worker-builder: `cargo install worker-builder`
 - Rust `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
 
 ## Project Setup
@@ -16,6 +17,7 @@ crates/my-app-adapter-cloudflare/
 ├── Cargo.toml
 ├── wrangler.toml
 └── src/
+    ├── lib.rs
     └── main.rs
 ```
 
@@ -29,23 +31,20 @@ main = "build/worker/shim.mjs"
 compatibility_date = "2024-01-01"
 
 [build]
-command = "cargo build --release --target wasm32-unknown-unknown"
+command = "edgezero build --adapter cloudflare"
 ```
 
 ### Entrypoint
 
-The Cloudflare entrypoint wires the adapter:
+The Cloudflare Wasm entrypoint in `src/lib.rs` wires the adapter:
 
 ```rust
-use edgezero_adapter_cloudflare::dispatch;
-use edgezero_core::app::Hooks;
 use my_app_core::App;
 use worker::*;
 
 #[event(fetch)]
-async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    let app = App::build_app();
-    dispatch(&app, req, env, ctx).await
+pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    edgezero_adapter_cloudflare::run_app::<App>(req, env, ctx).await
 }
 ```
 
@@ -56,9 +55,6 @@ Build for Cloudflare's Wasm target:
 ```bash
 # Using the CLI
 edgezero build --adapter cloudflare
-
-# Or directly with cargo
-cargo build -p my-app-adapter-cloudflare --target wasm32-unknown-unknown --release
 ```
 
 ## Local Development
@@ -68,9 +64,6 @@ Run locally with Wrangler:
 ```bash
 # Using the CLI
 edgezero serve --adapter cloudflare
-
-# Or directly
-wrangler dev --config crates/my-app-adapter-cloudflare/wrangler.toml
 ```
 
 This starts a local server at `http://127.0.0.1:8787`.
@@ -84,7 +77,7 @@ Deploy to Cloudflare Workers:
 edgezero deploy --adapter cloudflare
 
 # Or directly
-wrangler publish --config crates/my-app-adapter-cloudflare/wrangler.toml
+wrangler deploy --cwd crates/my-app-adapter-cloudflare
 ```
 
 ## Fetch API
