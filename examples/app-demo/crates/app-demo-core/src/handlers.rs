@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
@@ -6,7 +7,6 @@ use edgezero_core::extractor::{Headers, Json, Path};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
-use bytes::Bytes;
 use futures::{stream, StreamExt};
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
@@ -48,10 +48,8 @@ pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
 
 #[action]
 pub(crate) async fn stream() -> Response {
-    let body = Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!(
-        "chunk {}\n",
-        index
-    ))));
+    let body =
+        Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!("chunk {}\n", index))));
 
     http::response_builder()
         .status(StatusCode::OK)
@@ -115,6 +113,7 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
@@ -122,7 +121,6 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse;
-    use async_trait::async_trait;
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
     use std::env;
@@ -179,11 +177,10 @@ mod tests {
 
     #[test]
     fn echo_json_formats_payload() {
-        let ctx = context_with_json(
-            "/echo",
-            r#"{"name":"Edge"}"#,
-        );
-        let response = block_on(echo_json(ctx)).expect("handler ok").into_response();
+        let ctx = context_with_json("/echo", r#"{"name":"Edge"}"#);
+        let response = block_on(echo_json(ctx))
+            .expect("handler ok")
+            .into_response();
         let bytes = response.into_body().into_bytes();
         assert_eq!(bytes.as_ref(), b"Hello, Edge!");
     }
@@ -193,7 +190,10 @@ mod tests {
         env::set_var("API_BASE_URL", "https://example.com/api");
         let original = Uri::from_static("/proxy/status?foo=bar");
         let target = build_proxy_target("status/200", &original).expect("target uri");
-        assert_eq!(target.to_string(), "https://example.com/api/status/200?foo=bar");
+        assert_eq!(
+            target.to_string(),
+            "https://example.com/api/status/200?foo=bar"
+        );
         env::remove_var("API_BASE_URL");
     }
 
@@ -262,11 +262,7 @@ mod tests {
         RequestContext::new(request, PathParams::new(map))
     }
 
-    fn context_with_header(
-        path: &str,
-        header: HeaderName,
-        value: HeaderValue,
-    ) -> RequestContext {
+    fn context_with_header(path: &str, header: HeaderName, value: HeaderValue) -> RequestContext {
         let mut request = request_builder()
             .method(Method::GET)
             .uri(path)
