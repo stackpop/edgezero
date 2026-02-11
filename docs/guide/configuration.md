@@ -247,9 +247,9 @@ target = "wasm32-wasip1"
 profile = "release"
 
 [adapters.fastly.commands]
-build = "cargo build --release --target wasm32-wasip1 -p my-app-adapter-fastly"
-serve = "fastly compute serve -C crates/my-app-adapter-fastly"
+build = "fastly build -C crates/my-app-adapter-fastly"
 deploy = "fastly compute deploy -C crates/my-app-adapter-fastly"
+serve = "fastly compute serve -C crates/my-app-adapter-fastly"
 
 [adapters.fastly.logging]
 endpoint = "stdout"
@@ -266,8 +266,8 @@ profile = "release"
 
 [adapters.cloudflare.commands]
 build = "wrangler build --cwd crates/my-app-adapter-cloudflare"
-serve = "wrangler dev --cwd crates/my-app-adapter-cloudflare"
 deploy = "wrangler deploy --cwd crates/my-app-adapter-cloudflare"
+serve = "wrangler dev --cwd crates/my-app-adapter-cloudflare"
 
 [adapters.cloudflare.logging]
 level = "info"

@@ -1009,7 +1009,7 @@ features = ["feature1", "feature2"]
 [adapters.fastly.commands]
 build = "fastly compute build"
 serve = "fastly compute serve"
-deploy = "fastly compute publish"
+deploy = "fastly compute deploy"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
         let m = loader.manifest();
@@ -1024,7 +1024,7 @@ deploy = "fastly compute publish"
         );
         assert_eq!(
             adapter.commands.deploy.as_deref(),
-            Some("fastly compute publish")
+            Some("fastly compute deploy")
         );
     }
 
