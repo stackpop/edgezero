@@ -1063,7 +1063,7 @@ mod tests {
         assert!(debug.contains("Kv"));
 
         // Deref works
-        let _: &KvHandle = &*kv;
+        let _: &KvHandle = &kv;
 
         // into_inner works
         let _inner: KvHandle = kv.into_inner();

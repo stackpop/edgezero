@@ -107,7 +107,7 @@ fn normalize_request_context_pat(pat: &mut Box<Pat>) -> syn::Result<()> {
     let Some(replacement) = extract_request_context_binding(pat.as_ref())? else {
         return Ok(());
     };
-    *pat = Box::new(replacement);
+    **pat = replacement;
     Ok(())
 }
 
