@@ -105,6 +105,7 @@ dependencies = [
  "edgezero-core",
  "futures",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -678,6 +679,8 @@ dependencies = [
  "http",
  "log",
  "reqwest",
+ "serde",
+ "serde_json",
  "simple_logger",
  "tempfile",
  "thiserror 2.0.18",
@@ -686,12 +689,14 @@ dependencies = [
  "tower",
  "tracing",
  "walkdir",
+ "web-time",
 ]
 
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "brotli",
  "bytes",
@@ -712,6 +717,7 @@ dependencies = [
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "async-trait",
  "brotli",
@@ -774,6 +780,7 @@ dependencies = [
  "serde_urlencoded",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "tower-service",
  "tracing",

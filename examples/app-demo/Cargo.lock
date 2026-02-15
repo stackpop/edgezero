@@ -517,17 +517,20 @@ dependencies = [
  "http",
  "log",
  "reqwest",
+ "serde_json",
  "simple_logger 5.1.0",
  "thiserror 2.0.18",
  "tokio",
  "tower",
  "tracing",
+ "web-time",
 ]
 
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "brotli",
  "bytes",
@@ -544,6 +547,7 @@ dependencies = [
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "async-trait",
  "brotli",

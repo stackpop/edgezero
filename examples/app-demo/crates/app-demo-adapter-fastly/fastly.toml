@@ -7,5 +7,20 @@ service_id = ""
 
 [local_server]
 
+[local_server.kv_stores]
+
+[[local_server.kv_stores.EDGEZERO_KV]]
+# We use a dummy key to initialize the store.
+# 'data' provides inline content (empty string here).
+# 'path' would load content from a file (e.g. path="./README.md"), but we don't need that.
+key = "__init__"
+data = ""
+
+[setup]
+[setup.kv_stores]
+[setup.kv_stores.EDGEZERO_KV]
+description = "KV store for EdgeZero demo"
+
+
 [scripts]
-  build = "cargo build --profile release --target wasm32-wasip1"
+build = "cargo build --profile release --target wasm32-wasip1"

@@ -8,6 +8,9 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
     let (parts, body) = response.into_parts();
 
     let cf_response = match body {
+        Body::Once(bytes) if bytes.is_empty() => {
+            CfResponse::empty().map_err(EdgeError::internal)?
+        }
         Body::Once(bytes) => CfResponse::from_bytes(bytes.to_vec()).map_err(EdgeError::internal)?,
         Body::Stream(stream) => {
             let worker_stream = stream

@@ -52,6 +52,50 @@ methods = ["GET", "POST"]
 handler = "app_demo_core::handlers::proxy_demo"
 adapters = ["axum", "cloudflare", "fastly"]
 
+# -- KV demo routes --------------------------------------------------------
+
+[[triggers.http]]
+id = "kv_counter"
+path = "/kv/counter"
+methods = ["GET"]
+handler = "app_demo_core::handlers::kv_counter"
+adapters = ["axum", "cloudflare", "fastly"]
+description = "Increment and return a visit counter stored in KV"
+
+[[triggers.http]]
+id = "kv_note_put"
+path = "/kv/notes/{id}"
+methods = ["POST"]
+handler = "app_demo_core::handlers::kv_note_put"
+adapters = ["axum", "cloudflare", "fastly"]
+description = "Store a note by id"
+
+[[triggers.http]]
+id = "kv_note_get"
+path = "/kv/notes/{id}"
+methods = ["GET"]
+handler = "app_demo_core::handlers::kv_note_get"
+adapters = ["axum", "cloudflare", "fastly"]
+description = "Read a note by id"
+
+[[triggers.http]]
+id = "kv_note_delete"
+path = "/kv/notes/{id}"
+methods = ["DELETE"]
+handler = "app_demo_core::handlers::kv_note_delete"
+adapters = ["axum", "cloudflare", "fastly"]
+description = "Delete a note by id"
+
+# -- Stores ----------------------------------------------------------------
+
+[stores.kv]
+# Uses the default name "EDGEZERO_KV". Uncomment to customise:
+# name = "MY_CUSTOM_KV"
+#
+# Per-adapter overrides:
+# [stores.kv.adapters.cloudflare]
+# name = "CF_KV_BINDING"
+
 # [environment]
 #
 # [[environment.variables]]

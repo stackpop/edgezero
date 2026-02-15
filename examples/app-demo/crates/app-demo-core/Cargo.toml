@@ -10,7 +10,7 @@ bytes = { workspace = true }
 edgezero-core = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-serde_json = { workspace = true }

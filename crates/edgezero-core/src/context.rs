@@ -1,6 +1,7 @@
 use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::Request;
+use crate::kv::KvHandle;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
 use serde::de::DeserializeOwned;
@@ -82,6 +83,10 @@ impl RequestContext {
 
     pub fn proxy_handle(&self) -> Option<ProxyHandle> {
         self.request.extensions().get::<ProxyHandle>().cloned()
+    }
+
+    pub fn kv_handle(&self) -> Option<KvHandle> {
+        self.request.extensions().get::<KvHandle>().cloned()
     }
 }
 
@@ -320,5 +325,55 @@ mod tests {
         let request = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
         let response = futures::executor::block_on(handle.forward(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn kv_handle_is_retrieved_when_present() {
+        use crate::kv::{KvHandle, KvStore};
+        use std::sync::Arc;
+
+        // Minimal stub — only needs to exist, not store real data.
+        struct Stub;
+        #[async_trait(?Send)]
+        impl KvStore for Stub {
+            async fn get_bytes(&self, _: &str) -> Result<Option<Bytes>, crate::kv::KvError> {
+                Ok(None)
+            }
+            async fn put_bytes(&self, _: &str, _: Bytes) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn put_bytes_with_ttl(
+                &self,
+                _: &str,
+                _: Bytes,
+                _: std::time::Duration,
+            ) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn list_keys(&self, _: &str) -> Result<Vec<String>, crate::kv::KvError> {
+                Ok(vec![])
+            }
+        }
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(KvHandle::new(Arc::new(Stub)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.kv_handle().is_some());
+    }
+
+    #[test]
+    fn kv_handle_returns_none_when_absent() {
+        let ctx = ctx("/test", Body::empty(), PathParams::default());
+        assert!(ctx.kv_handle().is_none());
     }
 }

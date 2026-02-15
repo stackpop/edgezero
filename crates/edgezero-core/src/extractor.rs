@@ -401,6 +401,46 @@ impl<T> ValidatedForm<T> {
     }
 }
 
+/// Extracts the [`KvHandle`] from the request context.
+///
+/// Returns `EdgeError::Internal` if no KV store was configured for this request.
+///
+/// # Example
+/// ```ignore
+/// #[action]
+/// pub async fn handler(Kv(store): Kv) -> Result<Response, EdgeError> {
+///     let count: i32 = store.get_or("visits", 0).await?;
+///     store.put("visits", &(count + 1)).await?;
+///     Ok(Response::ok(format!("visits: {}", count + 1)))
+/// }
+/// ```
+#[derive(Debug)]
+pub struct Kv(pub crate::kv::KvHandle);
+
+#[async_trait(?Send)]
+impl FromRequest for Kv {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.kv_handle()
+            .map(Kv)
+            .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no kv store configured")))
+    }
+}
+
+impl std::ops::Deref for Kv {
+    type Target = crate::kv::KvHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Kv {
+    #[must_use]
+    pub fn into_inner(self) -> crate::kv::KvHandle {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +948,124 @@ mod tests {
         assert_eq!(&*host, "example.com"); // Deref
         let inner = host.into_inner();
         assert_eq!(inner, "example.com");
+    }
+
+    // -- Kv extractor -------------------------------------------------------
+
+    #[test]
+    fn kv_extractor_returns_handle_when_configured() {
+        use crate::kv::{KvHandle, KvStore};
+        use std::sync::Arc;
+
+        struct NoopStore;
+
+        #[async_trait(?Send)]
+        impl KvStore for NoopStore {
+            async fn get_bytes(
+                &self,
+                _key: &str,
+            ) -> Result<Option<bytes::Bytes>, crate::kv::KvError> {
+                Ok(None)
+            }
+            async fn put_bytes(
+                &self,
+                _key: &str,
+                _value: bytes::Bytes,
+            ) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn put_bytes_with_ttl(
+                &self,
+                _key: &str,
+                _value: bytes::Bytes,
+                _ttl: std::time::Duration,
+            ) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _key: &str) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn list_keys(&self, _prefix: &str) -> Result<Vec<String>, crate::kv::KvError> {
+                Ok(vec![])
+            }
+        }
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(KvHandle::new(Arc::new(NoopStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let kv = block_on(Kv::from_request(&ctx));
+        assert!(kv.is_ok());
+    }
+
+    #[test]
+    fn kv_extractor_returns_error_when_not_configured() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        let err = block_on(Kv::from_request(&ctx)).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("no kv store configured"));
+    }
+
+    #[test]
+    fn kv_deref_and_into_inner() {
+        use crate::kv::{KvHandle, KvStore};
+        use std::sync::Arc;
+
+        struct NoopStore;
+
+        #[async_trait(?Send)]
+        impl KvStore for NoopStore {
+            async fn get_bytes(
+                &self,
+                _key: &str,
+            ) -> Result<Option<bytes::Bytes>, crate::kv::KvError> {
+                Ok(None)
+            }
+            async fn put_bytes(
+                &self,
+                _key: &str,
+                _value: bytes::Bytes,
+            ) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn put_bytes_with_ttl(
+                &self,
+                _key: &str,
+                _value: bytes::Bytes,
+                _ttl: std::time::Duration,
+            ) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn delete(&self, _key: &str) -> Result<(), crate::kv::KvError> {
+                Ok(())
+            }
+            async fn list_keys(&self, _prefix: &str) -> Result<Vec<String>, crate::kv::KvError> {
+                Ok(vec![])
+            }
+        }
+
+        let handle = KvHandle::new(Arc::new(NoopStore));
+        let kv = Kv(handle);
+
+        // Debug works
+        let debug = format!("{:?}", kv);
+        assert!(debug.contains("Kv"));
+
+        // Deref works
+        let _: &KvHandle = &*kv;
+
+        // into_inner works
+        let _inner: KvHandle = kv.into_inner();
     }
 }
