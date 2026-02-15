@@ -140,7 +140,9 @@ pub(crate) async fn kv_note_put(
 ) -> Result<Response, EdgeError> {
     let body = ctx.into_request().into_body();
     let body_bytes = collect_body(body).await?;
-    store.put_bytes(&format!("note:{}", path.id), body_bytes).await?;
+    store
+        .put_bytes(&format!("note:{}", path.id), body_bytes)
+        .await?;
     http::response_builder()
         .status(StatusCode::CREATED)
         .body(Body::empty())
@@ -364,16 +366,18 @@ mod tests {
 
     // -- KV handler tests --------------------------------------------------
 
-    use edgezero_core::kv::{KvHandle, KvStore, KvError};
-    use std::sync::{Arc, Mutex};
+    use edgezero_core::kv::{KvError, KvHandle, KvStore};
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     struct MockKv {
         data: Mutex<BTreeMap<String, Bytes>>,
     }
     impl MockKv {
         fn new() -> Self {
-            Self { data: Mutex::new(BTreeMap::new()) }
+            Self {
+                data: Mutex::new(BTreeMap::new()),
+            }
         }
     }
 
@@ -386,7 +390,12 @@ mod tests {
             self.data.lock().unwrap().insert(key.to_string(), value);
             Ok(())
         }
-        async fn put_bytes_with_ttl(&self, key: &str, value: Bytes, _ttl: std::time::Duration) -> Result<(), KvError> {
+        async fn put_bytes_with_ttl(
+            &self,
+            key: &str,
+            value: Bytes,
+            _ttl: std::time::Duration,
+        ) -> Result<(), KvError> {
             self.data.lock().unwrap().insert(key.to_string(), value);
             Ok(())
         }
@@ -395,11 +404,23 @@ mod tests {
             Ok(())
         }
         async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-            Ok(self.data.lock().unwrap().keys().filter(|k| k.starts_with(prefix)).cloned().collect())
+            Ok(self
+                .data
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
         }
     }
 
-    fn context_with_kv(path: &str, method: Method, body: Body, params: &[(&str, &str)]) -> (RequestContext, KvHandle) {
+    fn context_with_kv(
+        path: &str,
+        method: Method,
+        body: Body,
+        params: &[(&str, &str)],
+    ) -> (RequestContext, KvHandle) {
         let kv = Arc::new(MockKv::new());
         let handle = KvHandle::new(kv);
         let mut request = request_builder()
@@ -446,7 +467,10 @@ mod tests {
             request.extensions_mut().insert(handle.clone());
             let mut map = HashMap::new();
             map.insert("id".to_string(), "abc".to_string());
-            (RequestContext::new(request, PathParams::new(map)), handle.clone())
+            (
+                RequestContext::new(request, PathParams::new(map)),
+                handle.clone(),
+            )
         };
         let resp = block_on(kv_note_get(ctx2)).expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -455,7 +479,12 @@ mod tests {
 
     #[test]
     fn kv_note_get_missing_returns_404() {
-        let (ctx, _) = context_with_kv("/kv/notes/xyz", Method::GET, Body::empty(), &[("id", "xyz")]);
+        let (ctx, _) = context_with_kv(
+            "/kv/notes/xyz",
+            Method::GET,
+            Body::empty(),
+            &[("id", "xyz")],
+        );
         let err = block_on(kv_note_get(ctx)).expect_err("should be NotFound");
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
     }
