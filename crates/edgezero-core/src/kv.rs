@@ -69,6 +69,10 @@ pub enum KvError {
     #[error("kv store unavailable")]
     Unavailable,
 
+    /// A validation error (e.g., invalid key or value).
+    #[error("validation error: {0}")]
+    Validation(String),
+
     /// A serialization or deserialization error.
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -83,6 +87,7 @@ impl From<KvError> for EdgeError {
         match err {
             KvError::NotFound { key } => EdgeError::not_found(format!("kv key: {key}")),
             KvError::Unavailable => EdgeError::internal(anyhow::anyhow!("kv store unavailable")),
+            KvError::Validation(e) => EdgeError::bad_request(format!("kv validation error: {e}")),
             KvError::Serialization(e) => {
                 EdgeError::bad_request(format!("kv serialization error: {e}"))
             }
@@ -167,9 +172,61 @@ impl fmt::Debug for KvHandle {
 }
 
 impl KvHandle {
+    /// Maximum key size in bytes (Cloudflare limit).
+    pub const MAX_KEY_SIZE: usize = 512;
+
+    /// Maximum value size in bytes (Standard limit).
+    pub const MAX_VALUE_SIZE: usize = 25 * 1024 * 1024;
+
+    /// Minimum TTL in seconds (Cloudflare limit).
+    pub const MIN_TTL: Duration = Duration::from_secs(60);
+
     /// Create a new handle wrapping a KV store implementation.
     pub fn new(store: Arc<dyn KvStore>) -> Self {
         Self { store }
+    }
+
+    // -- Validation ---------------------------------------------------------
+
+    fn validate_key(key: &str) -> Result<(), KvError> {
+        if key.len() > Self::MAX_KEY_SIZE {
+            return Err(KvError::Validation(format!(
+                "key length {} exceeds limit of {} bytes",
+                key.len(),
+                Self::MAX_KEY_SIZE
+            )));
+        }
+        if key == "." || key == ".." {
+            return Err(KvError::Validation(
+                "key cannot be exactly '.' or '..'".to_string(),
+            ));
+        }
+        if key.chars().any(|c| c.is_control()) {
+            return Err(KvError::Validation(
+                "key contains invalid control characters".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_value(value: &[u8]) -> Result<(), KvError> {
+        if value.len() > Self::MAX_VALUE_SIZE {
+            return Err(KvError::Validation(format!(
+                "value size {} exceeds limit of 25MB",
+                value.len()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_ttl(ttl: Duration) -> Result<(), KvError> {
+        if ttl < Self::MIN_TTL {
+            return Err(KvError::Validation(format!(
+                "TTL {:?} is less than minimum of at least 60 seconds",
+                ttl
+            )));
+        }
+        Ok(())
     }
 
     // -- Typed helpers (JSON) -----------------------------------------------
@@ -178,6 +235,7 @@ impl KvHandle {
     ///
     /// Returns `Ok(None)` if the key does not exist.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, KvError> {
+        Self::validate_key(key)?;
         match self.store.get_bytes(key).await? {
             Some(bytes) => {
                 let val = serde_json::from_slice(&bytes)?;
@@ -194,7 +252,9 @@ impl KvHandle {
 
     /// Put a value, serializing it to JSON.
     pub async fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<(), KvError> {
+        Self::validate_key(key)?;
         let bytes = serde_json::to_vec(value)?;
+        Self::validate_value(&bytes)?;
         self.store.put_bytes(key, Bytes::from(bytes)).await
     }
 
@@ -205,7 +265,10 @@ impl KvHandle {
         value: &T,
         ttl: Duration,
     ) -> Result<(), KvError> {
+        Self::validate_key(key)?;
+        Self::validate_ttl(ttl)?;
         let bytes = serde_json::to_vec(value)?;
+        Self::validate_value(&bytes)?;
         self.store
             .put_bytes_with_ttl(key, Bytes::from(bytes), ttl)
             .await
@@ -228,6 +291,7 @@ impl KvHandle {
         T: DeserializeOwned + Serialize,
         F: FnOnce(T) -> T,
     {
+        // Validation happens in get_or and put
         let current = self.get_or(key, default).await?;
         let updated = f(current);
         self.put(key, &updated).await?;
@@ -238,11 +302,14 @@ impl KvHandle {
 
     /// Get raw bytes for a key.
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        Self::validate_key(key)?;
         self.store.get_bytes(key).await
     }
 
     /// Put raw bytes for a key.
     pub async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        Self::validate_key(key)?;
+        Self::validate_value(&value)?;
         self.store.put_bytes(key, value).await
     }
 
@@ -253,6 +320,9 @@ impl KvHandle {
         value: Bytes,
         ttl: Duration,
     ) -> Result<(), KvError> {
+        Self::validate_key(key)?;
+        Self::validate_ttl(ttl)?;
+        Self::validate_value(&value)?;
         self.store.put_bytes_with_ttl(key, value, ttl).await
     }
 
@@ -260,16 +330,21 @@ impl KvHandle {
 
     /// Check whether a key exists without deserializing its value.
     pub async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Self::validate_key(key)?;
         self.store.exists(key).await
     }
 
     /// Delete a key.
     pub async fn delete(&self, key: &str) -> Result<(), KvError> {
+        Self::validate_key(key)?;
         self.store.delete(key).await
     }
 
     /// List keys with the given prefix.
     pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
+        // We generally allow validation on list prefixes too in strict environments,
+        // but often prefixes are short. We'll strict check it doesn't exceed key limits.
+        Self::validate_key(prefix)?;
         self.store.list_keys(prefix).await
     }
 }
@@ -736,6 +811,62 @@ mod tests {
         let h = handle();
         let debug = format!("{:?}", h);
         assert!(debug.contains("KvHandle"));
+    }
+
+    // -- Validation Tests ---------------------------------------------------
+
+    #[tokio::test]
+    async fn validation_rejects_long_keys() {
+        let h = handle();
+        // MAX_KEY_SIZE + 1
+        let long_key = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
+        let err = h.get::<i32>(&long_key).await.unwrap_err();
+        assert!(matches!(err, KvError::Validation(_)));
+        assert!(format!("{}", err).contains("key length"));
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_dot_keys() {
+        let h = handle();
+        let err = h.get::<i32>(".").await.unwrap_err();
+        assert!(matches!(err, KvError::Validation(_)));
+        assert!(format!("{}", err).contains("cannot be exactly"));
+
+        let err = h.get::<i32>("..").await.unwrap_err();
+        assert!(matches!(err, KvError::Validation(_)));
+        assert!(format!("{}", err).contains("cannot be exactly"));
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_control_chars() {
+        let h = handle();
+        let err = h.get::<i32>("key\nwith\nnewline").await.unwrap_err();
+        assert!(matches!(err, KvError::Validation(_)));
+        assert!(format!("{}", err).contains("control characters"));
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_large_values() {
+        let h = handle();
+        // MAX_VALUE_SIZE + 1 byte
+        let large_val = vec![0u8; KvHandle::MAX_VALUE_SIZE + 1];
+        let err = h
+            .put_bytes("large", Bytes::from(large_val))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KvError::Validation(_)));
+        assert!(format!("{}", err).contains("value size"));
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_short_ttl() {
+        let h = handle();
+        let err = h
+            .put_with_ttl("short", &"val", Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KvError::Validation(_)));
+        assert!(format!("{}", err).contains("at least 60 seconds"));
     }
 
     #[tokio::test]
