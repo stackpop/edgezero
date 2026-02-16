@@ -190,7 +190,8 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_expires_entry() {
-        let s = store();
+        // Use the store impl directly to bypass validation limits (min TTL 60s)
+        let s = MemoryKvStore::new();
         s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_millis(1))
             .await
             .unwrap();
@@ -210,7 +211,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_keys_evicts_expired() {
-        let s = store();
+        // Use the store impl directly to bypass validation limits (min TTL 60s)
+        let s = MemoryKvStore::new();
         s.put_bytes_with_ttl("expired", Bytes::from("x"), Duration::from_millis(1))
             .await
             .unwrap();
