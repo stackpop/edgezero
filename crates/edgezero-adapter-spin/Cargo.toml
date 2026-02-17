@@ -1,0 +1,27 @@
+[package]
+name = "edgezero-adapter-spin"
+edition = { workspace = true }
+version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[features]
+default = []
+spin = ["dep:spin-sdk"]
+cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:walkdir"]
+
+[dependencies]
+edgezero-core = { path = "../edgezero-core" }
+edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = ["cli"] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+spin-sdk = { workspace = true, optional = true }
+ctor = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

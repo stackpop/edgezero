@@ -1,0 +1,16 @@
+spin_manifest_version = 2
+
+[application]
+name = "app-demo-adapter-spin"
+version = "0.1.0"
+
+[[trigger.http]]
+route = "/..."
+component = "app-demo"
+
+[component.app-demo]
+source = "target/wasm32-wasip1/release/app_demo_adapter_spin.wasm"
+allowed_outbound_hosts = ["https://*:*"]
+[component.app-demo.build]
+command = "cargo build --target wasm32-wasip1 --release"
+watch = ["src/**/*.rs", "Cargo.toml"]

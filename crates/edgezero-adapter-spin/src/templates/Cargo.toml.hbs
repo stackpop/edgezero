@@ -1,0 +1,23 @@
+[package]
+name = "{{proj_spin}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+default = ["spin"]
+spin = ["edgezero-adapter-spin/spin"]
+
+[dependencies]
+{{proj_core}} = { path = "../{{proj_core}}" }
+{{{dep_edgezero_adapter_spin}}}
+anyhow = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+{{{dep_edgezero_adapter_spin_wasm}}}
+{{{dep_edgezero_core_spin}}}
+spin-sdk = { workspace = true }
