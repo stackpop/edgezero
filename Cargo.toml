@@ -3,6 +3,7 @@ members = [
     "crates/edgezero-adapter-axum",
     "crates/edgezero-adapter-cloudflare",
     "crates/edgezero-adapter-fastly",
+    "crates/edgezero-adapter-spin",
     "crates/edgezero-adapter",
     "crates/edgezero-cli",
     "crates/edgezero-core",
@@ -35,6 +36,7 @@ edgezero-adapter = { path = "crates/edgezero-adapter" }
 edgezero-adapter-axum = { path = "crates/edgezero-adapter-axum", default-features = false }
 edgezero-adapter-cloudflare = { path = "crates/edgezero-adapter-cloudflare", default-features = false }
 edgezero-adapter-fastly = { path = "crates/edgezero-adapter-fastly", default-features = false }
+edgezero-adapter-spin = { path = "crates/edgezero-adapter-spin", default-features = false }
 edgezero-core = { path = "crates/edgezero-core", default-features = false }
 fastly = "0.11"
 fern = "0.7"
@@ -53,6 +55,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 simple_logger = "5"
+spin-sdk = { version = "5.2", default-features = false }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
