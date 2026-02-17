@@ -1,88 +1,205 @@
-//! In-memory KV store for local development and testing.
+//! Persistent KV store for local development and testing.
 //!
-//! Values are stored in a `BTreeMap` behind a `std::sync::Mutex`.
-//! TTL-expired entries are lazily evicted on access.
+//! Values are stored in a `redb` embedded database with TTL support.
+//! Data persists across server restarts, providing parity with edge provider
+//! KV stores (Cloudflare Workers KV, Fastly KV Store).
+//!
+//! ## Storage Location
+//!
+//! By default, the development server stores data at `.edgezero/kv.redb`
+//! in your project directory. Add this path to your `.gitignore`:
+//!
+//! ```gitignore
+//! .edgezero/
+//! ```
+//!
+//! ## TTL and Cleanup
+//!
+//! Expired entries are lazily evicted when accessed via `get_bytes` or when
+//! scanning keys with `list_keys`. Entries that are never accessed after expiration
+//! will remain in the database until explicitly listed or deleted.
+//!
+//! For long-running servers with many expiring keys, consider periodically calling
+//! `list_keys("")` to trigger cleanup of expired entries.
+//!
+//! ## Database File Management
+//!
+//! The redb database file will grow over time and does not automatically
+//! shrink after deletions. For development, this is typically not an issue.
+//! To reclaim space, delete the `.edgezero/kv.redb` file (data will be lost).
+//!
+//! ## Concurrent Access
+//!
+//! The database uses exclusive file locking. Only one process can access
+//! a database file at a time. If you need to run multiple dev servers
+//! simultaneously, use different database paths (e.g., by running them
+//! in separate project directories).
+//!
+//! Within a single process, the store is thread-safe and supports
+//! concurrent access via redb's transaction system.
+//!
+//! ## Performance Notes
+//!
+//! - `list_keys` performs a full table scan. Performance may degrade with
+//!   very large datasets (>10k keys).
+//! - All operations are ACID-compliant via redb's transaction system.
+//! - The database file path acts as the namespace identifier, similar to
+//!   how Cloudflare uses bindings and Fastly uses store names.
 
-use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::kv::{KvError, KvStore};
-use web_time::Instant;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use web_time::SystemTime;
 
-/// Entry stored in the in-memory KV store.
-struct Entry {
-    value: Bytes,
-    expires_at: Option<Instant>,
-}
+/// Table definition for the KV store.
+/// Key: String, Value: (Bytes, Option<expiration_timestamp_millis>)
+const KV_TABLE: TableDefinition<&str, (&[u8], Option<u128>)> = TableDefinition::new("kv");
 
-impl Entry {
-    fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|exp| Instant::now() >= exp)
-            .unwrap_or(false)
-    }
-}
-
-/// An in-memory KV store backed by `BTreeMap<String, Entry>`.
+/// A persistent KV store backed by `redb`.
 ///
-/// Suitable for local development and unit testing.
+/// Suitable for local development where data persistence across restarts is needed.
 /// TTL-expired entries are lazily evicted (checked on read/list).
-///
-/// Uses `BTreeMap` instead of `HashMap` to keep keys in sorted order,
-/// which makes `list_keys` prefix scans efficient without a post-sort.
-pub struct MemoryKvStore {
-    data: Mutex<BTreeMap<String, Entry>>,
+pub struct PersistentKvStore {
+    db: Database,
 }
 
-impl MemoryKvStore {
-    /// Create an empty in-memory KV store.
-    pub fn new() -> Self {
-        Self {
-            data: Mutex::new(BTreeMap::new()),
+impl PersistentKvStore {
+    /// Create a new persistent KV store at the given path.
+    ///
+    /// # Behavior
+    ///
+    /// - If the file does not exist, a new database will be initialized
+    /// - If the file exists and is a valid redb database, it will be opened with existing data preserved
+    /// - If the file exists but is not a valid redb database, returns an error
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, KvError> {
+        let db_path = path.as_ref().to_path_buf();
+        let db = Database::create(path).map_err(|e| {
+            KvError::Internal(anyhow::anyhow!(
+                "Failed to open KV database at {:?}. If the file is corrupted or locked \
+                 by another process, try deleting it and restarting: {}",
+                db_path,
+                e
+            ))
+        })?;
+
+        // Initialize the table
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
+        {
+            let _table = write_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+        }
+        write_txn
+            .commit()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit txn: {}", e)))?;
+
+        Ok(Self { db })
+    }
+
+    /// Check if an entry is expired based on its expiration timestamp.
+    ///
+    /// If the system clock is before UNIX epoch (highly unlikely), treats entries
+    /// as not expired to avoid incorrectly deleting data.
+    fn is_expired(expires_at_millis: Option<u128>) -> bool {
+        if let Some(exp) = expires_at_millis {
+            match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(now) => now.as_millis() >= exp,
+                Err(_) => {
+                    // System clock is before UNIX epoch - treat as not expired
+                    // to avoid incorrectly deleting data
+                    false
+                }
+            }
+        } else {
+            false
         }
     }
 
-    /// Lock the inner data, converting a poisoned-lock panic into `KvError`.
-    fn lock_data(&self) -> Result<MutexGuard<'_, BTreeMap<String, Entry>>, KvError> {
-        self.data
-            .lock()
-            .map_err(|_| KvError::Internal(anyhow::anyhow!("kv store lock poisoned")))
-    }
-}
-
-impl Default for MemoryKvStore {
-    fn default() -> Self {
-        Self::new()
+    /// Convert SystemTime to milliseconds since UNIX epoch.
+    ///
+    /// Returns 0 if the time is before UNIX epoch (should never happen in practice).
+    fn system_time_to_millis(time: SystemTime) -> u128 {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
     }
 }
 
 #[async_trait(?Send)]
-impl KvStore for MemoryKvStore {
+impl KvStore for PersistentKvStore {
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
-        let mut data = self.lock_data()?;
-        if let Some(entry) = data.get(key) {
-            if entry.is_expired() {
-                data.remove(key);
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin read txn: {}", e)))?;
+
+        let table = read_txn
+            .open_table(KV_TABLE)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+
+        if let Some(entry) = table
+            .get(key)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {}", e)))?
+        {
+            let (value_bytes, expires_at) = entry.value();
+
+            // Check if expired
+            if Self::is_expired(expires_at) {
+                // Drop read transaction before write
+                drop(table);
+                drop(read_txn);
+
+                // Delete the expired key
+                let write_txn = self.db.begin_write().map_err(|e| {
+                    KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e))
+                })?;
+                {
+                    let mut table = write_txn.open_table(KV_TABLE).map_err(|e| {
+                        KvError::Internal(anyhow::anyhow!("failed to open table: {}", e))
+                    })?;
+                    table.remove(key).map_err(|e| {
+                        KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
+                    })?;
+                }
+                write_txn
+                    .commit()
+                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
+
                 return Ok(None);
             }
-            Ok(Some(entry.value.clone()))
+
+            Ok(Some(Bytes::copy_from_slice(value_bytes)))
         } else {
             Ok(None)
         }
     }
 
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-        let mut data = self.lock_data()?;
-        data.insert(
-            key.to_string(),
-            Entry {
-                value,
-                expires_at: None,
-            },
-        );
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
+
+        {
+            let mut table = write_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+
+            table
+                .insert(key, (value.as_ref(), None))
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {}", e)))?;
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
+
         Ok(())
     }
 
@@ -92,42 +209,111 @@ impl KvStore for MemoryKvStore {
         value: Bytes,
         ttl: Duration,
     ) -> Result<(), KvError> {
-        let mut data = self.lock_data()?;
-        data.insert(
-            key.to_string(),
-            Entry {
-                value,
-                expires_at: Some(Instant::now() + ttl),
-            },
-        );
+        let expires_at = SystemTime::now() + ttl;
+        let expires_at_millis = Self::system_time_to_millis(expires_at);
+
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
+
+        {
+            let mut table = write_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+
+            table
+                .insert(key, (value.as_ref(), Some(expires_at_millis)))
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {}", e)))?;
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
+
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
-        let mut data = self.lock_data()?;
-        data.remove(key);
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
+
+        {
+            let mut table = write_txn
+                .open_table(KV_TABLE)
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+
+            table
+                .remove(key)
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {}", e)))?;
+        }
+
+        write_txn
+            .commit()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
+
         Ok(())
     }
 
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-        let mut data = self.lock_data()?;
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin read txn: {}", e)))?;
 
-        // Collect expired keys to remove
-        let expired: Vec<String> = data
+        let table = read_txn
+            .open_table(KV_TABLE)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+
+        // Collect all keys and identify expired ones
+        let mut keys = Vec::new();
+        let mut expired_keys = Vec::new();
+
+        let iter = table
             .iter()
-            .filter(|(_, entry)| entry.is_expired())
-            .map(|(key, _)| key.clone())
-            .collect();
-        for key in &expired {
-            data.remove(key);
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to iterate: {}", e)))?;
+
+        for entry in iter {
+            let entry = entry
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to read entry: {}", e)))?;
+            let key = entry.0.value();
+            let (_value, expires_at) = entry.1.value();
+
+            if Self::is_expired(expires_at) {
+                expired_keys.push(key.to_string());
+            } else if key.starts_with(prefix) {
+                keys.push(key.to_string());
+            }
         }
 
-        // BTreeMap keys are already sorted — range scan is efficient.
-        let keys: Vec<String> = data
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
+        // Drop read transaction before write
+        drop(table);
+        drop(read_txn);
+
+        // Remove expired keys
+        if !expired_keys.is_empty() {
+            let write_txn = self.db.begin_write().map_err(|e| {
+                KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e))
+            })?;
+            {
+                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| {
+                    KvError::Internal(anyhow::anyhow!("failed to open table: {}", e))
+                })?;
+                for key in &expired_keys {
+                    table.remove(key.as_str()).map_err(|e| {
+                        KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
+                    })?;
+                }
+            }
+            write_txn
+                .commit()
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
+        }
+
+        // Sort keys to maintain consistency with BTreeMap behavior
+        keys.sort();
         Ok(keys)
     }
 }
@@ -139,7 +325,10 @@ mod tests {
     use std::sync::Arc;
 
     fn store() -> KvHandle {
-        KvHandle::new(Arc::new(MemoryKvStore::new()))
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let store = PersistentKvStore::new(db_path).unwrap();
+        KvHandle::new(Arc::new(store))
     }
 
     // -- Raw bytes -----------------------------------------------------------
@@ -191,7 +380,9 @@ mod tests {
     #[tokio::test]
     async fn ttl_expires_entry() {
         // Use the store impl directly to bypass validation limits (min TTL 60s)
-        let s = MemoryKvStore::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let s = PersistentKvStore::new(db_path).unwrap();
         s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_millis(1))
             .await
             .unwrap();
@@ -212,7 +403,9 @@ mod tests {
     #[tokio::test]
     async fn list_keys_evicts_expired() {
         // Use the store impl directly to bypass validation limits (min TTL 60s)
-        let s = MemoryKvStore::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let s = PersistentKvStore::new(db_path).unwrap();
         s.put_bytes_with_ttl("expired", Bytes::from("x"), Duration::from_millis(1))
             .await
             .unwrap();
@@ -269,7 +462,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_writes_dont_panic() {
-        let s = MemoryKvStore::new();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let s = PersistentKvStore::new(db_path).unwrap();
         let handle = KvHandle::new(std::sync::Arc::new(s));
 
         // Write 100 keys and verify each one
@@ -302,6 +497,32 @@ mod tests {
         assert_eq!(keys, vec!["a", "c"]);
     }
 
-    // Run the shared contract tests against MemoryKvStore.
-    edgezero_core::kv_contract_tests!(memory_kv_contract, MemoryKvStore::new());
+    #[tokio::test]
+    async fn data_persists_across_reopens() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+
+        // Write data
+        {
+            let store = PersistentKvStore::new(&db_path).unwrap();
+            store
+                .put_bytes("persistent", Bytes::from("value"))
+                .await
+                .unwrap();
+        }
+
+        // Reopen and verify data persists
+        {
+            let store = PersistentKvStore::new(&db_path).unwrap();
+            let value = store.get_bytes("persistent").await.unwrap();
+            assert_eq!(value, Some(Bytes::from("value")));
+        }
+    }
+
+    // Run the shared contract tests against PersistentKvStore.
+    edgezero_core::kv_contract_tests!(persistent_kv_contract, {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        PersistentKvStore::new(db_path).unwrap()
+    });
 }

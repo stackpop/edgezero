@@ -77,7 +77,7 @@ It also supports raw bytes via `get_bytes`, `put_bytes`, etc.
 
 ### Local Development
 
-- **Axum**: Uses an in-memory `HashMap`. Data is lost on restart.
+- **Axum**: Uses a persistent `redb` embedded database stored at `.edgezero/kv.redb`. Data persists across restarts (add `.edgezero/` to your `.gitignore`).
 - **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` entry in `fastly.toml`.
 
   ```toml

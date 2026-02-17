@@ -23,7 +23,7 @@ pub use context::AxumRequestContext;
 #[cfg(feature = "axum")]
 pub use dev_server::{run_app, AxumDevServer, AxumDevServerConfig};
 #[cfg(feature = "axum")]
-pub use kv::MemoryKvStore;
+pub use kv::PersistentKvStore;
 #[cfg(feature = "axum")]
 pub use proxy::AxumProxyClient;
 #[cfg(feature = "axum")]

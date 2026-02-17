@@ -11,7 +11,7 @@
 //!                              │
 //!               ┌──────────────┼──────────────┐
 //!               ▼              ▼              ▼
-//!         MemoryKvStore   FastlyKvStore  CloudflareKvStore
+//!      PersistentKvStore  FastlyKvStore  CloudflareKvStore
 //! ```
 //!
 //! # Consistency Model
@@ -106,7 +106,7 @@ impl From<KvError> for EdgeError {
 /// (e.g., platform APIs, or `Mutex` for in-memory stores).
 ///
 /// Implementations exist per adapter:
-/// - `MemoryKvStore` (axum adapter) — local dev / tests
+/// - `PersistentKvStore` (axum adapter) — local dev / tests with persistent storage
 /// - `FastlyKvStore` (fastly adapter) — Fastly KV Store
 /// - `CloudflareKvStore` (cloudflare adapter) — Cloudflare Workers KV
 #[async_trait(?Send)]
@@ -363,7 +363,11 @@ impl KvHandle {
 /// # Example
 ///
 /// ```rust,ignore
-/// edgezero_core::kv_contract_tests!(memory_contract, MemoryKvStore::new());
+/// edgezero_core::kv_contract_tests!(persistent_kv_contract, {
+///     let temp_dir = tempfile::tempdir().unwrap();
+///     let db_path = temp_dir.path().join("test.redb");
+///     PersistentKvStore::new(db_path).unwrap()
+/// });
 /// ```
 #[macro_export]
 macro_rules! kv_contract_tests {

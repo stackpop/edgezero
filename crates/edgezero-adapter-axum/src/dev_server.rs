@@ -74,9 +74,9 @@ impl AxumDevServer {
     }
 
     #[cfg(test)]
-    async fn run_with_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+    async fn run_with_listener(self, listener: tokio::net::TcpListener, kv_path: &str) -> anyhow::Result<()> {
         let AxumDevServer { router, config } = self;
-        serve_with_listener(router, listener, config.enable_ctrl_c).await
+        serve_with_listener_and_kv_path(router, listener, config.enable_ctrl_c, kv_path).await
     }
 }
 
@@ -85,8 +85,24 @@ async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
 ) -> anyhow::Result<()> {
-    // Create a shared in-memory KV store for the lifetime of the server.
-    let kv_store = std::sync::Arc::new(crate::kv::MemoryKvStore::new());
+    serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, ".edgezero/kv.redb").await
+}
+
+async fn serve_with_listener_and_kv_path(
+    router: RouterService,
+    listener: tokio::net::TcpListener,
+    enable_ctrl_c: bool,
+    kv_path: &str,
+) -> anyhow::Result<()> {
+    // Create a persistent KV store
+    if let Some(parent) = std::path::Path::new(kv_path).parent() {
+        std::fs::create_dir_all(parent)
+            .context("failed to create KV store directory")?;
+    }
+    let kv_store = std::sync::Arc::new(
+        crate::kv::PersistentKvStore::new(kv_path)
+            .context("failed to create KV store")?,
+    );
     let kv_handle = edgezero_core::kv::KvHandle::new(kv_store);
 
     let service = EdgeZeroAxumService::new(router).with_kv_handle(kv_handle);
@@ -208,6 +224,7 @@ mod integration_tests {
     struct TestServer {
         base_url: String,
         handle: tokio::task::JoinHandle<()>,
+        _temp_dir: tempfile::TempDir,
     }
 
     async fn start_test_server(router: RouterService) -> TestServer {
@@ -221,13 +238,19 @@ mod integration_tests {
         };
         let server = AxumDevServer::with_config(router, config);
 
+        // Use a unique temp directory for each test server
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let kv_path = temp_dir.path().join("kv.redb");
+        let kv_path_str = kv_path.to_str().expect("valid path").to_string();
+
         let handle = tokio::spawn(async move {
-            let _ = server.run_with_listener(listener).await;
+            let _ = server.run_with_listener(listener, &kv_path_str).await;
         });
 
         TestServer {
             base_url: format!("http://{}", addr),
             handle,
+            _temp_dir: temp_dir,
         }
     }
 

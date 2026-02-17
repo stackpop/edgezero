@@ -106,11 +106,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_kv_handle_injects_into_request() {
-        use crate::kv::MemoryKvStore;
+        use crate::kv::PersistentKvStore;
         use std::sync::Arc;
 
         // Pre-seed the store with a value so the handler can verify injection
-        let store = Arc::new(MemoryKvStore::new());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let store = Arc::new(PersistentKvStore::new(db_path).unwrap());
         let handle = KvHandle::new(store.clone());
         handle.put("test_key", &"injected").await.unwrap();
 

@@ -30,6 +30,7 @@ futures = { workspace = true }
 futures-util = { workspace = true, optional = true }
 http = { workspace = true }
 log = { workspace = true }
+redb = { workspace = true }
 reqwest = { workspace = true, optional = true }
 simple_logger = { workspace = true }
 thiserror = { workspace = true }
