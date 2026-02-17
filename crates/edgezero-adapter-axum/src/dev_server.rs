@@ -74,7 +74,11 @@ impl AxumDevServer {
     }
 
     #[cfg(test)]
-    async fn run_with_listener(self, listener: tokio::net::TcpListener, kv_path: &str) -> anyhow::Result<()> {
+    async fn run_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+        kv_path: &str,
+    ) -> anyhow::Result<()> {
         let AxumDevServer { router, config } = self;
         serve_with_listener_and_kv_path(router, listener, config.enable_ctrl_c, kv_path).await
     }
@@ -96,12 +100,10 @@ async fn serve_with_listener_and_kv_path(
 ) -> anyhow::Result<()> {
     // Create a persistent KV store
     if let Some(parent) = std::path::Path::new(kv_path).parent() {
-        std::fs::create_dir_all(parent)
-            .context("failed to create KV store directory")?;
+        std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
     }
     let kv_store = std::sync::Arc::new(
-        crate::kv::PersistentKvStore::new(kv_path)
-            .context("failed to create KV store")?,
+        crate::kv::PersistentKvStore::new(kv_path).context("failed to create KV store")?,
     );
     let kv_handle = edgezero_core::kv::KvHandle::new(kv_store);
 
