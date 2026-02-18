@@ -12,7 +12,7 @@ id = "root"
 path = "/"
 methods = ["GET"]
 handler = "app_demo_core::handlers::root"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Default health-check endpoint"
 
 [[triggers.http]]
@@ -20,14 +20,14 @@ id = "echo"
 path = "/echo/{name}"
 methods = ["GET"]
 handler = "app_demo_core::handlers::echo"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 
 [[triggers.http]]
 id = "stream"
 path = "/stream"
 methods = ["GET"]
 handler = "app_demo_core::handlers::stream"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 body-mode = "stream"
 
 [[triggers.http]]
@@ -35,14 +35,14 @@ id = "headers"
 path = "/headers"
 methods = ["GET"]
 handler = "app_demo_core::handlers::headers"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 
 [[triggers.http]]
 id = "echo_json"
 path = "/echo"
 methods = ["POST"]
 handler = "app_demo_core::handlers::echo_json"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 
 
 [[triggers.http]]
@@ -50,7 +50,7 @@ id = "proxy_demo"
 path = "/proxy/{*rest}"
 methods = ["GET", "POST"]
 handler = "app_demo_core::handlers::proxy_demo"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 
 # [environment]
 #
@@ -119,3 +119,20 @@ serve = "fastly compute serve -C crates/app-demo-adapter-fastly"
 endpoint = "app_demo_log"
 level = "info"
 echo_stdout = true
+
+[adapters.spin.adapter]
+crate = "crates/app-demo-adapter-spin"
+manifest = "crates/app-demo-adapter-spin/spin.toml"
+
+[adapters.spin.build]
+target = "wasm32-wasip1"
+profile = "release"
+features = ["spin"]
+
+[adapters.spin.commands]
+build = "cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin"
+deploy = "spin deploy --from crates/app-demo-adapter-spin"
+serve = "spin up --from crates/app-demo-adapter-spin"
+
+[adapters.spin.logging]
+level = "info"
