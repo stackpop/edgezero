@@ -318,3 +318,4 @@ Custom commands live in `.claude/commands/`:
 - Don't make large, sweeping refactors — keep changes minimal and focused.
 - Don't commit without running `cargo test` first.
 - Don't skip `cargo fmt` and `cargo clippy` — CI will reject the PR.
+- Don't include `Co-Authored-By` trailers, "Generated with" footers, or any AI bylines in commits or PR bodies.

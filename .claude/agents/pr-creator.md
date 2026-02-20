@@ -25,14 +25,15 @@ cargo test --workspace --all-targets
 cargo check --workspace --all-targets --features "fastly cloudflare"
 ```
 
-If any gate fails, report the failure and stop — do not create a broken PR.
+If any gate fails, report the failure and stop -- do not create a broken PR.
 
 ### 3. Ensure a linked issue exists
 
-Every PR should close a ticket. If no issue exists for this work:
+Every PR should close a ticket.
 
-1. Create one using the appropriate issue type (see Issue Types below).
-2. Reference it in the PR body with `Closes #<number>`.
+1. Ask the user for the issue number to close, or whether to create a new one.
+2. If creating a new issue, use the appropriate issue type (see Issue Types below).
+3. Reference it in the PR body with `Closes #<number>`.
 
 ### 4. Draft PR content
 
@@ -47,7 +48,7 @@ Using the `.github/pull_request_template.md` structure, draft:
 ### 5. Create the PR
 
 ```
-gh pr create --title "<short title under 70 chars>" --body "$(cat <<'EOF'
+gh pr create --title "<short title under 70 chars>" --assignee @me --body "$(cat <<'EOF'
 <filled template>
 EOF
 )"
@@ -98,4 +99,5 @@ Do **not** use labels as a substitute for types.
 - If the branch has many commits, group related changes in the summary.
 - Never force-push or rebase without explicit user approval.
 - Always base PRs against `main` unless told otherwise.
-- Do **not** include any byline, "Generated with" footer, or `Co-Authored-By` trailer ‚Äî in PR bodies or commit messages.
+- Always assign the PR to the current user (`--assignee @me`).
+- Do **not** include any byline, "Generated with" footer, or `Co-Authored-By` trailer -- in PR bodies or commit messages.
