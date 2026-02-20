@@ -217,14 +217,15 @@ Docs CI additionally runs ESLint + Prettier on the `docs/` directory.
 
 Specialized agents live in `.claude/agents/`. Use them to distribute work:
 
-| Agent             | Purpose                                                                  |
-| ----------------- | ------------------------------------------------------------------------ |
-| `code-simplifier` | Simplifies code after work is done — dead code, duplication, nesting     |
-| `verify-app`      | End-to-end verification: tests, lint, WASM builds, dev server smoke test |
-| `build-validator` | Validates builds across all targets and feature combinations             |
-| `code-architect`  | Architectural review — evaluates designs against project principles      |
-| `pr-creator`      | Creates or updates GitHub PRs using the project template and CI gates    |
-| `repo-explorer`   | Read-only codebase mapping for unfamiliar areas and cross-crate flow     |
+| Agent             | Purpose                                                                   |
+| ----------------- | ------------------------------------------------------------------------- |
+| `code-simplifier` | Simplifies code after work is done — dead code, duplication, nesting      |
+| `verify-app`      | End-to-end verification: tests, lint, WASM builds, dev server smoke test  |
+| `build-validator` | Validates builds across all targets and feature combinations              |
+| `code-architect`  | Architectural review — evaluates designs against project principles       |
+| `pr-creator`      | Creates or updates GitHub PRs using the project template and CI gates     |
+| `issue-creator`   | Creates GitHub issues with proper types (Task/Bug/Story/Epic) via GraphQL |
+| `repo-explorer`   | Read-only codebase mapping for unfamiliar areas and cross-crate flow      |
 
 Invoke with "use subagents" in your prompt or reference a specific agent by name.
 

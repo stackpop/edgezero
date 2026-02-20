@@ -27,7 +27,7 @@ Closes #
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo check --workspace --all-targets --features "fastly cloudflare"`
 - [ ] WASM builds: `wasm32-wasip1` (Fastly) / `wasm32-unknown-unknown` (Cloudflare)
-- [ ] Manual testing via `edgezero dev`
+- [ ] Manual testing via `edgezero-cli dev`
 - [ ] Other: <!-- describe -->
 
 ## Checklist
