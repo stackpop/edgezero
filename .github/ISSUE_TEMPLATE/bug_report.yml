@@ -1,0 +1,73 @@
+name: Bug Report
+description: Report a bug in EdgeZero
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! Please fill out the sections below so we can reproduce and fix it.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: A clear description of the bug.
+      placeholder: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to trigger the bug.
+      placeholder: |
+        1. Create a handler with ...
+        2. Run `edgezero dev`
+        3. Send a request to ...
+        4. See error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened instead?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Adapter / Target
+      description: Which adapter or target is affected?
+      multiple: true
+      options:
+        - Fastly (wasm32-wasip1)
+        - Cloudflare (wasm32-unknown-unknown)
+        - Axum (native)
+        - CLI
+        - Core (platform-independent)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: EdgeZero version
+      description: Output of `cargo metadata --format-version 1 | jq '.packages[] | select(.name == "edgezero-core") | .version'` or the git SHA.
+      placeholder: "0.1.0 or commit abc1234"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste any error messages or logs.
+      render: shell
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help (OS, Rust version, related issues).

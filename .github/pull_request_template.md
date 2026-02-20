@@ -14,7 +14,10 @@
 
 ## Closes
 
-<!-- Link to issue(s) this PR resolves. Use "Closes #123" syntax -->
+<!-- Link to the issue this PR resolves. Every PR should have a ticket. -->
+<!-- Use "Closes #123" syntax to auto-close the issue when merged. -->
+
+Closes #
 
 ## Test plan
 
