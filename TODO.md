@@ -613,3 +613,15 @@ High-level backlog and decisions to drive the next milestones.
 - Summary: Canonicalized Apache-2.0 appendix wording in `LICENSE`, aligned docs package root license metadata by regenerating `docs/package-lock.json`, and standardized user-facing license text to "Apache License 2.0" in `README.md` and `docs/.vitepress/config.mts`.
 - Assumptions: Keeping transitive dependency `license` fields unchanged in `docs/package-lock.json` is correct; only the root package license needed alignment.
 - Outstanding: No functional issues found; `cargo test` passes when run without sandbox socket restrictions.
+
+## Codex Plan (2026-02-20 - AGENTS Fallback CI Alignment)
+
+- [x] Update `AGENTS.md` fallback formatting/linting guidance to use the exact CI command forms.
+- [x] Add the missing fallback feature-compilation gate command used in CI.
+- [x] Re-check `AGENTS.md` for consistency and append a review entry with UTC timestamp.
+
+## Review (2026-02-20 05:32:00 UTC)
+
+- Summary: Updated `AGENTS.md` fallback rule #4 to use the exact CI `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` commands, and added fallback rule #5 for `cargo check --workspace --all-targets --features "fastly cloudflare"`.
+- Assumptions: This request only targeted documentation guidance alignment; no runtime or crate code behavior changed.
+- Outstanding: No unresolved issues. `cargo test` was not run because no Rust source code changed.
