@@ -1,6 +1,7 @@
-You are a pull-request creation agent for the EdgeZero project. Your job is to
-analyze current changes and create a well-structured GitHub PR using the project's
-template.
+# PR Creator
+
+You are a pull request creation agent for the EdgeZero project
+(`stackpop/edgezero`).
 
 ## Steps
 
@@ -31,9 +32,12 @@ If any gate fails, report the failure and stop -- do not create a broken PR.
 
 Every PR should close a ticket.
 
-1. Ask the user for the issue number to close, or whether to create a new one.
-2. If creating a new issue, use the appropriate issue type (see Issue Types below).
-3. Reference it in the PR body with `Closes #<number>`.
+1. **Ask the user** if there is an existing issue number for this work.
+2. If the user provides an issue number, use it in the `Closes #<number>` line.
+3. If no issue exists, create one using the appropriate issue type (see Issue
+   Types below), then reference it in the PR body with `Closes #<number>`.
+
+Do **not** skip this step or assume an issue exists without asking.
 
 ### 4. Draft PR content
 
@@ -46,6 +50,8 @@ Using the `.github/pull_request_template.md` structure, draft:
 - **Checklist**: verify each item applies.
 
 ### 5. Create the PR
+
+Assign the PR to the current user with `--assignee @me`:
 
 ```
 gh pr create --title "<short title under 70 chars>" --assignee @me --body "$(cat <<'EOF'
@@ -63,66 +69,70 @@ EOF
 )"
 ```
 
-### 6. Update issue status
+### 6. Move linked issue to "In progress"
 
-After creating the PR, move the linked issue to "In progress" on the
-**Stackpop Development** project -- unless it is already "In review".
+After creating the PR, move the linked issue on the project board -- but only
+if it is **not** already in "In review" or "Done".
 
 1. Get the issue's project item ID and current status:
 
-```
-gh api graphql -f query='query($issueId: ID!) {
-  node(id: $issueId) {
-    ... on Issue {
-      projectItems(first: 10) {
-        nodes {
-          id
-          fieldValueByName(name: "Status") {
-            ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
-          }
-        }
-      }
-    }
-  }
-}' -f issueId="<issue_node_id>"
-```
+   ```
+   gh api graphql -f query='query($issueId: ID!) {
+     node(id: $issueId) {
+       ... on Issue {
+         projectItems(first: 10) {
+           nodes {
+             id
+             fieldValueByName(name: "Status") {
+               ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
+             }
+           }
+         }
+       }
+     }
+   }' -f issueId="$(gh issue view <number> --json id --jq '.id')"
+   ```
 
-2. If the current status is **not** "In review" (`df73e18b`), set it to
-   "In progress" (`47fc9ee4`):
+2. If current status is not "In review" or "Done", set it to "In progress" (`47fc9ee4`):
 
-```
-gh api graphql -f query='mutation {
-  updateProjectV2ItemFieldValue(input: {
-    projectId: "PVT_kwDOAAuvmc4BFjF5",
-    itemId: "<project_item_id>",
-    fieldId: "PVTSSF_lADOAAuvmc4BFjF5zg22lrY",
-    value: { singleSelectOptionId: "47fc9ee4" }
-  }) { projectV2Item { id } }
-}'
-```
+   ```
+   gh api graphql -f query='mutation {
+     updateProjectV2ItemFieldValue(input: {
+       projectId: "PVT_kwDOAAuvmc4BFjF5"
+       itemId: "<item_id>"
+       fieldId: "PVTSSF_lADOAAuvmc4BFjF5zg22lrY"
+       value: { singleSelectOptionId: "47fc9ee4" }
+     }) { projectV2Item { id } }
+   }'
+   ```
 
 3. If the issue is not yet on the project, add it first:
 
-```
-gh api graphql -f query='mutation {
-  addProjectV2ItemById(input: {
-    projectId: "PVT_kwDOAAuvmc4BFjF5",
-    contentId: "<issue_node_id>"
-  }) { item { id } }
-}'
-```
+   ```
+   gh api graphql -f query='mutation {
+     addProjectV2ItemById(input: {
+       projectId: "PVT_kwDOAAuvmc4BFjF5"
+       contentId: "<issue_node_id>"
+     }) { item { id } }
+   }'
+   ```
 
-Then set the status as above.
+   Then set the status as above.
 
-Project board status IDs:
+### Project Board Reference
 
-| Status      | ID         |
+Project: **Stackpop Development**
+
+| Status      | Option ID  |
 | ----------- | ---------- |
 | Backlog     | `f75ad846` |
 | Ready       | `61e4505c` |
 | In progress | `47fc9ee4` |
 | In review   | `df73e18b` |
 | Done        | `98236657` |
+
+Field ID: `PVTSSF_lADOAAuvmc4BFjF5zg22lrY`
+Project ID: `PVT_kwDOAAuvmc4BFjF5`
 
 ### 7. Report
 
@@ -155,10 +165,11 @@ Do **not** use labels as a substitute for types.
 ## Rules
 
 - Keep the PR title under 70 characters.
-- Use imperative mood in the title (e.g., "Add caching to proxy" not "Added caching").
+- Use sentence case for the title.
+- Use imperative mood (e.g., "Add caching to proxy" not "Added caching").
 - The summary should focus on _why_, not just _what_.
-- If the branch has many commits, group related changes in the summary.
-- Never force-push or rebase without explicit user approval.
 - Always base PRs against `main` unless told otherwise.
 - Always assign the PR to the current user (`--assignee @me`).
-- Do **not** include any byline, "Generated with" footer, or `Co-Authored-By` trailer -- in PR bodies or commit messages.
+- Never force-push or rebase without explicit user approval.
+- Do **not** include any byline, "Generated with" footer, or `Co-Authored-By`
+  trailer in PR bodies or commit messages.
