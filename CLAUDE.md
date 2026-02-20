@@ -63,17 +63,18 @@ faster iteration on a single crate.
 
 ## Compilation Targets
 
-| Adapter     | Target                    | Notes                               |
-|-------------|---------------------------|-------------------------------------|
-| Fastly      | `wasm32-wasip1`           | Requires Viceroy for local testing  |
-| Cloudflare  | `wasm32-unknown-unknown`  | Requires `wrangler` for dev/deploy  |
-| Axum        | Native (host triple)      | Standard Tokio runtime              |
+| Adapter    | Target                   | Notes                              |
+| ---------- | ------------------------ | ---------------------------------- |
+| Fastly     | `wasm32-wasip1`          | Requires Viceroy for local testing |
+| Cloudflare | `wasm32-unknown-unknown` | Requires `wrangler` for dev/deploy |
+| Axum       | Native (host triple)     | Standard Tokio runtime             |
 
 ## Coding Conventions
 
 ### Routing
 
 Use matchit 0.8+ brace syntax for path parameters:
+
 ```rust
 // CORRECT
 "/resource/{id}"
@@ -86,6 +87,7 @@ Use matchit 0.8+ brace syntax for path parameters:
 ### Handlers
 
 Use the `#[action]` macro for all new handlers:
+
 ```rust
 use edgezero_core::{action, Json, Path, Query, ValidatedJson, Response, EdgeError};
 
@@ -114,6 +116,7 @@ async fn my_handler(
 ### Middleware
 
 Implement the `Middleware` trait. Chain via `Next::run()`:
+
 ```rust
 struct MyMiddleware;
 impl Middleware for MyMiddleware {
@@ -154,6 +157,7 @@ Use `ProxyService` with adapter-specific clients (`FastlyProxyClient`,
 ## Adapter Pattern
 
 Each adapter follows the same structure:
+
 - `context.rs` — platform-specific request context
 - `request.rs` — platform request → core request conversion
 - `response.rs` — core response → platform response conversion
@@ -171,6 +175,7 @@ Key sections: `[app]`, `[[triggers.http]]`, `[environment]`, `[adapters]`.
 ## CI Gates
 
 Every PR must pass:
+
 1. `cargo fmt --all -- --check`
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace --all-targets`
@@ -197,6 +202,7 @@ Docs CI additionally runs ESLint + Prettier on the `docs/` directory.
 7. **Review section**: when finished, append a review section to `TODO.md` with:
    a summary of the changes made, assumptions made, any unresolved issues or
    errors, and the date/time (UTC) when the work was completed.
+
 ## Verification & Quality
 
 - **Verify, don't assume**: after implementing a change, prove it works. Run
@@ -216,13 +222,13 @@ Docs CI additionally runs ESLint + Prettier on the `docs/` directory.
 
 Custom commands live in `.claude/commands/`:
 
-| Command             | Purpose                                          |
-|---------------------|--------------------------------------------------|
-| `/check-ci`         | Run all 4 CI gate checks locally                 |
-| `/test-all`         | Run full workspace test suite                    |
-| `/test-crate`       | Run tests for a specific crate                   |
-| `/review-changes`   | Staff-engineer-level review of uncommitted changes |
-| `/verify`           | Prove current changes work vs main               |
+| Command           | Purpose                                            |
+| ----------------- | -------------------------------------------------- |
+| `/check-ci`       | Run all 4 CI gate checks locally                   |
+| `/test-all`       | Run full workspace test suite                      |
+| `/test-crate`     | Run tests for a specific crate                     |
+| `/review-changes` | Staff-engineer-level review of uncommitted changes |
+| `/verify`         | Prove current changes work vs main                 |
 
 ## Available MCPs
 
@@ -230,22 +236,22 @@ Custom commands live in `.claude/commands/`:
 
 ## Key Files Reference
 
-| Purpose                | Path                                              |
-|------------------------|---------------------------------------------------|
-| Workspace manifest     | `Cargo.toml`                                      |
-| Core crate entry       | `crates/edgezero-core/src/lib.rs`                 |
-| Router                 | `crates/edgezero-core/src/router.rs`              |
-| Extractors             | `crates/edgezero-core/src/extractor.rs`           |
-| Action macro           | `crates/edgezero-macros/src/action.rs`            |
-| CLI entry              | `crates/edgezero-cli/src/main.rs`                 |
-| Demo app               | `examples/app-demo/`                              |
-| Demo manifest          | `examples/app-demo/edgezero.toml`                 |
-| CI tests               | `.github/workflows/test.yml`                      |
-| CI format/lint         | `.github/workflows/format.yml`                    |
-| Docs site              | `docs/`                                           |
-| Test script            | `scripts/run_tests.sh`                            |
-| Roadmap                | `ROADMAP.md`                                      |
-| Backlog                | `TODO.md`                                         |
+| Purpose            | Path                                    |
+| ------------------ | --------------------------------------- |
+| Workspace manifest | `Cargo.toml`                            |
+| Core crate entry   | `crates/edgezero-core/src/lib.rs`       |
+| Router             | `crates/edgezero-core/src/router.rs`    |
+| Extractors         | `crates/edgezero-core/src/extractor.rs` |
+| Action macro       | `crates/edgezero-macros/src/action.rs`  |
+| CLI entry          | `crates/edgezero-cli/src/main.rs`       |
+| Demo app           | `examples/app-demo/`                    |
+| Demo manifest      | `examples/app-demo/edgezero.toml`       |
+| CI tests           | `.github/workflows/test.yml`            |
+| CI format/lint     | `.github/workflows/format.yml`          |
+| Docs site          | `docs/`                                 |
+| Test script        | `scripts/run_tests.sh`                  |
+| Roadmap            | `ROADMAP.md`                            |
+| Backlog            | `TODO.md`                               |
 
 ## Dependencies Philosophy
 
