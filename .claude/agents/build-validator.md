@@ -33,10 +33,10 @@ cargo check -p edgezero-cli --features dev-example
 ## Demo apps
 
 ```
-cargo check -p app-demo-core
-cargo build -p app-demo-adapter-fastly --target wasm32-wasip1
-cargo build -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown
-cargo build -p app-demo-adapter-axum
+cargo check --manifest-path examples/app-demo/Cargo.toml -p app-demo-core
+cargo build --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-fastly --target wasm32-wasip1
+cargo build --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown
+cargo build --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-axum
 ```
 
 ## Reporting

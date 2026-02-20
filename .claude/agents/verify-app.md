@@ -41,8 +41,8 @@ Both WASM targets must compile. Report any errors with the exact compiler output
 ## 5. Demo app
 
 ```
-cargo build -p app-demo-adapter-fastly --target wasm32-wasip1
-cargo build -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown
+cargo build --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-fastly --target wasm32-wasip1
+cargo build --manifest-path examples/app-demo/Cargo.toml -p app-demo-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown
 ```
 
 Demo adapters must build for their respective WASM targets.
@@ -51,10 +51,14 @@ Demo adapters must build for their respective WASM targets.
 
 ```
 cargo run -p edgezero-cli --features dev-example -- dev &
+pid=$!
+trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 sleep 3
 curl -s http://127.0.0.1:8787/ | head -20
 curl -s http://127.0.0.1:8787/__edgezero/routes
-kill %1
+kill "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+trap - EXIT
 ```
 
 The dev server must start, respond to requests, and list routes.

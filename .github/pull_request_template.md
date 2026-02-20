@@ -32,7 +32,7 @@ Closes #
 
 ## Checklist
 
-- [ ] Changes follow [CLAUDE.md](../CLAUDE.md) conventions
+- [ ] Changes follow [CLAUDE.md](/CLAUDE.md) conventions
 - [ ] No Tokio deps added to core or adapter crates
 - [ ] Route params use `{id}` syntax (not `:id`)
 - [ ] Types imported from `edgezero_core` (not `http` crate)
