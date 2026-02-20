@@ -13,6 +13,7 @@ target/
 # Editors
 .claude/*
 !.claude/commands/
+!.claude/agents/
 .idea
 .specstory
 .vscode/*
