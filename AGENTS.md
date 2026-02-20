@@ -13,7 +13,7 @@ fallback.
 
 If `CLAUDE.md` is unavailable, these are the minimum rules:
 
-1. Write a plan to `TODO.md` before coding. Get approval first.
+1. Present a plan inline and get approval before coding.
 2. Keep changes minimal — every change should impact as little code as possible.
 3. Run `cargo test` after every code change.
 4. Run `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
@@ -21,5 +21,3 @@ If `CLAUDE.md` is unavailable, these are the minimum rules:
 6. Use matchit `{id}` syntax, never legacy `:id`.
 7. Use `#[action]` macro for handlers, import types from `edgezero_core`.
 8. Don't add Tokio deps to core/adapter crates — WASM compatibility first.
-9. Append a review section to `TODO.md` when done (summary, assumptions,
-   unresolved issues, UTC timestamp).

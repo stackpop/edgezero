@@ -186,22 +186,17 @@ Docs CI additionally runs ESLint + Prettier on the `docs/` directory.
 ## Standard Workflow
 
 1. **Read & plan**: think through the problem, read the codebase for relevant
-   files, and write a plan to `TODO.md` (create it if it doesn't exist). The
-   plan should be a checklist of todo items you can check off as you complete
-   them.
+   files, and present a plan as a checklist inline in the conversation.
 2. **Get approval first**: show the full plan and get approval before commencing
    any coding work.
-3. **Implement incrementally**: work on the todo items, marking them complete as
-   you go. Make every task and code change as simple as possible — every change
-   should impact as little code as possible.
+3. **Implement incrementally**: work through the checklist items. Make every
+   task and code change as simple as possible — every change should impact as
+   little code as possible.
 4. **Test after every change**: run `cargo test` (or scoped `-p <crate>`) after
    touching any code.
-5. **Explain as you go**: after completing each todo item, give a high-level
+5. **Explain as you go**: after completing each item, give a high-level
    explanation of what changes you made.
-6. **If blocked**: mark the item as blocked in `TODO.md` and explain why.
-7. **Review section**: when finished, append a review section to `TODO.md` with:
-   a summary of the changes made, assumptions made, any unresolved issues or
-   errors, and the date/time (UTC) when the work was completed.
+6. **If blocked**: explain what's blocking and why.
 
 ## Verification & Quality
 
@@ -251,7 +246,6 @@ Custom commands live in `.claude/commands/`:
 | Docs site          | `docs/`                                 |
 | Test script        | `scripts/run_tests.sh`                  |
 | Roadmap            | `ROADMAP.md`                            |
-| Backlog            | `TODO.md`                               |
 
 ## Dependencies Philosophy
 
