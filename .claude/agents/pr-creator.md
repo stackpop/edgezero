@@ -63,7 +63,68 @@ EOF
 )"
 ```
 
-### 6. Report
+### 6. Update issue status
+
+After creating the PR, move the linked issue to "In progress" on the
+**Stackpop Development** project -- unless it is already "In review".
+
+1. Get the issue's project item ID and current status:
+
+```
+gh api graphql -f query='query($issueId: ID!) {
+  node(id: $issueId) {
+    ... on Issue {
+      projectItems(first: 10) {
+        nodes {
+          id
+          fieldValueByName(name: "Status") {
+            ... on ProjectV2ItemFieldSingleSelectValue { name optionId }
+          }
+        }
+      }
+    }
+  }
+}' -f issueId="<issue_node_id>"
+```
+
+2. If the current status is **not** "In review" (`df73e18b`), set it to
+   "In progress" (`47fc9ee4`):
+
+```
+gh api graphql -f query='mutation {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: "PVT_kwDOAAuvmc4BFjF5",
+    itemId: "<project_item_id>",
+    fieldId: "PVTSSF_lADOAAuvmc4BFjF5zg22lrY",
+    value: { singleSelectOptionId: "47fc9ee4" }
+  }) { projectV2Item { id } }
+}'
+```
+
+3. If the issue is not yet on the project, add it first:
+
+```
+gh api graphql -f query='mutation {
+  addProjectV2ItemById(input: {
+    projectId: "PVT_kwDOAAuvmc4BFjF5",
+    contentId: "<issue_node_id>"
+  }) { item { id } }
+}'
+```
+
+Then set the status as above.
+
+Project board status IDs:
+
+| Status      | ID         |
+| ----------- | ---------- |
+| Backlog     | `f75ad846` |
+| Ready       | `61e4505c` |
+| In progress | `47fc9ee4` |
+| In review   | `df73e18b` |
+| Done        | `98236657` |
+
+### 7. Report
 
 Output the PR URL and a summary of what was included.
 
