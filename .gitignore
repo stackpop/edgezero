@@ -11,7 +11,8 @@ target/
 .DS_Store
 
 # Editors
-.claude
+.claude/*
+!.claude/commands/
 .idea
 .specstory
 .vscode/*
