@@ -223,6 +223,7 @@ Specialized agents live in `.claude/agents/`. Use them to distribute work:
 | `verify-app`      | End-to-end verification: tests, lint, WASM builds, dev server smoke test |
 | `build-validator` | Validates builds across all targets and feature combinations             |
 | `code-architect`  | Architectural review — evaluates designs against project principles      |
+| `pr-creator`      | Creates or updates GitHub PRs using the project template and CI gates    |
 
 Invoke with "use subagents" in your prompt or reference a specific agent by name.
 
