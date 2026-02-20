@@ -9,7 +9,7 @@
 <!-- Which crates/files were modified and what changed in each -->
 
 | Crate / File | Change |
-|--------------|--------|
+| ------------ | ------ |
 |              |        |
 
 ## Closes

@@ -63,7 +63,7 @@ Output the PR URL and a summary of what was included.
 
 - Keep the PR title under 70 characters.
 - Use imperative mood in the title (e.g., "Add caching to proxy" not "Added caching").
-- The summary should focus on *why*, not just *what*.
+- The summary should focus on _why_, not just _what_.
 - If the branch has many commits, group related changes in the summary.
 - Never force-push or rebase without explicit user approval.
 - Always base PRs against `main` unless told otherwise.
