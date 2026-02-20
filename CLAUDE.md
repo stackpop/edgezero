@@ -245,7 +245,6 @@ Custom commands live in `.claude/commands/`:
 | CI format/lint     | `.github/workflows/format.yml`          |
 | Docs site          | `docs/`                                 |
 | Test script        | `scripts/run_tests.sh`                  |
-| Roadmap            | `ROADMAP.md`                            |
 
 ## Dependencies Philosophy
 
