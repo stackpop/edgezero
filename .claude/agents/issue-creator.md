@@ -51,7 +51,45 @@ Get the issue node ID with:
 gh issue view <number> --json id --jq '.id'
 ```
 
-### 5. Report
+### 5. Add to project board and set status
+
+Add the issue to the **Stackpop Development** project and set its status to
+"Ready". The `addProjectV2ItemById` mutation returns the project item ID needed
+for the status update.
+
+```
+ITEM_ID=$(gh api graphql -f query='mutation {
+  addProjectV2ItemById(input: {
+    projectId: "PVT_kwDOAAuvmc4BFjF5",
+    contentId: "<issue_node_id>"
+  }) { item { id } }
+}' --jq '.data.addProjectV2ItemById.item.id')
+```
+
+Then set status to "Ready":
+
+```
+gh api graphql -f query='mutation {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: "PVT_kwDOAAuvmc4BFjF5",
+    itemId: "'"$ITEM_ID"'",
+    fieldId: "PVTSSF_lADOAAuvmc4BFjF5zg22lrY",
+    value: { singleSelectOptionId: "61e4505c" }
+  }) { projectV2Item { id } }
+}'
+```
+
+Project board status IDs:
+
+| Status      | ID         |
+| ----------- | ---------- |
+| Backlog     | `f75ad846` |
+| Ready       | `61e4505c` |
+| In progress | `47fc9ee4` |
+| In review   | `df73e18b` |
+| Done        | `98236657` |
+
+### 6. Report
 
 Output the issue URL and type.
 
