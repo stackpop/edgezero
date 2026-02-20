@@ -224,8 +224,47 @@ Specialized agents live in `.claude/agents/`. Use them to distribute work:
 | `build-validator` | Validates builds across all targets and feature combinations             |
 | `code-architect`  | Architectural review — evaluates designs against project principles      |
 | `pr-creator`      | Creates or updates GitHub PRs using the project template and CI gates    |
+| `repo-explorer`   | Read-only codebase mapping for unfamiliar areas and cross-crate flow     |
 
 Invoke with "use subagents" in your prompt or reference a specific agent by name.
+
+### Subagent Workflow (Required for Complex Tasks)
+
+For tasks spanning multiple crates, adapters, or unclear failures, use this flow:
+
+1. **Phase 1 — Parallel investigation (read-only)**:
+   launch 2-4 subagents with non-overlapping scopes (tests, diff review, architecture checks).
+   Each subagent must return concrete findings with file paths and line references.
+2. **Phase 2 — Parallel solution proposals (no edits)**:
+   launch at least 2 subagents to propose minimal fix strategies based on Phase 1 findings.
+   Compare tradeoffs (scope, risk, CI impact) before coding.
+3. **Phase 3 — Single-path implementation**:
+   pick one plan (smallest safe change) and implement centrally.
+   Do not let multiple subagents edit overlapping files at the same time.
+4. **Phase 4 — Verification handoff**:
+   run `verify-app` or `build-validator` for broad changes, then summarize pass/fail by step.
+5. **Phase 5 — Decision log**:
+   report which subagents were used, what each found, and why the chosen plan was selected.
+
+Default trigger:
+
+- If work touches 2+ crates or includes both runtime behavior and build/tooling changes, use this workflow.
+
+### Subagent Selection Matrix
+
+| Situation                  | Use first         | Optional follow-up                  | Expected output                   |
+| -------------------------- | ----------------- | ----------------------------------- | --------------------------------- |
+| Unfamiliar code area       | `repo-explorer`   | `code-architect`                    | File map and risk hotspots        |
+| Multi-crate feature change | `repo-explorer`   | `code-architect`, `build-validator` | Change plan and validation scope  |
+| CI/build failures          | `build-validator` | `repo-explorer`                     | Failing combos and fault area     |
+| Design/API proposal        | `code-architect`  | `repo-explorer`                     | Architecture concerns and options |
+| Cleanup/refactor pass      | `code-simplifier` | `build-validator`                   | Simplification summary and checks |
+| Pre-PR readiness           | `build-validator` | `verify-app`, `pr-creator`          | Pass/fail report and PR draft     |
+
+Use at least 2 subagents when:
+
+- The task touches 2+ crates.
+- The change affects both runtime behavior and CI/build tooling.
 
 ## Slash Commands
 
