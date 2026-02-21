@@ -3,6 +3,7 @@ bin/
 pkg/
 target/
 .wrangler/
+.edgezero/
 
 # env
 .env

@@ -32,3 +32,4 @@ web-time = { workspace = true }
 brotli = { workspace = true }
 flate2 = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }

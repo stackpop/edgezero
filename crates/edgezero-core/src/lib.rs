@@ -8,6 +8,7 @@ pub mod error;
 pub mod extractor;
 pub mod handler;
 pub mod http;
+pub mod kv;
 pub mod manifest;
 pub mod middleware;
 pub mod params;
@@ -17,3 +18,4 @@ pub mod response;
 pub mod router;
 
 pub use edgezero_macros::{action, app};
+pub use kv::{KvError, KvHandle, KvStore};

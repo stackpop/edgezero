@@ -5,6 +5,8 @@
 pub mod cli;
 mod context;
 #[cfg(feature = "fastly")]
+pub mod kv;
+#[cfg(feature = "fastly")]
 mod logger;
 #[cfg(feature = "fastly")]
 mod proxy;
@@ -17,7 +19,7 @@ pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
-pub use request::{dispatch, into_core_request};
+pub use request::{dispatch, dispatch_with_kv, into_core_request, DEFAULT_KV_STORE_NAME};
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
 
@@ -78,14 +80,17 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
     let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
-    let logging = manifest_loader.manifest().logging_or_default("fastly");
-    run_app_with_logging::<A>(logging.into(), req)
+    let manifest = manifest_loader.manifest();
+    let logging = manifest.logging_or_default("fastly");
+    let kv_name = manifest.kv_store_name("fastly").to_string();
+    run_app_with_logging::<A>(logging.into(), req, &kv_name)
 }
 
 #[cfg(feature = "fastly")]
-pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
+pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     logging: FastlyLogging,
     req: fastly::Request,
+    kv_store_name: &str,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -93,7 +98,7 @@ pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    dispatch(&app, req)
+    dispatch_with_kv(&app, req, kv_store_name)
 }
 
 #[cfg(all(test, feature = "fastly"))]

@@ -5,6 +5,8 @@ mod context;
 #[cfg(feature = "axum")]
 mod dev_server;
 #[cfg(feature = "axum")]
+pub mod kv;
+#[cfg(feature = "axum")]
 mod proxy;
 #[cfg(feature = "axum")]
 mod request;
@@ -20,6 +22,8 @@ pub mod cli;
 pub use context::AxumRequestContext;
 #[cfg(feature = "axum")]
 pub use dev_server::{run_app, AxumDevServer, AxumDevServerConfig};
+#[cfg(feature = "axum")]
+pub use kv::PersistentKvStore;
 #[cfg(feature = "axum")]
 pub use proxy::AxumProxyClient;
 #[cfg(feature = "axum")]
