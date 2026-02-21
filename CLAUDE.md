@@ -254,15 +254,15 @@ Default trigger:
 
 ### Subagent Selection Matrix
 
-| Situation                  | Use first         | Optional follow-up                  | Expected output                   |
-| -------------------------- | ----------------- | ----------------------------------- | --------------------------------- |
-| Unfamiliar code area       | `repo-explorer`   | `code-architect`                    | File map and risk hotspots        |
-| Multi-crate feature change | `repo-explorer`   | `code-architect`, `build-validator` | Change plan and validation scope  |
-| CI/build failures          | `build-validator` | `repo-explorer`                     | Failing combos and fault area     |
-| Design/API proposal        | `code-architect`  | `repo-explorer`                     | Architecture concerns and options |
-| Cleanup/refactor pass      | `code-simplifier` | `build-validator`                   | Simplification summary and checks |
-| Pre-PR readiness           | `build-validator` | `verify-app`, `pr-creator`          | Pass/fail report and PR draft     |
-| PR review                  | `pr-reviewer`     | `code-architect`, `repo-explorer`   | Inline GitHub review with findings|
+| Situation                  | Use first         | Optional follow-up                  | Expected output                    |
+| -------------------------- | ----------------- | ----------------------------------- | ---------------------------------- |
+| Unfamiliar code area       | `repo-explorer`   | `code-architect`                    | File map and risk hotspots         |
+| Multi-crate feature change | `repo-explorer`   | `code-architect`, `build-validator` | Change plan and validation scope   |
+| CI/build failures          | `build-validator` | `repo-explorer`                     | Failing combos and fault area      |
+| Design/API proposal        | `code-architect`  | `repo-explorer`                     | Architecture concerns and options  |
+| Cleanup/refactor pass      | `code-simplifier` | `build-validator`                   | Simplification summary and checks  |
+| Pre-PR readiness           | `build-validator` | `verify-app`, `pr-creator`          | Pass/fail report and PR draft      |
+| PR review                  | `pr-reviewer`     | `code-architect`, `repo-explorer`   | Inline GitHub review with findings |
 
 Use at least 2 subagents when:
 

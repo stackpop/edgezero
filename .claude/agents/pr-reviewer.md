@@ -59,18 +59,21 @@ Note any CI failures in the review but continue with the code review regardless.
 For each changed file, evaluate:
 
 #### Correctness
+
 - Logic errors, off-by-one, missing edge cases
 - Race conditions (especially in concurrent/async code)
 - Error handling: are errors propagated, swallowed, or misclassified?
 - Resource leaks (files, connections, transactions)
 
 #### WASM compatibility
+
 - No Tokio or runtime-specific deps in core or adapter crates
 - `#[async_trait(?Send)]` without `Send` bounds in core
 - `futures::executor::block_on` for async tests (not `#[tokio::test]`)
 - `web-time` instead of `std::time::Instant` in core
 
 #### Convention compliance (from CLAUDE.md)
+
 - Route params use `{id}` syntax (not `:id`)
 - Types imported from `edgezero_core` (not `http` crate directly)
 - `#[action]` macro on handlers
@@ -79,22 +82,26 @@ For each changed file, evaluate:
 - Colocated tests with `#[cfg(test)]`
 
 #### Security
+
 - Input validation: size limits on bodies, key lengths, value sizes
 - No unbounded allocations (collect without limits, unbounded Vec growth)
 - `env::set_var` is unsound on Rust 1.63+ in multi-threaded contexts
 - No secrets or credentials in committed files
 
 #### API design
+
 - Public API surface: too broad? Too narrow? Breaking changes?
 - Consistency with existing patterns in the codebase
 - Error types: are they specific enough for callers to handle?
 
 #### Dependencies
+
 - New deps justified? WASM compatible?
 - Feature gating: are deps behind the correct feature flags?
 - Unconditional deps that should be optional
 
 #### Test coverage
+
 - Are new code paths tested?
 - Are edge cases covered (empty input, max values, error paths)?
 - Do tests follow project conventions (block_on, not tokio::test)?
@@ -103,12 +110,12 @@ For each changed file, evaluate:
 
 Assign each finding a severity:
 
-| Severity | Criteria |
-| -------- | -------- |
-| P0 — Blocker | Must fix before merge: bugs, data loss, security, CI failures |
-| P1 — High | Should fix: race conditions, API design issues, missing validation |
-| P2 — Medium | Recommended: inconsistencies, test gaps, dead code |
-| P3 — Low | Nice to have: style, minor improvements, documentation |
+| Severity     | Criteria                                                           |
+| ------------ | ------------------------------------------------------------------ |
+| P0 — Blocker | Must fix before merge: bugs, data loss, security, CI failures      |
+| P1 — High    | Should fix: race conditions, API design issues, missing validation |
+| P2 — Medium  | Recommended: inconsistencies, test gaps, dead code                 |
+| P3 — Low     | Nice to have: style, minor improvements, documentation             |
 
 ### 6. Present findings for user approval
 
@@ -147,14 +154,14 @@ For each finding that can be pinpointed to a specific line, create an inline
 comment. Use the file's **current line number** (not diff position) with the
 `line` and `side` parameters:
 
-```json
+````json
 {
   "path": "crates/edgezero-core/src/kv.rs",
   "line": 166,
   "side": "RIGHT",
   "body": "**P1 — Race condition**: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
 }
-```
+````
 
 #### Build the review body
 
@@ -165,23 +172,29 @@ concerns, architectural issues, dependency problems) in the review body:
 ## Staff Engineer Review
 
 ### Summary
+
 <1-2 sentence overview of the changes and overall assessment>
 
 ### Findings
 
 #### P0 — Blockers
+
 - **Title**: description (file:line)
 
 #### P1 — High
+
 - **Title**: description (file:line)
 
 #### P2 — Medium
+
 - **Title**: description
 
 #### P3 — Low
+
 - **Title**: description
 
 ### CI Status
+
 - fmt: PASS/FAIL
 - clippy: PASS/FAIL
 - tests: PASS/FAIL
@@ -193,6 +206,7 @@ Use the GitHub API to submit. Handle these known issues:
 
 1. **"User can only have one pending review"**: Delete the existing pending
    review first:
+
    ```
    # Find pending review
    gh api repos/stackpop/edgezero/pulls/<number>/reviews --jq '.[] | select(.state == "PENDING") | .id'
