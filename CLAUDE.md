@@ -225,6 +225,7 @@ Specialized agents live in `.claude/agents/`. Use them to distribute work:
 | `code-architect`  | Architectural review — evaluates designs against project principles       |
 | `pr-creator`      | Creates or updates GitHub PRs using the project template and CI gates     |
 | `issue-creator`   | Creates GitHub issues with proper types (Task/Bug/Story/Epic) via GraphQL |
+| `pr-reviewer`     | Staff-engineer PR review with inline GitHub comments (user approves)      |
 | `repo-explorer`   | Read-only codebase mapping for unfamiliar areas and cross-crate flow      |
 
 Invoke with "use subagents" in your prompt or reference a specific agent by name.
@@ -261,6 +262,7 @@ Default trigger:
 | Design/API proposal        | `code-architect`  | `repo-explorer`                     | Architecture concerns and options |
 | Cleanup/refactor pass      | `code-simplifier` | `build-validator`                   | Simplification summary and checks |
 | Pre-PR readiness           | `build-validator` | `verify-app`, `pr-creator`          | Pass/fail report and PR draft     |
+| PR review                  | `pr-reviewer`     | `code-architect`, `repo-explorer`   | Inline GitHub review with findings|
 
 Use at least 2 subagents when:
 
