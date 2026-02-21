@@ -169,7 +169,7 @@ Include findings that cannot be pinpointed to a single line (cross-cutting
 concerns, architectural issues, dependency problems) in the review body:
 
 ```markdown
-## Staff Engineer Review
+## PR Review
 
 ### Summary
 
