@@ -12,7 +12,10 @@ target/
 .DS_Store
 
 # Editors
-.claude
+.claude/*
+!.claude/settings.json
+!.claude/commands/
+!.claude/agents/
 .idea
 .specstory
 .vscode/*
