@@ -73,7 +73,8 @@ pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Re
     let params: ProxyPath = ctx.path()?;
     let proxy_handle = ctx.proxy_handle();
     let request = ctx.into_request();
-    let target = build_proxy_target(&params.rest, request.uri())?;
+    let base = std::env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_string());
+    let target = build_proxy_target(&base, &params.rest, request.uri())?;
     let proxy_request = ProxyRequest::from_request(request, target);
 
     if let Some(handle) = proxy_handle {
@@ -83,8 +84,7 @@ pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Re
     }
 }
 
-fn build_proxy_target(rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> {
-    let base = std::env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_string());
+fn build_proxy_target(base: &str, rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> {
     let mut target = base.trim_end_matches('/').to_string();
     let trimmed_rest = rest.trim_start_matches('/');
     if !trimmed_rest.is_empty() {
@@ -149,7 +149,13 @@ pub(crate) async fn kv_note_put(
         .map_err(EdgeError::internal)
 }
 
+/// Maximum request body size (25 MB, matches KV value limit).
+const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
+
 /// Drain a [`Body`] into a single [`Bytes`] buffer, regardless of variant.
+///
+/// Caps accumulation at [`MAX_BODY_SIZE`] to prevent denial-of-service via
+/// multi-GB streaming uploads.
 async fn collect_body(body: Body) -> Result<Bytes, EdgeError> {
     if body.is_stream() {
         let mut stream = body.into_stream().expect("checked is_stream");
@@ -157,6 +163,9 @@ async fn collect_body(body: Body) -> Result<Bytes, EdgeError> {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(EdgeError::internal)?;
             buf.extend_from_slice(&chunk);
+            if buf.len() > MAX_BODY_SIZE {
+                return Err(EdgeError::bad_request("request body too large"));
+            }
         }
         Ok(Bytes::from(buf))
     } else {
@@ -206,7 +215,6 @@ mod tests {
     use edgezero_core::response::IntoResponse;
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
-    use std::env;
 
     #[test]
     fn root_returns_static_body() {
@@ -270,23 +278,20 @@ mod tests {
 
     #[test]
     fn build_proxy_target_merges_segments_and_query() {
-        env::set_var("API_BASE_URL", "https://example.com/api");
         let original = Uri::from_static("/proxy/status?foo=bar");
-        let target = build_proxy_target("status/200", &original).expect("target uri");
+        let target = build_proxy_target("https://example.com/api", "status/200", &original)
+            .expect("target uri");
         assert_eq!(
             target.to_string(),
             "https://example.com/api/status/200?foo=bar"
         );
-        env::remove_var("API_BASE_URL");
     }
 
     #[test]
     fn proxy_demo_without_handle_returns_placeholder() {
-        env::set_var("API_BASE_URL", "https://example.com/api");
         let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        env::remove_var("API_BASE_URL");
     }
 
     struct TestProxyClient;
@@ -302,8 +307,6 @@ mod tests {
 
     #[test]
     fn proxy_demo_uses_injected_handle() {
-        env::set_var("API_BASE_URL", "https://example.com/api");
-
         let mut request = request_builder()
             .method(Method::GET)
             .uri("/proxy/status/201")
@@ -319,8 +322,6 @@ mod tests {
 
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::CREATED);
-
-        env::remove_var("API_BASE_URL");
     }
 
     fn empty_context(path: &str) -> RequestContext {
@@ -366,7 +367,7 @@ mod tests {
 
     // -- KV handler tests --------------------------------------------------
 
-    use edgezero_core::kv::{KvError, KvHandle, KvStore};
+    use edgezero_core::key_value_store::{KvError, KvHandle, KvStore};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 

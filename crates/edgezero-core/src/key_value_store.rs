@@ -142,6 +142,42 @@ pub trait KvStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Test-only no-op store
+// ---------------------------------------------------------------------------
+
+/// A no-op [`KvStore`] for tests that only need a [`KvHandle`] to exist
+/// without storing real data.
+///
+/// All reads return `None` / empty; all writes succeed silently.
+#[cfg(test)]
+pub struct NoopKvStore;
+
+#[cfg(test)]
+#[async_trait(?Send)]
+impl KvStore for NoopKvStore {
+    async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+        Ok(None)
+    }
+    async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+        Ok(())
+    }
+    async fn put_bytes_with_ttl(
+        &self,
+        _key: &str,
+        _value: Bytes,
+        _ttl: Duration,
+    ) -> Result<(), KvError> {
+        Ok(())
+    }
+    async fn delete(&self, _key: &str) -> Result<(), KvError> {
+        Ok(())
+    }
+    async fn list_keys(&self, _prefix: &str) -> Result<Vec<String>, KvError> {
+        Ok(vec![])
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handle
 // ---------------------------------------------------------------------------
 
@@ -181,6 +217,9 @@ impl KvHandle {
     /// Minimum TTL in seconds (Cloudflare limit).
     pub const MIN_TTL: Duration = Duration::from_secs(60);
 
+    /// Maximum TTL (1 year). Prevents overflow when adding to `SystemTime::now()`.
+    pub const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
     /// Create a new handle wrapping a KV store implementation.
     pub fn new(store: Arc<dyn KvStore>) -> Self {
         Self { store }
@@ -189,6 +228,9 @@ impl KvHandle {
     // -- Validation ---------------------------------------------------------
 
     fn validate_key(key: &str) -> Result<(), KvError> {
+        if key.is_empty() {
+            return Err(KvError::Validation("key cannot be empty".to_string()));
+        }
         if key.len() > Self::MAX_KEY_SIZE {
             return Err(KvError::Validation(format!(
                 "key length {} exceeds limit of {} bytes",
@@ -223,6 +265,12 @@ impl KvHandle {
         if ttl < Self::MIN_TTL {
             return Err(KvError::Validation(format!(
                 "TTL {:?} is less than minimum of at least 60 seconds",
+                ttl
+            )));
+        }
+        if ttl > Self::MAX_TTL {
+            return Err(KvError::Validation(format!(
+                "TTL {:?} exceeds maximum of 1 year",
                 ttl
             )));
         }
@@ -341,10 +389,18 @@ impl KvHandle {
     }
 
     /// List keys with the given prefix.
+    ///
+    /// An empty prefix returns all keys. Prefixes are size-checked but not
+    /// subject to the full key validation (e.g. empty string is valid as a
+    /// "match everything" prefix).
     pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-        // We generally allow validation on list prefixes too in strict environments,
-        // but often prefixes are short. We'll strict check it doesn't exceed key limits.
-        Self::validate_key(prefix)?;
+        if prefix.len() > Self::MAX_KEY_SIZE {
+            return Err(KvError::Validation(format!(
+                "prefix length {} exceeds limit of {} bytes",
+                prefix.len(),
+                Self::MAX_KEY_SIZE
+            )));
+        }
         self.store.list_keys(prefix).await
     }
 }
@@ -363,19 +419,19 @@ impl KvHandle {
 /// # Example
 ///
 /// ```rust,ignore
-/// edgezero_core::kv_contract_tests!(persistent_kv_contract, {
+/// edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
 ///     let temp_dir = tempfile::tempdir().unwrap();
 ///     let db_path = temp_dir.path().join("test.redb");
 ///     PersistentKvStore::new(db_path).unwrap()
 /// });
 /// ```
 #[macro_export]
-macro_rules! kv_contract_tests {
+macro_rules! key_value_store_contract_tests {
     ($mod_name:ident, $factory:expr) => {
         mod $mod_name {
             use super::*;
             use bytes::Bytes;
-            use $crate::kv::KvStore;
+            use $crate::key_value_store::KvStore;
 
             fn run<F: std::future::Future>(f: F) -> F::Output {
                 futures::executor::block_on(f)
@@ -463,6 +519,43 @@ macro_rules! kv_contract_tests {
                     assert!(!store.exists("k").await.unwrap());
                 });
             }
+
+            #[test]
+            fn contract_put_with_ttl_stores_value() {
+                let store = $factory;
+                run(async {
+                    store
+                        .put_bytes_with_ttl(
+                            "ttl_key",
+                            Bytes::from("ttl_val"),
+                            std::time::Duration::from_secs(300),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        store.get_bytes("ttl_key").await.unwrap(),
+                        Some(Bytes::from("ttl_val"))
+                    );
+                });
+            }
+
+            #[test]
+            fn contract_ttl_expires() {
+                let store = $factory;
+                run(async {
+                    store
+                        .put_bytes_with_ttl(
+                            "ephemeral",
+                            Bytes::from("gone_soon"),
+                            std::time::Duration::from_millis(1),
+                        )
+                        .await
+                        .unwrap();
+                    // Allow the TTL to elapse.
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    assert_eq!(store.get_bytes("ephemeral").await.unwrap(), None);
+                });
+            }
         }
     };
 }
@@ -476,10 +569,11 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Instant;
 
-    // Minimal in-memory store for testing the handle/trait contract
+    // In-memory store with TTL support for contract testing.
     struct MockStore {
-        data: Mutex<HashMap<String, Bytes>>,
+        data: Mutex<HashMap<String, (Bytes, Option<Instant>)>>,
     }
 
     impl MockStore {
@@ -493,13 +587,19 @@ mod tests {
     #[async_trait(?Send)]
     impl KvStore for MockStore {
         async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
-            let data = self.data.lock().unwrap();
-            Ok(data.get(key).cloned())
+            let mut data = self.data.lock().unwrap();
+            if let Some((_, Some(exp))) = data.get(key) {
+                if Instant::now() >= *exp {
+                    data.remove(key);
+                    return Ok(None);
+                }
+            }
+            Ok(data.get(key).map(|(v, _)| v.clone()))
         }
 
         async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
             let mut data = self.data.lock().unwrap();
-            data.insert(key.to_string(), value);
+            data.insert(key.to_string(), (value, None));
             Ok(())
         }
 
@@ -507,10 +607,11 @@ mod tests {
             &self,
             key: &str,
             value: Bytes,
-            _ttl: Duration,
+            ttl: Duration,
         ) -> Result<(), KvError> {
-            // MockStore ignores TTL for simplicity
-            self.put_bytes(key, value).await
+            let mut data = self.data.lock().unwrap();
+            data.insert(key.to_string(), (value, Some(Instant::now() + ttl)));
+            Ok(())
         }
 
         async fn delete(&self, key: &str) -> Result<(), KvError> {
@@ -520,7 +621,10 @@ mod tests {
         }
 
         async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-            let data = self.data.lock().unwrap();
+            let mut data = self.data.lock().unwrap();
+            let now = Instant::now();
+            // Remove expired keys first
+            data.retain(|_, (_, exp)| exp.is_none_or(|e| now < e));
             let mut keys: Vec<String> = data
                 .keys()
                 .filter(|k| k.starts_with(prefix))
@@ -537,25 +641,31 @@ mod tests {
 
     // -- Raw bytes ----------------------------------------------------------
 
-    #[tokio::test]
-    async fn raw_bytes_roundtrip() {
+    #[test]
+    fn raw_bytes_roundtrip() {
         let h = handle();
-        h.put_bytes("k", Bytes::from("hello")).await.unwrap();
-        assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
+        futures::executor::block_on(async {
+            h.put_bytes("k", Bytes::from("hello")).await.unwrap();
+            assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
+        });
     }
 
-    #[tokio::test]
-    async fn raw_bytes_missing_key_returns_none() {
+    #[test]
+    fn raw_bytes_missing_key_returns_none() {
         let h = handle();
-        assert_eq!(h.get_bytes("missing").await.unwrap(), None);
+        futures::executor::block_on(async {
+            assert_eq!(h.get_bytes("missing").await.unwrap(), None);
+        });
     }
 
-    #[tokio::test]
-    async fn raw_bytes_overwrite() {
+    #[test]
+    fn raw_bytes_overwrite() {
         let h = handle();
-        h.put_bytes("k", Bytes::from("a")).await.unwrap();
-        h.put_bytes("k", Bytes::from("b")).await.unwrap();
-        assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("b")));
+        futures::executor::block_on(async {
+            h.put_bytes("k", Bytes::from("a")).await.unwrap();
+            h.put_bytes("k", Bytes::from("b")).await.unwrap();
+            assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("b")));
+        });
     }
 
     // -- Typed JSON ---------------------------------------------------------
@@ -565,136 +675,166 @@ mod tests {
         count: i32,
     }
 
-    #[tokio::test]
-    async fn typed_get_put_roundtrip() {
+    #[test]
+    fn typed_get_put_roundtrip() {
         let h = handle();
-        let data = Counter { count: 42 };
-        h.put("counter", &data).await.unwrap();
-        let out: Option<Counter> = h.get("counter").await.unwrap();
-        assert_eq!(out, Some(data));
+        futures::executor::block_on(async {
+            let data = Counter { count: 42 };
+            h.put("counter", &data).await.unwrap();
+            let out: Option<Counter> = h.get("counter").await.unwrap();
+            assert_eq!(out, Some(data));
+        });
     }
 
-    #[tokio::test]
-    async fn typed_get_missing_returns_none() {
+    #[test]
+    fn typed_get_missing_returns_none() {
         let h = handle();
-        let out: Option<Counter> = h.get("nope").await.unwrap();
-        assert_eq!(out, None);
+        futures::executor::block_on(async {
+            let out: Option<Counter> = h.get("nope").await.unwrap();
+            assert_eq!(out, None);
+        });
     }
 
-    #[tokio::test]
-    async fn typed_get_or_returns_default() {
+    #[test]
+    fn typed_get_or_returns_default() {
         let h = handle();
-        let count: i32 = h.get_or("visits", 0).await.unwrap();
-        assert_eq!(count, 0);
+        futures::executor::block_on(async {
+            let count: i32 = h.get_or("visits", 0).await.unwrap();
+            assert_eq!(count, 0);
+        });
     }
 
-    #[tokio::test]
-    async fn typed_get_or_returns_existing() {
+    #[test]
+    fn typed_get_or_returns_existing() {
         let h = handle();
-        h.put("visits", &99).await.unwrap();
-        let count: i32 = h.get_or("visits", 0).await.unwrap();
-        assert_eq!(count, 99);
+        futures::executor::block_on(async {
+            h.put("visits", &99).await.unwrap();
+            let count: i32 = h.get_or("visits", 0).await.unwrap();
+            assert_eq!(count, 99);
+        });
     }
 
-    #[tokio::test]
-    async fn typed_get_bad_json_returns_serialization_error() {
+    #[test]
+    fn typed_get_bad_json_returns_serialization_error() {
         let h = handle();
-        h.put_bytes("bad", Bytes::from("not json")).await.unwrap();
-        let err = h.get::<Counter>("bad").await.unwrap_err();
-        assert!(matches!(err, KvError::Serialization(_)));
+        futures::executor::block_on(async {
+            h.put_bytes("bad", Bytes::from("not json")).await.unwrap();
+            let err = h.get::<Counter>("bad").await.unwrap_err();
+            assert!(matches!(err, KvError::Serialization(_)));
+        });
     }
 
     // -- Update -------------------------------------------------------------
 
-    #[tokio::test]
-    async fn update_increments_counter() {
+    #[test]
+    fn update_increments_counter() {
         let h = handle();
-        h.put("c", &0i32).await.unwrap();
-        let val = h.update("c", 0i32, |n| n + 1).await.unwrap();
-        assert_eq!(val, 1);
-        let val = h.update("c", 0i32, |n| n + 1).await.unwrap();
-        assert_eq!(val, 2);
+        futures::executor::block_on(async {
+            h.put("c", &0i32).await.unwrap();
+            let val = h.update("c", 0i32, |n| n + 1).await.unwrap();
+            assert_eq!(val, 1);
+            let val = h.update("c", 0i32, |n| n + 1).await.unwrap();
+            assert_eq!(val, 2);
+        });
     }
 
-    #[tokio::test]
-    async fn update_uses_default_when_missing() {
+    #[test]
+    fn update_uses_default_when_missing() {
         let h = handle();
-        let val = h.update("new", 10i32, |n| n * 2).await.unwrap();
-        assert_eq!(val, 20);
+        futures::executor::block_on(async {
+            let val = h.update("new", 10i32, |n| n * 2).await.unwrap();
+            assert_eq!(val, 20);
+        });
     }
 
     // -- Exists -------------------------------------------------------------
 
-    #[tokio::test]
-    async fn exists_returns_false_for_missing() {
+    #[test]
+    fn exists_returns_false_for_missing() {
         let h = handle();
-        assert!(!h.exists("nope").await.unwrap());
+        futures::executor::block_on(async {
+            assert!(!h.exists("nope").await.unwrap());
+        });
     }
 
-    #[tokio::test]
-    async fn exists_returns_true_for_present() {
+    #[test]
+    fn exists_returns_true_for_present() {
         let h = handle();
-        h.put_bytes("k", Bytes::from("v")).await.unwrap();
-        assert!(h.exists("k").await.unwrap());
+        futures::executor::block_on(async {
+            h.put_bytes("k", Bytes::from("v")).await.unwrap();
+            assert!(h.exists("k").await.unwrap());
+        });
     }
 
     // -- Delete -------------------------------------------------------------
 
-    #[tokio::test]
-    async fn delete_removes_key() {
+    #[test]
+    fn delete_removes_key() {
         let h = handle();
-        h.put_bytes("k", Bytes::from("v")).await.unwrap();
-        h.delete("k").await.unwrap();
-        assert_eq!(h.get_bytes("k").await.unwrap(), None);
+        futures::executor::block_on(async {
+            h.put_bytes("k", Bytes::from("v")).await.unwrap();
+            h.delete("k").await.unwrap();
+            assert_eq!(h.get_bytes("k").await.unwrap(), None);
+        });
     }
 
-    #[tokio::test]
-    async fn delete_missing_key_is_ok() {
+    #[test]
+    fn delete_missing_key_is_ok() {
         let h = handle();
-        h.delete("nope").await.unwrap();
+        futures::executor::block_on(async {
+            h.delete("nope").await.unwrap();
+        });
     }
 
     // -- List keys ----------------------------------------------------------
 
-    #[tokio::test]
-    async fn list_keys_with_prefix() {
+    #[test]
+    fn list_keys_with_prefix() {
         let h = handle();
-        h.put_bytes("user:1", Bytes::from("a")).await.unwrap();
-        h.put_bytes("user:2", Bytes::from("b")).await.unwrap();
-        h.put_bytes("session:1", Bytes::from("c")).await.unwrap();
+        futures::executor::block_on(async {
+            h.put_bytes("user:1", Bytes::from("a")).await.unwrap();
+            h.put_bytes("user:2", Bytes::from("b")).await.unwrap();
+            h.put_bytes("session:1", Bytes::from("c")).await.unwrap();
 
-        let keys = h.list_keys("user:").await.unwrap();
-        assert_eq!(keys, vec!["user:1", "user:2"]);
+            let keys = h.list_keys("user:").await.unwrap();
+            assert_eq!(keys, vec!["user:1", "user:2"]);
+        });
     }
 
-    #[tokio::test]
-    async fn list_keys_empty_prefix_returns_all() {
+    #[test]
+    fn list_keys_empty_prefix_returns_all() {
         let h = handle();
-        h.put_bytes("a", Bytes::from("1")).await.unwrap();
-        h.put_bytes("b", Bytes::from("2")).await.unwrap();
+        futures::executor::block_on(async {
+            h.put_bytes("a", Bytes::from("1")).await.unwrap();
+            h.put_bytes("b", Bytes::from("2")).await.unwrap();
 
-        let keys = h.list_keys("").await.unwrap();
-        assert_eq!(keys, vec!["a", "b"]);
+            let keys = h.list_keys("").await.unwrap();
+            assert_eq!(keys, vec!["a", "b"]);
+        });
     }
 
-    #[tokio::test]
-    async fn list_keys_no_matches() {
+    #[test]
+    fn list_keys_no_matches() {
         let h = handle();
-        h.put_bytes("a", Bytes::from("1")).await.unwrap();
-        let keys = h.list_keys("zzz").await.unwrap();
-        assert!(keys.is_empty());
+        futures::executor::block_on(async {
+            h.put_bytes("a", Bytes::from("1")).await.unwrap();
+            let keys = h.list_keys("zzz").await.unwrap();
+            assert!(keys.is_empty());
+        });
     }
 
     // -- TTL ----------------------------------------------------------------
 
-    #[tokio::test]
-    async fn put_with_ttl_stores_value() {
+    #[test]
+    fn put_with_ttl_stores_value() {
         let h = handle();
-        h.put_with_ttl("session", &"token123", Duration::from_secs(60))
-            .await
-            .unwrap();
-        let val: Option<String> = h.get("session").await.unwrap();
-        assert_eq!(val, Some("token123".to_string()));
+        futures::executor::block_on(async {
+            h.put_with_ttl("session", &"token123", Duration::from_secs(60))
+                .await
+                .unwrap();
+            let val: Option<String> = h.get("session").await.unwrap();
+            assert_eq!(val, Some("token123".to_string()));
+        });
     }
 
     // -- KvError -> EdgeError -----------------------------------------------
@@ -724,81 +864,95 @@ mod tests {
 
     // -- Clone handle -------------------------------------------------------
 
-    #[tokio::test]
-    async fn handle_is_cloneable_and_shares_state() {
+    #[test]
+    fn handle_is_cloneable_and_shares_state() {
         let h1 = handle();
         let h2 = h1.clone();
-        h1.put("shared", &42i32).await.unwrap();
-        let val: i32 = h2.get_or("shared", 0).await.unwrap();
-        assert_eq!(val, 42);
+        futures::executor::block_on(async {
+            h1.put("shared", &42i32).await.unwrap();
+            let val: i32 = h2.get_or("shared", 0).await.unwrap();
+            assert_eq!(val, 42);
+        });
     }
 
     // -- Edge cases ---------------------------------------------------------
 
-    #[tokio::test]
-    async fn empty_key_roundtrip() {
+    #[test]
+    fn empty_key_rejected() {
         let h = handle();
-        h.put("", &"empty key").await.unwrap();
-        let val: Option<String> = h.get("").await.unwrap();
-        assert_eq!(val, Some("empty key".to_string()));
+        futures::executor::block_on(async {
+            let err = h.put("", &"empty key").await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("cannot be empty"));
+        });
     }
 
-    #[tokio::test]
-    async fn unicode_key_roundtrip() {
+    #[test]
+    fn unicode_key_roundtrip() {
         let h = handle();
-        h.put("日本語キー", &"value").await.unwrap();
-        let val: Option<String> = h.get("日本語キー").await.unwrap();
-        assert_eq!(val, Some("value".to_string()));
+        futures::executor::block_on(async {
+            h.put("日本語キー", &"value").await.unwrap();
+            let val: Option<String> = h.get("日本語キー").await.unwrap();
+            assert_eq!(val, Some("value".to_string()));
+        });
     }
 
-    #[tokio::test]
-    async fn large_value_roundtrip() {
+    #[test]
+    fn large_value_roundtrip() {
         let h = handle();
-        let large = "x".repeat(1_000_000); // 1MB string
-        h.put("big", &large).await.unwrap();
-        let val: Option<String> = h.get("big").await.unwrap();
-        assert_eq!(val.as_deref(), Some(large.as_str()));
+        futures::executor::block_on(async {
+            let large = "x".repeat(1_000_000); // 1MB string
+            h.put("big", &large).await.unwrap();
+            let val: Option<String> = h.get("big").await.unwrap();
+            assert_eq!(val.as_deref(), Some(large.as_str()));
+        });
     }
 
-    #[tokio::test]
-    async fn put_with_ttl_typed_helper() {
+    #[test]
+    fn put_with_ttl_typed_helper() {
         let h = handle();
-        let data = Counter { count: 7 };
-        h.put_with_ttl("ttl_key", &data, Duration::from_secs(600))
-            .await
-            .unwrap();
-        let val: Option<Counter> = h.get("ttl_key").await.unwrap();
-        assert_eq!(val, Some(Counter { count: 7 }));
+        futures::executor::block_on(async {
+            let data = Counter { count: 7 };
+            h.put_with_ttl("ttl_key", &data, Duration::from_secs(600))
+                .await
+                .unwrap();
+            let val: Option<Counter> = h.get("ttl_key").await.unwrap();
+            assert_eq!(val, Some(Counter { count: 7 }));
+        });
     }
 
-    #[tokio::test]
-    async fn get_or_with_complex_default() {
+    #[test]
+    fn get_or_with_complex_default() {
         let h = handle();
-        let default = Counter { count: 100 };
-        let val: Counter = h.get_or("missing_struct", default).await.unwrap();
-        assert_eq!(val.count, 100);
+        futures::executor::block_on(async {
+            let default = Counter { count: 100 };
+            let val: Counter = h.get_or("missing_struct", default).await.unwrap();
+            assert_eq!(val.count, 100);
+        });
     }
 
-    #[tokio::test]
-    async fn update_with_struct() {
+    #[test]
+    fn update_with_struct() {
         let h = handle();
-        let val = h
-            .update("counter_struct", Counter { count: 0 }, |mut c| {
-                c.count += 10;
-                c
-            })
-            .await
-            .unwrap();
-        assert_eq!(val.count, 10);
+        futures::executor::block_on(async {
+            let val = h
+                .update("counter_struct", Counter { count: 0 }, |mut c| {
+                    c.count += 10;
+                    c
+                })
+                .await
+                .unwrap();
+            assert_eq!(val.count, 10);
 
-        let val = h
-            .update("counter_struct", Counter { count: 0 }, |mut c| {
-                c.count += 5;
-                c
-            })
-            .await
-            .unwrap();
-        assert_eq!(val.count, 15);
+            let val = h
+                .update("counter_struct", Counter { count: 0 }, |mut c| {
+                    c.count += 5;
+                    c
+                })
+                .await
+                .unwrap();
+            assert_eq!(val.count, 15);
+        });
     }
 
     #[test]
@@ -819,102 +973,116 @@ mod tests {
 
     // -- Validation Tests ---------------------------------------------------
 
-    #[tokio::test]
-    async fn validation_rejects_long_keys() {
+    #[test]
+    fn validation_rejects_long_keys() {
         let h = handle();
-        // MAX_KEY_SIZE + 1
-        let long_key = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
-        let err = h.get::<i32>(&long_key).await.unwrap_err();
-        assert!(matches!(err, KvError::Validation(_)));
-        assert!(format!("{}", err).contains("key length"));
+        futures::executor::block_on(async {
+            let long_key = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
+            let err = h.get::<i32>(&long_key).await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("key length"));
+        });
     }
 
-    #[tokio::test]
-    async fn validation_rejects_dot_keys() {
+    #[test]
+    fn validation_rejects_dot_keys() {
         let h = handle();
-        let err = h.get::<i32>(".").await.unwrap_err();
-        assert!(matches!(err, KvError::Validation(_)));
-        assert!(format!("{}", err).contains("cannot be exactly"));
+        futures::executor::block_on(async {
+            let err = h.get::<i32>(".").await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("cannot be exactly"));
 
-        let err = h.get::<i32>("..").await.unwrap_err();
-        assert!(matches!(err, KvError::Validation(_)));
-        assert!(format!("{}", err).contains("cannot be exactly"));
+            let err = h.get::<i32>("..").await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("cannot be exactly"));
+        });
     }
 
-    #[tokio::test]
-    async fn validation_rejects_control_chars() {
+    #[test]
+    fn validation_rejects_control_chars() {
         let h = handle();
-        let err = h.get::<i32>("key\nwith\nnewline").await.unwrap_err();
-        assert!(matches!(err, KvError::Validation(_)));
-        assert!(format!("{}", err).contains("control characters"));
+        futures::executor::block_on(async {
+            let err = h.get::<i32>("key\nwith\nnewline").await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("control characters"));
+        });
     }
 
-    #[tokio::test]
-    async fn validation_rejects_large_values() {
+    #[test]
+    fn validation_rejects_large_values() {
         let h = handle();
-        // MAX_VALUE_SIZE + 1 byte
-        let large_val = vec![0u8; KvHandle::MAX_VALUE_SIZE + 1];
-        let err = h
-            .put_bytes("large", Bytes::from(large_val))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, KvError::Validation(_)));
-        assert!(format!("{}", err).contains("value size"));
+        futures::executor::block_on(async {
+            let large_val = vec![0u8; KvHandle::MAX_VALUE_SIZE + 1];
+            let err = h
+                .put_bytes("large", Bytes::from(large_val))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("value size"));
+        });
     }
 
-    #[tokio::test]
-    async fn validation_rejects_short_ttl() {
+    #[test]
+    fn validation_rejects_short_ttl() {
         let h = handle();
-        let err = h
-            .put_with_ttl("short", &"val", Duration::from_secs(10))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, KvError::Validation(_)));
-        assert!(format!("{}", err).contains("at least 60 seconds"));
+        futures::executor::block_on(async {
+            let err = h
+                .put_with_ttl("short", &"val", Duration::from_secs(10))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("at least 60 seconds"));
+        });
     }
 
-    #[tokio::test]
-    async fn list_keys_overlapping_prefixes() {
+    #[test]
+    fn list_keys_overlapping_prefixes() {
         let h = handle();
-        h.put_bytes("app:user:1", Bytes::from("a")).await.unwrap();
-        h.put_bytes("app:user:2", Bytes::from("b")).await.unwrap();
-        h.put_bytes("app:session:1", Bytes::from("c"))
-            .await
-            .unwrap();
-        h.put_bytes("other:1", Bytes::from("d")).await.unwrap();
+        futures::executor::block_on(async {
+            h.put_bytes("app:user:1", Bytes::from("a")).await.unwrap();
+            h.put_bytes("app:user:2", Bytes::from("b")).await.unwrap();
+            h.put_bytes("app:session:1", Bytes::from("c"))
+                .await
+                .unwrap();
+            h.put_bytes("other:1", Bytes::from("d")).await.unwrap();
 
-        let app_keys = h.list_keys("app:").await.unwrap();
-        assert_eq!(app_keys.len(), 3);
+            let app_keys = h.list_keys("app:").await.unwrap();
+            assert_eq!(app_keys.len(), 3);
 
-        let user_keys = h.list_keys("app:user:").await.unwrap();
-        assert_eq!(user_keys, vec!["app:user:1", "app:user:2"]);
+            let user_keys = h.list_keys("app:user:").await.unwrap();
+            assert_eq!(user_keys, vec!["app:user:1", "app:user:2"]);
 
-        let session_keys = h.list_keys("app:session:").await.unwrap();
-        assert_eq!(session_keys, vec!["app:session:1"]);
+            let session_keys = h.list_keys("app:session:").await.unwrap();
+            assert_eq!(session_keys, vec!["app:session:1"]);
+        });
     }
 
-    #[tokio::test]
-    async fn exists_returns_false_after_delete() {
+    #[test]
+    fn exists_returns_false_after_delete() {
         let h = handle();
-        h.put_bytes("ephemeral", Bytes::from("v")).await.unwrap();
-        assert!(h.exists("ephemeral").await.unwrap());
-        h.delete("ephemeral").await.unwrap();
-        assert!(!h.exists("ephemeral").await.unwrap());
+        futures::executor::block_on(async {
+            h.put_bytes("ephemeral", Bytes::from("v")).await.unwrap();
+            assert!(h.exists("ephemeral").await.unwrap());
+            h.delete("ephemeral").await.unwrap();
+            assert!(!h.exists("ephemeral").await.unwrap());
+        });
     }
 
-    #[tokio::test]
-    async fn put_overwrite_changes_type() {
+    #[test]
+    fn put_overwrite_changes_type() {
         let h = handle();
-        h.put("flex", &42i32).await.unwrap();
-        let val: i32 = h.get_or("flex", 0).await.unwrap();
-        assert_eq!(val, 42);
+        futures::executor::block_on(async {
+            h.put("flex", &42i32).await.unwrap();
+            let val: i32 = h.get_or("flex", 0).await.unwrap();
+            assert_eq!(val, 42);
 
-        // Overwrite with a different type
-        h.put("flex", &"now a string").await.unwrap();
-        let val: String = h.get_or("flex", String::new()).await.unwrap();
-        assert_eq!(val, "now a string");
+            // Overwrite with a different type
+            h.put("flex", &"now a string").await.unwrap();
+            let val: String = h.get_or("flex", String::new()).await.unwrap();
+            assert_eq!(val, "now a string");
+        });
     }
 
     // Run the shared contract tests against MockStore.
-    crate::kv_contract_tests!(mock_store_contract, MockStore::new());
+    crate::key_value_store_contract_tests!(mock_store_contract, MockStore::new());
 }

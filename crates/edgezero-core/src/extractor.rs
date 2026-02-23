@@ -415,7 +415,7 @@ impl<T> ValidatedForm<T> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Kv(pub crate::kv::KvHandle);
+pub struct Kv(pub crate::key_value_store::KvHandle);
 
 #[async_trait(?Send)]
 impl FromRequest for Kv {
@@ -427,7 +427,7 @@ impl FromRequest for Kv {
 }
 
 impl std::ops::Deref for Kv {
-    type Target = crate::kv::KvHandle;
+    type Target = crate::key_value_store::KvHandle;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -435,8 +435,7 @@ impl std::ops::Deref for Kv {
 }
 
 impl Kv {
-    #[must_use]
-    pub fn into_inner(self) -> crate::kv::KvHandle {
+    pub fn into_inner(self) -> crate::key_value_store::KvHandle {
         self.0
     }
 }
@@ -954,41 +953,8 @@ mod tests {
 
     #[test]
     fn kv_extractor_returns_handle_when_configured() {
-        use crate::kv::{KvHandle, KvStore};
+        use crate::key_value_store::{KvHandle, NoopKvStore};
         use std::sync::Arc;
-
-        struct NoopStore;
-
-        #[async_trait(?Send)]
-        impl KvStore for NoopStore {
-            async fn get_bytes(
-                &self,
-                _key: &str,
-            ) -> Result<Option<bytes::Bytes>, crate::kv::KvError> {
-                Ok(None)
-            }
-            async fn put_bytes(
-                &self,
-                _key: &str,
-                _value: bytes::Bytes,
-            ) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn put_bytes_with_ttl(
-                &self,
-                _key: &str,
-                _value: bytes::Bytes,
-                _ttl: std::time::Duration,
-            ) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn delete(&self, _key: &str) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn list_keys(&self, _prefix: &str) -> Result<Vec<String>, crate::kv::KvError> {
-                Ok(vec![])
-            }
-        }
 
         let mut request = request_builder()
             .method(Method::GET)
@@ -997,7 +963,7 @@ mod tests {
             .expect("request");
         request
             .extensions_mut()
-            .insert(KvHandle::new(Arc::new(NoopStore)));
+            .insert(KvHandle::new(Arc::new(NoopKvStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
         let kv = block_on(Kv::from_request(&ctx));
@@ -1019,43 +985,10 @@ mod tests {
 
     #[test]
     fn kv_deref_and_into_inner() {
-        use crate::kv::{KvHandle, KvStore};
+        use crate::key_value_store::{KvHandle, NoopKvStore};
         use std::sync::Arc;
 
-        struct NoopStore;
-
-        #[async_trait(?Send)]
-        impl KvStore for NoopStore {
-            async fn get_bytes(
-                &self,
-                _key: &str,
-            ) -> Result<Option<bytes::Bytes>, crate::kv::KvError> {
-                Ok(None)
-            }
-            async fn put_bytes(
-                &self,
-                _key: &str,
-                _value: bytes::Bytes,
-            ) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn put_bytes_with_ttl(
-                &self,
-                _key: &str,
-                _value: bytes::Bytes,
-                _ttl: std::time::Duration,
-            ) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn delete(&self, _key: &str) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn list_keys(&self, _prefix: &str) -> Result<Vec<String>, crate::kv::KvError> {
-                Ok(vec![])
-            }
-        }
-
-        let handle = KvHandle::new(Arc::new(NoopStore));
+        let handle = KvHandle::new(Arc::new(NoopKvStore));
         let kv = Kv(handle);
 
         // Debug works

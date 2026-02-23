@@ -1,6 +1,6 @@
 //! Fastly KV Store adapter.
 //!
-//! Wraps `fastly::kv_store::KVStore` to implement the `edgezero_core::kv::KvStore` trait.
+//! Wraps `fastly::kv_store::KVStore` to implement the `edgezero_core::key_value_store::KvStore` trait.
 //!
 //! # Note
 //!
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 #[cfg(feature = "fastly")]
 use bytes::Bytes;
 #[cfg(feature = "fastly")]
-use edgezero_core::kv::{KvError, KvStore};
+use edgezero_core::key_value_store::{KvError, KvStore};
 #[cfg(feature = "fastly")]
 use std::time::Duration;
 

@@ -5,7 +5,7 @@ use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Method as CoreMethod, Request, Uri};
-use edgezero_core::kv::KvHandle;
+use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
@@ -15,7 +15,7 @@ use worker::{
 ///
 /// If a KV namespace with this binding exists in your `wrangler.toml`,
 /// it will be automatically available to handlers via the `Kv` extractor.
-pub const DEFAULT_KV_BINDING: &str = "EDGEZERO_KV";
+pub const DEFAULT_KV_BINDING: &str = edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 
 pub async fn into_core_request(
     mut req: CfRequest,
@@ -69,9 +69,13 @@ pub async fn dispatch_with_kv(
 ) -> Result<CfResponse, WorkerError> {
     // Try to open the KV binding from `env` before consuming it in `into_core_request`.
     // We borrow `env` here; `into_core_request` takes ownership afterwards.
-    let kv_handle = crate::kv::CloudflareKvStore::from_env(&env, kv_binding)
-        .ok()
-        .map(|store| KvHandle::new(std::sync::Arc::new(store)));
+    let kv_handle = match crate::key_value_store::CloudflareKvStore::from_env(&env, kv_binding) {
+        Ok(store) => Some(KvHandle::new(std::sync::Arc::new(store))),
+        Err(e) => {
+            log::warn!("KV binding '{}' not available: {}", kv_binding, e);
+            None
+        }
+    };
 
     let mut core_request = into_core_request(req, env, ctx)
         .await

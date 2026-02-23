@@ -9,7 +9,7 @@ use http::StatusCode;
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
-use edgezero_core::kv::KvHandle;
+use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::router::RouterService;
 
 use crate::request::into_core_request;
@@ -106,7 +106,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_kv_handle_injects_into_request() {
-        use crate::kv::PersistentKvStore;
+        use crate::key_value_store::PersistentKvStore;
         use std::sync::Arc;
 
         // Pre-seed the store with a value so the handler can verify injection

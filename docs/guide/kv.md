@@ -105,17 +105,25 @@ Both Fastly and Cloudflare KV stores are **eventually consistent**.
 
 - A value written at one edge location may not be immediately visible at another.
 - `update()` is **not atomic**. Concurrent updates to the same key may result in lost writes.
-- **TTL**: When using `put_with_ttl`, Cloudflare enforces a **minimum TTL of 60 seconds**.
+- **TTL**: `put_with_ttl` enforces a minimum of **60 seconds** and a maximum of **1 year** across all adapters.
 
 ## Limits & Validation
 
-To ensure portability across all providers, `KvHandle` enforces the strictest common limits:
+To ensure portability across all providers, `KvHandle` enforces the
+strictest common limits:
 
-- **Key Size**: Max **512 bytes** (Cloudflare limit).
-- **Value Size**: Max **25 MB**.
-- **Constraints**: Keys cannot be `.` or `..` and cannot contain control characters.
+| Rule          | Limit                                |
+| ------------- | ------------------------------------ |
+| Key size      | Max **512 bytes** (Cloudflare limit) |
+| Value size    | Max **25 MB**                        |
+| TTL minimum   | **60 seconds**                       |
+| TTL maximum   | **1 year**                           |
+| Empty keys    | Rejected                             |
+| Reserved keys | `.` and `..` rejected                |
+| Control chars | Rejected in keys                     |
 
-Attempting to violate these limits will return a `KvError::Validation`, which maps to `400 Bad Request`.
+Violating any of these returns a `KvError::Validation`, which maps to
+`400 Bad Request`.
 
 ## Next Steps
 

@@ -390,8 +390,8 @@ impl ManifestLoggingConfig {
     }
 }
 
-/// Default KV store name used when `[stores.kv]` is omitted.
-const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
+/// Default KV store / binding name used when `[stores.kv]` is omitted.
+pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
 
 fn default_kv_name() -> String {
     DEFAULT_KV_STORE_NAME.to_string()

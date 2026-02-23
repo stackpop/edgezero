@@ -103,9 +103,11 @@ async fn serve_with_listener_and_kv_path(
         std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
     }
     let kv_store = std::sync::Arc::new(
-        crate::kv::PersistentKvStore::new(kv_path).context("failed to create KV store")?,
+        crate::key_value_store::PersistentKvStore::new(kv_path)
+            .context("failed to create KV store")?,
     );
-    let kv_handle = edgezero_core::kv::KvHandle::new(kv_store);
+    log::info!("KV store: {}", kv_path);
+    let kv_handle = edgezero_core::key_value_store::KvHandle::new(kv_store);
 
     let service = EdgeZeroAxumService::new(router).with_kv_handle(kv_handle);
     let router = Router::new().fallback_service(service_fn(move |req| {

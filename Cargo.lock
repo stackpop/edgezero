@@ -708,6 +708,7 @@ dependencies = [
  "futures",
  "futures-util",
  "log",
+ "serde_json",
  "walkdir",
  "wasm-bindgen-test",
  "web-sys",
@@ -734,6 +735,7 @@ dependencies = [
  "futures-util",
  "log",
  "log-fastly",
+ "serde_json",
  "tempfile",
  "walkdir",
 ]
@@ -781,7 +783,6 @@ dependencies = [
  "serde_urlencoded",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
  "toml",
  "tower-service",
  "tracing",

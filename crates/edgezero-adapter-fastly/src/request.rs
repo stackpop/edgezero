@@ -4,12 +4,12 @@ use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request};
-use edgezero_core::kv::KvHandle;
+use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 
-use crate::kv::FastlyKvStore;
+use crate::key_value_store::FastlyKvStore;
 use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
 use crate::FastlyRequestContext;
@@ -18,7 +18,7 @@ use crate::FastlyRequestContext;
 ///
 /// If a KV Store with this name exists in your Fastly service, it will
 /// be automatically available to handlers via the `Kv` extractor.
-pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
+pub const DEFAULT_KV_STORE_NAME: &str = edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 
 pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
     let method = req.get_method().clone();
@@ -61,9 +61,14 @@ pub fn dispatch_with_kv(
     let mut core_request = into_core_request(req).map_err(map_edge_error)?;
 
     // Inject KV handle if the store exists — graceful fallback.
-    if let Ok(store) = FastlyKvStore::open(kv_store_name) {
-        let handle = KvHandle::new(std::sync::Arc::new(store));
-        core_request.extensions_mut().insert(handle);
+    match FastlyKvStore::open(kv_store_name) {
+        Ok(store) => {
+            let handle = KvHandle::new(std::sync::Arc::new(store));
+            core_request.extensions_mut().insert(handle);
+        }
+        Err(e) => {
+            log::warn!("KV store '{}' not available: {}", kv_store_name, e);
+        }
     }
 
     let response = executor::block_on(app.router().oneshot(core_request));

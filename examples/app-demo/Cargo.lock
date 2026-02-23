@@ -540,6 +540,7 @@ dependencies = [
  "futures",
  "futures-util",
  "log",
+ "serde_json",
  "wasm-bindgen-test",
  "worker",
 ]
@@ -562,6 +563,7 @@ dependencies = [
  "futures-util",
  "log",
  "log-fastly",
+ "serde_json",
 ]
 
 [[package]]

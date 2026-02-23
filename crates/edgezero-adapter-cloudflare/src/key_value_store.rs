@@ -1,6 +1,6 @@
 //! Cloudflare Workers KV adapter.
 //!
-//! Wraps `worker::kv::KvStore` to implement the `edgezero_core::kv::KvStore` trait.
+//! Wraps `worker::kv::KvStore` to implement the `edgezero_core::key_value_store::KvStore` trait.
 //!
 //! # Note
 //!
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use bytes::Bytes;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::kv::{KvError, KvStore};
+use edgezero_core::key_value_store::{KvError, KvStore};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use std::time::Duration;
 
@@ -66,8 +66,7 @@ impl KvStore for CloudflareKvStore {
         value: Bytes,
         ttl: Duration,
     ) -> Result<(), KvError> {
-        // Cloudflare KV requires a minimum TTL of 60 seconds.
-        let ttl_secs = ttl.as_secs().max(60);
+        let ttl_secs = ttl.as_secs();
 
         self.store
             .put_bytes(key, value.as_ref())

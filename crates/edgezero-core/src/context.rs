@@ -1,7 +1,7 @@
 use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::Request;
-use crate::kv::KvHandle;
+use crate::key_value_store::KvHandle;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
 use serde::de::DeserializeOwned;
@@ -329,34 +329,8 @@ mod tests {
 
     #[test]
     fn kv_handle_is_retrieved_when_present() {
-        use crate::kv::{KvHandle, KvStore};
+        use crate::key_value_store::{KvHandle, NoopKvStore};
         use std::sync::Arc;
-
-        // Minimal stub — only needs to exist, not store real data.
-        struct Stub;
-        #[async_trait(?Send)]
-        impl KvStore for Stub {
-            async fn get_bytes(&self, _: &str) -> Result<Option<Bytes>, crate::kv::KvError> {
-                Ok(None)
-            }
-            async fn put_bytes(&self, _: &str, _: Bytes) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn put_bytes_with_ttl(
-                &self,
-                _: &str,
-                _: Bytes,
-                _: std::time::Duration,
-            ) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn delete(&self, _: &str) -> Result<(), crate::kv::KvError> {
-                Ok(())
-            }
-            async fn list_keys(&self, _: &str) -> Result<Vec<String>, crate::kv::KvError> {
-                Ok(vec![])
-            }
-        }
 
         let mut request = request_builder()
             .method(Method::GET)
@@ -365,7 +339,7 @@ mod tests {
             .expect("request");
         request
             .extensions_mut()
-            .insert(KvHandle::new(Arc::new(Stub)));
+            .insert(KvHandle::new(Arc::new(NoopKvStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
         assert!(ctx.kv_handle().is_some());

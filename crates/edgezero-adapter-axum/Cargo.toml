@@ -7,7 +7,16 @@ license = { workspace = true }
 
 [features]
 default = ["axum"]
-axum = ["dep:axum", "dep:tokio", "dep:tower", "dep:futures-util", "dep:reqwest"]
+axum = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:tower",
+    "dep:futures-util",
+    "dep:reqwest",
+    "dep:redb",
+    "dep:serde_json",
+    "dep:web-time",
+]
 cli = [
     "dep:edgezero-adapter",
     "edgezero-adapter/cli",
@@ -30,17 +39,17 @@ futures = { workspace = true }
 futures-util = { workspace = true, optional = true }
 http = { workspace = true }
 log = { workspace = true }
-redb = { workspace = true }
+redb = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 simple_logger = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, optional = true }
 tracing = { workspace = true }
 walkdir = { workspace = true, optional = true }
-web-time = { workspace = true }
+web-time = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

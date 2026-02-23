@@ -5,7 +5,7 @@
 pub mod cli;
 mod context;
 #[cfg(feature = "fastly")]
-pub mod kv;
+pub mod key_value_store;
 #[cfg(feature = "fastly")]
 mod logger;
 #[cfg(feature = "fastly")]

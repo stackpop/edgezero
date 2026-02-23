@@ -6,7 +6,7 @@ pub mod cli;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub mod kv;
+pub mod key_value_store;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod proxy;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]

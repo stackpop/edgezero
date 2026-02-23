@@ -51,13 +51,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use edgezero_core::kv::{KvError, KvStore};
+use edgezero_core::key_value_store::{KvError, KvStore};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
-use web_time::SystemTime;
+use std::time::SystemTime;
 
 /// Table definition for the KV store.
 /// Key: String, Value: (Bytes, Option<expiration_timestamp_millis>)
 const KV_TABLE: TableDefinition<&str, (&[u8], Option<u128>)> = TableDefinition::new("kv");
+
+/// Type alias for a writable KV table handle.
+type KvTable<'txn> = redb::Table<'txn, &'static str, (&'static [u8], Option<u128>)>;
 
 /// A persistent KV store backed by `redb`.
 ///
@@ -87,19 +90,14 @@ impl PersistentKvStore {
         })?;
 
         // Initialize the table
-        let write_txn = db
-            .begin_write()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
+        let store = Self { db };
+        let write_txn = store.begin_write()?;
         {
-            let _table = write_txn
-                .open_table(KV_TABLE)
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+            let _table = Self::open_table(&write_txn)?;
         }
-        write_txn
-            .commit()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit txn: {}", e)))?;
+        Self::commit(write_txn)?;
 
-        Ok(Self { db })
+        Ok(store)
     }
 
     /// Check if an entry is expired based on its expiration timestamp.
@@ -129,6 +127,24 @@ impl PersistentKvStore {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     }
+
+    // -- Transaction helpers ------------------------------------------------
+
+    fn begin_write(&self) -> Result<redb::WriteTransaction, KvError> {
+        self.db
+            .begin_write()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))
+    }
+
+    fn open_table<'txn>(txn: &'txn redb::WriteTransaction) -> Result<KvTable<'txn>, KvError> {
+        txn.open_table(KV_TABLE)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))
+    }
+
+    fn commit(txn: redb::WriteTransaction) -> Result<(), KvError> {
+        txn.commit()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))
+    }
 }
 
 #[async_trait(?Send)]
@@ -156,20 +172,28 @@ impl KvStore for PersistentKvStore {
                 drop(read_txn);
 
                 // Delete the expired key
-                let write_txn = self.db.begin_write().map_err(|e| {
-                    KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e))
-                })?;
+                let write_txn = self.begin_write()?;
                 {
-                    let mut table = write_txn.open_table(KV_TABLE).map_err(|e| {
-                        KvError::Internal(anyhow::anyhow!("failed to open table: {}", e))
-                    })?;
-                    table.remove(key).map_err(|e| {
-                        KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
-                    })?;
+                    let mut table = Self::open_table(&write_txn)?;
+                    // Re-check expiry inside write txn to avoid TOCTOU race:
+                    // a concurrent put_bytes may have overwritten the key with
+                    // a fresh value between our read and this write.
+                    let still_expired = table
+                        .get(key)
+                        .map_err(|e| {
+                            KvError::Internal(anyhow::anyhow!("failed to get key: {}", e))
+                        })?
+                        .is_some_and(|entry| {
+                            let (_, exp) = entry.value();
+                            Self::is_expired(exp)
+                        });
+                    if still_expired {
+                        table.remove(key).map_err(|e| {
+                            KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
+                        })?;
+                    }
                 }
-                write_txn
-                    .commit()
-                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
+                Self::commit(write_txn)?;
 
                 return Ok(None);
             }
@@ -181,26 +205,14 @@ impl KvStore for PersistentKvStore {
     }
 
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
-
+        let write_txn = self.begin_write()?;
         {
-            let mut table = write_txn
-                .open_table(KV_TABLE)
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
-
+            let mut table = Self::open_table(&write_txn)?;
             table
                 .insert(key, (value.as_ref(), None))
                 .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {}", e)))?;
         }
-
-        write_txn
-            .commit()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
-
-        Ok(())
+        Self::commit(write_txn)
     }
 
     async fn put_bytes_with_ttl(
@@ -212,49 +224,25 @@ impl KvStore for PersistentKvStore {
         let expires_at = SystemTime::now() + ttl;
         let expires_at_millis = Self::system_time_to_millis(expires_at);
 
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
-
+        let write_txn = self.begin_write()?;
         {
-            let mut table = write_txn
-                .open_table(KV_TABLE)
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
-
+            let mut table = Self::open_table(&write_txn)?;
             table
                 .insert(key, (value.as_ref(), Some(expires_at_millis)))
                 .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {}", e)))?;
         }
-
-        write_txn
-            .commit()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
-
-        Ok(())
+        Self::commit(write_txn)
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))?;
-
+        let write_txn = self.begin_write()?;
         {
-            let mut table = write_txn
-                .open_table(KV_TABLE)
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
-
+            let mut table = Self::open_table(&write_txn)?;
             table
                 .remove(key)
                 .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {}", e)))?;
         }
-
-        write_txn
-            .commit()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
-
-        Ok(())
+        Self::commit(write_txn)
     }
 
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
@@ -294,22 +282,29 @@ impl KvStore for PersistentKvStore {
 
         // Remove expired keys
         if !expired_keys.is_empty() {
-            let write_txn = self.db.begin_write().map_err(|e| {
-                KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e))
-            })?;
+            let write_txn = self.begin_write()?;
             {
-                let mut table = write_txn.open_table(KV_TABLE).map_err(|e| {
-                    KvError::Internal(anyhow::anyhow!("failed to open table: {}", e))
-                })?;
+                let mut table = Self::open_table(&write_txn)?;
                 for key in &expired_keys {
-                    table.remove(key.as_str()).map_err(|e| {
-                        KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
-                    })?;
+                    // Re-check expiry inside write txn to avoid TOCTOU race:
+                    // a concurrent put_bytes may have overwritten the key.
+                    let still_expired = table
+                        .get(key.as_str())
+                        .map_err(|e| {
+                            KvError::Internal(anyhow::anyhow!("failed to get key: {}", e))
+                        })?
+                        .is_some_and(|entry| {
+                            let (_, exp) = entry.value();
+                            Self::is_expired(exp)
+                        });
+                    if still_expired {
+                        table.remove(key.as_str()).map_err(|e| {
+                            KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
+                        })?;
+                    }
                 }
             }
-            write_txn
-                .commit()
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))?;
+            Self::commit(write_txn)?;
         }
 
         // Sort keys to maintain consistency with BTreeMap behavior
@@ -321,7 +316,7 @@ impl KvStore for PersistentKvStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgezero_core::kv::KvHandle;
+    use edgezero_core::key_value_store::KvHandle;
     use std::sync::Arc;
 
     fn store() -> KvHandle {
@@ -520,7 +515,7 @@ mod tests {
     }
 
     // Run the shared contract tests against PersistentKvStore.
-    edgezero_core::kv_contract_tests!(persistent_kv_contract, {
+    edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
         PersistentKvStore::new(db_path).unwrap()
