@@ -569,11 +569,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use std::time::Instant;
+    use std::time::SystemTime;
 
     // In-memory store with TTL support for contract testing.
+    // Uses `SystemTime` instead of `Instant` for WASM compatibility.
     struct MockStore {
-        data: Mutex<HashMap<String, (Bytes, Option<Instant>)>>,
+        data: Mutex<HashMap<String, (Bytes, Option<SystemTime>)>>,
     }
 
     impl MockStore {
@@ -589,7 +590,7 @@ mod tests {
         async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
             let mut data = self.data.lock().unwrap();
             if let Some((_, Some(exp))) = data.get(key) {
-                if Instant::now() >= *exp {
+                if SystemTime::now() >= *exp {
                     data.remove(key);
                     return Ok(None);
                 }
@@ -610,7 +611,7 @@ mod tests {
             ttl: Duration,
         ) -> Result<(), KvError> {
             let mut data = self.data.lock().unwrap();
-            data.insert(key.to_string(), (value, Some(Instant::now() + ttl)));
+            data.insert(key.to_string(), (value, Some(SystemTime::now() + ttl)));
             Ok(())
         }
 
@@ -622,7 +623,7 @@ mod tests {
 
         async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
             let mut data = self.data.lock().unwrap();
-            let now = Instant::now();
+            let now = SystemTime::now();
             // Remove expired keys first
             data.retain(|_, (_, exp)| exp.is_none_or(|e| now < e));
             let mut keys: Vec<String> = data
