@@ -95,7 +95,14 @@ fn edge_error_to_worker(err: EdgeError) -> WorkerError {
 }
 
 fn into_core_method(method: Method) -> CoreMethod {
-    CoreMethod::from_bytes(method.as_ref().as_bytes()).unwrap_or(CoreMethod::GET)
+    let bytes = method.as_ref().as_bytes();
+    CoreMethod::from_bytes(bytes).unwrap_or_else(|_| {
+        log::warn!(
+            "unknown HTTP method {:?}, defaulting to GET",
+            method.as_ref()
+        );
+        CoreMethod::GET
+    })
 }
 
 #[cfg(test)]

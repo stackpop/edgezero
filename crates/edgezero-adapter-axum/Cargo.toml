@@ -15,7 +15,6 @@ axum = [
     "dep:reqwest",
     "dep:redb",
     "dep:serde_json",
-    "dep:web-time",
 ]
 cli = [
     "dep:edgezero-adapter",
@@ -49,7 +48,6 @@ tower = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tracing = { workspace = true }
 walkdir = { workspace = true, optional = true }
-web-time = { workspace = true, optional = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

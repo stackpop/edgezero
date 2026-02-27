@@ -44,7 +44,7 @@ mod tests {
     use futures_util::{stream, StreamExt};
 
     #[test]
-    #[ignore]
+    #[ignore] // Requires worker runtime — cannot construct worker::Response in unit tests
     fn propagates_status_and_headers() {
         let response = response_builder()
             .status(201)

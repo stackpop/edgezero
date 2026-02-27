@@ -130,6 +130,10 @@ pub trait KvStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<(), KvError>;
 
     /// List keys that start with `prefix`. Returns an empty vec if none match.
+    ///
+    /// **Note:** Results are returned in a single `Vec` with no pagination.
+    /// This is suitable for namespaces with up to ~10 000 keys. For larger
+    /// datasets, consider narrowing the prefix or adding pagination upstream.
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError>;
 
     /// Check whether a key exists.
@@ -420,8 +424,11 @@ impl KvHandle {
 ///
 /// ```rust,ignore
 /// edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
-///     let temp_dir = tempfile::tempdir().unwrap();
-///     let db_path = temp_dir.path().join("test.redb");
+///     let db_path = std::env::temp_dir().join(format!(
+///         "edgezero-contract-{}-{:?}.redb",
+///         std::process::id(),
+///         std::thread::current().id()
+///     ));
 ///     PersistentKvStore::new(db_path).unwrap()
 /// });
 /// ```

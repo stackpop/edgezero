@@ -524,7 +524,6 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
- "web-time",
 ]
 
 [[package]]
