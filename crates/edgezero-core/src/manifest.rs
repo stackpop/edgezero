@@ -411,6 +411,7 @@ pub struct ManifestStores {
     /// KV store configuration. When absent, the default
     /// name `EDGEZERO_KV` is used.
     #[serde(default)]
+    #[validate(nested)]
     pub kv: Option<ManifestKvConfig>,
 }
 
@@ -424,6 +425,7 @@ pub struct ManifestKvConfig {
 
     /// Per-adapter name overrides.
     #[serde(default)]
+    #[validate(nested)]
     pub adapters: BTreeMap<String, ManifestKvAdapterConfig>,
 }
 

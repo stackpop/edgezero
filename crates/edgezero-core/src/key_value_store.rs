@@ -89,7 +89,7 @@ impl From<KvError> for EdgeError {
             KvError::Unavailable => EdgeError::internal(anyhow::anyhow!("kv store unavailable")),
             KvError::Validation(e) => EdgeError::bad_request(format!("kv validation error: {e}")),
             KvError::Serialization(e) => {
-                EdgeError::bad_request(format!("kv serialization error: {e}"))
+                EdgeError::internal(anyhow::anyhow!("kv serialization error: {e}"))
             }
             KvError::Internal(e) => EdgeError::internal(e),
         }
@@ -190,10 +190,10 @@ impl KvStore for NoopKvStore {
 ///
 /// ```ignore
 /// #[action]
-/// async fn handler(Kv(store): Kv) -> Result<Response, EdgeError> {
+/// async fn handler(Kv(store): Kv) -> Result<String, EdgeError> {
 ///     let count: i32 = store.get_or("visits", 0).await?;
 ///     store.put("visits", &(count + 1)).await?;
-///     Ok(Response::ok(format!("visits: {}", count + 1)))
+///     Ok(format!("visits: {}", count + 1))
 /// }
 /// ```
 #[derive(Clone)]
@@ -957,11 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn kv_error_serialization_converts_to_bad_request() {
+    fn kv_error_serialization_converts_to_internal() {
         let json_err: serde_json::Error = serde_json::from_str::<i32>("not json").unwrap_err();
         let kv_err = KvError::Serialization(json_err);
         let edge_err: EdgeError = kv_err.into();
-        assert_eq!(edge_err.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(edge_err.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
         assert!(edge_err.message().contains("serialization"));
     }
 

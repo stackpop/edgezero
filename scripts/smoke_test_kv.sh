@@ -73,6 +73,7 @@ echo "==> Waiting for server at $BASE ..."
 MAX_WAIT=60
 WAITED=0
 until curl -s -o /dev/null "$BASE/" 2>/dev/null; do
+  kill -0 "$SERVER_PID" 2>/dev/null || { echo "Server process exited early" >&2; exit 1; }
   sleep 1
   WAITED=$((WAITED + 1))
   if [ "$WAITED" -ge "$MAX_WAIT" ]; then

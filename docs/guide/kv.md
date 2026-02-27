@@ -10,7 +10,6 @@ This example implements a simple visit counter. It retrieves the current count, 
 use edgezero_core::action;
 use edgezero_core::error::EdgeError;
 use edgezero_core::extractor::Kv;
-use edgezero_core::http::Response;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Default)]
@@ -19,7 +18,7 @@ struct VisitData {
 }
 
 #[action]
-async fn visit_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
+async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
     // Read-modify-write helper (Note: not atomic!)
     let data = store
         .update("visits", VisitData::default(), |mut d| {
@@ -28,7 +27,7 @@ async fn visit_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
         })
         .await?;
 
-    Ok(Response::ok(format!("Visit #{}", data.count)))
+    Ok(format!("Visit #{}", data.count))
 }
 ```
 

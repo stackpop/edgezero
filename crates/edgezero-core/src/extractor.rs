@@ -408,10 +408,10 @@ impl<T> ValidatedForm<T> {
 /// # Example
 /// ```ignore
 /// #[action]
-/// pub async fn handler(Kv(store): Kv) -> Result<Response, EdgeError> {
+/// pub async fn handler(Kv(store): Kv) -> Result<String, EdgeError> {
 ///     let count: i32 = store.get_or("visits", 0).await?;
 ///     store.put("visits", &(count + 1)).await?;
-///     Ok(Response::ok(format!("visits: {}", count + 1)))
+///     Ok(format!("visits: {}", count + 1))
 /// }
 /// ```
 #[derive(Debug)]
@@ -431,6 +431,12 @@ impl std::ops::Deref for Kv {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl std::ops::DerefMut for Kv {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 

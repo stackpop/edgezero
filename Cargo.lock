@@ -708,7 +708,6 @@ dependencies = [
  "futures",
  "futures-util",
  "log",
- "serde_json",
  "walkdir",
  "wasm-bindgen-test",
  "web-sys",

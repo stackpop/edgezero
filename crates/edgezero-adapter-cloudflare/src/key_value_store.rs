@@ -110,6 +110,9 @@ impl KvStore for CloudflareKvStore {
                 break;
             }
             cursor = response.cursor;
+            if cursor.is_none() {
+                break;
+            }
         }
 
         Ok(all_keys)

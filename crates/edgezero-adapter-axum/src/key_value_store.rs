@@ -319,31 +319,31 @@ mod tests {
     use edgezero_core::key_value_store::KvHandle;
     use std::sync::Arc;
 
-    fn store() -> KvHandle {
+    fn store() -> (KvHandle, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
         let store = PersistentKvStore::new(db_path).unwrap();
-        KvHandle::new(Arc::new(store))
+        (KvHandle::new(Arc::new(store)), temp_dir)
     }
 
     // -- Raw bytes -----------------------------------------------------------
 
     #[tokio::test]
     async fn put_and_get_bytes() {
-        let s = store();
+        let (s, _dir) = store();
         s.put_bytes("k", Bytes::from("hello")).await.unwrap();
         assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
     }
 
     #[tokio::test]
     async fn get_missing_key_returns_none() {
-        let s = store();
+        let (s, _dir) = store();
         assert_eq!(s.get_bytes("missing").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn put_overwrites_existing() {
-        let s = store();
+        let (s, _dir) = store();
         s.put_bytes("k", Bytes::from("first")).await.unwrap();
         s.put_bytes("k", Bytes::from("second")).await.unwrap();
         assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("second")));
@@ -351,7 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_removes_key() {
-        let s = store();
+        let (s, _dir) = store();
         s.put_bytes("k", Bytes::from("v")).await.unwrap();
         s.delete("k").await.unwrap();
         assert_eq!(s.get_bytes("k").await.unwrap(), None);
@@ -359,13 +359,13 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_is_ok() {
-        let s = store();
+        let (s, _dir) = store();
         s.delete("nope").await.unwrap();
     }
 
     #[tokio::test]
     async fn list_keys_filters_by_prefix() {
-        let s = store();
+        let (s, _dir) = store();
         s.put_bytes("a", Bytes::from("1")).await.unwrap();
         s.put_bytes("b", Bytes::from("2")).await.unwrap();
         let keys = s.list_keys("").await.unwrap();
@@ -388,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn ttl_not_expired_returns_value() {
-        let s = store();
+        let (s, _dir) = store();
         s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_secs(60))
             .await
             .unwrap();
@@ -421,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_roundtrip() {
-        let s = store();
+        let (s, _dir) = store();
         let cfg = Config {
             name: "test".into(),
             enabled: true,
@@ -433,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_helper() {
-        let s = store();
+        let (s, _dir) = store();
         s.put("counter", &0i32).await.unwrap();
         let val = s.update("counter", 0i32, |n| n + 5).await.unwrap();
         assert_eq!(val, 5);
@@ -441,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn exists_helper() {
-        let s = store();
+        let (s, _dir) = store();
         assert!(!s.exists("nope").await.unwrap());
         s.put_bytes("k", Bytes::from("v")).await.unwrap();
         assert!(s.exists("k").await.unwrap());
@@ -449,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_store_is_empty() {
-        let s = store();
+        let (s, _dir) = store();
         let keys = s.list_keys("").await.unwrap();
         assert!(keys.is_empty());
         assert!(!s.exists("anything").await.unwrap());
@@ -481,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_then_list_keys_is_consistent() {
-        let s = store();
+        let (s, _dir) = store();
         s.put_bytes("a", Bytes::from("1")).await.unwrap();
         s.put_bytes("b", Bytes::from("2")).await.unwrap();
         s.put_bytes("c", Bytes::from("3")).await.unwrap();
@@ -515,9 +515,15 @@ mod tests {
     }
 
     // Run the shared contract tests against PersistentKvStore.
+    // Use a unique path per test to avoid TempDir lifetime issues (the
+    // tempdir handle would drop before the store, which is fragile on
+    // non-Unix platforms).
     edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.redb");
+        let db_path = std::env::temp_dir().join(format!(
+            "edgezero-contract-{}-{:?}.redb",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         PersistentKvStore::new(db_path).unwrap()
     });
 }

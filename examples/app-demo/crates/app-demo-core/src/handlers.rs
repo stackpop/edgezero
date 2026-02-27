@@ -169,7 +169,11 @@ async fn collect_body(body: Body) -> Result<Bytes, EdgeError> {
         }
         Ok(Bytes::from(buf))
     } else {
-        Ok(body.into_bytes())
+        let bytes = body.into_bytes();
+        if bytes.len() > MAX_BODY_SIZE {
+            return Err(EdgeError::bad_request("request body too large"));
+        }
+        Ok(bytes)
     }
 }
 
