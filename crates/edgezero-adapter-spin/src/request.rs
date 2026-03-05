@@ -26,7 +26,7 @@ pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeErro
     let header_entries = headers.entries();
 
     let mut builder = request_builder()
-        .method(into_core_method(&method))
+        .method(into_core_method(&method)?)
         .uri(uri);
 
     for (name, value) in &header_entries {
@@ -74,29 +74,26 @@ fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<Strin
 
 /// Dispatch a Spin request through the EdgeZero router and return
 /// a Spin-compatible response.
-pub async fn dispatch(
-    app: &App,
-    req: IncomingRequest,
-) -> anyhow::Result<impl IntoResponse> {
+pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<impl IntoResponse> {
     let core_request = into_core_request(req).await?;
     let response = app.router().oneshot(core_request).await;
     Ok(from_core_response(response).await?)
 }
 
-fn into_core_method(method: &spin_sdk::http::Method) -> edgezero_core::http::Method {
+fn into_core_method(
+    method: &spin_sdk::http::Method,
+) -> Result<edgezero_core::http::Method, EdgeError> {
     match method {
-        spin_sdk::http::Method::Get => edgezero_core::http::Method::GET,
-        spin_sdk::http::Method::Post => edgezero_core::http::Method::POST,
-        spin_sdk::http::Method::Put => edgezero_core::http::Method::PUT,
-        spin_sdk::http::Method::Delete => edgezero_core::http::Method::DELETE,
-        spin_sdk::http::Method::Patch => edgezero_core::http::Method::PATCH,
-        spin_sdk::http::Method::Head => edgezero_core::http::Method::HEAD,
-        spin_sdk::http::Method::Options => edgezero_core::http::Method::OPTIONS,
-        spin_sdk::http::Method::Connect => edgezero_core::http::Method::CONNECT,
-        spin_sdk::http::Method::Trace => edgezero_core::http::Method::TRACE,
-        spin_sdk::http::Method::Other(s) => {
-            edgezero_core::http::Method::from_bytes(s.as_bytes())
-                .unwrap_or(edgezero_core::http::Method::GET)
-        }
+        spin_sdk::http::Method::Get => Ok(edgezero_core::http::Method::GET),
+        spin_sdk::http::Method::Post => Ok(edgezero_core::http::Method::POST),
+        spin_sdk::http::Method::Put => Ok(edgezero_core::http::Method::PUT),
+        spin_sdk::http::Method::Delete => Ok(edgezero_core::http::Method::DELETE),
+        spin_sdk::http::Method::Patch => Ok(edgezero_core::http::Method::PATCH),
+        spin_sdk::http::Method::Head => Ok(edgezero_core::http::Method::HEAD),
+        spin_sdk::http::Method::Options => Ok(edgezero_core::http::Method::OPTIONS),
+        spin_sdk::http::Method::Connect => Ok(edgezero_core::http::Method::CONNECT),
+        spin_sdk::http::Method::Trace => Ok(edgezero_core::http::Method::TRACE),
+        spin_sdk::http::Method::Other(s) => edgezero_core::http::Method::from_bytes(s.as_bytes())
+            .map_err(|_| EdgeError::bad_request(format!("unsupported HTTP method: {s}"))),
     }
 }

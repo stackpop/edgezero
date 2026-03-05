@@ -45,7 +45,7 @@ impl ProxyClient for SpinProxyClient {
 
         let spin_response: spin_sdk::http::Response = spin_sdk::http::send(spin_request)
             .await
-            .map_err(|e| EdgeError::internal(anyhow::anyhow!("Spin outbound HTTP error: {}", e)))?;
+            .map_err(|e| EdgeError::internal(format!("Spin outbound HTTP error: {e}")))?;
 
         let status = StatusCode::from_u16(*spin_response.status())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -68,9 +68,10 @@ impl ProxyClient for SpinProxyClient {
             proxy_response.headers_mut().insert(name, value);
         }
 
-        proxy_response
-            .headers_mut()
-            .insert("x-edgezero-proxy", "spin".parse().unwrap());
+        proxy_response.headers_mut().insert(
+            "x-edgezero-proxy",
+            "spin".parse().expect("static header value should parse"),
+        );
 
         Ok(proxy_response)
     }

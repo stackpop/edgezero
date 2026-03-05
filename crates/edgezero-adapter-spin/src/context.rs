@@ -24,3 +24,41 @@ impl SpinRequestContext {
         request.extensions().get::<SpinRequestContext>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use edgezero_core::body::Body;
+    use edgezero_core::http::request_builder;
+
+    #[test]
+    fn inserts_and_retrieves_context() {
+        let mut request = request_builder()
+            .uri("https://example.com")
+            .body(Body::empty())
+            .expect("request");
+
+        let context = SpinRequestContext {
+            client_addr: Some("127.0.0.1:12345".to_string()),
+            full_url: Some("https://example.com/path".to_string()),
+        };
+        SpinRequestContext::insert(&mut request, context);
+
+        let retrieved = SpinRequestContext::get(&request).expect("context");
+        assert_eq!(retrieved.client_addr.as_deref(), Some("127.0.0.1:12345"));
+        assert_eq!(
+            retrieved.full_url.as_deref(),
+            Some("https://example.com/path")
+        );
+    }
+
+    #[test]
+    fn get_returns_none_when_missing() {
+        let request = request_builder()
+            .uri("https://example.com")
+            .body(Body::empty())
+            .expect("request");
+
+        assert!(SpinRequestContext::get(&request).is_none());
+    }
+}
