@@ -9,23 +9,34 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
     let (parts, body) = response.into_parts();
     let mut fastly_response = FastlyResponse::from_status(parts.status.as_u16());
 
-    match body {
-        Body::Once(bytes) => fastly_response.set_body(bytes.to_vec()),
-        Body::Stream(mut stream) => {
-            let mut fastly_body = fastly::Body::new();
-            while let Some(chunk) = futures::executor::block_on(stream.next()) {
-                let chunk = chunk.map_err(EdgeError::internal)?;
-                fastly_body.write_all(&chunk).map_err(EdgeError::internal)?;
-            }
-            fastly_response.set_body(fastly_body);
-        }
-    }
-
     for (name, value) in parts.headers.iter() {
         fastly_response.set_header(name.as_str(), value.as_bytes());
     }
 
-    Ok(fastly_response)
+    match body {
+        Body::Once(bytes) => {
+            fastly_response.set_body(bytes.to_vec());
+            Ok(fastly_response)
+        }
+        Body::Stream(mut stream) => {
+            // Use stream_to_client() for true incremental delivery. This sends
+            // the response headers immediately and returns a StreamingBody we
+            // can write chunks to as they arrive.  After streaming, the Fastly
+            // runtime ignores the return value of the main function.
+            //
+            // NOTE: The returned FastlyResponse is an empty placeholder — the
+            // real response is already on the wire. Callers should not inspect
+            // the returned value for status/headers/body when the original
+            // response had a streaming body.
+            let mut streaming = fastly_response.stream_to_client();
+            while let Some(chunk) = futures::executor::block_on(stream.next()) {
+                let chunk = chunk.map_err(EdgeError::internal)?;
+                streaming.write_all(&chunk).map_err(EdgeError::internal)?;
+            }
+            streaming.finish().map_err(EdgeError::internal)?;
+            Ok(FastlyResponse::new())
+        }
+    }
 }
 
 pub fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {

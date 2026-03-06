@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::stream::{LocalBoxStream, Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -56,6 +56,24 @@ impl Body {
         match self {
             Body::Once(bytes) => bytes,
             Body::Stream(_) => panic!("streaming body cannot be converted into bytes"),
+        }
+    }
+
+    /// Asynchronously collect the entire body into a single `Bytes` buffer.
+    ///
+    /// For `Body::Once` this returns the bytes immediately. For `Body::Stream` this drains
+    /// every chunk into a contiguous buffer. Prefer this over `into_bytes()` when the body
+    /// may be streaming.
+    pub async fn collect(self) -> Result<Bytes, anyhow::Error> {
+        match self {
+            Body::Once(bytes) => Ok(bytes),
+            Body::Stream(mut stream) => {
+                let mut buf = BytesMut::new();
+                while let Some(chunk) = stream.next().await {
+                    buf.extend_from_slice(&chunk?);
+                }
+                Ok(buf.freeze())
+            }
         }
     }
 
@@ -245,5 +263,34 @@ mod tests {
     fn from_vec_u8_builds_buffered_body() {
         let body = Body::from(vec![1u8, 2u8, 3u8]);
         assert_eq!(body.as_bytes(), &[1u8, 2u8, 3u8]);
+    }
+
+    #[test]
+    fn collect_returns_bytes_for_buffered_body() {
+        let body = Body::from("hello");
+        let bytes = block_on(body.collect()).unwrap();
+        assert_eq!(bytes.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn collect_drains_streaming_body() {
+        let body = Body::stream(futures_util::stream::iter(vec![
+            Bytes::from_static(b"he"),
+            Bytes::from_static(b"llo"),
+        ]));
+        let bytes = block_on(body.collect()).unwrap();
+        assert_eq!(bytes.as_ref(), b"hello");
+    }
+
+    #[test]
+    fn collect_propagates_stream_error() {
+        let stream = futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"ok")),
+            Err(io::Error::other("fail")),
+        ]);
+        let body = Body::from_stream(stream);
+        let result = block_on(body.collect());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("fail"));
     }
 }

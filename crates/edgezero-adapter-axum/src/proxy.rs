@@ -1,12 +1,17 @@
+use std::io;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use edgezero_core::body::Body;
+use edgezero_core::compression::{
+    decode_brotli_stream, decode_deflate_stream, decode_gzip_stream, ContentEncoding,
+};
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderName, HeaderValue, Method, StatusCode};
+use edgezero_core::http::{header, HeaderName, HeaderValue, Method, StatusCode};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
-use futures_util::StreamExt;
-use reqwest::{header, Client};
+use futures_util::stream::{BoxStream, StreamExt};
+use reqwest::Client;
 
 pub struct AxumProxyClient {
     client: Client,
@@ -30,24 +35,18 @@ impl ProxyClient for AxumProxyClient {
         let mut builder = self.client.request(reqwest_method, uri.to_string());
 
         for (name, value) in headers.iter() {
-            let header_name = header::HeaderName::from_bytes(name.as_str().as_bytes())
+            let header_name = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes())
                 .map_err(EdgeError::internal)?;
-            let header_value =
-                header::HeaderValue::from_bytes(value.as_bytes()).map_err(EdgeError::internal)?;
+            let header_value = reqwest::header::HeaderValue::from_bytes(value.as_bytes())
+                .map_err(EdgeError::internal)?;
             builder = builder.header(header_name, header_value);
         }
 
-        builder = match body {
-            Body::Once(bytes) => builder.body(bytes.to_vec()),
-            Body::Stream(mut stream) => {
-                let mut buf = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(EdgeError::internal)?;
-                    buf.extend_from_slice(&chunk);
-                }
-                builder.body(buf)
-            }
-        };
+        // Use collect() for streaming bodies so we don't lose data.
+        let body_bytes = body.collect().await.map_err(EdgeError::internal)?;
+        if !body_bytes.is_empty() {
+            builder = builder.body(body_bytes.to_vec());
+        }
 
         let response = builder.send().await.map_err(EdgeError::internal)?;
         let status =
@@ -64,10 +63,50 @@ impl ProxyClient for AxumProxyClient {
                 .insert(header_name, header_value);
         }
 
-        let bytes = response.bytes().await.map_err(EdgeError::internal)?;
-        *proxy_response.body_mut() = Body::from(bytes.to_vec());
+        // Detect Content-Encoding for decompression.
+        let encoding = proxy_response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .and_then(ContentEncoding::parse);
+
+        // Stream the response body instead of buffering the whole thing.
+        let byte_stream = response.bytes_stream();
+        let chunk_stream: BoxStream<'static, Result<Vec<u8>, io::Error>> = byte_stream
+            .map(|res| match res {
+                Ok(bytes) => Ok(bytes.to_vec()),
+                Err(err) => Err(io::Error::other(err.to_string())),
+            })
+            .boxed();
+
+        let body_stream = transform_stream(chunk_stream, encoding);
+        *proxy_response.body_mut() = Body::from_stream(body_stream);
+
+        if matches!(
+            encoding,
+            Some(ContentEncoding::Gzip)
+                | Some(ContentEncoding::Brotli)
+                | Some(ContentEncoding::Deflate)
+        ) {
+            proxy_response
+                .headers_mut()
+                .remove(header::CONTENT_ENCODING);
+            proxy_response.headers_mut().remove(header::CONTENT_LENGTH);
+        }
 
         Ok(proxy_response)
+    }
+}
+
+fn transform_stream(
+    stream: BoxStream<'static, Result<Vec<u8>, io::Error>>,
+    encoding: Option<ContentEncoding>,
+) -> BoxStream<'static, Result<Bytes, io::Error>> {
+    match encoding {
+        Some(ContentEncoding::Gzip) => decode_gzip_stream(stream).boxed(),
+        Some(ContentEncoding::Brotli) => decode_brotli_stream(stream).boxed(),
+        Some(ContentEncoding::Deflate) => decode_deflate_stream(stream).boxed(),
+        _ => stream.map(|res| res.map(Bytes::from)).boxed(),
     }
 }
 
@@ -140,10 +179,8 @@ mod integration_tests {
         let response = client.send(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
 
-        match response.body() {
-            Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"hello from server"),
-            _ => panic!("expected buffered body"),
-        }
+        let bytes = response.into_body().collect().await.expect("collect body");
+        assert_eq!(bytes.as_ref(), b"hello from server");
     }
 
     #[tokio::test]
@@ -159,10 +196,8 @@ mod integration_tests {
         let response = client.send(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
 
-        match response.body() {
-            Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"request body data"),
-            _ => panic!("expected buffered body"),
-        }
+        let bytes = response.into_body().collect().await.expect("collect body");
+        assert_eq!(bytes.as_ref(), b"request body data");
     }
 
     #[tokio::test]
@@ -189,10 +224,8 @@ mod integration_tests {
         let response = client.send(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
 
-        match response.body() {
-            Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"custom-value"),
-            _ => panic!("expected buffered body"),
-        }
+        let bytes = response.into_body().collect().await.expect("collect body");
+        assert_eq!(bytes.as_ref(), b"custom-value");
     }
 
     #[tokio::test]
@@ -274,10 +307,8 @@ mod integration_tests {
             let request = ProxyRequest::new(method, uri);
             let response = client.send(request).await.expect("response");
             assert_eq!(response.status(), StatusCode::OK);
-            match response.body() {
-                Body::Once(bytes) => assert_eq!(bytes.as_ref(), expected_body.as_bytes()),
-                _ => panic!("expected buffered body"),
-            }
+            let bytes = response.into_body().collect().await.expect("collect body");
+            assert_eq!(bytes.as_ref(), expected_body.as_bytes());
         }
     }
 
@@ -294,7 +325,6 @@ mod integration_tests {
 
     #[tokio::test]
     async fn proxy_client_sends_streaming_body() {
-        use bytes::Bytes;
         use futures::stream;
 
         let app = Router::new().route(
@@ -319,9 +349,26 @@ mod integration_tests {
         let response = client.send(request).await.expect("response");
         assert_eq!(response.status(), StatusCode::OK);
 
-        match response.body() {
-            Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"chunk1chunk2chunk3"),
-            _ => panic!("expected buffered body"),
-        }
+        let bytes = response.into_body().collect().await.expect("collect body");
+        assert_eq!(bytes.as_ref(), b"chunk1chunk2chunk3");
+    }
+
+    #[tokio::test]
+    async fn proxy_response_body_is_streamed() {
+        // Verify the response body comes back as a stream, not a buffered body.
+        let app = Router::new().route("/test", get(|| async { "streamed" }));
+        let base_url = start_test_server(app).await;
+
+        let client = AxumProxyClient::default();
+        let uri: Uri = format!("{}/test", base_url).parse().unwrap();
+        let request = ProxyRequest::new(Method::GET, uri);
+
+        let response = client.send(request).await.expect("response");
+        assert!(
+            response.body().is_stream(),
+            "proxy response should be a stream"
+        );
+        let bytes = response.into_body().collect().await.expect("collect body");
+        assert_eq!(bytes.as_ref(), b"streamed");
     }
 }

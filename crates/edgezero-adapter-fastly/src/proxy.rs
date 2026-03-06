@@ -2,7 +2,9 @@ use async_stream::try_stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::body::Body;
-use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
+use edgezero_core::compression::{
+    decode_brotli_stream, decode_deflate_stream, decode_gzip_stream, ContentEncoding,
+};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderValue, Method, Uri};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
@@ -162,14 +164,19 @@ fn convert_response(fastly_response: &mut FastlyResponse) -> Result<ProxyRespons
         .headers()
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase());
+        .and_then(ContentEncoding::parse);
 
     let body = fastly_response.take_body();
 
     let chunk_stream = fastly_body_stream(body);
-    let body_stream = transform_stream(chunk_stream, encoding.as_deref());
+    let body_stream = transform_stream(chunk_stream, encoding);
     *proxy_response.body_mut() = Body::from_stream(body_stream);
-    if encoding.as_deref() == Some("gzip") || encoding.as_deref() == Some("br") {
+    if matches!(
+        encoding,
+        Some(ContentEncoding::Gzip)
+            | Some(ContentEncoding::Brotli)
+            | Some(ContentEncoding::Deflate)
+    ) {
         proxy_response
             .headers_mut()
             .remove(header::CONTENT_ENCODING);
@@ -193,11 +200,12 @@ fn fastly_body_stream(mut body: fastly::Body) -> ChunkStream {
 
 fn transform_stream(
     stream: ChunkStream,
-    encoding: Option<&str>,
+    encoding: Option<ContentEncoding>,
 ) -> BoxStream<'static, Result<Bytes, io::Error>> {
     match encoding {
-        Some("gzip") => decode_gzip_stream(stream).boxed(),
-        Some("br") => decode_brotli_stream(stream).boxed(),
+        Some(ContentEncoding::Gzip) => decode_gzip_stream(stream).boxed(),
+        Some(ContentEncoding::Brotli) => decode_brotli_stream(stream).boxed(),
+        Some(ContentEncoding::Deflate) => decode_deflate_stream(stream).boxed(),
         _ => stream.map(|res| res.map(Bytes::from)).boxed(),
     }
 }
@@ -223,7 +231,10 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         let mut gz_body = fastly::Body::new();
         gz_body.write_all(&compressed).unwrap();
-        let body = Body::from_stream(transform_stream(fastly_body_stream(gz_body), Some("gzip")));
+        let body = Body::from_stream(transform_stream(
+            fastly_body_stream(gz_body),
+            Some(ContentEncoding::Gzip),
+        ));
         let collected = collect_body(body);
         assert_eq!(collected, b"hello gzip");
     }
@@ -238,7 +249,10 @@ mod tests {
 
         let mut br_body = fastly::Body::new();
         br_body.write_all(&compressed).unwrap();
-        let body = Body::from_stream(transform_stream(fastly_body_stream(br_body), Some("br")));
+        let body = Body::from_stream(transform_stream(
+            fastly_body_stream(br_body),
+            Some(ContentEncoding::Brotli),
+        ));
         let collected = collect_body(body);
         assert_eq!(collected, b"hello brotli");
     }

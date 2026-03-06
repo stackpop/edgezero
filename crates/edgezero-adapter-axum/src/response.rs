@@ -9,9 +9,10 @@ use edgezero_core::http::Response as CoreResponse;
 
 /// Convert an EdgeZero response into one consumable by Axum/Hyper.
 ///
-/// Streaming responses are collected into an in-memory buffer. While this sacrifices
-/// incremental flushing, it keeps the adapter compatible with the non-`Send` streaming type used by
-/// `edgezero_core::Body` and works well for local development.
+/// **Known limitation:** streaming responses are collected into an in-memory buffer rather than
+/// flushed incrementally. This is because `edgezero_core::Body` uses a `LocalBoxStream` (`!Send`)
+/// for WASM compatibility, while Axum/Hyper require `Send` bodies. Since the Axum adapter is
+/// intended for local development (not production edge deployment), this trade-off is acceptable.
 pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
     let (parts, body) = response.into_parts();
     let body = match body {

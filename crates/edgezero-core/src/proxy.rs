@@ -138,6 +138,10 @@ impl ProxyResponse {
         &mut self.extensions
     }
 
+    pub fn into_body(self) -> Body {
+        self.body
+    }
+
     pub fn into_response(self) -> Response {
         let mut builder = response_builder().status(self.status);
         for (name, value) in self.headers.iter() {

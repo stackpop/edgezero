@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::body::Body;
-use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
+use edgezero_core::compression::{
+    decode_brotli_stream, decode_deflate_stream, decode_gzip_stream, ContentEncoding,
+};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
@@ -88,7 +90,7 @@ async fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse,
     let mut encoding = None;
     for (name, value) in cf_response.headers().entries() {
         if name.eq_ignore_ascii_case(header::CONTENT_ENCODING.as_str()) {
-            encoding = Some(value.to_ascii_lowercase());
+            encoding = ContentEncoding::parse(&value);
         }
         if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
             if let Ok(header_value) = HeaderValue::from_str(&value) {
@@ -102,10 +104,15 @@ async fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse,
     let worker_stream = cf_response.stream().map_err(EdgeError::internal)?;
 
     let chunk_stream: ChunkStream = worker_stream.map_err(worker_error_to_io).boxed_local();
-    let body_stream = transform_stream(chunk_stream, encoding.as_deref());
+    let body_stream = transform_stream(chunk_stream, encoding);
     *proxy_response.body_mut() = Body::from_stream(body_stream);
 
-    if encoding.is_some() {
+    if matches!(
+        encoding,
+        Some(ContentEncoding::Gzip)
+            | Some(ContentEncoding::Brotli)
+            | Some(ContentEncoding::Deflate)
+    ) {
         proxy_response
             .headers_mut()
             .remove(header::CONTENT_ENCODING);
@@ -133,16 +140,17 @@ fn http_method_to_cf(method: Method) -> CfMethod {
 type ChunkStream = LocalBoxStream<'static, Result<Vec<u8>, io::Error>>;
 
 fn worker_error_to_io(err: worker::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
+    io::Error::other(err.to_string())
 }
 
 fn transform_stream(
     stream: ChunkStream,
-    encoding: Option<&str>,
+    encoding: Option<ContentEncoding>,
 ) -> LocalBoxStream<'static, Result<Bytes, io::Error>> {
     match encoding {
-        Some("gzip") => decode_gzip_stream(stream).boxed_local(),
-        Some("br") => decode_brotli_stream(stream).boxed_local(),
+        Some(ContentEncoding::Gzip) => decode_gzip_stream(stream).boxed_local(),
+        Some(ContentEncoding::Brotli) => decode_brotli_stream(stream).boxed_local(),
+        Some(ContentEncoding::Deflate) => decode_deflate_stream(stream).boxed_local(),
         _ => stream.map(|res| res.map(Bytes::from)).boxed_local(),
     }
 }
@@ -151,7 +159,10 @@ fn transform_stream(
 mod tests {
     use super::*;
     use brotli::CompressorWriter;
-    use flate2::{write::GzEncoder, Compression};
+    use flate2::{
+        write::{DeflateEncoder as FlateDeflateEncoder, GzEncoder},
+        Compression,
+    };
     use futures::executor::block_on;
     use futures_util::stream;
     use std::io::Write;
@@ -187,7 +198,7 @@ mod tests {
         encoder.write_all(b"gzip payload").unwrap();
         let gzip = encoder.finish().unwrap();
         let gzip_stream: ChunkStream = Box::pin(stream::iter(vec![Ok::<Vec<u8>, io::Error>(gzip)]));
-        let body = Body::from_stream(transform_stream(gzip_stream, Some("gzip")));
+        let body = Body::from_stream(transform_stream(gzip_stream, Some(ContentEncoding::Gzip)));
         assert_eq!(collect_body(body), b"gzip payload");
 
         let mut brotli_data = Vec::new();
@@ -197,7 +208,24 @@ mod tests {
         }
         let brotli_stream: ChunkStream =
             Box::pin(stream::iter(vec![Ok::<Vec<u8>, io::Error>(brotli_data)]));
-        let body = Body::from_stream(transform_stream(brotli_stream, Some("br")));
+        let body = Body::from_stream(transform_stream(
+            brotli_stream,
+            Some(ContentEncoding::Brotli),
+        ));
         assert_eq!(collect_body(body), b"brotli payload");
+    }
+
+    #[test]
+    fn streaming_handles_deflate() {
+        let mut encoder = FlateDeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"deflate payload").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let chunk_stream: ChunkStream =
+            Box::pin(stream::iter(vec![Ok::<Vec<u8>, io::Error>(compressed)]));
+        let body = Body::from_stream(transform_stream(
+            chunk_stream,
+            Some(ContentEncoding::Deflate),
+        ));
+        assert_eq!(collect_body(body), b"deflate payload");
     }
 }
