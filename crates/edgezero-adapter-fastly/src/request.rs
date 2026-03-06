@@ -67,7 +67,13 @@ pub fn dispatch_with_kv(
             core_request.extensions_mut().insert(handle);
         }
         Err(e) => {
-            log::warn!("KV store '{}' not available: {}", kv_store_name, e);
+            // Log once per process to avoid noise. Fastly Compute spawns a
+            // fresh WASI instance per request so this is inherently once, but
+            // the guard makes the intent explicit.
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                log::warn!("KV store not available: {}", e);
+            });
         }
     }
 

@@ -57,7 +57,7 @@ adapters = ["axum", "cloudflare", "fastly"]
 [[triggers.http]]
 id = "kv_counter"
 path = "/kv/counter"
-methods = ["GET"]
+methods = ["POST"]
 handler = "app_demo_core::handlers::kv_counter"
 adapters = ["axum", "cloudflare", "fastly"]
 description = "Increment and return a visit counter stored in KV"

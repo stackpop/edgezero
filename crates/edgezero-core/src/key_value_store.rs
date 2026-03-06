@@ -28,7 +28,7 @@
 //! ```rust,ignore
 //! async fn visit_counter(ctx: RequestContext) -> Result<String, EdgeError> {
 //!     let kv = ctx.kv_handle().expect("kv store configured");
-//!     let count: i32 = kv.update("visits", 0, |n| n + 1).await?;
+//!     let count: i32 = kv.read_modify_write("visits", 0, |n| n + 1).await?;
 //!     Ok(format!("Visit #{count}"))
 //! }
 //! ```
@@ -38,7 +38,7 @@
 //! ```rust,ignore
 //! #[action]
 //! async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
-//!     let count: i32 = store.update("visits", 0, |n| n + 1).await?;
+//!     let count: i32 = store.read_modify_write("visits", 0, |n| n + 1).await?;
 //!     Ok(format!("Visit #{count}"))
 //! }
 //! ```
@@ -86,7 +86,7 @@ impl From<KvError> for EdgeError {
     fn from(err: KvError) -> Self {
         match err {
             KvError::NotFound { key } => EdgeError::not_found(format!("kv key: {key}")),
-            KvError::Unavailable => EdgeError::internal(anyhow::anyhow!("kv store unavailable")),
+            KvError::Unavailable => EdgeError::service_unavailable("kv store unavailable"),
             KvError::Validation(e) => EdgeError::bad_request(format!("kv validation error: {e}")),
             KvError::Serialization(e) => {
                 EdgeError::internal(anyhow::anyhow!("kv serialization error: {e}"))
@@ -330,15 +330,15 @@ impl KvHandle {
     /// apply `f`, and write the result back.
     ///
     /// Returns the **new** (post-mutation) value. If you also need the
-    /// previous value, read it separately before calling `update`.
+    /// previous value, read it separately before calling this method.
     ///
     /// # Warning
     ///
     /// This operation is **not atomic**. The read and write are separate
-    /// calls to the backend. Concurrent `update` calls on the same key
-    /// may cause lost writes. Use this only when eventual consistency
-    /// is acceptable (e.g., approximate counters).
-    pub async fn update<T, F>(&self, key: &str, default: T, f: F) -> Result<T, KvError>
+    /// calls to the backend. Concurrent calls on the same key may cause
+    /// lost writes. Use this only when eventual consistency is acceptable
+    /// (e.g., approximate counters).
+    pub async fn read_modify_write<T, F>(&self, key: &str, default: T, f: F) -> Result<T, KvError>
     where
         T: DeserializeOwned + Serialize,
         F: FnOnce(T) -> T,
@@ -550,6 +550,10 @@ macro_rules! key_value_store_contract_tests {
             fn contract_ttl_expires() {
                 let store = $factory;
                 run(async {
+                    // Uses a sub-second TTL intentionally. Contract tests call
+                    // `KvStore` directly (not `KvHandle`), so the 60-second
+                    // minimum TTL validation is bypassed. This lets us verify
+                    // that the backend actually evicts expired entries.
                     store
                         .put_bytes_with_ttl(
                             "ephemeral",
@@ -739,9 +743,9 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             h.put("c", &0i32).await.unwrap();
-            let val = h.update("c", 0i32, |n| n + 1).await.unwrap();
+            let val = h.read_modify_write("c", 0i32, |n| n + 1).await.unwrap();
             assert_eq!(val, 1);
-            let val = h.update("c", 0i32, |n| n + 1).await.unwrap();
+            let val = h.read_modify_write("c", 0i32, |n| n + 1).await.unwrap();
             assert_eq!(val, 2);
         });
     }
@@ -750,7 +754,7 @@ mod tests {
     fn update_uses_default_when_missing() {
         let h = handle();
         futures::executor::block_on(async {
-            let val = h.update("new", 10i32, |n| n * 2).await.unwrap();
+            let val = h.read_modify_write("new", 10i32, |n| n * 2).await.unwrap();
             assert_eq!(val, 20);
         });
     }
@@ -856,10 +860,10 @@ mod tests {
     }
 
     #[test]
-    fn kv_error_unavailable_converts_to_internal() {
+    fn kv_error_unavailable_converts_to_service_unavailable() {
         let kv_err = KvError::Unavailable;
         let edge_err: EdgeError = kv_err.into();
-        assert_eq!(edge_err.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(edge_err.status(), http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -944,7 +948,7 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             let val = h
-                .update("counter_struct", Counter { count: 0 }, |mut c| {
+                .read_modify_write("counter_struct", Counter { count: 0 }, |mut c| {
                     c.count += 10;
                     c
                 })
@@ -953,7 +957,7 @@ mod tests {
             assert_eq!(val.count, 10);
 
             let val = h
-                .update("counter_struct", Counter { count: 0 }, |mut c| {
+                .read_modify_write("counter_struct", Counter { count: 0 }, |mut c| {
                     c.count += 5;
                     c
                 })

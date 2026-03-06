@@ -110,10 +110,10 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/")
 check "GET / returns 200" "200" "$STATUS"
 
 section "KV Counter"
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/kv/counter")
-check "GET /kv/counter returns 200" "200" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/kv/counter")
+check "POST /kv/counter returns 200" "200" "$STATUS"
 
-BODY=$(curl -s "$BASE/kv/counter")
+BODY=$(curl -s -X POST "$BASE/kv/counter")
 COUNT=$(echo "$BODY" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
 check "Counter returns a number" "true" "$([ -n "$COUNT" ] && echo true || echo false)"
 

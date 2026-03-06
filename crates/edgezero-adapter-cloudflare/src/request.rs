@@ -72,7 +72,12 @@ pub async fn dispatch_with_kv(
     let kv_handle = match crate::key_value_store::CloudflareKvStore::from_env(&env, kv_binding) {
         Ok(store) => Some(KvHandle::new(std::sync::Arc::new(store))),
         Err(e) => {
-            log::warn!("KV binding '{}' not available: {}", kv_binding, e);
+            // Log once per worker instance to avoid flooding the console
+            // on high-traffic workers where every request re-opens the binding.
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                log::warn!("KV binding not available: {}", e);
+            });
             None
         }
     };

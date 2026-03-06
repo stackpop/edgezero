@@ -21,7 +21,7 @@ struct VisitData {
 async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
     // Read-modify-write helper (Note: not atomic!)
     let data = store
-        .update("visits", VisitData::default(), |mut d| {
+        .read_modify_write("visits", VisitData::default(), |mut d| {
             d.count += 1;
             d
         })

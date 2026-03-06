@@ -435,7 +435,10 @@ mod tests {
     async fn update_helper() {
         let (s, _dir) = store();
         s.put("counter", &0i32).await.unwrap();
-        let val = s.update("counter", 0i32, |n| n + 5).await.unwrap();
+        let val = s
+            .read_modify_write("counter", 0i32, |n| n + 5)
+            .await
+            .unwrap();
         assert_eq!(val, 5);
     }
 
@@ -515,15 +518,10 @@ mod tests {
     }
 
     // Run the shared contract tests against PersistentKvStore.
-    // Use a unique path per test to avoid TempDir lifetime issues (the
-    // tempdir handle would drop before the store, which is fragile on
-    // non-Unix platforms).
+    // `keep()` disables automatic cleanup so the TempDir doesn't
+    // drop before the store finishes (the OS cleans up /tmp eventually).
     edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
-        let db_path = std::env::temp_dir().join(format!(
-            "edgezero-contract-{}-{:?}.redb",
-            std::process::id(),
-            std::thread::current().id()
-        ));
+        let db_path = tempfile::tempdir().unwrap().keep().join("contract.redb");
         PersistentKvStore::new(db_path).unwrap()
     });
 }

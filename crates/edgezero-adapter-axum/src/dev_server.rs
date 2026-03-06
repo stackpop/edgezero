@@ -80,7 +80,7 @@ impl AxumDevServer {
         kv_path: &str,
     ) -> anyhow::Result<()> {
         let AxumDevServer { router, config } = self;
-        serve_with_listener_and_kv_path(router, listener, config.enable_ctrl_c, kv_path).await
+        serve_with_listener_and_kv_path(router, listener, config.enable_ctrl_c, Some(kv_path)).await
     }
 }
 
@@ -89,27 +89,32 @@ async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
 ) -> anyhow::Result<()> {
-    serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, ".edgezero/kv.redb").await
+    serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, Some(".edgezero/kv.redb"))
+        .await
 }
 
 async fn serve_with_listener_and_kv_path(
     router: RouterService,
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
-    kv_path: &str,
+    kv_path: Option<&str>,
 ) -> anyhow::Result<()> {
-    // Create a persistent KV store
-    if let Some(parent) = std::path::Path::new(kv_path).parent() {
-        std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
-    }
-    let kv_store = std::sync::Arc::new(
-        crate::key_value_store::PersistentKvStore::new(kv_path)
-            .context("failed to create KV store")?,
-    );
-    log::info!("KV store: {}", kv_path);
-    let kv_handle = edgezero_core::key_value_store::KvHandle::new(kv_store);
+    let mut service = EdgeZeroAxumService::new(router);
 
-    let service = EdgeZeroAxumService::new(router).with_kv_handle(kv_handle);
+    if let Some(kv_path) = kv_path {
+        if let Some(parent) = std::path::Path::new(kv_path).parent() {
+            std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
+        }
+        let kv_store = std::sync::Arc::new(
+            crate::key_value_store::PersistentKvStore::new(kv_path)
+                .context("failed to create KV store")?,
+        );
+        log::info!("KV store: {}", kv_path);
+        let kv_handle = edgezero_core::key_value_store::KvHandle::new(kv_store);
+        service = service.with_kv_handle(kv_handle);
+    }
+
+    let service = service;
     let router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
         async move { svc.call(req).await }
@@ -148,10 +153,34 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
 
     SimpleLogger::new().with_level(level).init().ok();
 
+    // Only initialize KV store if configured in the manifest.
+    let kv_enabled = manifest.manifest().stores.kv.is_some();
+
     let app = A::build_app();
     let router = app.router().clone();
 
-    AxumDevServer::new(router).run()
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    runtime.block_on(async move {
+        let config = AxumDevServerConfig::default();
+        let listener = StdTcpListener::bind(config.addr)
+            .with_context(|| format!("failed to bind dev server to {}", config.addr))?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to set listener to non-blocking")?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .context("failed to adopt std listener into tokio")?;
+
+        let kv_path = if kv_enabled {
+            Some(".edgezero/kv.redb")
+        } else {
+            None
+        };
+        serve_with_listener_and_kv_path(router, listener, config.enable_ctrl_c, kv_path).await
+    })
 }
 
 #[cfg(test)]
@@ -480,7 +509,7 @@ mod integration_tests {
     async fn kv_store_update_across_requests() {
         async fn increment_handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let kv = ctx.kv_handle().expect("kv configured");
-            let val = kv.update("counter", 0i32, |n| n + 1).await?;
+            let val = kv.read_modify_write("counter", 0i32, |n| n + 1).await?;
             Ok(val.to_string())
         }
 

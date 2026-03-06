@@ -85,10 +85,14 @@ impl KvStore for CloudflareKvStore {
     }
 
     async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
+        // Cloudflare KV returns up to 1 000 keys per page. Cap at 100 pages
+        // (100k keys) to prevent runaway pagination from a misbehaving API.
+        const MAX_PAGES: usize = 100;
+
         let mut all_keys = Vec::new();
         let mut cursor: Option<String> = None;
 
-        loop {
+        for _ in 0..MAX_PAGES {
             let mut builder = self.store.list();
             if !prefix.is_empty() {
                 builder = builder.prefix(prefix.to_string());

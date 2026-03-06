@@ -122,7 +122,9 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
 /// Increment and return a visit counter stored in KV.
 #[action]
 pub(crate) async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
-    let count: i64 = store.update("demo:counter", 0i64, |n| n + 1).await?;
+    let count: i64 = store
+        .read_modify_write("demo:counter", 0i64, |n| n + 1)
+        .await?;
     let body = serde_json::json!({ "count": count }).to_string();
     http::response_builder()
         .status(StatusCode::OK)
@@ -139,7 +141,7 @@ pub(crate) async fn kv_note_put(
     RequestContext(ctx): RequestContext,
 ) -> Result<Response, EdgeError> {
     let body = ctx.into_request().into_body();
-    let body_bytes = collect_body(body).await?;
+    let body_bytes = body.into_bytes_bounded(MAX_BODY_SIZE).await?;
     store
         .put_bytes(&format!("note:{}", path.id), body_bytes)
         .await?;
@@ -151,31 +153,6 @@ pub(crate) async fn kv_note_put(
 
 /// Maximum request body size (25 MB, matches KV value limit).
 const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
-
-/// Drain a [`Body`] into a single [`Bytes`] buffer, regardless of variant.
-///
-/// Caps accumulation at [`MAX_BODY_SIZE`] to prevent denial-of-service via
-/// multi-GB streaming uploads.
-async fn collect_body(body: Body) -> Result<Bytes, EdgeError> {
-    if body.is_stream() {
-        let mut stream = body.into_stream().expect("checked is_stream");
-        let mut buf = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(EdgeError::internal)?;
-            buf.extend_from_slice(&chunk);
-            if buf.len() > MAX_BODY_SIZE {
-                return Err(EdgeError::bad_request("request body too large"));
-            }
-        }
-        Ok(Bytes::from(buf))
-    } else {
-        let bytes = body.into_bytes();
-        if bytes.len() > MAX_BODY_SIZE {
-            return Err(EdgeError::bad_request("request body too large"));
-        }
-        Ok(bytes)
-    }
-}
 
 /// Read a note by id.
 #[action]
@@ -443,7 +420,7 @@ mod tests {
 
     #[test]
     fn kv_counter_increments() {
-        let (ctx, _) = context_with_kv("/kv/counter", Method::GET, Body::empty(), &[]);
+        let (ctx, _) = context_with_kv("/kv/counter", Method::POST, Body::empty(), &[]);
         let resp = block_on(kv_counter(ctx)).expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().into_bytes();
