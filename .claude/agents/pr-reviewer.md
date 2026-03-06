@@ -112,8 +112,8 @@ Tag each finding with an emoji from the
 [Code Review Emoji Guide](https://github.com/erikthedeveloper/code-review-emoji-guide).
 Every comment — inline or body-level — must start with the emoji.
 
-| Emoji | Name         | When to use                                                                 | Blocking? |
-| ----- | ------------ | --------------------------------------------------------------------------- | --------- |
+| Emoji | Name         | When to use                                                                  | Blocking? |
+| ----- | ------------ | ---------------------------------------------------------------------------- | --------- |
 | 🔧    | wrench       | Required change — bugs, security, data loss, CI failures, missing validation | Yes       |
 | ❓    | question     | Clarification needed — something is unclear and needs a substantive answer   | Yes       |
 | 🤔    | thinking     | Reasoning aloud — expressing concern or exploring an alternative             | No        |
