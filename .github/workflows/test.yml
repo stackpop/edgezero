@@ -56,4 +56,7 @@ jobs:
         run: cargo test --workspace --all-targets
 
       - name: Check feature compilation
-        run: cargo check --workspace --all-targets --features "fastly cloudflare"
+        run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
+
+      - name: Check Spin wasm32 compilation
+        run: cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
