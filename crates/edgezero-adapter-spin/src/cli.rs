@@ -175,7 +175,7 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &["spin"],
     },
     commands: CommandTemplates {
-        build: "cargo build --target wasm32-wasip1 --release -p {crate_name}",
+        build: "cargo build --target wasm32-wasip1 --release -p {crate}",
         deploy: "spin deploy --from {crate_dir}",
         serve: "spin up --from {crate_dir}",
     },

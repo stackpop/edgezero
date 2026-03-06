@@ -19,12 +19,6 @@ pub use request::{dispatch, into_core_request};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub fn init_logger() -> Result<(), log::SetLoggerError> {
-    Ok(())
-}
-
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
@@ -47,12 +41,7 @@ impl AppExt for edgezero_core::app::App {
     ) -> ::core::pin::Pin<
         Box<dyn ::core::future::Future<Output = anyhow::Result<spin_sdk::http::Response>> + 'a>,
     > {
-        Box::pin(async move {
-            let core_request = into_core_request(req).await?;
-            let response = self.router().oneshot(core_request).await;
-            let spin_response = from_core_response(response).await?;
-            Ok(spin_response)
-        })
+        Box::pin(request::dispatch(self, req))
     }
 }
 

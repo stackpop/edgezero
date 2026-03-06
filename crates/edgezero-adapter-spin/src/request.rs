@@ -6,7 +6,7 @@ use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request, Uri};
 use edgezero_core::proxy::ProxyHandle;
-use spin_sdk::http::{IncomingRequest, IntoResponse};
+use spin_sdk::http::IncomingRequest;
 
 /// Convert a Spin `IncomingRequest` into an EdgeZero core `Request`.
 ///
@@ -32,10 +32,13 @@ pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeErro
     for (name, value) in &header_entries {
         if let Ok(value_str) = std::str::from_utf8(value) {
             builder = builder.header(name.as_str(), value_str);
+        } else {
+            log::warn!("dropping non-UTF-8 request header: {}", name);
         }
     }
 
-    let client_addr = find_header_string(&header_entries, "spin-client-addr");
+    let client_addr = find_header_string(&header_entries, "spin-client-addr")
+        .and_then(|raw| crate::context::parse_client_addr(&raw));
     let full_url = find_header_string(&header_entries, "spin-full-url");
 
     // Drop the WASI resource handle before consuming the body.
@@ -74,7 +77,7 @@ fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<Strin
 
 /// Dispatch a Spin request through the EdgeZero router and return
 /// a Spin-compatible response.
-pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<impl IntoResponse> {
+pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sdk::http::Response> {
     let core_request = into_core_request(req).await?;
     let response = app.router().oneshot(core_request).await;
     Ok(from_core_response(response).await?)

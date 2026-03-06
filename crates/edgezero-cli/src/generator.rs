@@ -137,6 +137,10 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "tokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }".to_string(),
     );
     deps.insert("tracing".to_string(), "tracing = \"0.1\"".to_string());
+    deps.insert(
+        "spin-sdk".to_string(),
+        "spin-sdk = { version = \"5.2\", default-features = false }".to_string(),
+    );
     deps
 }
 
@@ -185,6 +189,10 @@ fn collect_adapter_data(
 
         let mut data_entries: Vec<(String, String)> = Vec::new();
         data_entries.push((format!("proj_{}", blueprint.id), crate_name.clone()));
+        data_entries.push((
+            format!("proj_{}_underscored", blueprint.id),
+            crate_name.replace('-', "_"),
+        ));
 
         for dep in blueprint.dependencies {
             let ResolvedDependency {
