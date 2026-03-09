@@ -12,16 +12,19 @@
 //! names are restricted to JavaScript identifier syntax.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use edgezero_core::config_store::ConfigStore;
 use worker::Env;
+
+type ConfigMap = HashMap<String, String>;
 
 /// Config store backed by a single Cloudflare JSON string binding.
 ///
 /// At construction time the binding value is parsed into a `HashMap<String, String>`.
 /// Reads are then O(1) map lookups with no further JS interop.
 pub struct CloudflareConfigStore {
-    data: HashMap<String, String>,
+    data: Arc<ConfigMap>,
 }
 
 impl CloudflareConfigStore {
@@ -30,29 +33,31 @@ impl CloudflareConfigStore {
     /// Returns an empty store (graceful fallback) if the binding is absent or
     /// the value is not valid JSON.
     pub fn new(env: &Env, binding_name: &str) -> Self {
-        let raw = env.var(binding_name).ok();
-        if raw.is_none() {
-            log::info!(
-                "config store binding '{}' is not set in wrangler.toml [vars]; proceeding without config",
-                binding_name
-            );
+        Self::try_new(env, binding_name).unwrap_or_else(Self::empty)
+    }
+
+    /// Build a store only when the configured Cloudflare binding exists and parses successfully.
+    ///
+    /// Missing bindings or invalid JSON are treated as configuration problems, logged at warn
+    /// level (once per binding name per isolate lifetime), and return `None` so the adapter
+    /// can skip injecting the handle.
+    pub fn try_new(env: &Env, binding_name: &str) -> Option<Self> {
+        Some(Self {
+            data: lookup_cached(env, binding_name)?,
+        })
+    }
+
+    fn empty() -> Self {
+        Self {
+            data: Arc::new(HashMap::new()),
         }
-        let data = raw
-            .and_then(|v| {
-                let s = v.to_string();
-                serde_json::from_str(&s)
-                    .map_err(|e| {
-                        log::warn!(
-                            "config store binding '{}' is not valid JSON: {}; proceeding without config",
-                            binding_name,
-                            e
-                        );
-                        e
-                    })
-                    .ok()
-            })
-            .unwrap_or_default();
-        Self { data }
+    }
+
+    #[cfg(test)]
+    fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            data: Arc::new(entries.into_iter().collect()),
+        }
     }
 }
 
@@ -62,7 +67,70 @@ impl ConfigStore for CloudflareConfigStore {
     }
 }
 
-// Contract tests cannot run natively: `worker::Env` is only available inside
-// the Cloudflare Workers runtime and has no testable mock. Platform-level
-// contract coverage is provided by the smoke test
-// (`scripts/smoke_test_config.sh cloudflare`) against a live wrangler dev instance.
+/// Parse-and-cache the config map for `binding_name`.
+///
+/// Keyed only by name: Cloudflare env vars are immutable within an isolate lifetime,
+/// so the parsed result for a given binding name never changes. Warnings are emitted
+/// only on the first miss for a given name (log-once semantics).
+///
+/// # WASM safety
+/// `std::sync::Mutex` compiles for `wasm32-unknown-unknown` and is safe here because
+/// WASM is single-threaded — the lock can never be contested and poisoning cannot
+/// occur via a concurrent thread panic.
+fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
+    // Fast path: already cached.
+    if let Some(entry) = config_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(binding_name)
+    {
+        return entry.clone();
+    }
+
+    // Cache miss: resolve from the JS env (synchronous interop, safe outside the lock).
+    let resolved = match env.var(binding_name).ok().map(|v| v.to_string()) {
+        None => {
+            log::warn!(
+                "configured config store binding '{}' is missing from the Worker environment; skipping config-store injection",
+                binding_name
+            );
+            None
+        }
+        Some(raw) => match serde_json::from_str::<ConfigMap>(&raw) {
+            Ok(data) => Some(Arc::new(data)),
+            Err(err) => {
+                log::warn!(
+                    "configured config store binding '{}' contains invalid JSON: {}; skipping config-store injection",
+                    binding_name,
+                    err
+                );
+                None
+            }
+        },
+    };
+
+    config_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(binding_name.to_string())
+        .or_insert(resolved)
+        .clone()
+}
+
+fn config_cache() -> &'static Mutex<HashMap<String, Option<Arc<ConfigMap>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<ConfigMap>>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    edgezero_core::config_store_contract_tests!(cloudflare_config_store_contract, #[wasm_bindgen_test], {
+        CloudflareConfigStore::from_entries([
+            ("contract.key.a".to_string(), "value_a".to_string()),
+            ("contract.key.b".to_string(), "value_b".to_string()),
+        ])
+    });
+}

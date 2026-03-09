@@ -2,6 +2,69 @@ use crate::router::RouterService;
 
 const DEFAULT_APP_NAME: &str = "EdgeZero App";
 
+/// Canonical adapter name for the Axum adapter.
+pub const AXUM_ADAPTER: &str = "axum";
+/// Canonical adapter name for the Cloudflare adapter.
+pub const CLOUDFLARE_ADAPTER: &str = "cloudflare";
+/// Canonical adapter name for the Fastly adapter.
+pub const FASTLY_ADAPTER: &str = "fastly";
+
+/// Adapter-specific config-store override metadata generated from `[stores.config.adapters.*]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigStoreAdapterMetadata {
+    adapter: &'static str,
+    name: &'static str,
+}
+
+impl ConfigStoreAdapterMetadata {
+    pub const fn new(adapter: &'static str, name: &'static str) -> Self {
+        Self { adapter, name }
+    }
+
+    pub fn adapter(&self) -> &'static str {
+        self.adapter
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+/// Provider-neutral config-store metadata generated from `[stores.config]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigStoreMetadata {
+    default_name: &'static str,
+    adapters: &'static [ConfigStoreAdapterMetadata],
+}
+
+impl ConfigStoreMetadata {
+    pub const fn new(
+        default_name: &'static str,
+        adapters: &'static [ConfigStoreAdapterMetadata],
+    ) -> Self {
+        Self {
+            default_name,
+            adapters,
+        }
+    }
+
+    pub fn default_name(&self) -> &'static str {
+        self.default_name
+    }
+
+    pub fn adapters(&self) -> &'static [ConfigStoreAdapterMetadata] {
+        self.adapters
+    }
+
+    pub fn name_for_adapter(&self, adapter: &str) -> &'static str {
+        self.adapters
+            .iter()
+            .find(|entry| entry.adapter.eq_ignore_ascii_case(adapter))
+            .map(|entry| entry.name)
+            .unwrap_or(self.default_name)
+    }
+}
+
 /// Lightweight container around a `RouterService` that can be extended via hook implementations.
 pub struct App {
     router: RouterService,
@@ -68,6 +131,13 @@ pub trait Hooks {
         App::default_name()
     }
 
+    /// Structured config-store metadata for the application, if declared.
+    ///
+    /// Macro-generated apps derive this from `[stores.config]` in `edgezero.toml`.
+    fn config_store() -> Option<&'static ConfigStoreMetadata> {
+        None
+    }
+
     /// Construct an `App` by wiring the routes and invoking the configuration hook.
     fn build_app() -> App
     where
@@ -117,12 +187,29 @@ mod tests {
         fn name() -> &'static str {
             "hooks-name"
         }
+
+        fn config_store() -> Option<&'static ConfigStoreMetadata> {
+            static CONFIG_STORE: ConfigStoreMetadata = ConfigStoreMetadata::new(
+                "default-config",
+                &[ConfigStoreAdapterMetadata::new(
+                    CLOUDFLARE_ADAPTER,
+                    "cf-config",
+                )],
+            );
+            Some(&CONFIG_STORE)
+        }
     }
 
     #[test]
     fn build_app_invokes_hooks_for_routes_and_configuration() {
         let app = TestHooks::build_app();
         assert_eq!(app.name(), "configured");
+        let config = TestHooks::config_store().expect("config store metadata");
+        assert_eq!(config.name_for_adapter(CLOUDFLARE_ADAPTER), "cf-config");
+        assert_eq!(config.name_for_adapter("CLOUDFLARE"), "cf-config");
+        assert_eq!(config.name_for_adapter(FASTLY_ADAPTER), "default-config");
+        assert_eq!(config.default_name(), "default-config");
+        assert_eq!(config.adapters().len(), 1);
 
         let request = request_builder()
             .method(Method::GET)
@@ -147,6 +234,7 @@ mod tests {
     fn default_hooks_use_default_name_and_into_router() {
         let app = DefaultHooks::build_app();
         assert_eq!(app.name(), App::default_name());
+        assert_eq!(DefaultHooks::config_store(), None);
         let router = app.into_router();
         assert!(router.routes().is_empty());
     }

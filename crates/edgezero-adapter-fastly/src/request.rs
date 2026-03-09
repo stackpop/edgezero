@@ -66,8 +66,8 @@ pub fn dispatch_with_config(
                 .insert(ConfigStoreHandle::new(Arc::new(store)));
         }
         None => {
-            log::info!(
-                "config store '{}' is not available; proceeding without it",
+            log::warn!(
+                "configured Fastly config store '{}' is unavailable; skipping config-store injection",
                 store_name
             );
         }

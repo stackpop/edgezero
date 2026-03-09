@@ -2,22 +2,26 @@
 
 use bytes::Bytes;
 use edgezero_adapter_cloudflare::{
-    dispatch, from_core_response, into_core_request, CloudflareRequestContext,
+    dispatch, dispatch_with_config, from_core_response, into_core_request,
+    CloudflareRequestContext,
 };
 use edgezero_core::{
-    response_builder, App, Body, EdgeError, Method, RequestContext, RouterService, StatusCode,
+    app::App,
+    body::Body,
+    context::RequestContext,
+    error::EdgeError,
+    http::{response_builder, Method, Response, StatusCode},
+    router::RouterService,
 };
 use futures::stream;
-use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
-use worker::{
-    Context, Env, Method as CfMethod, Request as CfRequest, RequestInit, Response as CfResponse,
-};
+use worker::wasm_bindgen::{JsCast, JsValue};
+use worker::{Context, Env, Method as CfMethod, Request as CfRequest, RequestInit};
 
 wasm_bindgen_test_configure!(run_in_browser);
 
 fn build_test_app() -> App {
-    async fn capture_uri(ctx: RequestContext) -> Result<edgezero_core::Response, EdgeError> {
+    async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
         let body = Body::text(ctx.request().uri().to_string());
         let response = response_builder()
             .status(StatusCode::OK)
@@ -26,7 +30,7 @@ fn build_test_app() -> App {
         Ok(response)
     }
 
-    async fn mirror_body(ctx: RequestContext) -> Result<edgezero_core::Response, EdgeError> {
+    async fn mirror_body(ctx: RequestContext) -> Result<Response, EdgeError> {
         let bytes = ctx.request().body().as_bytes().to_vec();
         let response = response_builder()
             .status(StatusCode::OK)
@@ -35,7 +39,20 @@ fn build_test_app() -> App {
         Ok(response)
     }
 
-    async fn stream_response(_ctx: RequestContext) -> Result<edgezero_core::Response, EdgeError> {
+    async fn config_presence(_ctx: RequestContext) -> Result<Response, EdgeError> {
+        let present = if _ctx.config_store().is_some() {
+            "yes"
+        } else {
+            "no"
+        };
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::text(present))
+            .expect("response");
+        Ok(response)
+    }
+
+    async fn stream_response(_ctx: RequestContext) -> Result<Response, EdgeError> {
         let chunks = stream::iter(vec![
             Bytes::from_static(b"chunk-1"),
             Bytes::from_static(b"chunk-2"),
@@ -52,18 +69,19 @@ fn build_test_app() -> App {
         .get("/uri", capture_uri)
         .post("/mirror", mirror_body)
         .get("/stream", stream_response)
+        .get("/has-config", config_presence)
         .build();
 
     App::new(router)
 }
 
 fn cf_request(method: CfMethod, path: &str, body: Option<&[u8]>) -> CfRequest {
-    use js_sys::Uint8Array;
+    use worker::js_sys::Uint8Array;
 
     let mut init = RequestInit::new();
     init.with_method(method);
 
-    let headers = worker::Headers::new().expect("headers");
+    let headers = worker::Headers::new();
     headers.set("host", "example.com").expect("host header");
     headers.set("x-edgezero-test", "1").expect("custom header");
     init.with_headers(headers);
@@ -78,7 +96,9 @@ fn cf_request(method: CfMethod, path: &str, body: Option<&[u8]>) -> CfRequest {
 }
 
 fn test_env_ctx() -> (Env, Context) {
-    (Env::default(), Context::default())
+    let env = worker::js_sys::Object::new().unchecked_into::<Env>();
+    let js_context = worker::js_sys::Object::new().unchecked_into::<worker::worker_sys::Context>();
+    (env, Context::new(js_context))
 }
 
 #[wasm_bindgen_test]
@@ -117,7 +137,7 @@ async fn from_core_response_translates_status_headers_and_streaming_body() {
         ])))
         .expect("response");
 
-    let cf_response = from_core_response(response).expect("cf response");
+    let mut cf_response = from_core_response(response).expect("cf response");
 
     assert_eq!(cf_response.status_code(), StatusCode::CREATED.as_u16());
     let header = cf_response.headers().get("x-edgezero-res").unwrap();
@@ -133,11 +153,11 @@ async fn dispatch_runs_router_and_returns_response() {
     let req = cf_request(CfMethod::Get, "/uri", None);
     let (env, ctx) = test_env_ctx();
 
-    let response = dispatch(&app, req, env, ctx).await.expect("cf response");
+    let mut response = dispatch(&app, req, env, ctx).await.expect("cf response");
 
     assert_eq!(response.status_code(), StatusCode::OK.as_u16());
     let body = response.text().await.expect("text");
-    assert_eq!(body.unwrap(), "https://example.com/uri");
+    assert_eq!(body, "https://example.com/uri");
 }
 
 #[wasm_bindgen_test]
@@ -146,7 +166,7 @@ async fn dispatch_streaming_route_preserves_chunks() {
     let req = cf_request(CfMethod::Get, "/stream", None);
     let (env, ctx) = test_env_ctx();
 
-    let response = dispatch(&app, req, env, ctx).await.expect("cf response");
+    let mut response = dispatch(&app, req, env, ctx).await.expect("cf response");
 
     assert_eq!(response.status_code(), StatusCode::OK.as_u16());
     let bytes = response.bytes().await.expect("bytes");
@@ -159,9 +179,27 @@ async fn dispatch_passes_request_body_to_handlers() {
     let req = cf_request(CfMethod::Post, "/mirror", Some(b"echo"));
     let (env, ctx) = test_env_ctx();
 
-    let response = dispatch(&app, req, env, ctx).await.expect("cf response");
+    let mut response = dispatch(&app, req, env, ctx).await.expect("cf response");
 
     assert_eq!(response.status_code(), StatusCode::OK.as_u16());
     let bytes = response.bytes().await.expect("bytes");
     assert_eq!(bytes.as_slice(), b"echo");
+}
+
+#[wasm_bindgen_test]
+async fn dispatch_with_config_missing_binding_skips_injection() {
+    // The test env is an empty JS object; any env.var() call returns None.
+    // dispatch_with_config should log a warning and dispatch without injecting
+    // a config-store handle, so the handler receives ctx.config_store() == None.
+    let app = build_test_app();
+    let req = cf_request(CfMethod::Get, "/has-config", None);
+    let (env, ctx) = test_env_ctx();
+
+    let mut response = dispatch_with_config(&app, req, env, ctx, "nonexistent_binding")
+        .await
+        .expect("cf response");
+
+    assert_eq!(response.status_code(), StatusCode::OK.as_u16());
+    let body = response.text().await.expect("text");
+    assert_eq!(body, "no");
 }

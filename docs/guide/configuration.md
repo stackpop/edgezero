@@ -137,6 +137,39 @@ Variables with a default `value` are injected when running CLI commands.
 
 Secrets must be present in the environment; missing secrets abort CLI commands with an error.
 
+## Stores Section
+
+Use `[stores.config]` for small read-only runtime configuration such as feature flags, JWKS metadata,
+or service settings:
+
+```toml
+[stores.config]
+name = "app_config"
+
+[stores.config.defaults]
+"greeting" = "hello from config store"
+"service.timeout_ms" = "1500"
+
+[stores.config.adapters.cloudflare]
+name = "APP_CONFIG"
+```
+
+| Field      | Required | Description                                                                                                  |
+| ---------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `name`     | No       | Global store or binding name; if omitted but the section is present, adapters fall back to `EDGEZERO_CONFIG` |
+| `adapters` | No       | Per-adapter name overrides, keyed by adapter name                                                            |
+| `defaults` | No       | Local default values used by the Axum adapter when env vars are absent                                       |
+
+Runtime behavior by adapter:
+
+- Fastly reads from a Fastly Config Store resource link.
+- Cloudflare reads from a single JSON string binding in `wrangler.toml [vars]`.
+- Axum reads from the process environment and falls back to `defaults`.
+
+When `[stores.config]` is present, the `app!` macro generates config-store metadata on the `App`
+type. The standard adapter `run_app` helpers use that metadata to inject a config-store handle into
+request extensions automatically, so handlers can call `ctx.config_store()`.
+
 ## Adapters Section
 
 Each adapter has its own configuration block:
@@ -299,6 +332,7 @@ The macro:
 - Parses HTTP triggers
 - Generates route registration
 - Wires middleware from the manifest
+- Generates config-store metadata from `[stores.config]` when present
 - Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
 
 ### ManifestLoader

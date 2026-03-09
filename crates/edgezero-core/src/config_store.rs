@@ -78,44 +78,44 @@ impl ConfigStoreHandle {
 /// ```
 #[macro_export]
 macro_rules! config_store_contract_tests {
-    ($mod_name:ident, $factory:expr) => {
+    ($mod_name:ident, #[$test_attr:meta], $factory:expr $(,)?) => {
         mod $mod_name {
             use super::*;
             use $crate::config_store::ConfigStore;
 
-            #[test]
+            #[$test_attr]
             fn contract_get_returns_value_for_existing_key() {
                 let store = $factory;
                 assert_eq!(store.get("contract.key.a"), Some("value_a".to_string()));
             }
 
-            #[test]
+            #[$test_attr]
             fn contract_get_returns_none_for_missing_key() {
                 let store = $factory;
                 assert_eq!(store.get("contract.key.missing"), None);
             }
 
-            #[test]
+            #[$test_attr]
             fn contract_multiple_keys_are_independent() {
                 let store = $factory;
                 assert_eq!(store.get("contract.key.a"), Some("value_a".to_string()));
                 assert_eq!(store.get("contract.key.b"), Some("value_b".to_string()));
             }
 
-            #[test]
+            #[$test_attr]
             fn contract_key_lookup_is_case_sensitive() {
                 let store = $factory;
                 // lowercase "contract.key.a" exists; uppercase must not match
                 assert_eq!(store.get("CONTRACT.KEY.A"), None);
             }
 
-            #[test]
+            #[$test_attr]
             fn contract_empty_key_returns_none() {
                 let store = $factory;
                 assert_eq!(store.get(""), None);
             }
 
-            #[test]
+            #[$test_attr]
             fn contract_handle_wraps_store() {
                 use std::sync::Arc;
                 use $crate::config_store::ConfigStoreHandle;
@@ -125,7 +125,7 @@ macro_rules! config_store_contract_tests {
                 assert_eq!(handle.get("contract.key.missing"), None);
             }
 
-            #[test]
+            #[$test_attr]
             fn contract_cloned_handle_delegates_consistently() {
                 use std::sync::Arc;
                 use $crate::config_store::ConfigStoreHandle;
@@ -139,6 +139,9 @@ macro_rules! config_store_contract_tests {
                 );
             }
         }
+    };
+    ($mod_name:ident, $factory:expr) => {
+        $crate::config_store_contract_tests!($mod_name, #[test], $factory);
     };
 }
 

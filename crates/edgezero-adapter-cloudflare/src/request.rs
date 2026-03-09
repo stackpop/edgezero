@@ -66,7 +66,8 @@ pub async fn dispatch(
 /// Dispatch a request with a Cloudflare JSON config store injected.
 ///
 /// Reads `binding_name` from `env` (a `[vars]` string whose value is a JSON object),
-/// parses it into a `CloudflareConfigStore`, then injects the handle before dispatch.
+/// parses it into a `CloudflareConfigStore`, and injects the handle before dispatch
+/// when the binding is present and valid.
 pub async fn dispatch_with_config(
     app: &App,
     req: CfRequest,
@@ -74,12 +75,14 @@ pub async fn dispatch_with_config(
     ctx: Context,
     binding_name: &str,
 ) -> Result<CfResponse, WorkerError> {
-    let config_handle =
-        ConfigStoreHandle::new(Arc::new(CloudflareConfigStore::new(&env, binding_name)));
+    let config_handle = CloudflareConfigStore::try_new(&env, binding_name)
+        .map(|store| ConfigStoreHandle::new(Arc::new(store)));
     let mut core_request = into_core_request(req, env, ctx)
         .await
         .map_err(edge_error_to_worker)?;
-    core_request.extensions_mut().insert(config_handle);
+    if let Some(handle) = config_handle {
+        core_request.extensions_mut().insert(handle);
+    }
     let svc = app.router().clone();
     let response = svc.oneshot(core_request).await;
     from_core_response(response).map_err(edge_error_to_worker)

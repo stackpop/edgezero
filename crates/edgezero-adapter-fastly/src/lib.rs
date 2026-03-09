@@ -83,12 +83,18 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
 ) -> Result<fastly::Response, fastly::Error> {
     let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
     let m = manifest_loader.manifest();
-    let logging = m.logging_or_default("fastly");
-    let config_name = m
-        .stores
-        .config
-        .as_ref()
-        .map(|cfg| cfg.config_store_name("fastly").to_string());
+    let logging = m.logging_or_default(edgezero_core::app::FASTLY_ADAPTER);
+    let config_name = A::config_store()
+        .map(|cfg| {
+            cfg.name_for_adapter(edgezero_core::app::FASTLY_ADAPTER)
+                .to_string()
+        })
+        .or_else(|| {
+            m.stores.config.as_ref().map(|cfg| {
+                cfg.config_store_name(edgezero_core::app::FASTLY_ADAPTER)
+                    .to_string()
+            })
+        });
     run_app_with_config::<A>(logging.into(), req, config_name.as_deref())
 }
 

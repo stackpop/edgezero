@@ -41,16 +41,16 @@ authors = ["you@example.com"]
 The Fastly entrypoint wires the adapter:
 
 ```rust
-use edgezero_adapter_fastly::dispatch;
-use edgezero_core::app::Hooks;
 use my_app_core::App;
 
 #[fastly::main]
 fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    let app = App::build_app();
-    dispatch(&app, req)
+    edgezero_adapter_fastly::run_app::<App>(include_str!("../../../edgezero.toml"), req)
 }
 ```
+
+`run_app` reads logging and config-store settings from `edgezero.toml`, builds the app, and injects
+the configured Fastly Config Store into request extensions automatically.
 
 ## Building
 
@@ -130,6 +130,29 @@ fn main() {
 ::: tip Logging status
 Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
 :::
+
+## Config Store
+
+Fastly uses a native Config Store resource link for runtime configuration. Declare the logical store
+name in `edgezero.toml`:
+
+```toml
+[stores.config]
+name = "app_config"
+```
+
+For local Viceroy testing, mirror that binding in `fastly.toml`:
+
+```toml
+[local_server.config_stores.app_config]
+format = "inline-toml"
+
+[local_server.config_stores.app_config.contents]
+greeting = "hello from config store"
+```
+
+Handlers can then read values through `ctx.config_store()`. If the configured store link is missing,
+the adapter logs a warning and continues without injecting a config-store handle.
 
 ## Context Access
 

@@ -67,7 +67,7 @@ fn fastly_request(method: FastlyMethod, path: &str, body: Option<&[u8]>) -> Fast
 
 #[test]
 fn into_core_request_preserves_method_uri_headers_body_and_context() {
-    let mut req = fastly_request(FastlyMethod::POST, "/mirror?foo=bar", Some(b"payload"));
+    let req = fastly_request(FastlyMethod::POST, "/mirror?foo=bar", Some(b"payload"));
     let expected_ip = req.get_client_ip_addr();
 
     let core_request = into_core_request(req).expect("core request");
