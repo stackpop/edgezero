@@ -1,13 +1,16 @@
 use std::io::Read;
+use std::sync::Arc;
 
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request};
 use edgezero_core::proxy::ProxyHandle;
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 
+use crate::config_store::FastlyConfigStore;
 use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
 use crate::FastlyRequestContext;
@@ -42,6 +45,34 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
 
 pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
     let core_request = into_core_request(req).map_err(map_edge_error)?;
+    let response = executor::block_on(app.router().oneshot(core_request));
+    from_core_response(response).map_err(map_edge_error)
+}
+
+/// Dispatch a request with a Fastly Config Store injected into extensions.
+///
+/// If the named store is not available, logs at info level and dispatches without it.
+pub fn dispatch_with_config(
+    app: &App,
+    req: FastlyRequest,
+    store_name: &str,
+) -> Result<FastlyResponse, FastlyError> {
+    let mut core_request = into_core_request(req).map_err(map_edge_error)?;
+
+    match FastlyConfigStore::try_open(store_name) {
+        Some(store) => {
+            core_request
+                .extensions_mut()
+                .insert(ConfigStoreHandle::new(Arc::new(store)));
+        }
+        None => {
+            log::info!(
+                "config store '{}' is not available; proceeding without it",
+                store_name
+            );
+        }
+    }
+
     let response = executor::block_on(app.router().oneshot(core_request));
     from_core_response(response).map_err(map_edge_error)
 }

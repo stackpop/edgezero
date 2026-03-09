@@ -7,5 +7,15 @@ service_id = ""
 
 [local_server]
 
+# Config store entries for local Viceroy testing.
+# Mirrors [stores.config.defaults] in edgezero.toml so smoke tests pass on all adapters.
+[local_server.config_stores.app_config]
+format = "inline-toml"
+
+[local_server.config_stores.app_config.contents]
+greeting = "hello from config store"
+"feature.new_checkout" = "false"
+"service.timeout_ms" = "1500"
+
 [scripts]
   build = "cargo build --profile release --target wasm32-wasip1"

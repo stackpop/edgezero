@@ -1,8 +1,12 @@
+use std::sync::Arc;
+
+use crate::config_store::CloudflareConfigStore;
 use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
 use crate::CloudflareRequestContext;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Method as CoreMethod, Request, Uri};
 use edgezero_core::proxy::ProxyHandle;
@@ -54,6 +58,28 @@ pub async fn dispatch(
     let core_request = into_core_request(req, env, ctx)
         .await
         .map_err(edge_error_to_worker)?;
+    let svc = app.router().clone();
+    let response = svc.oneshot(core_request).await;
+    from_core_response(response).map_err(edge_error_to_worker)
+}
+
+/// Dispatch a request with a Cloudflare JSON config store injected.
+///
+/// Reads `binding_name` from `env` (a `[vars]` string whose value is a JSON object),
+/// parses it into a `CloudflareConfigStore`, then injects the handle before dispatch.
+pub async fn dispatch_with_config(
+    app: &App,
+    req: CfRequest,
+    env: Env,
+    ctx: Context,
+    binding_name: &str,
+) -> Result<CfResponse, WorkerError> {
+    let config_handle =
+        ConfigStoreHandle::new(Arc::new(CloudflareConfigStore::new(&env, binding_name)));
+    let mut core_request = into_core_request(req, env, ctx)
+        .await
+        .map_err(edge_error_to_worker)?;
+    core_request.extensions_mut().insert(config_handle);
     let svc = app.router().clone();
     let response = svc.oneshot(core_request).await;
     from_core_response(response).map_err(edge_error_to_worker)

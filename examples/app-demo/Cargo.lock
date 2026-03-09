@@ -536,6 +536,7 @@ dependencies = [
  "futures",
  "futures-util",
  "log",
+ "serde_json",
  "wasm-bindgen-test",
  "worker",
 ]

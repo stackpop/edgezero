@@ -7,11 +7,13 @@ use tokio::signal;
 use tower::{service_fn, Service};
 
 use edgezero_core::app::Hooks;
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::manifest::ManifestLoader;
 use edgezero_core::router::RouterService;
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
+use crate::config_store::AxumConfigStore;
 use crate::service::EdgeZeroAxumService;
 
 /// Configuration used when running the dev server embedding EdgeZero into Axum.
@@ -34,6 +36,7 @@ impl Default for AxumDevServerConfig {
 pub struct AxumDevServer {
     router: RouterService,
     config: AxumDevServerConfig,
+    config_store_handle: Option<ConfigStoreHandle>,
 }
 
 impl AxumDevServer {
@@ -41,11 +44,22 @@ impl AxumDevServer {
         Self {
             router,
             config: AxumDevServerConfig::default(),
+            config_store_handle: None,
         }
     }
 
     pub fn with_config(router: RouterService, config: AxumDevServerConfig) -> Self {
-        Self { router, config }
+        Self {
+            router,
+            config,
+            config_store_handle: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_config_store(mut self, handle: ConfigStoreHandle) -> Self {
+        self.config_store_handle = Some(handle);
+        self
     }
 
     pub fn run(self) -> anyhow::Result<()> {
@@ -58,7 +72,11 @@ impl AxumDevServer {
     }
 
     async fn run_async(self) -> anyhow::Result<()> {
-        let AxumDevServer { router, config } = self;
+        let AxumDevServer {
+            router,
+            config,
+            config_store_handle,
+        } = self;
 
         // Allow binding to already-open listener if caller created one to surface errors early.
         let listener = StdTcpListener::bind(config.addr)
@@ -70,13 +88,17 @@ impl AxumDevServer {
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("failed to adopt std listener into tokio")?;
 
-        serve_with_listener(router, listener, config.enable_ctrl_c).await
+        serve_with_listener(router, listener, config.enable_ctrl_c, config_store_handle).await
     }
 
     #[cfg(test)]
     async fn run_with_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-        let AxumDevServer { router, config } = self;
-        serve_with_listener(router, listener, config.enable_ctrl_c).await
+        let AxumDevServer {
+            router,
+            config,
+            config_store_handle,
+        } = self;
+        serve_with_listener(router, listener, config.enable_ctrl_c, config_store_handle).await
     }
 }
 
@@ -84,8 +106,12 @@ async fn serve_with_listener(
     router: RouterService,
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
+    config_store_handle: Option<ConfigStoreHandle>,
 ) -> anyhow::Result<()> {
-    let service = EdgeZeroAxumService::new(router);
+    let mut service = EdgeZeroAxumService::new(router);
+    if let Some(handle) = config_store_handle {
+        service = service.with_config_store_handle(handle);
+    }
     let router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
         async move { svc.call(req).await }
@@ -113,7 +139,8 @@ async fn serve_with_listener(
 
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let manifest = ManifestLoader::load_from_str(manifest_src);
-    let logging = manifest.manifest().logging_or_default("axum");
+    let m = manifest.manifest();
+    let logging = m.logging_or_default("axum");
 
     let level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
@@ -127,7 +154,13 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let app = A::build_app();
     let router = app.router().clone();
 
-    AxumDevServer::new(router).run()
+    let mut server = AxumDevServer::new(router);
+    if let Some(cfg) = m.stores.config.as_ref() {
+        let defaults = cfg.config_store_defaults().clone();
+        let store = AxumConfigStore::from_env(defaults);
+        server = server.with_config_store(ConfigStoreHandle::new(std::sync::Arc::new(store)));
+    }
+    server.run()
 }
 
 #[cfg(test)]

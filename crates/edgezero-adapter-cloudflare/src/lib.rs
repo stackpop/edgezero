@@ -4,6 +4,8 @@
 pub mod cli;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub mod config_store;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod proxy;
@@ -13,11 +15,13 @@ mod request;
 mod response;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub use config_store::CloudflareConfigStore;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use context::CloudflareRequestContext;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use proxy::CloudflareProxyClient;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use request::{dispatch, into_core_request};
+pub use request::{dispatch, dispatch_with_config, into_core_request};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
@@ -66,4 +70,26 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     init_logger().expect("init cloudflare logger");
     let app = A::build_app();
     dispatch(&app, req, env, ctx).await
+}
+
+/// Run the app resolving the config store binding name from `manifest_src`.
+///
+/// If `[stores.config]` is present in the manifest, injects a
+/// [`CloudflareConfigStore`] built from the Cloudflare env before dispatching.
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub async fn run_app_with_manifest<A: edgezero_core::app::Hooks>(
+    manifest_src: &str,
+    req: worker::Request,
+    env: worker::Env,
+    ctx: worker::Context,
+) -> Result<worker::Response, worker::Error> {
+    init_logger().expect("init cloudflare logger");
+    let manifest = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
+    let app = A::build_app();
+    if let Some(cfg) = manifest.manifest().stores.config.as_ref() {
+        let binding_name = cfg.config_store_name("cloudflare").to_string();
+        dispatch_with_config(&app, req, env, ctx, &binding_name).await
+    } else {
+        dispatch(&app, req, env, ctx).await
+    }
 }

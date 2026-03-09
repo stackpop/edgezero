@@ -17,6 +17,11 @@ pub(crate) struct EchoParams {
 }
 
 #[derive(serde::Deserialize)]
+struct ConfigParams {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
 pub(crate) struct EchoBody {
     pub(crate) name: String,
 }
@@ -110,11 +115,35 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
         .map_err(EdgeError::internal)
 }
 
+#[action]
+pub(crate) async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
+    let params: ConfigParams = ctx.path()?;
+    match ctx.config_store().and_then(|s| s.get(&params.name)) {
+        Some(value) => {
+            let body = Body::text(value);
+            http::response_builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(body)
+                .map_err(EdgeError::internal)
+        }
+        None => {
+            let body = Body::text(format!("config key '{}' not found", params.name));
+            http::response_builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("content-type", "text/plain; charset=utf-8")
+                .body(body)
+                .map_err(EdgeError::internal)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
@@ -124,6 +153,7 @@ mod tests {
     use futures::{executor::block_on, StreamExt};
     use std::collections::HashMap;
     use std::env;
+    use std::sync::Arc;
 
     #[test]
     fn root_returns_static_body() {
@@ -279,5 +309,58 @@ mod tests {
             .body(Body::from(json))
             .expect("request");
         RequestContext::new(request, PathParams::default())
+    }
+
+    struct MapConfigStore(HashMap<String, String>);
+
+    impl ConfigStore for MapConfigStore {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!("/config/{key}"))
+            .body(Body::empty())
+            .expect("request");
+        let store = MapConfigStore(
+            entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        request
+            .extensions_mut()
+            .insert(ConfigStoreHandle::new(Arc::new(store)));
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), key.to_string());
+        RequestContext::new(request, PathParams::new(params))
+    }
+
+    #[test]
+    fn config_get_returns_value_when_key_exists() {
+        let ctx = context_with_config_key("greeting", &[("greeting", "hello from config store")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().into_bytes().as_ref(),
+            b"hello from config store"
+        );
+    }
+
+    #[test]
+    fn config_get_returns_404_when_key_missing() {
+        let ctx = context_with_config_key("missing.key", &[("other.key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_404_when_no_store_injected() {
+        let ctx = context_with_params("/config/greeting", &[("name", "greeting")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
