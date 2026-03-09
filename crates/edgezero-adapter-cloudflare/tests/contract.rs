@@ -2,8 +2,7 @@
 
 use bytes::Bytes;
 use edgezero_adapter_cloudflare::{
-    dispatch, dispatch_with_config, from_core_response, into_core_request,
-    CloudflareRequestContext,
+    dispatch, dispatch_with_config, from_core_response, into_core_request, CloudflareRequestContext,
 };
 use edgezero_core::{
     app::App,
