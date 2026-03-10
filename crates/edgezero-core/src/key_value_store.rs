@@ -129,13 +129,6 @@ pub trait KvStore: Send + Sync {
     /// Delete a key. Returns `Ok(())` even if the key did not exist.
     async fn delete(&self, key: &str) -> Result<(), KvError>;
 
-    /// List keys that start with `prefix`. Returns an empty vec if none match.
-    ///
-    /// **Note:** Results are returned in a single `Vec` with no pagination.
-    /// This is suitable for namespaces with up to ~10 000 keys. For larger
-    /// datasets, consider narrowing the prefix or adding pagination upstream.
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError>;
-
     /// Check whether a key exists.
     ///
     /// The default implementation delegates to `get_bytes`. Backends that
@@ -175,9 +168,6 @@ impl KvStore for NoopKvStore {
     }
     async fn delete(&self, _key: &str) -> Result<(), KvError> {
         Ok(())
-    }
-    async fn list_keys(&self, _prefix: &str) -> Result<Vec<String>, KvError> {
-        Ok(vec![])
     }
 }
 
@@ -391,22 +381,6 @@ impl KvHandle {
         Self::validate_key(key)?;
         self.store.delete(key).await
     }
-
-    /// List keys with the given prefix.
-    ///
-    /// An empty prefix returns all keys. Prefixes are size-checked but not
-    /// subject to the full key validation (e.g. empty string is valid as a
-    /// "match everything" prefix).
-    pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-        if prefix.len() > Self::MAX_KEY_SIZE {
-            return Err(KvError::Validation(format!(
-                "prefix length {} exceeds limit of {} bytes",
-                prefix.len(),
-                Self::MAX_KEY_SIZE
-            )));
-        }
-        self.store.list_keys(prefix).await
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,29 +463,6 @@ macro_rules! key_value_store_contract_tests {
                 let store = $factory;
                 run(async {
                     store.delete("nope").await.unwrap();
-                });
-            }
-
-            #[test]
-            fn contract_list_keys_prefix() {
-                let store = $factory;
-                run(async {
-                    store.put_bytes("a:1", Bytes::from("v")).await.unwrap();
-                    store.put_bytes("a:2", Bytes::from("v")).await.unwrap();
-                    store.put_bytes("b:1", Bytes::from("v")).await.unwrap();
-
-                    let mut keys = store.list_keys("a:").await.unwrap();
-                    keys.sort();
-                    assert_eq!(keys, vec!["a:1", "a:2"]);
-                });
-            }
-
-            #[test]
-            fn contract_list_keys_empty_store() {
-                let store = $factory;
-                run(async {
-                    let keys = store.list_keys("").await.unwrap();
-                    assert!(keys.is_empty());
                 });
             }
 
@@ -630,20 +581,6 @@ mod tests {
             let mut data = self.data.lock().unwrap();
             data.remove(key);
             Ok(())
-        }
-
-        async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-            let mut data = self.data.lock().unwrap();
-            let now = SystemTime::now();
-            // Remove expired keys first
-            data.retain(|_, (_, exp)| exp.is_none_or(|e| now < e));
-            let mut keys: Vec<String> = data
-                .keys()
-                .filter(|k| k.starts_with(prefix))
-                .cloned()
-                .collect();
-            keys.sort();
-            Ok(keys)
         }
     }
 
@@ -795,43 +732,6 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             h.delete("nope").await.unwrap();
-        });
-    }
-
-    // -- List keys ----------------------------------------------------------
-
-    #[test]
-    fn list_keys_with_prefix() {
-        let h = handle();
-        futures::executor::block_on(async {
-            h.put_bytes("user:1", Bytes::from("a")).await.unwrap();
-            h.put_bytes("user:2", Bytes::from("b")).await.unwrap();
-            h.put_bytes("session:1", Bytes::from("c")).await.unwrap();
-
-            let keys = h.list_keys("user:").await.unwrap();
-            assert_eq!(keys, vec!["user:1", "user:2"]);
-        });
-    }
-
-    #[test]
-    fn list_keys_empty_prefix_returns_all() {
-        let h = handle();
-        futures::executor::block_on(async {
-            h.put_bytes("a", Bytes::from("1")).await.unwrap();
-            h.put_bytes("b", Bytes::from("2")).await.unwrap();
-
-            let keys = h.list_keys("").await.unwrap();
-            assert_eq!(keys, vec!["a", "b"]);
-        });
-    }
-
-    #[test]
-    fn list_keys_no_matches() {
-        let h = handle();
-        futures::executor::block_on(async {
-            h.put_bytes("a", Bytes::from("1")).await.unwrap();
-            let keys = h.list_keys("zzz").await.unwrap();
-            assert!(keys.is_empty());
         });
     }
 
@@ -1044,28 +944,6 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{}", err).contains("at least 60 seconds"));
-        });
-    }
-
-    #[test]
-    fn list_keys_overlapping_prefixes() {
-        let h = handle();
-        futures::executor::block_on(async {
-            h.put_bytes("app:user:1", Bytes::from("a")).await.unwrap();
-            h.put_bytes("app:user:2", Bytes::from("b")).await.unwrap();
-            h.put_bytes("app:session:1", Bytes::from("c"))
-                .await
-                .unwrap();
-            h.put_bytes("other:1", Bytes::from("d")).await.unwrap();
-
-            let app_keys = h.list_keys("app:").await.unwrap();
-            assert_eq!(app_keys.len(), 3);
-
-            let user_keys = h.list_keys("app:user:").await.unwrap();
-            assert_eq!(user_keys, vec!["app:user:1", "app:user:2"]);
-
-            let session_keys = h.list_keys("app:session:").await.unwrap();
-            assert_eq!(session_keys, vec!["app:session:1"]);
         });
     }
 

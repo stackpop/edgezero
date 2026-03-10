@@ -385,16 +385,6 @@ mod tests {
             self.data.lock().unwrap().remove(key);
             Ok(())
         }
-        async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-            Ok(self
-                .data
-                .lock()
-                .unwrap()
-                .keys()
-                .filter(|k| k.starts_with(prefix))
-                .cloned()
-                .collect())
-        }
     }
 
     fn context_with_kv(

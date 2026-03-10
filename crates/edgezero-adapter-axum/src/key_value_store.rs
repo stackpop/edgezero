@@ -15,12 +15,9 @@
 //!
 //! ## TTL and Cleanup
 //!
-//! Expired entries are lazily evicted when accessed via `get_bytes` or when
-//! scanning keys with `list_keys`. Entries that are never accessed after expiration
-//! will remain in the database until explicitly listed or deleted.
-//!
-//! For long-running servers with many expiring keys, consider periodically calling
-//! `list_keys("")` to trigger cleanup of expired entries.
+//! Expired entries are lazily evicted when accessed via `get_bytes`.
+//! Entries that are never accessed after expiration will remain in the
+//! database until explicitly deleted.
 //!
 //! ## Database File Management
 //!
@@ -244,73 +241,6 @@ impl KvStore for PersistentKvStore {
         }
         Self::commit(write_txn)
     }
-
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-        let read_txn = self
-            .db
-            .begin_read()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin read txn: {}", e)))?;
-
-        let table = read_txn
-            .open_table(KV_TABLE)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
-
-        // Collect all keys and identify expired ones
-        let mut keys = Vec::new();
-        let mut expired_keys = Vec::new();
-
-        let iter = table
-            .iter()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to iterate: {}", e)))?;
-
-        for entry in iter {
-            let entry = entry
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to read entry: {}", e)))?;
-            let key = entry.0.value();
-            let (_value, expires_at) = entry.1.value();
-
-            if Self::is_expired(expires_at) {
-                expired_keys.push(key.to_string());
-            } else if key.starts_with(prefix) {
-                keys.push(key.to_string());
-            }
-        }
-
-        // Drop read transaction before write
-        drop(table);
-        drop(read_txn);
-
-        // Remove expired keys
-        if !expired_keys.is_empty() {
-            let write_txn = self.begin_write()?;
-            {
-                let mut table = Self::open_table(&write_txn)?;
-                for key in &expired_keys {
-                    // Re-check expiry inside write txn to avoid TOCTOU race:
-                    // a concurrent put_bytes may have overwritten the key.
-                    let still_expired = table
-                        .get(key.as_str())
-                        .map_err(|e| {
-                            KvError::Internal(anyhow::anyhow!("failed to get key: {}", e))
-                        })?
-                        .is_some_and(|entry| {
-                            let (_, exp) = entry.value();
-                            Self::is_expired(exp)
-                        });
-                    if still_expired {
-                        table.remove(key.as_str()).map_err(|e| {
-                            KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
-                        })?;
-                    }
-                }
-            }
-            Self::commit(write_txn)?;
-        }
-
-        // Sort keys to maintain consistency with BTreeMap behavior
-        keys.sort();
-        Ok(keys)
-    }
 }
 
 #[cfg(test)]
@@ -364,15 +294,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_keys_filters_by_prefix() {
-        let (s, _dir) = store();
-        s.put_bytes("a", Bytes::from("1")).await.unwrap();
-        s.put_bytes("b", Bytes::from("2")).await.unwrap();
-        let keys = s.list_keys("").await.unwrap();
-        assert_eq!(keys, vec!["a", "b"]);
-    }
-
-    #[tokio::test]
     async fn ttl_expires_entry() {
         // Use the store impl directly to bypass validation limits (min TTL 60s)
         let temp_dir = tempfile::tempdir().unwrap();
@@ -393,22 +314,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.get_bytes("temp").await.unwrap(), Some(Bytes::from("val")));
-    }
-
-    #[tokio::test]
-    async fn list_keys_evicts_expired() {
-        // Use the store impl directly to bypass validation limits (min TTL 60s)
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.redb");
-        let s = PersistentKvStore::new(db_path).unwrap();
-        s.put_bytes_with_ttl("expired", Bytes::from("x"), Duration::from_millis(1))
-            .await
-            .unwrap();
-        s.put_bytes("alive", Bytes::from("y")).await.unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-
-        let keys = s.list_keys("").await.unwrap();
-        assert_eq!(keys, vec!["alive"]);
     }
 
     // -- Typed helpers via KvHandle ----------------------------------------
@@ -453,8 +358,6 @@ mod tests {
     #[tokio::test]
     async fn new_store_is_empty() {
         let (s, _dir) = store();
-        let keys = s.list_keys("").await.unwrap();
-        assert!(keys.is_empty());
         assert!(!s.exists("anything").await.unwrap());
     }
 
@@ -477,22 +380,6 @@ mod tests {
             let val: i32 = handle.get_or(&key, -1).await.unwrap();
             assert_eq!(val, i);
         }
-
-        let keys = handle.list_keys("key:").await.unwrap();
-        assert_eq!(keys.len(), 100);
-    }
-
-    #[tokio::test]
-    async fn delete_then_list_keys_is_consistent() {
-        let (s, _dir) = store();
-        s.put_bytes("a", Bytes::from("1")).await.unwrap();
-        s.put_bytes("b", Bytes::from("2")).await.unwrap();
-        s.put_bytes("c", Bytes::from("3")).await.unwrap();
-
-        s.delete("b").await.unwrap();
-
-        let keys = s.list_keys("").await.unwrap();
-        assert_eq!(keys, vec!["a", "c"]);
     }
 
     #[tokio::test]

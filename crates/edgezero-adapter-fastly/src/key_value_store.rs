@@ -74,19 +74,6 @@ impl KvStore for FastlyKvStore {
             .delete(key)
             .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
     }
-
-    async fn list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
-        let mut keys = Vec::new();
-
-        // Use the ListBuilder's iterator for automatic pagination.
-        for page_result in self.store.build_list().prefix(prefix).iter() {
-            let page =
-                page_result.map_err(|e| KvError::Internal(anyhow::anyhow!("list failed: {e}")))?;
-            keys.extend(page.into_keys());
-        }
-
-        Ok(keys)
-    }
 }
 
 // TODO: integration tests require the Fastly compute environment.

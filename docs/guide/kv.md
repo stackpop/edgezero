@@ -66,9 +66,12 @@ async fn handler(ctx: RequestContext) {
 The `KvHandle` provides typed helpers that automatically serialize/deserialize JSON:
 
 - `get<T>(key)`: Returns `Option<T>`.
+- `get_or(key, default)`: Returns the value or a fallback.
 - `put<T>(key, value)`: Stores a value.
+- `put_with_ttl(key, value, ttl)`: Stores a value that expires after `ttl`.
 - `delete(key)`: Removes a value.
-- `list_keys(prefix)`: Lists keys starting with a prefix.
+- `exists(key)`: Checks if a key is present.
+- `read_modify_write(key, default, f)`: Read-modify-write (non-atomic).
 
 It also supports raw bytes via `get_bytes`, `put_bytes`, etc.
 
