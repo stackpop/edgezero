@@ -37,18 +37,17 @@
 //!
 //! ## Performance Notes
 //!
-//! - `list_keys` performs a full table scan. Performance may degrade with
-//!   very large datasets (>10k keys).
 //! - All operations are ACID-compliant via redb's transaction system.
 //! - The database file path acts as the namespace identifier, similar to
 //!   how Cloudflare uses bindings and Fastly uses store names.
 
+use std::ops::Bound;
 use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use edgezero_core::key_value_store::{KvError, KvStore};
+use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::time::SystemTime;
 
@@ -68,6 +67,8 @@ pub struct PersistentKvStore {
 }
 
 impl PersistentKvStore {
+    const LIST_SCAN_BATCH_SIZE: usize = 256;
+
     /// Create a new persistent KV store at the given path.
     ///
     /// # Behavior
@@ -141,6 +142,32 @@ impl PersistentKvStore {
     fn commit(txn: redb::WriteTransaction) -> Result<(), KvError> {
         txn.commit()
             .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))
+    }
+
+    fn cleanup_expired_keys(&self, expired_keys: &[String]) -> Result<(), KvError> {
+        if expired_keys.is_empty() {
+            return Ok(());
+        }
+
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = Self::open_table(&write_txn)?;
+            for key in expired_keys {
+                let still_expired = table
+                    .get(key.as_str())
+                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {}", e)))?
+                    .is_some_and(|entry| {
+                        let (_, expires_at) = entry.value();
+                        Self::is_expired(expires_at)
+                    });
+                if still_expired {
+                    table.remove(key.as_str()).map_err(|e| {
+                        KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
+                    })?;
+                }
+            }
+        }
+        Self::commit(write_txn)
     }
 }
 
@@ -241,6 +268,90 @@ impl KvStore for PersistentKvStore {
         }
         Self::commit(write_txn)
     }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let mut live_keys = Vec::with_capacity(limit.saturating_add(1));
+        let mut scan_cursor = cursor.map(str::to_string);
+        let mut reached_end = false;
+
+        while live_keys.len() < limit + 1 && !reached_end {
+            let mut expired_keys = Vec::new();
+
+            {
+                let read_txn = self.db.begin_read().map_err(|e| {
+                    KvError::Internal(anyhow::anyhow!("failed to begin read txn: {}", e))
+                })?;
+
+                let table = read_txn.open_table(KV_TABLE).map_err(|e| {
+                    KvError::Internal(anyhow::anyhow!("failed to open table: {}", e))
+                })?;
+
+                let mut iter = if prefix.is_empty() {
+                    match scan_cursor.as_deref() {
+                        Some(cursor) => {
+                            table.range::<&str>((Bound::Excluded(cursor), Bound::Unbounded))
+                        }
+                        None => table.iter(),
+                    }
+                } else {
+                    match scan_cursor.as_deref() {
+                        Some(cursor) if cursor >= prefix => {
+                            table.range::<&str>((Bound::Excluded(cursor), Bound::Unbounded))
+                        }
+                        _ => table.range(prefix..),
+                    }
+                }
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to create range: {}", e)))?;
+
+                for _ in 0..Self::LIST_SCAN_BATCH_SIZE {
+                    let Some(entry) = iter.next() else {
+                        reached_end = true;
+                        break;
+                    };
+
+                    let (key, value) = entry.map_err(|e| {
+                        KvError::Internal(anyhow::anyhow!("failed to read range entry: {}", e))
+                    })?;
+                    let key = key.value().to_string();
+
+                    if !prefix.is_empty() && !key.starts_with(prefix) {
+                        reached_end = true;
+                        break;
+                    }
+
+                    scan_cursor = Some(key.clone());
+                    let (_, expires_at) = value.value();
+
+                    if Self::is_expired(expires_at) {
+                        expired_keys.push(key);
+                        continue;
+                    }
+
+                    live_keys.push(key);
+                    if live_keys.len() == limit + 1 {
+                        break;
+                    }
+                }
+            }
+
+            self.cleanup_expired_keys(&expired_keys)?;
+        }
+
+        let has_more = live_keys.len() > limit;
+        if has_more {
+            live_keys.truncate(limit);
+        }
+
+        Ok(KvPage {
+            cursor: has_more.then(|| live_keys.last().cloned()).flatten(),
+            keys: live_keys,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +425,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(s.get_bytes("temp").await.unwrap(), Some(Bytes::from("val")));
+    }
+
+    #[tokio::test]
+    async fn list_keys_page_skips_expired_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let s = PersistentKvStore::new(db_path).unwrap();
+
+        s.put_bytes("app/live", Bytes::from("value")).await.unwrap();
+        s.put_bytes_with_ttl("app/expired", Bytes::from("gone"), Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        let page = s.list_keys_page("app/", None, 10).await.unwrap();
+        assert_eq!(page.keys, vec!["app/live".to_string()]);
+        assert_eq!(page.cursor, None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_keys_does_not_delete_fresh_overwrite() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let s = PersistentKvStore::new(db_path).unwrap();
+
+        s.put_bytes_with_ttl("race/key", Bytes::from("stale"), Duration::from_millis(1))
+            .await
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        s.put_bytes("race/key", Bytes::from("fresh")).await.unwrap();
+
+        s.cleanup_expired_keys(&["race/key".to_string()]).unwrap();
+
+        assert_eq!(
+            s.get_bytes("race/key").await.unwrap(),
+            Some(Bytes::from("fresh"))
+        );
     }
 
     // -- Typed helpers via KvHandle ----------------------------------------

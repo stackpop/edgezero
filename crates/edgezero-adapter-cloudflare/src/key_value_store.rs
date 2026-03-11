@@ -12,7 +12,7 @@ use async_trait::async_trait;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use bytes::Bytes;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-use edgezero_core::key_value_store::{KvError, KvStore};
+use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use std::time::Duration;
 
@@ -82,6 +82,35 @@ impl KvStore for CloudflareKvStore {
             .delete(key)
             .await
             .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let mut request = self.store.list().limit(limit as u64);
+
+        if !prefix.is_empty() {
+            request = request.prefix(prefix.to_string());
+        }
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+            request = request.cursor(cursor.to_string());
+        }
+
+        let response = request
+            .execute()
+            .await
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("list execute failed: {e}")))?;
+
+        Ok(KvPage {
+            keys: response.keys.into_iter().map(|key| key.name).collect(),
+            cursor: (!response.list_complete)
+                .then_some(response.cursor)
+                .flatten()
+                .filter(|cursor| !cursor.is_empty()),
+        })
     }
 }
 

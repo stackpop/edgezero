@@ -18,4 +18,4 @@ pub mod response;
 pub mod router;
 
 pub use edgezero_macros::{action, app};
-pub use key_value_store::{KvError, KvHandle, KvStore};
+pub use key_value_store::{KvError, KvHandle, KvPage, KvStore};

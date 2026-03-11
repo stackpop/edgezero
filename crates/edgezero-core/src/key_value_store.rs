@@ -50,7 +50,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::EdgeError;
 
@@ -80,6 +80,22 @@ pub enum KvError {
     /// A general internal error.
     #[error("kv store error: {0}")]
     Internal(#[from] anyhow::Error),
+}
+
+/// A single page of keys from a KV listing operation.
+///
+/// The `cursor` is opaque. Pass it back to `list_keys_page` to continue
+/// listing from the next page. `None` means the current page is the last page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KvPage {
+    pub keys: Vec<String>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KvCursorEnvelope {
+    prefix: String,
+    cursor: String,
 }
 
 impl From<KvError> for EdgeError {
@@ -129,6 +145,18 @@ pub trait KvStore: Send + Sync {
     /// Delete a key. Returns `Ok(())` even if the key did not exist.
     async fn delete(&self, key: &str) -> Result<(), KvError>;
 
+    /// List keys in lexicographic order, returning at most `limit` keys.
+    ///
+    /// The `cursor` is opaque. Pass the cursor from a previous page back to
+    /// continue listing. Implementations should keep memory usage bounded to a
+    /// single page worth of keys.
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError>;
+
     /// Check whether a key exists.
     ///
     /// The default implementation delegates to `get_bytes`. Backends that
@@ -168,6 +196,14 @@ impl KvStore for NoopKvStore {
     }
     async fn delete(&self, _key: &str) -> Result<(), KvError> {
         Ok(())
+    }
+    async fn list_keys_page(
+        &self,
+        _prefix: &str,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<KvPage, KvError> {
+        Ok(KvPage::default())
     }
 }
 
@@ -213,6 +249,9 @@ impl KvHandle {
 
     /// Maximum TTL (1 year). Prevents overflow when adding to `SystemTime::now()`.
     pub const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+    /// Maximum number of keys returned from a single page.
+    pub const MAX_LIST_PAGE_SIZE: usize = 1_000;
 
     /// Create a new handle wrapping a KV store implementation.
     pub fn new(store: Arc<dyn KvStore>) -> Self {
@@ -269,6 +308,72 @@ impl KvHandle {
             )));
         }
         Ok(())
+    }
+
+    fn validate_prefix(prefix: &str) -> Result<(), KvError> {
+        if prefix.len() > Self::MAX_KEY_SIZE {
+            return Err(KvError::Validation(format!(
+                "prefix length {} exceeds limit of {} bytes",
+                prefix.len(),
+                Self::MAX_KEY_SIZE
+            )));
+        }
+        if prefix.chars().any(|c| c.is_control()) {
+            return Err(KvError::Validation(
+                "prefix contains invalid control characters".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_list_limit(limit: usize) -> Result<(), KvError> {
+        if limit == 0 {
+            return Err(KvError::Validation(
+                "list limit must be greater than zero".to_string(),
+            ));
+        }
+        if limit > Self::MAX_LIST_PAGE_SIZE {
+            return Err(KvError::Validation(format!(
+                "list limit {} exceeds maximum of {}",
+                limit,
+                Self::MAX_LIST_PAGE_SIZE
+            )));
+        }
+        Ok(())
+    }
+
+    fn decode_list_cursor(prefix: &str, cursor: Option<&str>) -> Result<Option<String>, KvError> {
+        let Some(cursor) = cursor else {
+            return Ok(None);
+        };
+
+        let envelope: KvCursorEnvelope = serde_json::from_str(cursor)
+            .map_err(|_| KvError::Validation("list cursor is invalid or corrupted".to_string()))?;
+
+        if envelope.prefix != prefix {
+            return Err(KvError::Validation(
+                "list cursor does not match the requested prefix".to_string(),
+            ));
+        }
+        if envelope.cursor.is_empty() {
+            return Err(KvError::Validation(
+                "list cursor payload cannot be empty".to_string(),
+            ));
+        }
+
+        Ok(Some(envelope.cursor))
+    }
+
+    fn encode_list_cursor(prefix: &str, cursor: Option<String>) -> Result<Option<String>, KvError> {
+        cursor
+            .map(|cursor| {
+                serde_json::to_string(&KvCursorEnvelope {
+                    prefix: prefix.to_string(),
+                    cursor,
+                })
+                .map_err(KvError::from)
+            })
+            .transpose()
     }
 
     // -- Typed helpers (JSON) -----------------------------------------------
@@ -380,6 +485,32 @@ impl KvHandle {
     pub async fn delete(&self, key: &str) -> Result<(), KvError> {
         Self::validate_key(key)?;
         self.store.delete(key).await
+    }
+
+    /// List keys in a bounded, paginated fashion.
+    ///
+    /// The cursor is opaque, prefix-bound, and should be passed back unchanged
+    /// with the same prefix to retrieve the next page. Listings are not atomic
+    /// snapshots and may reflect concurrent writes or provider-level eventual
+    /// consistency.
+    pub async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        Self::validate_prefix(prefix)?;
+        Self::validate_list_limit(limit)?;
+        let decoded_cursor = Self::decode_list_cursor(prefix, cursor)?;
+        let page = self
+            .store
+            .list_keys_page(prefix, decoded_cursor.as_deref(), limit)
+            .await?;
+
+        Ok(KvPage {
+            keys: page.keys,
+            cursor: Self::encode_list_cursor(prefix, page.cursor)?,
+        })
     }
 }
 
@@ -518,6 +649,87 @@ macro_rules! key_value_store_contract_tests {
                     assert_eq!(store.get_bytes("ephemeral").await.unwrap(), None);
                 });
             }
+
+            #[test]
+            fn contract_list_keys_page_is_paginated() {
+                let store = $factory;
+                run(async {
+                    let expected = vec![
+                        "app/one".to_string(),
+                        "app/two".to_string(),
+                        "other/three".to_string(),
+                    ];
+                    for key in &expected {
+                        store
+                            .put_bytes(key, Bytes::from(key.clone()))
+                            .await
+                            .unwrap();
+                    }
+
+                    let mut cursor = None;
+                    let mut seen = std::collections::HashSet::new();
+                    let mut collected = Vec::new();
+
+                    for _ in 0..expected.len() {
+                        let page = store
+                            .list_keys_page("", cursor.as_deref(), 1)
+                            .await
+                            .unwrap();
+                        assert!(page.keys.len() <= 1);
+                        for key in &page.keys {
+                            assert!(
+                                seen.insert(key.clone()),
+                                "duplicate key in pagination: {key}"
+                            );
+                            collected.push(key.clone());
+                        }
+
+                        cursor = page.cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
+
+                    collected.sort();
+                    let mut expected_sorted = expected.clone();
+                    expected_sorted.sort();
+                    assert_eq!(collected, expected_sorted);
+                });
+            }
+
+            #[test]
+            fn contract_list_keys_page_respects_prefix() {
+                let store = $factory;
+                run(async {
+                    store
+                        .put_bytes("prefix/a", Bytes::from_static(b"a"))
+                        .await
+                        .unwrap();
+                    store
+                        .put_bytes("prefix/b", Bytes::from_static(b"b"))
+                        .await
+                        .unwrap();
+                    store
+                        .put_bytes("other/c", Bytes::from_static(b"c"))
+                        .await
+                        .unwrap();
+
+                    let first = store.list_keys_page("prefix/", None, 1).await.unwrap();
+                    assert_eq!(first.keys.len(), 1);
+                    assert!(first.keys[0].starts_with("prefix/"));
+
+                    let second = store
+                        .list_keys_page("prefix/", first.cursor.as_deref(), 1)
+                        .await
+                        .unwrap();
+                    assert!(second.keys.iter().all(|key| key.starts_with("prefix/")));
+                    assert!(first
+                        .keys
+                        .iter()
+                        .chain(second.keys.iter())
+                        .all(|key| key.starts_with("prefix/")));
+                });
+            }
         }
     };
 }
@@ -581,6 +793,34 @@ mod tests {
             let mut data = self.data.lock().unwrap();
             data.remove(key);
             Ok(())
+        }
+
+        async fn list_keys_page(
+            &self,
+            prefix: &str,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> Result<KvPage, KvError> {
+            let mut data = self.data.lock().unwrap();
+            let now = SystemTime::now();
+            data.retain(|_, (_, expires_at)| expires_at.is_none_or(|exp| now < exp));
+
+            let mut keys = data
+                .keys()
+                .filter(|key| {
+                    key.starts_with(prefix) && cursor.is_none_or(|cursor| key.as_str() > cursor)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.sort();
+
+            let has_more = keys.len() > limit;
+            keys.truncate(limit);
+
+            Ok(KvPage {
+                cursor: has_more.then(|| keys.last().cloned()).flatten(),
+                keys,
+            })
         }
     }
 
@@ -732,6 +972,29 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             h.delete("nope").await.unwrap();
+        });
+    }
+
+    #[test]
+    fn list_keys_page_roundtrip() {
+        let h = handle();
+        futures::executor::block_on(async {
+            h.put("app/a", &1i32).await.unwrap();
+            h.put("app/b", &2i32).await.unwrap();
+            h.put("app/c", &3i32).await.unwrap();
+            h.put("other/d", &4i32).await.unwrap();
+
+            let first = h.list_keys_page("app/", None, 2).await.unwrap();
+            assert_eq!(first.keys, vec!["app/a".to_string(), "app/b".to_string()]);
+            assert!(first.cursor.is_some());
+            assert_ne!(first.cursor.as_deref(), Some("app/b"));
+
+            let second = h
+                .list_keys_page("app/", first.cursor.as_deref(), 2)
+                .await
+                .unwrap();
+            assert_eq!(second.keys, vec!["app/c".to_string()]);
+            assert_eq!(second.cursor, None);
         });
     }
 
@@ -944,6 +1207,80 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{}", err).contains("at least 60 seconds"));
+        });
+    }
+
+    #[test]
+    fn validation_rejects_zero_list_limit() {
+        let h = handle();
+        futures::executor::block_on(async {
+            let err = h.list_keys_page("", None, 0).await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("greater than zero"));
+        });
+    }
+
+    #[test]
+    fn validation_rejects_large_list_limit() {
+        let h = handle();
+        futures::executor::block_on(async {
+            let err = h
+                .list_keys_page("", None, KvHandle::MAX_LIST_PAGE_SIZE + 1)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("list limit"));
+        });
+    }
+
+    #[test]
+    fn validation_rejects_long_prefix() {
+        let h = handle();
+        futures::executor::block_on(async {
+            let prefix = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
+            let err = h.list_keys_page(&prefix, None, 1).await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("prefix length"));
+        });
+    }
+
+    #[test]
+    fn validation_rejects_control_chars_in_prefix() {
+        let h = handle();
+        futures::executor::block_on(async {
+            let err = h.list_keys_page("bad\nprefix", None, 1).await.unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("control characters"));
+        });
+    }
+
+    #[test]
+    fn validation_rejects_malformed_list_cursor() {
+        let h = handle();
+        futures::executor::block_on(async {
+            let err = h
+                .list_keys_page("app/", Some("not-json"), 1)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("cursor"));
+        });
+    }
+
+    #[test]
+    fn validation_rejects_cursor_for_different_prefix() {
+        let h = handle();
+        futures::executor::block_on(async {
+            h.put("app/a", &1i32).await.unwrap();
+            h.put("app/b", &2i32).await.unwrap();
+
+            let page = h.list_keys_page("app/", None, 1).await.unwrap();
+            let err = h
+                .list_keys_page("other/", page.cursor.as_deref(), 1)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("requested prefix"));
         });
     }
 

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 #[cfg(feature = "fastly")]
 use bytes::Bytes;
 #[cfg(feature = "fastly")]
-use edgezero_core::key_value_store::{KvError, KvStore};
+use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 #[cfg(feature = "fastly")]
 use std::time::Duration;
 
@@ -73,6 +73,35 @@ impl KvStore for FastlyKvStore {
         self.store
             .delete(key)
             .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let limit = u32::try_from(limit)
+            .map_err(|_| KvError::Validation("list limit exceeds u32".to_string()))?;
+
+        let mut request = self.store.build_list().limit(limit);
+
+        if !prefix.is_empty() {
+            request = request.prefix(prefix);
+        }
+        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
+            request = request.cursor(cursor);
+        }
+
+        let page = request
+            .execute()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("list failed: {e}")))?;
+        let cursor = page.next_cursor().filter(|cursor| !cursor.is_empty());
+
+        Ok(KvPage {
+            keys: page.into_keys(),
+            cursor,
+        })
     }
 }
 

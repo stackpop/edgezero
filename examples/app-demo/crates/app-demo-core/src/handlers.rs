@@ -348,7 +348,7 @@ mod tests {
 
     // -- KV handler tests --------------------------------------------------
 
-    use edgezero_core::key_value_store::{KvError, KvHandle, KvStore};
+    use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
@@ -384,6 +384,29 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<(), KvError> {
             self.data.lock().unwrap().remove(key);
             Ok(())
+        }
+
+        async fn list_keys_page(
+            &self,
+            prefix: &str,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> Result<KvPage, KvError> {
+            let data = self.data.lock().unwrap();
+            let mut keys = data
+                .keys()
+                .filter(|key| {
+                    key.starts_with(prefix) && cursor.is_none_or(|cursor| key.as_str() > cursor)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let has_more = keys.len() > limit;
+            keys.truncate(limit);
+
+            Ok(KvPage {
+                cursor: has_more.then(|| keys.last().cloned()).flatten(),
+                keys,
+            })
         }
     }
 

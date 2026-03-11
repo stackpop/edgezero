@@ -71,9 +71,12 @@ The `KvHandle` provides typed helpers that automatically serialize/deserialize J
 - `put_with_ttl(key, value, ttl)`: Stores a value that expires after `ttl`.
 - `delete(key)`: Removes a value.
 - `exists(key)`: Checks if a key is present.
+- `list_keys_page(prefix, cursor, limit)`: Lists keys in a bounded page. Pass the returned cursor back unchanged with the same prefix to fetch the next page.
 - `read_modify_write(key, default, f)`: Read-modify-write (non-atomic).
 
 It also supports raw bytes via `get_bytes`, `put_bytes`, etc.
+
+Key listing is paginated by design. This avoids buffering an unbounded number of keys in memory and matches the underlying provider APIs.
 
 ## Platform Specifics
 
@@ -120,6 +123,7 @@ strictest common limits:
 | Value size    | Max **25 MB**                        |
 | TTL minimum   | **60 seconds**                       |
 | TTL maximum   | **1 year**                           |
+| List page max | **1000 keys**                        |
 | Empty keys    | Rejected                             |
 | Reserved keys | `.` and `..` rejected                |
 | Control chars | Rejected in keys                     |
