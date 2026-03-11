@@ -108,21 +108,31 @@ For each changed file, evaluate:
 
 ### 5. Classify findings
 
-Assign each finding a severity:
+Tag each finding with an emoji from the
+[Code Review Emoji Guide](https://github.com/erikthedeveloper/code-review-emoji-guide).
+Every comment — inline or body-level — must start with the emoji.
 
-| Severity     | Criteria                                                           |
-| ------------ | ------------------------------------------------------------------ |
-| P0 — Blocker | Must fix before merge: bugs, data loss, security, CI failures      |
-| P1 — High    | Should fix: race conditions, API design issues, missing validation |
-| P2 — Medium  | Recommended: inconsistencies, test gaps, dead code                 |
-| P3 — Low     | Nice to have: style, minor improvements, documentation             |
+| Emoji | Name         | When to use                                                                  | Blocking? |
+| ----- | ------------ | ---------------------------------------------------------------------------- | --------- |
+| 🔧    | wrench       | Required change — bugs, security, data loss, CI failures, missing validation | Yes       |
+| ❓    | question     | Clarification needed — something is unclear and needs a substantive answer   | Yes       |
+| 🤔    | thinking     | Reasoning aloud — expressing concern or exploring an alternative             | No        |
+| ♻️    | refactor     | Refactoring suggestion — actionable restructuring or extraction opportunity  | No        |
+| 🏕    | campsite     | Campsite rule — "leave it cleaner than you found it"; unrelated improvement  | No        |
+| ⛏     | nitpick      | Nitpick — minor style/formatting preference; not blocking                    | No        |
+| 🌱    | seedling     | Future consideration — planting a seed for later, not blocking               | No        |
+| 📝    | memo         | Informational note — fun fact, context, or explanation; no action required   | No        |
+| 📌    | out-of-scope | Out of scope — valid concern that should be tracked as a separate issue      | No        |
+| 😃    | praise       | Positive feedback — highlight something done well                            | No        |
+
+Always include at least one 😃 praise comment per review to acknowledge good work.
 
 ### 6. Present findings for user approval
 
 **Do not submit the review automatically.** Present all findings to the user
 organized by severity, with:
 
-- Severity and title
+- Emoji tag and title
 - File path and line number
 - Description and suggested fix
 - Whether it would be an inline comment or body-level finding
@@ -143,10 +153,9 @@ After user approval, submit the selected findings as a formal review.
 
 #### Determine the review verdict
 
-- If any P0 findings are included: `CHANGES_REQUESTED`
-- If any P1 findings are included: `CHANGES_REQUESTED`
-- If only P2 or below: `COMMENT`
-- If no findings: `APPROVE`
+- If any 🔧 or ❓ findings are included: `CHANGES_REQUESTED`
+- If only non-blocking findings (🤔 ♻️ 🏕 ⛏ 🌱 📝 📌 😃): `COMMENT`
+- If no findings (only 😃 praise): `APPROVE`
 
 #### Build inline comments
 
@@ -159,7 +168,7 @@ comment. Use the file's **current line number** (not diff position) with the
   "path": "crates/edgezero-core/src/kv.rs",
   "line": 166,
   "side": "RIGHT",
-  "body": "**P1 — Race condition**: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
+  "body": "🔧 **Race condition**: Description of the issue...\n\n**Fix**:\n```rust\n// suggested code\n```"
 }
 ````
 
@@ -175,23 +184,29 @@ concerns, architectural issues, dependency problems) in the review body:
 
 <1-2 sentence overview of the changes and overall assessment>
 
+### 😃 Praise
+
+- <highlight something done well in the PR>
+
 ### Findings
 
-#### P0 — Blockers
+#### Blocking
 
-- **Title**: description (file:line)
+- 🔧 **Title**: description (file:line)
+- ❓ **Title**: description (file:line)
 
-#### P1 — High
+#### Non-blocking
 
-- **Title**: description (file:line)
+- 🤔 **Title**: description
+- ♻️ **Title**: description
+- 🏕 **Title**: description
+- ⛏ **Title**: description
+- 🌱 **Title**: description
+- 📝 **Title**: description
 
-#### P2 — Medium
+### 📌 Out of Scope
 
-- **Title**: description
-
-#### P3 — Low
-
-- **Title**: description
+- <concerns worth tracking but not blocking this PR>
 
 ### CI Status
 
@@ -237,7 +252,7 @@ Where `comments.json` contains the array of inline comment objects.
 Output:
 
 - The review URL
-- Total findings by severity (e.g., "2 P0, 3 P1, 5 P2, 2 P3")
+- Total findings by emoji tag (e.g., "3 🔧, 1 ❓, 2 ♻️, 1 ⛏, 2 😃")
 - Whether the review requested changes or approved
 - Any CI failures encountered
 
