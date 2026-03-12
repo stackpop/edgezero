@@ -13,15 +13,17 @@ use edgezero_adapter::scaffold::{
 use edgezero_adapter::{register_adapter, Adapter, AdapterAction};
 use walkdir::WalkDir;
 
+const TARGET_TRIPLE: &str = "wasm32-wasip1";
+
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
-    let manifest = find_fastly_manifest(
+    let manifest = find_spin_manifest(
         std::env::current_dir()
             .map_err(|e| e.to_string())?
             .as_path(),
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "spin manifest has no parent directory".to_string())?;
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
@@ -30,7 +32,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
             "build",
             "--release",
             "--target",
-            "wasm32-wasip1",
+            TARGET_TRIPLE,
             "--manifest-path",
             cargo_manifest
                 .to_str()
@@ -56,160 +58,152 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 }
 
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_fastly_manifest(
+    let manifest = find_spin_manifest(
         std::env::current_dir()
             .map_err(|e| e.to_string())?
             .as_path(),
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "spin manifest has no parent directory".to_string())?;
 
-    let status = Command::new("fastly")
-        .args(["compute", "deploy"])
+    let status = Command::new("spin")
+        .args(["deploy"])
         .args(extra_args)
         .current_dir(manifest_dir)
         .status()
-        .map_err(|e| format!("failed to run fastly CLI: {e}"))?;
+        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
     if !status.success() {
-        return Err(format!("fastly compute deploy failed with status {status}"));
+        return Err(format!("spin deploy failed with status {status}"));
     }
 
     Ok(())
 }
 
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_fastly_manifest(
+    let manifest = find_spin_manifest(
         std::env::current_dir()
             .map_err(|e| e.to_string())?
             .as_path(),
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "spin manifest has no parent directory".to_string())?;
 
-    let status = Command::new("fastly")
-        .args(["compute", "serve"])
+    let status = Command::new("spin")
+        .args(["up"])
         .args(extra_args)
         .current_dir(manifest_dir)
         .status()
-        .map_err(|e| format!("failed to run fastly CLI: {e}"))?;
+        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
     if !status.success() {
-        return Err(format!("fastly compute serve failed with status {status}"));
+        return Err(format!("spin up failed with status {status}"));
     }
 
     Ok(())
 }
 
-struct FastlyCliAdapter;
+struct SpinCliAdapter;
 
-static FASTLY_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
+static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     TemplateRegistration {
-        name: "fastly_Cargo_toml",
+        name: "spin_Cargo_toml",
         contents: include_str!("templates/Cargo.toml.hbs"),
     },
     TemplateRegistration {
-        name: "fastly_src_main_rs",
-        contents: include_str!("templates/src/main.rs.hbs"),
+        name: "spin_src_lib_rs",
+        contents: include_str!("templates/src/lib.rs.hbs"),
     },
     TemplateRegistration {
-        name: "fastly_cargo_config_toml",
-        contents: include_str!("templates/.cargo/config.toml.hbs"),
-    },
-    TemplateRegistration {
-        name: "fastly_fastly_toml",
-        contents: include_str!("templates/fastly.toml.hbs"),
+        name: "spin_spin_toml",
+        contents: include_str!("templates/spin.toml.hbs"),
     },
 ];
 
-static FASTLY_FILE_SPECS: &[AdapterFileSpec] = &[
+static SPIN_FILE_SPECS: &[AdapterFileSpec] = &[
     AdapterFileSpec {
-        template: "fastly_Cargo_toml",
+        template: "spin_Cargo_toml",
         output: "Cargo.toml",
     },
     AdapterFileSpec {
-        template: "fastly_src_main_rs",
-        output: "src/main.rs",
+        template: "spin_src_lib_rs",
+        output: "src/lib.rs",
     },
     AdapterFileSpec {
-        template: "fastly_cargo_config_toml",
-        output: ".cargo/config.toml",
-    },
-    AdapterFileSpec {
-        template: "fastly_fastly_toml",
-        output: "fastly.toml",
+        template: "spin_spin_toml",
+        output: "spin.toml",
     },
 ];
 
-static FASTLY_DEPENDENCIES: &[DependencySpec] = &[
+static SPIN_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
-        key: "dep_edgezero_core_fastly",
+        key: "dep_edgezero_core_spin",
         repo_crate: "crates/edgezero-core",
         fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
         features: &[],
     },
     DependencySpec {
-        key: "dep_edgezero_adapter_fastly",
-        repo_crate: "crates/edgezero-adapter-fastly",
+        key: "dep_edgezero_adapter_spin",
+        repo_crate: "crates/edgezero-adapter-spin",
         fallback:
-            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false }",
+            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
         features: &[],
     },
     DependencySpec {
-        key: "dep_edgezero_adapter_fastly_wasm",
-        repo_crate: "crates/edgezero-adapter-fastly",
+        key: "dep_edgezero_adapter_spin_wasm",
+        repo_crate: "crates/edgezero-adapter-spin",
         fallback:
-            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
-        features: &["fastly"],
+            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
+        features: &["spin"],
     },
 ];
 
-static FASTLY_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
-    id: "fastly",
-    display_name: "Fastly Compute@Edge",
-    crate_suffix: "adapter-fastly",
-    dependency_crate: "edgezero-adapter-fastly",
-    dependency_repo_path: "crates/edgezero-adapter-fastly",
-    template_registrations: FASTLY_TEMPLATE_REGISTRATIONS,
-    files: FASTLY_FILE_SPECS,
-    extra_dirs: &["src", ".cargo"],
-    dependencies: FASTLY_DEPENDENCIES,
+static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
+    id: "spin",
+    display_name: "Spin (Fermyon)",
+    crate_suffix: "adapter-spin",
+    dependency_crate: "edgezero-adapter-spin",
+    dependency_repo_path: "crates/edgezero-adapter-spin",
+    template_registrations: SPIN_TEMPLATE_REGISTRATIONS,
+    files: SPIN_FILE_SPECS,
+    extra_dirs: &["src"],
+    dependencies: SPIN_DEPENDENCIES,
     manifest: ManifestSpec {
-        manifest_filename: "fastly.toml",
+        manifest_filename: "spin.toml",
         build_target: "wasm32-wasip1",
         build_profile: "release",
-        build_features: &["fastly"],
+        build_features: &["spin"],
     },
     commands: CommandTemplates {
-        build: "fastly compute build -C {crate_dir}",
-        deploy: "fastly compute deploy -C {crate_dir}",
-        serve: "fastly compute serve -C {crate_dir}",
+        build: "cargo build --target wasm32-wasip1 --release -p {crate}",
+        deploy: "spin deploy --from {crate_dir}",
+        serve: "spin up --from {crate_dir}",
     },
     logging: LoggingDefaults {
-        endpoint: Some("stdout"),
+        endpoint: None,
         level: "info",
-        echo_stdout: Some(true),
+        echo_stdout: None,
     },
     readme: ReadmeInfo {
         description: "{display} entrypoint.",
         dev_heading: "{display} (local)",
-        dev_steps: &["`cd {crate_dir}`", "`edgezero-cli serve --adapter fastly`"],
+        dev_steps: &["`edgezero-cli serve --adapter spin`"],
     },
-    run_module: "edgezero_adapter_fastly",
+    run_module: "edgezero_adapter_spin",
 };
 
-static FASTLY_ADAPTER: FastlyCliAdapter = FastlyCliAdapter;
+static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
 
-impl Adapter for FastlyCliAdapter {
+impl Adapter for SpinCliAdapter {
     fn name(&self) -> &'static str {
-        "fastly"
+        "spin"
     }
 
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             AdapterAction::Build => {
                 let artifact = build(args)?;
-                println!("[edgezero] Fastly build complete -> {}", artifact.display());
+                println!("[edgezero] Spin build complete -> {}", artifact.display());
                 Ok(())
             }
             AdapterAction::Deploy => deploy(args),
@@ -219,8 +213,8 @@ impl Adapter for FastlyCliAdapter {
 }
 
 pub fn register() {
-    register_adapter(&FASTLY_ADAPTER);
-    register_adapter_blueprint(&FASTLY_BLUEPRINT);
+    register_adapter(&SPIN_ADAPTER);
+    register_adapter_blueprint(&SPIN_BLUEPRINT);
 }
 
 #[ctor]
@@ -228,8 +222,8 @@ fn register_ctor() {
     register();
 }
 
-fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
-    if let Some(found) = find_manifest_upwards(start, "fastly.toml") {
+fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
+    if let Some(found) = find_manifest_upwards(start, "spin.toml") {
         return Ok(found);
     }
 
@@ -241,9 +235,7 @@ fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
-            path.file_name()
-                .map(|n| n == "fastly.toml")
-                .unwrap_or(false)
+            path.file_name().map(|n| n == "spin.toml").unwrap_or(false)
                 && path
                     .parent()
                     .map(|dir| dir.join("Cargo.toml").exists())
@@ -252,7 +244,7 @@ fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
         .collect();
 
     if candidates.is_empty() {
-        return Err("could not locate fastly.toml".to_string());
+        return Err("could not locate spin.toml".to_string());
     }
 
     candidates.sort_by_key(|path| {
@@ -268,12 +260,11 @@ fn locate_artifact(
     manifest_dir: &Path,
     crate_name: &str,
 ) -> Result<PathBuf, String> {
-    let target_triple = "wasm32-wasip1";
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
     if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
         let candidate = PathBuf::from(custom)
-            .join(target_triple)
+            .join(TARGET_TRIPLE)
             .join("release")
             .join(&release_name);
         if candidate.exists() {
@@ -283,7 +274,7 @@ fn locate_artifact(
 
     let manifest_target = manifest_dir
         .join("target")
-        .join(target_triple)
+        .join(TARGET_TRIPLE)
         .join("release")
         .join(&release_name);
     if manifest_target.exists() {
@@ -292,7 +283,7 @@ fn locate_artifact(
 
     let workspace_target = workspace_root
         .join("target")
-        .join(target_triple)
+        .join(TARGET_TRIPLE)
         .join("release")
         .join(&release_name);
     if workspace_target.exists() {
@@ -316,10 +307,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
-        fs::write(root.join("fastly.toml"), "name = \"demo\"").unwrap();
+        fs::write(root.join("spin.toml"), "spin_manifest_version = 2").unwrap();
 
-        let manifest = find_fastly_manifest(root).expect("should find manifest");
-        assert_eq!(manifest, root.join("fastly.toml"));
+        let manifest = find_spin_manifest(root).expect("should find manifest");
+        assert_eq!(manifest, root.join("spin.toml"));
     }
 
     #[test]
@@ -327,15 +318,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let manifest = dir.path().join("Cargo.toml");
         fs::write(&manifest, "[package]\nname = \"demo\"\n").unwrap();
-        let name = read_package_name(&manifest).unwrap();
-        assert_eq!(name, "demo");
-    }
-
-    #[test]
-    fn read_package_falls_back_to_name() {
-        let dir = tempdir().unwrap();
-        let manifest = dir.path().join("Cargo.toml");
-        fs::write(&manifest, "name = \"demo\"").unwrap();
         let name = read_package_name(&manifest).unwrap();
         assert_eq!(name, "demo");
     }
@@ -355,6 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn locate_artifact_converts_hyphens_to_underscores() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let manifest_dir = workspace.join("crates/my-cool-crate");
+        fs::create_dir_all(&manifest_dir).unwrap();
+
+        // Cargo emits underscored filenames for hyphenated crate names.
+        let artifact = workspace.join("target/wasm32-wasip1/release/my_cool_crate.wasm");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "wasm").unwrap();
+
+        let located = locate_artifact(workspace, &manifest_dir, "my-cool-crate").unwrap();
+        assert_eq!(located, artifact);
+    }
+
+    #[test]
     fn finds_closest_manifest_when_multiple_exist() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -363,14 +361,14 @@ mod tests {
         let first = root.join("crates/first");
         fs::create_dir_all(&first).unwrap();
         fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
-        fs::write(first.join("fastly.toml"), "name=\"first\"").unwrap();
+        fs::write(first.join("spin.toml"), "spin_manifest_version = 2").unwrap();
 
         let second = root.join("examples/second");
         fs::create_dir_all(&second).unwrap();
         fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
-        fs::write(second.join("fastly.toml"), "name=\"second\"").unwrap();
+        fs::write(second.join("spin.toml"), "spin_manifest_version = 2").unwrap();
 
-        let found = find_fastly_manifest(&second).unwrap();
-        assert_eq!(found, second.join("fastly.toml"));
+        let found = find_spin_manifest(&second).unwrap();
+        assert_eq!(found, second.join("spin.toml"));
     }
 }

@@ -1,6 +1,6 @@
 # EdgeZero
 
-Production-ready toolkit for portable edge HTTP workloads. Write once, deploy to Fastly Compute, Cloudflare Workers, or native Axum servers.
+Production-ready toolkit for portable edge HTTP workloads. Write once, deploy to Fastly Compute, Cloudflare Workers, Fermyon Spin, or native Axum servers.
 
 ## Quick Start
 
@@ -34,6 +34,7 @@ Full documentation is available at **[stackpop.github.io/edgezero](https://stack
 | ------------------ | ------------------------ | ------ |
 | Fastly Compute     | `wasm32-wasip1`          | Stable |
 | Cloudflare Workers | `wasm32-unknown-unknown` | Stable |
+| Fermyon Spin       | `wasm32-wasip1`          | Stable |
 | Axum (Native)      | Host                     | Stable |
 
 ## License

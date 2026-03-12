@@ -3,10 +3,10 @@
 ## Project Overview
 
 EdgeZero is a portable HTTP workload toolkit in Rust. Write once, deploy to
-Fastly Compute, Cloudflare Workers, or native Axum servers. The codebase is a
-Cargo workspace with 7 crates under `crates/`, an example app under
-`examples/app-demo/`, a VitePress documentation site under `docs/`, and CI
-workflows under `.github/workflows/`.
+Fastly Compute, Cloudflare Workers, Fermyon Spin, or native Axum servers. The
+codebase is a Cargo workspace with 8 crates under `crates/`, an example app
+under `examples/app-demo/`, a VitePress documentation site under `docs/`, and
+CI workflows under `.github/workflows/`.
 
 ## Workspace Layout
 
@@ -17,6 +17,7 @@ crates/
   edgezero-adapter/           # Adapter registry and traits
   edgezero-adapter-fastly/    # Fastly Compute bridge (wasm32-wasip1)
   edgezero-adapter-cloudflare/# Cloudflare Workers bridge (wasm32-unknown-unknown)
+  edgezero-adapter-spin/      # Fermyon Spin bridge (wasm32-wasip1)
   edgezero-adapter-axum/      # Axum/Tokio bridge (native, dev server)
   edgezero-cli/               # CLI: new, build, deploy, dev, serve
 examples/app-demo/            # Reference app with all 3 adapters (excluded from workspace)
@@ -49,7 +50,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Feature compilation check
-cargo check --workspace --all-targets --features "fastly cloudflare"
+cargo check --workspace --all-targets --features "fastly cloudflare spin"
+
+# Spin wasm32 compilation check
+cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
 
 # Run the demo dev server
 cargo run -p edgezero-cli --features dev-example -- dev
@@ -67,6 +71,7 @@ faster iteration on a single crate.
 | ---------- | ------------------------ | ---------------------------------- |
 | Fastly     | `wasm32-wasip1`          | Requires Viceroy for local testing |
 | Cloudflare | `wasm32-unknown-unknown` | Requires `wrangler` for dev/deploy |
+| Spin       | `wasm32-wasip1`          | Requires `spin` CLI for dev/deploy |
 | Axum       | Native (host triple)     | Standard Tokio runtime             |
 
 ## Coding Conventions
@@ -132,12 +137,14 @@ impl Middleware for MyMiddleware {
 ### Proxy
 
 Use `ProxyService` with adapter-specific clients (`FastlyProxyClient`,
-`CloudflareProxyClient`). Keep proxy logic provider-agnostic in core.
+`CloudflareProxyClient`, `SpinProxyClient`). Keep proxy logic provider-agnostic
+in core.
 
 ### Logging
 
 - Adapter-specific init: `edgezero_adapter_fastly::init_logger()`,
-  `edgezero_adapter_cloudflare::init_logger()`.
+  `edgezero_adapter_cloudflare::init_logger()`,
+  `edgezero_adapter_spin::init_logger()`.
 - Use `simple_logger` for local/Axum builds.
 - Use the `log` / `tracing` facade, not direct dependencies.
 
@@ -151,7 +158,7 @@ Use `ProxyService` with adapter-specific clients (`FastlyProxyClient`,
 - **Minimal changes**: every change should impact as little code as possible.
   Avoid unnecessary refactoring, docstrings on untouched code, or premature abstractions.
 - **Feature gates**: platform-specific code goes behind `fastly`, `cloudflare`,
-  or `axum` features. Core stays `default-features = false` for WASM targets.
+  `spin`, or `axum` features. Core stays `default-features = false` for WASM targets.
 - **No direct `http` crate imports** in application code — use `edgezero_core` re-exports.
 
 ## Adapter Pattern
@@ -179,7 +186,8 @@ Every PR must pass:
 1. `cargo fmt --all -- --check`
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace --all-targets`
-4. `cargo check --workspace --all-targets --features "fastly cloudflare"`
+4. `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
+5. `cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin`
 
 Docs CI additionally runs ESLint + Prettier on the `docs/` directory.
 
