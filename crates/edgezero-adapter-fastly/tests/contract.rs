@@ -82,7 +82,9 @@ fn build_test_app() -> App {
 }
 
 fn fastly_request(method: FastlyMethod, path: &str, body: Option<&[u8]>) -> FastlyRequest {
-    let mut req = FastlyRequest::new(method, path);
+    // Viceroy validates Fastly request URLs at construction time, so the
+    // contract tests must use absolute URLs instead of path-only strings.
+    let mut req = FastlyRequest::new(method, format!("http://example.com{path}"));
     req.set_header("host", "example.com");
     req.set_header("x-edgezero-test", "1");
     if let Some(bytes) = body {
