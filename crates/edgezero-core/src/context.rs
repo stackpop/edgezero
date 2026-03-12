@@ -337,8 +337,11 @@ mod tests {
 
         struct FixedStore;
         impl ConfigStore for FixedStore {
-            fn get(&self, _key: &str) -> Option<String> {
-                Some("value".to_string())
+            fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<String>, crate::config_store::ConfigStoreError> {
+                Ok(Some("value".to_string()))
             }
         }
 
@@ -354,7 +357,10 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         assert!(ctx.config_store().is_some());
         assert_eq!(
-            ctx.config_store().unwrap().get("any"),
+            ctx.config_store()
+                .unwrap()
+                .get("any")
+                .expect("config value"),
             Some("value".to_string())
         );
     }

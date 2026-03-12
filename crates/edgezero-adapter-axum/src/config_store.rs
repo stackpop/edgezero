@@ -2,20 +2,16 @@
 
 use std::collections::HashMap;
 
-use edgezero_core::config_store::ConfigStore;
+use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 
 /// Config store for local dev / Axum. Reads from env vars with manifest
 /// defaults as fallback. Env vars take precedence over defaults.
 ///
 /// # Note on `from_env`
 ///
-/// [`AxumConfigStore::from_env`] snapshots the **entire** process environment
-/// at construction time. Any env var name is therefore accessible via
-/// `ctx.config_store()?.get("VAR_NAME")`. In practice, manifest config keys
-/// use lowercase dotted names (e.g. `feature.new_checkout`) which do not
-/// collide with typical uppercase process vars (`PATH`, `HOME`, etc.), so
-/// accidental leakage is unlikely. For production deployments use Fastly or
-/// Cloudflare adapters, which read only from their respective platform stores.
+/// [`AxumConfigStore::from_env`] only reads environment variables for keys
+/// declared in `[stores.config.defaults]`. Use an empty-string default when a
+/// key should be overrideable from env without carrying a real default value.
 pub struct AxumConfigStore {
     env: HashMap<String, String>,
     defaults: HashMap<String, String>,
@@ -35,16 +31,29 @@ impl AxumConfigStore {
 
     /// Create from the current process environment and manifest defaults.
     pub fn from_env(defaults: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self::new(std::env::vars(), defaults)
+        Self::from_lookup(defaults, |key| std::env::var(key).ok())
+    }
+
+    fn from_lookup<F>(defaults: impl IntoIterator<Item = (String, String)>, mut lookup: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let defaults: HashMap<String, String> = defaults.into_iter().collect();
+        let env = defaults
+            .keys()
+            .filter_map(|key| lookup(key).map(|value| (key.clone(), value)))
+            .collect();
+        Self { env, defaults }
     }
 }
 
 impl ConfigStore for AxumConfigStore {
-    fn get(&self, key: &str) -> Option<String> {
-        self.env
+    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Ok(self
+            .env
             .get(key)
             .or_else(|| self.defaults.get(key))
-            .cloned()
+            .cloned())
     }
 }
 
@@ -62,25 +71,63 @@ mod tests {
     #[test]
     fn axum_config_store_returns_values() {
         let s = store(&[("MY_KEY", "my_val")], &[]);
-        assert_eq!(s.get("MY_KEY"), Some("my_val".to_string()));
+        assert_eq!(
+            s.get("MY_KEY").expect("config value"),
+            Some("my_val".to_string())
+        );
     }
 
     #[test]
     fn axum_config_store_returns_none_for_missing() {
         let s = store(&[], &[]);
-        assert_eq!(s.get("NOPE"), None);
+        assert_eq!(s.get("NOPE").expect("missing config"), None);
     }
 
     #[test]
     fn axum_config_store_env_overrides_defaults() {
         let s = store(&[("KEY", "from_env")], &[("KEY", "from_default")]);
-        assert_eq!(s.get("KEY"), Some("from_env".to_string()));
+        assert_eq!(
+            s.get("KEY").expect("config value"),
+            Some("from_env".to_string())
+        );
     }
 
     #[test]
     fn axum_config_store_falls_back_to_defaults() {
         let s = store(&[], &[("KEY", "default_val")]);
-        assert_eq!(s.get("KEY"), Some("default_val".to_string()));
+        assert_eq!(
+            s.get("KEY").expect("default config"),
+            Some("default_val".to_string())
+        );
+    }
+
+    #[test]
+    fn axum_config_store_from_env_reads_only_declared_keys() {
+        let s = AxumConfigStore::from_lookup(
+            [
+                ("feature.new_checkout".to_string(), "false".to_string()),
+                ("service.timeout_ms".to_string(), "1500".to_string()),
+            ],
+            |key| match key {
+                "feature.new_checkout" => Some("true".to_string()),
+                "DATABASE_URL" => Some("postgres://secret".to_string()),
+                _ => None,
+            },
+        );
+
+        assert_eq!(
+            s.get("feature.new_checkout").expect("allowed env override"),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            s.get("service.timeout_ms").expect("default fallback"),
+            Some("1500".to_string())
+        );
+        assert_eq!(
+            s.get("DATABASE_URL")
+                .expect("undeclared key should stay hidden"),
+            None
+        );
     }
 
     // Run the shared contract tests against AxumConfigStore (env path).

@@ -11,13 +11,14 @@
 //! This allows arbitrary string keys (including dots) on a platform whose binding
 //! names are restricted to JavaScript identifier syntax.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use edgezero_core::config_store::ConfigStore;
+use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use worker::Env;
 
 type ConfigMap = HashMap<String, String>;
+const CONFIG_CACHE_LIMIT: usize = 64;
 
 /// Config store backed by a single Cloudflare JSON string binding.
 ///
@@ -62,16 +63,16 @@ impl CloudflareConfigStore {
 }
 
 impl ConfigStore for CloudflareConfigStore {
-    fn get(&self, key: &str) -> Option<String> {
-        self.data.get(key).cloned()
+    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Ok(self.data.get(key).cloned())
     }
 }
 
 /// Parse-and-cache the config map for `binding_name`.
 ///
-/// Keyed only by name: Cloudflare env vars are immutable within an isolate lifetime,
-/// so the parsed result for a given binding name never changes. Warnings are emitted
-/// only on the first miss for a given name (log-once semantics).
+/// Keyed only by name: Cloudflare env vars are immutable within an isolate
+/// lifetime, so the parsed result for a given binding name never changes.
+/// Warnings are suppressed for recently seen binding names via a bounded cache.
 ///
 /// # WASM safety
 /// `std::sync::Mutex` compiles for `wasm32-unknown-unknown` and is safe here because
@@ -84,7 +85,7 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
         .unwrap_or_else(|p| p.into_inner())
         .get(binding_name)
     {
-        return entry.clone();
+        return entry;
     }
 
     // Cache miss: resolve from the JS env (synchronous interop, safe outside the lock).
@@ -112,14 +113,46 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
     config_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .entry(binding_name.to_string())
-        .or_insert(resolved)
-        .clone()
+        .insert(binding_name, resolved, CONFIG_CACHE_LIMIT)
 }
 
-fn config_cache() -> &'static Mutex<HashMap<String, Option<Arc<ConfigMap>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<ConfigMap>>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn config_cache() -> &'static Mutex<ConfigCache> {
+    static CACHE: OnceLock<Mutex<ConfigCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ConfigCache::default()))
+}
+
+#[derive(Default)]
+struct ConfigCache {
+    entries: HashMap<String, Option<Arc<ConfigMap>>>,
+    order: VecDeque<String>,
+}
+
+impl ConfigCache {
+    fn get(&self, key: &str) -> Option<Option<Arc<ConfigMap>>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(
+        &mut self,
+        key: &str,
+        value: Option<Arc<ConfigMap>>,
+        limit: usize,
+    ) -> Option<Arc<ConfigMap>> {
+        if let Some(existing) = self.entries.get(key) {
+            return existing.clone();
+        }
+
+        if limit > 0 && self.order.len() >= limit {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+
+        let key = key.to_string();
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value.clone());
+        value
+    }
 }
 
 #[cfg(test)]

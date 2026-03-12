@@ -4,6 +4,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::body::Body;
+use crate::config_store::ConfigStoreError;
 use crate::http::{header::CONTENT_TYPE, HeaderValue, Method, Response, StatusCode};
 use crate::response::{response_with_body, IntoResponse};
 
@@ -18,6 +19,8 @@ pub enum EdgeError {
     MethodNotAllowed { method: Method, allowed: String },
     #[error("validation error: {message}")]
     Validation { message: String },
+    #[error("{message}")]
+    ServiceUnavailable { message: String },
     #[error("internal error: {source}")]
     Internal {
         #[from]
@@ -68,12 +71,19 @@ impl EdgeError {
         }
     }
 
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        EdgeError::ServiceUnavailable {
+            message: message.into(),
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             EdgeError::BadRequest { .. } => StatusCode::BAD_REQUEST,
             EdgeError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
             EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
+            EdgeError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             EdgeError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -86,6 +96,7 @@ impl EdgeError {
             EdgeError::MethodNotAllowed { method, allowed } => {
                 format!("method {} not allowed; allowed: {}", method, allowed)
             }
+            EdgeError::ServiceUnavailable { message } => message.clone(),
             EdgeError::Internal { source } => format!("internal error: {}", source),
         }
     }
@@ -94,6 +105,16 @@ impl EdgeError {
         match self {
             EdgeError::Internal { source } => Some(source),
             _ => None,
+        }
+    }
+}
+
+impl From<ConfigStoreError> for EdgeError {
+    fn from(err: ConfigStoreError) -> Self {
+        match err {
+            ConfigStoreError::InvalidKey { message } => EdgeError::bad_request(message),
+            ConfigStoreError::Unavailable { message } => EdgeError::service_unavailable(message),
+            ConfigStoreError::Internal { source } => EdgeError::internal(source),
         }
     }
 }
@@ -168,6 +189,27 @@ mod tests {
         let err = EdgeError::method_not_allowed(&Method::GET, &[]);
         assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(err.message().contains("(none)"));
+    }
+
+    #[test]
+    fn service_unavailable_sets_status_and_message() {
+        let err = EdgeError::service_unavailable("config store unavailable");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), "config store unavailable");
+    }
+
+    #[test]
+    fn config_store_error_unavailable_maps_to_service_unavailable() {
+        let err = EdgeError::from(ConfigStoreError::unavailable("backend offline"));
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), "backend offline");
+    }
+
+    #[test]
+    fn config_store_error_invalid_key_maps_to_bad_request() {
+        let err = EdgeError::from(ConfigStoreError::invalid_key("invalid config key"));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "invalid config key");
     }
 
     #[test]

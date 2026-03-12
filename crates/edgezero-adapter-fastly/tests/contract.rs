@@ -1,11 +1,15 @@
 #![cfg(all(feature = "fastly", target_arch = "wasm32"))]
+// Keep coverage for the deprecated low-level dispatch path while it remains public.
+#![allow(deprecated)]
 
 use bytes::Bytes;
 use edgezero_adapter_fastly::{
-    dispatch, from_core_response, into_core_request, FastlyRequestContext,
+    dispatch, dispatch_with_config_store, from_core_response, into_core_request,
+    FastlyRequestContext,
 };
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
+use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{response_builder, Method, Response, StatusCode};
@@ -13,6 +17,15 @@ use edgezero_core::router::RouterService;
 use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
 use fastly::Request as FastlyRequest;
 use futures::stream;
+use std::sync::Arc;
+
+struct FixedConfigStore(&'static str);
+
+impl ConfigStore for FixedConfigStore {
+    fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Ok(Some(self.0.to_string()))
+    }
+}
 
 fn build_test_app() -> App {
     async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
@@ -46,10 +59,23 @@ fn build_test_app() -> App {
         Ok(response)
     }
 
+    async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let value = ctx
+            .config_store()
+            .and_then(|store| store.get("greeting").ok().flatten())
+            .unwrap_or_else(|| "missing".to_string());
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::text(value))
+            .expect("response");
+        Ok(response)
+    }
+
     let router = RouterService::builder()
         .get("/uri", capture_uri)
         .post("/mirror", mirror_body)
         .get("/stream", stream_response)
+        .get("/config", config_value)
         .build();
 
     App::new(router)
@@ -140,4 +166,16 @@ fn dispatch_passes_request_body_to_handlers() {
 
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"echo");
+}
+
+#[test]
+fn dispatch_with_config_store_injects_handle() {
+    let app = build_test_app();
+    let req = fastly_request(FastlyMethod::GET, "/config", None);
+    let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from fastly test")));
+
+    let mut response = dispatch_with_config_store(&app, req, handle).expect("fastly response");
+
+    assert_eq!(response.get_status(), FastlyStatus::OK);
+    assert_eq!(response.take_body_bytes(), b"hello from fastly test");
 }

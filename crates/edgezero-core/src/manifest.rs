@@ -1,10 +1,10 @@
 use log::LevelFilter;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 pub struct ManifestLoader {
     manifest: Arc<Manifest>,
@@ -54,6 +54,7 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
+const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct Manifest {
@@ -120,7 +121,7 @@ impl Manifest {
         &self.environment
     }
 
-    fn finalize(&mut self) {
+    pub(crate) fn finalize(&mut self) {
         let mut resolved = BTreeMap::new();
 
         for (adapter, cfg) in &self.adapters {
@@ -329,9 +330,11 @@ pub struct ManifestConfigStoreConfig {
     #[serde(default)]
     #[validate(length(min = 1))]
     pub name: Option<String>,
-    /// Per-adapter name overrides, keyed by lowercase adapter name.
+    /// Per-adapter name overrides, keyed by supported lowercase adapter name
+    /// (`axum`, `cloudflare`, or `fastly`).
     #[serde(default)]
     #[validate(nested)]
+    #[validate(custom(function = "validate_config_store_adapter_keys"))]
     pub adapters: BTreeMap<String, ManifestConfigAdapterConfig>,
     /// Optional default values used for local dev (Axum adapter).
     #[serde(default)]
@@ -339,10 +342,51 @@ pub struct ManifestConfigStoreConfig {
 }
 
 /// `[stores.config.adapters.<adapter>]` override.
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 pub struct ManifestConfigAdapterConfig {
     #[validate(length(min = 1))]
     pub name: String,
+}
+
+fn validate_config_store_adapter_keys(
+    adapters: &BTreeMap<String, ManifestConfigAdapterConfig>,
+) -> Result<(), ValidationError> {
+    let mixed_case_keys = adapters
+        .keys()
+        .filter(|key| key.as_str() != key.to_ascii_lowercase())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !mixed_case_keys.is_empty() {
+        let mut error = ValidationError::new("config_store_adapter_keys_lowercase");
+        error.message = Some(
+            format!(
+                "config store adapter override keys must be lowercase: {}",
+                mixed_case_keys.join(", ")
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+
+    let unknown_keys = adapters
+        .keys()
+        .filter(|key| !SUPPORTED_CONFIG_STORE_ADAPTERS.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown_keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut error = ValidationError::new("config_store_adapter_keys_known");
+    error.message = Some(
+        format!(
+            "config store adapter override keys must match supported adapters ({}): {}",
+            SUPPORTED_CONFIG_STORE_ADAPTERS.join(", "),
+            unknown_keys.join(", ")
+        )
+        .into(),
+    );
+    Err(error)
 }
 
 impl ManifestConfigStoreConfig {
@@ -1208,6 +1252,34 @@ name = "fastly-store"
         assert_eq!(config.config_store_name("FASTLY"), "fastly-store");
         assert_eq!(config.config_store_name("Fastly"), "fastly-store");
         assert_eq!(config.config_store_name("fastly"), "fastly-store");
+    }
+
+    #[test]
+    fn config_store_mixed_case_adapter_key_fails_validation() {
+        let src = r#"
+[stores.config.adapters.Fastly]
+name = "fastly-store"
+"#;
+        let manifest: Manifest = toml::from_str(src).expect("should parse");
+        let result = manifest.validate();
+        assert!(
+            result.is_err(),
+            "mixed-case config store adapter key should fail validation"
+        );
+    }
+
+    #[test]
+    fn config_store_unknown_adapter_key_fails_validation() {
+        let src = r#"
+[stores.config.adapters.clouflare]
+name = "APP_CONFIG"
+"#;
+        let manifest: Manifest = toml::from_str(src).expect("should parse");
+        let result = manifest.validate();
+        assert!(
+            result.is_err(),
+            "unknown config store adapter key should fail validation"
+        );
     }
 
     #[test]

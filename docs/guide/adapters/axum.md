@@ -137,8 +137,8 @@ cargo test -p my-app-adapter-axum
 
 ## Config Store
 
-For local development, the Axum adapter reads config values from a snapshot of the process
-environment and falls back to `[stores.config.defaults]` in `edgezero.toml`:
+For local development, the Axum adapter only reads environment variables for keys declared in
+`[stores.config.defaults]`, then falls back to those defaults in `edgezero.toml`:
 
 ```toml
 [stores.config]
@@ -147,10 +147,13 @@ name = "app_config"
 [stores.config.defaults]
 "greeting" = "hello from config store"
 "feature.new_checkout" = "false"
+"service.timeout_ms" = ""
 ```
 
 Handlers access the injected store through `ctx.config_store()`. Environment variables take
-precedence over manifest defaults.
+precedence over manifest defaults. If a key should be overrideable from env without carrying a real
+default value, declare it with an empty-string placeholder. Do not pass raw user input straight to
+`ctx.config_store()?.get(...)` in production handlers; validate or allowlist keys first.
 
 ## Container Deployment
 

@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Ident, LitStr, Token};
+use validator::Validate;
 
 #[allow(dead_code)]
 mod manifest_definitions {
@@ -23,8 +24,12 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     let manifest_source = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
 
-    let manifest: Manifest = toml::from_str(&manifest_source)
+    let mut manifest: Manifest = toml::from_str(&manifest_source)
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", manifest_path.display()));
+    manifest
+        .validate()
+        .unwrap_or_else(|err| panic!("failed to validate {}: {err}", manifest_path.display()));
+    manifest.finalize();
 
     let app_ident = args
         .app_ident

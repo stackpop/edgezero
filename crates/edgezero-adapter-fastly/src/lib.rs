@@ -21,7 +21,8 @@ pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
-pub use request::{dispatch, dispatch_with_config, into_core_request};
+#[allow(deprecated)]
+pub use request::{dispatch, dispatch_with_config, dispatch_with_config_store, into_core_request};
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
 
@@ -66,13 +67,17 @@ pub fn init_logger(
 
 #[cfg(feature = "fastly")]
 pub trait AppExt {
+    #[deprecated(
+        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_store()"
+    )]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
 }
 
 #[cfg(feature = "fastly")]
 impl AppExt for edgezero_core::app::App {
+    #[allow(deprecated)]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-        dispatch(self, req)
+        crate::request::dispatch_raw(self, req)
     }
 }
 
@@ -114,7 +119,7 @@ pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
     if let Some(name) = config_store_name {
         dispatch_with_config(&app, req, name)
     } else {
-        dispatch(&app, req)
+        crate::request::dispatch_raw(&app, req)
     }
 }
 

@@ -3,7 +3,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
-use edgezero_core::config_store::ConfigStore;
+use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 
 /// Config store backed by a Fastly Config Store resource link.
 pub struct FastlyConfigStore {
@@ -19,10 +19,9 @@ enum FastlyConfigStoreBackend {
 impl FastlyConfigStore {
     /// Open a Fastly Config Store by resource link name.
     ///
-    /// Returns `None` if the store is not available (e.g. not configured in
-    /// `fastly.toml`), allowing graceful fallback without panicking.
-    pub fn try_open(name: &str) -> Option<Self> {
-        fastly::ConfigStore::try_open(name).ok().map(|inner| Self {
+    /// Returns an error if the configured store cannot be opened.
+    pub fn try_open(name: &str) -> Result<Self, fastly::config_store::OpenError> {
+        fastly::ConfigStore::try_open(name).map(|inner| Self {
             inner: FastlyConfigStoreBackend::Fastly(inner),
         })
     }
@@ -36,12 +35,28 @@ impl FastlyConfigStore {
 }
 
 impl ConfigStore for FastlyConfigStore {
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
-            FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(key).ok().flatten(),
+            FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(key).map_err(map_lookup_error),
             #[cfg(test)]
-            FastlyConfigStoreBackend::InMemory(data) => data.get(key).cloned(),
+            FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(key).cloned()),
         }
+    }
+}
+
+fn map_lookup_error(err: fastly::config_store::LookupError) -> ConfigStoreError {
+    match err {
+        fastly::config_store::LookupError::KeyInvalid
+        | fastly::config_store::LookupError::KeyTooLong => {
+            ConfigStoreError::invalid_key("invalid config key")
+        }
+        fastly::config_store::LookupError::ConfigStoreInvalid
+        | fastly::config_store::LookupError::TooManyLookups
+        | fastly::config_store::LookupError::ValueTooLong
+        | fastly::config_store::LookupError::Other => {
+            ConfigStoreError::unavailable(format!("Fastly config store lookup failed: {err}"))
+        }
+        _ => ConfigStoreError::unavailable(format!("Fastly config store lookup failed: {err}")),
     }
 }
 
@@ -55,4 +70,16 @@ mod tests {
             ("contract.key.b".to_string(), "value_b".to_string()),
         ])
     });
+
+    #[test]
+    fn key_invalid_maps_to_invalid_key_error() {
+        let err = map_lookup_error(fastly::config_store::LookupError::KeyInvalid);
+        assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
+    }
+
+    #[test]
+    fn key_too_long_maps_to_invalid_key_error() {
+        let err = map_lookup_error(fastly::config_store::LookupError::KeyTooLong);
+        assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
+    }
 }

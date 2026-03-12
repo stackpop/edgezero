@@ -82,7 +82,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 mod tests {
     use super::*;
     use edgezero_core::body::Body;
-    use edgezero_core::config_store::{ConfigStore, ConfigStoreHandle};
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{response_builder, StatusCode};
@@ -92,8 +92,8 @@ mod tests {
     struct FixedConfigStore(String);
 
     impl ConfigStore for FixedConfigStore {
-        fn get(&self, _key: &str) -> Option<String> {
-            Some(self.0.clone())
+        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(Some(self.0.clone()))
         }
     }
 
@@ -122,7 +122,10 @@ mod tests {
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {
                 let store = ctx.config_store().expect("config store should be present");
-                let val = store.get("any_key").unwrap_or_default();
+                let val = store
+                    .get("any_key")
+                    .expect("config lookup should succeed")
+                    .unwrap_or_default();
                 let response = response_builder()
                     .status(StatusCode::OK)
                     .body(Body::from(val))

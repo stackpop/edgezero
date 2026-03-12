@@ -52,6 +52,9 @@ fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
 `run_app` reads logging and config-store settings from `edgezero.toml`, builds the app, and injects
 the configured Fastly Config Store into request extensions automatically.
 
+The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
+config-store metadata. Prefer `run_app`, `dispatch_with_config`, or `dispatch_with_config_store`.
+
 ## Building
 
 Build for Fastly's Wasm target:

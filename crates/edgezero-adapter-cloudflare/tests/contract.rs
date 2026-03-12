@@ -1,23 +1,36 @@
 #![cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+// Keep coverage for the deprecated low-level dispatch path while it remains public.
+#![allow(deprecated)]
 
 use bytes::Bytes;
 use edgezero_adapter_cloudflare::{
-    dispatch, dispatch_with_config, from_core_response, into_core_request, CloudflareRequestContext,
+    dispatch, dispatch_with_config, dispatch_with_config_store, from_core_response,
+    into_core_request, CloudflareRequestContext,
 };
 use edgezero_core::{
     app::App,
     body::Body,
+    config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle},
     context::RequestContext,
     error::EdgeError,
     http::{response_builder, Method, Response, StatusCode},
     router::RouterService,
 };
 use futures::stream;
+use std::sync::Arc;
 use wasm_bindgen_test::*;
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::{Context, Env, Method as CfMethod, Request as CfRequest, RequestInit};
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+struct FixedConfigStore(&'static str);
+
+impl ConfigStore for FixedConfigStore {
+    fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Ok(Some(self.0.to_string()))
+    }
+}
 
 fn build_test_app() -> App {
     async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
@@ -64,11 +77,24 @@ fn build_test_app() -> App {
         Ok(response)
     }
 
+    async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let value = ctx
+            .config_store()
+            .and_then(|store| store.get("greeting").ok().flatten())
+            .unwrap_or_else(|| "missing".to_string());
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::text(value))
+            .expect("response");
+        Ok(response)
+    }
+
     let router = RouterService::builder()
         .get("/uri", capture_uri)
         .post("/mirror", mirror_body)
         .get("/stream", stream_response)
         .get("/has-config", config_presence)
+        .get("/config-value", config_value)
         .build();
 
     App::new(router)
@@ -201,4 +227,20 @@ async fn dispatch_with_config_missing_binding_skips_injection() {
     assert_eq!(response.status_code(), StatusCode::OK.as_u16());
     let body = response.text().await.expect("text");
     assert_eq!(body, "no");
+}
+
+#[wasm_bindgen_test]
+async fn dispatch_with_config_store_injects_handle() {
+    let app = build_test_app();
+    let req = cf_request(CfMethod::Get, "/config-value", None);
+    let (env, ctx) = test_env_ctx();
+    let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from cf test")));
+
+    let mut response = dispatch_with_config_store(&app, req, env, ctx, handle)
+        .await
+        .expect("cf response");
+
+    assert_eq!(response.status_code(), StatusCode::OK.as_u16());
+    let body = response.text().await.expect("text");
+    assert_eq!(body, "hello from cf test");
 }
