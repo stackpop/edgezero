@@ -19,11 +19,16 @@ impl ProxyClient for SpinProxyClient {
             .method(into_spin_method(&method))
             .uri(uri.to_string());
 
+        // Spin's WASI HTTP interface requires string-typed header values,
+        // so non-UTF-8 values cannot be forwarded and are dropped with a warning.
         for (name, value) in headers.iter() {
             if let Ok(v) = value.to_str() {
                 builder.header(name.as_str(), v);
             } else {
-                log::warn!("dropping non-UTF-8 proxy request header: {}", name);
+                log::warn!(
+                    "dropping non-UTF-8 proxy request header (Spin WASI limitation): {}",
+                    name
+                );
             }
         }
 
@@ -42,19 +47,16 @@ impl ProxyClient for SpinProxyClient {
         // Collect response headers before consuming the body.
         let mut response_headers = Vec::new();
         for (name, value) in spin_response.headers() {
-            let Some(v) = value.as_str() else {
-                log::warn!("dropping non-UTF-8 proxy response header: {}", name);
-                continue;
-            };
             let Ok(hname) = edgezero_core::http::HeaderName::from_bytes(name.as_bytes()) else {
                 log::warn!("dropping invalid proxy response header name: {}", name);
                 continue;
             };
-            let Ok(hval) = v.parse::<edgezero_core::http::HeaderValue>() else {
-                log::warn!("dropping invalid proxy response header value for: {}", name);
-                continue;
-            };
-            response_headers.push((hname, hval));
+            match edgezero_core::http::HeaderValue::from_bytes(value.as_bytes()) {
+                Ok(hval) => response_headers.push((hname, hval)),
+                Err(_) => {
+                    log::warn!("dropping invalid proxy response header value for: {}", name);
+                }
+            }
         }
 
         let response_body = spin_response.into_body();

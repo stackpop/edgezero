@@ -31,11 +31,16 @@ pub async fn from_core_response(response: Response) -> Result<spin_http::Respons
     let mut builder = spin_http::Response::builder();
     builder.status(parts.status.as_u16());
 
+    // Spin's WASI HTTP interface requires string-typed header values,
+    // so non-UTF-8 values cannot be forwarded and are dropped with a warning.
     for (name, value) in parts.headers.iter() {
         if let Ok(v) = value.to_str() {
             builder.header(name.as_str(), v);
         } else {
-            log::warn!("dropping non-UTF-8 response header: {}", name);
+            log::warn!(
+                "dropping non-UTF-8 response header (Spin WASI limitation): {}",
+                name
+            );
         }
     }
 

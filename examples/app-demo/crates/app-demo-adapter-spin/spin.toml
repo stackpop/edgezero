@@ -9,7 +9,7 @@ route = "/..."
 component = "app-demo"
 
 [component.app-demo]
-source = "target/wasm32-wasip1/release/app_demo_adapter_spin.wasm"
+source = "../../target/wasm32-wasip1/release/app_demo_adapter_spin.wasm"
 allowed_outbound_hosts = ["https://*:*"]
 [component.app-demo.build]
 command = "cargo build --target wasm32-wasip1 --release"

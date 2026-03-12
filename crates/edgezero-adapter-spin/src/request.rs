@@ -30,10 +30,13 @@ pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeErro
         .uri(uri);
 
     for (name, value) in &header_entries {
-        if let Ok(value_str) = std::str::from_utf8(value) {
-            builder = builder.header(name.as_str(), value_str);
-        } else {
-            log::warn!("dropping non-UTF-8 request header: {}", name);
+        match edgezero_core::http::HeaderValue::from_bytes(value) {
+            Ok(hval) => {
+                builder = builder.header(name.as_str(), hval);
+            }
+            Err(_) => {
+                log::warn!("dropping invalid request header value: {}", name);
+            }
         }
     }
 

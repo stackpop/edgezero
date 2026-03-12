@@ -48,7 +48,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
         .map_err(|e| format!("failed to create {}: {e}", pkg_dir.display()))?;
-    let dest = pkg_dir.join(format!("{crate_name}.wasm"));
+    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
     fs::copy(&artifact, &dest)
         .map_err(|e| format!("failed to copy artifact to {}: {e}", dest.display()))?;
 
@@ -269,7 +269,7 @@ fn locate_artifact(
     crate_name: &str,
 ) -> Result<PathBuf, String> {
     let target_triple = "wasm32-wasip1";
-    let release_name = format!("{crate_name}.wasm");
+    let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
     if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
         let candidate = PathBuf::from(custom)

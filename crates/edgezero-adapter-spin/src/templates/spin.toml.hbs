@@ -9,7 +9,7 @@ route = "/..."
 component = "{{proj_spin}}"
 
 [component.{{proj_spin}}]
-source = "target/wasm32-wasip1/release/{{proj_spin_underscored}}.wasm"
+source = "{{target_dir_spin}}/wasm32-wasip1/release/{{proj_spin_underscored}}.wasm"
 allowed_outbound_hosts = ["https://*:*"]
 [component.{{proj_spin}}.build]
 command = "cargo build --target wasm32-wasip1 --release"

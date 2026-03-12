@@ -50,7 +50,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
         .map_err(|e| format!("failed to create {}: {e}", pkg_dir.display()))?;
-    let dest = pkg_dir.join(format!("{crate_name}.wasm"));
+    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
     fs::copy(&artifact, &dest)
         .map_err(|e| format!("failed to copy artifact to {}: {e}", dest.display()))?;
 
@@ -260,7 +260,7 @@ fn locate_artifact(
     manifest_dir: &Path,
     crate_name: &str,
 ) -> Result<PathBuf, String> {
-    let release_name = format!("{crate_name}.wasm");
+    let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
     if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
         let candidate = PathBuf::from(custom)
@@ -333,6 +333,22 @@ mod tests {
         fs::write(&artifact, "wasm").unwrap();
 
         let located = locate_artifact(workspace, &manifest_dir, "demo").unwrap();
+        assert_eq!(located, artifact);
+    }
+
+    #[test]
+    fn locate_artifact_converts_hyphens_to_underscores() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let manifest_dir = workspace.join("crates/my-cool-crate");
+        fs::create_dir_all(&manifest_dir).unwrap();
+
+        // Cargo emits underscored filenames for hyphenated crate names.
+        let artifact = workspace.join("target/wasm32-wasip1/release/my_cool_crate.wasm");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "wasm").unwrap();
+
+        let located = locate_artifact(workspace, &manifest_dir, "my-cool-crate").unwrap();
         assert_eq!(located, artifact);
     }
 
