@@ -420,9 +420,11 @@ pub struct Kv(pub crate::key_value_store::KvHandle);
 #[async_trait(?Send)]
 impl FromRequest for Kv {
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.kv_handle()
-            .map(Kv)
-            .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no kv store configured")))
+        ctx.kv_handle().map(Kv).ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!(
+                "no kv store configured -- check [stores.kv] in edgezero.toml and platform bindings"
+            ))
+        })
     }
 }
 
@@ -986,7 +988,7 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let err = block_on(Kv::from_request(&ctx)).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(err.message().contains("no kv store configured"));
+        assert!(err.message().contains("check [stores.kv]"));
     }
 
     #[test]

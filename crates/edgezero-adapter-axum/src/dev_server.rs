@@ -1,4 +1,5 @@
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use axum::Router;
@@ -13,6 +14,12 @@ use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
 use crate::service::EdgeZeroAxumService;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KvInitRequirement {
+    Optional,
+    Required,
+}
 
 /// Configuration used when running the dev server embedding EdgeZero into Axum.
 #[derive(Clone)]
@@ -84,6 +91,90 @@ impl AxumDevServer {
     }
 }
 
+fn kv_init_requirement(manifest: &edgezero_core::manifest::Manifest) -> KvInitRequirement {
+    if manifest.stores.kv.is_some() {
+        KvInitRequirement::Required
+    } else {
+        KvInitRequirement::Optional
+    }
+}
+
+fn kv_store_path(store_name: &str) -> PathBuf {
+    if store_name == edgezero_core::manifest::DEFAULT_KV_STORE_NAME {
+        return PathBuf::from(".edgezero/kv.redb");
+    }
+
+    PathBuf::from(".edgezero").join(format!(
+        "kv-{}-{:016x}.redb",
+        store_name_slug(store_name),
+        stable_store_name_hash(store_name)
+    ))
+}
+
+fn store_name_slug(store_name: &str) -> String {
+    const MAX_SLUG_LEN: usize = 24;
+
+    let mut slug = String::with_capacity(MAX_SLUG_LEN);
+    let mut last_was_separator = false;
+    for ch in store_name.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else {
+            None
+        };
+
+        match mapped {
+            Some(ch) => {
+                if slug.len() == MAX_SLUG_LEN {
+                    break;
+                }
+                slug.push(ch);
+                last_was_separator = false;
+            }
+            None if !slug.is_empty() && !last_was_separator => {
+                if slug.len() == MAX_SLUG_LEN {
+                    break;
+                }
+                slug.push('-');
+                last_was_separator = true;
+            }
+            None => {}
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "store".to_string()
+    } else {
+        slug
+    }
+}
+
+fn stable_store_name_hash(store_name: &str) -> u64 {
+    // Deterministic FNV-1a keeps local KV file names stable across processes.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in store_name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<edgezero_core::key_value_store::KvHandle> {
+    if let Some(parent) = kv_path.parent() {
+        std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
+    }
+    let kv_store = std::sync::Arc::new(
+        crate::key_value_store::PersistentKvStore::new(kv_path)
+            .context("failed to create KV store")?,
+    );
+    log::info!("KV store: {}", kv_path.display());
+    Ok(edgezero_core::key_value_store::KvHandle::new(kv_store))
+}
+
 async fn serve_with_listener(
     router: RouterService,
     listener: tokio::net::TcpListener,
@@ -99,18 +190,20 @@ async fn serve_with_listener_and_kv_path(
     enable_ctrl_c: bool,
     kv_path: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut service = EdgeZeroAxumService::new(router);
+    let kv_handle = kv_path
+        .map(|kv_path| kv_handle_from_path(Path::new(kv_path)))
+        .transpose()?;
+    serve_with_listener_and_kv_handle(router, listener, enable_ctrl_c, kv_handle).await
+}
 
-    if let Some(kv_path) = kv_path {
-        if let Some(parent) = std::path::Path::new(kv_path).parent() {
-            std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
-        }
-        let kv_store = std::sync::Arc::new(
-            crate::key_value_store::PersistentKvStore::new(kv_path)
-                .context("failed to create KV store")?,
-        );
-        log::info!("KV store: {}", kv_path);
-        let kv_handle = edgezero_core::key_value_store::KvHandle::new(kv_store);
+async fn serve_with_listener_and_kv_handle(
+    router: RouterService,
+    listener: tokio::net::TcpListener,
+    enable_ctrl_c: bool,
+    kv_handle: Option<edgezero_core::key_value_store::KvHandle>,
+) -> anyhow::Result<()> {
+    let mut service = EdgeZeroAxumService::new(router);
+    if let Some(kv_handle) = kv_handle {
         service = service.with_kv_handle(kv_handle);
     }
 
@@ -142,7 +235,11 @@ async fn serve_with_listener_and_kv_path(
 
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let manifest = ManifestLoader::load_from_str(manifest_src);
-    let logging = manifest.manifest().logging_or_default("axum");
+    let manifest = manifest.manifest();
+    let logging = manifest.logging_or_default("axum");
+    let kv_init_requirement = kv_init_requirement(manifest);
+    let kv_store_name = manifest.kv_store_name("axum").to_string();
+    let kv_path = kv_store_path(&kv_store_name);
 
     let level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
@@ -152,9 +249,6 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     };
 
     SimpleLogger::new().with_level(level).init().ok();
-
-    // Only initialize KV store if configured in the manifest.
-    let kv_enabled = manifest.manifest().stores.kv.is_some();
 
     let app = A::build_app();
     let router = app.router().clone();
@@ -174,12 +268,30 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("failed to adopt std listener into tokio")?;
 
-        let kv_path = if kv_enabled {
-            Some(".edgezero/kv.redb")
-        } else {
-            None
+        let kv_handle = match kv_handle_from_path(&kv_path) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                match kv_init_requirement {
+                    KvInitRequirement::Optional => {
+                        log::warn!(
+                            "KV store '{}' could not be initialized at {}: {}",
+                            kv_store_name,
+                            kv_path.display(),
+                            err
+                        );
+                        None
+                    }
+                    KvInitRequirement::Required => {
+                        return Err(err.context(format!(
+                            "KV store '{}' is explicitly configured for axum but could not be initialized at {}",
+                            kv_store_name,
+                            kv_path.display()
+                        )));
+                    }
+                }
+            }
         };
-        serve_with_listener_and_kv_path(router, listener, config.enable_ctrl_c, kv_path).await
+        serve_with_listener_and_kv_handle(router, listener, config.enable_ctrl_c, kv_handle).await
     })
 }
 
@@ -243,6 +355,69 @@ mod tests {
         let server = AxumDevServer::with_config(router, config);
         assert_eq!(server.config.addr.port(), 9000);
         assert!(!server.config.enable_ctrl_c);
+    }
+
+    #[test]
+    fn default_store_name_uses_legacy_kv_path() {
+        assert_eq!(
+            kv_store_path(edgezero_core::manifest::DEFAULT_KV_STORE_NAME),
+            PathBuf::from(".edgezero/kv.redb")
+        );
+    }
+
+    #[test]
+    fn implicit_default_kv_is_optional() {
+        let manifest = ManifestLoader::load_from_str("");
+        assert_eq!(
+            kv_init_requirement(manifest.manifest()),
+            KvInitRequirement::Optional
+        );
+    }
+
+    #[test]
+    fn explicit_kv_config_is_required() {
+        let manifest = ManifestLoader::load_from_str(
+            r#"
+[stores.kv]
+name = "EDGEZERO_KV"
+"#,
+        );
+        assert_eq!(
+            kv_init_requirement(manifest.manifest()),
+            KvInitRequirement::Required
+        );
+    }
+
+    #[test]
+    fn custom_store_name_uses_stable_bounded_path() {
+        let path = kv_store_path("../Prod KV");
+        let expected = format!(
+            "kv-prod-kv-{:016x}.redb",
+            stable_store_name_hash("../Prod KV")
+        );
+        assert_eq!(path.parent(), Some(Path::new(".edgezero")));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn custom_store_names_remain_distinct_across_case() {
+        assert_ne!(kv_store_path("Store"), kv_store_path("store"));
+    }
+
+    #[test]
+    fn custom_store_path_length_is_bounded() {
+        let path = kv_store_path(&"a".repeat(4_096));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("file name");
+        assert!(
+            file_name.len() <= 64,
+            "unexpected file name length: {file_name}"
+        );
     }
 }
 

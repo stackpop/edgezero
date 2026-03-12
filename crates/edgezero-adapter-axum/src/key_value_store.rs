@@ -7,7 +7,8 @@
 //! ## Storage Location
 //!
 //! By default, the development server stores data at `.edgezero/kv.redb`
-//! in your project directory. Add this path to your `.gitignore`:
+//! in your project directory. Custom store names get their own derived
+//! database file under `.edgezero/`. Add this path to your `.gitignore`:
 //!
 //! ```gitignore
 //! .edgezero/
@@ -23,7 +24,8 @@
 //!
 //! The redb database file will grow over time and does not automatically
 //! shrink after deletions. For development, this is typically not an issue.
-//! To reclaim space, delete the `.edgezero/kv.redb` file (data will be lost).
+//! To reclaim space, delete the corresponding file in `.edgezero/`
+//! (data will be lost).
 //!
 //! ## Concurrent Access
 //!

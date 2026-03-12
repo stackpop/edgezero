@@ -14,7 +14,6 @@ axum = [
     "dep:futures-util",
     "dep:reqwest",
     "dep:redb",
-    "dep:serde_json",
 ]
 cli = [
     "dep:edgezero-adapter",
@@ -45,7 +44,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 tracing = { workspace = true }
 walkdir = { workspace = true, optional = true }
 

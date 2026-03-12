@@ -114,8 +114,13 @@ STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/kv/counter")
 check "POST /kv/counter returns 200" "200" "$STATUS"
 
 BODY=$(curl -s -X POST "$BASE/kv/counter")
-COUNT=$(echo "$BODY" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
-check "Counter returns a number" "true" "$([ -n "$COUNT" ] && echo true || echo false)"
+FIRST_COUNT=$(echo "$BODY" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
+BODY=$(curl -s -X POST "$BASE/kv/counter")
+SECOND_COUNT=$(echo "$BODY" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
+check \
+  "Counter increments" \
+  "true" \
+  "$([ -n "$FIRST_COUNT" ] && [ -n "$SECOND_COUNT" ] && [ "$SECOND_COUNT" -eq $((FIRST_COUNT + 1)) ] 2>/dev/null && echo true || echo false)"
 
 section "KV Notes: PUT + GET"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/kv/notes/smoke-test" -d "hello from smoke test")

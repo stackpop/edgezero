@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::sync::{Mutex, OnceLock};
+
 use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
 use crate::CloudflareRequestContext;
@@ -72,12 +75,7 @@ pub async fn dispatch_with_kv(
     let kv_handle = match crate::key_value_store::CloudflareKvStore::from_env(&env, kv_binding) {
         Ok(store) => Some(KvHandle::new(std::sync::Arc::new(store))),
         Err(e) => {
-            // Log once per worker instance to avoid flooding the console
-            // on high-traffic workers where every request re-opens the binding.
-            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-            WARN_ONCE.call_once(|| {
-                log::warn!("KV binding not available: {}", e);
-            });
+            warn_missing_kv_binding_once(kv_binding, &e);
             None
         }
     };
@@ -97,6 +95,27 @@ pub async fn dispatch_with_kv(
 
 fn edge_error_to_worker(err: EdgeError) -> WorkerError {
     WorkerError::RustError(err.to_string())
+}
+
+fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl std::fmt::Display) {
+    const MAX_CACHED_WARNINGS: usize = 64;
+    static WARNED_BINDINGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let warned_bindings = WARNED_BINDINGS.get_or_init(|| Mutex::new(BTreeSet::new()));
+
+    match warned_bindings.lock() {
+        Ok(mut warned_bindings) => {
+            if warned_bindings.contains(kv_binding) {
+                return;
+            }
+            if warned_bindings.len() < MAX_CACHED_WARNINGS {
+                warned_bindings.insert(kv_binding.to_string());
+            }
+            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+        }
+        Err(_) => {
+            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+        }
+    }
 }
 
 fn into_core_method(method: Method) -> CoreMethod {

@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::io::Read;
+use std::sync::{Mutex, OnceLock};
 
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
@@ -67,13 +69,7 @@ pub fn dispatch_with_kv(
             core_request.extensions_mut().insert(handle);
         }
         Err(e) => {
-            // Log once per process to avoid noise. Fastly Compute spawns a
-            // fresh WASI instance per request so this is inherently once, but
-            // the guard makes the intent explicit.
-            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-            WARN_ONCE.call_once(|| {
-                log::warn!("KV store not available: {}", e);
-            });
+            warn_missing_kv_store_once(kv_store_name, &e);
         }
     }
 
@@ -83,4 +79,25 @@ pub fn dispatch_with_kv(
 
 fn map_edge_error(err: EdgeError) -> FastlyError {
     FastlyError::msg(err.to_string())
+}
+
+fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Display) {
+    const MAX_CACHED_WARNINGS: usize = 64;
+    static WARNED_STORES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let warned_stores = WARNED_STORES.get_or_init(|| Mutex::new(BTreeSet::new()));
+
+    match warned_stores.lock() {
+        Ok(mut warned_stores) => {
+            if warned_stores.contains(kv_store_name) {
+                return;
+            }
+            if warned_stores.len() < MAX_CACHED_WARNINGS {
+                warned_stores.insert(kv_store_name.to_string());
+            }
+            log::warn!("KV store '{}' not available: {}", kv_store_name, error);
+        }
+        Err(_) => {
+            log::warn!("KV store '{}' not available: {}", kv_store_name, error);
+        }
+    }
 }

@@ -681,7 +681,6 @@ dependencies = [
  "redb",
  "reqwest",
  "serde",
- "serde_json",
  "simple_logger",
  "tempfile",
  "thiserror 2.0.18",
@@ -733,7 +732,6 @@ dependencies = [
  "futures-util",
  "log",
  "log-fastly",
- "serde_json",
  "tempfile",
  "walkdir",
 ]

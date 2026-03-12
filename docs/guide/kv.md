@@ -82,7 +82,7 @@ Key listing is paginated by design. This avoids buffering an unbounded number of
 
 ### Local Development
 
-- **Axum**: Uses a persistent `redb` embedded database stored at `.edgezero/kv.redb`. Data persists across restarts (add `.edgezero/` to your `.gitignore`).
+- **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. The default store name uses `.edgezero/kv.redb`; custom store names get their own derived file. Data persists across restarts (add `.edgezero/` to your `.gitignore`).
 - **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` entry in `fastly.toml`.
 
   ```toml
@@ -109,7 +109,7 @@ Key listing is paginated by design. This avoids buffering an unbounded number of
 Both Fastly and Cloudflare KV stores are **eventually consistent**.
 
 - A value written at one edge location may not be immediately visible at another.
-- `update()` is **not atomic**. Concurrent updates to the same key may result in lost writes.
+- `read_modify_write()` is **not atomic**. Concurrent updates to the same key may result in lost writes.
 - **TTL**: `put_with_ttl` enforces a minimum of **60 seconds** and a maximum of **1 year** across all adapters.
 
 ## Limits & Validation

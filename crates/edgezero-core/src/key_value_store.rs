@@ -287,8 +287,9 @@ impl KvHandle {
     fn validate_value(value: &[u8]) -> Result<(), KvError> {
         if value.len() > Self::MAX_VALUE_SIZE {
             return Err(KvError::Validation(format!(
-                "value size {} exceeds limit of 25MB",
-                value.len()
+                "value size {} exceeds limit of {} bytes",
+                value.len(),
+                Self::MAX_VALUE_SIZE
             )));
         }
         Ok(())
@@ -1207,6 +1208,19 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{}", err).contains("at least 60 seconds"));
+        });
+    }
+
+    #[test]
+    fn validation_rejects_long_ttl() {
+        let h = handle();
+        futures::executor::block_on(async {
+            let err = h
+                .put_with_ttl("long", &"val", KvHandle::MAX_TTL + Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, KvError::Validation(_)));
+            assert!(format!("{}", err).contains("exceeds maximum"));
         });
     }
 
