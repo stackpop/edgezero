@@ -203,12 +203,24 @@ See the [Streaming guide](/guide/streaming) for examples and patterns.
 Run contract tests for the Cloudflare adapter:
 
 ```bash
-cargo install wasm-bindgen-cli --version 0.2.113 --locked
+WASM_BINDGEN_VERSION=$(
+  awk '
+    $1 == "name" && $3 == "\"wasm-bindgen\"" { in_pkg=1; next }
+    in_pkg && $1 == "version" {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+  ' Cargo.lock
+)
+cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked --force
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
-cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown
+cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown --test contract
 ```
 
-These tests use `wasm-bindgen-test-runner` and execute the adapter's real wasm32 request path.
+These tests use `wasm-bindgen-test-runner` and execute the adapter's real
+wasm32 request path. The CLI version must exactly match the workspace's
+`wasm-bindgen` version from `Cargo.lock`.
 
 ## Manifest Configuration
 

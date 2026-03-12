@@ -6,7 +6,7 @@ Deploy EdgeZero applications to Fastly's Compute@Edge platform using WebAssembly
 
 - [Fastly CLI](https://developer.fastly.com/learning/compute/#install-the-fastly-cli)
 - Rust `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
-- [Wasmtime](https://wasmtime.dev/) or [Viceroy](https://github.com/fastly/Viceroy) for local testing
+- [Viceroy](https://github.com/fastly/Viceroy) for local execution and testing
 
 ## Project Setup
 
@@ -187,15 +187,19 @@ See the [Streaming guide](/guide/streaming) for examples and patterns.
 Run contract tests for the Fastly adapter:
 
 ```bash
-# Set up the Wasm runner
-export CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir=."
+cargo install viceroy --locked
+export CARGO_TARGET_WASM32_WASIP1_RUNNER="viceroy run"
 
 # Run tests
-cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1
+cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract
 ```
 
-::: tip Viceroy Issues
-If Viceroy reports keychain access errors on macOS, use Wasmtime as the test runner instead.
+Fastly SDK-linked Wasm binaries require Viceroy for execution; plain Wasmtime
+does not provide the `fastly_*` host imports needed by the adapter tests.
+
+::: tip Local Execution
+If Viceroy reports native certificate or keychain errors on macOS, use `--no-run`
+locally and rely on Linux CI for execution.
 :::
 
 ## Manifest Configuration

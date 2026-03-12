@@ -90,8 +90,25 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
+      - name: Resolve wasm-bindgen CLI version
+        id: wasm-bindgen-version
+        shell: bash
+        run: |
+          version="$(
+            awk '
+              $1 == "name" && $3 == "\"wasm-bindgen\"" { in_pkg=1; next }
+              in_pkg && $1 == "version" {
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            ' Cargo.lock
+          )"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install wasm-bindgen test runner
-        run: cargo install wasm-bindgen-cli --version 0.2.113 --locked
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
@@ -99,7 +116,7 @@ jobs:
       - name: Run Cloudflare wasm tests
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown
+        run: cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown --test contract
 
   fastly-wasm-tests:
     name: fastly wasm tests
@@ -133,13 +150,13 @@ jobs:
       - name: Add wasm32-wasi target
         run: rustup target add wasm32-wasip1
 
-      - name: Set up Wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@v1
+      - name: Setup Viceroy
+        run: cargo install viceroy --locked
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
       - name: Run Fastly wasm tests
         env:
-          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --dir=."
-        run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "viceroy run"
+        run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract
