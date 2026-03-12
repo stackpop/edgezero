@@ -154,10 +154,10 @@ name = "app_config"
 name = "APP_CONFIG"
 ```
 
-| Field      | Required | Description                                                                                                  |
-| ---------- | -------- | ------------------------------------------------------------------------------------------------------------ |
-| `name`     | No       | Global store or binding name; if omitted but the section is present, adapters fall back to `EDGEZERO_CONFIG` |
-| `adapters` | No       | Per-adapter name overrides, keyed by supported lowercase adapter name (`axum`, `cloudflare`, `fastly`)      |
+| Field      | Required | Description                                                                                                       |
+| ---------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
+| `name`     | No       | Global store or binding name; if omitted but the section is present, adapters fall back to `EDGEZERO_CONFIG`      |
+| `adapters` | No       | Per-adapter name overrides, keyed by supported lowercase adapter name (`axum`, `cloudflare`, `fastly`)            |
 | `defaults` | No       | Local default values used by the Axum adapter when env vars are absent; this key set is also Axum's env allowlist |
 
 Runtime behavior by adapter:
