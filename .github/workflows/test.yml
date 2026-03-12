@@ -57,3 +57,106 @@ jobs:
 
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare"
+
+  cloudflare-wasm-tests:
+    name: cloudflare wasm tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Retrieve Rust version
+        id: rust-version-cloudflare
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust tool chain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version-cloudflare.outputs.rust-version }}
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Resolve wasm-bindgen CLI version
+        id: wasm-bindgen-version
+        shell: bash
+        run: |
+          version="$(
+            awk '
+              $1 == "name" && $3 == "\"wasm-bindgen\"" { in_pkg=1; next }
+              in_pkg && $1 == "version" {
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            ' Cargo.lock
+          )"
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install wasm-bindgen test runner
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Run Cloudflare wasm tests
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown --test contract
+
+  fastly-wasm-tests:
+    name: fastly wasm tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Retrieve Rust version
+        id: rust-version-fastly
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust tool chain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version-fastly.outputs.rust-version }}
+
+      - name: Add wasm32-wasi target
+        run: rustup target add wasm32-wasip1
+
+      - name: Setup Viceroy
+        run: cargo install viceroy --locked
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Run Fastly wasm tests
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "viceroy run"
+        run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract

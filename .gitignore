@@ -4,6 +4,9 @@ pkg/
 target/
 .wrangler/
 
+# Node
+node_modules/
+
 # env
 .env
 

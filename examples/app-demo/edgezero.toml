@@ -52,6 +52,13 @@ methods = ["GET", "POST"]
 handler = "app_demo_core::handlers::proxy_demo"
 adapters = ["axum", "cloudflare", "fastly"]
 
+[[triggers.http]]
+id = "config_get"
+path = "/config/{name}"
+methods = ["GET"]
+handler = "app_demo_core::handlers::config_get"
+adapters = ["axum", "cloudflare", "fastly"]
+
 # [environment]
 #
 # [[environment.variables]]
@@ -65,6 +72,14 @@ adapters = ["axum", "cloudflare", "fastly"]
 # description = "Secret token used when calling the upstream API"
 # adapters = ["axum", "cloudflare", "fastly"]
 # env = "API_TOKEN"
+
+[stores.config]
+name = "app_config"
+
+[stores.config.defaults]
+"feature.new_checkout" = "false"
+"service.timeout_ms" = "1500"
+"greeting" = "hello from config store"
 
 [adapters.axum.adapter]
 crate = "crates/app-demo-adapter-axum"

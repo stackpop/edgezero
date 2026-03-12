@@ -1,10 +1,10 @@
 use log::LevelFilter;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 pub struct ManifestLoader {
     manifest: Arc<Manifest>,
@@ -53,6 +53,9 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
+pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
+const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
+
 #[derive(Debug, Deserialize, Validate)]
 pub struct Manifest {
     #[serde(default)]
@@ -70,6 +73,9 @@ pub struct Manifest {
     #[serde(default)]
     #[validate(nested)]
     pub logging: ManifestLogging,
+    #[serde(default)]
+    #[validate(nested)]
+    pub stores: ManifestStores,
     #[serde(skip)]
     pub(crate) root: Option<PathBuf>,
     #[serde(skip)]
@@ -115,7 +121,7 @@ impl Manifest {
         &self.environment
     }
 
-    fn finalize(&mut self) {
+    pub(crate) fn finalize(&mut self) {
         let mut resolved = BTreeMap::new();
 
         for (adapter, cfg) in &self.adapters {
@@ -305,6 +311,108 @@ pub struct ManifestAdapterCommands {
     #[validate(length(min = 1))]
     pub deploy: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Stores
+// ---------------------------------------------------------------------------
+
+/// Top-level `[stores]` section. Compatible with the KV branch's `kv` sibling.
+#[derive(Debug, Default, Deserialize, Validate)]
+pub struct ManifestStores {
+    #[validate(nested)]
+    pub config: Option<ManifestConfigStoreConfig>,
+}
+
+/// `[stores.config]` section — provider-neutral config store.
+#[derive(Debug, Deserialize, Validate)]
+pub struct ManifestConfigStoreConfig {
+    /// Global store/binding name used when no adapter-specific override is set.
+    #[serde(default)]
+    #[validate(length(min = 1))]
+    pub name: Option<String>,
+    /// Per-adapter name overrides, keyed by supported lowercase adapter name
+    /// (`axum`, `cloudflare`, or `fastly`).
+    #[serde(default)]
+    #[validate(nested)]
+    #[validate(custom(function = "validate_config_store_adapter_keys"))]
+    pub adapters: BTreeMap<String, ManifestConfigAdapterConfig>,
+    /// Optional default values used for local dev (Axum adapter).
+    #[serde(default)]
+    pub defaults: BTreeMap<String, String>,
+}
+
+/// `[stores.config.adapters.<adapter>]` override.
+#[derive(Debug, Deserialize, Serialize, Validate)]
+pub struct ManifestConfigAdapterConfig {
+    #[validate(length(min = 1))]
+    pub name: String,
+}
+
+fn validate_config_store_adapter_keys(
+    adapters: &BTreeMap<String, ManifestConfigAdapterConfig>,
+) -> Result<(), ValidationError> {
+    let mixed_case_keys = adapters
+        .keys()
+        .filter(|key| key.as_str() != key.to_ascii_lowercase())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !mixed_case_keys.is_empty() {
+        let mut error = ValidationError::new("config_store_adapter_keys_lowercase");
+        error.message = Some(
+            format!(
+                "config store adapter override keys must be lowercase: {}",
+                mixed_case_keys.join(", ")
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+
+    let unknown_keys = adapters
+        .keys()
+        .filter(|key| !SUPPORTED_CONFIG_STORE_ADAPTERS.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown_keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut error = ValidationError::new("config_store_adapter_keys_known");
+    error.message = Some(
+        format!(
+            "config store adapter override keys must match supported adapters ({}): {}",
+            SUPPORTED_CONFIG_STORE_ADAPTERS.join(", "),
+            unknown_keys.join(", ")
+        )
+        .into(),
+    );
+    Err(error)
+}
+
+impl ManifestConfigStoreConfig {
+    /// Resolve the config store name for a given adapter.
+    ///
+    /// Priority: adapter override → global name → `DEFAULT_CONFIG_STORE_NAME`.
+    pub fn config_store_name(&self, adapter: &str) -> &str {
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(override_cfg) = self.adapters.get(&adapter_lower) {
+            return &override_cfg.name;
+        }
+        if let Some(name) = &self.name {
+            return name.as_str();
+        }
+        DEFAULT_CONFIG_STORE_NAME
+    }
+
+    /// Access the default key-value pairs for local dev.
+    pub fn config_store_defaults(&self) -> &BTreeMap<String, String> {
+        &self.defaults
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logging (unchanged)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize, Validate)]
 pub struct ManifestLogging {
@@ -1073,6 +1181,145 @@ manifest = "fastly.toml"
         assert_eq!(HttpMethod::Patch.as_str(), "PATCH");
         assert_eq!(HttpMethod::Options.as_str(), "OPTIONS");
         assert_eq!(HttpMethod::Head.as_str(), "HEAD");
+    }
+
+    // Config store tests
+    #[test]
+    fn config_store_name_falls_back_to_default_constant() {
+        // [stores.config] present but no name and no adapter overrides:
+        // config_store_name() must return DEFAULT_CONFIG_STORE_NAME.
+        let toml = "[stores.config]\n";
+        let m = ManifestLoader::load_from_str(toml);
+        let config = m.manifest().stores.config.as_ref().unwrap();
+        assert_eq!(
+            config.config_store_name("fastly"),
+            DEFAULT_CONFIG_STORE_NAME
+        );
+        assert_eq!(
+            config.config_store_name("cloudflare"),
+            DEFAULT_CONFIG_STORE_NAME
+        );
+        assert_eq!(config.config_store_name("axum"), DEFAULT_CONFIG_STORE_NAME);
+    }
+
+    #[test]
+    fn config_store_name_defaults_when_omitted() {
+        // No [stores.config] section at all: callers skip the config store entirely.
+        let manifest = ManifestLoader::load_from_str("");
+        assert!(manifest.manifest().stores.config.is_none());
+    }
+
+    #[test]
+    fn config_store_name_uses_global_name() {
+        let toml = r#"
+[stores.config]
+name = "app_config"
+"#;
+        let m = ManifestLoader::load_from_str(toml);
+        let config = m.manifest().stores.config.as_ref().unwrap();
+        assert_eq!(config.config_store_name("fastly"), "app_config");
+        assert_eq!(config.config_store_name("cloudflare"), "app_config");
+        assert_eq!(config.config_store_name("axum"), "app_config");
+    }
+
+    #[test]
+    fn config_store_name_adapter_override() {
+        let toml = r#"
+[stores.config]
+name = "global_config"
+
+[stores.config.adapters.fastly]
+name = "my-config-link"
+
+[stores.config.adapters.cloudflare]
+name = "APP_CONFIG_BINDING"
+"#;
+        let m = ManifestLoader::load_from_str(toml);
+        let config = m.manifest().stores.config.as_ref().unwrap();
+        assert_eq!(config.config_store_name("fastly"), "my-config-link");
+        assert_eq!(config.config_store_name("cloudflare"), "APP_CONFIG_BINDING");
+        assert_eq!(config.config_store_name("axum"), "global_config");
+    }
+
+    #[test]
+    fn config_store_name_case_insensitive() {
+        let toml = r#"
+[stores.config.adapters.fastly]
+name = "fastly-store"
+"#;
+        let m = ManifestLoader::load_from_str(toml);
+        let config = m.manifest().stores.config.as_ref().unwrap();
+        assert_eq!(config.config_store_name("FASTLY"), "fastly-store");
+        assert_eq!(config.config_store_name("Fastly"), "fastly-store");
+        assert_eq!(config.config_store_name("fastly"), "fastly-store");
+    }
+
+    #[test]
+    fn config_store_mixed_case_adapter_key_fails_validation() {
+        let src = r#"
+[stores.config.adapters.Fastly]
+name = "fastly-store"
+"#;
+        let manifest: Manifest = toml::from_str(src).expect("should parse");
+        let result = manifest.validate();
+        assert!(
+            result.is_err(),
+            "mixed-case config store adapter key should fail validation"
+        );
+    }
+
+    #[test]
+    fn config_store_unknown_adapter_key_fails_validation() {
+        let src = r#"
+[stores.config.adapters.clouflare]
+name = "APP_CONFIG"
+"#;
+        let manifest: Manifest = toml::from_str(src).expect("should parse");
+        let result = manifest.validate();
+        assert!(
+            result.is_err(),
+            "unknown config store adapter key should fail validation"
+        );
+    }
+
+    #[test]
+    fn config_store_defaults_accessible() {
+        let toml = r#"
+[stores.config.defaults]
+"feature.checkout" = "true"
+"service.timeout_ms" = "1500"
+"#;
+        let m = ManifestLoader::load_from_str(toml);
+        let config = m.manifest().stores.config.as_ref().unwrap();
+        let defaults = config.config_store_defaults();
+        assert_eq!(
+            defaults.get("feature.checkout").map(|s| s.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            defaults.get("service.timeout_ms").map(|s| s.as_str()),
+            Some("1500")
+        );
+    }
+
+    #[test]
+    fn empty_manifest_has_no_config_store() {
+        let m = ManifestLoader::load_from_str("");
+        assert!(m.manifest().stores.config.is_none());
+    }
+
+    #[test]
+    fn config_store_empty_global_name_fails_validation() {
+        let src = r#"
+[stores.config]
+name = ""
+"#;
+        let manifest: Manifest = toml::from_str(src).expect("should parse");
+        let result = manifest.validate();
+        assert!(
+            result.is_err(),
+            "empty global config store name should fail validation"
+        );
     }
 
     // Multiple triggers test

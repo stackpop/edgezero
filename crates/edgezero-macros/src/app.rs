@@ -6,6 +6,7 @@ use std::fs;
 use std::path::PathBuf;
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Ident, LitStr, Token};
+use validator::Validate;
 
 #[allow(dead_code)]
 mod manifest_definitions {
@@ -14,7 +15,7 @@ mod manifest_definitions {
         "/../edgezero-core/src/manifest.rs"
     ));
 }
-use manifest_definitions::Manifest;
+use manifest_definitions::{Manifest, DEFAULT_CONFIG_STORE_NAME};
 
 pub fn expand_app(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as AppArgs);
@@ -23,8 +24,12 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     let manifest_source = fs::read_to_string(&manifest_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
 
-    let manifest: Manifest = toml::from_str(&manifest_source)
+    let mut manifest: Manifest = toml::from_str(&manifest_source)
         .unwrap_or_else(|err| panic!("failed to parse {}: {err}", manifest_path.display()));
+    manifest
+        .validate()
+        .unwrap_or_else(|err| panic!("failed to validate {}: {err}", manifest_path.display()));
+    manifest.finalize();
 
     let app_ident = args
         .app_ident
@@ -38,6 +43,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
     let middleware_tokens = build_middleware_tokens(&manifest);
     let route_tokens = build_route_tokens(&manifest);
+    let config_store_tokens = build_config_store_tokens(&manifest);
 
     let output = quote! {
         pub struct #app_ident;
@@ -50,6 +56,8 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
             fn name() -> &'static str {
                 #app_name_lit
             }
+
+            #config_store_tokens
         }
 
         pub fn build_router() -> edgezero_core::router::RouterService {
@@ -105,6 +113,39 @@ fn build_middleware_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
             }
         })
         .collect()
+}
+
+fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
+    let Some(config) = manifest.stores.config.as_ref() else {
+        return quote! {};
+    };
+
+    let fallback_name = config.name.as_deref().unwrap_or(DEFAULT_CONFIG_STORE_NAME);
+    let fallback_name_lit = LitStr::new(fallback_name, Span::call_site());
+    let override_entries: Vec<_> = config
+        .adapters
+        .iter()
+        .map(|(adapter, cfg)| {
+            let adapter_lit = LitStr::new(adapter, Span::call_site());
+            let name_lit = LitStr::new(&cfg.name, Span::call_site());
+            quote! {
+                edgezero_core::app::ConfigStoreAdapterMetadata::new(#adapter_lit, #name_lit),
+            }
+        })
+        .collect();
+
+    quote! {
+        fn config_store() -> Option<&'static edgezero_core::app::ConfigStoreMetadata> {
+            static CONFIG_STORE: edgezero_core::app::ConfigStoreMetadata =
+                edgezero_core::app::ConfigStoreMetadata::new(
+                    #fallback_name_lit,
+                    &[
+                        #(#override_entries)*
+                    ],
+                );
+            Some(&CONFIG_STORE)
+        }
+    }
 }
 
 fn parse_handler_path(handler: &str) -> syn::ExprPath {

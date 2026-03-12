@@ -3,6 +3,8 @@
 
 #[cfg(feature = "cli")]
 pub mod cli;
+#[cfg(feature = "fastly")]
+pub mod config_store;
 mod context;
 #[cfg(feature = "fastly")]
 mod logger;
@@ -13,11 +15,14 @@ mod request;
 #[cfg(feature = "fastly")]
 mod response;
 
+#[cfg(feature = "fastly")]
+pub use config_store::FastlyConfigStore;
 pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
-pub use request::{dispatch, into_core_request};
+#[allow(deprecated)]
+pub use request::{dispatch, dispatch_with_config, dispatch_with_config_handle, into_core_request};
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
 
@@ -62,13 +67,17 @@ pub fn init_logger(
 
 #[cfg(feature = "fastly")]
 pub trait AppExt {
+    #[deprecated(
+        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
+    )]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
 }
 
 #[cfg(feature = "fastly")]
 impl AppExt for edgezero_core::app::App {
+    #[allow(deprecated)]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-        dispatch(self, req)
+        crate::request::dispatch_raw(self, req)
     }
 }
 
@@ -78,14 +87,28 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
     let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
-    let logging = manifest_loader.manifest().logging_or_default("fastly");
-    run_app_with_logging::<A>(logging.into(), req)
+    let m = manifest_loader.manifest();
+    let logging = m.logging_or_default(edgezero_core::app::FASTLY_ADAPTER);
+    let config_name = A::config_store()
+        .map(|cfg| {
+            cfg.name_for_adapter(edgezero_core::app::FASTLY_ADAPTER)
+                .to_string()
+        })
+        .or_else(|| {
+            m.stores.config.as_ref().map(|cfg| {
+                cfg.config_store_name(edgezero_core::app::FASTLY_ADAPTER)
+                    .to_string()
+            })
+        });
+    run_app_with_config::<A>(logging.into(), req, config_name.as_deref())
 }
 
+/// Dispatch with a config store. Prefer this over `run_app_with_logging` for new code.
 #[cfg(feature = "fastly")]
-pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
+pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
     logging: FastlyLogging,
     req: fastly::Request,
+    config_store_name: Option<&str>,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -93,7 +116,20 @@ pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    dispatch(&app, req)
+    if let Some(name) = config_store_name {
+        dispatch_with_config(&app, req, name)
+    } else {
+        crate::request::dispatch_raw(&app, req)
+    }
+}
+
+/// Compatibility wrapper for callers that do not use a config store.
+#[cfg(feature = "fastly")]
+pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
+    logging: FastlyLogging,
+    req: fastly::Request,
+) -> Result<fastly::Response, fastly::Error> {
+    run_app_with_config::<A>(logging, req, None)
 }
 
 #[cfg(all(test, feature = "fastly"))]

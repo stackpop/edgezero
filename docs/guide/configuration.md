@@ -137,6 +137,42 @@ Variables with a default `value` are injected when running CLI commands.
 
 Secrets must be present in the environment; missing secrets abort CLI commands with an error.
 
+## Stores Section
+
+Use `[stores.config]` for small read-only runtime configuration such as feature flags, JWKS metadata,
+or service settings:
+
+```toml
+[stores.config]
+name = "app_config"
+
+[stores.config.defaults]
+"greeting" = "hello from config store"
+"service.timeout_ms" = "1500"
+
+[stores.config.adapters.cloudflare]
+name = "APP_CONFIG"
+```
+
+| Field      | Required | Description                                                                                                       |
+| ---------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
+| `name`     | No       | Global store or binding name; if omitted but the section is present, adapters fall back to `EDGEZERO_CONFIG`      |
+| `adapters` | No       | Per-adapter name overrides, keyed by supported lowercase adapter name (`axum`, `cloudflare`, `fastly`)            |
+| `defaults` | No       | Local default values used by the Axum adapter when env vars are absent; this key set is also Axum's env allowlist |
+
+Runtime behavior by adapter:
+
+- Fastly reads from a Fastly Config Store resource link.
+- Cloudflare reads from a single JSON string binding in `wrangler.toml [vars]`.
+- Axum reads only the env vars declared in `defaults`, then falls back to `defaults`.
+
+When `[stores.config]` is present, the `app!` macro generates config-store metadata on the `App`
+type. The standard adapter `run_app` helpers use that metadata to inject a config-store handle into
+request extensions automatically, so handlers can call `ctx.config_store()`.
+
+Treat config-store keys like API surface: validate or allowlist any user-controlled lookup before
+calling `ctx.config_store()?.get(...)`.
+
 ## Adapters Section
 
 Each adapter has its own configuration block:
@@ -299,6 +335,7 @@ The macro:
 - Parses HTTP triggers
 - Generates route registration
 - Wires middleware from the manifest
+- Generates config-store metadata from `[stores.config]` when present
 - Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
 
 ### ManifestLoader

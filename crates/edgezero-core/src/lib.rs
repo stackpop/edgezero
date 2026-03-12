@@ -3,6 +3,7 @@
 pub mod app;
 pub mod body;
 pub mod compression;
+pub mod config_store;
 pub mod context;
 pub mod error;
 pub mod extractor;

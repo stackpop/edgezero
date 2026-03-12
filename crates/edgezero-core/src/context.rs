@@ -1,4 +1,5 @@
 use crate::body::Body;
+use crate::config_store::ConfigStoreHandle;
 use crate::error::EdgeError;
 use crate::http::Request;
 use crate::params::PathParams;
@@ -82,6 +83,13 @@ impl RequestContext {
 
     pub fn proxy_handle(&self) -> Option<ProxyHandle> {
         self.request.extensions().get::<ProxyHandle>().cloned()
+    }
+
+    pub fn config_store(&self) -> Option<ConfigStoreHandle> {
+        self.request
+            .extensions()
+            .get::<ConfigStoreHandle>()
+            .cloned()
     }
 }
 
@@ -320,5 +328,46 @@ mod tests {
         let request = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
         let response = futures::executor::block_on(handle.forward(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn config_store_is_retrieved_when_present() {
+        use crate::config_store::{ConfigStore, ConfigStoreHandle};
+        use std::sync::Arc;
+
+        struct FixedStore;
+        impl ConfigStore for FixedStore {
+            fn get(
+                &self,
+                _key: &str,
+            ) -> Result<Option<String>, crate::config_store::ConfigStoreError> {
+                Ok(Some("value".to_string()))
+            }
+        }
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ConfigStoreHandle::new(Arc::new(FixedStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.config_store().is_some());
+        assert_eq!(
+            ctx.config_store()
+                .unwrap()
+                .get("any")
+                .expect("config value"),
+            Some("value".to_string())
+        );
+    }
+
+    #[test]
+    fn config_store_returns_none_when_absent() {
+        let ctx = ctx("/test", Body::empty(), PathParams::default());
+        assert!(ctx.config_store().is_none());
     }
 }

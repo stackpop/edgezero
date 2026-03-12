@@ -4,3 +4,8 @@ compatibility_date = "2023-05-01"
 
 [build]
 command = "worker-build --release"
+
+# Config store as a single JSON string var, keyed by the binding name from edgezero.toml.
+# CloudflareConfigStore parses this at startup into a HashMap, enabling arbitrary key names.
+[vars]
+app_config = '{"greeting":"hello from config store","feature.new_checkout":"false","service.timeout_ms":"1500"}'
