@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use edgezero_adapter_fastly::{
-    dispatch, dispatch_with_config_store, from_core_response, into_core_request,
+    dispatch, dispatch_with_config_handle, from_core_response, into_core_request,
     FastlyRequestContext,
 };
 use edgezero_core::app::App;
@@ -171,12 +171,12 @@ fn dispatch_passes_request_body_to_handlers() {
 }
 
 #[test]
-fn dispatch_with_config_store_injects_handle() {
+fn dispatch_with_config_handle_injects_handle() {
     let app = build_test_app();
     let req = fastly_request(FastlyMethod::GET, "/config", None);
     let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from fastly test")));
 
-    let mut response = dispatch_with_config_store(&app, req, handle).expect("fastly response");
+    let mut response = dispatch_with_config_handle(&app, req, handle).expect("fastly response");
 
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"hello from fastly test");

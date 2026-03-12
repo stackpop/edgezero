@@ -64,10 +64,11 @@ pub(crate) async fn dispatch_raw(
 /// Low-level manual dispatch.
 ///
 /// This path does not resolve or inject config-store metadata from a manifest.
-/// Prefer `run_app`, `dispatch_with_config`, or `dispatch_with_config_store`
-/// for config-store-aware dispatch.
+/// Prefer `run_app` or `dispatch_with_config` for normal config-store-aware
+/// dispatch. Use `dispatch_with_config_handle` only when you already have a
+/// prepared `ConfigStoreHandle`.
 #[deprecated(
-    note = "dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_store()"
+    note = "dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
 )]
 pub async fn dispatch(
     app: &App,
@@ -79,7 +80,10 @@ pub async fn dispatch(
 }
 
 /// Dispatch a request with a prepared config-store handle injected.
-pub async fn dispatch_with_config_store(
+///
+/// This is the advanced/manual path. Prefer `dispatch_with_config` when you
+/// want the adapter to resolve the configured backend for you.
+pub async fn dispatch_with_config_handle(
     app: &App,
     req: CfRequest,
     env: Env,

@@ -27,7 +27,7 @@ pub use context::CloudflareRequestContext;
 pub use proxy::CloudflareProxyClient;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[allow(deprecated)]
-pub use request::{dispatch, dispatch_with_config, dispatch_with_config_store, into_core_request};
+pub use request::{dispatch, dispatch_with_config, dispatch_with_config_handle, into_core_request};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
@@ -44,7 +44,7 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub trait AppExt {
     #[deprecated(
-        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_store()"
+        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
     )]
     fn dispatch<'a>(
         &'a self,

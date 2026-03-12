@@ -4,7 +4,7 @@
 
 use bytes::Bytes;
 use edgezero_adapter_cloudflare::{
-    dispatch, dispatch_with_config, dispatch_with_config_store, from_core_response,
+    dispatch, dispatch_with_config, dispatch_with_config_handle, from_core_response,
     into_core_request, CloudflareRequestContext,
 };
 use edgezero_core::{
@@ -230,13 +230,13 @@ async fn dispatch_with_config_missing_binding_skips_injection() {
 }
 
 #[wasm_bindgen_test]
-async fn dispatch_with_config_store_injects_handle() {
+async fn dispatch_with_config_handle_injects_handle() {
     let app = build_test_app();
     let req = cf_request(CfMethod::Get, "/config-value", None);
     let (env, ctx) = test_env_ctx();
     let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from cf test")));
 
-    let mut response = dispatch_with_config_store(&app, req, env, ctx, handle)
+    let mut response = dispatch_with_config_handle(&app, req, env, ctx, handle)
         .await
         .expect("cf response");
 

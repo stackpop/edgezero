@@ -53,7 +53,9 @@ Cloudflare binding automatically. If you implement `Hooks` manually and need run
 fallbacks, use `run_app_with_manifest`.
 
 The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
-config-store metadata. Prefer `run_app`, `dispatch_with_config`, or `dispatch_with_config_store`.
+config-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
+`dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
+`ConfigStoreHandle`.
 
 ## Building
 

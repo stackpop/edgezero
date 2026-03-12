@@ -55,17 +55,21 @@ pub(crate) fn dispatch_raw(app: &App, req: FastlyRequest) -> Result<FastlyRespon
 /// Low-level manual dispatch.
 ///
 /// This path does not resolve or inject config-store metadata from a manifest.
-/// Prefer `run_app`, `dispatch_with_config`, or `dispatch_with_config_store`
-/// for config-store-aware dispatch.
+/// Prefer `run_app` or `dispatch_with_config` for normal config-store-aware
+/// dispatch. Use `dispatch_with_config_handle` only when you already have a
+/// prepared `ConfigStoreHandle`.
 #[deprecated(
-    note = "dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_store()"
+    note = "dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
 )]
 pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
     dispatch_raw(app, req)
 }
 
 /// Dispatch a request with a prepared config-store handle injected into extensions.
-pub fn dispatch_with_config_store(
+///
+/// This is the advanced/manual path. Prefer `dispatch_with_config` when you
+/// want the adapter to resolve the configured backend for you.
+pub fn dispatch_with_config_handle(
     app: &App,
     req: FastlyRequest,
     config_store_handle: ConfigStoreHandle,

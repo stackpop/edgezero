@@ -22,7 +22,7 @@ pub use context::FastlyRequestContext;
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
 #[allow(deprecated)]
-pub use request::{dispatch, dispatch_with_config, dispatch_with_config_store, into_core_request};
+pub use request::{dispatch, dispatch_with_config, dispatch_with_config_handle, into_core_request};
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
 
@@ -68,7 +68,7 @@ pub fn init_logger(
 #[cfg(feature = "fastly")]
 pub trait AppExt {
     #[deprecated(
-        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_store()"
+        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
     )]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
 }
