@@ -70,6 +70,38 @@ impl Body {
         matches!(self, Body::Stream(_))
     }
 
+    /// Drain the body into a single `Bytes` buffer, enforcing `max_size`.
+    ///
+    /// Works for both buffered and streaming variants. Returns an error if
+    /// the body exceeds `max_size` bytes.
+    pub async fn into_bytes_bounded(
+        self,
+        max_size: usize,
+    ) -> Result<Bytes, crate::error::EdgeError> {
+        if self.is_stream() {
+            let mut stream = self.into_stream().expect("checked is_stream");
+            let mut buf = Vec::new();
+            while let Some(chunk) = StreamExt::next(&mut stream).await {
+                let chunk = chunk.map_err(crate::error::EdgeError::internal)?;
+                buf.extend_from_slice(&chunk);
+                if buf.len() > max_size {
+                    return Err(crate::error::EdgeError::bad_request(
+                        "request body too large",
+                    ));
+                }
+            }
+            Ok(Bytes::from(buf))
+        } else {
+            let bytes = self.into_bytes();
+            if bytes.len() > max_size {
+                return Err(crate::error::EdgeError::bad_request(
+                    "request body too large",
+                ));
+            }
+            Ok(bytes)
+        }
+    }
+
     pub fn text<S>(text: S) -> Self
     where
         S: Into<String>,
@@ -245,5 +277,39 @@ mod tests {
     fn from_vec_u8_builds_buffered_body() {
         let body = Body::from(vec![1u8, 2u8, 3u8]);
         assert_eq!(body.as_bytes(), &[1u8, 2u8, 3u8]);
+    }
+
+    #[test]
+    fn into_bytes_bounded_buffered_ok() {
+        let body = Body::from("hello");
+        let result = block_on(body.into_bytes_bounded(100));
+        assert_eq!(result.unwrap(), Bytes::from("hello"));
+    }
+
+    #[test]
+    fn into_bytes_bounded_buffered_too_large() {
+        let body = Body::from("hello");
+        let result = block_on(body.into_bytes_bounded(3));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn into_bytes_bounded_stream_ok() {
+        let body = Body::stream(futures_util::stream::iter(vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from_static(b"cd"),
+        ]));
+        let result = block_on(body.into_bytes_bounded(100));
+        assert_eq!(result.unwrap(), Bytes::from("abcd"));
+    }
+
+    #[test]
+    fn into_bytes_bounded_stream_too_large() {
+        let body = Body::stream(futures_util::stream::iter(vec![
+            Bytes::from_static(b"ab"),
+            Bytes::from_static(b"cd"),
+        ]));
+        let result = block_on(body.into_bytes_bounded(3));
+        assert!(result.is_err());
     }
 }

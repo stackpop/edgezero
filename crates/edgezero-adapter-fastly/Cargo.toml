@@ -7,12 +7,20 @@ license = { workspace = true }
 
 [features]
 default = []
-cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:walkdir"]
+cli = [
+    "dep:edgezero-adapter",
+    "edgezero-adapter/cli",
+    "dep:ctor",
+    "dep:walkdir",
+]
 fastly = ["dep:fastly", "dep:log-fastly"]
 
 [dependencies]
+anyhow = { workspace = true }
 edgezero-core = { path = "../edgezero-core" }
-edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = ["cli"] }
+edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = [
+    "cli",
+] }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 brotli = { workspace = true }

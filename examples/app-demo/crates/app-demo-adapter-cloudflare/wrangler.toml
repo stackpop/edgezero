@@ -4,3 +4,11 @@ compatibility_date = "2023-05-01"
 
 [build]
 command = "worker-build --release"
+
+# KV namespace binding — used by KV demo handlers.
+# For local dev (`wrangler dev`), this creates a local KV store automatically.
+# For production, replace `id` with the output of:
+#   wrangler kv:namespace create EDGEZERO_KV
+[[kv_namespaces]]
+binding = "EDGEZERO_KV"
+id = "local-dev-placeholder"

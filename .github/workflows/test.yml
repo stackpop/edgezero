@@ -43,8 +43,8 @@ jobs:
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
-      - name: Add wasm32-wasi target
-        run: rustup target add wasm32-wasip1
+      - name: Add wasm targets
+        run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
 
       - name: Setup Viceroy
         run: cargo install viceroy --locked
@@ -57,3 +57,9 @@ jobs:
 
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare"
+
+      - name: Check Fastly wasm target
+        run: cargo check -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1
+
+      - name: Check Cloudflare wasm target
+        run: cargo check -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown

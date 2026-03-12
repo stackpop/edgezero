@@ -1,4 +1,5 @@
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use axum::Router;
@@ -13,6 +14,12 @@ use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
 use crate::service::EdgeZeroAxumService;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KvInitRequirement {
+    Optional,
+    Required,
+}
 
 /// Configuration used when running the dev server embedding EdgeZero into Axum.
 #[derive(Clone)]
@@ -74,10 +81,98 @@ impl AxumDevServer {
     }
 
     #[cfg(test)]
-    async fn run_with_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+    async fn run_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+        kv_path: &str,
+    ) -> anyhow::Result<()> {
         let AxumDevServer { router, config } = self;
-        serve_with_listener(router, listener, config.enable_ctrl_c).await
+        serve_with_listener_and_kv_path(router, listener, config.enable_ctrl_c, Some(kv_path)).await
     }
+}
+
+fn kv_init_requirement(manifest: &edgezero_core::manifest::Manifest) -> KvInitRequirement {
+    if manifest.stores.kv.is_some() {
+        KvInitRequirement::Required
+    } else {
+        KvInitRequirement::Optional
+    }
+}
+
+fn kv_store_path(store_name: &str) -> PathBuf {
+    if store_name == edgezero_core::manifest::DEFAULT_KV_STORE_NAME {
+        return PathBuf::from(".edgezero/kv.redb");
+    }
+
+    PathBuf::from(".edgezero").join(format!(
+        "kv-{}-{:016x}.redb",
+        store_name_slug(store_name),
+        stable_store_name_hash(store_name)
+    ))
+}
+
+fn store_name_slug(store_name: &str) -> String {
+    const MAX_SLUG_LEN: usize = 24;
+
+    let mut slug = String::with_capacity(MAX_SLUG_LEN);
+    let mut last_was_separator = false;
+    for ch in store_name.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else {
+            None
+        };
+
+        match mapped {
+            Some(ch) => {
+                if slug.len() == MAX_SLUG_LEN {
+                    break;
+                }
+                slug.push(ch);
+                last_was_separator = false;
+            }
+            None if !slug.is_empty() && !last_was_separator => {
+                if slug.len() == MAX_SLUG_LEN {
+                    break;
+                }
+                slug.push('-');
+                last_was_separator = true;
+            }
+            None => {}
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "store".to_string()
+    } else {
+        slug
+    }
+}
+
+fn stable_store_name_hash(store_name: &str) -> u64 {
+    // Deterministic FNV-1a keeps local KV file names stable across processes.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in store_name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<edgezero_core::key_value_store::KvHandle> {
+    if let Some(parent) = kv_path.parent() {
+        std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
+    }
+    let kv_store = std::sync::Arc::new(
+        crate::key_value_store::PersistentKvStore::new(kv_path)
+            .context("failed to create KV store")?,
+    );
+    log::info!("KV store: {}", kv_path.display());
+    Ok(edgezero_core::key_value_store::KvHandle::new(kv_store))
 }
 
 async fn serve_with_listener(
@@ -85,7 +180,34 @@ async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
 ) -> anyhow::Result<()> {
-    let service = EdgeZeroAxumService::new(router);
+    serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, Some(".edgezero/kv.redb"))
+        .await
+}
+
+async fn serve_with_listener_and_kv_path(
+    router: RouterService,
+    listener: tokio::net::TcpListener,
+    enable_ctrl_c: bool,
+    kv_path: Option<&str>,
+) -> anyhow::Result<()> {
+    let kv_handle = kv_path
+        .map(|kv_path| kv_handle_from_path(Path::new(kv_path)))
+        .transpose()?;
+    serve_with_listener_and_kv_handle(router, listener, enable_ctrl_c, kv_handle).await
+}
+
+async fn serve_with_listener_and_kv_handle(
+    router: RouterService,
+    listener: tokio::net::TcpListener,
+    enable_ctrl_c: bool,
+    kv_handle: Option<edgezero_core::key_value_store::KvHandle>,
+) -> anyhow::Result<()> {
+    let mut service = EdgeZeroAxumService::new(router);
+    if let Some(kv_handle) = kv_handle {
+        service = service.with_kv_handle(kv_handle);
+    }
+
+    let service = service;
     let router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
         async move { svc.call(req).await }
@@ -113,7 +235,11 @@ async fn serve_with_listener(
 
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let manifest = ManifestLoader::load_from_str(manifest_src);
-    let logging = manifest.manifest().logging_or_default("axum");
+    let manifest = manifest.manifest();
+    let logging = manifest.logging_or_default("axum");
+    let kv_init_requirement = kv_init_requirement(manifest);
+    let kv_store_name = manifest.kv_store_name("axum").to_string();
+    let kv_path = kv_store_path(&kv_store_name);
 
     let level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
@@ -127,7 +253,46 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let app = A::build_app();
     let router = app.router().clone();
 
-    AxumDevServer::new(router).run()
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    runtime.block_on(async move {
+        let config = AxumDevServerConfig::default();
+        let listener = StdTcpListener::bind(config.addr)
+            .with_context(|| format!("failed to bind dev server to {}", config.addr))?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to set listener to non-blocking")?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .context("failed to adopt std listener into tokio")?;
+
+        let kv_handle = match kv_handle_from_path(&kv_path) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                match kv_init_requirement {
+                    KvInitRequirement::Optional => {
+                        log::warn!(
+                            "KV store '{}' could not be initialized at {}: {}",
+                            kv_store_name,
+                            kv_path.display(),
+                            err
+                        );
+                        None
+                    }
+                    KvInitRequirement::Required => {
+                        return Err(err.context(format!(
+                            "KV store '{}' is explicitly configured for axum but could not be initialized at {}",
+                            kv_store_name,
+                            kv_path.display()
+                        )));
+                    }
+                }
+            }
+        };
+        serve_with_listener_and_kv_handle(router, listener, config.enable_ctrl_c, kv_handle).await
+    })
 }
 
 #[cfg(test)]
@@ -191,6 +356,69 @@ mod tests {
         assert_eq!(server.config.addr.port(), 9000);
         assert!(!server.config.enable_ctrl_c);
     }
+
+    #[test]
+    fn default_store_name_uses_legacy_kv_path() {
+        assert_eq!(
+            kv_store_path(edgezero_core::manifest::DEFAULT_KV_STORE_NAME),
+            PathBuf::from(".edgezero/kv.redb")
+        );
+    }
+
+    #[test]
+    fn implicit_default_kv_is_optional() {
+        let manifest = ManifestLoader::load_from_str("");
+        assert_eq!(
+            kv_init_requirement(manifest.manifest()),
+            KvInitRequirement::Optional
+        );
+    }
+
+    #[test]
+    fn explicit_kv_config_is_required() {
+        let manifest = ManifestLoader::load_from_str(
+            r#"
+[stores.kv]
+name = "EDGEZERO_KV"
+"#,
+        );
+        assert_eq!(
+            kv_init_requirement(manifest.manifest()),
+            KvInitRequirement::Required
+        );
+    }
+
+    #[test]
+    fn custom_store_name_uses_stable_bounded_path() {
+        let path = kv_store_path("../Prod KV");
+        let expected = format!(
+            "kv-prod-kv-{:016x}.redb",
+            stable_store_name_hash("../Prod KV")
+        );
+        assert_eq!(path.parent(), Some(Path::new(".edgezero")));
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn custom_store_names_remain_distinct_across_case() {
+        assert_ne!(kv_store_path("Store"), kv_store_path("store"));
+    }
+
+    #[test]
+    fn custom_store_path_length_is_bounded() {
+        let path = kv_store_path(&"a".repeat(4_096));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("file name");
+        assert!(
+            file_name.len() <= 64,
+            "unexpected file name length: {file_name}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +432,7 @@ mod integration_tests {
     struct TestServer {
         base_url: String,
         handle: tokio::task::JoinHandle<()>,
+        _temp_dir: tempfile::TempDir,
     }
 
     async fn start_test_server(router: RouterService) -> TestServer {
@@ -217,13 +446,19 @@ mod integration_tests {
         };
         let server = AxumDevServer::with_config(router, config);
 
+        // Use a unique temp directory for each test server
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let kv_path = temp_dir.path().join("kv.redb");
+        let kv_path_str = kv_path.to_str().expect("valid path").to_string();
+
         let handle = tokio::spawn(async move {
-            let _ = server.run_with_listener(listener).await;
+            let _ = server.run_with_listener(listener, &kv_path_str).await;
         });
 
         TestServer {
             base_url: format!("http://{}", addr),
             handle,
+            _temp_dir: temp_dir,
         }
     }
 
@@ -357,5 +592,190 @@ mod integration_tests {
         }
 
         drop(listener);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_store_persists_across_requests() {
+        async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
+            let store = ctx.kv_handle().expect("kv configured");
+            store.put("counter", &42i32).await?;
+            Ok("written")
+        }
+
+        async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let store = ctx.kv_handle().expect("kv configured");
+            let val: i32 = store.get_or("counter", 0).await?;
+            Ok(val.to_string())
+        }
+
+        let router = RouterService::builder()
+            .post("/write", write_handler)
+            .get("/read", read_handler)
+            .build();
+        let server = start_test_server(router).await;
+
+        let client = reqwest::Client::new();
+
+        // Write a value
+        let write_url = format!("{}/write", server.base_url);
+        let response = send_with_retry(&client, |client| client.post(write_url.as_str())).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "written");
+
+        // Read it back — proves shared state across requests
+        let read_url = format!("{}/read", server.base_url);
+        let response = send_with_retry(&client, |client| client.get(read_url.as_str())).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "42");
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_store_delete_across_requests() {
+        async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
+            let kv = ctx.kv_handle().expect("kv configured");
+            kv.put("temp", &"to_delete").await?;
+            Ok("written")
+        }
+
+        async fn delete_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
+            let kv = ctx.kv_handle().expect("kv configured");
+            kv.delete("temp").await?;
+            Ok("deleted")
+        }
+
+        async fn check_handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let kv = ctx.kv_handle().expect("kv configured");
+            let exists = kv.exists("temp").await?;
+            Ok(format!("exists={exists}"))
+        }
+
+        let router = RouterService::builder()
+            .post("/write", write_handler)
+            .post("/delete", delete_handler)
+            .get("/check", check_handler)
+            .build();
+        let server = start_test_server(router).await;
+        let client = reqwest::Client::new();
+
+        // Write
+        let url = format!("{}/write", server.base_url);
+        send_with_retry(&client, |c| c.post(url.as_str())).await;
+
+        // Verify exists
+        let url = format!("{}/check", server.base_url);
+        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        assert_eq!(resp.text().await.unwrap(), "exists=true");
+
+        // Delete
+        let url = format!("{}/delete", server.base_url);
+        send_with_retry(&client, |c| c.post(url.as_str())).await;
+
+        // Verify gone
+        let url = format!("{}/check", server.base_url);
+        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        assert_eq!(resp.text().await.unwrap(), "exists=false");
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_store_update_across_requests() {
+        async fn increment_handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let kv = ctx.kv_handle().expect("kv configured");
+            let val = kv.read_modify_write("counter", 0i32, |n| n + 1).await?;
+            Ok(val.to_string())
+        }
+
+        let router = RouterService::builder()
+            .post("/inc", increment_handler)
+            .build();
+        let server = start_test_server(router).await;
+        let client = reqwest::Client::new();
+        let url = format!("{}/inc", server.base_url);
+
+        // Increment 5 times, each should return incremented value
+        for expected in 1..=5i32 {
+            let resp = send_with_retry(&client, |c| c.post(url.as_str())).await;
+            assert_eq!(
+                resp.text().await.unwrap(),
+                expected.to_string(),
+                "increment #{expected}"
+            );
+        }
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_store_returns_not_found_gracefully() {
+        async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let kv = ctx.kv_handle().expect("kv configured");
+            let val: i32 = kv.get_or("nonexistent", -1).await?;
+            Ok(val.to_string())
+        }
+
+        let router = RouterService::builder().get("/read", read_handler).build();
+        let server = start_test_server(router).await;
+        let client = reqwest::Client::new();
+
+        let url = format!("{}/read", server.base_url);
+        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "-1");
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kv_store_handles_typed_data() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct UserProfile {
+            name: String,
+            age: u32,
+            active: bool,
+        }
+
+        async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
+            let kv = ctx.kv_handle().expect("kv configured");
+            let profile = UserProfile {
+                name: "Alice".to_string(),
+                age: 30,
+                active: true,
+            };
+            kv.put("user:alice", &profile).await?;
+            Ok("saved")
+        }
+
+        async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let kv = ctx.kv_handle().expect("kv configured");
+            let profile: Option<UserProfile> = kv.get("user:alice").await?;
+            match profile {
+                Some(p) => Ok(format!("{}:{}", p.name, p.age)),
+                None => Ok("not found".to_string()),
+            }
+        }
+
+        let router = RouterService::builder()
+            .post("/save", write_handler)
+            .get("/load", read_handler)
+            .build();
+        let server = start_test_server(router).await;
+        let client = reqwest::Client::new();
+
+        // Save profile
+        let url = format!("{}/save", server.base_url);
+        let resp = send_with_retry(&client, |c| c.post(url.as_str())).await;
+        assert_eq!(resp.text().await.unwrap(), "saved");
+
+        // Load profile
+        let url = format!("{}/load", server.base_url);
+        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        assert_eq!(resp.text().await.unwrap(), "Alice:30");
+
+        server.handle.abort();
     }
 }

@@ -6,6 +6,8 @@ pub mod cli;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub mod key_value_store;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod proxy;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod request;
@@ -17,7 +19,7 @@ pub use context::CloudflareRequestContext;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use proxy::CloudflareProxyClient;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use request::{dispatch, into_core_request};
+pub use request::{dispatch, dispatch_with_kv, into_core_request, DEFAULT_KV_BINDING};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
@@ -59,11 +61,26 @@ impl AppExt for edgezero_core::app::App {
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub async fn run_app<A: edgezero_core::app::Hooks>(
+    manifest_src: &str,
     req: worker::Request,
     env: worker::Env,
     ctx: worker::Context,
 ) -> Result<worker::Response, worker::Error> {
     init_logger().expect("init cloudflare logger");
+    let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
+    let kv_binding = manifest_loader.manifest().kv_store_name("cloudflare");
     let app = A::build_app();
-    dispatch(&app, req, env, ctx).await
+    dispatch_with_kv(&app, req, env, ctx, kv_binding).await
+}
+
+/// Deprecated: use [`run_app`] which now takes `manifest_src` directly.
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+#[deprecated(note = "use run_app instead, which now takes manifest_src")]
+pub async fn run_app_with_manifest<A: edgezero_core::app::Hooks>(
+    manifest_src: &str,
+    req: worker::Request,
+    env: worker::Env,
+    ctx: worker::Context,
+) -> Result<worker::Response, worker::Error> {
+    run_app::<A>(manifest_src, req, env, ctx).await
 }
