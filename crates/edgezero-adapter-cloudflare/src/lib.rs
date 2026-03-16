@@ -68,9 +68,11 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
 ) -> Result<worker::Response, worker::Error> {
     init_logger().expect("init cloudflare logger");
     let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
-    let kv_binding = manifest_loader.manifest().kv_store_name("cloudflare");
+    let manifest = manifest_loader.manifest();
+    let kv_binding = manifest.kv_store_name("cloudflare");
+    let kv_required = manifest.stores.kv.is_some();
     let app = A::build_app();
-    dispatch_with_kv(&app, req, env, ctx, kv_binding).await
+    dispatch_with_kv(&app, req, env, ctx, kv_binding, kv_required).await
 }
 
 /// Deprecated: use [`run_app`] which now takes `manifest_src` directly.

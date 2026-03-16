@@ -51,24 +51,34 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
 }
 
 pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
-    dispatch_with_kv(app, req, DEFAULT_KV_STORE_NAME)
+    dispatch_with_kv(app, req, DEFAULT_KV_STORE_NAME, false)
 }
 
 /// Dispatch a Fastly request with a custom KV store name.
+///
+/// `kv_required` should be `true` when `[stores.kv]` is explicitly present
+/// in the manifest, causing the request to fail if the store is unavailable
+/// rather than silently degrading.
 pub fn dispatch_with_kv(
     app: &App,
     req: FastlyRequest,
     kv_store_name: &str,
+    kv_required: bool,
 ) -> Result<FastlyResponse, FastlyError> {
     let mut core_request = into_core_request(req).map_err(map_edge_error)?;
 
-    // Inject KV handle if the store exists — graceful fallback.
     match FastlyKvStore::open(kv_store_name) {
         Ok(store) => {
             let handle = KvHandle::new(std::sync::Arc::new(store));
             core_request.extensions_mut().insert(handle);
         }
         Err(e) => {
+            if kv_required {
+                return Err(FastlyError::msg(format!(
+                    "KV store '{}' is explicitly configured but could not be opened: {}",
+                    kv_store_name, e
+                )));
+            }
             warn_missing_kv_store_once(kv_store_name, &e);
         }
     }
@@ -82,17 +92,13 @@ fn map_edge_error(err: EdgeError) -> FastlyError {
 }
 
 fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Display) {
-    const MAX_CACHED_WARNINGS: usize = 64;
     static WARNED_STORES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let warned_stores = WARNED_STORES.get_or_init(|| Mutex::new(BTreeSet::new()));
 
     match warned_stores.lock() {
         Ok(mut warned_stores) => {
-            if warned_stores.contains(kv_store_name) {
+            if !warned_stores.insert(kv_store_name.to_string()) {
                 return;
-            }
-            if warned_stores.len() < MAX_CACHED_WARNINGS {
-                warned_stores.insert(kv_store_name.to_string());
             }
             log::warn!("KV store '{}' not available: {}", kv_store_name, error);
         }

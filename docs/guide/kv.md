@@ -72,9 +72,19 @@ The `KvHandle` provides typed helpers that automatically serialize/deserialize J
 - `delete(key)`: Removes a value.
 - `exists(key)`: Checks if a key is present.
 - `list_keys_page(prefix, cursor, limit)`: Lists keys in a bounded page. Pass the returned cursor back unchanged with the same prefix to fetch the next page.
-- `read_modify_write(key, default, f)`: Read-modify-write (non-atomic).
+- `read_modify_write(key, default, f)`: Read-modify-write (**not atomic** — see warning below).
 
 It also supports raw bytes via `get_bytes`, `put_bytes`, etc.
+
+::: warning Non-atomic read-modify-write
+`read_modify_write` performs a read and a write as **two separate backend calls**.
+Concurrent calls on the same key from different requests can interleave, causing
+lost writes. For example, two requests that both read `counter = 5` and write `6`
+will end with `counter = 6` instead of `7`.
+
+Use it only when approximate values are acceptable (e.g. visit counters, feature flags).
+For strict correctness, use a transactional data store.
+:::
 
 Key listing is paginated by design. This avoids buffering an unbounded number of keys in memory and matches the underlying provider APIs.
 
@@ -94,15 +104,24 @@ Key listing is paginated by design. This avoids buffering an unbounded number of
   description = "Application KV store"
   ```
 
-- **Cloudflare (Workerd)**: Requires a generic binding in `wrangler.toml`.
-  - The `binding` name MUST match the store name configured in `edgezero.toml` (default: "EDGEZERO_KV").
-  ```toml
-  # inside wrangler.toml
-  [[kv_namespaces]]
-  binding = "EDGEZERO_KV"
-  id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-  preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
-  ```
+- **Cloudflare (Workerd)**: Requires a KV namespace and a binding in `wrangler.toml`.
+
+  1. Create the namespace (run once per environment):
+     ```sh
+     wrangler kv namespace create EDGEZERO_KV
+     wrangler kv namespace create EDGEZERO_KV --preview
+     ```
+     Each command prints an `id` — copy them into `wrangler.toml`:
+
+  2. Add the binding to `wrangler.toml`:
+     ```toml
+     [[kv_namespaces]]
+     binding = "EDGEZERO_KV"
+     id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"       # from step 1
+     preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" # from step 1 --preview
+     ```
+
+  The `binding` name MUST match the store name configured in `edgezero.toml` (default: `"EDGEZERO_KV"`).
 
 ### Consistency
 

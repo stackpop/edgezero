@@ -66,6 +66,8 @@ impl KvStore for CloudflareKvStore {
         value: Bytes,
         ttl: Duration,
     ) -> Result<(), KvError> {
+        // `KvHandle::validate_ttl` enforces a minimum of 60s, so sub-second
+        // truncation via `as_secs()` cannot produce a zero TTL here.
         let ttl_secs = ttl.as_secs();
 
         self.store
@@ -90,7 +92,9 @@ impl KvStore for CloudflareKvStore {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<KvPage, KvError> {
-        let mut request = self.store.list().limit(limit as u64);
+        let limit = u64::try_from(limit)
+            .map_err(|_| KvError::Validation("list limit exceeds u64".to_string()))?;
+        let mut request = self.store.list().limit(limit);
 
         if !prefix.is_empty() {
             request = request.prefix(prefix.to_string());

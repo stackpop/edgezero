@@ -83,7 +83,8 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     let manifest = manifest_loader.manifest();
     let logging = manifest.logging_or_default("fastly");
     let kv_name = manifest.kv_store_name("fastly").to_string();
-    run_app_with_logging::<A>(logging.into(), req, &kv_name)
+    let kv_required = manifest.stores.kv.is_some();
+    run_app_with_logging::<A>(logging.into(), req, &kv_name, kv_required)
 }
 
 #[cfg(feature = "fastly")]
@@ -91,6 +92,7 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     logging: FastlyLogging,
     req: fastly::Request,
     kv_store_name: &str,
+    kv_required: bool,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -98,7 +100,7 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    dispatch_with_kv(&app, req, kv_store_name)
+    dispatch_with_kv(&app, req, kv_store_name, kv_required)
 }
 
 #[cfg(all(test, feature = "fastly"))]

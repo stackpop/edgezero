@@ -121,6 +121,19 @@ impl From<KvError> for EdgeError {
 /// All methods take `&self` — backends handle concurrency internally
 /// (e.g., platform APIs, or `Mutex` for in-memory stores).
 ///
+/// # Pre-validation contract
+///
+/// This trait is always called through [`KvHandle`], which validates all
+/// inputs (key length/format, value size, TTL bounds, list limits) before
+/// delegating here. Implementations may therefore assume that:
+/// - Keys are non-empty and within [`KvHandle::MAX_KEY_SIZE`]
+/// - Values are within [`KvHandle::MAX_VALUE_SIZE`]
+/// - TTLs are within `[MIN_TTL, MAX_TTL]`
+/// - List limits are within `[1, MAX_LIST_PAGE_SIZE]`
+///
+/// Do **not** call trait methods directly in production code; always go
+/// through [`KvHandle`] to ensure validation is applied.
+///
 /// Implementations exist per adapter:
 /// - `PersistentKvStore` (axum adapter) — local dev / tests with persistent storage
 /// - `FastlyKvStore` (fastly adapter) — Fastly KV Store
@@ -134,7 +147,13 @@ pub trait KvStore: Send + Sync {
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError>;
 
     /// Store raw bytes with a time-to-live. After `ttl` has elapsed the key
-    /// should be treated as expired (exact eviction timing depends on the backend).
+    /// should be treated as expired. Eviction timing is backend-specific:
+    /// - **Axum (`PersistentKvStore`)**: lazy eviction — expired keys are removed
+    ///   on the next `get_bytes` call for that key. Keys never accessed after
+    ///   expiration remain in the database until deleted, so `.edgezero/kv.redb`
+    ///   grows without bound on long-running dev servers.
+    /// - **Fastly/Cloudflare**: eviction is managed by the platform and is not
+    ///   guaranteed to be immediate.
     async fn put_bytes_with_ttl(
         &self,
         key: &str,

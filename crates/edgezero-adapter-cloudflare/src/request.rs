@@ -59,22 +59,33 @@ pub async fn dispatch(
     env: Env,
     ctx: Context,
 ) -> Result<CfResponse, WorkerError> {
-    dispatch_with_kv(app, req, env, ctx, DEFAULT_KV_BINDING).await
+    dispatch_with_kv(app, req, env, ctx, DEFAULT_KV_BINDING, false).await
 }
 
 /// Dispatch a Cloudflare Worker request with a custom KV binding name.
+///
+/// `kv_required` should be `true` when `[stores.kv]` is explicitly present
+/// in the manifest, causing the request to fail if the binding is unavailable
+/// rather than silently degrading.
 pub async fn dispatch_with_kv(
     app: &App,
     req: CfRequest,
     env: Env,
     ctx: Context,
     kv_binding: &str,
+    kv_required: bool,
 ) -> Result<CfResponse, WorkerError> {
     // Try to open the KV binding from `env` before consuming it in `into_core_request`.
     // We borrow `env` here; `into_core_request` takes ownership afterwards.
     let kv_handle = match crate::key_value_store::CloudflareKvStore::from_env(&env, kv_binding) {
         Ok(store) => Some(KvHandle::new(std::sync::Arc::new(store))),
         Err(e) => {
+            if kv_required {
+                return Err(WorkerError::RustError(format!(
+                    "KV binding '{}' is explicitly configured but could not be opened: {}",
+                    kv_binding, e
+                )));
+            }
             warn_missing_kv_binding_once(kv_binding, &e);
             None
         }
@@ -98,17 +109,13 @@ fn edge_error_to_worker(err: EdgeError) -> WorkerError {
 }
 
 fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl std::fmt::Display) {
-    const MAX_CACHED_WARNINGS: usize = 64;
     static WARNED_BINDINGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
     let warned_bindings = WARNED_BINDINGS.get_or_init(|| Mutex::new(BTreeSet::new()));
 
     match warned_bindings.lock() {
         Ok(mut warned_bindings) => {
-            if warned_bindings.contains(kv_binding) {
+            if !warned_bindings.insert(kv_binding.to_string()) {
                 return;
-            }
-            if warned_bindings.len() < MAX_CACHED_WARNINGS {
-                warned_bindings.insert(kv_binding.to_string());
             }
             log::warn!("KV binding '{}' not available: {}", kv_binding, error);
         }
