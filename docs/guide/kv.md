@@ -105,12 +105,13 @@ Key listing is paginated by design. This avoids buffering an unbounded number of
   ```
 
 - **Cloudflare (Workerd)**: Requires a KV namespace and a binding in `wrangler.toml`.
-
   1. Create the namespace (run once per environment):
+
      ```sh
      wrangler kv namespace create EDGEZERO_KV
      wrangler kv namespace create EDGEZERO_KV --preview
      ```
+
      Each command prints an `id` — copy them into `wrangler.toml`:
 
   2. Add the binding to `wrangler.toml`:

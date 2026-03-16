@@ -47,7 +47,10 @@ jobs:
         run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
 
       - name: Setup Viceroy
-        run: cargo install viceroy --locked
+        run: |
+          if ! command -v viceroy &>/dev/null; then
+            cargo install viceroy --locked
+          fi
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
