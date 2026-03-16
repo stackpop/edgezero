@@ -19,15 +19,12 @@ pub use request::{dispatch, into_core_request};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
-// Spin manages its own logging internally, so both branches are no-ops.
-// The dual cfg mirrors the Cloudflare/Fastly pattern so that a real logger
-// implementation can be wired in for just one target in the future.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub fn init_logger() -> Result<(), log::SetLoggerError> {
-    Ok(())
-}
-
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+/// Initialize the logger for Spin.
+///
+/// Currently a no-op — Spin manages its own logging internally.
+/// When a real logger is needed for one target, split this into
+/// `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` /
+/// `#[cfg(not(...))]` branches following the Fastly/Cloudflare pattern.
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }

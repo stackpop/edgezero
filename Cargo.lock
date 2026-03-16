@@ -737,10 +737,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "brotli",
  "bytes",
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
+ "flate2",
  "futures",
  "futures-util",
  "log",

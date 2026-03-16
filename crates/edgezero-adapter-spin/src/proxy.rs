@@ -1,13 +1,10 @@
 use crate::response::collect_body_bytes;
 use async_trait::async_trait;
-use bytes::Bytes;
 use edgezero_core::body::Body;
-use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, StatusCode};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
-use futures_util::TryStreamExt;
-use std::io;
+use std::io::Read;
 
 /// A proxy client that uses Spin's outbound HTTP (`spin_sdk::http::send`)
 /// to forward requests to upstream services.
@@ -99,30 +96,27 @@ impl ProxyClient for SpinProxyClient {
 
 /// Decompress a buffered body based on the `Content-Encoding` value.
 ///
-/// Since Spin bodies are already fully buffered, we wrap the bytes in a
-/// single-chunk stream, pipe through the shared `edgezero_core::compression`
-/// decoders, then collect back into a `Vec<u8>`.
+/// Since Spin bodies are already fully buffered, we use synchronous
+/// decompression (`flate2`, `brotli`) directly on the byte slice. This
+/// avoids wrapping in an async stream and calling `block_on` inside
+/// the WASI single-threaded async executor, which risks deadlock.
 fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<Vec<u8>, EdgeError> {
     match encoding {
         Some("gzip") => {
-            let stream = futures::stream::iter(vec![Ok::<Vec<u8>, io::Error>(body)]);
-            let decoded = futures::executor::block_on(async {
-                decode_gzip_stream(stream).try_collect::<Vec<Bytes>>().await
-            })
-            .map_err(|e| EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}")))?;
-            Ok(decoded.concat())
+            let mut decoder = flate2::read::GzDecoder::new(body.as_slice());
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).map_err(|e| {
+                EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}"))
+            })?;
+            Ok(decoded)
         }
         Some("br") => {
-            let stream = futures::stream::iter(vec![Ok::<Vec<u8>, io::Error>(body)]);
-            let decoded = futures::executor::block_on(async {
-                decode_brotli_stream(stream)
-                    .try_collect::<Vec<Bytes>>()
-                    .await
-            })
-            .map_err(|e| {
+            let mut decoder = brotli::Decompressor::new(body.as_slice(), 8192);
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).map_err(|e| {
                 EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {e}"))
             })?;
-            Ok(decoded.concat())
+            Ok(decoded)
         }
         _ => Ok(body),
     }

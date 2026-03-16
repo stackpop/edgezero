@@ -20,7 +20,7 @@ crates/
   edgezero-adapter-spin/      # Fermyon Spin bridge (wasm32-wasip1)
   edgezero-adapter-axum/      # Axum/Tokio bridge (native, dev server)
   edgezero-cli/               # CLI: new, build, deploy, dev, serve
-examples/app-demo/            # Reference app with all 3 adapters (excluded from workspace)
+examples/app-demo/            # Reference app with all 4 adapters (excluded from workspace)
 docs/                         # VitePress documentation site (Node.js)
 scripts/                      # Build/deploy/test helper scripts
 ```

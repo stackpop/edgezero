@@ -15,7 +15,9 @@ edgezero-core = { path = "../edgezero-core" }
 edgezero-adapter = { path = "../edgezero-adapter", optional = true, features = ["cli"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+brotli = { workspace = true }
 bytes = { workspace = true }
+flate2 = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 log = { workspace = true }

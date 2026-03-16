@@ -4,7 +4,14 @@ use edgezero_core::http::Response;
 use futures_util::StreamExt;
 use spin_sdk::http as spin_http;
 
+/// Maximum body size (16 MiB) when collecting a streamed body into a buffer.
+/// Prevents unbounded memory growth from malicious or misconfigured upstreams.
+const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
+
 /// Collect a `Body` into a `Vec<u8>`, consuming streamed chunks if necessary.
+///
+/// Stream bodies are capped at [`MAX_BODY_SIZE`] bytes. If the accumulated
+/// size exceeds the limit, collection stops and an error is returned.
 pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError> {
     match body {
         Body::Once(bytes) => Ok(bytes.to_vec()),
@@ -12,7 +19,15 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
             let mut collected = Vec::new();
             while let Some(chunk) = stream.next().await {
                 match chunk {
-                    Ok(bytes) => collected.extend_from_slice(&bytes),
+                    Ok(bytes) => {
+                        if collected.len() + bytes.len() > MAX_BODY_SIZE {
+                            return Err(EdgeError::internal(anyhow::anyhow!(
+                                "body exceeds maximum size of {} bytes",
+                                MAX_BODY_SIZE
+                            )));
+                        }
+                        collected.extend_from_slice(&bytes);
+                    }
                     Err(err) => return Err(EdgeError::internal(err)),
                 }
             }
