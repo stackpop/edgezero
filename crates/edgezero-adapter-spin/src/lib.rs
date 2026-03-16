@@ -19,6 +19,15 @@ pub use request::{dispatch, into_core_request};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
+// Spin manages its own logging internally, so both branches are no-ops.
+// The dual cfg mirrors the Cloudflare/Fastly pattern so that a real logger
+// implementation can be wired in for just one target in the future.
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub fn init_logger() -> Result<(), log::SetLoggerError> {
+    Ok(())
+}
+
+#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
@@ -64,7 +73,11 @@ impl AppExt for edgezero_core::app::App {
 pub async fn run_app<A: edgezero_core::app::Hooks>(
     req: spin_sdk::http::IncomingRequest,
 ) -> anyhow::Result<impl spin_sdk::http::IntoResponse> {
-    init_logger().expect("init spin logger");
+    // Use `let _ =` instead of `.expect()` because Spin calls
+    // `#[http_component]` per-request. Once a real logger is wired in,
+    // `log::set_logger` returns Err on the second call — `.expect()`
+    // would panic on every subsequent request.
+    let _ = init_logger();
     let app = A::build_app();
     dispatch(&app, req).await
 }

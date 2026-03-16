@@ -4,8 +4,9 @@ use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{response_builder, Response, StatusCode};
+use edgezero_core::http::{request_builder, response_builder, Response, StatusCode};
 use edgezero_core::router::RouterService;
+use futures::executor::block_on;
 use futures::stream;
 
 fn build_test_app() -> App {
@@ -68,6 +69,50 @@ fn build_test_app_creates_valid_router() {
     // Smoke test: ensure the router builds without panicking and that
     // the test helpers are usable for future integration tests.
     let _app = build_test_app();
+}
+
+#[test]
+fn router_dispatches_get_and_returns_response() {
+    let app = build_test_app();
+    let request = request_builder()
+        .method("GET")
+        .uri("http://example.com/uri")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = block_on(app.router().oneshot(request));
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body().as_bytes(), b"http://example.com/uri");
+}
+
+#[test]
+fn router_dispatches_post_with_body() {
+    let app = build_test_app();
+    let request = request_builder()
+        .method("POST")
+        .uri("http://example.com/mirror")
+        .body(Body::from(b"echo-payload".to_vec()))
+        .expect("request");
+
+    let response = block_on(app.router().oneshot(request));
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body().as_bytes(), b"echo-payload");
+}
+
+#[test]
+fn router_dispatches_streaming_route() {
+    let app = build_test_app();
+    let request = request_builder()
+        .method("GET")
+        .uri("http://example.com/stream")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = block_on(app.router().oneshot(request));
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------

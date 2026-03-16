@@ -1,9 +1,13 @@
 use crate::response::collect_body_bytes;
 use async_trait::async_trait;
+use bytes::Bytes;
 use edgezero_core::body::Body;
+use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::StatusCode;
+use edgezero_core::http::{header, StatusCode};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
+use futures_util::TryStreamExt;
+use std::io;
 
 /// A proxy client that uses Spin's outbound HTTP (`spin_sdk::http::send`)
 /// to forward requests to upstream services.
@@ -59,11 +63,29 @@ impl ProxyClient for SpinProxyClient {
             }
         }
 
+        // Check Content-Encoding for decompression, matching the
+        // Fastly/Cloudflare adapter contract.
+        let encoding = response_headers
+            .iter()
+            .find(|(name, _)| *name == header::CONTENT_ENCODING)
+            .and_then(|(_, value)| value.to_str().ok())
+            .map(|v| v.to_ascii_lowercase());
+
         let response_body = spin_response.into_body();
-        let mut proxy_response = ProxyResponse::new(status, Body::from(response_body));
+        let decompressed = decompress_body(response_body, encoding.as_deref())?;
+        let mut proxy_response = ProxyResponse::new(status, Body::from(decompressed));
 
         for (name, value) in response_headers {
             proxy_response.headers_mut().insert(name, value);
+        }
+
+        // Strip encoding headers after decompression so downstream
+        // handlers see plain bytes (consistent with Fastly/Cloudflare).
+        if matches!(encoding.as_deref(), Some("gzip") | Some("br")) {
+            proxy_response
+                .headers_mut()
+                .remove(header::CONTENT_ENCODING);
+            proxy_response.headers_mut().remove(header::CONTENT_LENGTH);
         }
 
         proxy_response.headers_mut().insert(
@@ -72,6 +94,37 @@ impl ProxyClient for SpinProxyClient {
         );
 
         Ok(proxy_response)
+    }
+}
+
+/// Decompress a buffered body based on the `Content-Encoding` value.
+///
+/// Since Spin bodies are already fully buffered, we wrap the bytes in a
+/// single-chunk stream, pipe through the shared `edgezero_core::compression`
+/// decoders, then collect back into a `Vec<u8>`.
+fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<Vec<u8>, EdgeError> {
+    match encoding {
+        Some("gzip") => {
+            let stream = futures::stream::iter(vec![Ok::<Vec<u8>, io::Error>(body)]);
+            let decoded = futures::executor::block_on(async {
+                decode_gzip_stream(stream).try_collect::<Vec<Bytes>>().await
+            })
+            .map_err(|e| EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}")))?;
+            Ok(decoded.concat())
+        }
+        Some("br") => {
+            let stream = futures::stream::iter(vec![Ok::<Vec<u8>, io::Error>(body)]);
+            let decoded = futures::executor::block_on(async {
+                decode_brotli_stream(stream)
+                    .try_collect::<Vec<Bytes>>()
+                    .await
+            })
+            .map_err(|e| {
+                EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {e}"))
+            })?;
+            Ok(decoded.concat())
+        }
+        _ => Ok(body),
     }
 }
 
