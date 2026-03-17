@@ -47,6 +47,10 @@ pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeErro
     // Drop the WASI resource handle before consuming the body.
     drop(headers);
 
+    // Inbound body size is not capped at the adapter level. The Spin runtime
+    // enforces its own request body limit (configurable via `spin.toml`), which
+    // is consistent with how the Fastly and Cloudflare adapters delegate inbound
+    // size enforcement to their respective platform runtimes.
     let body_bytes = req
         .into_body()
         .await

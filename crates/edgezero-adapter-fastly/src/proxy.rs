@@ -32,9 +32,10 @@ impl ProxyClient for FastlyProxyClient {
         let mut fastly_response = pending_request.wait().map_err(EdgeError::internal)?;
 
         let mut proxy_response = convert_response(&mut fastly_response)?;
-        proxy_response
-            .headers_mut()
-            .insert("x-edgezero-proxy", HeaderValue::from_static("fastly"));
+        proxy_response.headers_mut().insert(
+            edgezero_core::proxy::PROXY_HEADER,
+            HeaderValue::from_static("fastly"),
+        );
         Ok(proxy_response)
     }
 }

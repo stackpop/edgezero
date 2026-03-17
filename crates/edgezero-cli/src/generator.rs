@@ -568,11 +568,25 @@ mod tests {
         assert!(cargo_toml.contains("crates/demo-app-core"));
         assert!(cargo_toml.contains("crates/demo-app-adapter-cloudflare"));
         assert!(cargo_toml.contains("crates/demo-app-adapter-fastly"));
+        assert!(
+            cargo_toml.contains("crates/demo-app-adapter-spin"),
+            "workspace Cargo.toml should include spin adapter"
+        );
 
         let manifest =
             std::fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
         assert!(manifest.contains("[adapters.cloudflare.adapter]"));
         assert!(manifest.contains("[adapters.fastly.adapter]"));
+        assert!(
+            manifest.contains("[adapters.spin"),
+            "edgezero.toml should include spin adapter section"
+        );
+        assert!(
+            project_dir
+                .join("crates/demo-app-adapter-spin/spin.toml")
+                .exists(),
+            "spin.toml should be scaffolded"
+        );
 
         let gitignore =
             std::fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");

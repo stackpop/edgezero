@@ -299,7 +299,6 @@ fn locate_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use edgezero_adapter::cli_support::read_package_name;
     use tempfile::tempdir;
 
     #[test]
@@ -311,15 +310,6 @@ mod tests {
 
         let manifest = find_spin_manifest(root).expect("should find manifest");
         assert_eq!(manifest, root.join("spin.toml"));
-    }
-
-    #[test]
-    fn read_package_prefers_package_table() {
-        let dir = tempdir().unwrap();
-        let manifest = dir.path().join("Cargo.toml");
-        fs::write(&manifest, "[package]\nname = \"demo\"\n").unwrap();
-        let name = read_package_name(&manifest).unwrap();
-        assert_eq!(name, "demo");
     }
 
     #[test]

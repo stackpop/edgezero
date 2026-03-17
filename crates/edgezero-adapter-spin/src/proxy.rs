@@ -86,7 +86,7 @@ impl ProxyClient for SpinProxyClient {
         }
 
         proxy_response.headers_mut().insert(
-            "x-edgezero-proxy",
+            edgezero_core::proxy::PROXY_HEADER,
             "spin".parse().expect("static header value should parse"),
         );
 
@@ -94,28 +94,55 @@ impl ProxyClient for SpinProxyClient {
     }
 }
 
+/// Maximum decompressed body size (64 MiB). Prevents zip-bomb attacks
+/// where a small compressed payload expands to exhaust WASI memory.
+const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+
 /// Decompress a buffered body based on the `Content-Encoding` value.
 ///
 /// Since Spin bodies are already fully buffered, we use synchronous
 /// decompression (`flate2`, `brotli`) directly on the byte slice. This
 /// avoids wrapping in an async stream and calling `block_on` inside
 /// the WASI single-threaded async executor, which risks deadlock.
+///
+/// The output is capped at [`MAX_DECOMPRESSED_SIZE`] to guard against
+/// zip-bomb payloads.
 fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<Vec<u8>, EdgeError> {
     match encoding {
         Some("gzip") => {
             let mut decoder = flate2::read::GzDecoder::new(body.as_slice());
-            let mut decoded = Vec::new();
-            decoder.read_to_end(&mut decoded).map_err(|e| {
-                EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}"))
-            })?;
+            let mut decoded = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
+            decoder
+                .by_ref()
+                .take(MAX_DECOMPRESSED_SIZE as u64 + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|e| {
+                    EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}"))
+                })?;
+            if decoded.len() > MAX_DECOMPRESSED_SIZE {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "decompressed body exceeds maximum size of {} bytes",
+                    MAX_DECOMPRESSED_SIZE
+                )));
+            }
             Ok(decoded)
         }
         Some("br") => {
             let mut decoder = brotli::Decompressor::new(body.as_slice(), 8192);
-            let mut decoded = Vec::new();
-            decoder.read_to_end(&mut decoded).map_err(|e| {
-                EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {e}"))
-            })?;
+            let mut decoded = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
+            decoder
+                .by_ref()
+                .take(MAX_DECOMPRESSED_SIZE as u64 + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|e| {
+                    EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {e}"))
+                })?;
+            if decoded.len() > MAX_DECOMPRESSED_SIZE {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "decompressed body exceeds maximum size of {} bytes",
+                    MAX_DECOMPRESSED_SIZE
+                )));
+            }
             Ok(decoded)
         }
         _ => Ok(body),
