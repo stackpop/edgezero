@@ -193,10 +193,18 @@ pub trait KvStore: Send + Sync {
 /// without storing real data.
 ///
 /// All reads return `None` / empty; all writes succeed silently.
-#[cfg(test)]
+///
+/// Available in `#[cfg(test)]` builds within this crate, and in any downstream
+/// crate that enables the `test-utils` feature on `edgezero-core`:
+///
+/// ```toml
+/// [dev-dependencies]
+/// edgezero-core = { path = "...", features = ["test-utils"] }
+/// ```
+#[cfg(any(test, feature = "test-utils"))]
 pub struct NoopKvStore;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait(?Send)]
 impl KvStore for NoopKvStore {
     async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
@@ -648,6 +656,12 @@ macro_rules! key_value_store_contract_tests {
                 });
             }
 
+            // `std::thread::sleep` is not available on `wasm32` targets (no
+            // thread support). The TTL eviction contract is verified on native
+            // targets only; WASM adapters are expected to delegate eviction to
+            // the platform runtime (Cloudflare/Fastly), which does not expose a
+            // synchronous sleep primitive in test environments.
+            #[cfg(not(target_arch = "wasm32"))]
             #[test]
             fn contract_ttl_expires() {
                 let store = $factory;
@@ -664,8 +678,9 @@ macro_rules! key_value_store_contract_tests {
                         )
                         .await
                         .unwrap();
-                    // Allow the TTL to elapse.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Allow the TTL to elapse. 200ms gives the OS scheduler
+                    // enough headroom on busy CI runners.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                     assert_eq!(store.get_bytes("ephemeral").await.unwrap(), None);
                 });
             }
@@ -761,6 +776,7 @@ macro_rules! key_value_store_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::StatusCode;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -1038,7 +1054,7 @@ mod tests {
     fn kv_error_not_found_converts_to_not_found() {
         let kv_err = KvError::NotFound { key: "test".into() };
         let edge_err: EdgeError = kv_err.into();
-        assert_eq!(edge_err.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(edge_err.status(), StatusCode::NOT_FOUND);
         assert!(edge_err.message().contains("kv key"));
     }
 
@@ -1046,14 +1062,14 @@ mod tests {
     fn kv_error_unavailable_converts_to_service_unavailable() {
         let kv_err = KvError::Unavailable;
         let edge_err: EdgeError = kv_err.into();
-        assert_eq!(edge_err.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(edge_err.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
     fn kv_error_internal_converts_to_internal() {
         let kv_err = KvError::Internal(anyhow::anyhow!("boom"));
         let edge_err: EdgeError = kv_err.into();
-        assert_eq!(edge_err.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(edge_err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(edge_err.message().contains("boom"));
     }
 
@@ -1155,7 +1171,7 @@ mod tests {
         let json_err: serde_json::Error = serde_json::from_str::<i32>("not json").unwrap_err();
         let kv_err = KvError::Serialization(json_err);
         let edge_err: EdgeError = kv_err.into();
-        assert_eq!(edge_err.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(edge_err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(edge_err.message().contains("serialization"));
     }
 

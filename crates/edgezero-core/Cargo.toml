@@ -26,7 +26,17 @@ tower-service = { workspace = true }
 tracing = { workspace = true }
 validator = { workspace = true }
 log = { workspace = true }
+# `web-time` is intentionally unconditional: `std::time::Instant` is
+# unavailable on `wasm32-unknown-unknown` (Cloudflare Workers target).
+# `web_time::Instant` is a zero-cost drop-in on native and a JS-backed
+# polyfill on WASM. Used by `RequestLogger` in `middleware.rs`.
 web-time = { workspace = true }
+
+[features]
+# Exposes `NoopKvStore` for use in downstream adapter and integration tests
+# that need a `KvHandle` without real storage. Add this feature to your crate's
+# `[dev-dependencies]` entry for `edgezero-core` to use it.
+test-utils = []
 
 [dev-dependencies]
 brotli = { workspace = true }

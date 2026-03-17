@@ -180,8 +180,11 @@ async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
 ) -> anyhow::Result<()> {
-    serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, Some(".edgezero/kv.redb"))
-        .await
+    // No KV store is attached here — this path is used by `AxumDevServer::run()`
+    // which is the manifest-unaware embedding API. Callers that need KV should
+    // use `run_app()` (manifest-driven) or attach a `KvHandle` directly via
+    // `EdgeZeroAxumService::with_kv_handle`.
+    serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, None).await
 }
 
 async fn serve_with_listener_and_kv_path(

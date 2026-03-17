@@ -3,7 +3,7 @@ use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::extractor::{Headers, Json, Kv, Path};
+use edgezero_core::extractor::{Headers, Json, Kv, Path, ValidatedPath};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
@@ -27,8 +27,16 @@ struct ProxyPath {
     rest: String,
 }
 
-#[derive(serde::Deserialize)]
+// 512 (KV key limit) - 5 (len of "note:") = 507
+const MAX_NOTE_ID_LEN: u64 = 507;
+
+#[derive(serde::Deserialize, validator::Validate)]
 pub(crate) struct NoteIdPath {
+    #[validate(length(
+        min = 1,
+        max = "MAX_NOTE_ID_LEN",
+        message = "note id must be 1–507 bytes"
+    ))]
     pub(crate) id: String,
 }
 
@@ -137,7 +145,7 @@ pub(crate) async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
 #[action]
 pub(crate) async fn kv_note_put(
     Kv(store): Kv,
-    Path(path): Path<NoteIdPath>,
+    ValidatedPath(path): ValidatedPath<NoteIdPath>,
     RequestContext(ctx): RequestContext,
 ) -> Result<Response, EdgeError> {
     let body = ctx.into_request().into_body();
@@ -158,7 +166,7 @@ const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
 #[action]
 pub(crate) async fn kv_note_get(
     Kv(store): Kv,
-    Path(path): Path<NoteIdPath>,
+    ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
     match store.get_bytes(&format!("note:{}", path.id)).await? {
         Some(data) => http::response_builder()
@@ -174,7 +182,7 @@ pub(crate) async fn kv_note_get(
 #[action]
 pub(crate) async fn kv_note_delete(
     Kv(store): Kv,
-    Path(path): Path<NoteIdPath>,
+    ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
     store.delete(&format!("note:{}", path.id)).await?;
     http::response_builder()

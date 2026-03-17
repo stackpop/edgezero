@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 
 use axum::body::Body as AxumBody;
 use axum::http::{Request, Response};
-use http::StatusCode;
+use edgezero_core::http::StatusCode;
 use tokio::{runtime::Handle, task};
 use tower::Service;
 

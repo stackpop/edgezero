@@ -70,6 +70,18 @@ pub struct PersistentKvStore {
 
 impl PersistentKvStore {
     const LIST_SCAN_BATCH_SIZE: usize = 256;
+    /// Maximum number of scan batches before returning a partial page.
+    ///
+    /// Each batch scans up to `LIST_SCAN_BATCH_SIZE` entries, so this caps
+    /// a single `list_keys_page` call at scanning ~25,600 entries regardless
+    /// of how many are expired. Without this guard, a database that has
+    /// accumulated large numbers of expired entries (common in long-running
+    /// dev sessions) can produce unbounded scan latency.
+    ///
+    /// When the limit is hit the partial page is returned with the last
+    /// live cursor, so callers can resume pagination normally on the next
+    /// call. A warning is logged once so operators know cleanup is needed.
+    const MAX_SCAN_BATCHES: usize = 100;
 
     /// Create a new persistent KV store at the given path.
     ///
@@ -280,8 +292,20 @@ impl KvStore for PersistentKvStore {
         let mut live_keys = Vec::with_capacity(limit.saturating_add(1));
         let mut scan_cursor = cursor.map(str::to_string);
         let mut reached_end = false;
+        let mut batch_count: usize = 0;
 
         while live_keys.len() < limit + 1 && !reached_end {
+            if batch_count >= Self::MAX_SCAN_BATCHES {
+                log::warn!(
+                    "list_keys_page: scanned {} batches ({} entries) without filling the \
+                     requested page; the database likely contains a large number of expired \
+                     entries. Returning partial page. Run a KV cleanup to improve performance.",
+                    Self::MAX_SCAN_BATCHES,
+                    Self::MAX_SCAN_BATCHES * Self::LIST_SCAN_BATCH_SIZE,
+                );
+                break;
+            }
+            batch_count += 1;
             let mut expired_keys = Vec::new();
 
             {
@@ -415,8 +439,8 @@ mod tests {
         s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_millis(1))
             .await
             .unwrap();
-        // Wait for expiration
-        std::thread::sleep(Duration::from_millis(10));
+        // 200ms gives the OS scheduler enough headroom on busy CI runners.
+        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(s.get_bytes("temp").await.unwrap(), None);
     }
 
@@ -440,7 +464,7 @@ mod tests {
             .await
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(200));
 
         let page = s.list_keys_page("app/", None, 10).await.unwrap();
         assert_eq!(page.keys, vec!["app/live".to_string()]);
@@ -456,7 +480,7 @@ mod tests {
         s.put_bytes_with_ttl("race/key", Bytes::from("stale"), Duration::from_millis(1))
             .await
             .unwrap();
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(200));
         s.put_bytes("race/key", Bytes::from("fresh")).await.unwrap();
 
         s.cleanup_expired_keys(&["race/key".to_string()]).unwrap();
@@ -512,25 +536,41 @@ mod tests {
         assert!(!s.exists("anything").await.unwrap());
     }
 
-    #[tokio::test]
-    async fn concurrent_writes_dont_panic() {
+    #[test]
+    fn concurrent_writes_dont_panic() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
         let s = PersistentKvStore::new(db_path).unwrap();
-        let handle = KvHandle::new(std::sync::Arc::new(s));
+        let handle = KvHandle::new(Arc::new(s));
 
-        // Write 100 keys and verify each one
-        for i in 0..100i32 {
-            let key = format!("key:{i}");
-            handle.put(&key, &i).await.unwrap();
+        // KvHandle futures are !Send (async_trait(?Send) for WASM compat), so
+        // tokio::spawn is off-limits. Use OS threads instead — KvHandle is
+        // Send + Sync, so each thread moves its own clone and runs its own
+        // executor. This is genuinely concurrent at the OS level.
+        let threads: Vec<_> = (0..100i32)
+            .map(|i| {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    futures::executor::block_on(async move {
+                        let key = format!("key:{i}");
+                        h.put(&key, &i).await.unwrap();
+                    });
+                })
+            })
+            .collect();
+
+        for t in threads {
+            t.join().expect("writer thread panicked");
         }
 
-        // Verify all 100 keys exist with correct values
-        for i in 0..100i32 {
-            let key = format!("key:{i}");
-            let val: i32 = handle.get_or(&key, -1).await.unwrap();
-            assert_eq!(val, i);
-        }
+        // Verify all 100 keys survived concurrent writes with correct values.
+        futures::executor::block_on(async {
+            for i in 0..100i32 {
+                let key = format!("key:{i}");
+                let val: i32 = handle.get_or(&key, -1).await.unwrap();
+                assert_eq!(val, i, "key:{i} has wrong value after concurrent writes");
+            }
+        });
     }
 
     #[tokio::test]
@@ -556,10 +596,13 @@ mod tests {
     }
 
     // Run the shared contract tests against PersistentKvStore.
-    // `keep()` disables automatic cleanup so the TempDir doesn't
-    // drop before the store finishes (the OS cleans up /tmp eventually).
+    // `Box::leak` intentionally extends the TempDir's lifetime to 'static so
+    // it remains alive for the duration of the test process. The directory is
+    // deleted when the process exits, unlike `.keep()` which leaves it behind
+    // permanently.
     edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
-        let db_path = tempfile::tempdir().unwrap().keep().join("contract.redb");
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let db_path = dir.path().join("contract.redb");
         PersistentKvStore::new(db_path).unwrap()
     });
 }
