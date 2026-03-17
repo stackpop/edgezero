@@ -12,6 +12,9 @@ path = "src/lib.rs"
 default = ["spin"]
 spin = ["edgezero-adapter-spin/spin"]
 
+# Base dependency provides types and context on all targets (including native
+# `cargo check`).  The wasm32-only section below adds the `spin` feature and
+# `spin-sdk` so that WASM-gated modules compile only on the real target.
 [dependencies]
 {{proj_core}} = { path = "../{{proj_core}}" }
 {{{dep_edgezero_adapter_spin}}}

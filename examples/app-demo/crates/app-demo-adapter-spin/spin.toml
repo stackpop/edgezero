@@ -4,6 +4,8 @@ spin_manifest_version = 2
 name = "app-demo-adapter-spin"
 version = "0.1.0"
 
+# Component name is shortened for brevity; scaffolded projects use the full
+# adapter crate name (e.g. "{{proj_spin}}") via the template.
 [[trigger.http]]
 route = "/..."
 component = "app-demo"

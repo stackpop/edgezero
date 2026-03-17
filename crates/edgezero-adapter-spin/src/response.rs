@@ -6,6 +6,12 @@ use spin_sdk::http as spin_http;
 
 /// Maximum body size (16 MiB) when collecting a streamed body into a buffer.
 /// Prevents unbounded memory growth from malicious or misconfigured upstreams.
+///
+/// Note: this cap only applies to `Body::Stream` variants.  `Body::Once` is
+/// already materialised in memory and bypasses this check.  The proxy module
+/// uses a separate, larger limit ([`MAX_DECOMPRESSED_SIZE`](crate::proxy) =
+/// 64 MiB) because proxy responses are untrusted external data that may
+/// decompress to a much larger size.
 const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 
 /// Collect a `Body` into a `Vec<u8>`, consuming streamed chunks if necessary.

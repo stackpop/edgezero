@@ -4,6 +4,7 @@
 pub mod cli;
 
 mod context;
+mod decompress;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod proxy;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -25,6 +26,7 @@ pub use response::from_core_response;
 /// When a real logger is needed for one target, split this into
 /// `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` /
 /// `#[cfg(not(...))]` branches following the Fastly/Cloudflare pattern.
+// TODO: wire in real Spin logger when available
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }

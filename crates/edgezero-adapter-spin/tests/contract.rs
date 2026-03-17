@@ -113,6 +113,18 @@ fn router_dispatches_streaming_route() {
     let response = block_on(app.router().oneshot(request));
 
     assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, body) = response.into_parts();
+    let mut stream = body.into_stream().expect("should be a stream");
+    let collected = block_on(async {
+        use futures::StreamExt;
+        let mut out = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.expect("chunk"));
+        }
+        out
+    });
+    assert_eq!(collected, b"chunk-1chunk-2");
 }
 
 // ---------------------------------------------------------------------------
