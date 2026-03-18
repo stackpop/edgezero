@@ -4,10 +4,10 @@ use axum::body::Body as AxumBody;
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::Request;
 use edgezero_core::body::Body;
+use edgezero_core::http::header::CONTENT_TYPE;
+use edgezero_core::http::HeaderValue;
 use edgezero_core::http::Request as CoreRequest;
 use edgezero_core::proxy::ProxyHandle;
-use http::header::CONTENT_TYPE;
-use http::HeaderValue;
 
 use crate::context::AxumRequestContext;
 use crate::proxy::AxumProxyClient;

@@ -1,8 +1,12 @@
+# node
+node_modules/
+
 # compiled output
 bin/
 pkg/
 target/
 .wrangler/
+.edgezero/
 
 # env
 .env
