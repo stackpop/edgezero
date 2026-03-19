@@ -2,6 +2,7 @@ use crate::body::Body;
 use crate::config_store::ConfigStoreHandle;
 use crate::error::EdgeError;
 use crate::http::Request;
+use crate::key_value_store::KvHandle;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
 use serde::de::DeserializeOwned;
@@ -90,6 +91,10 @@ impl RequestContext {
             .extensions()
             .get::<ConfigStoreHandle>()
             .cloned()
+    }
+
+    pub fn kv_handle(&self) -> Option<KvHandle> {
+        self.request.extensions().get::<KvHandle>().cloned()
     }
 }
 
@@ -369,5 +374,29 @@ mod tests {
     fn config_store_returns_none_when_absent() {
         let ctx = ctx("/test", Body::empty(), PathParams::default());
         assert!(ctx.config_store().is_none());
+    }
+
+    #[test]
+    fn kv_handle_is_retrieved_when_present() {
+        use crate::key_value_store::{KvHandle, NoopKvStore};
+        use std::sync::Arc;
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(KvHandle::new(Arc::new(NoopKvStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.kv_handle().is_some());
+    }
+
+    #[test]
+    fn kv_handle_returns_none_when_absent() {
+        let ctx = ctx("/test", Body::empty(), PathParams::default());
+        assert!(ctx.kv_handle().is_none());
     }
 }

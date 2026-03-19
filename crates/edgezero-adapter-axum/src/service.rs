@@ -3,15 +3,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use axum::body::Body;
 use axum::body::Body as AxumBody;
 use axum::http::{Request, Response};
-use http::StatusCode;
+use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::http::StatusCode;
+use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::router::RouterService;
 use tokio::{runtime::Handle, task};
 use tower::Service;
-
-use edgezero_core::config_store::ConfigStoreHandle;
-use edgezero_core::router::RouterService;
 
 use crate::request::into_core_request;
 use crate::response::into_axum_response;
@@ -21,6 +20,7 @@ use crate::response::into_axum_response;
 pub struct EdgeZeroAxumService {
     router: RouterService,
     config_store_handle: Option<ConfigStoreHandle>,
+    kv_handle: Option<KvHandle>,
 }
 
 impl EdgeZeroAxumService {
@@ -28,6 +28,7 @@ impl EdgeZeroAxumService {
         Self {
             router,
             config_store_handle: None,
+            kv_handle: None,
         }
     }
 
@@ -38,6 +39,16 @@ impl EdgeZeroAxumService {
     #[must_use]
     pub fn with_config_store_handle(mut self, handle: ConfigStoreHandle) -> Self {
         self.config_store_handle = Some(handle);
+        self
+    }
+
+    /// Attach a shared KV store to this service.
+    ///
+    /// The handle is cloned into every request's extensions, making
+    /// the `Kv` extractor available in handlers.
+    #[must_use]
+    pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
+        self.kv_handle = Some(handle);
         self
     }
 }
@@ -54,11 +65,12 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     fn call(&mut self, request: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
         let config_store_handle = self.config_store_handle.clone();
+        let kv_handle = self.kv_handle.clone();
         Box::pin(async move {
             let mut core_request = match into_core_request(request).await {
                 Ok(req) => req,
                 Err(e) => {
-                    let mut err_response = Response::new(Body::from(e.to_string()));
+                    let mut err_response = Response::new(AxumBody::from(e.to_string()));
                     *err_response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
 
                     return Ok(err_response);
@@ -66,6 +78,10 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
             };
 
             if let Some(handle) = config_store_handle {
+                core_request.extensions_mut().insert(handle);
+            }
+
+            if let Some(handle) = kv_handle {
                 core_request.extensions_mut().insert(handle);
             }
 
@@ -149,6 +165,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_kv_handle_injects_into_request() {
+        use crate::key_value_store::PersistentKvStore;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let store = Arc::new(PersistentKvStore::new(db_path).unwrap());
+        let handle = KvHandle::new(store.clone());
+        handle.put("test_key", &"injected").await.unwrap();
+
+        let router = RouterService::builder()
+            .get("/check", |ctx: RequestContext| async move {
+                let kv = ctx.kv_handle().expect("kv handle should be present");
+                let val: String = kv.get_or("test_key", String::new()).await.unwrap();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(val))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let mut service = EdgeZeroAxumService::new(router).with_kv_handle(handle);
+
+        let request = Request::builder()
+            .uri("/check")
+            .body(AxumBody::empty())
+            .unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"injected");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_without_config_store_handle_still_works() {
         let router = RouterService::builder()
             .get("/no-config", |ctx: RequestContext| async move {
@@ -173,5 +225,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"has_config=false");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_without_kv_handle_still_works() {
+        let router = RouterService::builder()
+            .get("/no-kv", |ctx: RequestContext| async move {
+                let has_kv = ctx.kv_handle().is_some();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(format!("has_kv={has_kv}")))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let mut service = EdgeZeroAxumService::new(router);
+
+        let request = Request::builder()
+            .uri("/no-kv")
+            .body(AxumBody::empty())
+            .unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"has_kv=false");
     }
 }

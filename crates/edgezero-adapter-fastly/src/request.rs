@@ -1,23 +1,30 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::io::Read;
-use std::sync::Arc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request};
+use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 
 use crate::config_store::FastlyConfigStore;
+use crate::key_value_store::FastlyKvStore;
 use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
 use crate::FastlyRequestContext;
 
 const WARNED_STORE_CACHE_LIMIT: usize = 64;
+
+/// Default Fastly KV Store name.
+///
+/// If a KV Store with this name exists in your Fastly service, it will
+/// be automatically available to handlers via the `Kv` extractor.
+pub const DEFAULT_KV_STORE_NAME: &str = edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 
 pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
     let method = req.get_method().clone();
@@ -48,8 +55,7 @@ pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
 }
 
 pub(crate) fn dispatch_raw(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
-    let core_request = into_core_request(req).map_err(map_edge_error)?;
-    dispatch_core_request(app, core_request, None)
+    dispatch_with_kv(app, req, DEFAULT_KV_STORE_NAME, false)
 }
 
 /// Low-level manual dispatch.
@@ -74,8 +80,7 @@ pub fn dispatch_with_config_handle(
     req: FastlyRequest,
     config_store_handle: ConfigStoreHandle,
 ) -> Result<FastlyResponse, FastlyError> {
-    let core_request = into_core_request(req).map_err(map_edge_error)?;
-    dispatch_core_request(app, core_request, Some(config_store_handle))
+    dispatch_with_handles(app, req, Some(config_store_handle), None)
 }
 
 /// Dispatch a request with a Fastly Config Store injected into extensions.
@@ -94,20 +99,90 @@ pub fn dispatch_with_config(
             None
         }
     };
+    dispatch_with_handles(app, req, config_store_handle, None)
+}
+
+/// Dispatch a Fastly request with a custom KV store name.
+///
+/// `kv_required` should be `true` when `[stores.kv]` is explicitly present
+/// in the manifest, causing the request to fail if the store is unavailable
+/// rather than silently degrading.
+pub fn dispatch_with_kv(
+    app: &App,
+    req: FastlyRequest,
+    kv_store_name: &str,
+    kv_required: bool,
+) -> Result<FastlyResponse, FastlyError> {
+    let kv_handle = resolve_kv_handle(kv_store_name, kv_required)?;
+    dispatch_with_handles(app, req, None, kv_handle)
+}
+
+pub(crate) fn dispatch_with_store_names(
+    app: &App,
+    req: FastlyRequest,
+    config_store_name: Option<&str>,
+    kv_store_name: &str,
+    kv_required: bool,
+) -> Result<FastlyResponse, FastlyError> {
+    let config_store_handle = match config_store_name {
+        Some(store_name) => match FastlyConfigStore::try_open(store_name) {
+            Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
+            Err(err) => {
+                warn_missing_store_once(store_name, &err.to_string());
+                None
+            }
+        },
+        None => None,
+    };
+    let kv_handle = resolve_kv_handle(kv_store_name, kv_required)?;
+    dispatch_with_handles(app, req, config_store_handle, kv_handle)
+}
+
+pub(crate) fn dispatch_with_handles(
+    app: &App,
+    req: FastlyRequest,
+    config_store_handle: Option<ConfigStoreHandle>,
+    kv_handle: Option<KvHandle>,
+) -> Result<FastlyResponse, FastlyError> {
     let core_request = into_core_request(req).map_err(map_edge_error)?;
-    dispatch_core_request(app, core_request, config_store_handle)
+    dispatch_core_request(app, core_request, config_store_handle, kv_handle)
 }
 
 fn dispatch_core_request(
     app: &App,
     mut core_request: Request,
     config_store_handle: Option<ConfigStoreHandle>,
+    kv_handle: Option<KvHandle>,
 ) -> Result<FastlyResponse, FastlyError> {
     if let Some(handle) = config_store_handle {
         core_request.extensions_mut().insert(handle);
     }
+
+    if let Some(handle) = kv_handle {
+        core_request.extensions_mut().insert(handle);
+    }
+
     let response = executor::block_on(app.router().oneshot(core_request));
     from_core_response(response).map_err(map_edge_error)
+}
+
+fn resolve_kv_handle(
+    kv_store_name: &str,
+    kv_required: bool,
+) -> Result<Option<KvHandle>, FastlyError> {
+    match FastlyKvStore::open(kv_store_name) {
+        Ok(store) => Ok(Some(KvHandle::new(Arc::new(store)))),
+        Err(err) => {
+            if kv_required {
+                return Err(FastlyError::msg(format!(
+                    "KV store '{}' is explicitly configured but could not be opened: {}",
+                    kv_store_name, err
+                )));
+            }
+            warn_missing_kv_store_once(kv_store_name, &err);
+            Ok(None)
+        }
+    }
 }
 
 fn warn_missing_store_once(store_name: &str, detail: &str) {
@@ -160,4 +235,21 @@ impl RecentStringSet {
 
 fn map_edge_error(err: EdgeError) -> FastlyError {
     FastlyError::msg(err.to_string())
+}
+
+fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Display) {
+    static WARNED_STORES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let warned_stores = WARNED_STORES.get_or_init(|| Mutex::new(BTreeSet::new()));
+
+    match warned_stores.lock() {
+        Ok(mut warned_stores) => {
+            if !warned_stores.insert(kv_store_name.to_string()) {
+                return;
+            }
+            log::warn!("KV store '{}' not available: {}", kv_store_name, error);
+        }
+        Err(_) => {
+            log::warn!("KV store '{}' not available: {}", kv_store_name, error);
+        }
+    }
 }

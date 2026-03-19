@@ -69,13 +69,13 @@ pub struct Manifest {
     pub environment: ManifestEnvironment,
     #[serde(default)]
     #[validate(nested)]
+    pub stores: ManifestStores,
+    #[serde(default)]
+    #[validate(nested)]
     pub adapters: BTreeMap<String, ManifestAdapter>,
     #[serde(default)]
     #[validate(nested)]
     pub logging: ManifestLogging,
-    #[serde(default)]
-    #[validate(nested)]
-    pub stores: ManifestStores,
     #[serde(skip)]
     pub(crate) root: Option<PathBuf>,
     #[serde(skip)]
@@ -140,6 +140,29 @@ impl Manifest {
         }
 
         self.logging_resolved = resolved;
+    }
+
+    /// Returns the KV store name for a given adapter.
+    ///
+    /// Resolution order:
+    /// 1. Per-adapter override (`[stores.kv.adapters.<adapter>]`)
+    /// 2. Global name (`[stores.kv] name = "..."`)
+    /// 3. Default: `"EDGEZERO_KV"`
+    pub fn kv_store_name(&self, adapter: &str) -> &str {
+        match &self.stores.kv {
+            Some(kv) => {
+                let adapter_lower = adapter.to_ascii_lowercase();
+                if let Some(adapter_cfg) = kv
+                    .adapters
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(&adapter_lower))
+                {
+                    return &adapter_cfg.1.name;
+                }
+                &kv.name
+            }
+            None => DEFAULT_KV_STORE_NAME,
+        }
     }
 }
 
@@ -319,8 +342,12 @@ pub struct ManifestAdapterCommands {
 /// Top-level `[stores]` section. Compatible with the KV branch's `kv` sibling.
 #[derive(Debug, Default, Deserialize, Validate)]
 pub struct ManifestStores {
+    #[serde(default)]
     #[validate(nested)]
     pub config: Option<ManifestConfigStoreConfig>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub kv: Option<ManifestKvConfig>,
 }
 
 /// `[stores.config]` section — provider-neutral config store.
@@ -469,6 +496,34 @@ impl ManifestLoggingConfig {
     fn is_specified(&self) -> bool {
         self.level.is_some() || self.endpoint.is_some() || self.echo_stdout.is_some()
     }
+}
+
+/// Default KV store / binding name used when `[stores.kv]` is omitted.
+pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
+
+fn default_kv_name() -> String {
+    DEFAULT_KV_STORE_NAME.to_string()
+}
+
+/// Global KV store configuration.
+#[derive(Debug, Deserialize, Validate)]
+pub struct ManifestKvConfig {
+    /// Store / binding name (default: `"EDGEZERO_KV"`).
+    #[serde(default = "default_kv_name")]
+    #[validate(length(min = 1))]
+    pub name: String,
+
+    /// Per-adapter name overrides.
+    #[serde(default)]
+    #[validate(nested)]
+    pub adapters: BTreeMap<String, ManifestKvAdapterConfig>,
+}
+
+/// Per-adapter KV binding / store name override.
+#[derive(Debug, Deserialize, Validate)]
+pub struct ManifestKvAdapterConfig {
+    #[validate(length(min = 1))]
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1347,5 +1402,70 @@ body-mode = "buffered"
             Some("User management endpoint")
         );
         assert_eq!(trigger.body_mode, Some(BodyMode::Buffered));
+    }
+
+    // -- KV store config ---------------------------------------------------
+
+    #[test]
+    fn kv_store_name_defaults_when_omitted() {
+        let toml_str = r#"
+[app]
+name = "test"
+"#;
+        let loader = ManifestLoader::load_from_str(toml_str);
+        let manifest = loader.manifest();
+        assert_eq!(manifest.kv_store_name("fastly"), "EDGEZERO_KV");
+        assert_eq!(manifest.kv_store_name("cloudflare"), "EDGEZERO_KV");
+    }
+
+    #[test]
+    fn kv_store_name_uses_global_name() {
+        let toml_str = r#"
+[app]
+name = "test"
+
+[stores.kv]
+name = "MY_KV"
+"#;
+        let loader = ManifestLoader::load_from_str(toml_str);
+        let manifest = loader.manifest();
+        assert_eq!(manifest.kv_store_name("fastly"), "MY_KV");
+        assert_eq!(manifest.kv_store_name("cloudflare"), "MY_KV");
+    }
+
+    #[test]
+    fn kv_store_name_adapter_override() {
+        let toml_str = r#"
+[app]
+name = "test"
+
+[stores.kv]
+name = "GLOBAL_KV"
+
+[stores.kv.adapters.cloudflare]
+name = "CF_BINDING"
+"#;
+        let loader = ManifestLoader::load_from_str(toml_str);
+        let manifest = loader.manifest();
+        assert_eq!(manifest.kv_store_name("cloudflare"), "CF_BINDING");
+        assert_eq!(manifest.kv_store_name("fastly"), "GLOBAL_KV");
+    }
+
+    #[test]
+    fn kv_store_name_case_insensitive() {
+        let toml_str = r#"
+[app]
+name = "test"
+
+[stores.kv]
+name = "DEFAULT"
+
+[stores.kv.adapters.Fastly]
+name = "FASTLY_STORE"
+"#;
+        let loader = ManifestLoader::load_from_str(toml_str);
+        let manifest = loader.manifest();
+        assert_eq!(manifest.kv_store_name("fastly"), "FASTLY_STORE");
+        assert_eq!(manifest.kv_store_name("FASTLY"), "FASTLY_STORE");
     }
 }
