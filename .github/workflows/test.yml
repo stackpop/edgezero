@@ -150,8 +150,8 @@ jobs:
         with:
           toolchain: ${{ steps.rust-version-fastly.outputs.rust-version }}
 
-      - name: Add wasm32-wasi target
-        run: rustup target add wasm32-wasip1
+      - name: Add wasm targets
+        run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
 
       - name: Setup Viceroy
         run: cargo install viceroy --locked
