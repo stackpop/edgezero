@@ -63,4 +63,17 @@ mod tests {
         assert_eq!(result, Some(Bytes::from("test_value_123")));
         std::env::remove_var("__EDGEZERO_TEST_SECRET__");
     }
+
+    // Contract tests: use InMemorySecretStore since EnvSecretStore needs
+    // real env vars, which are unsafe in parallel tests.
+    // The EnvSecretStore is tested individually above.
+    use edgezero_core::secret_store::InMemorySecretStore;
+    use edgezero_core::secret_store_contract_tests;
+
+    secret_store_contract_tests!(env_secret_contract, {
+        InMemorySecretStore::new([
+            ("contract_key", Bytes::from("contract_value")),
+            ("contract_key_2", Bytes::from("another_value")),
+        ])
+    });
 }

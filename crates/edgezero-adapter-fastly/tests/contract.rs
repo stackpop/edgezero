@@ -141,3 +141,19 @@ fn dispatch_passes_request_body_to_handlers() {
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"echo");
 }
+
+// Secret store contract tests for Fastly require a running Fastly Compute
+// environment and cannot be executed in CI. The FastlySecretStore type is
+// verified at compile time here.
+#[cfg(all(feature = "fastly", target_arch = "wasm32"))]
+mod secret_store_compile_check {
+    use edgezero_adapter_fastly::FastlySecretStore;
+    use edgezero_core::secret_store::SecretStore;
+
+    // Compile-time check: FastlySecretStore implements SecretStore
+    fn _assert_impl<T: SecretStore>() {}
+    fn _check() {
+        // This function is never called; it only verifies trait impl at compile time.
+        _assert_impl::<FastlySecretStore>();
+    }
+}

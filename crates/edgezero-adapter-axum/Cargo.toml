@@ -50,6 +50,7 @@ walkdir = { workspace = true, optional = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true, features = ["macros"] }
+edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
 serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

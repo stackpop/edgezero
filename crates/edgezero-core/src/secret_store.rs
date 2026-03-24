@@ -389,4 +389,11 @@ mod tests {
             assert_eq!(h.require_str("key").await.unwrap(), "value");
         });
     }
+
+    secret_store_contract_tests!(in_memory_contract, {
+        InMemorySecretStore::new([
+            ("contract_key", Bytes::from("contract_value")),
+            ("contract_key_2", Bytes::from("another_value")),
+        ])
+    });
 }
