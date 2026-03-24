@@ -3,8 +3,8 @@ use crate::error::EdgeError;
 use crate::http::Request;
 use crate::key_value_store::KvHandle;
 use crate::params::PathParams;
-use crate::secret_store::SecretHandle;
 use crate::proxy::ProxyHandle;
+use crate::secret_store::SecretHandle;
 use serde::de::DeserializeOwned;
 
 /// Request context exposed to handlers and middleware.

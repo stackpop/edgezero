@@ -60,9 +60,7 @@ impl From<SecretError> for EdgeError {
                 "required secret '{}' is not configured -- check platform secret store bindings",
                 name
             )),
-            SecretError::Unavailable => {
-                EdgeError::service_unavailable("secret store unavailable")
-            }
+            SecretError::Unavailable => EdgeError::service_unavailable("secret store unavailable"),
             // Validation errors are programming errors (bad secret name in code),
             // not client errors.
             SecretError::Validation(e) => {
@@ -131,9 +129,7 @@ pub struct InMemorySecretStore {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl InMemorySecretStore {
-    pub fn new(
-        entries: impl IntoIterator<Item = (impl Into<String>, impl Into<Bytes>)>,
-    ) -> Self {
+    pub fn new(entries: impl IntoIterator<Item = (impl Into<String>, impl Into<Bytes>)>) -> Self {
         Self {
             secrets: entries
                 .into_iter()
@@ -181,7 +177,9 @@ impl SecretHandle {
 
     fn validate_name(name: &str) -> Result<(), SecretError> {
         if name.is_empty() {
-            return Err(SecretError::Validation("secret name cannot be empty".to_string()));
+            return Err(SecretError::Validation(
+                "secret name cannot be empty".to_string(),
+            ));
         }
         if name.len() > Self::MAX_NAME_LEN {
             return Err(SecretError::Validation(format!(
@@ -223,17 +221,16 @@ impl SecretHandle {
     pub async fn require_bytes(&self, name: &str) -> Result<Bytes, SecretError> {
         self.get_bytes(name)
             .await?
-            .ok_or_else(|| SecretError::NotFound { name: name.to_string() })
+            .ok_or_else(|| SecretError::NotFound {
+                name: name.to_string(),
+            })
     }
 
     /// Retrieve a secret as a UTF-8 string. Returns `SecretError::NotFound` if absent.
     pub async fn require_str(&self, name: &str) -> Result<String, SecretError> {
         let bytes = self.require_bytes(name).await?;
         String::from_utf8(bytes.into()).map_err(|e| {
-            SecretError::Internal(anyhow::anyhow!(
-                "secret '{}' is not valid UTF-8: {e}",
-                name
-            ))
+            SecretError::Internal(anyhow::anyhow!("secret '{}' is not valid UTF-8: {e}", name))
         })
     }
 }

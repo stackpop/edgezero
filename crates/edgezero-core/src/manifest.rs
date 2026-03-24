@@ -1310,10 +1310,11 @@ name = "FASTLY_STORE"
 
     #[test]
     fn secret_store_name_uses_global_name_when_declared() {
-        let manifest = ManifestLoader::load_from_str(
-            "[stores.secrets]\nname = \"MY_SECRETS\"\n",
+        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nname = \"MY_SECRETS\"\n");
+        assert_eq!(
+            manifest.manifest().secret_store_name("fastly"),
+            "MY_SECRETS"
         );
-        assert_eq!(manifest.manifest().secret_store_name("fastly"), "MY_SECRETS");
         assert_eq!(
             manifest.manifest().secret_store_name("cloudflare"),
             "MY_SECRETS"
@@ -1344,9 +1345,7 @@ name = "FASTLY_STORE"
 
     #[test]
     fn secrets_required_is_true_when_declared() {
-        let manifest = ManifestLoader::load_from_str(
-            "[stores.secrets]\nname = \"MY_SECRETS\"\n",
-        );
+        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nname = \"MY_SECRETS\"\n");
         assert!(manifest.manifest().stores.secrets.is_some());
     }
 }

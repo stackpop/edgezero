@@ -10,13 +10,13 @@ pub mod handler;
 pub mod http;
 pub mod key_value_store;
 pub mod manifest;
-pub mod secret_store;
 pub mod middleware;
 pub mod params;
 pub mod proxy;
 pub mod responder;
 pub mod response;
 pub mod router;
+pub mod secret_store;
 
 pub use edgezero_macros::{action, app};
 pub use key_value_store::{KvError, KvHandle, KvPage, KvStore};

@@ -9,13 +9,13 @@ pub mod key_value_store;
 #[cfg(feature = "fastly")]
 mod logger;
 #[cfg(feature = "fastly")]
-pub mod secret_store;
-#[cfg(feature = "fastly")]
 mod proxy;
 #[cfg(feature = "fastly")]
 mod request;
 #[cfg(feature = "fastly")]
 mod response;
+#[cfg(feature = "fastly")]
+pub mod secret_store;
 
 pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
@@ -26,9 +26,9 @@ pub use request::{
     into_core_request, DEFAULT_KV_STORE_NAME,
 };
 #[cfg(feature = "fastly")]
-pub use secret_store::FastlySecretStore;
-#[cfg(feature = "fastly")]
 pub use response::from_core_response;
+#[cfg(feature = "fastly")]
+pub use secret_store::FastlySecretStore;
 
 #[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
@@ -118,7 +118,14 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    dispatch_with_kv_and_secrets(&app, req, kv_store_name, kv_required, secret_store_name, secrets_required)
+    dispatch_with_kv_and_secrets(
+        &app,
+        req,
+        kv_store_name,
+        kv_required,
+        secret_store_name,
+        secrets_required,
+    )
 }
 
 #[cfg(all(test, feature = "fastly"))]
