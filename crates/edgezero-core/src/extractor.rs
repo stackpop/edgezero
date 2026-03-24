@@ -448,6 +448,52 @@ impl Kv {
     }
 }
 
+/// Extracts the [`SecretHandle`] from the request context.
+///
+/// Returns `EdgeError::Internal` if no secret store was configured for this request.
+///
+/// # Example
+/// ```ignore
+/// #[action]
+/// pub async fn handler(Secrets(secrets): Secrets) -> Result<Response, EdgeError> {
+///     let key = secrets.require_str("API_KEY").await.map_err(EdgeError::from)?;
+///     // use key ...
+/// }
+/// ```
+#[derive(Debug)]
+pub struct Secrets(pub crate::secret_store::SecretHandle);
+
+#[async_trait(?Send)]
+impl FromRequest for Secrets {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.secret_handle().map(Secrets).ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!(
+                "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
+            ))
+        })
+    }
+}
+
+impl std::ops::Deref for Secrets {
+    type Target = crate::secret_store::SecretHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Secrets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Secrets {
+    pub fn into_inner(self) -> crate::secret_store::SecretHandle {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1008,5 +1054,37 @@ mod tests {
 
         // into_inner works
         let _inner: KvHandle = kv.into_inner();
+    }
+
+    // -- Secrets extractor --------------------------------------------------
+
+    #[test]
+    fn secrets_extractor_returns_handle_when_present() {
+        use crate::secret_store::{NoopSecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/secrets")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
+        let ctx = RequestContext::new(request, PathParams::default());
+        let result = block_on(Secrets::from_request(&ctx));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn secrets_extractor_errors_when_absent() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/secrets")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        let err = block_on(Secrets::from_request(&ctx)).unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
