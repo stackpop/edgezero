@@ -13,15 +13,22 @@ mod proxy;
 mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod response;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use context::CloudflareRequestContext;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use proxy::CloudflareProxyClient;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use request::{dispatch, dispatch_with_kv, into_core_request, DEFAULT_KV_BINDING};
+pub use request::{
+    dispatch, dispatch_with_kv, dispatch_with_kv_and_secrets, dispatch_with_secrets,
+    into_core_request, DEFAULT_KV_BINDING,
+};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub use secret_store::CloudflareSecretStore;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
@@ -71,8 +78,20 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     let manifest = manifest_loader.manifest();
     let kv_binding = manifest.kv_store_name("cloudflare");
     let kv_required = manifest.stores.kv.is_some();
+    let secret_binding = manifest.secret_store_name("cloudflare");
+    let secrets_required = manifest.stores.secrets.is_some();
     let app = A::build_app();
-    dispatch_with_kv(&app, req, env, ctx, kv_binding, kv_required).await
+    dispatch_with_kv_and_secrets(
+        &app,
+        req,
+        env,
+        ctx,
+        kv_binding,
+        kv_required,
+        secret_binding,
+        secrets_required,
+    )
+    .await
 }
 
 /// Deprecated: use [`run_app`] which now takes `manifest_src` directly.
