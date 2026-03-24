@@ -401,6 +401,53 @@ impl<T> ValidatedForm<T> {
     }
 }
 
+/// Extracts the [`KvHandle`] from the request context.
+///
+/// Returns `EdgeError::Internal` if no KV store was configured for this request.
+///
+/// # Example
+/// ```ignore
+/// #[action]
+/// pub async fn handler(Kv(store): Kv) -> Result<String, EdgeError> {
+///     let count: i32 = store.get_or("visits", 0).await?;
+///     store.put("visits", &(count + 1)).await?;
+///     Ok(format!("visits: {}", count + 1))
+/// }
+/// ```
+#[derive(Debug)]
+pub struct Kv(pub crate::key_value_store::KvHandle);
+
+#[async_trait(?Send)]
+impl FromRequest for Kv {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.kv_handle().map(Kv).ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!(
+                "no kv store configured -- check [stores.kv] in edgezero.toml and platform bindings"
+            ))
+        })
+    }
+}
+
+impl std::ops::Deref for Kv {
+    type Target = crate::key_value_store::KvHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Kv {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Kv {
+    pub fn into_inner(self) -> crate::key_value_store::KvHandle {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +955,58 @@ mod tests {
         assert_eq!(&*host, "example.com"); // Deref
         let inner = host.into_inner();
         assert_eq!(inner, "example.com");
+    }
+
+    // -- Kv extractor -------------------------------------------------------
+
+    #[test]
+    fn kv_extractor_returns_handle_when_configured() {
+        use crate::key_value_store::{KvHandle, NoopKvStore};
+        use std::sync::Arc;
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(KvHandle::new(Arc::new(NoopKvStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let kv = block_on(Kv::from_request(&ctx));
+        assert!(kv.is_ok());
+    }
+
+    #[test]
+    fn kv_extractor_returns_error_when_not_configured() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        let err = block_on(Kv::from_request(&ctx)).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("check [stores.kv]"));
+    }
+
+    #[test]
+    fn kv_deref_and_into_inner() {
+        use crate::key_value_store::{KvHandle, NoopKvStore};
+        use std::sync::Arc;
+
+        let handle = KvHandle::new(Arc::new(NoopKvStore));
+        let kv = Kv(handle);
+
+        // Debug works
+        let debug = format!("{:?}", kv);
+        assert!(debug.contains("Kv"));
+
+        // Deref works
+        let _: &KvHandle = &kv;
+
+        // into_inner works
+        let _inner: KvHandle = kv.into_inner();
     }
 }

@@ -52,7 +52,7 @@ impl ProxyClient for SpinProxyClient {
                 log::warn!("dropping invalid proxy response header name: {}", name);
                 continue;
             };
-            match edgezero_core::http::HeaderValue::from_str(value) {
+            match edgezero_core::http::HeaderValue::from_bytes(value.as_bytes()) {
                 Ok(hval) => response_headers.push((hname, hval)),
                 Err(_) => {
                     log::warn!("dropping invalid proxy response header value for: {}", name);

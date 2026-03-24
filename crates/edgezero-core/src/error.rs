@@ -18,6 +18,8 @@ pub enum EdgeError {
     MethodNotAllowed { method: Method, allowed: String },
     #[error("validation error: {message}")]
     Validation { message: String },
+    #[error("service unavailable: {message}")]
+    ServiceUnavailable { message: String },
     #[error("internal error: {source}")]
     Internal {
         #[from]
@@ -59,6 +61,12 @@ impl EdgeError {
         }
     }
 
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        EdgeError::ServiceUnavailable {
+            message: message.into(),
+        }
+    }
+
     pub fn internal<E>(error: E) -> Self
     where
         E: Into<AnyError>,
@@ -74,6 +82,7 @@ impl EdgeError {
             EdgeError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
             EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
+            EdgeError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             EdgeError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -86,6 +95,7 @@ impl EdgeError {
             EdgeError::MethodNotAllowed { method, allowed } => {
                 format!("method {} not allowed; allowed: {}", method, allowed)
             }
+            EdgeError::ServiceUnavailable { message } => message.clone(),
             EdgeError::Internal { source } => format!("internal error: {}", source),
         }
     }

@@ -1,3 +1,6 @@
+use std::collections::BTreeSet;
+use std::sync::{Mutex, OnceLock};
+
 use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
 use crate::CloudflareRequestContext;
@@ -5,12 +8,17 @@ use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Method as CoreMethod, Request, Uri};
+use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
 
-use wasm_bindgen_test::wasm_bindgen_test;
+/// Default Cloudflare Workers KV binding name.
+///
+/// If a KV namespace with this binding exists in your `wrangler.toml`,
+/// it will be automatically available to handlers via the `Kv` extractor.
+pub const DEFAULT_KV_BINDING: &str = edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 
 pub async fn into_core_request(
     mut req: CfRequest,
@@ -51,9 +59,46 @@ pub async fn dispatch(
     env: Env,
     ctx: Context,
 ) -> Result<CfResponse, WorkerError> {
-    let core_request = into_core_request(req, env, ctx)
+    dispatch_with_kv(app, req, env, ctx, DEFAULT_KV_BINDING, false).await
+}
+
+/// Dispatch a Cloudflare Worker request with a custom KV binding name.
+///
+/// `kv_required` should be `true` when `[stores.kv]` is explicitly present
+/// in the manifest, causing the request to fail if the binding is unavailable
+/// rather than silently degrading.
+pub async fn dispatch_with_kv(
+    app: &App,
+    req: CfRequest,
+    env: Env,
+    ctx: Context,
+    kv_binding: &str,
+    kv_required: bool,
+) -> Result<CfResponse, WorkerError> {
+    // Try to open the KV binding from `env` before consuming it in `into_core_request`.
+    // We borrow `env` here; `into_core_request` takes ownership afterwards.
+    let kv_handle = match crate::key_value_store::CloudflareKvStore::from_env(&env, kv_binding) {
+        Ok(store) => Some(KvHandle::new(std::sync::Arc::new(store))),
+        Err(e) => {
+            if kv_required {
+                return Err(WorkerError::RustError(format!(
+                    "KV binding '{}' is explicitly configured but could not be opened: {}",
+                    kv_binding, e
+                )));
+            }
+            warn_missing_kv_binding_once(kv_binding, &e);
+            None
+        }
+    };
+
+    let mut core_request = into_core_request(req, env, ctx)
         .await
         .map_err(edge_error_to_worker)?;
+
+    if let Some(handle) = kv_handle {
+        core_request.extensions_mut().insert(handle);
+    }
+
     let svc = app.router().clone();
     let response = svc.oneshot(core_request).await;
     from_core_response(response).map_err(edge_error_to_worker)
@@ -63,12 +108,38 @@ fn edge_error_to_worker(err: EdgeError) -> WorkerError {
     WorkerError::RustError(err.to_string())
 }
 
-fn into_core_method(method: Method) -> CoreMethod {
-    CoreMethod::from_bytes(method.as_ref().as_bytes()).unwrap_or(CoreMethod::GET)
+fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl std::fmt::Display) {
+    static WARNED_BINDINGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let warned_bindings = WARNED_BINDINGS.get_or_init(|| Mutex::new(BTreeSet::new()));
+
+    match warned_bindings.lock() {
+        Ok(mut warned_bindings) => {
+            if !warned_bindings.insert(kv_binding.to_string()) {
+                return;
+            }
+            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+        }
+        Err(_) => {
+            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+        }
+    }
 }
 
+fn into_core_method(method: Method) -> CoreMethod {
+    let bytes = method.as_ref().as_bytes();
+    CoreMethod::from_bytes(bytes).unwrap_or_else(|_| {
+        log::warn!(
+            "unknown HTTP method {:?}, defaulting to GET",
+            method.as_ref()
+        );
+        CoreMethod::GET
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
 
     #[wasm_bindgen_test]
     fn into_http_method_maps_known_methods() {

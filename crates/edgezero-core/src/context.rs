@@ -1,6 +1,7 @@
 use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::Request;
+use crate::key_value_store::KvHandle;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
 use serde::de::DeserializeOwned;
@@ -82,6 +83,10 @@ impl RequestContext {
 
     pub fn proxy_handle(&self) -> Option<ProxyHandle> {
         self.request.extensions().get::<ProxyHandle>().cloned()
+    }
+
+    pub fn kv_handle(&self) -> Option<KvHandle> {
+        self.request.extensions().get::<KvHandle>().cloned()
     }
 }
 
@@ -320,5 +325,29 @@ mod tests {
         let request = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
         let response = futures::executor::block_on(handle.forward(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn kv_handle_is_retrieved_when_present() {
+        use crate::key_value_store::{KvHandle, NoopKvStore};
+        use std::sync::Arc;
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(KvHandle::new(Arc::new(NoopKvStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.kv_handle().is_some());
+    }
+
+    #[test]
+    fn kv_handle_returns_none_when_absent() {
+        let ctx = ctx("/test", Body::empty(), PathParams::default());
+        assert!(ctx.kv_handle().is_none());
     }
 }
