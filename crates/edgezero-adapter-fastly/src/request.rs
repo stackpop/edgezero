@@ -8,6 +8,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::secret_store::SecretHandle;
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 
@@ -104,6 +105,98 @@ fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Displa
         }
         Err(_) => {
             log::warn!("KV store '{}' not available: {}", kv_store_name, error);
+        }
+    }
+}
+
+/// Dispatch a Fastly request with a secret store attached.
+pub fn dispatch_with_secrets(
+    app: &App,
+    req: FastlyRequest,
+    secret_store_name: &str,
+    secrets_required: bool,
+) -> Result<FastlyResponse, FastlyError> {
+    let mut core_request = into_core_request(req).map_err(map_edge_error)?;
+
+    match crate::secret_store::FastlySecretStore::open(secret_store_name) {
+        Ok(store) => {
+            let handle = SecretHandle::new(std::sync::Arc::new(store));
+            core_request.extensions_mut().insert(handle);
+        }
+        Err(e) => {
+            if secrets_required {
+                return Err(FastlyError::msg(format!(
+                    "secret store '{}' is explicitly configured but could not be opened: {}",
+                    secret_store_name, e
+                )));
+            }
+            warn_missing_secret_store_once(secret_store_name, &e);
+        }
+    }
+
+    let response = executor::block_on(app.router().oneshot(core_request));
+    from_core_response(response).map_err(map_edge_error)
+}
+
+/// Dispatch a Fastly request with both KV and secret stores attached.
+pub fn dispatch_with_kv_and_secrets(
+    app: &App,
+    req: FastlyRequest,
+    kv_store_name: &str,
+    kv_required: bool,
+    secret_store_name: &str,
+    secrets_required: bool,
+) -> Result<FastlyResponse, FastlyError> {
+    let mut core_request = into_core_request(req).map_err(map_edge_error)?;
+
+    match FastlyKvStore::open(kv_store_name) {
+        Ok(store) => {
+            let handle = KvHandle::new(std::sync::Arc::new(store));
+            core_request.extensions_mut().insert(handle);
+        }
+        Err(e) => {
+            if kv_required {
+                return Err(FastlyError::msg(format!(
+                    "KV store '{}' is explicitly configured but could not be opened: {}",
+                    kv_store_name, e
+                )));
+            }
+            warn_missing_kv_store_once(kv_store_name, &e);
+        }
+    }
+
+    match crate::secret_store::FastlySecretStore::open(secret_store_name) {
+        Ok(store) => {
+            let handle = SecretHandle::new(std::sync::Arc::new(store));
+            core_request.extensions_mut().insert(handle);
+        }
+        Err(e) => {
+            if secrets_required {
+                return Err(FastlyError::msg(format!(
+                    "secret store '{}' is explicitly configured but could not be opened: {}",
+                    secret_store_name, e
+                )));
+            }
+            warn_missing_secret_store_once(secret_store_name, &e);
+        }
+    }
+
+    let response = executor::block_on(app.router().oneshot(core_request));
+    from_core_response(response).map_err(map_edge_error)
+}
+
+fn warn_missing_secret_store_once(name: &str, error: &impl std::fmt::Display) {
+    static WARNED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(BTreeSet::new()));
+    match warned.lock() {
+        Ok(mut warned) => {
+            if !warned.insert(name.to_string()) {
+                return;
+            }
+            log::warn!("secret store '{}' not available: {}", name, error);
+        }
+        Err(_) => {
+            log::warn!("secret store '{}' not available: {}", name, error);
         }
     }
 }

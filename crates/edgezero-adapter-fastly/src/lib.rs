@@ -9,6 +9,8 @@ pub mod key_value_store;
 #[cfg(feature = "fastly")]
 mod logger;
 #[cfg(feature = "fastly")]
+pub mod secret_store;
+#[cfg(feature = "fastly")]
 mod proxy;
 #[cfg(feature = "fastly")]
 mod request;
@@ -19,7 +21,12 @@ pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
-pub use request::{dispatch, dispatch_with_kv, into_core_request, DEFAULT_KV_STORE_NAME};
+pub use request::{
+    dispatch, dispatch_with_kv, dispatch_with_kv_and_secrets, dispatch_with_secrets,
+    into_core_request, DEFAULT_KV_STORE_NAME,
+};
+#[cfg(feature = "fastly")]
+pub use secret_store::FastlySecretStore;
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
 
@@ -84,7 +91,16 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     let logging = manifest.logging_or_default("fastly");
     let kv_name = manifest.kv_store_name("fastly").to_string();
     let kv_required = manifest.stores.kv.is_some();
-    run_app_with_logging::<A>(logging.into(), req, &kv_name, kv_required)
+    let secret_name = manifest.secret_store_name("fastly").to_string();
+    let secrets_required = manifest.stores.secrets.is_some();
+    run_app_with_logging::<A>(
+        logging.into(),
+        req,
+        &kv_name,
+        kv_required,
+        &secret_name,
+        secrets_required,
+    )
 }
 
 #[cfg(feature = "fastly")]
@@ -93,6 +109,8 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     req: fastly::Request,
     kv_store_name: &str,
     kv_required: bool,
+    secret_store_name: &str,
+    secrets_required: bool,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -100,7 +118,7 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    dispatch_with_kv(&app, req, kv_store_name, kv_required)
+    dispatch_with_kv_and_secrets(&app, req, kv_store_name, kv_required, secret_store_name, secrets_required)
 }
 
 #[cfg(all(test, feature = "fastly"))]
