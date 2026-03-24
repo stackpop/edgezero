@@ -78,9 +78,26 @@ fn main() {
 }
 
 #[cfg(feature = "cli")]
+fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
+    let m = manifest.manifest();
+    if let Some(ref secrets) = m.stores.secrets {
+        let binding_name = m.secret_store_name(adapter_name);
+        println!(
+            "[edgezero] secret store '{binding_name}' declared -- \
+             ensure it is provisioned on the {adapter_name} platform \
+             (global name: '{}')",
+            secrets.name
+        );
+    }
+}
+
+#[cfg(feature = "cli")]
 fn handle_build(adapter_name: &str, adapter_args: &[String]) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
+    if let Some(ref m) = manifest {
+        log_store_bindings(adapter_name, m);
+    }
     adapter::execute(
         adapter_name,
         adapter::Action::Build,
@@ -288,5 +305,25 @@ serve = "echo serve"
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
         handle_serve("fastly").expect("serve command runs");
+    }
+
+    #[test]
+    fn secret_store_name_is_readable_from_manifest() {
+        let manifest_with_secrets = r#"
+[app]
+name = "demo-app"
+entry = "crates/demo-core"
+
+[stores.secrets]
+name = "MY_SECRETS"
+
+[adapters.fastly.commands]
+build = "echo build"
+deploy = "echo deploy"
+serve = "echo serve"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest_with_secrets);
+        assert_eq!(loader.manifest().secret_store_name("fastly"), "MY_SECRETS");
+        assert!(loader.manifest().stores.secrets.is_some());
     }
 }
