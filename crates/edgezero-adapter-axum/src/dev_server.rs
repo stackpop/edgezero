@@ -196,18 +196,22 @@ async fn serve_with_listener_and_kv_path(
     let kv_handle = kv_path
         .map(|kv_path| kv_handle_from_path(Path::new(kv_path)))
         .transpose()?;
-    serve_with_listener_and_kv_handle(router, listener, enable_ctrl_c, kv_handle).await
+    serve_with_listener_and_stores(router, listener, enable_ctrl_c, kv_handle, None).await
 }
 
-async fn serve_with_listener_and_kv_handle(
+async fn serve_with_listener_and_stores(
     router: RouterService,
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
     kv_handle: Option<edgezero_core::key_value_store::KvHandle>,
+    secret_handle: Option<edgezero_core::secret_store::SecretHandle>,
 ) -> anyhow::Result<()> {
     let mut service = EdgeZeroAxumService::new(router);
     if let Some(kv_handle) = kv_handle {
         service = service.with_kv_handle(kv_handle);
+    }
+    if let Some(secret_handle) = secret_handle {
+        service = service.with_secret_handle(secret_handle);
     }
 
     let service = service;
@@ -243,6 +247,8 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let kv_init_requirement = kv_init_requirement(manifest);
     let kv_store_name = manifest.kv_store_name("axum").to_string();
     let kv_path = kv_store_path(&kv_store_name);
+    let secret_store_name = manifest.secret_store_name("axum").to_string();
+    let has_secret_store = manifest.stores.secrets.is_some();
 
     let level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
@@ -294,7 +300,25 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
                 }
             }
         };
-        serve_with_listener_and_kv_handle(router, listener, config.enable_ctrl_c, kv_handle).await
+        let secret_handle = if has_secret_store {
+            log::info!(
+                "Secret store '{}': reading from environment variables",
+                secret_store_name
+            );
+            Some(edgezero_core::secret_store::SecretHandle::new(
+                std::sync::Arc::new(crate::secret_store::EnvSecretStore::new()),
+            ))
+        } else {
+            None
+        };
+        serve_with_listener_and_stores(
+            router,
+            listener,
+            config.enable_ctrl_c,
+            kv_handle,
+            secret_handle,
+        )
+        .await
     })
 }
 
