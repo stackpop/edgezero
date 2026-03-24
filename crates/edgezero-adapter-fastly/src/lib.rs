@@ -16,6 +16,7 @@ mod request;
 mod response;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
+mod store_handles;
 
 pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]

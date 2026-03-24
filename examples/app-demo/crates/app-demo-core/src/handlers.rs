@@ -10,6 +10,8 @@ use edgezero_core::response::Text;
 use futures::{stream, StreamExt};
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
+const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
+const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
 
 #[derive(serde::Deserialize)]
 pub(crate) struct EchoParams {
@@ -195,17 +197,30 @@ pub(crate) async fn kv_note_delete(
 // Secrets demo handler — illustrates platform-neutral secret access.
 // WARNING: This handler returns the raw secret value in the response body.
 //          It exists solely for smoke-testing. Never do this in production.
+//          Only fixed smoke-test key names are accepted.
 // ---------------------------------------------------------------------------
 
-/// Echo the value of a named secret from the configured secret store.
+/// Echo the value of an allowlisted smoke-test secret from the configured store.
 ///
-/// Usage: GET /secrets/echo?name=MY_SECRET_NAME
+/// Usage: GET /secrets/echo?name=SMOKE_SECRET
 #[action]
 pub(crate) async fn secrets_echo(
     Secrets(store): Secrets,
     Query(params): Query<EchoParams>,
 ) -> Result<Text<String>, EdgeError> {
-    let value = store.require_str(&params.name).await.map_err(EdgeError::from)?;
+    match params.name.as_str() {
+        SMOKE_SECRET_NAME | SMOKE_SECRET_MISSING_NAME => {}
+        _ => {
+            return Err(EdgeError::bad_request(
+                "only smoke-test secret names are allowed",
+            ))
+        }
+    }
+
+    let value = store
+        .require_str(&params.name)
+        .await
+        .map_err(EdgeError::from)?;
     Ok(Text::new(value))
 }
 
@@ -539,11 +554,7 @@ mod tests {
 
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
 
-    fn context_with_secrets(
-        path: &str,
-        query: &str,
-        entries: &[(&str, &str)],
-    ) -> RequestContext {
+    fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
         let store = InMemorySecretStore::new(
             entries
                 .iter()
@@ -564,8 +575,8 @@ mod tests {
     fn secrets_echo_returns_secret_value() {
         let ctx = context_with_secrets(
             "/secrets/echo",
-            "name=API_KEY",
-            &[("API_KEY", "my-secret-value")],
+            "name=SMOKE_SECRET",
+            &[("SMOKE_SECRET", "my-secret-value")],
         );
         let response = block_on(secrets_echo(ctx))
             .expect("handler ok")
@@ -575,10 +586,32 @@ mod tests {
     }
 
     #[test]
-    fn secrets_echo_returns_500_for_missing_secret() {
+    fn secrets_echo_returns_sanitized_500_for_missing_allowed_secret() {
         use edgezero_core::http::StatusCode;
-        let ctx = context_with_secrets("/secrets/echo", "name=MISSING_KEY", &[]);
-        let err = block_on(secrets_echo(ctx)).expect_err("should fail");
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let ctx = context_with_secrets("/secrets/echo", "name=SMOKE_SECRET_MISSING", &[]);
+        let response = block_on(secrets_echo(ctx))
+            .expect_err("should fail")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8(response.into_body().into_bytes().to_vec()).expect("utf8");
+        assert!(body.contains("required secret is not configured"));
+        assert!(!body.contains("SMOKE_SECRET_MISSING"));
+    }
+
+    #[test]
+    fn secrets_echo_rejects_non_smoke_secret_names() {
+        use edgezero_core::http::StatusCode;
+
+        let ctx = context_with_secrets("/secrets/echo", "name=API_KEY", &[("API_KEY", "secret")]);
+        let response = block_on(secrets_echo(ctx))
+            .expect_err("should reject arbitrary secret names")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(response.into_body().into_bytes().to_vec()).expect("utf8");
+        assert!(body.contains("only smoke-test secret names are allowed"));
+        assert!(!body.contains("API_KEY"));
     }
 }

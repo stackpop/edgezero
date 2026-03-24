@@ -15,6 +15,7 @@ mod request;
 mod response;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
+mod store_handles;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use context::CloudflareRequestContext;

@@ -94,7 +94,7 @@ path = "/secrets/echo"
 methods = ["GET"]
 handler = "app_demo_core::handlers::secrets_echo"
 adapters = ["axum", "cloudflare", "fastly"]
-description = "Echo a named secret value (smoke-test only — do not use in production)"
+description = "Echo an allowlisted smoke-test secret value (smoke-test only — do not use in production)"
 
 # -- Stores ----------------------------------------------------------------
 

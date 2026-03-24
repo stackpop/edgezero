@@ -451,8 +451,10 @@ name = "EDGEZERO_KV"
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use edgezero_core::action;
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
+    use edgezero_core::extractor::Secrets;
     use edgezero_core::router::RouterService;
     use std::time::{Duration, Instant};
 
@@ -824,19 +826,19 @@ mod integration_tests {
             .expect("bind secrets test server");
         let addr = listener.local_addr().expect("local addr");
         let handle = tokio::spawn(async move {
-            let _ = super::serve_with_listener_and_stores(
-                router,
-                listener,
-                false,
-                None,
-                secret_handle,
-            )
-            .await;
+            let _ =
+                super::serve_with_listener_and_stores(router, listener, false, None, secret_handle)
+                    .await;
         });
         TestServerSecrets {
             base_url: format!("http://{}", addr),
             handle,
         }
+    }
+
+    #[action]
+    async fn secret_value_handler(Secrets(store): Secrets) -> Result<String, EdgeError> {
+        store.require_str("API_KEY").await.map_err(EdgeError::from)
     }
 
     // -----------------------------------------------------------------------
@@ -848,14 +850,9 @@ mod integration_tests {
         use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
         use std::sync::Arc;
 
-        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let store = ctx
-                .secret_handle()
-                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secret store configured")))?;
-            store.require_str("API_KEY").await.map_err(EdgeError::from)
-        }
-
-        let router = RouterService::builder().get("/secret", handler).build();
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
         let store = InMemorySecretStore::new([("API_KEY", bytes::Bytes::from("s3cr3t"))]);
         let handle = SecretHandle::new(Arc::new(store));
         let server = start_test_server_with_secret_handle(router, Some(handle)).await;
@@ -875,14 +872,9 @@ mod integration_tests {
         use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
         use std::sync::Arc;
 
-        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let store = ctx
-                .secret_handle()
-                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secret store configured")))?;
-            store.require_str("API_KEY").await.map_err(EdgeError::from)
-        }
-
-        let router = RouterService::builder().get("/secret", handler).build();
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
         let store = InMemorySecretStore::new(std::iter::empty::<(&str, bytes::Bytes)>());
         let handle = SecretHandle::new(Arc::new(store));
         let server = start_test_server_with_secret_handle(router, Some(handle)).await;
@@ -891,28 +883,36 @@ mod integration_tests {
         let url = format!("{}/secret", server.base_url);
         let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
 
-        assert_eq!(response.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("API_KEY"));
+        assert!(body.contains("required secret is not configured"));
 
         server.handle.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn no_secret_store_configured_returns_500() {
-        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let store = ctx
-                .secret_handle()
-                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secret store configured")))?;
-            store.require_str("API_KEY").await.map_err(EdgeError::from)
-        }
-
-        let router = RouterService::builder().get("/secret", handler).build();
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
         let server = start_test_server_with_secret_handle(router, None).await;
 
         let client = reqwest::Client::new();
         let url = format!("{}/secret", server.base_url);
         let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
 
-        assert_eq!(response.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains(
+            "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
+        ));
 
         server.handle.abort();
     }
