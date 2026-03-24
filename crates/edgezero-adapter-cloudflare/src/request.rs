@@ -107,6 +107,11 @@ pub async fn dispatch_with_kv(
 
 /// Dispatch a Cloudflare Worker request with a secret store attached.
 ///
+/// Dispatch a Cloudflare Worker request with a secret store attached (no KV store).
+///
+/// Use this when your application accesses secrets but does not need a KV store.
+/// For applications that need both, use [`dispatch_with_kv_and_secrets`] instead.
+///
 /// Note: `_secrets_required` is intentionally unused. Cloudflare Worker Secrets
 /// are individually bound in `wrangler.toml`; there is no namespace to "open"
 /// that could fail. The store is always successfully constructed from `Env`.
