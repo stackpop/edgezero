@@ -118,19 +118,18 @@ pub fn dispatch_with_secrets(
 ) -> Result<FastlyResponse, FastlyError> {
     let mut core_request = into_core_request(req).map_err(map_edge_error)?;
 
-    match crate::secret_store::FastlySecretStore::open(secret_store_name) {
-        Ok(store) => {
-            let handle = SecretHandle::new(std::sync::Arc::new(store));
-            core_request.extensions_mut().insert(handle);
-        }
-        Err(e) => {
-            if secrets_required {
+    if secrets_required {
+        match crate::secret_store::FastlySecretStore::open(secret_store_name) {
+            Ok(store) => {
+                let handle = SecretHandle::new(std::sync::Arc::new(store));
+                core_request.extensions_mut().insert(handle);
+            }
+            Err(e) => {
                 return Err(FastlyError::msg(format!(
                     "secret store '{}' is explicitly configured but could not be opened: {}",
                     secret_store_name, e
                 )));
             }
-            warn_missing_secret_store_once(secret_store_name, &e);
         }
     }
 
@@ -165,38 +164,21 @@ pub fn dispatch_with_kv_and_secrets(
         }
     }
 
-    match crate::secret_store::FastlySecretStore::open(secret_store_name) {
-        Ok(store) => {
-            let handle = SecretHandle::new(std::sync::Arc::new(store));
-            core_request.extensions_mut().insert(handle);
-        }
-        Err(e) => {
-            if secrets_required {
+    if secrets_required {
+        match crate::secret_store::FastlySecretStore::open(secret_store_name) {
+            Ok(store) => {
+                let handle = SecretHandle::new(std::sync::Arc::new(store));
+                core_request.extensions_mut().insert(handle);
+            }
+            Err(e) => {
                 return Err(FastlyError::msg(format!(
                     "secret store '{}' is explicitly configured but could not be opened: {}",
                     secret_store_name, e
                 )));
             }
-            warn_missing_secret_store_once(secret_store_name, &e);
         }
     }
 
     let response = executor::block_on(app.router().oneshot(core_request));
     from_core_response(response).map_err(map_edge_error)
-}
-
-fn warn_missing_secret_store_once(name: &str, error: &impl std::fmt::Display) {
-    static WARNED: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    let warned = WARNED.get_or_init(|| Mutex::new(BTreeSet::new()));
-    match warned.lock() {
-        Ok(mut warned) => {
-            if !warned.insert(name.to_string()) {
-                return;
-            }
-            log::warn!("secret store '{}' not available: {}", name, error);
-        }
-        Err(_) => {
-            log::warn!("secret store '{}' not available: {}", name, error);
-        }
-    }
 }

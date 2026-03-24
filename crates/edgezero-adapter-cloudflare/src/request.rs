@@ -112,26 +112,32 @@ pub async fn dispatch_with_kv(
 /// Use this when your application accesses secrets but does not need a KV store.
 /// For applications that need both, use [`dispatch_with_kv_and_secrets`] instead.
 ///
-/// Note: `_secrets_required` is intentionally unused. Cloudflare Worker Secrets
-/// are individually bound in `wrangler.toml`; there is no namespace to "open"
-/// that could fail. The store is always successfully constructed from `Env`.
+/// The store is only attached when `secrets_required` is `true`.
 /// Individual missing secrets surface as `SecretError::NotFound` at access time.
 pub async fn dispatch_with_secrets(
     app: &App,
     req: CfRequest,
     env: Env,
     ctx: Context,
-    _secrets_required: bool,
+    secrets_required: bool,
 ) -> Result<CfResponse, WorkerError> {
-    // Clone env before consuming it in into_core_request.
-    // Env wraps a JsValue reference; cloning increments the JS reference count.
-    let secret_store = crate::secret_store::CloudflareSecretStore::from_env(env.clone());
-    let secret_handle = SecretHandle::new(std::sync::Arc::new(secret_store));
-
     let mut core_request = into_core_request(req, env, ctx)
         .await
         .map_err(edge_error_to_worker)?;
-    core_request.extensions_mut().insert(secret_handle);
+
+    if secrets_required {
+        // Env wraps a JsValue reference; cloning increments the JS reference count.
+        let secret_store = crate::secret_store::CloudflareSecretStore::from_env(
+            core_request
+                .extensions()
+                .get::<crate::CloudflareRequestContext>()
+                .expect("cloudflare request context inserted")
+                .env()
+                .clone(),
+        );
+        let secret_handle = SecretHandle::new(std::sync::Arc::new(secret_store));
+        core_request.extensions_mut().insert(secret_handle);
+    }
 
     let svc = app.router().clone();
     let response = svc.oneshot(core_request).await;
@@ -146,8 +152,8 @@ pub async fn dispatch_with_kv_and_secrets(
     ctx: Context,
     kv_binding: &str,
     kv_required: bool,
-    _secret_binding: &str,   // unused: CF secrets have no namespace concept
-    _secrets_required: bool, // unused: CloudflareSecretStore always constructs OK
+    _secret_binding: &str, // unused: CF secrets have no namespace concept
+    secrets_required: bool,
 ) -> Result<CfResponse, WorkerError> {
     // Open KV by borrowing env
     let kv_handle = match crate::key_value_store::CloudflareKvStore::from_env(&env, kv_binding) {
@@ -164,10 +170,6 @@ pub async fn dispatch_with_kv_and_secrets(
         }
     };
 
-    // Clone env for secrets before consuming it
-    let secret_store = crate::secret_store::CloudflareSecretStore::from_env(env.clone());
-    let secret_handle = SecretHandle::new(std::sync::Arc::new(secret_store));
-
     let mut core_request = into_core_request(req, env, ctx)
         .await
         .map_err(edge_error_to_worker)?;
@@ -175,7 +177,18 @@ pub async fn dispatch_with_kv_and_secrets(
     if let Some(handle) = kv_handle {
         core_request.extensions_mut().insert(handle);
     }
-    core_request.extensions_mut().insert(secret_handle);
+    if secrets_required {
+        let secret_store = crate::secret_store::CloudflareSecretStore::from_env(
+            core_request
+                .extensions()
+                .get::<crate::CloudflareRequestContext>()
+                .expect("cloudflare request context inserted")
+                .env()
+                .clone(),
+        );
+        let secret_handle = SecretHandle::new(std::sync::Arc::new(secret_store));
+        core_request.extensions_mut().insert(secret_handle);
+    }
 
     let svc = app.router().clone();
     let response = svc.oneshot(core_request).await;

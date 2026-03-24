@@ -53,20 +53,16 @@ pub enum SecretError {
 impl From<SecretError> for EdgeError {
     fn from(err: SecretError) -> Self {
         match err {
-            // NotFound = server misconfiguration, never a client 404.
-            // A missing API key means the platform isn't set up correctly,
-            // not that the request was invalid.
-            SecretError::NotFound { name } => EdgeError::internal(anyhow::anyhow!(
-                "required secret '{}' is not configured -- check platform secret store bindings",
-                name
-            )),
-            SecretError::Unavailable => EdgeError::service_unavailable("secret store unavailable"),
-            // Validation errors are programming errors (bad secret name in code),
-            // not client errors.
-            SecretError::Validation(e) => {
-                EdgeError::internal(anyhow::anyhow!("secret name validation error: {e}"))
+            SecretError::NotFound { .. } => {
+                EdgeError::internal(anyhow::anyhow!("required secret is not configured"))
             }
-            SecretError::Internal(e) => EdgeError::internal(e),
+            SecretError::Unavailable => EdgeError::service_unavailable("secret store unavailable"),
+            SecretError::Validation(..) => {
+                EdgeError::internal(anyhow::anyhow!("secret lookup failed"))
+            }
+            SecretError::Internal(..) => {
+                EdgeError::internal(anyhow::anyhow!("secret store operation failed"))
+            }
         }
     }
 }
@@ -294,6 +290,7 @@ macro_rules! secret_store_contract_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::StatusCode;
     use bytes::Bytes;
     use futures::executor::block_on;
 
@@ -311,6 +308,14 @@ mod tests {
         let map: HashMap<String, Bytes> = entries
             .iter()
             .map(|(k, v)| (k.to_string(), Bytes::from(v.to_string())))
+            .collect();
+        SecretHandle::new(std::sync::Arc::new(SimpleStore(map)))
+    }
+
+    fn store_with_bytes(entries: &[(&str, &[u8])]) -> SecretHandle {
+        let map: HashMap<String, Bytes> = entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), Bytes::copy_from_slice(v)))
             .collect();
         SecretHandle::new(std::sync::Arc::new(SimpleStore(map)))
     }
@@ -388,6 +393,41 @@ mod tests {
             let h = store_with(&[("key", "value")]);
             assert_eq!(h.require_str("key").await.unwrap(), "value");
         });
+    }
+
+    #[test]
+    fn get_str_rejects_invalid_utf8() {
+        block_on(async {
+            let h = store_with_bytes(&[("binary", &[0xff])]);
+            let err = h.get_str("binary").await.unwrap_err();
+            assert!(matches!(err, SecretError::Internal(_)));
+        });
+    }
+
+    #[test]
+    fn require_str_rejects_invalid_utf8() {
+        block_on(async {
+            let h = store_with_bytes(&[("binary", &[0xff])]);
+            let err = h.require_str("binary").await.unwrap_err();
+            assert!(matches!(err, SecretError::Internal(_)));
+        });
+    }
+
+    #[test]
+    fn secret_error_not_found_does_not_leak_secret_name() {
+        let err: EdgeError = SecretError::NotFound {
+            name: "API_KEY".to_string(),
+        }
+        .into();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!err.message().contains("API_KEY"));
+    }
+
+    #[test]
+    fn secret_error_validation_does_not_leak_details() {
+        let err: EdgeError = SecretError::Validation("bad\x00name".to_string()).into();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!err.message().contains("bad"));
     }
 
     secret_store_contract_tests!(in_memory_contract, {

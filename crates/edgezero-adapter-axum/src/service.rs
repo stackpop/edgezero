@@ -102,7 +102,37 @@ mod tests {
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{response_builder, StatusCode};
+    use std::ffi::OsString;
+    use std::sync::OnceLock;
     use tower::ServiceExt;
+
+    fn env_guard() -> &'static tokio::sync::Mutex<()> {
+        static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct EnvOverride {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvOverride {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            if let Some(ref original) = self.original {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forwards_request_to_router() {
@@ -166,7 +196,8 @@ mod tests {
         use edgezero_core::secret_store::SecretHandle;
         use std::sync::Arc;
 
-        std::env::set_var("__EDGEZERO_SERVICE_TEST_SECRET__", "injected_value");
+        let _guard = env_guard().lock().await;
+        let _env = EnvOverride::set("__EDGEZERO_SERVICE_TEST_SECRET__", "injected_value");
 
         let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
         let router = RouterService::builder()
@@ -198,8 +229,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"injected_value");
-
-        std::env::remove_var("__EDGEZERO_SERVICE_TEST_SECRET__");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

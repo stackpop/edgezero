@@ -1,6 +1,6 @@
 //! Environment variable secret store for local development.
 //!
-//! Reads secrets from `std::env::var(name)`. Set secrets as environment
+//! Reads secrets from the process environment. Set secrets as environment
 //! variables before starting the dev server:
 //!
 //! ```bash
@@ -32,12 +32,25 @@ impl Default for EnvSecretStore {
 #[async_trait(?Send)]
 impl SecretStore for EnvSecretStore {
     async fn get_bytes(&self, name: &str) -> Result<Option<Bytes>, SecretError> {
-        match std::env::var(name) {
-            Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(os_str)) => Err(SecretError::Internal(
-                anyhow::anyhow!("secret '{}' contains non-UTF-8 bytes: {:?}", name, os_str),
-            )),
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            match std::env::var_os(name) {
+                Some(value) => Ok(Some(Bytes::from(value.into_vec()))),
+                None => Ok(None),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(std::env::VarError::NotUnicode(_)) => Err(SecretError::Internal(
+                    anyhow::anyhow!("secret store returned an invalid Unicode value"),
+                )),
+            }
         }
     }
 }
@@ -46,22 +59,80 @@ impl SecretStore for EnvSecretStore {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use futures::executor::block_on;
+    use std::ffi::OsString;
+    use std::sync::OnceLock;
 
-    #[test]
-    fn get_bytes_returns_none_when_var_not_set() {
+    fn env_guard() -> &'static tokio::sync::Mutex<()> {
+        static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    struct EnvOverride {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvOverride {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let original = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            if let Some(ref original) = self.original {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_bytes_returns_none_when_var_not_set() {
+        let _guard = env_guard().lock().await;
+        let _env = EnvOverride::clear("__EDGEZERO_TEST_MISSING_VAR_XYZ__");
         let store = EnvSecretStore::new();
-        let result = block_on(store.get_bytes("__EDGEZERO_TEST_MISSING_VAR_XYZ__")).unwrap();
+        let result = store
+            .get_bytes("__EDGEZERO_TEST_MISSING_VAR_XYZ__")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
-    #[test]
-    fn get_bytes_returns_value_when_var_set() {
-        std::env::set_var("__EDGEZERO_TEST_SECRET__", "test_value_123");
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_bytes_returns_value_when_var_set() {
+        let _guard = env_guard().lock().await;
+        let _env = EnvOverride::set("__EDGEZERO_TEST_SECRET__", "test_value_123");
         let store = EnvSecretStore::new();
-        let result = block_on(store.get_bytes("__EDGEZERO_TEST_SECRET__")).unwrap();
+        let result = store.get_bytes("__EDGEZERO_TEST_SECRET__").await.unwrap();
         assert_eq!(result, Some(Bytes::from("test_value_123")));
-        std::env::remove_var("__EDGEZERO_TEST_SECRET__");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_bytes_preserves_non_utf8_secret_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = env_guard().lock().await;
+        let _env = EnvOverride::set(
+            "__EDGEZERO_TEST_BINARY_SECRET__",
+            OsString::from_vec(vec![0xff, 0x61]),
+        );
+        let store = EnvSecretStore::new();
+        let result = store
+            .get_bytes("__EDGEZERO_TEST_BINARY_SECRET__")
+            .await
+            .unwrap();
+        assert_eq!(result, Some(Bytes::from_static(&[0xff, 0x61])));
     }
 
     // Contract tests: use InMemorySecretStore since EnvSecretStore needs

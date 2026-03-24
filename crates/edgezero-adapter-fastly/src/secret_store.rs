@@ -39,8 +39,15 @@ impl FastlySecretStore {
 #[async_trait(?Send)]
 impl SecretStore for FastlySecretStore {
     async fn get_bytes(&self, name: &str) -> Result<Option<Bytes>, SecretError> {
-        match self.store.get(name) {
-            Some(secret) => Ok(Some(secret.plaintext())),
+        let secret = self
+            .store
+            .try_get(name)
+            .map_err(|e| SecretError::Internal(anyhow::anyhow!("secret lookup failed: {e}")))?;
+
+        match secret {
+            Some(secret) => secret.try_plaintext().map(Some).map_err(|e| {
+                SecretError::Internal(anyhow::anyhow!("secret decryption failed: {e}"))
+            }),
             None => Ok(None),
         }
     }

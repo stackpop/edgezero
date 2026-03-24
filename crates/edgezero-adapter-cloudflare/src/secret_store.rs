@@ -15,6 +15,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 use edgezero_core::secret_store::{SecretError, SecretStore};
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use worker::Error as WorkerError;
 
 /// Secret store backed by Cloudflare Workers `Env`.
 ///
@@ -42,8 +44,16 @@ impl SecretStore for CloudflareSecretStore {
                 let value = secret.to_string();
                 Ok(Some(Bytes::from(value.into_bytes())))
             }
-            // Workers returns an error when a secret binding is absent
-            Err(_) => Ok(None),
+            Err(WorkerError::BindingError(_)) => Ok(None),
+            Err(WorkerError::JsError(message))
+                if message.contains("does not contain binding")
+                    || message.contains("is undefined") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(SecretError::Internal(anyhow::anyhow!(
+                "secret lookup failed: {err}"
+            ))),
         }
     }
 }

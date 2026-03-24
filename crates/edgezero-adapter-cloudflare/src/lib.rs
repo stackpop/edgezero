@@ -79,19 +79,25 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     let kv_binding = manifest.kv_store_name("cloudflare");
     let kv_required = manifest.stores.kv.is_some();
     let secret_binding = manifest.secret_store_name("cloudflare");
-    let secrets_required = manifest.stores.secrets.is_some();
+    let secrets_required = manifest.secret_store_enabled("cloudflare");
     let app = A::build_app();
-    dispatch_with_kv_and_secrets(
-        &app,
-        req,
-        env,
-        ctx,
-        kv_binding,
-        kv_required,
-        secret_binding,
-        secrets_required,
-    )
-    .await
+    if secrets_required && kv_required {
+        dispatch_with_kv_and_secrets(
+            &app,
+            req,
+            env,
+            ctx,
+            kv_binding,
+            kv_required,
+            secret_binding,
+            secrets_required,
+        )
+        .await
+    } else if secrets_required {
+        dispatch_with_secrets(&app, req, env, ctx, secrets_required).await
+    } else {
+        dispatch_with_kv(&app, req, env, ctx, kv_binding, kv_required).await
+    }
 }
 
 /// Deprecated: use [`run_app`] which now takes `manifest_src` directly.

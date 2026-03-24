@@ -92,7 +92,7 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     let kv_name = manifest.kv_store_name("fastly").to_string();
     let kv_required = manifest.stores.kv.is_some();
     let secret_name = manifest.secret_store_name("fastly").to_string();
-    let secrets_required = manifest.stores.secrets.is_some();
+    let secrets_required = manifest.secret_store_enabled("fastly");
     run_app_with_logging::<A>(
         logging.into(),
         req,
@@ -118,14 +118,20 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    dispatch_with_kv_and_secrets(
-        &app,
-        req,
-        kv_store_name,
-        kv_required,
-        secret_store_name,
-        secrets_required,
-    )
+    if secrets_required && kv_required {
+        dispatch_with_kv_and_secrets(
+            &app,
+            req,
+            kv_store_name,
+            kv_required,
+            secret_store_name,
+            secrets_required,
+        )
+    } else if secrets_required {
+        dispatch_with_secrets(&app, req, secret_store_name, secrets_required)
+    } else {
+        dispatch_with_kv(&app, req, kv_store_name, kv_required)
+    }
 }
 
 #[cfg(all(test, feature = "fastly"))]

@@ -248,7 +248,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let kv_store_name = manifest.kv_store_name("axum").to_string();
     let kv_path = kv_store_path(&kv_store_name);
     let secret_store_name = manifest.secret_store_name("axum").to_string();
-    let has_secret_store = manifest.stores.secrets.is_some();
+    let has_secret_store = manifest.secret_store_enabled("axum");
 
     let level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
