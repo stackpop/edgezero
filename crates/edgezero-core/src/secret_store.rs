@@ -209,7 +209,7 @@ impl SecretHandle {
         let bytes = self.get_bytes(name).await?;
         bytes
             .map(|b| {
-                String::from_utf8(b.to_vec()).map_err(|e| {
+                String::from_utf8(b.into()).map_err(|e| {
                     SecretError::Internal(anyhow::anyhow!(
                         "secret '{}' is not valid UTF-8: {e}",
                         name
@@ -229,7 +229,7 @@ impl SecretHandle {
     /// Retrieve a secret as a UTF-8 string. Returns `SecretError::NotFound` if absent.
     pub async fn require_str(&self, name: &str) -> Result<String, SecretError> {
         let bytes = self.require_bytes(name).await?;
-        String::from_utf8(bytes.to_vec()).map_err(|e| {
+        String::from_utf8(bytes.into()).map_err(|e| {
             SecretError::Internal(anyhow::anyhow!(
                 "secret '{}' is not valid UTF-8: {e}",
                 name
