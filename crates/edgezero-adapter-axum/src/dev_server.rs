@@ -805,4 +805,115 @@ mod integration_tests {
 
         server.handle.abort();
     }
+
+    // -----------------------------------------------------------------------
+    // Secret store helpers
+    // -----------------------------------------------------------------------
+
+    struct TestServerSecrets {
+        base_url: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn start_test_server_with_secret_handle(
+        router: RouterService,
+        secret_handle: Option<edgezero_core::secret_store::SecretHandle>,
+    ) -> TestServerSecrets {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind secrets test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let _ = super::serve_with_listener_and_stores(
+                router,
+                listener,
+                false,
+                None,
+                secret_handle,
+            )
+            .await;
+        });
+        TestServerSecrets {
+            base_url: format!("http://{}", addr),
+            handle,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret store integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_present_returns_value() {
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let store = ctx
+                .secret_handle()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secret store configured")))?;
+            store.require_str("API_KEY").await.map_err(EdgeError::from)
+        }
+
+        let router = RouterService::builder().get("/secret", handler).build();
+        let store = InMemorySecretStore::new([("API_KEY", bytes::Bytes::from("s3cr3t"))]);
+        let handle = SecretHandle::new(Arc::new(store));
+        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "s3cr3t");
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_missing_returns_500() {
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let store = ctx
+                .secret_handle()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secret store configured")))?;
+            store.require_str("API_KEY").await.map_err(EdgeError::from)
+        }
+
+        let router = RouterService::builder().get("/secret", handler).build();
+        let store = InMemorySecretStore::new(std::iter::empty::<(&str, bytes::Bytes)>());
+        let handle = SecretHandle::new(Arc::new(store));
+        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_secret_store_configured_returns_500() {
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let store = ctx
+                .secret_handle()
+                .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secret store configured")))?;
+            store.require_str("API_KEY").await.map_err(EdgeError::from)
+        }
+
+        let router = RouterService::builder().get("/secret", handler).build();
+        let server = start_test_server_with_secret_handle(router, None).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+
+        server.handle.abort();
+    }
 }
