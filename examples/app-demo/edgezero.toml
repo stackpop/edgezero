@@ -86,6 +86,16 @@ handler = "app_demo_core::handlers::kv_note_delete"
 adapters = ["axum", "cloudflare", "fastly"]
 description = "Delete a note by id"
 
+# -- Secrets demo route --------------------------------------------------------
+
+[[triggers.http]]
+id = "secrets_echo"
+path = "/secrets/echo"
+methods = ["GET"]
+handler = "app_demo_core::handlers::secrets_echo"
+adapters = ["axum", "cloudflare", "fastly"]
+description = "Echo a named secret value (smoke-test only — do not use in production)"
+
 # -- Stores ----------------------------------------------------------------
 
 [stores.kv]
@@ -95,6 +105,12 @@ description = "Delete a note by id"
 # Per-adapter overrides:
 # [stores.kv.adapters.cloudflare]
 # name = "CF_KV_BINDING"
+
+[stores.secrets]
+# Uses the default name "EDGEZERO_SECRETS".
+# Axum reads secrets from environment variables of the same name.
+# Cloudflare reads from Worker secret bindings (local: .dev.vars).
+# Fastly reads from the declared secret store (local: fastly.toml [local_server.secret_stores]).
 
 # [environment]
 #

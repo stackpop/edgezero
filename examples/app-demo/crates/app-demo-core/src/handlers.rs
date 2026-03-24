@@ -3,7 +3,7 @@ use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::extractor::{Headers, Json, Kv, Path, ValidatedPath};
+use edgezero_core::extractor::{Headers, Json, Kv, Path, Query, Secrets, ValidatedPath};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
@@ -189,6 +189,24 @@ pub(crate) async fn kv_note_delete(
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .map_err(EdgeError::internal)
+}
+
+// ---------------------------------------------------------------------------
+// Secrets demo handler — illustrates platform-neutral secret access.
+// WARNING: This handler returns the raw secret value in the response body.
+//          It exists solely for smoke-testing. Never do this in production.
+// ---------------------------------------------------------------------------
+
+/// Echo the value of a named secret from the configured secret store.
+///
+/// Usage: GET /secrets/echo?name=MY_SECRET_NAME
+#[action]
+pub(crate) async fn secrets_echo(
+    Secrets(store): Secrets,
+    Query(params): Query<EchoParams>,
+) -> Result<Text<String>, EdgeError> {
+    let value = store.require_str(&params.name).await.map_err(EdgeError::from)?;
+    Ok(Text::new(value))
 }
 
 #[cfg(test)]
@@ -515,5 +533,52 @@ mod tests {
         };
         let resp = block_on(kv_note_delete(ctx2)).expect("response");
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    // -- Secrets handler tests ----------------------------------------------
+
+    use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+
+    fn context_with_secrets(
+        path: &str,
+        query: &str,
+        entries: &[(&str, &str)],
+    ) -> RequestContext {
+        let store = InMemorySecretStore::new(
+            entries
+                .iter()
+                .map(|(k, v)| (*k, bytes::Bytes::from(v.to_string()))),
+        );
+        let handle = SecretHandle::new(std::sync::Arc::new(store));
+        let uri = format!("{}?{}", path, query);
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(uri.as_str())
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(handle);
+        RequestContext::new(request, PathParams::default())
+    }
+
+    #[test]
+    fn secrets_echo_returns_secret_value() {
+        let ctx = context_with_secrets(
+            "/secrets/echo",
+            "name=API_KEY",
+            &[("API_KEY", "my-secret-value")],
+        );
+        let response = block_on(secrets_echo(ctx))
+            .expect("handler ok")
+            .into_response();
+        let bytes = response.into_body().into_bytes();
+        assert_eq!(bytes.as_ref(), b"my-secret-value");
+    }
+
+    #[test]
+    fn secrets_echo_returns_500_for_missing_secret() {
+        use edgezero_core::http::StatusCode;
+        let ctx = context_with_secrets("/secrets/echo", "name=MISSING_KEY", &[]);
+        let err = block_on(secrets_echo(ctx)).expect_err("should fail");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
