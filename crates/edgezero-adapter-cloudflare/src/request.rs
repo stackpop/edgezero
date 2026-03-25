@@ -103,6 +103,9 @@ pub async fn dispatch_with_kv(
 ///
 /// This is the advanced/manual path. Prefer `dispatch_with_config` when you
 /// want the adapter to resolve the configured backend for you.
+///
+/// The KV namespace bound to [`DEFAULT_KV_BINDING`] is also resolved and injected
+/// (non-required: missing bindings are silently skipped).
 pub async fn dispatch_with_config_handle(
     app: &App,
     req: CfRequest,
@@ -110,7 +113,8 @@ pub async fn dispatch_with_config_handle(
     ctx: Context,
     config_store_handle: ConfigStoreHandle,
 ) -> Result<CfResponse, WorkerError> {
-    dispatch_with_handles(app, req, env, ctx, Some(config_store_handle), None).await
+    let kv_handle = resolve_kv_handle(&env, DEFAULT_KV_BINDING, false)?;
+    dispatch_with_handles(app, req, env, ctx, Some(config_store_handle), kv_handle).await
 }
 
 /// Dispatch a request with a Cloudflare JSON config store injected.
@@ -118,6 +122,9 @@ pub async fn dispatch_with_config_handle(
 /// Reads `binding_name` from `env` (a `[vars]` string whose value is a JSON object),
 /// parses it into a `CloudflareConfigStore`, and injects the handle before dispatch
 /// when the binding is present and valid.
+///
+/// The KV namespace bound to [`DEFAULT_KV_BINDING`] is also resolved and injected
+/// (non-required: missing bindings are silently skipped).
 pub async fn dispatch_with_config(
     app: &App,
     req: CfRequest,
@@ -127,7 +134,8 @@ pub async fn dispatch_with_config(
 ) -> Result<CfResponse, WorkerError> {
     let config_store_handle = CloudflareConfigStore::try_new(&env, binding_name)
         .map(|store| ConfigStoreHandle::new(Arc::new(store)));
-    dispatch_with_handles(app, req, env, ctx, config_store_handle, None).await
+    let kv_handle = resolve_kv_handle(&env, DEFAULT_KV_BINDING, false)?;
+    dispatch_with_handles(app, req, env, ctx, config_store_handle, kv_handle).await
 }
 
 pub(crate) async fn dispatch_with_bindings(

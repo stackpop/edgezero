@@ -94,6 +94,11 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
     let manifest = manifest_loader.manifest();
     let logging = manifest.logging_or_default(edgezero_core::app::FASTLY_ADAPTER);
+    // Two-path resolution: `A::config_store()` is set at compile time by the
+    // `#[app]` macro and is the common case. The manifest fallback handles
+    // callers that implement `Hooks` manually without the macro — in that case
+    // `A::config_store()` returns `None` while `[stores.config]` in
+    // `edgezero.toml` may still be present.
     let config_name = A::config_store()
         .map(|cfg| {
             cfg.name_for_adapter(edgezero_core::app::FASTLY_ADAPTER)

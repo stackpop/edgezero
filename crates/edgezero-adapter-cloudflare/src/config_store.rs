@@ -31,9 +31,10 @@ pub struct CloudflareConfigStore {
 impl CloudflareConfigStore {
     /// Build a store by reading and parsing the JSON binding named `binding_name`.
     ///
-    /// Returns an empty store (graceful fallback) if the binding is absent or
-    /// the value is not valid JSON.
-    pub fn new(env: &Env, binding_name: &str) -> Self {
+    /// Returns an empty store (every key returns `None`) if the binding is absent or
+    /// its value is not valid JSON. Use [`Self::try_new`] when you need to distinguish
+    /// a missing/invalid binding from a valid but empty config.
+    pub fn new_or_empty(env: &Env, binding_name: &str) -> Self {
         Self::try_new(env, binding_name).unwrap_or_else(Self::empty)
     }
 

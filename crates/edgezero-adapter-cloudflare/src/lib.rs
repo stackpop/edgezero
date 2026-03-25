@@ -83,6 +83,11 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     let manifest = manifest_loader.manifest();
     let kv_binding = manifest.kv_store_name(edgezero_core::app::CLOUDFLARE_ADAPTER);
     let kv_required = manifest.stores.kv.is_some();
+    // Two-path resolution: `A::config_store()` is set at compile time by the
+    // `#[app]` macro and is the common case. The manifest fallback handles
+    // callers that implement `Hooks` manually without the macro — in that case
+    // `A::config_store()` returns `None` while `[stores.config]` in
+    // `edgezero.toml` may still be present.
     let config_binding = A::config_store()
         .map(|cfg| cfg.name_for_adapter(edgezero_core::app::CLOUDFLARE_ADAPTER))
         .or_else(|| {

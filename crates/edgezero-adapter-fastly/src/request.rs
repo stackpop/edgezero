@@ -75,18 +75,25 @@ pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyE
 ///
 /// This is the advanced/manual path. Prefer `dispatch_with_config` when you
 /// want the adapter to resolve the configured backend for you.
+///
+/// The KV store named [`DEFAULT_KV_STORE_NAME`] is also resolved and injected
+/// (non-required: unavailable stores are silently skipped).
 pub fn dispatch_with_config_handle(
     app: &App,
     req: FastlyRequest,
     config_store_handle: ConfigStoreHandle,
 ) -> Result<FastlyResponse, FastlyError> {
-    dispatch_with_handles(app, req, Some(config_store_handle), None)
+    let kv_handle = resolve_kv_handle(DEFAULT_KV_STORE_NAME, false)?;
+    dispatch_with_handles(app, req, Some(config_store_handle), kv_handle)
 }
 
 /// Dispatch a request with a Fastly Config Store injected into extensions.
 ///
 /// If the named store is not available, suppresses repeated warnings for
 /// recently seen store names and dispatches without it.
+///
+/// The KV store named [`DEFAULT_KV_STORE_NAME`] is also resolved and injected
+/// (non-required: unavailable stores are silently skipped).
 pub fn dispatch_with_config(
     app: &App,
     req: FastlyRequest,
@@ -99,7 +106,8 @@ pub fn dispatch_with_config(
             None
         }
     };
-    dispatch_with_handles(app, req, config_store_handle, None)
+    let kv_handle = resolve_kv_handle(DEFAULT_KV_STORE_NAME, false)?;
+    dispatch_with_handles(app, req, config_store_handle, kv_handle)
 }
 
 /// Dispatch a Fastly request with a custom KV store name.

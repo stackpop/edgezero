@@ -51,8 +51,8 @@ fn build_test_app() -> App {
         Ok(response)
     }
 
-    async fn config_presence(_ctx: RequestContext) -> Result<Response, EdgeError> {
-        let present = if _ctx.config_store().is_some() {
+    async fn config_presence(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let present = if ctx.config_store().is_some() {
             "yes"
         } else {
             "no"
