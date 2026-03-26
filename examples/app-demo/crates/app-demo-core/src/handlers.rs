@@ -12,6 +12,7 @@ use futures::{stream, StreamExt};
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
 const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
+const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
 
 #[derive(serde::Deserialize)]
 pub(crate) struct EchoParams {
@@ -218,7 +219,7 @@ pub(crate) async fn secrets_echo(
     }
 
     let value = store
-        .require_str(&params.name)
+        .require_str(SECRET_STORE_NAME, &params.name)
         .await
         .map_err(EdgeError::from)?;
     Ok(Text::new(value))
@@ -555,12 +556,13 @@ mod tests {
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
 
     fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
-        let store = InMemorySecretStore::new(
-            entries
-                .iter()
-                .map(|(k, v)| (*k, bytes::Bytes::from(v.to_string()))),
-        );
-        let handle = SecretHandle::new(std::sync::Arc::new(store));
+        let provider = InMemorySecretStore::new(entries.iter().map(|(k, v)| {
+            (
+                format!("{SECRET_STORE_NAME}/{k}"),
+                bytes::Bytes::from(v.to_string()),
+            )
+        }));
+        let handle = SecretHandle::new(std::sync::Arc::new(provider));
         let uri = format!("{}?{}", path, query);
         let mut request = request_builder()
             .method(Method::GET)

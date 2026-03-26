@@ -206,9 +206,10 @@ mod tests {
                     .secret_handle()
                     .expect("secret handle should be present");
                 let val = secrets
-                    .get_str("__EDGEZERO_SERVICE_TEST_SECRET__")
+                    .get_bytes("env", "__EDGEZERO_SERVICE_TEST_SECRET__")
                     .await
                     .unwrap()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default();
                 let response = response_builder()
                     .status(StatusCode::OK)

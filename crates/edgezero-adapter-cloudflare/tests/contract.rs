@@ -168,11 +168,11 @@ async fn dispatch_passes_request_body_to_handlers() {
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod secret_store_compile_check {
-    use edgezero_adapter_cloudflare::CloudflareSecretStore;
+    use edgezero_adapter_cloudflare::secret_store::CloudflareSecretStore;
     use edgezero_core::secret_store::SecretStore;
 
-    fn _assert_impl<T: SecretStore>() {}
+    fn _assert_provider_impl<T: SecretStore>() {}
     fn _check() {
-        _assert_impl::<CloudflareSecretStore>();
+        _assert_provider_impl::<CloudflareSecretStore>();
     }
 }

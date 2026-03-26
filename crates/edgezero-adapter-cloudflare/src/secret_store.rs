@@ -38,8 +38,8 @@ impl CloudflareSecretStore {
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl SecretStore for CloudflareSecretStore {
-    async fn get_bytes(&self, name: &str) -> Result<Option<Bytes>, SecretError> {
-        match self.env.secret(name) {
+    async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
+        match self.env.secret(key) {
             Ok(secret) => {
                 let value = secret.to_string();
                 Ok(Some(Bytes::from(value.into_bytes())))

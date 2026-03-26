@@ -3,15 +3,15 @@
 //! # Architecture
 //!
 //! ```text
-//!  Handler code         SecretHandle (get_str / require_str)
+//!  Handler code         SecretHandle (get_bytes / require_bytes / require_str)
 //!      │                       │
 //!      └── Secrets extractor ─►│  UTF-8 / bytes layer
 //!                              │
-//!                     Arc<dyn SecretStore>  (object-safe, Bytes)
+//!                  Arc<dyn SecretStore>
 //!                              │
 //!               ┌──────────────┼──────────────┐
 //!               ▼              ▼              ▼
-//!     EnvSecretStore  FastlySecretStore  CloudflareSecretStore
+//!         EnvSecretStore  FastlySecretStore  CloudflareSecretStore
 //! ```
 //!
 //! Secrets are read-only — this API only retrieves values,
@@ -68,56 +68,54 @@ impl From<SecretError> for EdgeError {
 }
 
 // ---------------------------------------------------------------------------
-// Trait
+// Maximum name length
 // ---------------------------------------------------------------------------
 
-/// Object-safe interface for secret store backends.
+/// Maximum length in bytes for any secret name or store name.
+pub const MAX_NAME_LEN: usize = 512;
+
+// ---------------------------------------------------------------------------
+// Multi-store provider trait
+// ---------------------------------------------------------------------------
+
+/// Access secrets across multiple named stores.
 ///
-/// All methods take `&self` — backends handle their own access model.
-///
-/// This trait is always called through [`SecretHandle`], which validates
-/// inputs before delegating here. Implementations may therefore assume:
-/// - Names are non-empty and within [`SecretHandle::MAX_NAME_LEN`]
-/// - Names contain no control characters
+/// Platforms with a single flat namespace (env vars, in-memory test stores)
+/// implement this by keying on `"{store_name}/{key}"`.
+/// Platforms with named stores (Fastly, Spin) open a store-specific handle
+/// per `store_name`.
 #[async_trait(?Send)]
 pub trait SecretStore: Send + Sync {
-    /// Retrieve a secret as raw bytes. Returns `Ok(None)` if not found.
-    async fn get_bytes(&self, name: &str) -> Result<Option<Bytes>, SecretError>;
+    /// Retrieve a secret from a named store. Returns `Ok(None)` if not found.
+    async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError>;
 }
 
 // ---------------------------------------------------------------------------
-// Test-only no-op store
+// No-op provider (test-utils)
 // ---------------------------------------------------------------------------
 
-/// A no-op [`SecretStore`] for tests that only need a [`SecretHandle`] to exist.
+/// A no-op [`SecretStore`] for tests that don't need secrets.
 ///
 /// All reads return `None`.
-///
-/// Available in `#[cfg(test)]` builds and via the `test-utils` feature:
-/// ```toml
-/// [dev-dependencies]
-/// edgezero-core = { path = "...", features = ["test-utils"] }
-/// ```
 #[cfg(any(test, feature = "test-utils"))]
 pub struct NoopSecretStore;
 
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait(?Send)]
 impl SecretStore for NoopSecretStore {
-    async fn get_bytes(&self, _name: &str) -> Result<Option<Bytes>, SecretError> {
+    async fn get_bytes(&self, _store_name: &str, _key: &str) -> Result<Option<Bytes>, SecretError> {
         Ok(None)
     }
 }
 
 // ---------------------------------------------------------------------------
-// In-memory store (test-utils)
+// In-memory provider (test-utils)
 // ---------------------------------------------------------------------------
 
-/// An in-memory [`SecretStore`] pre-populated with known secrets.
+/// An in-memory [`SecretStore`] keyed by `"{store_name}/{key}"`.
 ///
-/// Useful for contract tests and unit tests that need deterministic secret values.
-///
-/// Available in `#[cfg(test)]` builds and via the `test-utils` feature.
+/// Useful for contract tests and unit tests that need deterministic values
+/// across multiple named stores.
 #[cfg(any(test, feature = "test-utils"))]
 pub struct InMemorySecretStore {
     secrets: std::collections::HashMap<String, Bytes>,
@@ -125,6 +123,7 @@ pub struct InMemorySecretStore {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl InMemorySecretStore {
+    /// Build with entries of the form `("{store_name}/{key}", value)`.
     pub fn new(entries: impl IntoIterator<Item = (impl Into<String>, impl Into<Bytes>)>) -> Self {
         Self {
             secrets: entries
@@ -138,22 +137,22 @@ impl InMemorySecretStore {
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait(?Send)]
 impl SecretStore for InMemorySecretStore {
-    async fn get_bytes(&self, name: &str) -> Result<Option<Bytes>, SecretError> {
-        Ok(self.secrets.get(name).cloned())
+    async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
+        let compound = format!("{store_name}/{key}");
+        Ok(self.secrets.get(&compound).cloned())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Handle
+// Provider handle
 // ---------------------------------------------------------------------------
 
-/// A cloneable, ergonomic handle to a secret store.
+/// A cloneable, ergonomic handle to a multi-store [`SecretStore`].
 ///
-/// Provides typed helpers (`get_str`, `require_bytes`, `require_str`)
-/// while delegating to the object-safe `SecretStore` trait underneath.
+/// Validates both `store_name` and `key` before delegating to the provider.
 #[derive(Clone)]
 pub struct SecretHandle {
-    store: Arc<dyn SecretStore>,
+    provider: Arc<dyn SecretStore>,
 }
 
 impl fmt::Debug for SecretHandle {
@@ -163,72 +162,62 @@ impl fmt::Debug for SecretHandle {
 }
 
 impl SecretHandle {
-    /// Maximum secret name length in bytes.
-    pub const MAX_NAME_LEN: usize = 512;
-
-    /// Create a new handle wrapping a secret store implementation.
-    pub fn new(store: Arc<dyn SecretStore>) -> Self {
-        Self { store }
+    /// Create a new handle wrapping a multi-store provider.
+    pub fn new(provider: Arc<dyn SecretStore>) -> Self {
+        Self { provider }
     }
 
-    fn validate_name(name: &str) -> Result<(), SecretError> {
-        if name.is_empty() {
-            return Err(SecretError::Validation(
-                "secret name cannot be empty".to_string(),
-            ));
-        }
-        if name.len() > Self::MAX_NAME_LEN {
-            return Err(SecretError::Validation(format!(
-                "secret name length {} exceeds limit of {} bytes",
-                name.len(),
-                Self::MAX_NAME_LEN
-            )));
-        }
-        if name.chars().any(|c| c.is_control()) {
-            return Err(SecretError::Validation(
-                "secret name contains invalid control characters".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Retrieve a secret as raw bytes. Returns `Ok(None)` if not found.
-    pub async fn get_bytes(&self, name: &str) -> Result<Option<Bytes>, SecretError> {
-        Self::validate_name(name)?;
-        self.store.get_bytes(name).await
-    }
-
-    /// Retrieve a secret as a UTF-8 string. Returns `Ok(None)` if not found.
-    pub async fn get_str(&self, name: &str) -> Result<Option<String>, SecretError> {
-        let bytes = self.get_bytes(name).await?;
-        bytes
-            .map(|b| {
-                String::from_utf8(b.into()).map_err(|e| {
-                    SecretError::Internal(anyhow::anyhow!(
-                        "secret '{}' is not valid UTF-8: {e}",
-                        name
-                    ))
-                })
-            })
-            .transpose()
+    /// Retrieve a secret from a named store. Returns `Ok(None)` if not found.
+    pub async fn get_bytes(
+        &self,
+        store_name: &str,
+        key: &str,
+    ) -> Result<Option<Bytes>, SecretError> {
+        validate_name(store_name)?;
+        validate_name(key)?;
+        self.provider.get_bytes(store_name, key).await
     }
 
     /// Retrieve a secret as raw bytes. Returns `SecretError::NotFound` if absent.
-    pub async fn require_bytes(&self, name: &str) -> Result<Bytes, SecretError> {
-        self.get_bytes(name)
+    pub async fn require_bytes(&self, store_name: &str, key: &str) -> Result<Bytes, SecretError> {
+        self.get_bytes(store_name, key)
             .await?
             .ok_or_else(|| SecretError::NotFound {
-                name: name.to_string(),
+                name: format!("{store_name}/{key}"),
             })
     }
 
     /// Retrieve a secret as a UTF-8 string. Returns `SecretError::NotFound` if absent.
-    pub async fn require_str(&self, name: &str) -> Result<String, SecretError> {
-        let bytes = self.require_bytes(name).await?;
-        String::from_utf8(bytes.into()).map_err(|e| {
-            SecretError::Internal(anyhow::anyhow!("secret '{}' is not valid UTF-8: {e}", name))
-        })
+    pub async fn require_str(&self, store_name: &str, key: &str) -> Result<String, SecretError> {
+        let bytes = self.require_bytes(store_name, key).await?;
+        String::from_utf8(bytes.into())
+            .map_err(|e| SecretError::Internal(anyhow::anyhow!("secret is not valid UTF-8: {e}")))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared validation
+// ---------------------------------------------------------------------------
+
+pub(crate) fn validate_name(name: &str) -> Result<(), SecretError> {
+    if name.is_empty() {
+        return Err(SecretError::Validation(
+            "secret name cannot be empty".to_string(),
+        ));
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(SecretError::Validation(format!(
+            "secret name length {} exceeds limit of {} bytes",
+            name.len(),
+            MAX_NAME_LEN
+        )));
+    }
+    if name.chars().any(|c| c.is_control()) {
+        return Err(SecretError::Validation(
+            "secret name contains invalid control characters".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +226,8 @@ impl SecretHandle {
 
 /// Generate a suite of contract tests for any [`SecretStore`] implementation.
 ///
-/// The factory expression must produce a store pre-populated with:
+/// The factory expression must produce a provider pre-populated with these
+/// entries in the `"mystore"` store:
 /// - `"contract_key"` → `Bytes::from("contract_value")`
 /// - `"contract_key_2"` → `Bytes::from("another_value")`
 /// - `"missing_key"` must NOT be present.
@@ -255,27 +245,42 @@ macro_rules! secret_store_contract_tests {
 
             #[test]
             fn contract_get_existing_returns_bytes() {
-                let store = $factory;
+                let provider = $factory;
                 run(async {
-                    let result = store.get_bytes("contract_key").await.unwrap();
+                    let result = provider.get_bytes("mystore", "contract_key").await.unwrap();
                     assert_eq!(result, Some(Bytes::from("contract_value")));
                 });
             }
 
             #[test]
             fn contract_get_second_key_returns_bytes() {
-                let store = $factory;
+                let provider = $factory;
                 run(async {
-                    let result = store.get_bytes("contract_key_2").await.unwrap();
+                    let result = provider
+                        .get_bytes("mystore", "contract_key_2")
+                        .await
+                        .unwrap();
                     assert_eq!(result, Some(Bytes::from("another_value")));
                 });
             }
 
             #[test]
             fn contract_get_missing_returns_none() {
-                let store = $factory;
+                let provider = $factory;
                 run(async {
-                    let result = store.get_bytes("missing_key").await.unwrap();
+                    let result = provider.get_bytes("mystore", "missing_key").await.unwrap();
+                    assert!(result.is_none());
+                });
+            }
+
+            #[test]
+            fn contract_wrong_store_returns_none() {
+                let provider = $factory;
+                run(async {
+                    let result = provider
+                        .get_bytes("other_store", "contract_key")
+                        .await
+                        .unwrap();
                     assert!(result.is_none());
                 });
             }
@@ -294,122 +299,138 @@ mod tests {
     use bytes::Bytes;
     use futures::executor::block_on;
 
-    // Test-only in-memory store
-    use std::collections::HashMap;
-    struct SimpleStore(HashMap<String, Bytes>);
-    #[async_trait(?Send)]
-    impl SecretStore for SimpleStore {
-        async fn get_bytes(&self, name: &str) -> Result<Option<Bytes>, SecretError> {
-            Ok(self.0.get(name).cloned())
-        }
-    }
-
-    fn store_with(entries: &[(&str, &str)]) -> SecretHandle {
-        let map: HashMap<String, Bytes> = entries
-            .iter()
-            .map(|(k, v)| (k.to_string(), Bytes::from(v.to_string())))
-            .collect();
-        SecretHandle::new(std::sync::Arc::new(SimpleStore(map)))
-    }
-
-    fn store_with_bytes(entries: &[(&str, &[u8])]) -> SecretHandle {
-        let map: HashMap<String, Bytes> = entries
-            .iter()
-            .map(|(k, v)| (k.to_string(), Bytes::copy_from_slice(v)))
-            .collect();
-        SecretHandle::new(std::sync::Arc::new(SimpleStore(map)))
-    }
+    // -----------------------------------------------------------------------
+    // SecretStoreProvider tests
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_name_rejects_empty() {
+    fn provider_in_memory_returns_value_for_existing_key() {
+        let provider = InMemorySecretStore::new([("store/key", Bytes::from("hello"))]);
         block_on(async {
-            let h = store_with(&[]);
-            let err = h.get_bytes("").await.unwrap_err();
-            assert!(matches!(err, SecretError::Validation(_)));
+            let result = provider.get_bytes("store", "key").await.unwrap();
+            assert_eq!(result, Some(Bytes::from("hello")));
         });
     }
 
     #[test]
-    fn validate_name_rejects_control_chars() {
+    fn provider_in_memory_returns_none_for_missing_key() {
+        let provider = InMemorySecretStore::new([("store/key", Bytes::from("hello"))]);
         block_on(async {
-            let h = store_with(&[]);
-            let err = h.get_bytes("bad\x00name").await.unwrap_err();
-            assert!(matches!(err, SecretError::Validation(_)));
+            let result = provider.get_bytes("store", "missing").await.unwrap();
+            assert!(result.is_none());
         });
     }
 
     #[test]
-    fn validate_name_rejects_oversized() {
+    fn provider_in_memory_returns_none_for_wrong_store() {
+        let provider = InMemorySecretStore::new([("store/key", Bytes::from("hello"))]);
         block_on(async {
-            let h = store_with(&[]);
-            let name = "x".repeat(SecretHandle::MAX_NAME_LEN + 1);
-            let err = h.get_bytes(&name).await.unwrap_err();
-            assert!(matches!(err, SecretError::Validation(_)));
+            let result = provider.get_bytes("other", "key").await.unwrap();
+            assert!(result.is_none());
         });
     }
 
     #[test]
-    fn get_bytes_returns_none_for_missing() {
+    fn noop_provider_always_returns_none() {
+        let provider = NoopSecretStore;
         block_on(async {
-            let h = store_with(&[]);
-            assert_eq!(h.get_bytes("missing").await.unwrap(), None);
+            let result = provider.get_bytes("any_store", "any_key").await.unwrap();
+            assert!(result.is_none());
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // SecretProviderHandle tests
+    // -----------------------------------------------------------------------
+
+    fn provider_handle_with(entries: &[(&str, &str)]) -> SecretHandle {
+        let provider = InMemorySecretStore::new(
+            entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))),
+        );
+        SecretHandle::new(std::sync::Arc::new(provider))
+    }
+
+    #[test]
+    fn provider_handle_get_bytes_returns_value() {
+        let h = provider_handle_with(&[("signing-keys/current", "abc123")]);
+        block_on(async {
+            let result = h.get_bytes("signing-keys", "current").await.unwrap();
+            assert_eq!(result, Some(Bytes::from("abc123")));
         });
     }
 
     #[test]
-    fn get_bytes_returns_value_for_existing() {
+    fn provider_handle_get_bytes_returns_none_for_missing() {
+        let h = provider_handle_with(&[]);
         block_on(async {
-            let h = store_with(&[("api_key", "secret123")]);
-            assert_eq!(
-                h.get_bytes("api_key").await.unwrap(),
-                Some(Bytes::from("secret123"))
-            );
+            let result = h.get_bytes("store", "missing").await.unwrap();
+            assert!(result.is_none());
         });
     }
 
     #[test]
-    fn get_str_decodes_utf8() {
+    fn provider_handle_require_bytes_errors_for_missing() {
+        let h = provider_handle_with(&[]);
         block_on(async {
-            let h = store_with(&[("token", "bearer xyz")]);
-            assert_eq!(
-                h.get_str("token").await.unwrap(),
-                Some("bearer xyz".to_string())
-            );
-        });
-    }
-
-    #[test]
-    fn require_bytes_fails_for_missing() {
-        block_on(async {
-            let h = store_with(&[]);
-            let err = h.require_bytes("missing").await.unwrap_err();
+            let err = h.require_bytes("store", "missing").await.unwrap_err();
             assert!(matches!(err, SecretError::NotFound { .. }));
         });
     }
 
     #[test]
-    fn require_str_returns_value() {
+    fn provider_handle_require_str_returns_value() {
+        let h = provider_handle_with(&[("api-keys/prod", "secret_val")]);
         block_on(async {
-            let h = store_with(&[("key", "value")]);
-            assert_eq!(h.require_str("key").await.unwrap(), "value");
+            let val = h.require_str("api-keys", "prod").await.unwrap();
+            assert_eq!(val, "secret_val");
         });
     }
 
     #[test]
-    fn get_str_rejects_invalid_utf8() {
+    fn provider_handle_validates_empty_store_name() {
+        let h = provider_handle_with(&[]);
         block_on(async {
-            let h = store_with_bytes(&[("binary", &[0xff])]);
-            let err = h.get_str("binary").await.unwrap_err();
-            assert!(matches!(err, SecretError::Internal(_)));
+            let err = h.get_bytes("", "key").await.unwrap_err();
+            assert!(matches!(err, SecretError::Validation(_)));
         });
     }
 
     #[test]
-    fn require_str_rejects_invalid_utf8() {
+    fn provider_handle_validates_empty_key() {
+        let h = provider_handle_with(&[]);
         block_on(async {
-            let h = store_with_bytes(&[("binary", &[0xff])]);
-            let err = h.require_str("binary").await.unwrap_err();
-            assert!(matches!(err, SecretError::Internal(_)));
+            let err = h.get_bytes("store", "").await.unwrap_err();
+            assert!(matches!(err, SecretError::Validation(_)));
+        });
+    }
+
+    #[test]
+    fn provider_handle_validates_control_chars_in_store_name() {
+        let h = provider_handle_with(&[]);
+        block_on(async {
+            let err = h.get_bytes("bad\x00store", "key").await.unwrap_err();
+            assert!(matches!(err, SecretError::Validation(_)));
+        });
+    }
+
+    #[test]
+    fn provider_handle_validates_control_chars_in_key() {
+        let h = provider_handle_with(&[]);
+        block_on(async {
+            let err = h.get_bytes("store", "bad\x00key").await.unwrap_err();
+            assert!(matches!(err, SecretError::Validation(_)));
+        });
+    }
+
+    #[test]
+    fn provider_handle_validates_oversized_name() {
+        let h = provider_handle_with(&[]);
+        block_on(async {
+            let name = "x".repeat(MAX_NAME_LEN + 1);
+            let err = h.get_bytes(&name, "key").await.unwrap_err();
+            assert!(matches!(err, SecretError::Validation(_)));
         });
     }
 
@@ -430,10 +451,10 @@ mod tests {
         assert!(!err.message().contains("bad"));
     }
 
-    secret_store_contract_tests!(in_memory_contract, {
+    secret_store_contract_tests!(in_memory_provider_contract, {
         InMemorySecretStore::new([
-            ("contract_key", Bytes::from("contract_value")),
-            ("contract_key_2", Bytes::from("another_value")),
+            ("mystore/contract_key", Bytes::from("contract_value")),
+            ("mystore/contract_key_2", Bytes::from("another_value")),
         ])
     });
 }

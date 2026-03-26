@@ -247,7 +247,6 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let kv_init_requirement = kv_init_requirement(manifest);
     let kv_store_name = manifest.kv_store_name("axum").to_string();
     let kv_path = kv_store_path(&kv_store_name);
-    let secret_store_name = manifest.secret_store_name("axum").to_string();
     let has_secret_store = manifest.secret_store_enabled("axum");
 
     let level: LevelFilter = logging.level.into();
@@ -301,10 +300,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
             }
         };
         let secret_handle = if has_secret_store {
-            log::info!(
-                "Secret store '{}': reading from environment variables",
-                secret_store_name
-            );
+            log::info!("Secret store: reading from environment variables");
             Some(edgezero_core::secret_store::SecretHandle::new(
                 std::sync::Arc::new(crate::secret_store::EnvSecretStore::new()),
             ))
@@ -838,7 +834,10 @@ mod integration_tests {
 
     #[action]
     async fn secret_value_handler(Secrets(store): Secrets) -> Result<String, EdgeError> {
-        store.require_str("API_KEY").await.map_err(EdgeError::from)
+        store
+            .require_str("test-store", "API_KEY")
+            .await
+            .map_err(EdgeError::from)
     }
 
     // -----------------------------------------------------------------------
@@ -853,7 +852,8 @@ mod integration_tests {
         let router = RouterService::builder()
             .get("/secret", secret_value_handler)
             .build();
-        let store = InMemorySecretStore::new([("API_KEY", bytes::Bytes::from("s3cr3t"))]);
+        let store =
+            InMemorySecretStore::new([("test-store/API_KEY", bytes::Bytes::from("s3cr3t"))]);
         let handle = SecretHandle::new(Arc::new(store));
         let server = start_test_server_with_secret_handle(router, Some(handle)).await;
 

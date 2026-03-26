@@ -456,7 +456,7 @@ impl Kv {
 /// ```ignore
 /// #[action]
 /// pub async fn handler(Secrets(secrets): Secrets) -> Result<Response, EdgeError> {
-///     let key = secrets.require_str("API_KEY").await.map_err(EdgeError::from)?;
+///     let key = secrets.require_str("api-keys", "API_KEY").await.map_err(EdgeError::from)?;
 ///     // use key ...
 /// }
 /// ```

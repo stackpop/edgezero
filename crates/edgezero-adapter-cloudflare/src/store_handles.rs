@@ -28,7 +28,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
     use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
-    use edgezero_core::secret_store::{SecretError, SecretStore};
+    use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -70,15 +70,6 @@ mod tests {
         }
     }
 
-    struct DummySecretStore;
-
-    #[async_trait(?Send)]
-    impl SecretStore for DummySecretStore {
-        async fn get_bytes(&self, _name: &str) -> Result<Option<Bytes>, SecretError> {
-            Ok(None)
-        }
-    }
-
     #[test]
     fn insert_store_handles_adds_present_handles() {
         let mut request = request_builder()
@@ -86,7 +77,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
         let kv_handle = KvHandle::new(Arc::new(DummyKvStore));
-        let secret_handle = SecretHandle::new(Arc::new(DummySecretStore));
+        let secret_handle = SecretHandle::new(Arc::new(NoopSecretStore));
 
         insert_store_handles(
             &mut request,

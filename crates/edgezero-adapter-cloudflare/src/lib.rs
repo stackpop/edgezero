@@ -28,8 +28,6 @@ pub use request::{
 };
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use secret_store::CloudflareSecretStore;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {

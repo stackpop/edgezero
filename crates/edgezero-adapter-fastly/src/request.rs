@@ -96,10 +96,9 @@ fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Displa
 pub fn dispatch_with_secrets(
     app: &App,
     req: FastlyRequest,
-    secret_store_name: &str,
     secrets_required: bool,
 ) -> Result<FastlyResponse, FastlyError> {
-    let secret_handle = resolve_secret_handle(secret_store_name, secrets_required)?;
+    let secret_handle = resolve_secret_handle(secrets_required);
     dispatch_with_handles(app, req, None, secret_handle)
 }
 
@@ -109,11 +108,10 @@ pub fn dispatch_with_kv_and_secrets(
     req: FastlyRequest,
     kv_store_name: &str,
     kv_required: bool,
-    secret_store_name: &str,
     secrets_required: bool,
 ) -> Result<FastlyResponse, FastlyError> {
     let kv_handle = resolve_kv_handle(kv_store_name, kv_required)?;
-    let secret_handle = resolve_secret_handle(secret_store_name, secrets_required)?;
+    let secret_handle = resolve_secret_handle(secrets_required);
     dispatch_with_handles(app, req, kv_handle, secret_handle)
 }
 
@@ -157,19 +155,11 @@ fn resolve_kv_handle(
     }
 }
 
-fn resolve_secret_handle(
-    secret_store_name: &str,
-    secrets_required: bool,
-) -> Result<Option<SecretHandle>, FastlyError> {
+fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
     if !secrets_required {
-        return Ok(None);
+        return None;
     }
-
-    match crate::secret_store::FastlySecretStore::open(secret_store_name) {
-        Ok(store) => Ok(Some(SecretHandle::new(std::sync::Arc::new(store)))),
-        Err(e) => Err(FastlyError::msg(format!(
-            "secret store '{}' is explicitly configured but could not be opened: {}",
-            secret_store_name, e
-        ))),
-    }
+    Some(SecretHandle::new(std::sync::Arc::new(
+        crate::secret_store::FastlySecretStore,
+    )))
 }
