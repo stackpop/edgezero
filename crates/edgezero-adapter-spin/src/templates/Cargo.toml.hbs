@@ -1,0 +1,26 @@
+[package]
+name = "{{proj_spin}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+default = ["spin"]
+spin = ["edgezero-adapter-spin/spin"]
+
+# Base dependency provides types and context on all targets (including native
+# `cargo check`).  The wasm32-only section below adds the `spin` feature and
+# `spin-sdk` so that WASM-gated modules compile only on the real target.
+[dependencies]
+{{proj_core}} = { path = "../{{proj_core}}" }
+{{{dep_edgezero_adapter_spin}}}
+anyhow = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+{{{dep_edgezero_adapter_spin_wasm}}}
+{{{dep_edgezero_core_spin}}}
+spin-sdk = { workspace = true }

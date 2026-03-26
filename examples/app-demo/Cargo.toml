@@ -4,6 +4,7 @@ members = [
   "crates/app-demo-adapter-axum",
   "crates/app-demo-adapter-cloudflare",
   "crates/app-demo-adapter-fastly",
+  "crates/app-demo-adapter-spin",
 ]
 resolver = "2"
 
@@ -18,7 +19,9 @@ bytes = "1"
 edgezero-adapter-axum = { path = "../../crates/edgezero-adapter-axum" }
 edgezero-adapter-cloudflare = { path = "../../crates/edgezero-adapter-cloudflare" }
 edgezero-adapter-fastly = { path = "../../crates/edgezero-adapter-fastly" }
+edgezero-adapter-spin = { path = "../../crates/edgezero-adapter-spin" }
 edgezero-core = { path = "../../crates/edgezero-core" }
+spin-sdk = { version = "5.2", default-features = false }
 fastly = "0.11"
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 log = "0.4"

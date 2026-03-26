@@ -9,6 +9,10 @@ use crate::http::{
     response_builder, Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri,
 };
 
+/// Header name attached to proxied responses to identify which adapter
+/// forwarded the request (e.g. "fastly", "cloudflare", "spin").
+pub const PROXY_HEADER: &str = "x-edgezero-proxy";
+
 /// Outbound request description for a proxy operation.
 pub struct ProxyRequest {
     method: Method,

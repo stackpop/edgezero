@@ -1,0 +1,24 @@
+[package]
+name = "app-demo-adapter-spin"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+default = ["spin"]
+spin = ["edgezero-adapter-spin/spin"]
+
+[dependencies]
+app-demo-core = { path = "../app-demo-core" }
+edgezero-adapter-spin = { workspace = true }
+anyhow = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+edgezero-adapter-spin = { workspace = true, features = ["spin"] }
+edgezero-core = { workspace = true }
+spin-sdk = { workspace = true }

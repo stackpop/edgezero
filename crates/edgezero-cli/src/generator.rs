@@ -137,6 +137,10 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "tokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }".to_string(),
     );
     deps.insert("tracing".to_string(), "tracing = \"0.1\"".to_string());
+    deps.insert(
+        "spin-sdk".to_string(),
+        "spin-sdk = { version = \"5.2\", default-features = false }".to_string(),
+    );
     deps
 }
 
@@ -185,6 +189,10 @@ fn collect_adapter_data(
 
         let mut data_entries: Vec<(String, String)> = Vec::new();
         data_entries.push((format!("proj_{}", blueprint.id), crate_name.clone()));
+        data_entries.push((
+            format!("proj_{}_underscored", blueprint.id),
+            crate_name.replace('-', "_"),
+        ));
 
         for dep in blueprint.dependencies {
             let ResolvedDependency {
@@ -203,6 +211,14 @@ fn collect_adapter_data(
         }
 
         let crate_dir_rel = format!("crates/{}", crate_name);
+
+        // Compute the relative path from the adapter crate to the workspace
+        // target directory so templates can reference build artifacts.
+        let depth = crate_dir_rel.matches('/').count() + 1;
+        data_entries.push((
+            format!("target_dir_{}", blueprint.id),
+            format!("{}target", "../".repeat(depth)),
+        ));
 
         let build_cmd = blueprint
             .commands
@@ -552,11 +568,25 @@ mod tests {
         assert!(cargo_toml.contains("crates/demo-app-core"));
         assert!(cargo_toml.contains("crates/demo-app-adapter-cloudflare"));
         assert!(cargo_toml.contains("crates/demo-app-adapter-fastly"));
+        assert!(
+            cargo_toml.contains("crates/demo-app-adapter-spin"),
+            "workspace Cargo.toml should include spin adapter"
+        );
 
         let manifest =
             std::fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
         assert!(manifest.contains("[adapters.cloudflare.adapter]"));
         assert!(manifest.contains("[adapters.fastly.adapter]"));
+        assert!(
+            manifest.contains("[adapters.spin"),
+            "edgezero.toml should include spin adapter section"
+        );
+        assert!(
+            project_dir
+                .join("crates/demo-app-adapter-spin/spin.toml")
+                .exists(),
+            "spin.toml should be scaffolded"
+        );
 
         let gitignore =
             std::fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
