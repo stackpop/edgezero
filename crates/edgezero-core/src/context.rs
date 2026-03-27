@@ -86,10 +86,12 @@ impl RequestContext {
         self.request.extensions().get::<ProxyHandle>().cloned()
     }
 
+    /// Returns the KV store handle if one was configured for this request.
     pub fn kv_handle(&self) -> Option<KvHandle> {
         self.request.extensions().get::<KvHandle>().cloned()
     }
 
+    /// Returns the secret store handle if one was configured for this request.
     pub fn secret_handle(&self) -> Option<SecretHandle> {
         self.request.extensions().get::<SecretHandle>().cloned()
     }

@@ -23,52 +23,11 @@ pub(crate) fn insert_store_handles(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
-    use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
+    use edgezero_core::key_value_store::NoopKvStore;
     use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
     use std::sync::Arc;
-    use std::time::Duration;
-
-    struct DummyKvStore;
-
-    #[async_trait(?Send)]
-    impl KvStore for DummyKvStore {
-        async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
-            Ok(None)
-        }
-
-        async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
-            Ok(())
-        }
-
-        async fn put_bytes_with_ttl(
-            &self,
-            _key: &str,
-            _value: Bytes,
-            _ttl: Duration,
-        ) -> Result<(), KvError> {
-            Ok(())
-        }
-
-        async fn delete(&self, _key: &str) -> Result<(), KvError> {
-            Ok(())
-        }
-
-        async fn list_keys_page(
-            &self,
-            _prefix: &str,
-            _cursor: Option<&str>,
-            _limit: usize,
-        ) -> Result<KvPage, KvError> {
-            Ok(KvPage {
-                keys: Vec::new(),
-                cursor: None,
-            })
-        }
-    }
 
     #[test]
     fn insert_store_handles_adds_present_handles() {
@@ -76,7 +35,7 @@ mod tests {
             .uri("https://example.com")
             .body(Body::empty())
             .expect("request");
-        let kv_handle = KvHandle::new(Arc::new(DummyKvStore));
+        let kv_handle = KvHandle::new(Arc::new(NoopKvStore));
         let secret_handle = SecretHandle::new(Arc::new(NoopSecretStore));
 
         insert_store_handles(

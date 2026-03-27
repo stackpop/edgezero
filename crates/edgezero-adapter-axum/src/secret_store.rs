@@ -58,43 +58,10 @@ impl SecretStore for EnvSecretStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{env_guard, EnvOverride};
     use bytes::Bytes;
+    #[cfg(unix)]
     use std::ffi::OsString;
-    use std::sync::OnceLock;
-
-    fn env_guard() -> &'static tokio::sync::Mutex<()> {
-        static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
-    }
-
-    struct EnvOverride {
-        key: &'static str,
-        original: Option<OsString>,
-    }
-
-    impl EnvOverride {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let original = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, original }
-        }
-
-        fn clear(key: &'static str) -> Self {
-            let original = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvOverride {
-        fn drop(&mut self) {
-            if let Some(ref original) = self.original {
-                std::env::set_var(self.key, original);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn get_bytes_returns_none_when_var_not_set() {

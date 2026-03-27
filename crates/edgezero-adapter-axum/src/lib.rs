@@ -20,6 +20,9 @@ mod service;
 #[cfg(feature = "cli")]
 pub mod cli;
 
+#[cfg(test)]
+pub mod test_utils;
+
 #[cfg(feature = "axum")]
 pub use context::AxumRequestContext;
 #[cfg(feature = "axum")]

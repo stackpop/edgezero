@@ -466,6 +466,9 @@ pub struct Secrets(pub crate::secret_store::SecretHandle);
 #[async_trait(?Send)]
 impl FromRequest for Secrets {
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        // ctx.secret_handle() returns a handle object, not secret bytes.
+        // The error message below contains only store configuration info — no secret values
+        // are included, so this is safe from a cleartext-logging perspective.
         ctx.secret_handle().map(Secrets).ok_or_else(|| {
             EdgeError::internal(anyhow::anyhow!(
                 "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"

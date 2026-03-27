@@ -180,10 +180,12 @@ async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
 ) -> anyhow::Result<()> {
-    // No KV store is attached here — this path is used by `AxumDevServer::run()`
-    // which is the manifest-unaware embedding API. Callers that need KV should
-    // use `run_app()` (manifest-driven) or attach a `KvHandle` directly via
-    // `EdgeZeroAxumService::with_kv_handle`.
+    // No KV store or secret store is attached here — this path is used by
+    // `AxumDevServer::run()`, which is the manifest-unaware embedding API.
+    // Callers that need KV should use `run_app()` (manifest-driven) or attach
+    // a `KvHandle` directly via `EdgeZeroAxumService::with_kv_handle`.
+    // Callers that need secrets should use `run_app()` or attach a
+    // `SecretHandle` directly via `EdgeZeroAxumService::with_secret_handle`.
     serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, None).await
 }
 

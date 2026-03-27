@@ -102,6 +102,8 @@ pub async fn dispatch_with_secrets(
 }
 
 /// Dispatch a Cloudflare Worker request with both KV and secret stores attached.
+///
+/// Note: Cloudflare secrets have no namespace concept, so no secret binding name is needed.
 pub async fn dispatch_with_kv_and_secrets(
     app: &App,
     req: CfRequest,
@@ -109,7 +111,6 @@ pub async fn dispatch_with_kv_and_secrets(
     ctx: Context,
     kv_binding: &str,
     kv_required: bool,
-    _secret_binding: &str, // unused: CF secrets have no namespace concept
     secrets_required: bool,
 ) -> Result<CfResponse, WorkerError> {
     let kv_handle = resolve_kv_handle(&env, kv_binding, kv_required)?;
@@ -117,7 +118,7 @@ pub async fn dispatch_with_kv_and_secrets(
     dispatch_with_handles(app, req, env, ctx, kv_handle, secret_handle).await
 }
 
-async fn dispatch_with_handles(
+pub(crate) async fn dispatch_with_handles(
     app: &App,
     req: CfRequest,
     env: Env,
@@ -143,7 +144,7 @@ async fn dispatch_core_request(
     from_core_response(response).map_err(edge_error_to_worker)
 }
 
-fn resolve_kv_handle(
+pub(crate) fn resolve_kv_handle(
     env: &Env,
     kv_binding: &str,
     kv_required: bool,
@@ -163,7 +164,7 @@ fn resolve_kv_handle(
     }
 }
 
-fn resolve_secret_handle(env: &Env, secrets_required: bool) -> Option<SecretHandle> {
+pub(crate) fn resolve_secret_handle(env: &Env, secrets_required: bool) -> Option<SecretHandle> {
     if !secrets_required {
         return None;
     }

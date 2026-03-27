@@ -65,6 +65,11 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
+/// Entry point for a Cloudflare Workers application.
+///
+/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
+/// Callers previously using `run_app_with_manifest` can rename to `run_app` —
+/// the signatures are identical.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub async fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
@@ -77,26 +82,11 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     let manifest = manifest_loader.manifest();
     let kv_binding = manifest.kv_store_name("cloudflare");
     let kv_required = manifest.stores.kv.is_some();
-    let secret_binding = manifest.secret_store_name("cloudflare");
     let secrets_required = manifest.secret_store_enabled("cloudflare");
     let app = A::build_app();
-    if secrets_required && kv_required {
-        dispatch_with_kv_and_secrets(
-            &app,
-            req,
-            env,
-            ctx,
-            kv_binding,
-            kv_required,
-            secret_binding,
-            secrets_required,
-        )
-        .await
-    } else if secrets_required {
-        dispatch_with_secrets(&app, req, env, ctx, secrets_required).await
-    } else {
-        dispatch_with_kv(&app, req, env, ctx, kv_binding, kv_required).await
-    }
+    let kv_handle = crate::request::resolve_kv_handle(&env, kv_binding, kv_required)?;
+    let secret_handle = crate::request::resolve_secret_handle(&env, secrets_required);
+    crate::request::dispatch_with_handles(&app, req, env, ctx, kv_handle, secret_handle).await
 }
 
 /// Deprecated: use [`run_app`] which now takes `manifest_src` directly.

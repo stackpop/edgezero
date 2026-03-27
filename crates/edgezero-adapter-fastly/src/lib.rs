@@ -82,6 +82,9 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
+/// Entry point for a Fastly Compute application.
+///
+/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
 #[cfg(feature = "fastly")]
 pub fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
@@ -110,13 +113,9 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    if secrets_required && kv_required {
-        dispatch_with_kv_and_secrets(&app, req, kv_store_name, kv_required, secrets_required)
-    } else if secrets_required {
-        dispatch_with_secrets(&app, req, secrets_required)
-    } else {
-        dispatch_with_kv(&app, req, kv_store_name, kv_required)
-    }
+    let kv_handle = crate::request::resolve_kv_handle(kv_store_name, kv_required)?;
+    let secret_handle = crate::request::resolve_secret_handle(secrets_required);
+    crate::request::dispatch_with_handles(&app, req, kv_handle, secret_handle)
 }
 
 #[cfg(all(test, feature = "fastly"))]

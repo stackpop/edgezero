@@ -115,7 +115,7 @@ pub fn dispatch_with_kv_and_secrets(
     dispatch_with_handles(app, req, kv_handle, secret_handle)
 }
 
-fn dispatch_with_handles(
+pub(crate) fn dispatch_with_handles(
     app: &App,
     req: FastlyRequest,
     kv_handle: Option<KvHandle>,
@@ -136,7 +136,7 @@ fn dispatch_core_request(
     from_core_response(response).map_err(map_edge_error)
 }
 
-fn resolve_kv_handle(
+pub(crate) fn resolve_kv_handle(
     kv_store_name: &str,
     kv_required: bool,
 ) -> Result<Option<KvHandle>, FastlyError> {
@@ -155,7 +155,7 @@ fn resolve_kv_handle(
     }
 }
 
-fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
+pub(crate) fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
     if !secrets_required {
         return None;
     }
