@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -139,10 +140,12 @@ fn deploy(_extra_args: &[String]) -> Result<(), String> {
     Err("Axum adapter does not define a deploy command. Extend your workspace manifest with one if needed.".into())
 }
 
+#[derive(Debug)]
 struct AxumProject {
     crate_dir: PathBuf,
     cargo_manifest: PathBuf,
     crate_name: String,
+    host: IpAddr,
     port: u16,
 }
 
@@ -155,8 +158,8 @@ fn locate_project() -> Result<AxumProject, String> {
 fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
     let display = project.crate_dir.display();
     println!(
-        "[edgezero] Axum {subcommand} ({}) in {} (port: {})",
-        project.crate_name, display, project.port
+        "[edgezero] Axum {subcommand} ({}) in {} ({}:{})",
+        project.crate_name, display, project.host, project.port
     );
     let mut command = Command::new("cargo");
     command.arg(subcommand);
@@ -169,6 +172,8 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     );
     command.args(extra_args);
     command.current_dir(&project.crate_dir);
+    command.env("EDGEZERO_HOST", project.host.to_string());
+    command.env("EDGEZERO_PORT", project.port.to_string());
     let status = command
         .status()
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
@@ -255,6 +260,16 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
             })
         });
 
+    let host: IpAddr = match adapter.get("host").and_then(Value::as_str) {
+        Some(value) => value.parse().map_err(|_| {
+            format!(
+                "adapter.host in {} must be a valid IP address",
+                manifest.display()
+            )
+        })?,
+        None => [127, 0, 0, 1].into(),
+    };
+
     let port = match adapter.get("port").and_then(Value::as_integer) {
         Some(value) => {
             if !(1..=u16::MAX as i64).contains(&value) {
@@ -272,6 +287,7 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
         crate_dir,
         cargo_manifest,
         crate_name,
+        host,
         port,
     })
 }
@@ -530,6 +546,64 @@ mod tests {
 
         let project = read_axum_project(&root.join("axum.toml")).expect("project");
         assert_eq!(project.port, 1);
+    }
+
+    #[test]
+    fn read_axum_project_defaults_host_to_localhost() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        assert_eq!(project.host, IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[test]
+    fn read_axum_project_uses_custom_host() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        assert_eq!(project.host, IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn read_axum_project_rejects_invalid_host() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"not-an-ip\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let result = read_axum_project(&root.join("axum.toml"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("valid IP address"));
     }
 
     #[test]

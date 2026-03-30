@@ -292,17 +292,24 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
 
     SimpleLogger::new().with_level(level).init().ok();
 
+    let addr = resolve_addr(manifest);
     let app = A::build_app();
     let router = app.router().clone();
+
+    println!(
+        "[edgezero] starting axum server on http://{}:{}",
+        addr.ip(),
+        addr.port()
+    );
+
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
 
     runtime.block_on(async move {
-        let config = AxumDevServerConfig::default();
-        let listener = StdTcpListener::bind(config.addr)
-            .with_context(|| format!("failed to bind dev server to {}", config.addr))?;
+        let listener = StdTcpListener::bind(addr)
+            .with_context(|| format!("failed to bind dev server to {}", addr))?;
         listener
             .set_nonblocking(true)
             .context("failed to set listener to non-blocking")?;
@@ -357,8 +364,31 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
             kv: kv_handle,
             secrets: secret,
         };
-        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
+        serve_with_stores(router, listener, true, stores).await
     })
+}
+
+/// Resolve the bind address from environment variables and manifest config.
+///
+/// Precedence (highest wins):
+/// 1. `EDGEZERO_HOST` / `EDGEZERO_PORT` environment variables
+/// 2. `[adapters.axum.adapter]` host/port in the manifest
+/// 3. Default: `127.0.0.1:8787`
+pub(crate) fn resolve_addr(manifest: &edgezero_core::manifest::Manifest) -> SocketAddr {
+    let env_host = std::env::var("EDGEZERO_HOST").ok();
+    let env_port = std::env::var("EDGEZERO_PORT").ok();
+    resolve_addr_from_parts(manifest, env_host.as_deref(), env_port.as_deref())
+}
+
+fn resolve_addr_from_parts(
+    manifest: &edgezero_core::manifest::Manifest,
+    env_host: Option<&str>,
+    env_port: Option<&str>,
+) -> SocketAddr {
+    let adapter = manifest.adapters.get("axum");
+    let config_host = adapter.and_then(|a| a.adapter.host.as_deref());
+    let config_port = adapter.and_then(|a| a.adapter.port);
+    edgezero_core::addr::resolve_bind_addr(env_host, env_port, config_host, config_port)
 }
 
 #[cfg(test)]
@@ -484,6 +514,49 @@ name = "EDGEZERO_KV"
             file_name.len() <= 64,
             "unexpected file name length: {file_name}"
         );
+    }
+
+    #[test]
+    fn resolve_addr_defaults_without_manifest_config() {
+        // Note: env var tests use resolve_addr_from_parts to avoid races.
+        let loader = ManifestLoader::load_from_str("");
+        let addr = resolve_addr_from_parts(loader.manifest(), None, None);
+        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
+    }
+
+    #[test]
+    fn resolve_addr_reads_manifest_host_and_port() {
+        let manifest = r#"
+[adapters.axum.adapter]
+host = "0.0.0.0"
+port = 3000
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let addr = resolve_addr_from_parts(loader.manifest(), None, None);
+        assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 3000)));
+    }
+
+    #[test]
+    fn resolve_addr_env_overrides_manifest() {
+        let manifest = r#"
+[adapters.axum.adapter]
+host = "127.0.0.1"
+port = 3000
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let addr = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), Some("4000"));
+        assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
+    }
+
+    #[test]
+    fn resolve_addr_partial_env_override() {
+        let manifest = r#"
+[adapters.axum.adapter]
+port = 5000
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let addr = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), None);
+        assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
     }
 }
 

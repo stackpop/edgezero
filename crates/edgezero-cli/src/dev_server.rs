@@ -25,7 +25,7 @@ pub fn run_dev() {
         Err(err) => eprintln!("[edgezero] dev manifest error: {err}"),
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+    let addr = resolve_dev_addr();
     println!(
         "[edgezero] dev: starting local server on http://{}:{}",
         addr.ip(),
@@ -81,6 +81,31 @@ async fn dev_root() -> Text<&'static str> {
 #[action]
 async fn dev_echo(Path(params): Path<EchoParams>) -> Text<String> {
     Text::new(format!("hello {}", params.name))
+}
+
+/// Resolve the dev server bind address from `EDGEZERO_HOST` / `EDGEZERO_PORT`
+/// environment variables, falling back to `127.0.0.1:8787`.
+fn resolve_dev_addr() -> SocketAddr {
+    let default_host: std::net::IpAddr = [127, 0, 0, 1].into();
+    let host = match std::env::var("EDGEZERO_HOST") {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "[edgezero] warning: EDGEZERO_HOST={v:?} is not a valid IP address, using default"
+            );
+            default_host
+        }),
+        Err(_) => default_host,
+    };
+    let port = match std::env::var("EDGEZERO_PORT") {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "[edgezero] warning: EDGEZERO_PORT={v:?} is not a valid port number, using default"
+            );
+            8787
+        }),
+        Err(_) => 8787,
+    };
+    SocketAddr::from((host, port))
 }
 
 fn try_run_manifest_axum() -> Result<bool, String> {
