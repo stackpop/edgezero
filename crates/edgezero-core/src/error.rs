@@ -19,7 +19,7 @@ pub enum EdgeError {
     MethodNotAllowed { method: Method, allowed: String },
     #[error("validation error: {message}")]
     Validation { message: String },
-    #[error("{message}")]
+    #[error("service unavailable: {message}")]
     ServiceUnavailable { message: String },
     #[error("internal error: {source}")]
     Internal {

@@ -194,7 +194,8 @@ fn resolve_kv_handle(
 }
 
 fn warn_missing_store_once(store_name: &str, detail: &str) {
-    let warned = warned_store_cache().get_or_init(|| Mutex::new(RecentStringSet::default()));
+    static WARNED_STORES: OnceLock<Mutex<RecentStringSet>> = OnceLock::new();
+    let warned = WARNED_STORES.get_or_init(|| Mutex::new(RecentStringSet::default()));
     let mut warned = warned
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -207,11 +208,6 @@ fn warn_missing_store_once(store_name: &str, detail: &str) {
     }
 }
 
-fn warned_store_cache() -> &'static OnceLock<Mutex<RecentStringSet>> {
-    static WARNED_STORES: OnceLock<Mutex<RecentStringSet>> = OnceLock::new();
-    &WARNED_STORES
-}
-
 #[derive(Default)]
 struct RecentStringSet {
     keys: HashSet<String>,
@@ -220,23 +216,15 @@ struct RecentStringSet {
 
 impl RecentStringSet {
     fn insert(&mut self, key: &str, limit: usize) -> bool {
-        if self.keys.contains(key) {
+        if !self.keys.insert(key.to_string()) {
             return false;
         }
-
-        if limit == 0 {
-            return true;
-        }
-
-        if self.order.len() >= limit {
+        self.order.push_back(key.to_string());
+        while limit > 0 && self.order.len() > limit {
             if let Some(oldest) = self.order.pop_front() {
                 self.keys.remove(&oldest);
             }
         }
-
-        let key = key.to_string();
-        self.keys.insert(key.clone());
-        self.order.push_back(key);
         true
     }
 }

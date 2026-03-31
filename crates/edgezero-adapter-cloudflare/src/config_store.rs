@@ -111,6 +111,10 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
         },
     };
 
+    // Cache the resolved value — including None for missing/invalid bindings.
+    // This is safe because Cloudflare string bindings are immutable within an
+    // isolate lifetime: the parsed result for a given binding name never changes,
+    // so caching a failed parse prevents redundant warnings on every request.
     config_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
