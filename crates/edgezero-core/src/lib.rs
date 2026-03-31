@@ -1,5 +1,6 @@
 //! Core primitives for building portable edge workloads across edge adapters.
 
+pub mod addr;
 pub mod app;
 pub mod body;
 pub mod compression;

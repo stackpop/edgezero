@@ -30,7 +30,7 @@ pub use config_store::AxumConfigStore;
 #[cfg(feature = "axum")]
 pub use context::AxumRequestContext;
 #[cfg(feature = "axum")]
-pub use dev_server::{resolve_addr, run_app, AxumDevServer, AxumDevServerConfig};
+pub use dev_server::{run_app, AxumDevServer, AxumDevServerConfig};
 #[cfg(feature = "axum")]
 pub use key_value_store::PersistentKvStore;
 #[cfg(feature = "axum")]
