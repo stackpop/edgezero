@@ -25,7 +25,13 @@ pub fn run_dev() {
         Err(err) => eprintln!("[edgezero] dev manifest error: {err}"),
     }
 
-    let addr = resolve_dev_addr();
+    let addr = match resolve_dev_addr() {
+        Ok(addr) => addr,
+        Err(err) => {
+            eprintln!("[edgezero] {err}");
+            return;
+        }
+    };
     println!(
         "[edgezero] dev: starting local server on http://{}:{}",
         addr.ip(),
@@ -85,7 +91,7 @@ async fn dev_echo(Path(params): Path<EchoParams>) -> Text<String> {
 
 /// Resolve the dev server bind address from `EDGEZERO_HOST` / `EDGEZERO_PORT`
 /// environment variables, falling back to `127.0.0.1:8787`.
-fn resolve_dev_addr() -> SocketAddr {
+fn resolve_dev_addr() -> Result<SocketAddr, String> {
     let env_host = std::env::var("EDGEZERO_HOST").ok();
     let env_port = std::env::var("EDGEZERO_PORT").ok();
     edgezero_core::addr::resolve_bind_addr(env_host.as_deref(), env_port.as_deref(), None, None)

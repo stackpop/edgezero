@@ -35,7 +35,10 @@ pub struct AxumDevServerConfig {
 impl Default for AxumDevServerConfig {
     fn default() -> Self {
         Self {
-            addr: SocketAddr::from(([127, 0, 0, 1], 8787)),
+            addr: SocketAddr::from((
+                edgezero_core::addr::DEFAULT_HOST,
+                edgezero_core::addr::DEFAULT_PORT,
+            )),
             enable_ctrl_c: true,
         }
     }
@@ -292,7 +295,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
 
     SimpleLogger::new().with_level(level).init().ok();
 
-    let addr = resolve_addr(manifest);
+    let addr = resolve_addr(manifest).map_err(|e| anyhow::anyhow!("{e}"))?;
     let app = A::build_app();
     let router = app.router().clone();
 
@@ -374,7 +377,9 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
 /// 1. `EDGEZERO_HOST` / `EDGEZERO_PORT` environment variables
 /// 2. `[adapters.axum.adapter]` host/port in the manifest
 /// 3. Default: `127.0.0.1:8787`
-pub(crate) fn resolve_addr(manifest: &edgezero_core::manifest::Manifest) -> SocketAddr {
+pub(crate) fn resolve_addr(
+    manifest: &edgezero_core::manifest::Manifest,
+) -> Result<SocketAddr, String> {
     let env_host = std::env::var("EDGEZERO_HOST").ok();
     let env_port = std::env::var("EDGEZERO_PORT").ok();
     resolve_addr_from_parts(manifest, env_host.as_deref(), env_port.as_deref())
@@ -384,7 +389,7 @@ fn resolve_addr_from_parts(
     manifest: &edgezero_core::manifest::Manifest,
     env_host: Option<&str>,
     env_port: Option<&str>,
-) -> SocketAddr {
+) -> Result<SocketAddr, String> {
     let adapter = manifest.adapters.get("axum");
     let config_host = adapter.and_then(|a| a.adapter.host.as_deref());
     let config_port = adapter.and_then(|a| a.adapter.port);
@@ -520,7 +525,7 @@ name = "EDGEZERO_KV"
     fn resolve_addr_defaults_without_manifest_config() {
         // Note: env var tests use resolve_addr_from_parts to avoid races.
         let loader = ManifestLoader::load_from_str("");
-        let addr = resolve_addr_from_parts(loader.manifest(), None, None);
+        let addr = resolve_addr_from_parts(loader.manifest(), None, None).unwrap();
         assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
     }
 
@@ -532,7 +537,7 @@ host = "0.0.0.0"
 port = 3000
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let addr = resolve_addr_from_parts(loader.manifest(), None, None);
+        let addr = resolve_addr_from_parts(loader.manifest(), None, None).unwrap();
         assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 3000)));
     }
 
@@ -544,7 +549,8 @@ host = "127.0.0.1"
 port = 3000
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let addr = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), Some("4000"));
+        let addr =
+            resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), Some("4000")).unwrap();
         assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
     }
 
@@ -555,7 +561,7 @@ port = 3000
 port = 5000
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let addr = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), None);
+        let addr = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), None).unwrap();
         assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
     }
 }

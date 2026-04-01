@@ -1,5 +1,5 @@
 use std::fs;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -145,8 +145,7 @@ struct AxumProject {
     crate_dir: PathBuf,
     cargo_manifest: PathBuf,
     crate_name: String,
-    host: IpAddr,
-    port: u16,
+    addr: SocketAddr,
 }
 
 fn locate_project() -> Result<AxumProject, String> {
@@ -158,8 +157,8 @@ fn locate_project() -> Result<AxumProject, String> {
 fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
     let display = project.crate_dir.display();
     println!(
-        "[edgezero] Axum {subcommand} ({}) in {} ({}:{})",
-        project.crate_name, display, project.host, project.port
+        "[edgezero] Axum {subcommand} ({}) in {} ({})",
+        project.crate_name, display, project.addr
     );
     let mut command = Command::new("cargo");
     command.arg(subcommand);
@@ -172,8 +171,8 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     );
     command.args(extra_args);
     command.current_dir(&project.crate_dir);
-    command.env("EDGEZERO_HOST", project.host.to_string());
-    command.env("EDGEZERO_PORT", project.port.to_string());
+    command.env("EDGEZERO_HOST", project.addr.ip().to_string());
+    command.env("EDGEZERO_PORT", project.addr.port().to_string());
     let status = command
         .status()
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
@@ -260,35 +259,25 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
             })
         });
 
-    let host: IpAddr = match adapter.get("host").and_then(Value::as_str) {
-        Some(value) => value.parse().map_err(|_| {
+    let config_host = adapter.get("host").and_then(Value::as_str);
+    let config_port = match adapter.get("port").and_then(Value::as_integer) {
+        Some(value) => Some(u16::try_from(value).map_err(|_| {
             format!(
-                "adapter.host in {} must be a valid IP address",
+                "adapter.port in {} must be between 1 and 65535",
                 manifest.display()
             )
-        })?,
-        None => [127, 0, 0, 1].into(),
+        })?),
+        None => None,
     };
 
-    let port = match adapter.get("port").and_then(Value::as_integer) {
-        Some(value) => {
-            if !(1..=u16::MAX as i64).contains(&value) {
-                return Err(format!(
-                    "adapter.port in {} must be between 1 and 65535",
-                    manifest.display()
-                ));
-            }
-            value as u16
-        }
-        None => 8787,
-    };
+    let addr = edgezero_core::addr::resolve_bind_addr(None, None, config_host, config_port)
+        .map_err(|e| format!("{e} (in {})", manifest.display()))?;
 
     Ok(AxumProject {
         crate_dir,
         cargo_manifest,
         crate_name,
-        host,
-        port,
+        addr,
     })
 }
 
@@ -317,7 +306,8 @@ mod tests {
         assert_eq!(project.crate_name, "demo");
         assert_eq!(project.crate_dir, root);
         assert_eq!(project.cargo_manifest, root.join("Cargo.toml"));
-        assert_eq!(project.port, 8787);
+        assert_eq!(project.addr.port(), edgezero_core::addr::DEFAULT_PORT);
+        assert_eq!(project.addr.ip(), edgezero_core::addr::DEFAULT_HOST);
     }
 
     #[test]
@@ -353,7 +343,7 @@ mod tests {
         .unwrap();
 
         let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.port, 4001);
+        assert_eq!(project.addr.port(), 4001);
     }
 
     #[test]
@@ -526,7 +516,7 @@ mod tests {
         .unwrap();
 
         let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.port, 65535);
+        assert_eq!(project.addr.port(), 65535);
     }
 
     #[test]
@@ -545,7 +535,7 @@ mod tests {
         .unwrap();
 
         let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.port, 1);
+        assert_eq!(project.addr.port(), 1);
     }
 
     #[test]
@@ -564,7 +554,7 @@ mod tests {
         .unwrap();
 
         let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.host, IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(project.addr.ip(), edgezero_core::addr::DEFAULT_HOST);
     }
 
     #[test]
@@ -583,7 +573,7 @@ mod tests {
         .unwrap();
 
         let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.host, IpAddr::from([0, 0, 0, 0]));
+        assert_eq!(project.addr.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
     }
 
     #[test]
