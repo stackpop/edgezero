@@ -16,14 +16,24 @@ pub fn find_manifest_upwards(start: &Path, manifest_name: &str) -> Option<PathBu
     None
 }
 
-/// Returns the nearest ancestor containing a `Cargo.toml`, defaulting to `dir` when none are found.
+/// Returns the workspace root for `dir` by walking upward and stopping at the
+/// first `Cargo.toml` that contains a `[workspace]` table.  If no workspace
+/// table is found, falls back to the highest ancestor containing a `Cargo.toml`,
+/// and finally to `dir` itself.
 pub fn find_workspace_root(dir: &Path) -> PathBuf {
     let mut current: Option<&Path> = Some(dir);
     let mut candidate: Option<PathBuf> = None;
 
     while let Some(path) = current {
-        if path.join("Cargo.toml").exists() {
+        let cargo = path.join("Cargo.toml");
+        if cargo.exists() {
             candidate = Some(path.to_path_buf());
+            if fs::read_to_string(&cargo)
+                .map(|s| s.contains("[workspace]"))
+                .unwrap_or(false)
+            {
+                break;
+            }
         }
         current = path.parent();
     }
@@ -97,6 +107,40 @@ mod tests {
         fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
 
         assert_eq!(find_workspace_root(&child), root);
+    }
+
+    #[test]
+    fn workspace_root_stops_at_workspace_table() {
+        let dir = tempdir().unwrap();
+        let outer = dir.path();
+
+        // Outer repo root with a Cargo.toml
+        fs::write(
+            outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"examples/*\"]",
+        )
+        .unwrap();
+
+        // Inner workspace (e.g. examples/app-demo)
+        let inner = outer.join("examples/app-demo");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(
+            inner.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]",
+        )
+        .unwrap();
+
+        // Crate inside the inner workspace
+        let crate_dir = inner.join("crates/my-adapter");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"my-adapter\"",
+        )
+        .unwrap();
+
+        // Should resolve to the inner workspace, not the outer repo root.
+        assert_eq!(find_workspace_root(&crate_dir), inner);
     }
 
     #[test]

@@ -26,9 +26,10 @@ impl ProxyClient for CloudflareProxyClient {
             .map_err(EdgeError::internal)?;
 
         let mut proxy_response = convert_response(&mut cf_response).await?;
-        proxy_response
-            .headers_mut()
-            .insert("x-edgezero-proxy", HeaderValue::from_static("cloudflare"));
+        proxy_response.headers_mut().insert(
+            edgezero_core::proxy::PROXY_HEADER,
+            HeaderValue::from_static("cloudflare"),
+        );
         Ok(proxy_response)
     }
 }

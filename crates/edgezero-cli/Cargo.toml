@@ -11,6 +11,7 @@ edgezero-adapter = { path = "../edgezero-adapter" }
 edgezero-adapter-axum = { workspace = true, features = ["cli", "axum"], optional = true }
 edgezero-adapter-cloudflare = { workspace = true, features = ["cli"], optional = true }
 edgezero-adapter-fastly = { workspace = true, features = ["cli"], optional = true }
+edgezero-adapter-spin = { workspace = true, features = ["cli"], optional = true }
 app-demo-core = { path = "../../examples/app-demo/crates/app-demo-core", package = "app-demo-core", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 futures = { workspace = true }
@@ -32,6 +33,7 @@ default = [
     "edgezero-adapter-axum",
     "edgezero-adapter-fastly",
     "edgezero-adapter-cloudflare",
+    "edgezero-adapter-spin",
 ]
 cli = ["dep:clap"]
 dev-example = ["dep:app-demo-core"]
