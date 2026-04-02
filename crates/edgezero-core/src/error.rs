@@ -213,6 +213,13 @@ mod tests {
     }
 
     #[test]
+    fn config_store_error_internal_maps_to_internal_server_error() {
+        let err = EdgeError::from(ConfigStoreError::internal(anyhow::anyhow!("boom")));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("boom"));
+    }
+
+    #[test]
     fn json_or_text_falls_back_on_serialization_error() {
         struct FailingSerialize;
 

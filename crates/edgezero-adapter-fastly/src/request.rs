@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -234,12 +234,12 @@ fn map_edge_error(err: EdgeError) -> FastlyError {
 }
 
 fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Display) {
-    static WARNED_STORES: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    let warned_stores = WARNED_STORES.get_or_init(|| Mutex::new(BTreeSet::new()));
+    static WARNED_STORES: OnceLock<Mutex<RecentStringSet>> = OnceLock::new();
+    let warned_stores = WARNED_STORES.get_or_init(|| Mutex::new(RecentStringSet::default()));
 
     match warned_stores.lock() {
         Ok(mut warned_stores) => {
-            if !warned_stores.insert(kv_store_name.to_string()) {
+            if !warned_stores.insert(kv_store_name, 64) {
                 return;
             }
             log::warn!("KV store '{}' not available: {}", kv_store_name, error);

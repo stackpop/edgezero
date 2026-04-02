@@ -54,7 +54,7 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
-const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
+const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly", "spin"];
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct Manifest {

@@ -165,9 +165,16 @@ macro_rules! config_store_contract_tests {
             }
 
             #[$test_attr]
-            fn contract_empty_key_returns_none() {
+            fn contract_empty_key_returns_none_or_invalid_key() {
                 let store = $factory;
-                assert_eq!(store.get("").expect("empty key miss"), None);
+                // Backends may either return Ok(None) or Err(InvalidKey) for an empty key.
+                // Fastly's Config Store SDK may reject empty keys rather than returning None.
+                match store.get("") {
+                    Ok(None) => {}
+                    Ok(Some(_)) => panic!("empty key should not return a value"),
+                    Err($crate::config_store::ConfigStoreError::InvalidKey { .. }) => {}
+                    Err(e) => panic!("unexpected error for empty key: {}", e),
+                }
             }
 
             #[$test_attr]

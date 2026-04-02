@@ -8,6 +8,8 @@ pub const AXUM_ADAPTER: &str = "axum";
 pub const CLOUDFLARE_ADAPTER: &str = "cloudflare";
 /// Canonical adapter name for the Fastly adapter.
 pub const FASTLY_ADAPTER: &str = "fastly";
+/// Canonical adapter name for the Spin adapter.
+pub const SPIN_ADAPTER: &str = "spin";
 
 /// Adapter-specific config-store override metadata generated from `[stores.config.adapters.*]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

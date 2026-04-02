@@ -18,5 +18,6 @@ pub mod responder;
 pub mod response;
 pub mod router;
 
+pub use config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
 pub use edgezero_macros::{action, app};
 pub use key_value_store::{KvError, KvHandle, KvPage, KvStore};

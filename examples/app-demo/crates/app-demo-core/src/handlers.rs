@@ -455,8 +455,15 @@ mod tests {
     }
 
     #[test]
-    fn config_get_returns_404_when_key_missing() {
+    fn config_get_returns_404_when_key_not_in_allowlist() {
         let ctx = context_with_config_key("missing.key", &[("other.key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_404_when_key_not_in_store() {
+        let ctx = context_with_config_key("greeting", &[("other_key", "value")]);
         let response = block_on(config_get(ctx)).expect("handler ok");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }

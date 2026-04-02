@@ -32,8 +32,11 @@ impl CloudflareConfigStore {
     /// Build a store by reading and parsing the JSON binding named `binding_name`.
     ///
     /// Returns an empty store (every key returns `None`) if the binding is absent or
-    /// its value is not valid JSON. Use [`Self::try_new`] when you need to distinguish
-    /// a missing/invalid binding from a valid but empty config.
+    /// its value is not valid JSON. Missing or invalid bindings are logged at `warn`
+    /// level (once per binding name per isolate lifetime) via the same path as
+    /// [`Self::try_new`], so misconfigured binding names will surface in logs.
+    /// Use [`Self::try_new`] when you need to distinguish a missing/invalid binding
+    /// from a valid but empty config at the call site.
     pub fn new_or_empty(env: &Env, binding_name: &str) -> Self {
         Self::try_new(env, binding_name).unwrap_or_else(Self::empty)
     }
