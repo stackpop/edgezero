@@ -15,6 +15,8 @@ mod proxy;
 mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod response;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub mod secret_store;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use config_store::CloudflareConfigStore;
@@ -26,7 +28,7 @@ pub use proxy::CloudflareProxyClient;
 #[allow(deprecated)]
 pub use request::{
     dispatch, dispatch_with_config, dispatch_with_config_handle, dispatch_with_kv,
-    into_core_request, DEFAULT_KV_BINDING,
+    dispatch_with_kv_and_secrets, dispatch_with_secrets, into_core_request, DEFAULT_KV_BINDING,
 };
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
@@ -71,6 +73,11 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
+/// Entry point for a Cloudflare Workers application.
+///
+/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
+/// Callers previously using `run_app_with_manifest` can rename to `run_app` —
+/// the signatures are identical.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub async fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
@@ -97,6 +104,7 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
                 .as_ref()
                 .map(|cfg| cfg.config_store_name(edgezero_core::app::CLOUDFLARE_ADAPTER))
         });
+    let secrets_required = manifest.secret_store_enabled("cloudflare");
     let app = A::build_app();
     crate::request::dispatch_with_bindings(
         &app,
@@ -106,6 +114,7 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
         config_binding,
         kv_binding,
         kv_required,
+        secrets_required,
     )
     .await
 }

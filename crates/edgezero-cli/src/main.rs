@@ -78,9 +78,42 @@ fn main() {
 }
 
 #[cfg(feature = "cli")]
+fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Option<String> {
+    let m = manifest.manifest();
+    if !m.secret_store_enabled(adapter_name) {
+        return None;
+    }
+
+    let binding_name = m.secret_store_name(adapter_name);
+    let message = match adapter_name {
+        "axum" => format!(
+            "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs (configured store name: '{binding_name}')"
+        ),
+        "cloudflare" => format!(
+            "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler (configured store name: '{binding_name}' is metadata only)"
+        ),
+        _ => format!(
+            "[edgezero] secret store '{binding_name}' enabled for {adapter_name} -- ensure it is provisioned on the target platform"
+        ),
+    };
+
+    Some(message)
+}
+
+#[cfg(feature = "cli")]
+fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
+    if let Some(message) = store_bindings_message(adapter_name, manifest) {
+        println!("{message}");
+    }
+}
+
+#[cfg(feature = "cli")]
 fn handle_build(adapter_name: &str, adapter_args: &[String]) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
+    if let Some(ref m) = manifest {
+        log_store_bindings(adapter_name, m);
+    }
     adapter::execute(
         adapter_name,
         adapter::Action::Build,
@@ -288,5 +321,55 @@ serve = "echo serve"
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
         handle_serve("fastly").expect("serve command runs");
+    }
+
+    #[test]
+    fn secret_store_name_is_readable_from_manifest() {
+        let manifest_with_secrets = r#"
+[app]
+name = "demo-app"
+entry = "crates/demo-core"
+
+[stores.secrets]
+name = "MY_SECRETS"
+
+[adapters.fastly.commands]
+build = "echo build"
+deploy = "echo deploy"
+serve = "echo serve"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest_with_secrets);
+        assert_eq!(loader.manifest().secret_store_name("fastly"), "MY_SECRETS");
+        assert!(loader.manifest().stores.secrets.is_some());
+    }
+
+    #[test]
+    fn store_bindings_message_is_adapter_specific() {
+        let loader = ManifestLoader::load_from_str(
+            r#"
+[stores.secrets]
+name = "MY_SECRETS"
+"#,
+        );
+
+        let axum = store_bindings_message("axum", &loader).expect("axum message");
+        assert!(axum.contains("environment variables"));
+
+        let cloudflare = store_bindings_message("cloudflare", &loader).expect("cloudflare message");
+        assert!(cloudflare.contains("wrangler"));
+
+        let fastly = store_bindings_message("fastly", &loader).expect("fastly message");
+        assert!(fastly.contains("secret store 'MY_SECRETS'"));
+    }
+
+    #[test]
+    fn store_bindings_message_respects_secret_store_enabled() {
+        let loader = ManifestLoader::load_from_str(
+            r#"
+[stores.secrets]
+enabled = false
+"#,
+        );
+        assert!(store_bindings_message("fastly", &loader).is_none());
     }
 }

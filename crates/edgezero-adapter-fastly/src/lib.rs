@@ -16,6 +16,8 @@ mod proxy;
 mod request;
 #[cfg(feature = "fastly")]
 mod response;
+#[cfg(feature = "fastly")]
+pub mod secret_store;
 
 #[cfg(feature = "fastly")]
 pub use config_store::FastlyConfigStore;
@@ -26,10 +28,12 @@ pub use proxy::FastlyProxyClient;
 #[allow(deprecated)]
 pub use request::{
     dispatch, dispatch_with_config, dispatch_with_config_handle, dispatch_with_kv,
-    into_core_request, DEFAULT_KV_STORE_NAME,
+    dispatch_with_kv_and_secrets, dispatch_with_secrets, into_core_request, DEFAULT_KV_STORE_NAME,
 };
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
+#[cfg(feature = "fastly")]
+pub use secret_store::FastlySecretStore;
 
 #[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
@@ -86,6 +90,9 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
+/// Entry point for a Fastly Compute application.
+///
+/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
 #[cfg(feature = "fastly")]
 pub fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
@@ -113,13 +120,16 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     let kv_name = manifest
         .kv_store_name(edgezero_core::app::FASTLY_ADAPTER)
         .to_string();
-    let kv_required = manifest.stores.kv.is_some();
+    let requirements = StoreRequirements {
+        kv_required: manifest.stores.kv.is_some(),
+        secrets_required: manifest.secret_store_enabled("fastly"),
+    };
     run_app_with_stores::<A>(
         logging.into(),
         req,
         config_name.as_deref(),
         &kv_name,
-        kv_required,
+        requirements,
     )
 }
 
@@ -135,7 +145,7 @@ pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
         req,
         config_store_name,
         DEFAULT_KV_STORE_NAME,
-        false,
+        StoreRequirements::default(),
     )
 }
 
@@ -145,7 +155,24 @@ pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     logging: FastlyLogging,
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
-    run_app_with_stores::<A>(logging, req, None, DEFAULT_KV_STORE_NAME, false)
+    run_app_with_stores::<A>(
+        logging,
+        req,
+        None,
+        DEFAULT_KV_STORE_NAME,
+        StoreRequirements::default(),
+    )
+}
+
+/// Whether each optional store is required to be present at startup.
+///
+/// Using a named struct instead of positional `bool` arguments prevents
+/// accidental parameter swaps between `kv_required` and `secrets_required`.
+#[cfg(feature = "fastly")]
+#[derive(Default)]
+struct StoreRequirements {
+    kv_required: bool,
+    secrets_required: bool,
 }
 
 #[cfg(feature = "fastly")]
@@ -154,7 +181,7 @@ fn run_app_with_stores<A: edgezero_core::app::Hooks>(
     req: fastly::Request,
     config_store_name: Option<&str>,
     kv_store_name: &str,
-    kv_required: bool,
+    requirements: StoreRequirements,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -167,7 +194,8 @@ fn run_app_with_stores<A: edgezero_core::app::Hooks>(
         req,
         config_store_name,
         kv_store_name,
-        kv_required,
+        requirements.kv_required,
+        requirements.secrets_required,
     )
 }
 

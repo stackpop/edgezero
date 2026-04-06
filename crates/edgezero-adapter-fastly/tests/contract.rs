@@ -181,3 +181,14 @@ fn dispatch_with_config_handle_injects_handle() {
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"hello from fastly test");
 }
+
+#[cfg(all(feature = "fastly", target_arch = "wasm32"))]
+mod secret_store_compile_check {
+    use edgezero_adapter_fastly::FastlySecretStore;
+    use edgezero_core::secret_store::SecretStore;
+
+    fn _assert_provider_impl<T: SecretStore>() {}
+    fn _check() {
+        _assert_provider_impl::<FastlySecretStore>();
+    }
+}

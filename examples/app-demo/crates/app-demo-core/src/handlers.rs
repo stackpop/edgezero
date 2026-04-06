@@ -3,7 +3,7 @@ use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::extractor::{Headers, Json, Kv, Path, ValidatedPath};
+use edgezero_core::extractor::{Headers, Json, Kv, Path, Query, Secrets, ValidatedPath};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
@@ -11,6 +11,9 @@ use futures::{stream, StreamExt};
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 const ALLOWED_CONFIG_KEYS: &[&str] = &["greeting", "feature.new_checkout", "service.timeout_ms"];
+const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
+const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
+const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
 
 #[derive(serde::Deserialize)]
 pub(crate) struct EchoParams {
@@ -225,6 +228,37 @@ pub(crate) async fn kv_note_delete(
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
         .map_err(EdgeError::internal)
+}
+
+// ---------------------------------------------------------------------------
+// Secrets demo handler — illustrates platform-neutral secret access.
+// WARNING: This handler returns the raw secret value in the response body.
+//          It exists solely for smoke-testing. Never do this in production.
+//          Only fixed smoke-test key names are accepted.
+// ---------------------------------------------------------------------------
+
+/// Echo the value of an allowlisted smoke-test secret from the configured store.
+///
+/// Usage: GET /secrets/echo?name=SMOKE_SECRET
+#[action]
+pub(crate) async fn secrets_echo(
+    Secrets(store): Secrets,
+    Query(params): Query<EchoParams>,
+) -> Result<Text<String>, EdgeError> {
+    match params.name.as_str() {
+        SMOKE_SECRET_NAME | SMOKE_SECRET_MISSING_NAME => {}
+        _ => {
+            return Err(EdgeError::bad_request(
+                "only smoke-test secret names are allowed",
+            ))
+        }
+    }
+
+    let value = store
+        .require_str(SECRET_STORE_NAME, &params.name)
+        .await
+        .map_err(EdgeError::from)?;
+    Ok(Text::new(value))
 }
 
 #[cfg(test)]
@@ -647,5 +681,71 @@ mod tests {
         };
         let resp = block_on(kv_note_delete(ctx2)).expect("response");
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    // -- Secrets handler tests ----------------------------------------------
+
+    use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+
+    fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
+        let provider = InMemorySecretStore::new(entries.iter().map(|(k, v)| {
+            (
+                format!("{SECRET_STORE_NAME}/{k}"),
+                bytes::Bytes::from(v.to_string()),
+            )
+        }));
+        let handle = SecretHandle::new(std::sync::Arc::new(provider));
+        let uri = format!("{}?{}", path, query);
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(uri.as_str())
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(handle);
+        RequestContext::new(request, PathParams::default())
+    }
+
+    #[test]
+    fn secrets_echo_returns_secret_value() {
+        let ctx = context_with_secrets(
+            "/secrets/echo",
+            "name=SMOKE_SECRET",
+            &[("SMOKE_SECRET", "my-secret-value")],
+        );
+        let response = block_on(secrets_echo(ctx))
+            .expect("handler ok")
+            .into_response();
+        let bytes = response.into_body().into_bytes();
+        assert_eq!(bytes.as_ref(), b"my-secret-value");
+    }
+
+    #[test]
+    fn secrets_echo_returns_sanitized_500_for_missing_allowed_secret() {
+        use edgezero_core::http::StatusCode;
+
+        let ctx = context_with_secrets("/secrets/echo", "name=SMOKE_SECRET_MISSING", &[]);
+        let response = block_on(secrets_echo(ctx))
+            .expect_err("should fail")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = String::from_utf8(response.into_body().into_bytes().to_vec()).expect("utf8");
+        assert!(body.contains("required secret is not configured"));
+        assert!(!body.contains("SMOKE_SECRET_MISSING"));
+    }
+
+    #[test]
+    fn secrets_echo_rejects_non_smoke_secret_names() {
+        use edgezero_core::http::StatusCode;
+
+        let ctx = context_with_secrets("/secrets/echo", "name=API_KEY", &[("API_KEY", "secret")]);
+        let response = block_on(secrets_echo(ctx))
+            .expect_err("should reject arbitrary secret names")
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(response.into_body().into_bytes().to_vec()).expect("utf8");
+        assert!(body.contains("only smoke-test secret names are allowed"));
+        assert!(!body.contains("API_KEY"));
     }
 }

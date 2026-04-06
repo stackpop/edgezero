@@ -137,6 +137,48 @@ Variables with a default `value` are injected when running CLI commands.
 
 Secrets must be present in the environment; missing secrets abort CLI commands with an error.
 
+These declarations are for CLI and deployment workflows. To expose a runtime
+secret store to request handlers, configure `[stores.secrets]`.
+
+## Runtime Secret Stores
+
+Use `[stores.secrets]` when your application reads secrets at request time via
+the `Secrets` extractor. This is separate from `[[environment.secrets]]`:
+
+- `[[environment.secrets]]` declares required environment variables for CLI commands
+- `[stores.secrets]` enables runtime secret lookup during request handling
+
+```toml
+[stores.secrets]
+name = "EDGEZERO_SECRETS"
+
+[stores.secrets.adapters.fastly]
+name = "MY_FASTLY_SECRETS"
+```
+
+### Global Fields
+
+| Field     | Required | Description                                                                                                 |
+| --------- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `enabled` | No       | Whether secrets are enabled for adapters without overrides (defaults to `true` when the section is present) |
+| `name`    | No       | Store or binding name (defaults to `EDGEZERO_SECRETS`)                                                      |
+
+### Per-Adapter Overrides
+
+| Field                        | Required | Description                                   |
+| ---------------------------- | -------- | --------------------------------------------- |
+| `adapters.<adapter>.enabled` | No       | Override whether that adapter exposes secrets |
+| `adapters.<adapter>.name`    | No       | Override the adapter-specific store name      |
+
+### Adapter Behavior
+
+- Axum reads secrets from process environment variables of the same name.
+- Fastly opens the configured secret store name from `fastly.toml`.
+- Cloudflare reads Worker Secrets individually; the configured `name` is metadata only.
+
+If `[stores.secrets]` is omitted, the `Secrets` extractor is not attached for
+that adapter.
+
 ## Stores Section
 
 Use `[stores.config]` for small read-only runtime configuration such as feature flags, JWKS metadata,
@@ -273,6 +315,9 @@ value = "https://api.example.com"
 
 [[environment.secrets]]
 name = "API_KEY"
+
+[stores.secrets]
+name = "EDGEZERO_SECRETS"
 
 [adapters.fastly.adapter]
 crate = "crates/my-app-adapter-fastly"

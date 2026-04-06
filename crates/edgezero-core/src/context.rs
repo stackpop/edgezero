@@ -5,6 +5,7 @@ use crate::http::Request;
 use crate::key_value_store::KvHandle;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
+use crate::secret_store::SecretHandle;
 use serde::de::DeserializeOwned;
 
 /// Request context exposed to handlers and middleware.
@@ -93,8 +94,14 @@ impl RequestContext {
             .cloned()
     }
 
+    /// Returns the KV store handle if one was configured for this request.
     pub fn kv_handle(&self) -> Option<KvHandle> {
         self.request.extensions().get::<KvHandle>().cloned()
+    }
+
+    /// Returns the secret store handle if one was configured for this request.
+    pub fn secret_handle(&self) -> Option<SecretHandle> {
+        self.request.extensions().get::<SecretHandle>().cloned()
     }
 }
 
@@ -398,5 +405,29 @@ mod tests {
     fn kv_handle_returns_none_when_absent() {
         let ctx = ctx("/test", Body::empty(), PathParams::default());
         assert!(ctx.kv_handle().is_none());
+    }
+
+    #[test]
+    fn secret_handle_is_retrieved_when_present() {
+        use crate::secret_store::{NoopSecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/secrets")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.secret_handle().is_some());
+    }
+
+    #[test]
+    fn secret_handle_returns_none_when_absent() {
+        let ctx = ctx("/test", Body::empty(), PathParams::default());
+        assert!(ctx.secret_handle().is_none());
     }
 }

@@ -244,3 +244,14 @@ async fn dispatch_with_config_handle_injects_handle() {
     let body = response.text().await.expect("text");
     assert_eq!(body, "hello from cf test");
 }
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+mod secret_store_compile_check {
+    use edgezero_adapter_cloudflare::secret_store::CloudflareSecretStore;
+    use edgezero_core::secret_store::SecretStore;
+
+    fn _assert_provider_impl<T: SecretStore>() {}
+    fn _check() {
+        _assert_provider_impl::<CloudflareSecretStore>();
+    }
+}

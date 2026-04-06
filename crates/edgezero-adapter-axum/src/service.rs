@@ -9,6 +9,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::StatusCode;
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::router::RouterService;
+use edgezero_core::secret_store::SecretHandle;
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
@@ -21,6 +22,7 @@ pub struct EdgeZeroAxumService {
     router: RouterService,
     config_store_handle: Option<ConfigStoreHandle>,
     kv_handle: Option<KvHandle>,
+    secret_handle: Option<SecretHandle>,
 }
 
 impl EdgeZeroAxumService {
@@ -29,6 +31,7 @@ impl EdgeZeroAxumService {
             router,
             config_store_handle: None,
             kv_handle: None,
+            secret_handle: None,
         }
     }
 
@@ -51,6 +54,16 @@ impl EdgeZeroAxumService {
         self.kv_handle = Some(handle);
         self
     }
+
+    /// Attach a shared secret store to this service.
+    ///
+    /// The handle is cloned into every request's extensions, making
+    /// the `Secrets` extractor available in handlers.
+    #[must_use]
+    pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
+        self.secret_handle = Some(handle);
+        self
+    }
 }
 
 impl Service<Request<AxumBody>> for EdgeZeroAxumService {
@@ -66,6 +79,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
         let router = self.router.clone();
         let config_store_handle = self.config_store_handle.clone();
         let kv_handle = self.kv_handle.clone();
+        let secret_handle = self.secret_handle.clone();
         Box::pin(async move {
             let mut core_request = match into_core_request(request).await {
                 Ok(req) => req,
@@ -83,6 +97,10 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 
             if let Some(handle) = kv_handle {
                 core_request.extensions_mut().insert(handle);
+            }
+
+            if let Some(secret_handle) = secret_handle {
+                core_request.extensions_mut().insert(secret_handle);
             }
 
             let core_response = task::block_in_place(move || {
@@ -225,6 +243,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"has_config=false");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_secret_handle_injects_into_request() {
+        use bytes::Bytes;
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let handle = SecretHandle::new(Arc::new(InMemorySecretStore::new([(
+            "env/__EDGEZERO_SERVICE_TEST_SECRET__",
+            Bytes::from("injected_value"),
+        )])));
+        let router = RouterService::builder()
+            .get("/check", |ctx: RequestContext| async move {
+                let secrets = ctx
+                    .secret_handle()
+                    .expect("secret handle should be present");
+                let val = secrets
+                    .get_bytes("env", "__EDGEZERO_SERVICE_TEST_SECRET__")
+                    .await
+                    .unwrap()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(val))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let mut service = EdgeZeroAxumService::new(router).with_secret_handle(handle);
+
+        let request = Request::builder()
+            .uri("/check")
+            .body(AxumBody::empty())
+            .unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"injected_value");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -50,7 +50,10 @@ fn map_lookup_error(err: fastly::config_store::LookupError) -> ConfigStoreError 
         | fastly::config_store::LookupError::KeyTooLong => {
             ConfigStoreError::invalid_key("invalid config key")
         }
-        _ => ConfigStoreError::unavailable(format!("Fastly config store lookup failed: {err}")),
+        _ => {
+            log::warn!("Fastly config store lookup failed: {err}");
+            ConfigStoreError::unavailable("config store temporarily unavailable")
+        }
     }
 }
 

@@ -15,10 +15,15 @@ mod request;
 #[cfg(feature = "axum")]
 mod response;
 #[cfg(feature = "axum")]
+pub mod secret_store;
+#[cfg(feature = "axum")]
 mod service;
 
 #[cfg(feature = "cli")]
 pub mod cli;
+
+#[cfg(test)]
+pub mod test_utils;
 
 #[cfg(feature = "axum")]
 pub use config_store::AxumConfigStore;
@@ -34,5 +39,7 @@ pub use proxy::AxumProxyClient;
 pub use request::into_core_request;
 #[cfg(feature = "axum")]
 pub use response::into_axum_response;
+#[cfg(feature = "axum")]
+pub use secret_store::EnvSecretStore;
 #[cfg(feature = "axum")]
 pub use service::EdgeZeroAxumService;

@@ -15,3 +15,4 @@ validator = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+edgezero-core = { path = "../../../../crates/edgezero-core", features = ["test-utils"] }

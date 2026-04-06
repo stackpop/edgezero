@@ -68,6 +68,11 @@ impl AppExt for edgezero_core::app::App {
 ///     edgezero_adapter_spin::run_app::<App>(req).await
 /// }
 /// ```
+///
+/// **Note:** Config store, KV store, and secret store support are not yet
+/// implemented for the Spin adapter. The `[stores.config]`, `[stores.kv]`,
+/// and `[stores.secrets]` manifest sections are intentionally rejected for
+/// the `spin` adapter. See the manifest validation error for details.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub async fn run_app<A: edgezero_core::app::Hooks>(
     req: spin_sdk::http::IncomingRequest,

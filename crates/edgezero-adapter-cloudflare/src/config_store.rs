@@ -18,6 +18,11 @@ use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use worker::Env;
 
 type ConfigMap = HashMap<String, String>;
+/// Maximum number of distinct binding names to remember in the parse cache.
+///
+/// A single Worker typically uses one or two config bindings; 64 is a generous
+/// ceiling that bounds isolate memory without any practical limit for real apps.
+/// When the cache is full, the oldest entry is evicted (LRU-style) to make room.
 const CONFIG_CACHE_LIMIT: usize = 64;
 
 /// Config store backed by a single Cloudflare JSON string binding.

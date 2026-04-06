@@ -9,8 +9,10 @@ use tower::{service_fn, Service};
 
 use edgezero_core::app::Hooks;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::manifest::ManifestLoader;
 use edgezero_core::router::RouterService;
+use edgezero_core::secret_store::SecretHandle;
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
@@ -39,11 +41,25 @@ impl Default for AxumDevServerConfig {
     }
 }
 
+/// Optional store handles attached to every request processed by the dev server.
+///
+/// Build with struct init and `..Default::default()` for the fields you do not need:
+///
+/// ```rust,ignore
+/// let stores = Stores { kv: Some(kv_handle), ..Default::default() };
+/// ```
+#[derive(Default)]
+struct Stores {
+    config_store: Option<ConfigStoreHandle>,
+    kv: Option<KvHandle>,
+    secrets: Option<SecretHandle>,
+}
+
 /// Blocking dev server runner used by the EdgeZero CLI.
 pub struct AxumDevServer {
     router: RouterService,
     config: AxumDevServerConfig,
-    config_store_handle: Option<ConfigStoreHandle>,
+    stores: Stores,
 }
 
 impl AxumDevServer {
@@ -51,7 +67,7 @@ impl AxumDevServer {
         Self {
             router,
             config: AxumDevServerConfig::default(),
-            config_store_handle: None,
+            stores: Stores::default(),
         }
     }
 
@@ -59,13 +75,33 @@ impl AxumDevServer {
         Self {
             router,
             config,
-            config_store_handle: None,
+            stores: Stores::default(),
         }
     }
 
     #[must_use]
     pub fn with_config_store(mut self, handle: ConfigStoreHandle) -> Self {
-        self.config_store_handle = Some(handle);
+        self.stores.config_store = Some(handle);
+        self
+    }
+
+    /// Attach a KV store to the dev server.
+    ///
+    /// The handle is shared across all requests, making the `Kv` extractor
+    /// available in handlers.
+    #[must_use]
+    pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
+        self.stores.kv = Some(handle);
+        self
+    }
+
+    /// Attach a secret store to the dev server.
+    ///
+    /// The handle is shared across all requests, making the `Secrets` extractor
+    /// available in handlers.
+    #[must_use]
+    pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
+        self.stores.secrets = Some(handle);
         self
     }
 
@@ -82,7 +118,7 @@ impl AxumDevServer {
         let AxumDevServer {
             router,
             config,
-            config_store_handle,
+            stores,
         } = self;
 
         // Allow binding to already-open listener if caller created one to surface errors early.
@@ -95,36 +131,17 @@ impl AxumDevServer {
         let listener = tokio::net::TcpListener::from_std(listener)
             .context("failed to adopt std listener into tokio")?;
 
-        serve_with_listener(
-            router,
-            listener,
-            config.enable_ctrl_c,
-            config_store_handle,
-            None,
-        )
-        .await
+        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
     }
 
     #[cfg(test)]
-    async fn run_with_listener(
-        self,
-        listener: tokio::net::TcpListener,
-        kv_path: &str,
-    ) -> anyhow::Result<()> {
+    async fn run_with_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
         let AxumDevServer {
             router,
             config,
-            config_store_handle,
+            stores,
         } = self;
-        let kv_handle = Some(kv_handle_from_path(Path::new(kv_path))?);
-        serve_with_listener(
-            router,
-            listener,
-            config.enable_ctrl_c,
-            config_store_handle,
-            kv_handle,
-        )
-        .await
+        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
     }
 }
 
@@ -212,20 +229,24 @@ fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<edgezero_core::key_valu
     Ok(edgezero_core::key_value_store::KvHandle::new(kv_store))
 }
 
-async fn serve_with_listener(
+async fn serve_with_stores(
     router: RouterService,
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
-    config_store_handle: Option<ConfigStoreHandle>,
-    kv_handle: Option<edgezero_core::key_value_store::KvHandle>,
+    stores: Stores,
 ) -> anyhow::Result<()> {
     let mut service = EdgeZeroAxumService::new(router);
-    if let Some(handle) = config_store_handle {
+    if let Some(handle) = stores.config_store {
         service = service.with_config_store_handle(handle);
     }
-    if let Some(kv_handle) = kv_handle {
-        service = service.with_kv_handle(kv_handle);
+    if let Some(handle) = stores.kv {
+        service = service.with_kv_handle(handle);
     }
+    if let Some(handle) = stores.secrets {
+        service = service.with_secret_handle(handle);
+    }
+
+    let service = service;
     let router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
         async move { svc.call(req).await }
@@ -260,6 +281,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         .kv_store_name(edgezero_core::app::AXUM_ADAPTER)
         .to_string();
     let kv_path = kv_store_path(&kv_store_name);
+    let has_secret_store = m.secret_store_enabled("axum");
 
     let level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
@@ -319,14 +341,20 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
             let store = AxumConfigStore::from_env(defaults);
             ConfigStoreHandle::new(std::sync::Arc::new(store))
         });
-        serve_with_listener(
-            router,
-            listener,
-            config.enable_ctrl_c,
-            config_store_handle,
-            kv_handle,
-        )
-        .await
+        let secret = if has_secret_store {
+            log::info!("Secret store: reading from environment variables");
+            Some(SecretHandle::new(std::sync::Arc::new(
+                crate::secret_store::EnvSecretStore::new(),
+            )))
+        } else {
+            None
+        };
+        let stores = Stores {
+            config_store: config_store_handle,
+            kv: kv_handle,
+            secrets: secret,
+        };
+        serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
     })
 }
 
@@ -459,8 +487,10 @@ name = "EDGEZERO_KV"
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use edgezero_core::action;
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
+    use edgezero_core::extractor::Secrets;
     use edgezero_core::router::RouterService;
     use std::time::{Duration, Instant};
 
@@ -479,15 +509,14 @@ mod integration_tests {
             addr,
             enable_ctrl_c: false,
         };
-        let server = AxumDevServer::with_config(router, config);
-
         // Use a unique temp directory for each test server
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let kv_path = temp_dir.path().join("kv.redb");
-        let kv_path_str = kv_path.to_str().expect("valid path").to_string();
+        let kv_handle = kv_handle_from_path(&kv_path).expect("create kv store");
+        let server = AxumDevServer::with_config(router, config).with_kv_handle(kv_handle);
 
         let handle = tokio::spawn(async move {
-            let _ = server.run_with_listener(listener, &kv_path_str).await;
+            let _ = server.run_with_listener(listener).await;
         });
 
         TestServer {
@@ -810,6 +839,125 @@ mod integration_tests {
         let url = format!("{}/load", server.base_url);
         let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
         assert_eq!(resp.text().await.unwrap(), "Alice:30");
+
+        server.handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret store helpers
+    // -----------------------------------------------------------------------
+
+    struct TestServerSecrets {
+        base_url: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn start_test_server_with_secret_handle(
+        router: RouterService,
+        secret_handle: Option<edgezero_core::secret_store::SecretHandle>,
+    ) -> TestServerSecrets {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind secrets test server");
+        let addr = listener.local_addr().expect("local addr");
+        let config = super::AxumDevServerConfig {
+            addr,
+            enable_ctrl_c: false,
+        };
+        let mut server = super::AxumDevServer::with_config(router, config);
+        if let Some(h) = secret_handle {
+            server = server.with_secret_handle(h);
+        }
+        let handle = tokio::spawn(async move {
+            let _ = server.run_with_listener(listener).await;
+        });
+        TestServerSecrets {
+            base_url: format!("http://{}", addr),
+            handle,
+        }
+    }
+
+    #[action]
+    async fn secret_value_handler(Secrets(store): Secrets) -> Result<String, EdgeError> {
+        store
+            .require_str("test-store", "API_KEY")
+            .await
+            .map_err(EdgeError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret store integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_present_returns_value() {
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
+        let store =
+            InMemorySecretStore::new([("test-store/API_KEY", bytes::Bytes::from("s3cr3t"))]);
+        let handle = SecretHandle::new(Arc::new(store));
+        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "s3cr3t");
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_missing_returns_500() {
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
+        let store = InMemorySecretStore::new(std::iter::empty::<(&str, bytes::Bytes)>());
+        let handle = SecretHandle::new(Arc::new(store));
+        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("API_KEY"));
+        assert!(body.contains("required secret is not configured"));
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_secret_store_configured_returns_500() {
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
+        let server = start_test_server_with_secret_handle(router, None).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains(
+            "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
+        ));
 
         server.handle.abort();
     }
