@@ -151,7 +151,7 @@ name = "app_config"
 "service.timeout_ms" = "1500"
 
 [stores.config.adapters.cloudflare]
-name = "APP_CONFIG"
+name = "app_config"
 ```
 
 | Field      | Required | Description                                                                                                       |

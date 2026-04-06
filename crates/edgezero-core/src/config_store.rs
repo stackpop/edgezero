@@ -13,13 +13,6 @@ use thiserror::Error;
 // Trait
 // ---------------------------------------------------------------------------
 
-/// Object-safe interface for read-only configuration store backends.
-///
-/// Implementations exist per adapter:
-/// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
-/// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
-/// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare env bindings
-///
 /// Errors returned by config-store backends.
 ///
 /// Missing keys are represented as `Ok(None)` from [`ConfigStore::get`].
@@ -62,6 +55,12 @@ impl ConfigStoreError {
     }
 }
 
+/// Object-safe interface for read-only configuration store backends.
+///
+/// Implementations exist per adapter:
+/// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
+/// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
+/// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare env bindings
 pub trait ConfigStore: Send + Sync {
     /// Retrieve a config value by key. Returns `None` if the key does not exist.
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;

@@ -114,7 +114,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install wasm-bindgen test runner
-        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked

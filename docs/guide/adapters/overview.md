@@ -41,6 +41,10 @@ Adapters surface a `dispatch` function that bridges from the provider event loop
 
 This helper is what demo entrypoints and adapters call when wiring their platform-specific main functions.
 
+## Config Store Resolution
+
+When wiring adapters, Fastly and Cloudflare check `Hooks::config_store()` first to allow custom overrides, and then fall back to the manifest. However, the Axum adapter resolves the config store exclusively from `edgezero.toml` defaults (`[stores.config.defaults]`) and currently ignores custom `Hooks::config_store()` implementations.
+
 ## Proxy Integration
 
 Adapters implement `edgezero_core::proxy::ProxyClient` so handlers can forward outbound requests. The client must:

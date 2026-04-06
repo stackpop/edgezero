@@ -193,19 +193,27 @@ fn resolve_kv_handle(
     }
 }
 
+fn warn_missing_once(
+    cache: &'static OnceLock<Mutex<RecentStringSet>>,
+    item_type: &str,
+    name: &str,
+    detail: &impl std::fmt::Display,
+) {
+    let set = cache.get_or_init(|| Mutex::new(RecentStringSet::default()));
+    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.insert(name, WARNED_STORE_CACHE_LIMIT) {
+        log::warn!("{} '{}' not available: {}", item_type, name, detail);
+    }
+}
+
 fn warn_missing_store_once(store_name: &str, detail: &str) {
     static WARNED_STORES: OnceLock<Mutex<RecentStringSet>> = OnceLock::new();
-    let warned = WARNED_STORES.get_or_init(|| Mutex::new(RecentStringSet::default()));
-    let mut warned = warned
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if warned.insert(store_name, WARNED_STORE_CACHE_LIMIT) {
-        log::warn!(
-            "configured Fastly config store '{}' is unavailable ({}); skipping config-store injection",
-            store_name,
-            detail
-        );
-    }
+    warn_missing_once(
+        &WARNED_STORES,
+        "configured Fastly config store",
+        store_name,
+        &format!("{}; skipping config-store injection", detail),
+    );
 }
 
 #[derive(Default)]
@@ -234,18 +242,6 @@ fn map_edge_error(err: EdgeError) -> FastlyError {
 }
 
 fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Display) {
-    static WARNED_STORES: OnceLock<Mutex<RecentStringSet>> = OnceLock::new();
-    let warned_stores = WARNED_STORES.get_or_init(|| Mutex::new(RecentStringSet::default()));
-
-    match warned_stores.lock() {
-        Ok(mut warned_stores) => {
-            if !warned_stores.insert(kv_store_name, 64) {
-                return;
-            }
-            log::warn!("KV store '{}' not available: {}", kv_store_name, error);
-        }
-        Err(_) => {
-            log::warn!("KV store '{}' not available: {}", kv_store_name, error);
-        }
-    }
+    static WARNED_KV_STORES: OnceLock<Mutex<RecentStringSet>> = OnceLock::new();
+    warn_missing_once(&WARNED_KV_STORES, "KV store", kv_store_name, error);
 }

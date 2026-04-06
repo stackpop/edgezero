@@ -54,7 +54,7 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
-const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly", "spin"];
+const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct Manifest {
@@ -1334,6 +1334,25 @@ name = "APP_CONFIG"
         assert!(
             result.is_err(),
             "unknown config store adapter key should fail validation"
+        );
+    }
+
+    #[test]
+    fn config_store_spin_adapter_key_fails_validation() {
+        let src = r#"
+[stores.config.adapters.spin]
+name = "SPIN_CONFIG"
+"#;
+        let manifest: Manifest = toml::from_str(src).expect("should parse");
+        let result = manifest.validate();
+        assert!(
+            result.is_err(),
+            "spin config store adapter key should fail validation because it is not implemented yet"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("spin"),
+            "error should name the unknown adapter: {err_msg}"
         );
     }
 

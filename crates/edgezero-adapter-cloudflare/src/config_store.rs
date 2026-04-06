@@ -121,7 +121,7 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
     config_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(binding_name, resolved, CONFIG_CACHE_LIMIT)
+        .get_or_insert(binding_name, resolved, CONFIG_CACHE_LIMIT)
 }
 
 fn config_cache() -> &'static Mutex<ConfigCache> {
@@ -140,7 +140,7 @@ impl ConfigCache {
         self.entries.get(key).cloned()
     }
 
-    fn insert(
+    fn get_or_insert(
         &mut self,
         key: &str,
         value: Option<Arc<ConfigMap>>,
