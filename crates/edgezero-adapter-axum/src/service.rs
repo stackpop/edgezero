@@ -98,7 +98,6 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{env_guard, EnvOverride};
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
@@ -163,14 +162,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_secret_handle_injects_into_request() {
-        use crate::secret_store::EnvSecretStore;
-        use edgezero_core::secret_store::SecretHandle;
+        use bytes::Bytes;
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
         use std::sync::Arc;
 
-        let _guard = env_guard().lock().await;
-        let _env = EnvOverride::set("__EDGEZERO_SERVICE_TEST_SECRET__", "injected_value");
-
-        let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
+        let handle = SecretHandle::new(Arc::new(InMemorySecretStore::new([(
+            "env/__EDGEZERO_SERVICE_TEST_SECRET__",
+            Bytes::from("injected_value"),
+        )])));
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {
                 let secrets = ctx
