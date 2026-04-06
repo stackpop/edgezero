@@ -180,10 +180,12 @@ async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
 ) -> anyhow::Result<()> {
-    // No KV store is attached here — this path is used by `AxumDevServer::run()`
-    // which is the manifest-unaware embedding API. Callers that need KV should
-    // use `run_app()` (manifest-driven) or attach a `KvHandle` directly via
-    // `EdgeZeroAxumService::with_kv_handle`.
+    // No KV store or secret store is attached here — this path is used by
+    // `AxumDevServer::run()`, which is the manifest-unaware embedding API.
+    // Callers that need KV should use `run_app()` (manifest-driven) or attach
+    // a `KvHandle` directly via `EdgeZeroAxumService::with_kv_handle`.
+    // Callers that need secrets should use `run_app()` or attach a
+    // `SecretHandle` directly via `EdgeZeroAxumService::with_secret_handle`.
     serve_with_listener_and_kv_path(router, listener, enable_ctrl_c, None).await
 }
 
@@ -196,18 +198,22 @@ async fn serve_with_listener_and_kv_path(
     let kv_handle = kv_path
         .map(|kv_path| kv_handle_from_path(Path::new(kv_path)))
         .transpose()?;
-    serve_with_listener_and_kv_handle(router, listener, enable_ctrl_c, kv_handle).await
+    serve_with_listener_and_stores(router, listener, enable_ctrl_c, kv_handle, None).await
 }
 
-async fn serve_with_listener_and_kv_handle(
+async fn serve_with_listener_and_stores(
     router: RouterService,
     listener: tokio::net::TcpListener,
     enable_ctrl_c: bool,
     kv_handle: Option<edgezero_core::key_value_store::KvHandle>,
+    secret_handle: Option<edgezero_core::secret_store::SecretHandle>,
 ) -> anyhow::Result<()> {
     let mut service = EdgeZeroAxumService::new(router);
     if let Some(kv_handle) = kv_handle {
         service = service.with_kv_handle(kv_handle);
+    }
+    if let Some(secret_handle) = secret_handle {
+        service = service.with_secret_handle(secret_handle);
     }
 
     let service = service;
@@ -243,6 +249,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let kv_init_requirement = kv_init_requirement(manifest);
     let kv_store_name = manifest.kv_store_name("axum").to_string();
     let kv_path = kv_store_path(&kv_store_name);
+    let has_secret_store = manifest.secret_store_enabled("axum");
 
     let level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
@@ -294,7 +301,22 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
                 }
             }
         };
-        serve_with_listener_and_kv_handle(router, listener, config.enable_ctrl_c, kv_handle).await
+        let secret_handle = if has_secret_store {
+            log::info!("Secret store: reading from environment variables");
+            Some(edgezero_core::secret_store::SecretHandle::new(
+                std::sync::Arc::new(crate::secret_store::EnvSecretStore::new()),
+            ))
+        } else {
+            None
+        };
+        serve_with_listener_and_stores(
+            router,
+            listener,
+            config.enable_ctrl_c,
+            kv_handle,
+            secret_handle,
+        )
+        .await
     })
 }
 
@@ -427,8 +449,10 @@ name = "EDGEZERO_KV"
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    use edgezero_core::action;
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
+    use edgezero_core::extractor::Secrets;
     use edgezero_core::router::RouterService;
     use std::time::{Duration, Instant};
 
@@ -778,6 +802,119 @@ mod integration_tests {
         let url = format!("{}/load", server.base_url);
         let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
         assert_eq!(resp.text().await.unwrap(), "Alice:30");
+
+        server.handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret store helpers
+    // -----------------------------------------------------------------------
+
+    struct TestServerSecrets {
+        base_url: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    async fn start_test_server_with_secret_handle(
+        router: RouterService,
+        secret_handle: Option<edgezero_core::secret_store::SecretHandle>,
+    ) -> TestServerSecrets {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind secrets test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            let _ =
+                super::serve_with_listener_and_stores(router, listener, false, None, secret_handle)
+                    .await;
+        });
+        TestServerSecrets {
+            base_url: format!("http://{}", addr),
+            handle,
+        }
+    }
+
+    #[action]
+    async fn secret_value_handler(Secrets(store): Secrets) -> Result<String, EdgeError> {
+        store
+            .require_str("test-store", "API_KEY")
+            .await
+            .map_err(EdgeError::from)
+    }
+
+    // -----------------------------------------------------------------------
+    // Secret store integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_present_returns_value() {
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
+        let store =
+            InMemorySecretStore::new([("test-store/API_KEY", bytes::Bytes::from("s3cr3t"))]);
+        let handle = SecretHandle::new(Arc::new(store));
+        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "s3cr3t");
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn secret_missing_returns_500() {
+        use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
+        let store = InMemorySecretStore::new(std::iter::empty::<(&str, bytes::Bytes)>());
+        let handle = SecretHandle::new(Arc::new(store));
+        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("API_KEY"));
+        assert!(body.contains("required secret is not configured"));
+
+        server.handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_secret_store_configured_returns_500() {
+        let router = RouterService::builder()
+            .get("/secret", secret_value_handler)
+            .build();
+        let server = start_test_server_with_secret_handle(router, None).await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/secret", server.base_url);
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains(
+            "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
+        ));
 
         server.handle.abort();
     }

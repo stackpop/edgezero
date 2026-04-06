@@ -36,6 +36,7 @@ walkdir = { workspace = true, optional = true }
 wasm-bindgen-test = "0.3"
 
 [dev-dependencies]
+edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
 web-sys = { version = "0.3", features = [
     "Window",
     "Response",

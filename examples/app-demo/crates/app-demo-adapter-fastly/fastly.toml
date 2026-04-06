@@ -16,10 +16,20 @@ service_id = ""
 key = "__init__"
 data = ""
 
+[local_server.secret_stores]
+
+[[local_server.secret_stores.EDGEZERO_SECRETS]]
+key = "SMOKE_SECRET"
+env = "SMOKE_SECRET"
+
 [setup]
 [setup.kv_stores]
 [setup.kv_stores.EDGEZERO_KV]
 description = "KV store for EdgeZero demo"
+
+[setup.secret_stores]
+[setup.secret_stores.EDGEZERO_SECRETS]
+description = "Secret store for EdgeZero demo"
 
 
 [scripts]

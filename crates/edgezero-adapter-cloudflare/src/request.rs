@@ -3,6 +3,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
+use crate::store_handles::insert_store_handles;
 use crate::CloudflareRequestContext;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
@@ -10,6 +11,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Method as CoreMethod, Request, Uri};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::secret_store::SecretHandle;
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
@@ -75,10 +77,80 @@ pub async fn dispatch_with_kv(
     kv_binding: &str,
     kv_required: bool,
 ) -> Result<CfResponse, WorkerError> {
-    // Try to open the KV binding from `env` before consuming it in `into_core_request`.
-    // We borrow `env` here; `into_core_request` takes ownership afterwards.
-    let kv_handle = match crate::key_value_store::CloudflareKvStore::from_env(&env, kv_binding) {
-        Ok(store) => Some(KvHandle::new(std::sync::Arc::new(store))),
+    let kv_handle = resolve_kv_handle(&env, kv_binding, kv_required)?;
+    dispatch_with_handles(app, req, env, ctx, kv_handle, None).await
+}
+
+/// Dispatch a Cloudflare Worker request with a secret store attached.
+///
+/// Dispatch a Cloudflare Worker request with a secret store attached (no KV store).
+///
+/// Use this when your application accesses secrets but does not need a KV store.
+/// For applications that need both, use [`dispatch_with_kv_and_secrets`] instead.
+///
+/// The store is only attached when `secrets_required` is `true`.
+/// Individual missing secrets surface as `SecretError::NotFound` at access time.
+pub async fn dispatch_with_secrets(
+    app: &App,
+    req: CfRequest,
+    env: Env,
+    ctx: Context,
+    secrets_required: bool,
+) -> Result<CfResponse, WorkerError> {
+    let secret_handle = resolve_secret_handle(&env, secrets_required);
+    dispatch_with_handles(app, req, env, ctx, None, secret_handle).await
+}
+
+/// Dispatch a Cloudflare Worker request with both KV and secret stores attached.
+///
+/// Note: Cloudflare secrets have no namespace concept, so no secret binding name is needed.
+pub async fn dispatch_with_kv_and_secrets(
+    app: &App,
+    req: CfRequest,
+    env: Env,
+    ctx: Context,
+    kv_binding: &str,
+    kv_required: bool,
+    secrets_required: bool,
+) -> Result<CfResponse, WorkerError> {
+    let kv_handle = resolve_kv_handle(&env, kv_binding, kv_required)?;
+    let secret_handle = resolve_secret_handle(&env, secrets_required);
+    dispatch_with_handles(app, req, env, ctx, kv_handle, secret_handle).await
+}
+
+pub(crate) async fn dispatch_with_handles(
+    app: &App,
+    req: CfRequest,
+    env: Env,
+    ctx: Context,
+    kv_handle: Option<KvHandle>,
+    secret_handle: Option<SecretHandle>,
+) -> Result<CfResponse, WorkerError> {
+    let core_request = into_core_request(req, env, ctx)
+        .await
+        .map_err(edge_error_to_worker)?;
+    dispatch_core_request(app, core_request, kv_handle, secret_handle).await
+}
+
+async fn dispatch_core_request(
+    app: &App,
+    mut core_request: Request,
+    kv_handle: Option<KvHandle>,
+    secret_handle: Option<SecretHandle>,
+) -> Result<CfResponse, WorkerError> {
+    insert_store_handles(&mut core_request, kv_handle, secret_handle);
+    let svc = app.router().clone();
+    let response = svc.oneshot(core_request).await;
+    from_core_response(response).map_err(edge_error_to_worker)
+}
+
+pub(crate) fn resolve_kv_handle(
+    env: &Env,
+    kv_binding: &str,
+    kv_required: bool,
+) -> Result<Option<KvHandle>, WorkerError> {
+    match crate::key_value_store::CloudflareKvStore::from_env(env, kv_binding) {
+        Ok(store) => Ok(Some(KvHandle::new(std::sync::Arc::new(store)))),
         Err(e) => {
             if kv_required {
                 return Err(WorkerError::RustError(format!(
@@ -87,21 +159,18 @@ pub async fn dispatch_with_kv(
                 )));
             }
             warn_missing_kv_binding_once(kv_binding, &e);
-            None
+            Ok(None)
         }
-    };
+    }
+}
 
-    let mut core_request = into_core_request(req, env, ctx)
-        .await
-        .map_err(edge_error_to_worker)?;
-
-    if let Some(handle) = kv_handle {
-        core_request.extensions_mut().insert(handle);
+pub(crate) fn resolve_secret_handle(env: &Env, secrets_required: bool) -> Option<SecretHandle> {
+    if !secrets_required {
+        return None;
     }
 
-    let svc = app.router().clone();
-    let response = svc.oneshot(core_request).await;
-    from_core_response(response).map_err(edge_error_to_worker)
+    let secret_store = crate::secret_store::CloudflareSecretStore::from_env(env.clone());
+    Some(SecretHandle::new(std::sync::Arc::new(secret_store)))
 }
 
 fn edge_error_to_worker(err: EdgeError) -> WorkerError {

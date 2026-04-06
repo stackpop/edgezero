@@ -13,13 +13,19 @@ mod proxy;
 mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 mod response;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+pub mod secret_store;
+mod store_handles;
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use context::CloudflareRequestContext;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use proxy::CloudflareProxyClient;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use request::{dispatch, dispatch_with_kv, into_core_request, DEFAULT_KV_BINDING};
+pub use request::{
+    dispatch, dispatch_with_kv, dispatch_with_kv_and_secrets, dispatch_with_secrets,
+    into_core_request, DEFAULT_KV_BINDING,
+};
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
@@ -59,6 +65,11 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
+/// Entry point for a Cloudflare Workers application.
+///
+/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
+/// Callers previously using `run_app_with_manifest` can rename to `run_app` —
+/// the signatures are identical.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub async fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
@@ -71,8 +82,11 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     let manifest = manifest_loader.manifest();
     let kv_binding = manifest.kv_store_name("cloudflare");
     let kv_required = manifest.stores.kv.is_some();
+    let secrets_required = manifest.secret_store_enabled("cloudflare");
     let app = A::build_app();
-    dispatch_with_kv(&app, req, env, ctx, kv_binding, kv_required).await
+    let kv_handle = crate::request::resolve_kv_handle(&env, kv_binding, kv_required)?;
+    let secret_handle = crate::request::resolve_secret_handle(&env, secrets_required);
+    crate::request::dispatch_with_handles(&app, req, env, ctx, kv_handle, secret_handle).await
 }
 
 /// Deprecated: use [`run_app`] which now takes `manifest_src` directly.

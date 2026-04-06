@@ -16,6 +16,12 @@ pub mod proxy;
 pub mod responder;
 pub mod response;
 pub mod router;
+pub mod secret_store;
 
 pub use edgezero_macros::{action, app};
+#[cfg(any(test, feature = "test-utils"))]
+pub use key_value_store::NoopKvStore;
 pub use key_value_store::{KvError, KvHandle, KvPage, KvStore};
+#[cfg(any(test, feature = "test-utils"))]
+pub use secret_store::{InMemorySecretStore, NoopSecretStore};
+pub use secret_store::{SecretError, SecretHandle, SecretStore};

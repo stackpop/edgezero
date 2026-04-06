@@ -14,14 +14,22 @@ mod proxy;
 mod request;
 #[cfg(feature = "fastly")]
 mod response;
+#[cfg(feature = "fastly")]
+pub mod secret_store;
+mod store_handles;
 
 pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
-pub use request::{dispatch, dispatch_with_kv, into_core_request, DEFAULT_KV_STORE_NAME};
+pub use request::{
+    dispatch, dispatch_with_kv, dispatch_with_kv_and_secrets, dispatch_with_secrets,
+    into_core_request, DEFAULT_KV_STORE_NAME,
+};
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
+#[cfg(feature = "fastly")]
+pub use secret_store::FastlySecretStore;
 
 #[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
@@ -74,6 +82,9 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
+/// Entry point for a Fastly Compute application.
+///
+/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
 #[cfg(feature = "fastly")]
 pub fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
@@ -84,7 +95,8 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     let logging = manifest.logging_or_default("fastly");
     let kv_name = manifest.kv_store_name("fastly").to_string();
     let kv_required = manifest.stores.kv.is_some();
-    run_app_with_logging::<A>(logging.into(), req, &kv_name, kv_required)
+    let secrets_required = manifest.secret_store_enabled("fastly");
+    run_app_with_logging::<A>(logging.into(), req, &kv_name, kv_required, secrets_required)
 }
 
 #[cfg(feature = "fastly")]
@@ -93,6 +105,7 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     req: fastly::Request,
     kv_store_name: &str,
     kv_required: bool,
+    secrets_required: bool,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -100,7 +113,9 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    dispatch_with_kv(&app, req, kv_store_name, kv_required)
+    let kv_handle = crate::request::resolve_kv_handle(kv_store_name, kv_required)?;
+    let secret_handle = crate::request::resolve_secret_handle(secrets_required);
+    crate::request::dispatch_with_handles(&app, req, kv_handle, secret_handle)
 }
 
 #[cfg(all(test, feature = "fastly"))]

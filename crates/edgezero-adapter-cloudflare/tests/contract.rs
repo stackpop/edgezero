@@ -165,3 +165,14 @@ async fn dispatch_passes_request_body_to_handlers() {
     let bytes = response.bytes().await.expect("bytes");
     assert_eq!(bytes.as_slice(), b"echo");
 }
+
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+mod secret_store_compile_check {
+    use edgezero_adapter_cloudflare::secret_store::CloudflareSecretStore;
+    use edgezero_core::secret_store::SecretStore;
+
+    fn _assert_provider_impl<T: SecretStore>() {}
+    fn _check() {
+        _assert_provider_impl::<CloudflareSecretStore>();
+    }
+}
