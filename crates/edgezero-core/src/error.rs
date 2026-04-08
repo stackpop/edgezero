@@ -4,6 +4,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::body::Body;
+use crate::config_store::ConfigStoreError;
 use crate::http::{header::CONTENT_TYPE, HeaderValue, Method, Response, StatusCode};
 use crate::response::{response_with_body, IntoResponse};
 
@@ -61,18 +62,18 @@ impl EdgeError {
         }
     }
 
-    pub fn service_unavailable(message: impl Into<String>) -> Self {
-        EdgeError::ServiceUnavailable {
-            message: message.into(),
-        }
-    }
-
     pub fn internal<E>(error: E) -> Self
     where
         E: Into<AnyError>,
     {
         EdgeError::Internal {
             source: error.into(),
+        }
+    }
+
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        EdgeError::ServiceUnavailable {
+            message: message.into(),
         }
     }
 
@@ -104,6 +105,16 @@ impl EdgeError {
         match self {
             EdgeError::Internal { source } => Some(source),
             _ => None,
+        }
+    }
+}
+
+impl From<ConfigStoreError> for EdgeError {
+    fn from(err: ConfigStoreError) -> Self {
+        match err {
+            ConfigStoreError::InvalidKey { message } => EdgeError::bad_request(message),
+            ConfigStoreError::Unavailable { message } => EdgeError::service_unavailable(message),
+            ConfigStoreError::Internal { source } => EdgeError::internal(source),
         }
     }
 }
@@ -178,6 +189,34 @@ mod tests {
         let err = EdgeError::method_not_allowed(&Method::GET, &[]);
         assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert!(err.message().contains("(none)"));
+    }
+
+    #[test]
+    fn service_unavailable_sets_status_and_message() {
+        let err = EdgeError::service_unavailable("config store unavailable");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), "config store unavailable");
+    }
+
+    #[test]
+    fn config_store_error_unavailable_maps_to_service_unavailable() {
+        let err = EdgeError::from(ConfigStoreError::unavailable("backend offline"));
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), "backend offline");
+    }
+
+    #[test]
+    fn config_store_error_invalid_key_maps_to_bad_request() {
+        let err = EdgeError::from(ConfigStoreError::invalid_key("invalid config key"));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "invalid config key");
+    }
+
+    #[test]
+    fn config_store_error_internal_maps_to_internal_server_error() {
+        let err = EdgeError::from(ConfigStoreError::internal(anyhow::anyhow!("boom")));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("boom"));
     }
 
     #[test]

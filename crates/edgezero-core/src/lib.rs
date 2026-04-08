@@ -3,6 +3,7 @@
 pub mod app;
 pub mod body;
 pub mod compression;
+pub mod config_store;
 pub mod context;
 pub mod error;
 pub mod extractor;
@@ -18,6 +19,7 @@ pub mod response;
 pub mod router;
 pub mod secret_store;
 
+pub use config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
 pub use edgezero_macros::{action, app};
 #[cfg(any(test, feature = "test-utils"))]
 pub use key_value_store::NoopKvStore;

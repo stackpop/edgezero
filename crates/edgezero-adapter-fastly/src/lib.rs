@@ -3,6 +3,8 @@
 
 #[cfg(feature = "cli")]
 pub mod cli;
+#[cfg(feature = "fastly")]
+pub mod config_store;
 mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
@@ -16,15 +18,17 @@ mod request;
 mod response;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
-mod store_handles;
 
+#[cfg(feature = "fastly")]
+pub use config_store::FastlyConfigStore;
 pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
+#[allow(deprecated)]
 pub use request::{
-    dispatch, dispatch_with_kv, dispatch_with_kv_and_secrets, dispatch_with_secrets,
-    into_core_request, DEFAULT_KV_STORE_NAME,
+    dispatch, dispatch_with_config, dispatch_with_config_handle, dispatch_with_kv,
+    dispatch_with_kv_and_secrets, dispatch_with_secrets, into_core_request, DEFAULT_KV_STORE_NAME,
 };
 #[cfg(feature = "fastly")]
 pub use response::from_core_response;
@@ -72,13 +76,17 @@ pub fn init_logger(
 
 #[cfg(feature = "fastly")]
 pub trait AppExt {
+    #[deprecated(
+        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
+    )]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
 }
 
 #[cfg(feature = "fastly")]
 impl AppExt for edgezero_core::app::App {
+    #[allow(deprecated)]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-        dispatch(self, req)
+        crate::request::dispatch_raw(self, req)
     }
 }
 
@@ -92,20 +100,88 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
 ) -> Result<fastly::Response, fastly::Error> {
     let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
     let manifest = manifest_loader.manifest();
-    let logging = manifest.logging_or_default("fastly");
-    let kv_name = manifest.kv_store_name("fastly").to_string();
-    let kv_required = manifest.stores.kv.is_some();
-    let secrets_required = manifest.secret_store_enabled("fastly");
-    run_app_with_logging::<A>(logging.into(), req, &kv_name, kv_required, secrets_required)
+    let logging = manifest.logging_or_default(edgezero_core::app::FASTLY_ADAPTER);
+    // Two-path resolution: `A::config_store()` is set at compile time by the
+    // `#[app]` macro and is the common case. The manifest fallback handles
+    // callers that implement `Hooks` manually without the macro — in that case
+    // `A::config_store()` returns `None` while `[stores.config]` in
+    // `edgezero.toml` may still be present.
+    let config_name = A::config_store()
+        .map(|cfg| {
+            cfg.name_for_adapter(edgezero_core::app::FASTLY_ADAPTER)
+                .to_string()
+        })
+        .or_else(|| {
+            manifest.stores.config.as_ref().map(|cfg| {
+                cfg.config_store_name(edgezero_core::app::FASTLY_ADAPTER)
+                    .to_string()
+            })
+        });
+    let kv_name = manifest
+        .kv_store_name(edgezero_core::app::FASTLY_ADAPTER)
+        .to_string();
+    let requirements = StoreRequirements {
+        kv_required: manifest.stores.kv.is_some(),
+        secrets_required: manifest.secret_store_enabled("fastly"),
+    };
+    run_app_with_stores::<A>(
+        logging.into(),
+        req,
+        config_name.as_deref(),
+        &kv_name,
+        requirements,
+    )
+}
+
+/// Dispatch with a config store. Prefer this over `run_app_with_logging` for new code.
+#[cfg(feature = "fastly")]
+pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
+    logging: FastlyLogging,
+    req: fastly::Request,
+    config_store_name: Option<&str>,
+) -> Result<fastly::Response, fastly::Error> {
+    run_app_with_stores::<A>(
+        logging,
+        req,
+        config_store_name,
+        DEFAULT_KV_STORE_NAME,
+        StoreRequirements::default(),
+    )
+}
+
+/// Compatibility wrapper for callers that do not use a config store.
+#[cfg(feature = "fastly")]
+pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
+    logging: FastlyLogging,
+    req: fastly::Request,
+) -> Result<fastly::Response, fastly::Error> {
+    run_app_with_stores::<A>(
+        logging,
+        req,
+        None,
+        DEFAULT_KV_STORE_NAME,
+        StoreRequirements::default(),
+    )
+}
+
+/// Whether each optional store is required to be present at startup.
+///
+/// Using a named struct instead of positional `bool` arguments prevents
+/// accidental parameter swaps between `kv_required` and `secrets_required`.
+#[cfg(feature = "fastly")]
+#[derive(Default)]
+struct StoreRequirements {
+    kv_required: bool,
+    secrets_required: bool,
 }
 
 #[cfg(feature = "fastly")]
-pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
+fn run_app_with_stores<A: edgezero_core::app::Hooks>(
     logging: FastlyLogging,
     req: fastly::Request,
+    config_store_name: Option<&str>,
     kv_store_name: &str,
-    kv_required: bool,
-    secrets_required: bool,
+    requirements: StoreRequirements,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -113,9 +189,14 @@ pub(crate) fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     }
 
     let app = A::build_app();
-    let kv_handle = crate::request::resolve_kv_handle(kv_store_name, kv_required)?;
-    let secret_handle = crate::request::resolve_secret_handle(secrets_required);
-    crate::request::dispatch_with_handles(&app, req, kv_handle, secret_handle)
+    crate::request::dispatch_with_store_names(
+        &app,
+        req,
+        config_store_name,
+        kv_store_name,
+        requirements.kv_required,
+        requirements.secrets_required,
+    )
 }
 
 #[cfg(all(test, feature = "fastly"))]

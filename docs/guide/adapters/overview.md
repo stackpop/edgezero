@@ -41,6 +41,10 @@ Adapters surface a `dispatch` function that bridges from the provider event loop
 
 This helper is what demo entrypoints and adapters call when wiring their platform-specific main functions.
 
+## Config Store Resolution
+
+When wiring adapters, Fastly and Cloudflare check `Hooks::config_store()` first to allow custom overrides, and then fall back to the manifest. However, the Axum adapter resolves the config store exclusively from `edgezero.toml` defaults (`[stores.config.defaults]`) and currently ignores custom `Hooks::config_store()` implementations.
+
 ## Proxy Integration
 
 Adapters implement `edgezero_core::proxy::ProxyClient` so handlers can forward outbound requests. The client must:
@@ -71,10 +75,13 @@ Because the Fastly SDK links against the Compute@Edge host functions, the contra
 
 ```bash
 rustup target add wasm32-wasip1
-cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --tests
+cargo install viceroy --locked
+export CARGO_TARGET_WASM32_WASIP1_RUNNER="viceroy run"
+cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract
 ```
 
-Provide a Wasm runner (Wasmtime or Viceroy) via `CARGO_TARGET_WASM32_WASIP1_RUNNER` if you want to execute the binaries instead of running `--no-run`.
+Fastly's SDK-linked test binaries need Viceroy for execution; plain Wasmtime
+does not provide the required `fastly_*` host imports.
 
 ### Cloudflare Tests
 
@@ -82,8 +89,12 @@ Cloudflare's adapter relies on `wasm32-unknown-unknown`. The contract suite uses
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown --tests
+export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner
+cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown --test contract
 ```
+
+Install a `wasm-bindgen-cli` version that matches the workspace's `wasm-bindgen`
+entry in `Cargo.lock` before running the Cloudflare tests.
 
 ## Onboarding New Adapters
 

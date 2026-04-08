@@ -7,7 +7,7 @@ license = { workspace = true }
 
 [features]
 default = []
-cloudflare = ["dep:worker"]
+cloudflare = ["dep:worker", "dep:serde_json"]
 cli = [
     "dep:edgezero-adapter",
     "edgezero-adapter/cli",
@@ -29,14 +29,13 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 log = { workspace = true }
 ctor = { workspace = true, optional = true }
-worker = { version = "0.7", default-features = false, features = [
-    "http",
-], optional = true }
+serde_json = { workspace = true, optional = true }
+worker = { version = "0.7", default-features = false, features = ["http"], optional = true }
 walkdir = { workspace = true, optional = true }
-wasm-bindgen-test = "0.3"
 
 [dev-dependencies]
 edgezero-core = { path = "../edgezero-core", features = ["test-utils"] }
+wasm-bindgen-test = "0.3"
 web-sys = { version = "0.3", features = [
     "Window",
     "Response",

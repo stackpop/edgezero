@@ -1,6 +1,8 @@
 //! Axum adapter for EdgeZero routers and applications.
 
 #[cfg(feature = "axum")]
+pub mod config_store;
+#[cfg(feature = "axum")]
 mod context;
 #[cfg(feature = "axum")]
 mod dev_server;
@@ -23,6 +25,8 @@ pub mod cli;
 #[cfg(test)]
 pub mod test_utils;
 
+#[cfg(feature = "axum")]
+pub use config_store::AxumConfigStore;
 #[cfg(feature = "axum")]
 pub use context::AxumRequestContext;
 #[cfg(feature = "axum")]

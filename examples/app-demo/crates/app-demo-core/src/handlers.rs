@@ -10,6 +10,7 @@ use edgezero_core::response::Text;
 use futures::{stream, StreamExt};
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
+const ALLOWED_CONFIG_KEYS: &[&str] = &["greeting", "feature.new_checkout", "service.timeout_ms"];
 const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
 const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
 const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
@@ -17,6 +18,11 @@ const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
 #[derive(serde::Deserialize)]
 pub(crate) struct EchoParams {
     pub(crate) name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ConfigParams {
+    name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -42,6 +48,9 @@ pub(crate) struct NoteIdPath {
     ))]
     pub(crate) id: String,
 }
+
+/// Maximum request body size (25 MB, matches KV value limit).
+const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
 
 #[action]
 pub(crate) async fn root() -> Text<&'static str> {
@@ -126,9 +135,39 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
         .map_err(EdgeError::internal)
 }
 
-// ---------------------------------------------------------------------------
-// KV-powered handlers — demonstrate platform-neutral key-value storage.
-// ---------------------------------------------------------------------------
+fn text_response(status: StatusCode, message: impl Into<String>) -> Result<Response, EdgeError> {
+    http::response_builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::text(message.into()))
+        .map_err(EdgeError::internal)
+}
+
+#[action]
+pub(crate) async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
+    let params: ConfigParams = ctx.path()?;
+    if !ALLOWED_CONFIG_KEYS.contains(&params.name.as_str()) {
+        return text_response(
+            StatusCode::NOT_FOUND,
+            format!("config key '{}' is not exposed by the demo", params.name),
+        );
+    }
+
+    let Some(store) = ctx.config_store() else {
+        return text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config store is unavailable for this adapter",
+        );
+    };
+
+    match store.get(&params.name)? {
+        Some(value) => text_response(StatusCode::OK, value),
+        None => text_response(
+            StatusCode::NOT_FOUND,
+            format!("config key '{}' not found", params.name),
+        ),
+    }
+}
 
 /// Increment and return a visit counter stored in KV.
 #[action]
@@ -161,9 +200,6 @@ pub(crate) async fn kv_note_put(
         .body(Body::empty())
         .map_err(EdgeError::internal)
 }
-
-/// Maximum request body size (25 MB, matches KV value limit).
-const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
 
 /// Read a note by id.
 #[action]
@@ -230,14 +266,17 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
+    use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse;
     use futures::{executor::block_on, StreamExt};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn root_returns_static_body() {
@@ -388,15 +427,106 @@ mod tests {
         RequestContext::new(request, PathParams::default())
     }
 
-    // -- KV handler tests --------------------------------------------------
+    struct MapConfigStore(HashMap<String, String>);
 
-    use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    impl ConfigStore for MapConfigStore {
+        fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(self.0.get(key).cloned())
+        }
+    }
+
+    struct UnavailableConfigStore;
+
+    impl ConfigStore for UnavailableConfigStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Err(ConfigStoreError::unavailable("backend offline"))
+        }
+    }
+
+    fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!("/config/{key}"))
+            .body(Body::empty())
+            .expect("request");
+        let store = MapConfigStore(
+            entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        );
+        request
+            .extensions_mut()
+            .insert(ConfigStoreHandle::new(Arc::new(store)));
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), key.to_string());
+        RequestContext::new(request, PathParams::new(params))
+    }
+
+    fn context_with_unavailable_config_store(key: &str) -> RequestContext {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!("/config/{key}"))
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ConfigStoreHandle::new(Arc::new(UnavailableConfigStore)));
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), key.to_string());
+        RequestContext::new(request, PathParams::new(params))
+    }
+
+    #[test]
+    fn config_get_returns_value_when_key_exists() {
+        let ctx = context_with_config_key("greeting", &[("greeting", "hello from config store")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().into_bytes().as_ref(),
+            b"hello from config store"
+        );
+    }
+
+    #[test]
+    fn config_get_returns_404_when_key_not_in_allowlist() {
+        let ctx = context_with_config_key("missing.key", &[("other.key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_404_when_key_not_in_store() {
+        let ctx = context_with_config_key("greeting", &[("other_key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_404_for_keys_outside_demo_allowlist() {
+        let ctx = context_with_config_key("missing.key", &[("missing.key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_503_when_no_store_injected() {
+        let ctx = context_with_params("/config/greeting", &[("name", "greeting")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn config_get_returns_503_when_store_lookup_fails() {
+        let ctx = context_with_unavailable_config_store("greeting");
+        let err = block_on(config_get(ctx)).expect_err("expected store error");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     struct MockKv {
         data: Mutex<BTreeMap<String, Bytes>>,
     }
+
     impl MockKv {
         fn new() -> Self {
             Self {
@@ -410,10 +540,12 @@ mod tests {
         async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
             Ok(self.data.lock().unwrap().get(key).cloned())
         }
+
         async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
             self.data.lock().unwrap().insert(key.to_string(), value);
             Ok(())
         }
+
         async fn put_bytes_with_ttl(
             &self,
             key: &str,
@@ -423,6 +555,7 @@ mod tests {
             self.data.lock().unwrap().insert(key.to_string(), value);
             Ok(())
         }
+
         async fn delete(&self, key: &str) -> Result<(), KvError> {
             self.data.lock().unwrap().remove(key);
             Ok(())
@@ -494,7 +627,6 @@ mod tests {
         let resp = block_on(kv_note_put(ctx)).expect("response");
         assert_eq!(resp.status(), StatusCode::CREATED);
 
-        // Now read back via get
         let (ctx2, _) = {
             let mut request = request_builder()
                 .method(Method::GET)

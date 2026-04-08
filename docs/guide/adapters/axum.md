@@ -27,19 +27,18 @@ crates/my-app-adapter-axum/
 The Axum entrypoint wires the adapter:
 
 ```rust
-use edgezero_adapter_axum::AxumDevServer;
-use edgezero_core::app::Hooks;
 use my_app_core::App;
 
 fn main() {
-    let app = App::build_app();
-    let router = app.router().clone();
-    if let Err(err) = AxumDevServer::new(router).run() {
+    if let Err(err) = edgezero_adapter_axum::run_app::<App>(include_str!("../../../edgezero.toml")) {
         eprintln!("axum adapter failed: {err}");
         std::process::exit(1);
     }
 }
 ```
+
+`run_app` installs `simple_logger`, builds the app, and wires the local config store from
+`[stores.config]` automatically.
 
 ## Development Server
 
@@ -135,6 +134,26 @@ Run tests:
 cargo test -p my-app-core
 cargo test -p my-app-adapter-axum
 ```
+
+## Config Store
+
+For local development, the Axum adapter only reads environment variables for keys declared in
+`[stores.config.defaults]`, then falls back to those defaults in `edgezero.toml`:
+
+```toml
+[stores.config]
+name = "app_config"
+
+[stores.config.defaults]
+"greeting" = "hello from config store"
+"feature.new_checkout" = "false"
+"service.timeout_ms" = ""
+```
+
+Handlers access the injected store through `ctx.config_store()`. Environment variables take
+precedence over manifest defaults. If a key should be overrideable from env without carrying a real
+default value, declare it with an empty-string placeholder. Do not pass raw user input straight to
+`ctx.config_store()?.get(...)` in production handlers; validate or allowlist keys first.
 
 ## Container Deployment
 

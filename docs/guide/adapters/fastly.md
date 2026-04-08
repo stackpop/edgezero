@@ -6,7 +6,7 @@ Deploy EdgeZero applications to Fastly's Compute@Edge platform using WebAssembly
 
 - [Fastly CLI](https://developer.fastly.com/learning/compute/#install-the-fastly-cli)
 - Rust `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
-- [Wasmtime](https://wasmtime.dev/) or [Viceroy](https://github.com/fastly/Viceroy) for local testing
+- [Viceroy](https://github.com/fastly/Viceroy) for local execution and testing
 
 ## Project Setup
 
@@ -41,16 +41,21 @@ authors = ["you@example.com"]
 The Fastly entrypoint wires the adapter:
 
 ```rust
-use edgezero_adapter_fastly::dispatch;
-use edgezero_core::app::Hooks;
 use my_app_core::App;
 
 #[fastly::main]
 fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    let app = App::build_app();
-    dispatch(&app, req)
+    edgezero_adapter_fastly::run_app::<App>(include_str!("../../../edgezero.toml"), req)
 }
 ```
+
+`run_app` reads logging and config-store settings from `edgezero.toml`, builds the app, and injects
+the configured Fastly Config Store into request extensions automatically.
+
+The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
+config-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
+`dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
+`ConfigStoreHandle`.
 
 ## Building
 
@@ -131,6 +136,29 @@ fn main() {
 Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no logger is installed.
 :::
 
+## Config Store
+
+Fastly uses a native Config Store resource link for runtime configuration. Declare the logical store
+name in `edgezero.toml`:
+
+```toml
+[stores.config]
+name = "app_config"
+```
+
+For local Viceroy testing, mirror that binding in `fastly.toml`:
+
+```toml
+[local_server.config_stores.app_config]
+format = "inline-toml"
+
+[local_server.config_stores.app_config.contents]
+greeting = "hello from config store"
+```
+
+Handlers can then read values through `ctx.config_store()`. If the configured store link is missing,
+the adapter logs a warning and continues without injecting a config-store handle.
+
 ## Context Access
 
 Access Fastly-specific APIs via the request context extensions:
@@ -161,15 +189,19 @@ See the [Streaming guide](/guide/streaming) for examples and patterns.
 Run contract tests for the Fastly adapter:
 
 ```bash
-# Set up the Wasm runner
-export CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --dir=."
+cargo install viceroy --locked
+export CARGO_TARGET_WASM32_WASIP1_RUNNER="viceroy run"
 
 # Run tests
-cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1
+cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract
 ```
 
-::: tip Viceroy Issues
-If Viceroy reports keychain access errors on macOS, use Wasmtime as the test runner instead.
+Fastly SDK-linked Wasm binaries require Viceroy for execution; plain Wasmtime
+does not provide the `fastly_*` host imports needed by the adapter tests.
+
+::: tip Local Execution
+If Viceroy reports native certificate or keychain errors on macOS, use `--no-run`
+locally and rely on Linux CI for execution.
 :::
 
 ## Manifest Configuration

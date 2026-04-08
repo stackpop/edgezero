@@ -5,13 +5,13 @@ use std::task::{Context, Poll};
 
 use axum::body::Body as AxumBody;
 use axum::http::{Request, Response};
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::http::StatusCode;
-use tokio::{runtime::Handle, task};
-use tower::Service;
-
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
+use tokio::{runtime::Handle, task};
+use tower::Service;
 
 use crate::request::into_core_request;
 use crate::response::into_axum_response;
@@ -20,6 +20,7 @@ use crate::response::into_axum_response;
 #[derive(Clone)]
 pub struct EdgeZeroAxumService {
     router: RouterService,
+    config_store_handle: Option<ConfigStoreHandle>,
     kv_handle: Option<KvHandle>,
     secret_handle: Option<SecretHandle>,
 }
@@ -28,9 +29,20 @@ impl EdgeZeroAxumService {
     pub fn new(router: RouterService) -> Self {
         Self {
             router,
+            config_store_handle: None,
             kv_handle: None,
             secret_handle: None,
         }
+    }
+
+    /// Attach a shared config store to this service.
+    ///
+    /// The handle is cloned into every request's extensions, making
+    /// `ctx.config_store()` available in handlers.
+    #[must_use]
+    pub fn with_config_store_handle(mut self, handle: ConfigStoreHandle) -> Self {
+        self.config_store_handle = Some(handle);
+        self
     }
 
     /// Attach a shared KV store to this service.
@@ -65,6 +77,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 
     fn call(&mut self, request: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
+        let config_store_handle = self.config_store_handle.clone();
         let kv_handle = self.kv_handle.clone();
         let secret_handle = self.secret_handle.clone();
         Box::pin(async move {
@@ -77,6 +90,10 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
                     return Ok(err_response);
                 }
             };
+
+            if let Some(handle) = config_store_handle {
+                core_request.extensions_mut().insert(handle);
+            }
 
             if let Some(handle) = kv_handle {
                 core_request.extensions_mut().insert(handle);
@@ -99,10 +116,20 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 mod tests {
     use super::*;
     use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{response_builder, StatusCode};
+    use std::sync::Arc;
     use tower::ServiceExt;
+
+    struct FixedConfigStore(String);
+
+    impl ConfigStore for FixedConfigStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(Some(self.0.clone()))
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn forwards_request_to_router() {
@@ -123,11 +150,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_config_store_handle_injects_into_request() {
+        let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("injected".to_string())));
+
+        let router = RouterService::builder()
+            .get("/check", |ctx: RequestContext| async move {
+                let store = ctx.config_store().expect("config store should be present");
+                let val = store
+                    .get("any_key")
+                    .expect("config lookup should succeed")
+                    .unwrap_or_default();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(val))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let mut service = EdgeZeroAxumService::new(router).with_config_store_handle(handle);
+
+        let request = Request::builder()
+            .uri("/check")
+            .body(AxumBody::empty())
+            .unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"injected");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_kv_handle_injects_into_request() {
         use crate::key_value_store::PersistentKvStore;
-        use std::sync::Arc;
 
-        // Pre-seed the store with a value so the handler can verify injection
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
         let store = Arc::new(PersistentKvStore::new(db_path).unwrap());
@@ -158,6 +216,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"injected");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_without_config_store_handle_still_works() {
+        let router = RouterService::builder()
+            .get("/no-config", |ctx: RequestContext| async move {
+                let has_config = ctx.config_store().is_some();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(format!("has_config={has_config}")))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let mut service = EdgeZeroAxumService::new(router);
+
+        let request = Request::builder()
+            .uri("/no-config")
+            .body(AxumBody::empty())
+            .unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"has_config=false");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -214,7 +299,6 @@ mod tests {
                 Ok::<_, EdgeError>(response)
             })
             .build();
-        // No with_kv_handle call — KV is optional
         let mut service = EdgeZeroAxumService::new(router);
 
         let request = Request::builder()
