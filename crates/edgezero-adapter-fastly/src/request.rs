@@ -225,10 +225,11 @@ struct RecentStringSet {
 
 impl RecentStringSet {
     fn insert(&mut self, key: &str, limit: usize) -> bool {
-        if !self.keys.insert(key.to_string()) {
+        let owned = key.to_string();
+        if !self.keys.insert(owned.clone()) {
             return false;
         }
-        self.order.push_back(key.to_string());
+        self.order.push_back(owned);
         while limit > 0 && self.order.len() > limit {
             if let Some(oldest) = self.order.pop_front() {
                 self.keys.remove(&oldest);

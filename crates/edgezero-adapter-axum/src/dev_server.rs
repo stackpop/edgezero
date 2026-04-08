@@ -336,6 +336,9 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         // Unlike Fastly and Cloudflare, it does not check A::config_store() first.
         // If a user implements Hooks::config_store() without a [stores.config] section
         // in edgezero.toml, the override is silently ignored on Axum.
+        if A::config_store().is_some() && m.stores.config.is_none() {
+            log::warn!("A::config_store() is set but [stores.config] is missing in the manifest. This override is ignored on Axum.");
+        }
         let config_store_handle = m.stores.config.as_ref().map(|cfg| {
             let defaults = cfg.config_store_defaults().clone();
             let store = AxumConfigStore::from_env(defaults);
