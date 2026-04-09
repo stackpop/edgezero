@@ -270,8 +270,15 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
         None => None,
     };
 
-    let addr = edgezero_core::addr::resolve_bind_addr(None, None, config_host, config_port)
-        .map_err(|e| format!("{e} (in {})", manifest.display()))?;
+    let env_host = std::env::var("EDGEZERO_HOST").ok();
+    let env_port = std::env::var("EDGEZERO_PORT").ok();
+    let addr = edgezero_core::addr::resolve_bind_addr(
+        env_host.as_deref(),
+        env_port.as_deref(),
+        config_host,
+        config_port,
+    )
+    .map_err(|e| format!("{e} (in {})", manifest.display()))?;
 
     Ok(AxumProject {
         crate_dir,
@@ -667,6 +674,40 @@ mod tests {
     #[test]
     fn adapter_name_is_axum() {
         assert_eq!(AXUM_ADAPTER.name(), "axum");
+    }
+
+    #[test]
+    fn read_axum_project_env_overrides_config() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"127.0.0.1\"\nport = 3000\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        // SAFETY: env vars are process-global; this test must not run in
+        // parallel with other tests that read these same vars.  The
+        // `serial_test` crate is not in scope, so we accept the small race
+        // risk in CI (the test is deterministic in isolation).
+        unsafe {
+            std::env::set_var("EDGEZERO_HOST", "0.0.0.0");
+            std::env::set_var("EDGEZERO_PORT", "9999");
+        }
+        let result = read_axum_project(&root.join("axum.toml"));
+        unsafe {
+            std::env::remove_var("EDGEZERO_HOST");
+            std::env::remove_var("EDGEZERO_PORT");
+        }
+
+        let project = result.expect("project");
+        assert_eq!(project.addr.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
+        assert_eq!(project.addr.port(), 9999);
     }
 
     #[test]
