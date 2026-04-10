@@ -77,7 +77,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -88,7 +88,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -431,7 +431,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -727,7 +727,7 @@ dependencies = [
  "ctor",
  "edgezero-adapter",
  "edgezero-core",
- "fastly",
+ "fastly 0.11.13",
  "fern",
  "flate2",
  "futures",
@@ -852,7 +852,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -865,9 +865,37 @@ dependencies = [
  "bytes",
  "downcast-rs",
  "elsa",
- "fastly-macros",
- "fastly-shared",
- "fastly-sys",
+ "fastly-macros 0.11.13",
+ "fastly-shared 0.11.13",
+ "fastly-sys 0.11.13",
+ "http",
+ "itertools",
+ "lazy_static",
+ "mime",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "serde_urlencoded",
+ "sha2 0.9.9",
+ "smallvec",
+ "thiserror 1.0.69",
+ "time",
+ "url",
+]
+
+[[package]]
+name = "fastly"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16393f187c703d5460d095201e194940a190479cd5a45aa7e324e8c97f4a3df4"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "downcast-rs",
+ "elsa",
+ "fastly-macros 0.12.0",
+ "fastly-shared 0.12.0",
+ "fastly-sys 0.12.0",
  "http",
  "itertools",
  "lazy_static",
@@ -895,10 +923,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastly-macros"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e11b9b78e4d8d0fab4b9d7d8ba289c30d62d641e649e89153bc4d5446c88db2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 1.0.109",
+]
+
+[[package]]
 name = "fastly-shared"
 version = "0.11.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d64ed1bba12ca45d1a2a80c2c55d903297adb3eeb4edc9d327c1d51ee709d404"
+dependencies = [
+ "bitflags 1.3.2",
+ "http",
+]
+
+[[package]]
+name = "fastly-shared"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4ca5a9664c64b9f85188426aa1598e9885d6dbb247d6155fd9ebe043b551800"
 dependencies = [
  "bitflags 1.3.2",
  "http",
@@ -911,9 +960,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f1b82ebd99583740a074d8962ca75d7d17065b185a94e4919c3a3f2193268b6"
 dependencies = [
  "bitflags 1.3.2",
- "fastly-shared",
+ "fastly-shared 0.11.13",
  "wasip2",
  "wit-bindgen 0.46.0",
+]
+
+[[package]]
+name = "fastly-sys"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5dacc6ac7a7400e0b38757f48fbf1db09971812ef3dbb1f1a90a50746df662f"
+dependencies = [
+ "bitflags 1.3.2",
+ "fastly-shared 0.12.0",
+ "http",
+ "wasip2",
+ "wit-bindgen 0.51.0",
 ]
 
 [[package]]
@@ -1530,11 +1592,11 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "log-fastly"
-version = "0.11.13"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58a5d864949b863161476a8129ef0322c56c77bb15f98d88991002072f497b1e"
+checksum = "68896fe30b7c6c46d38cb33ade05daff20ad03a51d2dc422eab3138f2419fc51"
 dependencies = [
- "fastly",
+ "fastly 0.12.0",
  "log",
  "regex",
 ]
@@ -1612,7 +1674,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2044,7 +2106,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2101,7 +2163,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2500,7 +2562,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3079,7 +3141,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
