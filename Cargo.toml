@@ -31,7 +31,7 @@ axum = { version = "0.8", default-features = true }
 brotli = "8"
 bytes = "1"
 chrono = "0.4"
-ctor = "0.6"
+ctor = "0.9"
 edgezero-adapter = { path = "crates/edgezero-adapter" }
 edgezero-adapter-axum = { path = "crates/edgezero-adapter-axum", default-features = false }
 edgezero-adapter-cloudflare = { path = "crates/edgezero-adapter-cloudflare", default-features = false }
