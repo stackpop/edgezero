@@ -219,6 +219,16 @@ fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
+    let env_host = std::env::var("EDGEZERO_HOST").ok();
+    let env_port = std::env::var("EDGEZERO_PORT").ok();
+    read_axum_project_with_env(manifest, env_host.as_deref(), env_port.as_deref())
+}
+
+fn read_axum_project_with_env(
+    manifest: &Path,
+    env_host: Option<&str>,
+    env_port: Option<&str>,
+) -> Result<AxumProject, String> {
     let contents = fs::read_to_string(manifest)
         .map_err(|err| format!("failed to read {}: {err}", manifest.display()))?;
     let value: Value = toml::from_str(&contents)
@@ -270,11 +280,9 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
         None => None,
     };
 
-    let env_host = std::env::var("EDGEZERO_HOST").ok();
-    let env_port = std::env::var("EDGEZERO_PORT").ok();
     let addr = edgezero_core::addr::resolve_bind_addr(
-        env_host.as_deref(),
-        env_port.as_deref(),
+        env_host,
+        env_port,
         config_host,
         config_port,
     )
@@ -309,7 +317,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.crate_name, "demo");
         assert_eq!(project.crate_dir, root);
         assert_eq!(project.cargo_manifest, root.join("Cargo.toml"));
@@ -349,7 +357,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.addr.port(), 4001);
     }
 
@@ -368,7 +376,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.contains("must be between 1 and 65535")),
@@ -390,7 +398,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         assert!(result.is_err());
     }
 
@@ -409,7 +417,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         assert!(result.is_err());
     }
 
@@ -424,7 +432,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.contains("adapter table missing")),
@@ -442,7 +450,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.contains("crate_dir missing")),
@@ -462,7 +470,7 @@ mod tests {
         .unwrap();
         // No Cargo.toml in subdir
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.contains("Cargo.toml missing")),
@@ -481,7 +489,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.crate_name, "my-package");
     }
 
@@ -502,7 +510,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.crate_name, "my-adapter");
         assert_eq!(project.crate_dir, adapter_dir);
     }
@@ -522,7 +530,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.addr.port(), 65535);
     }
 
@@ -541,7 +549,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.addr.port(), 1);
     }
 
@@ -560,7 +568,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.addr.ip(), edgezero_core::addr::DEFAULT_HOST);
     }
 
@@ -579,7 +587,7 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project = read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.addr.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
     }
 
@@ -598,7 +606,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("valid IP address"));
     }
@@ -691,19 +699,11 @@ mod tests {
         )
         .unwrap();
 
-        // SAFETY: env vars are process-global; this test must not run in
-        // parallel with other tests that read these same vars.  The
-        // `serial_test` crate is not in scope, so we accept the small race
-        // risk in CI (the test is deterministic in isolation).
-        unsafe {
-            std::env::set_var("EDGEZERO_HOST", "0.0.0.0");
-            std::env::set_var("EDGEZERO_PORT", "9999");
-        }
-        let result = read_axum_project(&root.join("axum.toml"));
-        unsafe {
-            std::env::remove_var("EDGEZERO_HOST");
-            std::env::remove_var("EDGEZERO_PORT");
-        }
+        let result = read_axum_project_with_env(
+            &root.join("axum.toml"),
+            Some("0.0.0.0"),
+            Some("9999"),
+        );
 
         let project = result.expect("project");
         assert_eq!(project.addr.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
