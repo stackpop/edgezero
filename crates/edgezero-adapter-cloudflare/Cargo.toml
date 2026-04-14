@@ -30,7 +30,7 @@ futures-util = { workspace = true }
 log = { workspace = true }
 ctor = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-worker = { version = "0.7", default-features = false, features = ["http"], optional = true }
+worker = { version = "0.8", default-features = false, features = ["http"], optional = true }
 walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]
