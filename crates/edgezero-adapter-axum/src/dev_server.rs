@@ -295,15 +295,15 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
 
     SimpleLogger::new().with_level(level).init().ok();
 
-    let addr = resolve_addr(manifest).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let resolution = resolve_addr(m);
+    for warning in &resolution.warnings {
+        log::warn!("{warning}");
+    }
+    let addr = resolution.addr;
     let app = A::build_app();
     let router = app.router().clone();
 
-    println!(
-        "[edgezero] starting axum server on http://{}:{}",
-        addr.ip(),
-        addr.port()
-    );
+    println!("[edgezero] starting axum server on http://{}", addr);
 
     let runtime = RuntimeBuilder::new_multi_thread()
         .enable_all()
@@ -379,7 +379,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
 /// 3. Default: `127.0.0.1:8787`
 pub(crate) fn resolve_addr(
     manifest: &edgezero_core::manifest::Manifest,
-) -> Result<SocketAddr, String> {
+) -> edgezero_core::addr::BindAddrResolution {
     let env_host = std::env::var("EDGEZERO_HOST").ok();
     let env_port = std::env::var("EDGEZERO_PORT").ok();
     resolve_addr_from_parts(manifest, env_host.as_deref(), env_port.as_deref())
@@ -389,7 +389,7 @@ fn resolve_addr_from_parts(
     manifest: &edgezero_core::manifest::Manifest,
     env_host: Option<&str>,
     env_port: Option<&str>,
-) -> Result<SocketAddr, String> {
+) -> edgezero_core::addr::BindAddrResolution {
     let adapter = manifest.adapters.get("axum");
     let config_host = adapter.and_then(|a| a.adapter.host.as_deref());
     let config_port = adapter.and_then(|a| a.adapter.port);
@@ -525,8 +525,9 @@ name = "EDGEZERO_KV"
     fn resolve_addr_defaults_without_manifest_config() {
         // Note: env var tests use resolve_addr_from_parts to avoid races.
         let loader = ManifestLoader::load_from_str("");
-        let addr = resolve_addr_from_parts(loader.manifest(), None, None).unwrap();
-        assert_eq!(addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
+        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+        assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
+        assert!(resolution.warnings.is_empty());
     }
 
     #[test]
@@ -537,8 +538,9 @@ host = "0.0.0.0"
 port = 3000
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let addr = resolve_addr_from_parts(loader.manifest(), None, None).unwrap();
-        assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 3000)));
+        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 3000)));
+        assert!(resolution.warnings.is_empty());
     }
 
     #[test]
@@ -549,9 +551,9 @@ host = "127.0.0.1"
 port = 3000
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let addr =
-            resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), Some("4000")).unwrap();
-        assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
+        let resolution = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), Some("4000"));
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
+        assert!(resolution.warnings.is_empty());
     }
 
     #[test]
@@ -561,8 +563,35 @@ port = 3000
 port = 5000
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let addr = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), None).unwrap();
-        assert_eq!(addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
+        let resolution = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), None);
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
+        assert!(resolution.warnings.is_empty());
+    }
+
+    #[test]
+    fn resolve_addr_invalid_env_falls_back_to_manifest() {
+        let manifest = r#"
+[adapters.axum.adapter]
+host = "0.0.0.0"
+port = 5000
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let resolution = resolve_addr_from_parts(loader.manifest(), Some("not-an-ip"), Some("abc"));
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
+        assert_eq!(resolution.warnings.len(), 2);
+    }
+
+    #[test]
+    fn resolve_addr_invalid_manifest_falls_back_to_default() {
+        let manifest = r#"
+[adapters.axum.adapter]
+host = "localhost"
+port = 0
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+        assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
+        assert_eq!(resolution.warnings.len(), 2);
     }
 }
 

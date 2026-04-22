@@ -353,9 +353,9 @@ pub struct ManifestAdapterDefinition {
     pub manifest: Option<String>,
     /// Bind address for the adapter server (e.g. `"0.0.0.0"` or `"127.0.0.1"`).
     ///
-    /// Stored as a raw string for WASM compatibility — IP-address validation
-    /// happens at the adapter layer when the server binds
-    /// (see [`crate::addr::resolve_bind_addr`]).
+    /// Stored as a raw string so validation can be deferred until bind-address
+    /// resolution, where environment-variable overrides and fallback behavior
+    /// are applied consistently (see [`crate::addr::resolve_bind_addr`]).
     #[serde(default)]
     #[validate(length(min = 1))]
     pub host: Option<String>,
