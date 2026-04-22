@@ -24,7 +24,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -47,10 +46,7 @@ jobs:
         run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
 
       - name: Setup Viceroy
-        run: |
-          if ! command -v viceroy &>/dev/null; then
-            cargo install viceroy --locked
-          fi
+        run: cargo install viceroy --locked --force
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
@@ -74,7 +70,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -114,7 +109,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install wasm-bindgen test runner
-        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
@@ -137,7 +132,6 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -160,7 +154,7 @@ jobs:
         run: rustup target add wasm32-wasip1
 
       - name: Setup Viceroy
-        run: cargo install viceroy --locked
+        run: cargo install viceroy --locked --force
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
