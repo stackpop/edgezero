@@ -16,6 +16,10 @@ mod response;
 pub use config_store::SpinConfigStore;
 pub use context::SpinRequestContext;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+mod secret_store;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub use secret_store::SpinSecretStore;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use proxy::SpinProxyClient;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use request::{dispatch, into_core_request};
