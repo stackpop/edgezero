@@ -57,7 +57,7 @@ id = "config_get"
 path = "/config/{name}"
 methods = ["GET"]
 handler = "app_demo_core::handlers::config_get"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 
 # -- KV demo routes --------------------------------------------------------
 
@@ -66,7 +66,7 @@ id = "kv_counter"
 path = "/kv/counter"
 methods = ["POST"]
 handler = "app_demo_core::handlers::kv_counter"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Increment and return a visit counter stored in KV"
 
 [[triggers.http]]
@@ -74,7 +74,7 @@ id = "kv_note_put"
 path = "/kv/notes/{id}"
 methods = ["POST"]
 handler = "app_demo_core::handlers::kv_note_put"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Store a note by id"
 
 [[triggers.http]]
@@ -82,7 +82,7 @@ id = "kv_note_get"
 path = "/kv/notes/{id}"
 methods = ["GET"]
 handler = "app_demo_core::handlers::kv_note_get"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Read a note by id"
 
 [[triggers.http]]
@@ -90,7 +90,7 @@ id = "kv_note_delete"
 path = "/kv/notes/{id}"
 methods = ["DELETE"]
 handler = "app_demo_core::handlers::kv_note_delete"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Delete a note by id"
 
 # -- Secrets demo route --------------------------------------------------------
@@ -100,7 +100,7 @@ id = "secrets_echo"
 path = "/secrets/echo"
 methods = ["GET"]
 handler = "app_demo_core::handlers::secrets_echo"
-adapters = ["axum", "cloudflare", "fastly"]
+adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Echo an allowlisted smoke-test secret value (smoke-test only — do not use in production)"
 
 # -- Stores ----------------------------------------------------------------
