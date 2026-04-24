@@ -2,12 +2,70 @@ use bytes::Bytes;
 use edgezero_adapter_spin::SpinRequestContext;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
+use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, response_builder, Response, StatusCode};
+use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
 use edgezero_core::router::RouterService;
+use edgezero_core::secret_store::{SecretError, SecretHandle, SecretStore};
 use futures::executor::block_on;
 use futures::stream;
+use std::sync::Arc;
+
+struct FixedConfigStore(&'static str);
+
+impl ConfigStore for FixedConfigStore {
+    fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Ok(Some(self.0.to_string()))
+    }
+}
+
+struct StubKvStore;
+
+#[async_trait::async_trait(?Send)]
+impl KvStore for StubKvStore {
+    async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+        Ok(None)
+    }
+    async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+        Ok(())
+    }
+    async fn put_bytes_with_ttl(
+        &self,
+        _key: &str,
+        _value: Bytes,
+        _ttl: std::time::Duration,
+    ) -> Result<(), KvError> {
+        Ok(())
+    }
+    async fn delete(&self, _key: &str) -> Result<(), KvError> {
+        Ok(())
+    }
+    async fn exists(&self, _key: &str) -> Result<bool, KvError> {
+        Ok(false)
+    }
+    async fn list_keys_page(
+        &self,
+        _prefix: &str,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<KvPage, KvError> {
+        Ok(KvPage {
+            keys: vec![],
+            cursor: None,
+        })
+    }
+}
+
+struct StubSecretStore;
+
+#[async_trait::async_trait(?Send)]
+impl SecretStore for StubSecretStore {
+    async fn get_bytes(&self, _store_name: &str, _key: &str) -> Result<Option<Bytes>, SecretError> {
+        Ok(None)
+    }
+}
 
 fn build_test_app() -> App {
     async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
@@ -41,10 +99,51 @@ fn build_test_app() -> App {
         Ok(response)
     }
 
+    async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let value = ctx
+            .config_store()
+            .and_then(|store| store.get("greeting").ok().flatten())
+            .unwrap_or_else(|| "missing".to_string());
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(Body::text(value))
+            .expect("response");
+        Ok(response)
+    }
+
+    async fn kv_presence(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let body = Body::text(if ctx.kv_handle().is_some() {
+            "yes"
+        } else {
+            "no"
+        });
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .expect("response");
+        Ok(response)
+    }
+
+    async fn secret_presence(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let body = Body::text(if ctx.secret_handle().is_some() {
+            "yes"
+        } else {
+            "no"
+        });
+        let response = response_builder()
+            .status(StatusCode::OK)
+            .body(body)
+            .expect("response");
+        Ok(response)
+    }
+
     let router = RouterService::builder()
         .get("/uri", capture_uri)
         .post("/mirror", mirror_body)
         .get("/stream", stream_response)
+        .get("/config", config_value)
+        .get("/has-kv", kv_presence)
+        .get("/has-secret", secret_presence)
         .build();
 
     App::new(router)
@@ -128,6 +227,95 @@ fn router_dispatches_streaming_route() {
 }
 
 // ---------------------------------------------------------------------------
+// Store injection smoke tests (host-side, no Spin runtime required)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_store_handle_is_accessible_from_handler() {
+    let app = build_test_app();
+    let mut request = request_builder()
+        .method("GET")
+        .uri("http://example.com/config")
+        .body(Body::empty())
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(ConfigStoreHandle::new(Arc::new(FixedConfigStore(
+            "hello-spin",
+        ))));
+
+    let response = block_on(app.router().oneshot(request));
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body().as_bytes(), b"hello-spin");
+}
+
+#[test]
+fn kv_handle_is_accessible_from_handler() {
+    let app = build_test_app();
+    let mut request = request_builder()
+        .method("GET")
+        .uri("http://example.com/has-kv")
+        .body(Body::empty())
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(KvHandle::new(Arc::new(StubKvStore)));
+
+    let response = block_on(app.router().oneshot(request));
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body().as_bytes(), b"yes");
+}
+
+#[test]
+fn secret_handle_is_accessible_from_handler() {
+    let app = build_test_app();
+    let mut request = request_builder()
+        .method("GET")
+        .uri("http://example.com/has-secret")
+        .body(Body::empty())
+        .expect("request");
+    request
+        .extensions_mut()
+        .insert(SecretHandle::new(Arc::new(StubSecretStore)));
+
+    let response = block_on(app.router().oneshot(request));
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.body().as_bytes(), b"yes");
+}
+
+#[test]
+fn missing_store_handles_return_absent_values_in_handler() {
+    let app = build_test_app();
+
+    let config_req = request_builder()
+        .method("GET")
+        .uri("http://example.com/config")
+        .body(Body::empty())
+        .expect("request");
+    let config_response = block_on(app.router().oneshot(config_req));
+    assert_eq!(config_response.body().as_bytes(), b"missing");
+
+    let kv_req = request_builder()
+        .method("GET")
+        .uri("http://example.com/has-kv")
+        .body(Body::empty())
+        .expect("request");
+    let kv_response = block_on(app.router().oneshot(kv_req));
+    assert_eq!(kv_response.body().as_bytes(), b"no");
+
+    let secret_req = request_builder()
+        .method("GET")
+        .uri("http://example.com/has-secret")
+        .body(Body::empty())
+        .expect("request");
+    let secret_response = block_on(app.router().oneshot(secret_req));
+    assert_eq!(secret_response.body().as_bytes(), b"no");
+}
+
+// ---------------------------------------------------------------------------
 // Tests that require `spin_sdk` types (wasm32 + spin feature only)
 //
 // `from_core_response` returns `spin_sdk::http::Response` which is only
@@ -190,5 +378,19 @@ mod wasm {
             assert_eq!(*spin_response.status(), 204);
             assert!(spin_response.into_body().is_empty());
         });
+    }
+}
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+mod store_trait_compile_checks {
+    use edgezero_adapter_spin::{SpinKvStore, SpinSecretStore};
+    use edgezero_core::key_value_store::KvStore;
+    use edgezero_core::secret_store::SecretStore;
+
+    fn _assert_kv_impl<T: KvStore>() {}
+    fn _assert_secret_impl<T: SecretStore>() {}
+    fn _check() {
+        _assert_kv_impl::<SpinKvStore>();
+        _assert_secret_impl::<SpinSecretStore>();
     }
 }

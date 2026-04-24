@@ -1,11 +1,19 @@
+use std::sync::Arc;
+
+use crate::config_store::SpinConfigStore;
 use crate::context::SpinRequestContext;
+use crate::key_value_store::SpinKvStore;
 use crate::proxy::SpinProxyClient;
 use crate::response::from_core_response;
+use crate::secret_store::SpinSecretStore;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
+use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request, Uri};
+use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
+use edgezero_core::secret_store::SecretHandle;
 use spin_sdk::http::IncomingRequest;
 
 /// Convert a Spin `IncomingRequest` into an EdgeZero core `Request`.
@@ -84,8 +92,37 @@ fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<Strin
 
 /// Dispatch a Spin request through the EdgeZero router and return
 /// a Spin-compatible response.
+///
+/// Injects all available stores into request extensions:
+/// - `ConfigStoreHandle` backed by `SpinConfigStore` (Spin component variables)
+/// - `KvHandle` backed by `SpinKvStore` for the `"default"` KV label (best-effort;
+///   a warning is logged and the handle is omitted if the label is not configured)
+/// - `SecretHandle` backed by `SpinSecretStore` (Spin component variables)
 pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sdk::http::Response> {
-    let core_request = into_core_request(req).await?;
+    let mut core_request = into_core_request(req).await?;
+
+    core_request
+        .extensions_mut()
+        .insert(ConfigStoreHandle::new(Arc::new(SpinConfigStore::new())));
+
+    match SpinKvStore::open_default() {
+        Ok(store) => {
+            core_request
+                .extensions_mut()
+                .insert(KvHandle::new(Arc::new(store)));
+        }
+        Err(e) => {
+            log::warn!(
+                "SpinKvStore: could not open default KV store (label \"default\"); \
+                 KV operations will be unavailable: {e}"
+            );
+        }
+    }
+
+    core_request
+        .extensions_mut()
+        .insert(SecretHandle::new(Arc::new(SpinSecretStore::new())));
+
     let response = app.router().oneshot(core_request).await;
     Ok(from_core_response(response).await?)
 }

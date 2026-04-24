@@ -37,7 +37,11 @@ impl Default for SpinSecretStore {
 impl SecretStore for SpinSecretStore {
     async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         use spin_sdk::variables;
-        match variables::get(key) {
+        // Spin variable names are always lowercase. Normalise the key so that
+        // conventional uppercase secret names (e.g. "STRIPE_KEY") work without
+        // callers needing to know the Spin naming convention.
+        let lower = key.to_ascii_lowercase();
+        match variables::get(&lower) {
             Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
             Err(variables::Error::Undefined(_)) => Ok(None),
             Err(variables::Error::InvalidName(msg)) => Err(SecretError::Validation(msg)),
