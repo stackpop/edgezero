@@ -10,7 +10,12 @@
 //!   `log::warn!`.
 //! - **Listing**: `spin_sdk::key_value::Store::get_keys()` returns all keys
 //!   with no prefix or cursor support. Prefix filtering and pagination are
-//!   performed in-process after fetching all keys.
+//!   performed in-process after fetching all keys. A configurable cap
+//!   (`max_list_keys`, default [`DEFAULT_MAX_LIST_KEYS`]) guards against
+//!   unbounded allocations; when the total key count exceeds it the list is
+//!   silently truncated, a `log::warn!` is emitted, and a partial page is
+//!   returned so the caller can resume via cursor (matching the Axum adapter
+//!   behaviour for its scan-batch limit).
 //!
 //! # Note
 //!
@@ -26,6 +31,12 @@ use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use std::time::Duration;
 
+/// Maximum number of keys fetched from the Spin KV host before
+/// `list_keys_page` returns `KvError::Validation`. Overridable via
+/// [`SpinKvStore::with_max_list_keys`].
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub const DEFAULT_MAX_LIST_KEYS: usize = 10_000;
+
 /// KV store backed by the Spin KV API.
 ///
 /// Wraps a `spin_sdk::key_value::Store` handle obtained via
@@ -33,6 +44,7 @@ use std::time::Duration;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinKvStore {
     store: spin_sdk::key_value::Store,
+    max_list_keys: usize,
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -44,12 +56,25 @@ impl SpinKvStore {
     pub fn open(label: &str) -> Result<Self, KvError> {
         let store = spin_sdk::key_value::Store::open(label)
             .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            max_list_keys: DEFAULT_MAX_LIST_KEYS,
+        })
     }
 
     /// Open the default Spin KV store (label `"default"`).
     pub fn open_default() -> Result<Self, KvError> {
         Self::open("default")
+    }
+
+    /// Override the maximum number of keys fetched during `list_keys_page`.
+    ///
+    /// When the Spin KV store contains more than `limit` keys,
+    /// `list_keys_page` returns `KvError::Validation` rather than
+    /// allocating an unbounded `Vec`. Defaults to [`DEFAULT_MAX_LIST_KEYS`].
+    pub fn with_max_list_keys(mut self, limit: usize) -> Self {
+        self.max_list_keys = limit;
+        self
     }
 }
 
@@ -75,9 +100,7 @@ impl KvStore for SpinKvStore {
         value: Bytes,
         _ttl: Duration,
     ) -> Result<(), KvError> {
-        log::warn!(
-            "SpinKvStore: TTL is not supported by the Spin KV API; storing without expiry"
-        );
+        log::warn!("SpinKvStore: TTL is not supported by the Spin KV API; storing without expiry");
         self.store
             .set(key, value.as_ref())
             .map_err(|e| KvError::Internal(anyhow::anyhow!("set failed: {e}")))
@@ -101,11 +124,24 @@ impl KvStore for SpinKvStore {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<KvPage, KvError> {
-        let mut keys: Vec<String> = self
+        let all_keys = self
             .store
             .get_keys()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("get_keys failed: {e}")))?
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("get_keys failed: {e}")))?;
+
+        if all_keys.len() > self.max_list_keys {
+            log::warn!(
+                "SpinKvStore: fetched {} keys, exceeding max_list_keys={}; \
+                 processing the first {} keys only. Use with_max_list_keys to scan the full store.",
+                all_keys.len(),
+                self.max_list_keys,
+                self.max_list_keys,
+            );
+        }
+
+        let mut keys: Vec<String> = all_keys
             .into_iter()
+            .take(self.max_list_keys)
             .filter(|k| k.starts_with(prefix))
             .collect();
 
