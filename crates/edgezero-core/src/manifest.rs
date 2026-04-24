@@ -404,7 +404,7 @@ pub struct ManifestConfigStoreConfig {
     #[validate(length(min = 1))]
     pub name: Option<String>,
     /// Per-adapter name overrides, keyed by supported lowercase adapter name
-    /// (`axum`, `cloudflare`, or `fastly`).
+    /// (`axum`, `cloudflare`, `fastly`, or `spin`).
     #[serde(default)]
     #[validate(nested)]
     #[validate(custom(function = "validate_config_store_adapter_keys"))]
