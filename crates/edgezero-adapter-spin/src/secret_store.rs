@@ -35,15 +35,12 @@ impl Default for SpinSecretStore {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl SecretStore for SpinSecretStore {
-    async fn get_bytes(
-        &self,
-        _store_name: &str,
-        key: &str,
-    ) -> Result<Option<Bytes>, SecretError> {
+    async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         use spin_sdk::variables;
         match variables::get(key) {
             Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
             Err(variables::Error::Undefined(_)) => Ok(None),
+            Err(variables::Error::InvalidName(msg)) => Err(SecretError::Validation(msg)),
             Err(e) => Err(SecretError::Internal(anyhow::anyhow!(
                 "secret lookup failed: {e}"
             ))),

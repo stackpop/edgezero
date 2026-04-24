@@ -42,6 +42,7 @@ impl Default for SpinConfigStore {
 }
 
 impl ConfigStore for SpinConfigStore {
+    // `key` is unused in the _Uninhabited arm on native non-test builds
     #[allow(unused_variables)]
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
