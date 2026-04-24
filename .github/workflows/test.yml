@@ -172,3 +172,44 @@ jobs:
 
       - name: Check Fastly wasm target
         run: cargo check -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1
+
+  spin-adapter-tests:
+    name: spin adapter tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-spin-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-spin-
+
+      - name: Retrieve Rust version
+        id: rust-version-spin
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version-spin.outputs.rust-version }}
+
+      - name: Add wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Run Spin adapter native tests
+        run: cargo test -p edgezero-adapter-spin --features spin
+
+      - name: Check Spin wasm32 compilation
+        run: cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
