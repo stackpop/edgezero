@@ -16,15 +16,19 @@ mod response;
 pub use config_store::SpinConfigStore;
 pub use context::SpinRequestContext;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-mod secret_store;
+mod key_value_store;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use secret_store::SpinSecretStore;
+pub use key_value_store::SpinKvStore;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+mod secret_store;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use proxy::SpinProxyClient;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use request::{dispatch, into_core_request};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use response::from_core_response;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub use secret_store::SpinSecretStore;
 
 /// Initialize the logger for Spin.
 ///
