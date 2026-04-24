@@ -4,18 +4,15 @@ use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 
 /// Config store backed by Spin component variables.
 pub struct SpinConfigStore {
-    inner: SpinConfigInner,
+    inner: SpinConfigBackend,
 }
 
-enum SpinConfigInner {
+enum SpinConfigBackend {
     #[cfg(target_arch = "wasm32")]
     Spin,
     #[cfg(test)]
     InMemory(std::collections::HashMap<String, String>),
-    /// Placeholder variant for non-wasm32, non-test builds.
-    ///
-    /// This variant is never constructed; it exists solely to keep the enum
-    /// inhabited so that `match` arms compile without `unreachable!()` noise.
+    /// Never constructed; keeps the enum inhabited in non-wasm32, non-test builds.
     #[cfg(not(any(target_arch = "wasm32", test)))]
     _Uninhabited(std::convert::Infallible),
 }
@@ -25,14 +22,14 @@ impl SpinConfigStore {
     #[cfg(target_arch = "wasm32")]
     pub fn new() -> Self {
         Self {
-            inner: SpinConfigInner::Spin,
+            inner: SpinConfigBackend::Spin,
         }
     }
 
     #[cfg(test)]
     fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
-            inner: SpinConfigInner::InMemory(entries.into_iter().collect()),
+            inner: SpinConfigBackend::InMemory(entries.into_iter().collect()),
         }
     }
 }
@@ -49,7 +46,7 @@ impl ConfigStore for SpinConfigStore {
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
             #[cfg(target_arch = "wasm32")]
-            SpinConfigInner::Spin => {
+            SpinConfigBackend::Spin => {
                 use spin_sdk::variables;
                 match variables::get(key) {
                     Ok(value) => Ok(Some(value)),
@@ -61,9 +58,9 @@ impl ConfigStore for SpinConfigStore {
                 }
             }
             #[cfg(test)]
-            SpinConfigInner::InMemory(data) => Ok(data.get(key).cloned()),
+            SpinConfigBackend::InMemory(data) => Ok(data.get(key).cloned()),
             #[cfg(not(any(target_arch = "wasm32", test)))]
-            SpinConfigInner::_Uninhabited(never) => match *never {},
+            SpinConfigBackend::_Uninhabited(never) => match *never {},
         }
     }
 }

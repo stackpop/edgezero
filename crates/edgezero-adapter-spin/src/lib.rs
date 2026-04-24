@@ -11,7 +11,6 @@ mod proxy;
 mod request;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod response;
-#[cfg(feature = "spin")]
 pub mod config_store;
 
 pub use context::SpinRequestContext;
@@ -21,7 +20,6 @@ pub use proxy::SpinProxyClient;
 pub use request::{dispatch, into_core_request};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use response::from_core_response;
-#[cfg(feature = "spin")]
 pub use config_store::SpinConfigStore;
 
 /// Initialize the logger for Spin.
