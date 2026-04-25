@@ -15,6 +15,8 @@ use walkdir::WalkDir;
 
 const TARGET_TRIPLE: &str = "wasm32-unknown-unknown";
 
+/// # Errors
+/// Returns an error if the Cloudflare wrangler build command fails.
 pub fn build() -> Result<PathBuf, String> {
     let manifest = find_wrangler_manifest(
         std::env::current_dir()
@@ -56,6 +58,8 @@ pub fn build() -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// # Errors
+/// Returns an error if the Cloudflare wrangler deploy command fails.
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest = find_wrangler_manifest(
         std::env::current_dir()
@@ -82,6 +86,8 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// # Errors
+/// Returns an error if the Cloudflare wrangler dev command fails.
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest = find_wrangler_manifest(
         std::env::current_dir()

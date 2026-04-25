@@ -28,6 +28,9 @@ impl FastlyKvStore {
     /// Open a Fastly KV Store by name.
     ///
     /// Returns `KvError::Unavailable` if the store does not exist.
+    ///
+    /// # Errors
+    /// Returns [`KvError::Internal`] if the named KV store cannot be opened.
     pub fn open(name: &str) -> Result<Self, KvError> {
         let store = fastly::kv_store::KVStore::open(name)
             .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?

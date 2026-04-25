@@ -27,6 +27,8 @@ pub use response::from_core_response;
 /// `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` /
 /// `#[cfg(not(...))]` branches following the Fastly/Cloudflare pattern.
 // TODO: wire in real Spin logger when available
+/// # Errors
+/// Returns [`log::SetLoggerError`] if a global logger is already installed.
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }

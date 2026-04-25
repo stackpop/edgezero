@@ -17,6 +17,8 @@ impl PathParams {
         self.inner.get(key).map(std::string::String::as_str)
     }
 
+    /// # Errors
+    /// Returns [`serde_json::Error`] if the path parameters cannot be deserialized into `T`.
     pub fn deserialize<T>(&self) -> Result<T, serde_json::Error>
     where
         T: DeserializeOwned,

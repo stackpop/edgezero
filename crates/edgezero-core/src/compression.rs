@@ -11,6 +11,10 @@ use futures_util::TryStreamExt as _;
 const BUFFER_SIZE: usize = 8 * 1024;
 
 /// Decode a stream of gzip-compressed chunks into plain bytes.
+///
+/// # Panics
+/// Cannot panic on caller-controlled input. The internal slice access is
+/// proven safe by the `AsyncRead::read` contract (always returns ≤ `buffer.len()`).
 pub fn decode_gzip_stream<S>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>>
 where
     S: TryStream<Ok = Vec<u8>, Error = io::Error> + Unpin,
@@ -36,6 +40,10 @@ where
 }
 
 /// Decode a stream of brotli-compressed chunks into plain bytes.
+///
+/// # Panics
+/// Cannot panic on caller-controlled input. The internal slice access is
+/// proven safe by the `AsyncRead::read` contract (always returns ≤ `buffer.len()`).
 pub fn decode_brotli_stream<S>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>>
 where
     S: TryStream<Ok = Vec<u8>, Error = io::Error> + Unpin,

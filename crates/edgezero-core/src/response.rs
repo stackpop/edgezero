@@ -68,6 +68,9 @@ where
     }
 }
 
+/// # Panics
+/// Panics if the supplied [`StatusCode`] cannot be set on the internal builder —
+/// not possible since `StatusCode` values are always valid by construction.
 pub fn response_with_body(status: StatusCode, body: Body) -> Response {
     use crate::http::response_builder;
 

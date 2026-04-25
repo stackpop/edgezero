@@ -408,6 +408,9 @@ impl KvHandle {
     /// Get a value by key, deserializing from JSON.
     ///
     /// Returns `Ok(None)` if the key does not exist.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the lookup fails or the stored bytes cannot be deserialized into `T`.
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, KvError> {
         Self::validate_key(key)?;
         match self.store.get_bytes(key).await? {
@@ -420,11 +423,17 @@ impl KvHandle {
     }
 
     /// Get a value by key, returning `default` if the key does not exist.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the lookup fails or the stored bytes cannot be deserialized into `T`.
     pub async fn get_or<T: DeserializeOwned>(&self, key: &str, default: T) -> Result<T, KvError> {
         Ok(self.get(key).await?.unwrap_or(default))
     }
 
     /// Put a value, serializing it to JSON.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the value cannot be serialized or the backend rejects the write.
     pub async fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<(), KvError> {
         Self::validate_key(key)?;
         let bytes = serde_json::to_vec(value)?;
@@ -433,6 +442,9 @@ impl KvHandle {
     }
 
     /// Put a value with a TTL, serializing it to JSON.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the value cannot be serialized or the backend rejects the write.
     pub async fn put_with_ttl<T: Serialize>(
         &self,
         key: &str,
@@ -460,6 +472,9 @@ impl KvHandle {
     /// calls to the backend. Concurrent calls on the same key may cause
     /// lost writes. Use this only when eventual consistency is acceptable
     /// (e.g., approximate counters).
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if any of the read, mutate, or write steps fail.
     pub async fn read_modify_write<T, F>(&self, key: &str, default: T, f: F) -> Result<T, KvError>
     where
         T: DeserializeOwned + Serialize,
@@ -475,12 +490,18 @@ impl KvHandle {
     // -- Raw bytes ----------------------------------------------------------
 
     /// Get raw bytes for a key.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the backend lookup fails.
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         Self::validate_key(key)?;
         self.store.get_bytes(key).await
     }
 
     /// Put raw bytes for a key.
+    ///
+    /// # Errors
+    /// Returns [`KvError::Validation`] for invalid keys or oversized values; [`KvError::Internal`] on backend failure.
     pub async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         Self::validate_key(key)?;
         Self::validate_value(&value)?;
@@ -488,6 +509,9 @@ impl KvHandle {
     }
 
     /// Put raw bytes with a TTL.
+    ///
+    /// # Errors
+    /// Returns [`KvError::Validation`] for invalid input; [`KvError::Internal`] on backend failure.
     pub async fn put_bytes_with_ttl(
         &self,
         key: &str,
@@ -503,12 +527,18 @@ impl KvHandle {
     // -- Other operations ---------------------------------------------------
 
     /// Check whether a key exists without deserializing its value.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the backend lookup fails.
     pub async fn exists(&self, key: &str) -> Result<bool, KvError> {
         Self::validate_key(key)?;
         self.store.exists(key).await
     }
 
     /// Delete a key.
+    ///
+    /// # Errors
+    /// Returns [`KvError`] if the backend rejects the delete.
     pub async fn delete(&self, key: &str) -> Result<(), KvError> {
         Self::validate_key(key)?;
         self.store.delete(key).await
@@ -520,6 +550,9 @@ impl KvHandle {
     /// with the same prefix to retrieve the next page. Listings are not atomic
     /// snapshots and may reflect concurrent writes or provider-level eventual
     /// consistency.
+    ///
+    /// # Errors
+    /// Returns [`KvError::Validation`] if `cursor` is malformed or `prefix` exceeds backend limits; [`KvError::Internal`] on backend failure.
     pub async fn list_keys_page(
         &self,
         prefix: &str,

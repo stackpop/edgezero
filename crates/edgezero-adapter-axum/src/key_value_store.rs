@@ -54,7 +54,7 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition}
 use std::time::SystemTime;
 
 /// Table definition for the KV store.
-/// Key: String, Value: (Bytes, Option<expiration_timestamp_millis>)
+/// Key: `String`, Value: `(Bytes, Option<expiration_timestamp_millis>)`
 const KV_TABLE: TableDefinition<&str, (&[u8], Option<u128>)> = TableDefinition::new("kv");
 
 /// Type alias for a writable KV table handle.
@@ -90,6 +90,9 @@ impl PersistentKvStore {
     /// - If the file does not exist, a new database will be initialized
     /// - If the file exists and is a valid redb database, it will be opened with existing data preserved
     /// - If the file exists but is not a valid redb database, returns an error
+    ///
+    /// # Errors
+    /// Returns an error if the database file cannot be opened or initialised (corrupted file, locked by another process, or insufficient permissions).
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, KvError> {
         let db_path = path.as_ref().display().to_string();
         let db = Database::create(path).map_err(|e| {
@@ -129,7 +132,7 @@ impl PersistentKvStore {
         }
     }
 
-    /// Convert SystemTime to milliseconds since UNIX epoch.
+    /// Convert `SystemTime` to milliseconds since UNIX epoch.
     ///
     /// Returns 0 if the time is before UNIX epoch (should never happen in practice).
     fn system_time_to_millis(time: SystemTime) -> u128 {

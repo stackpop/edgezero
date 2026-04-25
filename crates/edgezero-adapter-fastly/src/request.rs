@@ -41,6 +41,8 @@ pub(crate) struct Stores {
 /// be automatically available to handlers via the `Kv` extractor.
 pub const DEFAULT_KV_STORE_NAME: &str = edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 
+/// # Errors
+/// Returns [`EdgeError::Internal`] if the Fastly request cannot be reconstituted into a core request (e.g., method or URI conversion failure).
 pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
     let method = req.get_method().clone();
     let uri = parse_uri(req.get_url_str())?;
@@ -82,6 +84,8 @@ pub(crate) fn dispatch_raw(app: &App, req: FastlyRequest) -> Result<FastlyRespon
 #[deprecated(
     note = "dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
 )]
+/// # Errors
+/// Returns an error if request conversion fails or the underlying handler returns an error.
 pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
     dispatch_raw(app, req)
 }
@@ -93,6 +97,9 @@ pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyE
 ///
 /// The KV store named [`DEFAULT_KV_STORE_NAME`] is also resolved and injected
 /// (non-required: unavailable stores are silently skipped).
+///
+/// # Errors
+/// Returns an error if request conversion fails or the underlying handler returns an error.
 pub fn dispatch_with_config_handle(
     app: &App,
     req: FastlyRequest,
@@ -117,6 +124,9 @@ pub fn dispatch_with_config_handle(
 ///
 /// The KV store named [`DEFAULT_KV_STORE_NAME`] is also resolved and injected
 /// (non-required: unavailable stores are silently skipped).
+///
+/// # Errors
+/// Returns an error if the named config store cannot be opened or the underlying handler returns an error.
 pub fn dispatch_with_config(
     app: &App,
     req: FastlyRequest,
@@ -146,6 +156,9 @@ pub fn dispatch_with_config(
 /// `kv_required` should be `true` when `[stores.kv]` is explicitly present
 /// in the manifest, causing the request to fail if the store is unavailable
 /// rather than silently degrading.
+///
+/// # Errors
+/// Returns an error if the named KV store cannot be opened or the underlying handler returns an error.
 pub fn dispatch_with_kv(
     app: &App,
     req: FastlyRequest,
@@ -255,6 +268,9 @@ fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Displa
 /// For most applications, prefer [`crate::run_app`] which resolves all stores
 /// from the manifest automatically. Use `dispatch_with_secrets` only when you
 /// need direct control over the dispatch lifecycle without a manifest.
+///
+/// # Errors
+/// Returns an error if the named secret store is required but cannot be opened, or the underlying handler returns an error.
 pub fn dispatch_with_secrets(
     app: &App,
     req: FastlyRequest,
@@ -276,6 +292,9 @@ pub fn dispatch_with_secrets(
 /// For most applications, prefer [`crate::run_app`] which resolves all stores
 /// from the manifest automatically. Use `dispatch_with_kv_and_secrets` only
 /// when you need direct control over the dispatch lifecycle without a manifest.
+///
+/// # Errors
+/// Returns an error if a required store cannot be opened or the underlying handler returns an error.
 pub fn dispatch_with_kv_and_secrets(
     app: &App,
     req: FastlyRequest,

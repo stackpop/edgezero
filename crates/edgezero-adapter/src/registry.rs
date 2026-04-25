@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 
-/// Actions the EdgeZero CLI can request from an adapter implementation.
+/// Actions the `EdgeZero` CLI can request from an adapter implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdapterAction {
     Build,
@@ -9,12 +9,15 @@ pub enum AdapterAction {
     Serve,
 }
 
-/// Interface implemented by adapter crates to integrate with the EdgeZero CLI.
+/// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 pub trait Adapter: Sync + Send {
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
 
     /// Execute the requested action with optional adapter-specific args.
+    ///
+    /// # Errors
+    /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
 }
 
@@ -22,6 +25,10 @@ static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Registers an adapter so it can be discovered by the CLI.
+///
+/// # Panics
+/// Panics if the registry's [`RwLock`] is poisoned (only possible if a previous
+/// registration panicked while holding the write lock — unrecoverable).
 pub fn register_adapter(adapter: &'static dyn Adapter) {
     let mut registry = REGISTRY
         .write()
@@ -30,6 +37,9 @@ pub fn register_adapter(adapter: &'static dyn Adapter) {
 }
 
 /// Looks up an adapter by name.
+///
+/// # Panics
+/// Panics if the registry's [`RwLock`] is poisoned.
 pub fn get_adapter(name: &str) -> Option<&'static dyn Adapter> {
     let registry = REGISTRY
         .read()
@@ -38,6 +48,9 @@ pub fn get_adapter(name: &str) -> Option<&'static dyn Adapter> {
 }
 
 /// Returns the names of all registered adapters.
+///
+/// # Panics
+/// Panics if the registry's [`RwLock`] is poisoned.
 pub fn registered_adapters() -> Vec<String> {
     let registry = REGISTRY
         .read()

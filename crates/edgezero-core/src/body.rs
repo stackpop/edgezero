@@ -80,6 +80,13 @@ impl Body {
     ///
     /// Works for both buffered and streaming variants. Returns an error if
     /// the body exceeds `max_size` bytes.
+    ///
+    /// # Panics
+    /// Internal invariant only: `is_stream` is checked before unwrapping into the
+    /// matching variant. Cannot panic on any caller-controlled input.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::EdgeError::bad_request`] if the body exceeds `max_size` bytes; or [`crate::error::EdgeError::internal`] if the upstream stream errors.
     pub async fn into_bytes_bounded(
         self,
         max_size: usize,
@@ -115,6 +122,8 @@ impl Body {
         Self::from_bytes(text.into().into_bytes())
     }
 
+    /// # Errors
+    /// Returns the underlying [`serde_json::Error`] if `value` cannot be serialized.
     pub fn json<T>(value: &T) -> Result<Self, serde_json::Error>
     where
         T: Serialize,
@@ -122,6 +131,8 @@ impl Body {
         serde_json::to_vec(value).map(Self::from_bytes)
     }
 
+    /// # Errors
+    /// Returns [`serde_json::Error`] if the body is streaming or its bytes are not valid JSON for `T`.
     pub fn to_json<T>(&self) -> Result<T, serde_json::Error>
     where
         T: DeserializeOwned,

@@ -29,6 +29,8 @@ impl<'a> Next<'a> {
         }
     }
 
+    /// # Errors
+    /// Returns whatever error the next middleware or the final handler produces.
     pub async fn run(self, ctx: RequestContext) -> Result<Response, EdgeError> {
         if let Some((head, tail)) = self.middlewares.split_first() {
             head.handle(ctx, Next::new(tail, self.handler)).await

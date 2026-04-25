@@ -33,11 +33,15 @@ pub use request::{
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub use response::from_core_response;
 
+/// # Errors
+/// Returns [`log::SetLoggerError`] if a global logger is already installed.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
 
+/// # Errors
+/// Never; this is a no-op stub on non-wasm targets.
 #[cfg(not(all(feature = "cloudflare", target_arch = "wasm32")))]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
