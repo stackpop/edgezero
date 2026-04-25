@@ -988,10 +988,10 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             h.put("c", &0_i32).await.unwrap();
-            let val = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
-            assert_eq!(val, 1);
-            let val = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
-            assert_eq!(val, 2);
+            let after_first = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
+            assert_eq!(after_first, 1);
+            let after_second = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
+            assert_eq!(after_second, 2);
         });
     }
 
@@ -1132,10 +1132,13 @@ mod tests {
 
     #[test]
     fn unicode_key_roundtrip() {
+        // "日本語キー" — the literal is written as Unicode escapes so the source
+        // file stays ASCII-only. The runtime bytes are identical.
+        const JAPANESE_KEY: &str = "\u{65E5}\u{672C}\u{8A9E}\u{30AD}\u{30FC}";
         let h = handle();
         futures::executor::block_on(async {
-            h.put("日本語キー", &"value").await.unwrap();
-            let val: Option<String> = h.get("日本語キー").await.unwrap();
+            h.put(JAPANESE_KEY, &"value").await.unwrap();
+            let val: Option<String> = h.get(JAPANESE_KEY).await.unwrap();
             assert_eq!(val, Some("value".to_string()));
         });
     }
@@ -1178,23 +1181,23 @@ mod tests {
     fn update_with_struct() {
         let h = handle();
         futures::executor::block_on(async {
-            let val = h
+            let after_first = h
                 .read_modify_write("counter_struct", Counter { count: 0 }, |mut c| {
                     c.count += 10;
                     c
                 })
                 .await
                 .unwrap();
-            assert_eq!(val.count, 10);
+            assert_eq!(after_first.count, 10);
 
-            let val = h
+            let after_second = h
                 .read_modify_write("counter_struct", Counter { count: 0 }, |mut c| {
                     c.count += 5;
                     c
                 })
                 .await
                 .unwrap();
-            assert_eq!(val.count, 15);
+            assert_eq!(after_second.count, 15);
         });
     }
 
@@ -1231,13 +1234,13 @@ mod tests {
     fn validation_rejects_dot_keys() {
         let h = handle();
         futures::executor::block_on(async {
-            let err = h.get::<i32>(".").await.unwrap_err();
-            assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{err}").contains("cannot be exactly"));
+            let single_dot_err = h.get::<i32>(".").await.unwrap_err();
+            assert!(matches!(single_dot_err, KvError::Validation(_)));
+            assert!(format!("{single_dot_err}").contains("cannot be exactly"));
 
-            let err = h.get::<i32>("..").await.unwrap_err();
-            assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{err}").contains("cannot be exactly"));
+            let double_dot_err = h.get::<i32>("..").await.unwrap_err();
+            assert!(matches!(double_dot_err, KvError::Validation(_)));
+            assert!(format!("{double_dot_err}").contains("cannot be exactly"));
         });
     }
 
@@ -1381,13 +1384,13 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             h.put("flex", &42_i32).await.unwrap();
-            let val: i32 = h.get_or("flex", 0).await.unwrap();
-            assert_eq!(val, 42);
+            let int_val: i32 = h.get_or("flex", 0).await.unwrap();
+            assert_eq!(int_val, 42);
 
             // Overwrite with a different type
             h.put("flex", &"now a string").await.unwrap();
-            let val: String = h.get_or("flex", String::new()).await.unwrap();
-            assert_eq!(val, "now a string");
+            let str_val: String = h.get_or("flex", String::new()).await.unwrap();
+            assert_eq!(str_val, "now a string");
         });
     }
 

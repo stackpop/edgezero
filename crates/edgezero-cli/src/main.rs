@@ -300,7 +300,7 @@ serve = "echo serve"
 
     #[test]
     fn ensure_adapter_defined_allows_when_manifest_missing() {
-        ensure_adapter_defined("fastly", None).expect("manifest missing → permissive");
+        ensure_adapter_defined("fastly", None).expect("manifest missing -> permissive");
     }
 
     #[cfg(not(windows))]

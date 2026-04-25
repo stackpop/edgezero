@@ -254,7 +254,7 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
     );
 
     let port = match adapter.get("port").and_then(Value::as_integer) {
-        Some(value) => u16::try_from(value)
+        Some(port_value) => u16::try_from(port_value)
             .ok()
             .filter(|p| *p > 0)
             .ok_or_else(|| {

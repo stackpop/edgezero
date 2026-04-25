@@ -175,9 +175,7 @@ fn collect_adapter_data(
     let mut readme_adapter_crates = String::new();
     let mut readme_adapter_dev = String::new();
 
-    let blueprints = scaffold::registered_blueprints();
-
-    for blueprint in blueprints.iter().copied() {
+    for blueprint in scaffold::registered_blueprints().iter().copied() {
         let crate_name = format!("{}-{}", layout.name, blueprint.crate_suffix);
         let adapter_dir = layout.crates_dir.join(&crate_name);
         std::fs::create_dir_all(&adapter_dir)?;
@@ -185,119 +183,30 @@ fn collect_adapter_data(
             std::fs::create_dir_all(adapter_dir.join(dir_name))?;
         }
 
-        let mut data_entries: Vec<(String, String)> = Vec::new();
-        data_entries.push((format!("proj_{}", blueprint.id), crate_name.clone()));
-        data_entries.push((
-            format!("proj_{}_underscored", blueprint.id),
-            crate_name.replace('-', "_"),
-        ));
-
-        for dep in blueprint.dependencies {
-            let ResolvedDependency {
-                name,
-                workspace_line,
-                crate_line,
-            } = resolve_dep_line(
-                &layout.out_dir,
-                cwd,
-                dep.repo_crate,
-                dep.fallback,
-                dep.features,
-            );
-            workspace_dependencies.entry(name).or_insert(workspace_line);
-            data_entries.push((dep.key.to_string(), crate_line));
-        }
-
         let crate_dir_rel = format!("crates/{crate_name}");
+        let data_entries = blueprint_data_entries(
+            layout,
+            cwd,
+            blueprint,
+            &crate_name,
+            &crate_dir_rel,
+            workspace_dependencies,
+        );
 
-        // Compute the relative path from the adapter crate to the workspace
-        // target directory so templates can reference build artifacts.
-        let depth = crate_dir_rel.matches('/').count() + 1;
-        data_entries.push((
-            format!("target_dir_{}", blueprint.id),
-            format!("{}target", "../".repeat(depth)),
+        manifest_sections.push_str(&render_manifest_section(
+            layout,
+            blueprint,
+            &crate_name,
+            &crate_dir_rel,
         ));
+        append_readme_entries(
+            blueprint,
+            &crate_name,
+            &crate_dir_rel,
+            &mut readme_adapter_crates,
+            &mut readme_adapter_dev,
+        );
 
-        let build_cmd = blueprint
-            .commands
-            .build
-            .replace("{crate}", &crate_name)
-            .replace("{crate_dir}", &crate_dir_rel);
-        let serve_cmd = blueprint
-            .commands
-            .serve
-            .replace("{crate}", &crate_name)
-            .replace("{crate_dir}", &crate_dir_rel);
-        let deploy_cmd = blueprint
-            .commands
-            .deploy
-            .replace("{crate}", &crate_name)
-            .replace("{crate_dir}", &crate_dir_rel);
-
-        let mut manifest_section = String::new();
-        manifest_section.push_str(&format!(
-            "[adapters.{}.adapter]\ncrate = \"crates/{}\"\nmanifest = \"crates/{}/{}\"\n\n",
-            blueprint.id, crate_name, crate_name, blueprint.manifest.manifest_filename,
-        ));
-        manifest_section.push_str(&format!(
-            "[adapters.{}.build]\ntarget = \"{}\"\nprofile = \"{}\"\n",
-            blueprint.id, blueprint.manifest.build_target, blueprint.manifest.build_profile,
-        ));
-        if !blueprint.manifest.build_features.is_empty() {
-            let joined = blueprint
-                .manifest
-                .build_features
-                .iter()
-                .map(|f| format!("\"{f}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            manifest_section.push_str(&format!("features = [{joined}]\n"));
-        }
-        manifest_section.push('\n');
-        manifest_section.push_str(&format!(
-            "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n\n",
-            blueprint.id, build_cmd, deploy_cmd, serve_cmd,
-        ));
-
-        manifest_section.push('\n');
-        manifest_section.push_str(&format!("[adapters.{}.logging]\n", blueprint.id));
-        let endpoint = if blueprint.id == "fastly" {
-            Some(format!("{}_log", layout.project_mod))
-        } else {
-            blueprint.logging.endpoint.map(str::to_owned)
-        };
-        if let Some(endpoint) = endpoint {
-            manifest_section.push_str(&format!("endpoint = \"{endpoint}\"\n"));
-        }
-        manifest_section.push_str(&format!("level = \"{}\"\n", blueprint.logging.level));
-        if let Some(echo_stdout) = blueprint.logging.echo_stdout {
-            manifest_section.push_str(&format!(
-                "echo_stdout = {}\n",
-                if echo_stdout { "true" } else { "false" },
-            ));
-        }
-        manifest_section.push('\n');
-
-        let description = blueprint
-            .readme
-            .description
-            .replace("{display}", blueprint.display_name);
-        readme_adapter_crates.push_str(&format!("- `crates/{crate_name}`: {description}\n"));
-
-        let heading = blueprint
-            .readme
-            .dev_heading
-            .replace("{display}", blueprint.display_name);
-        readme_adapter_dev.push_str(&format!("- {heading}:\n"));
-        for step in blueprint.readme.dev_steps {
-            let formatted = step
-                .replace("{crate}", &crate_name)
-                .replace("{crate_dir}", &crate_dir_rel);
-            readme_adapter_dev.push_str(&format!("  - {formatted}\n"));
-        }
-        readme_adapter_dev.push('\n');
-
-        manifest_sections.push_str(&manifest_section);
         workspace_members.push(format!("  \"crates/{crate_name}\","));
         adapter_ids.push(blueprint.id.to_string());
 
@@ -316,6 +225,147 @@ fn collect_adapter_data(
         readme_adapter_crates,
         readme_adapter_dev,
     })
+}
+
+/// Build the `(key, value)` template-data entries for a single adapter blueprint,
+/// resolving its dependencies and recording them in `workspace_dependencies`.
+fn blueprint_data_entries(
+    layout: &ProjectLayout,
+    cwd: &Path,
+    blueprint: &'static AdapterBlueprint,
+    crate_name: &str,
+    crate_dir_rel: &str,
+    workspace_dependencies: &mut BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut data_entries: Vec<(String, String)> = Vec::new();
+    data_entries.push((format!("proj_{}", blueprint.id), crate_name.to_string()));
+    data_entries.push((
+        format!("proj_{}_underscored", blueprint.id),
+        crate_name.replace('-', "_"),
+    ));
+
+    for dep in blueprint.dependencies {
+        let ResolvedDependency {
+            name,
+            workspace_line,
+            crate_line,
+        } = resolve_dep_line(
+            &layout.out_dir,
+            cwd,
+            dep.repo_crate,
+            dep.fallback,
+            dep.features,
+        );
+        workspace_dependencies.entry(name).or_insert(workspace_line);
+        data_entries.push((dep.key.to_string(), crate_line));
+    }
+
+    // Compute the relative path from the adapter crate to the workspace
+    // target directory so templates can reference build artifacts.
+    let depth = crate_dir_rel.matches('/').count() + 1;
+    data_entries.push((
+        format!("target_dir_{}", blueprint.id),
+        format!("{}target", "../".repeat(depth)),
+    ));
+
+    data_entries
+}
+
+/// Render the `[adapters.<id>.*]` TOML stanza for a single blueprint.
+fn render_manifest_section(
+    layout: &ProjectLayout,
+    blueprint: &'static AdapterBlueprint,
+    crate_name: &str,
+    crate_dir_rel: &str,
+) -> String {
+    let build_cmd = blueprint
+        .commands
+        .build
+        .replace("{crate}", crate_name)
+        .replace("{crate_dir}", crate_dir_rel);
+    let serve_cmd = blueprint
+        .commands
+        .serve
+        .replace("{crate}", crate_name)
+        .replace("{crate_dir}", crate_dir_rel);
+    let deploy_cmd = blueprint
+        .commands
+        .deploy
+        .replace("{crate}", crate_name)
+        .replace("{crate_dir}", crate_dir_rel);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "[adapters.{}.adapter]\ncrate = \"crates/{}\"\nmanifest = \"crates/{}/{}\"\n\n",
+        blueprint.id, crate_name, crate_name, blueprint.manifest.manifest_filename,
+    ));
+    out.push_str(&format!(
+        "[adapters.{}.build]\ntarget = \"{}\"\nprofile = \"{}\"\n",
+        blueprint.id, blueprint.manifest.build_target, blueprint.manifest.build_profile,
+    ));
+    if !blueprint.manifest.build_features.is_empty() {
+        let joined = blueprint
+            .manifest
+            .build_features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("features = [{joined}]\n"));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n\n",
+        blueprint.id, build_cmd, deploy_cmd, serve_cmd,
+    ));
+
+    out.push('\n');
+    out.push_str(&format!("[adapters.{}.logging]\n", blueprint.id));
+    let endpoint = if blueprint.id == "fastly" {
+        Some(format!("{}_log", layout.project_mod))
+    } else {
+        blueprint.logging.endpoint.map(str::to_owned)
+    };
+    if let Some(endpoint) = endpoint {
+        out.push_str(&format!("endpoint = \"{endpoint}\"\n"));
+    }
+    out.push_str(&format!("level = \"{}\"\n", blueprint.logging.level));
+    if let Some(echo_stdout) = blueprint.logging.echo_stdout {
+        out.push_str(&format!(
+            "echo_stdout = {}\n",
+            if echo_stdout { "true" } else { "false" },
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// Append the per-adapter README entries for crates list and dev-step list.
+fn append_readme_entries(
+    blueprint: &'static AdapterBlueprint,
+    crate_name: &str,
+    crate_dir_rel: &str,
+    readme_adapter_crates: &mut String,
+    readme_adapter_dev: &mut String,
+) {
+    let description = blueprint
+        .readme
+        .description
+        .replace("{display}", blueprint.display_name);
+    readme_adapter_crates.push_str(&format!("- `crates/{crate_name}`: {description}\n"));
+
+    let heading = blueprint
+        .readme
+        .dev_heading
+        .replace("{display}", blueprint.display_name);
+    readme_adapter_dev.push_str(&format!("- {heading}:\n"));
+    for step in blueprint.readme.dev_steps {
+        let formatted = step
+            .replace("{crate}", crate_name)
+            .replace("{crate_dir}", crate_dir_rel);
+        readme_adapter_dev.push_str(&format!("  - {formatted}\n"));
+    }
+    readme_adapter_dev.push('\n');
 }
 
 fn build_base_data(

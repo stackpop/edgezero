@@ -203,18 +203,17 @@ mod tests {
     fn stream_handles_identity_and_gzip() {
         let mut plain = fastly::Body::new();
         plain.write_all(b"plain").unwrap();
-        let body = Body::from_stream(transform_stream(fastly_body_stream(plain), None));
-        let collected = collect_body(body);
-        assert_eq!(collected, b"plain");
+        let plain_body = Body::from_stream(transform_stream(fastly_body_stream(plain), None));
+        assert_eq!(collect_body(plain_body), b"plain");
 
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(b"hello gzip").unwrap();
         let compressed = encoder.finish().unwrap();
         let mut gz_body = fastly::Body::new();
         gz_body.write_all(&compressed).unwrap();
-        let body = Body::from_stream(transform_stream(fastly_body_stream(gz_body), Some("gzip")));
-        let collected = collect_body(body);
-        assert_eq!(collected, b"hello gzip");
+        let gzip_body =
+            Body::from_stream(transform_stream(fastly_body_stream(gz_body), Some("gzip")));
+        assert_eq!(collect_body(gzip_body), b"hello gzip");
     }
 
     #[test]

@@ -215,15 +215,15 @@ mod tests {
 
     #[test]
     fn from_stream_maps_errors() {
-        let stream = futures_util::stream::iter(vec![
+        let source = futures_util::stream::iter(vec![
             Ok(Bytes::from_static(b"ok")),
             Err(io::Error::other("boom")),
         ]);
-        let body = Body::from_stream(stream);
-        let mut stream = body.into_stream().expect("stream");
+        let body = Body::from_stream(source);
+        let mut chunks = body.into_stream().expect("stream");
         let (first, second) = block_on(async {
-            let first = stream.next().await.expect("first").expect("ok");
-            let second = stream.next().await.expect("second");
+            let first = chunks.next().await.expect("first").expect("ok");
+            let second = chunks.next().await.expect("second");
             (first, second)
         });
         assert_eq!(first, Bytes::from_static(b"ok"));

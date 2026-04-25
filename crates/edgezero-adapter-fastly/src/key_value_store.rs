@@ -99,11 +99,11 @@ impl KvStore for FastlyKvStore {
         let page = request
             .execute()
             .map_err(|e| KvError::Internal(anyhow::anyhow!("list failed: {e}")))?;
-        let cursor = page.next_cursor().filter(|cursor| !cursor.is_empty());
+        let next_cursor = page.next_cursor().filter(|c| !c.is_empty());
 
         Ok(KvPage {
             keys: page.into_keys(),
-            cursor,
+            cursor: next_cursor,
         })
     }
 }

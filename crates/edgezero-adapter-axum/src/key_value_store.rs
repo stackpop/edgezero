@@ -213,19 +213,19 @@ impl KvStore for PersistentKvStore {
                 // Delete the expired key
                 let write_txn = self.begin_write()?;
                 {
-                    let mut table = Self::open_table(&write_txn)?;
+                    let mut write_table = Self::open_table(&write_txn)?;
                     // Re-check expiry inside write txn to avoid TOCTOU race:
                     // a concurrent put_bytes may have overwritten the key with
                     // a fresh value between our read and this write.
-                    let still_expired = table
+                    let still_expired = write_table
                         .get(key)
                         .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
-                        .is_some_and(|entry| {
-                            let (_, exp) = entry.value();
+                        .is_some_and(|fresh_entry| {
+                            let (_, exp) = fresh_entry.value();
                             Self::is_expired(exp)
                         });
                     if still_expired {
-                        table.remove(key).map_err(|e| {
+                        write_table.remove(key).map_err(|e| {
                             KvError::Internal(anyhow::anyhow!("failed to remove: {e}"))
                         })?;
                     }
@@ -315,15 +315,15 @@ impl KvStore for PersistentKvStore {
 
                 let mut iter = if prefix.is_empty() {
                     match scan_cursor.as_deref() {
-                        Some(cursor) => {
-                            table.range::<&str>((Bound::Excluded(cursor), Bound::Unbounded))
+                        Some(scan_from) => {
+                            table.range::<&str>((Bound::Excluded(scan_from), Bound::Unbounded))
                         }
                         None => table.iter(),
                     }
                 } else {
                     match scan_cursor.as_deref() {
-                        Some(cursor) if cursor >= prefix => {
-                            table.range::<&str>((Bound::Excluded(cursor), Bound::Unbounded))
+                        Some(scan_from) if scan_from >= prefix => {
+                            table.range::<&str>((Bound::Excluded(scan_from), Bound::Unbounded))
                         }
                         _ => table.range(prefix..),
                     }
@@ -584,8 +584,8 @@ mod tests {
 
         // Reopen and verify data persists
         {
-            let store = PersistentKvStore::new(&db_path).unwrap();
-            let value = store.get_bytes("persistent").await.unwrap();
+            let reopened = PersistentKvStore::new(&db_path).unwrap();
+            let value = reopened.get_bytes("persistent").await.unwrap();
             assert_eq!(value, Some(Bytes::from("value")));
         }
     }

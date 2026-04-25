@@ -119,10 +119,6 @@ pub_with_shorthand = "allow"             # using `pub(crate)` (vs `pub(in crate)
 # Style choices held intentionally:
 format_push_string = "allow"             # `push_str(&format!(...))` chosen over `write!(s, ...).unwrap()` (no panic on OOM)
 shadow_reuse = "allow"                   # `let x = x.into()` etc. is idiomatic
-shadow_unrelated = "allow"               # remaining 5 sites case-by-case in tests
-similar_names = "allow"                  # 4 sites; lint flags any prefix-shared pair
-non_ascii_literal = "allow"              # 2 sites; intentional Unicode in test fixtures
-too_many_lines = "allow"                 # 2 sites; configurable threshold
 arbitrary_source_item_ordering = "allow" # alphabetical re-sort across 541 sites adds churn, not readability
 module_name_repetitions = "allow"        # `edgezero_core::CoreError` is clearer than `Error` in cross-crate use
 
