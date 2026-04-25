@@ -14,7 +14,7 @@ impl PathParams {
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.inner.get(key).map(|s| s.as_str())
+        self.inner.get(key).map(std::string::String::as_str)
     }
 
     pub fn deserialize<T>(&self) -> Result<T, serde_json::Error>

@@ -186,7 +186,7 @@ impl RouterBuilder {
                         handler: listing_handler.into_handler(),
                     },
                 )
-                .unwrap_or_else(|err| panic!("duplicate route definition for {}: {}", path, err));
+                .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
         }
 
         RouterService::new(self.routes, self.middlewares, route_index)
@@ -205,7 +205,7 @@ impl RouterBuilder {
                     handler: handler.into_handler(),
                 },
             )
-            .unwrap_or_else(|err| panic!("duplicate route definition for {}: {}", path, err));
+            .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
 
         self.route_info
             .push(RouteInfo::new(method, path.to_string()));
@@ -543,7 +543,7 @@ mod tests {
                 .id
                 .parse::<u32>()
                 .map_err(|_e| EdgeError::bad_request("invalid id"))?;
-            Ok(format!("hello {}", id))
+            Ok(format!("hello {id}"))
         }
 
         let service = RouterService::builder().get("/items/{id}", handler).build();

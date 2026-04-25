@@ -268,20 +268,20 @@ mod tests {
     #[test]
     fn debug_formats_both_body_variants() {
         let buffered = Body::from("payload");
-        let buffered_debug = format!("{:?}", buffered);
+        let buffered_debug = format!("{buffered:?}");
         assert!(buffered_debug.contains("Body::Once"));
 
         let stream = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
             b"chunk",
         )]));
-        let stream_debug = format!("{:?}", stream);
+        let stream_debug = format!("{stream:?}");
         assert!(stream_debug.contains("Body::Stream"));
     }
 
     #[test]
     fn from_vec_u8_builds_buffered_body() {
-        let body = Body::from(vec![1u8, 2u8, 3u8]);
-        assert_eq!(body.as_bytes().expect("buffered"), &[1u8, 2u8, 3u8]);
+        let body = Body::from(vec![1_u8, 2_u8, 3_u8]);
+        assert_eq!(body.as_bytes().expect("buffered"), &[1_u8, 2_u8, 3_u8]);
     }
 
     #[test]

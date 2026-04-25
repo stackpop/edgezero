@@ -304,7 +304,7 @@ impl KvHandle {
                 "key cannot be exactly '.' or '..'".to_string(),
             ));
         }
-        if key.chars().any(|c| c.is_control()) {
+        if key.chars().any(char::is_control) {
             return Err(KvError::Validation(
                 "key contains invalid control characters".to_string(),
             ));
@@ -326,14 +326,12 @@ impl KvHandle {
     fn validate_ttl(ttl: Duration) -> Result<(), KvError> {
         if ttl < Self::MIN_TTL {
             return Err(KvError::Validation(format!(
-                "TTL {:?} is less than minimum of at least 60 seconds",
-                ttl
+                "TTL {ttl:?} is less than minimum of at least 60 seconds"
             )));
         }
         if ttl > Self::MAX_TTL {
             return Err(KvError::Validation(format!(
-                "TTL {:?} exceeds maximum of 1 year",
-                ttl
+                "TTL {ttl:?} exceeds maximum of 1 year"
             )));
         }
         Ok(())
@@ -347,7 +345,7 @@ impl KvHandle {
                 Self::MAX_KEY_SIZE
             )));
         }
-        if prefix.chars().any(|c| c.is_control()) {
+        if prefix.chars().any(char::is_control) {
             return Err(KvError::Validation(
                 "prefix contains invalid control characters".to_string(),
             ));
@@ -956,10 +954,10 @@ mod tests {
     fn update_increments_counter() {
         let h = handle();
         futures::executor::block_on(async {
-            h.put("c", &0i32).await.unwrap();
-            let val = h.read_modify_write("c", 0i32, |n| n + 1).await.unwrap();
+            h.put("c", &0_i32).await.unwrap();
+            let val = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
             assert_eq!(val, 1);
-            let val = h.read_modify_write("c", 0i32, |n| n + 1).await.unwrap();
+            let val = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
             assert_eq!(val, 2);
         });
     }
@@ -968,7 +966,7 @@ mod tests {
     fn update_uses_default_when_missing() {
         let h = handle();
         futures::executor::block_on(async {
-            let val = h.read_modify_write("new", 10i32, |n| n * 2).await.unwrap();
+            let val = h.read_modify_write("new", 10_i32, |n| n * 2).await.unwrap();
             assert_eq!(val, 20);
         });
     }
@@ -1016,10 +1014,10 @@ mod tests {
     fn list_keys_page_roundtrip() {
         let h = handle();
         futures::executor::block_on(async {
-            h.put("app/a", &1i32).await.unwrap();
-            h.put("app/b", &2i32).await.unwrap();
-            h.put("app/c", &3i32).await.unwrap();
-            h.put("other/d", &4i32).await.unwrap();
+            h.put("app/a", &1_i32).await.unwrap();
+            h.put("app/b", &2_i32).await.unwrap();
+            h.put("app/c", &3_i32).await.unwrap();
+            h.put("other/d", &4_i32).await.unwrap();
 
             let first = h.list_keys_page("app/", None, 2).await.unwrap();
             assert_eq!(first.keys, vec!["app/a".to_string(), "app/b".to_string()]);
@@ -1081,7 +1079,7 @@ mod tests {
         let h1 = handle();
         let h2 = h1.clone();
         futures::executor::block_on(async {
-            h1.put("shared", &42i32).await.unwrap();
+            h1.put("shared", &42_i32).await.unwrap();
             let val: i32 = h2.get_or("shared", 0).await.unwrap();
             assert_eq!(val, 42);
         });
@@ -1095,7 +1093,7 @@ mod tests {
         futures::executor::block_on(async {
             let err = h.put("", &"empty key").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("cannot be empty"));
+            assert!(format!("{err}").contains("cannot be empty"));
         });
     }
 
@@ -1179,7 +1177,7 @@ mod tests {
     #[test]
     fn kv_handle_debug_output() {
         let h = handle();
-        let debug = format!("{:?}", h);
+        let debug = format!("{h:?}");
         assert!(debug.contains("KvHandle"));
     }
 
@@ -1192,7 +1190,7 @@ mod tests {
             let long_key = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
             let err = h.get::<i32>(&long_key).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("key length"));
+            assert!(format!("{err}").contains("key length"));
         });
     }
 
@@ -1202,11 +1200,11 @@ mod tests {
         futures::executor::block_on(async {
             let err = h.get::<i32>(".").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("cannot be exactly"));
+            assert!(format!("{err}").contains("cannot be exactly"));
 
             let err = h.get::<i32>("..").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("cannot be exactly"));
+            assert!(format!("{err}").contains("cannot be exactly"));
         });
     }
 
@@ -1216,7 +1214,7 @@ mod tests {
         futures::executor::block_on(async {
             let err = h.get::<i32>("key\nwith\nnewline").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("control characters"));
+            assert!(format!("{err}").contains("control characters"));
         });
     }
 
@@ -1224,13 +1222,13 @@ mod tests {
     fn validation_rejects_large_values() {
         let h = handle();
         futures::executor::block_on(async {
-            let large_val = vec![0u8; KvHandle::MAX_VALUE_SIZE + 1];
+            let large_val = vec![0_u8; KvHandle::MAX_VALUE_SIZE + 1];
             let err = h
                 .put_bytes("large", Bytes::from(large_val))
                 .await
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("value size"));
+            assert!(format!("{err}").contains("value size"));
         });
     }
 
@@ -1243,7 +1241,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("at least 60 seconds"));
+            assert!(format!("{err}").contains("at least 60 seconds"));
         });
     }
 
@@ -1256,7 +1254,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("exceeds maximum"));
+            assert!(format!("{err}").contains("exceeds maximum"));
         });
     }
 
@@ -1266,7 +1264,7 @@ mod tests {
         futures::executor::block_on(async {
             let err = h.list_keys_page("", None, 0).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("greater than zero"));
+            assert!(format!("{err}").contains("greater than zero"));
         });
     }
 
@@ -1279,7 +1277,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("list limit"));
+            assert!(format!("{err}").contains("list limit"));
         });
     }
 
@@ -1290,7 +1288,7 @@ mod tests {
             let prefix = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
             let err = h.list_keys_page(&prefix, None, 1).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("prefix length"));
+            assert!(format!("{err}").contains("prefix length"));
         });
     }
 
@@ -1300,7 +1298,7 @@ mod tests {
         futures::executor::block_on(async {
             let err = h.list_keys_page("bad\nprefix", None, 1).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("control characters"));
+            assert!(format!("{err}").contains("control characters"));
         });
     }
 
@@ -1313,7 +1311,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("cursor"));
+            assert!(format!("{err}").contains("cursor"));
         });
     }
 
@@ -1321,8 +1319,8 @@ mod tests {
     fn validation_rejects_cursor_for_different_prefix() {
         let h = handle();
         futures::executor::block_on(async {
-            h.put("app/a", &1i32).await.unwrap();
-            h.put("app/b", &2i32).await.unwrap();
+            h.put("app/a", &1_i32).await.unwrap();
+            h.put("app/b", &2_i32).await.unwrap();
 
             let page = h.list_keys_page("app/", None, 1).await.unwrap();
             let err = h
@@ -1330,7 +1328,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
-            assert!(format!("{}", err).contains("requested prefix"));
+            assert!(format!("{err}").contains("requested prefix"));
         });
     }
 
@@ -1349,7 +1347,7 @@ mod tests {
     fn put_overwrite_changes_type() {
         let h = handle();
         futures::executor::block_on(async {
-            h.put("flex", &42i32).await.unwrap();
+            h.put("flex", &42_i32).await.unwrap();
             let val: i32 = h.get_or("flex", 0).await.unwrap();
             assert_eq!(val, 42);
 

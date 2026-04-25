@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn config_store_handle_debug_output() {
         let h = handle(&[]);
-        let debug = format!("{:?}", h);
+        let debug = format!("{h:?}");
         assert!(debug.contains("ConfigStoreHandle"));
     }
 

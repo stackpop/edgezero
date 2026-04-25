@@ -44,7 +44,7 @@ fn build_fastly_request(method: Method, uri: &Uri, headers: HeaderMap) -> Fastly
     let mut fastly_request = FastlyRequest::new(method.clone(), uri.to_string());
     fastly_request.set_method(method);
 
-    for (name, value) in headers.iter() {
+    for (name, value) in &headers {
         if name.as_str().eq_ignore_ascii_case("host") {
             continue;
         }
@@ -99,10 +99,10 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
         (None, false) => 80,
     };
 
-    let host_with_port = format!("{}:{}", host, target_port);
+    let host_with_port = format!("{host}:{target_port}");
 
     // Human-readable name: backend_{scheme}_{host}_{port} with dots/colons sanitised
-    let name_base = format!("{}_{}_{}", scheme, host, target_port);
+    let name_base = format!("{scheme}_{host}_{target_port}");
     let backend_name = format!("{}{}", BACKEND_PREFIX, name_base.replace(['.', ':'], "_"));
 
     let mut builder = Backend::builder(&backend_name, &host_with_port)
@@ -116,29 +116,22 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
             .enable_ssl()
             .sni_hostname(host)
             .check_certificate(host);
-        log::debug!("enable ssl for backend: {}", backend_name);
+        log::debug!("enable ssl for backend: {backend_name}");
     }
 
     match builder.finish() {
         Ok(_) => {
-            log::debug!(
-                "created dynamic backend: {} -> {}",
-                backend_name,
-                host_with_port
-            );
+            log::debug!("created dynamic backend: {backend_name} -> {host_with_port}");
             Ok(backend_name)
         }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("NameInUse") || msg.contains("already in use") {
-                log::debug!("reusing existing dynamic backend: {}", backend_name);
+                log::debug!("reusing existing dynamic backend: {backend_name}");
                 Ok(backend_name)
             } else {
                 Err(EdgeError::internal(anyhow!(
-                    "dynamic backend creation failed ({} -> {}): {}",
-                    backend_name,
-                    host_with_port,
-                    msg
+                    "dynamic backend creation failed ({backend_name} -> {host_with_port}): {msg}"
                 )))
             }
         }
@@ -159,7 +152,7 @@ fn convert_response(fastly_response: &mut FastlyResponse) -> ProxyResponse {
         .headers()
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase());
+        .map(str::to_ascii_lowercase);
 
     let body = fastly_response.take_body();
 
@@ -228,10 +221,9 @@ mod tests {
     #[test]
     fn stream_handles_brotli() {
         let mut compressed = Vec::new();
-        {
-            let mut compressor = CompressorWriter::new(&mut compressed, 4096, 5, 21);
-            compressor.write_all(b"hello brotli").unwrap();
-        }
+        let mut compressor = CompressorWriter::new(&mut compressed, 4096, 5, 21);
+        compressor.write_all(b"hello brotli").unwrap();
+        drop(compressor);
 
         let mut br_body = fastly::Body::new();
         br_body.write_all(&compressed).unwrap();

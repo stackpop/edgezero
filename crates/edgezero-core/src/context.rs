@@ -44,7 +44,7 @@ impl RequestContext {
     {
         self.path_params
             .deserialize()
-            .map_err(|err| EdgeError::bad_request(format!("invalid path parameters: {}", err)))
+            .map_err(|err| EdgeError::bad_request(format!("invalid path parameters: {err}")))
     }
 
     pub fn query<T>(&self) -> Result<T, EdgeError>
@@ -53,7 +53,7 @@ impl RequestContext {
     {
         let query = self.request.uri().query().unwrap_or("");
         serde_urlencoded::from_str(query)
-            .map_err(|err| EdgeError::bad_request(format!("invalid query string: {}", err)))
+            .map_err(|err| EdgeError::bad_request(format!("invalid query string: {err}")))
     }
 
     pub fn json<T>(&self) -> Result<T, EdgeError>
@@ -63,7 +63,7 @@ impl RequestContext {
         self.request
             .body()
             .to_json()
-            .map_err(|err| EdgeError::bad_request(format!("invalid JSON payload: {}", err)))
+            .map_err(|err| EdgeError::bad_request(format!("invalid JSON payload: {err}")))
     }
 
     pub fn body(&self) -> &Body {
@@ -76,7 +76,7 @@ impl RequestContext {
     {
         match self.request.body() {
             Body::Once(bytes) => serde_urlencoded::from_bytes(bytes.as_ref())
-                .map_err(|err| EdgeError::bad_request(format!("invalid form payload: {}", err))),
+                .map_err(|err| EdgeError::bad_request(format!("invalid form payload: {err}"))),
             Body::Stream(_) => Err(EdgeError::bad_request(
                 "streaming bodies are not supported for form extraction",
             )),
@@ -244,7 +244,7 @@ mod tests {
                 name: "demo".into()
             }
         );
-        let debug = format!("{:?}", parsed);
+        let debug = format!("{parsed:?}");
         assert!(debug.contains("demo"));
     }
 

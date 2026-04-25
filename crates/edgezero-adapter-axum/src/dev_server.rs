@@ -171,11 +171,7 @@ fn store_name_slug(store_name: &str) -> String {
     let mut slug = String::with_capacity(MAX_SLUG_LEN);
     let mut last_was_separator = false;
     for ch in store_name.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() {
-            Some(ch.to_ascii_lowercase())
-        } else {
-            None
-        };
+        let mapped = ch.is_ascii_alphanumeric().then(|| ch.to_ascii_lowercase());
 
         match mapped {
             Some(ch) => {
@@ -209,10 +205,10 @@ fn store_name_slug(store_name: &str) -> String {
 
 fn stable_store_name_hash(store_name: &str) -> u64 {
     // Deterministic FNV-1a keeps local KV file names stable across processes.
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in store_name.as_bytes() {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0000_0001_0000_01b3);
     }
     hash
 }
@@ -235,31 +231,28 @@ async fn serve_with_stores(
     enable_ctrl_c: bool,
     stores: Stores,
 ) -> anyhow::Result<()> {
-    let mut service = EdgeZeroAxumService::new(router);
-    if let Some(handle) = stores.config_store {
-        service = service.with_config_store_handle(handle);
-    }
-    if let Some(handle) = stores.kv {
-        service = service.with_kv_handle(handle);
-    }
-    if let Some(handle) = stores.secrets {
-        service = service.with_secret_handle(handle);
-    }
-
-    let service = service;
+    let service = {
+        let mut service = EdgeZeroAxumService::new(router);
+        if let Some(handle) = stores.config_store {
+            service = service.with_config_store_handle(handle);
+        }
+        if let Some(handle) = stores.kv {
+            service = service.with_kv_handle(handle);
+        }
+        if let Some(handle) = stores.secrets {
+            service = service.with_secret_handle(handle);
+        }
+        service
+    };
     let router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
         async move { svc.call(req).await }
     }));
     let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
 
-    let shutdown = if enable_ctrl_c {
-        Some(async {
-            let _ctrl_c = signal::ctrl_c().await;
-        })
-    } else {
-        None
-    };
+    let shutdown = enable_ctrl_c.then_some(async {
+        let _ctrl_c = signal::ctrl_c().await;
+    });
 
     let server = axum::serve(listener, make_service);
     if let Some(shutdown) = shutdown {
@@ -344,14 +337,9 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
             let store = AxumConfigStore::from_env(defaults);
             ConfigStoreHandle::new(std::sync::Arc::new(store))
         });
-        let secret = if has_secret_store {
-            log::info!("Secret store: reading from environment variables");
-            Some(SecretHandle::new(std::sync::Arc::new(
+        let secret = has_secret_store.then(||  { log::info!("Secret store: reading from environment variables"); SecretHandle::new(std::sync::Arc::new(
                 crate::secret_store::EnvSecretStore::new(),
-            )))
-        } else {
-            None
-        };
+            )) });
         let stores = Stores {
             config_store: config_store_handle,
             kv: kv_handle,
@@ -369,7 +357,7 @@ mod tests {
     #[test]
     fn default_config_uses_expected_address() {
         let config = AxumDevServerConfig::default();
-        assert_eq!(config.addr.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert_eq!(config.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(config.addr.port(), 8787);
     }
 
@@ -394,7 +382,7 @@ mod tests {
             addr,
             enable_ctrl_c: false,
         };
-        assert_eq!(config.addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert_eq!(config.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(config.addr.port(), 3000);
         assert!(!config.enable_ctrl_c);
     }
@@ -523,7 +511,7 @@ mod integration_tests {
         });
 
         TestServer {
-            base_url: format!("http://{}", addr),
+            base_url: format!("http://{addr}"),
             handle,
             _temp_dir: temp_dir,
         }
@@ -542,8 +530,7 @@ mod integration_tests {
                 Err(err) => {
                     assert!(
                         start.elapsed() < timeout,
-                        "server did not respond before timeout: {}",
-                        err
+                        "server did not respond before timeout: {err}"
                     );
                 }
             }
@@ -653,8 +640,7 @@ mod integration_tests {
                 let err_str = e.to_string();
                 assert!(
                     err_str.contains("bind") || err_str.contains("address"),
-                    "expected bind error, got: {}",
-                    err_str
+                    "expected bind error, got: {err_str}"
                 );
             }
             _ => panic!("expected bind error"),
@@ -667,7 +653,7 @@ mod integration_tests {
     async fn kv_store_persists_across_requests() {
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
             let store = ctx.kv_handle().expect("kv configured");
-            store.put("counter", &42i32).await?;
+            store.put("counter", &42_i32).await?;
             Ok("written")
         }
 
@@ -753,7 +739,7 @@ mod integration_tests {
     async fn kv_store_update_across_requests() {
         async fn increment_handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let kv = ctx.kv_handle().expect("kv configured");
-            let val = kv.read_modify_write("counter", 0i32, |n| n + 1).await?;
+            let val = kv.read_modify_write("counter", 0_i32, |n| n + 1).await?;
             Ok(val.to_string())
         }
 
@@ -765,7 +751,7 @@ mod integration_tests {
         let url = format!("{}/inc", server.base_url);
 
         // Increment 5 times, each should return incremented value
-        for expected in 1..=5i32 {
+        for expected in 1..=5_i32 {
             let resp = send_with_retry(&client, |c| c.post(url.as_str())).await;
             assert_eq!(
                 resp.text().await.unwrap(),
@@ -877,7 +863,7 @@ mod integration_tests {
             let _result = server.run_with_listener(listener).await;
         });
         TestServerSecrets {
-            base_url: format!("http://{}", addr),
+            base_url: format!("http://{addr}"),
             handle,
         }
     }

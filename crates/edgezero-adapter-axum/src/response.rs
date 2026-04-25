@@ -19,7 +19,6 @@ pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
         Body::Stream(stream) => {
             let result = block_on(async {
                 let mut buf = Vec::new();
-                let stream = stream;
                 pin_mut!(stream);
                 while let Some(chunk) = stream.next().await {
                     let bytes = chunk?;

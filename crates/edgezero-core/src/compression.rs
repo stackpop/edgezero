@@ -18,7 +18,7 @@ where
     try_stream! {
         let reader = BufReader::new(stream.into_async_read());
         let mut decoder = GzipDecoder::new(reader);
-        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
 
         loop {
             let read = decoder.read(&mut buffer).await?;
@@ -43,7 +43,7 @@ where
     try_stream! {
         let reader = BufReader::new(stream.into_async_read());
         let mut decoder = BrotliDecoder::new(reader);
-        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut buffer = vec![0_u8; BUFFER_SIZE];
 
         loop {
             let read = decoder.read(&mut buffer).await?;
@@ -90,10 +90,9 @@ mod tests {
     #[test]
     fn decode_brotli_stream_yields_plain_bytes() {
         let mut brotli_bytes = Vec::new();
-        {
-            let mut compressor = CompressorWriter::new(&mut brotli_bytes, 4096, 5, 21);
-            compressor.write_all(b"hello brotli").unwrap();
-        }
+        let mut compressor = CompressorWriter::new(&mut brotli_bytes, 4096, 5, 21);
+        compressor.write_all(b"hello brotli").unwrap();
+        drop(compressor);
 
         let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(brotli_bytes)]);
         let decoded = block_on(async {

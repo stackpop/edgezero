@@ -27,7 +27,7 @@ pub fn init_logger(
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 record.level(),
                 message
-            ))
+            ));
         })
         .chain(Box::new(logger) as Box<dyn log::Log>);
 

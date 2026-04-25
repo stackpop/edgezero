@@ -134,17 +134,14 @@ fn extract_request_context_binding(pat: &Pat) -> syn::Result<Option<Pat>> {
 }
 
 fn path_is_request_context(path: &syn::Path) -> bool {
-    path.segments
-        .last()
-        .map(|segment| {
-            segment.ident == "RequestContext" && matches!(segment.arguments, PathArguments::None)
-        })
-        .unwrap_or(false)
+    path.segments.last().is_some_and(|segment| {
+        segment.ident == "RequestContext" && matches!(segment.arguments, PathArguments::None)
+    })
 }
 
 fn normalize_request_context_patterns(func: &mut ItemFn) -> Result<(), Error> {
     let mut error: Option<Error> = None;
-    for arg in func.sig.inputs.iter_mut() {
+    for arg in &mut func.sig.inputs {
         if let FnArg::Typed(pat_type) = arg {
             if is_request_context_type(&pat_type.ty) {
                 if let Err(err) = normalize_request_context_pat(&mut pat_type.pat) {

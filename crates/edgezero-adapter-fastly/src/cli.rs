@@ -241,13 +241,10 @@ fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
-            path.file_name()
-                .map(|n| n == "fastly.toml")
-                .unwrap_or(false)
+            path.file_name().is_some_and(|n| n == "fastly.toml")
                 && path
                     .parent()
-                    .map(|dir| dir.join("Cargo.toml").exists())
-                    .unwrap_or(false)
+                    .is_some_and(|dir| dir.join("Cargo.toml").exists())
         })
         .collect();
 

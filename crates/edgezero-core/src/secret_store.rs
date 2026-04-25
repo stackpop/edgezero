@@ -218,7 +218,7 @@ pub(crate) fn validate_name(name: &str) -> Result<(), SecretError> {
             MAX_NAME_LEN
         )));
     }
-    if name.chars().any(|c| c.is_control()) {
+    if name.chars().any(char::is_control) {
         return Err(SecretError::Validation(
             "secret name contains invalid control characters".to_string(),
         ));

@@ -21,7 +21,7 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
         }
     }
 
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         fastly_response.set_header(name.as_str(), value.as_bytes());
     }
 
@@ -30,7 +30,7 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
 
 pub fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {
     uri.parse::<Uri>()
-        .map_err(|err| EdgeError::bad_request(format!("invalid request URI: {}", err)))
+        .map_err(|err| EdgeError::bad_request(format!("invalid request URI: {err}")))
 }
 
 #[cfg(test)]

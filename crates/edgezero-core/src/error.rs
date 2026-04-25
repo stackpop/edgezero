@@ -96,9 +96,9 @@ impl EdgeError {
             | EdgeError::ServiceUnavailable { message } => message.clone(),
             EdgeError::NotFound { path } => format!("no route matched path: {path}"),
             EdgeError::MethodNotAllowed { method, allowed } => {
-                format!("method {} not allowed; allowed: {}", method, allowed)
+                format!("method {method} not allowed; allowed: {allowed}")
             }
-            EdgeError::Internal { source } => format!("internal error: {}", source),
+            EdgeError::Internal { source } => format!("internal error: {source}"),
         }
     }
 

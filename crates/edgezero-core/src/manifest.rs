@@ -258,7 +258,7 @@ impl ManifestHttpTrigger {
         if self.methods.is_empty() {
             vec!["GET"]
         } else {
-            self.methods.iter().map(|m| m.as_str()).collect()
+            self.methods.iter().map(HttpMethod::as_str).collect()
         }
     }
 }
@@ -673,8 +673,7 @@ impl<'de> Deserialize<'de> for HttpMethod {
             "OPTIONS" => Ok(Self::Options),
             "HEAD" => Ok(Self::Head),
             other => Err(serde::de::Error::custom(format!(
-                "unsupported HTTP method `{}`",
-                other
+                "unsupported HTTP method `{other}`"
             ))),
         }
     }
@@ -697,8 +696,7 @@ impl<'de> Deserialize<'de> for BodyMode {
             "buffered" => Ok(Self::Buffered),
             "stream" => Ok(Self::Stream),
             other => Err(serde::de::Error::custom(format!(
-                "unsupported body mode `{}`",
-                other
+                "unsupported body mode `{other}`"
             ))),
         }
     }
@@ -756,8 +754,7 @@ impl<'de> Deserialize<'de> for LogLevel {
             "error" => Ok(Self::Error),
             "off" => Ok(Self::Off),
             other => Err(serde::de::Error::custom(format!(
-                "logging level must be trace, debug, info, warn, error, or off (got `{}`)",
-                other
+                "logging level must be trace, debug, info, warn, error, or off (got `{other}`)"
             ))),
         }
     }
@@ -1476,11 +1473,15 @@ name = "SPIN_CONFIG"
         let config = m.manifest().stores.config.as_ref().unwrap();
         let defaults = config.config_store_defaults();
         assert_eq!(
-            defaults.get("feature.checkout").map(|s| s.as_str()),
+            defaults
+                .get("feature.checkout")
+                .map(std::string::String::as_str),
             Some("true")
         );
         assert_eq!(
-            defaults.get("service.timeout_ms").map(|s| s.as_str()),
+            defaults
+                .get("service.timeout_ms")
+                .map(std::string::String::as_str),
             Some("1500")
         );
     }

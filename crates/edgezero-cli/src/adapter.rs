@@ -42,13 +42,11 @@ pub fn execute(
         if available.is_empty() {
             if manifest.is_none() {
                 format!(
-                    "adapter `{}` is not registered in this build. Provide an `edgezero.toml` (or set `EDGEZERO_MANIFEST`) so the CLI can load adapters, or rebuild `edgezero-cli` with the `{adapter_name}` adapter feature enabled.",
-                    adapter_name
+                    "adapter `{adapter_name}` is not registered in this build. Provide an `edgezero.toml` (or set `EDGEZERO_MANIFEST`) so the CLI can load adapters, or rebuild `edgezero-cli` with the `{adapter_name}` adapter feature enabled."
                 )
             } else {
                 format!(
-                    "adapter `{}` is not registered (no adapters available)",
-                    adapter_name
+                    "adapter `{adapter_name}` is not registered (no adapters available)"
                 )
             }
         } else {
@@ -90,19 +88,15 @@ fn run_shell(
         apply_environment(adapter_name, &env, &mut cmd)?;
     }
 
-    let status = cmd.status().map_err(|err| {
-        format!(
-            "failed to run {} command `{}`: {}",
-            action, full_command, err
-        )
-    })?;
+    let status = cmd
+        .status()
+        .map_err(|err| format!("failed to run {action} command `{full_command}`: {err}"))?;
 
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "{} command `{}` exited with status {}",
-            action, full_command, status
+            "{action} command `{full_command}` exited with status {status}"
         ))
     }
 }
@@ -172,14 +166,12 @@ fn manifest_command<'a>(
     adapter_name: &str,
     action: Action,
 ) -> Option<&'a str> {
-    manifest
-        .adapters
-        .get(adapter_name)
-        .and_then(|cfg| match action {
-            Action::Build => cfg.commands.build.as_deref(),
-            Action::Deploy => cfg.commands.deploy.as_deref(),
-            Action::Serve => cfg.commands.serve.as_deref(),
-        })
+    let cfg = manifest.adapters.get(adapter_name)?;
+    match action {
+        Action::Build => cfg.commands.build.as_deref(),
+        Action::Deploy => cfg.commands.deploy.as_deref(),
+        Action::Serve => cfg.commands.serve.as_deref(),
+    }
 }
 
 #[cfg(test)]

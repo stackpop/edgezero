@@ -73,9 +73,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
 fn resolve_manifest_path(relative: String) -> PathBuf {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR env var");
-    let mut path = PathBuf::from(manifest_dir);
-    path.push(relative);
-    path
+    PathBuf::from(manifest_dir).join(relative)
 }
 
 fn build_route_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
@@ -159,13 +157,13 @@ fn parse_handler_path(handler: &str) -> syn::ExprPath {
         let crate_name = env::var("CARGO_PKG_NAME")
             .map(|name| name.replace('-', "_"))
             .unwrap_or_default();
-        if !crate_name.is_empty() && handler_str.starts_with(&(crate_name.clone() + "::")) {
+        if !crate_name.is_empty() && handler_str.starts_with(&format!("{crate_name}::")) {
             handler_str = format!("crate::{}", &handler_str[crate_name.len() + 2..]);
         }
     }
 
     syn::parse_str::<syn::ExprPath>(&handler_str)
-        .unwrap_or_else(|err| panic!("invalid handler path `{}`: {err}", handler))
+        .unwrap_or_else(|err| panic!("invalid handler path `{handler}`: {err}"))
 }
 
 fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> TokenStream2 {

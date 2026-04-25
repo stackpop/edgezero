@@ -44,7 +44,7 @@ impl ProjectLayout {
         println!("[edgezero] creating project at {}", out_dir.display());
 
         let crates_dir = out_dir.join("crates");
-        let core_name = format!("{}-core", name);
+        let core_name = format!("{name}-core");
         let core_dir = crates_dir.join(&core_name);
         std::fs::create_dir_all(core_dir.join("src"))?;
 
@@ -208,7 +208,7 @@ fn collect_adapter_data(
             data_entries.push((dep.key.to_string(), crate_line));
         }
 
-        let crate_dir_rel = format!("crates/{}", crate_name);
+        let crate_dir_rel = format!("crates/{crate_name}");
 
         // Compute the relative path from the adapter crate to the workspace
         // target directory so templates can reference build artifacts.
@@ -248,10 +248,10 @@ fn collect_adapter_data(
                 .manifest
                 .build_features
                 .iter()
-                .map(|f| format!("\"{}\"", f))
+                .map(|f| format!("\"{f}\""))
                 .collect::<Vec<_>>()
                 .join(", ");
-            manifest_section.push_str(&format!("features = [{}]\n", joined));
+            manifest_section.push_str(&format!("features = [{joined}]\n"));
         }
         manifest_section.push('\n');
         manifest_section.push_str(&format!(
@@ -261,10 +261,13 @@ fn collect_adapter_data(
 
         manifest_section.push('\n');
         manifest_section.push_str(&format!("[adapters.{}.logging]\n", blueprint.id));
-        if blueprint.id == "fastly" {
-            manifest_section.push_str(&format!("endpoint = \"{}_log\"\n", layout.project_mod));
-        } else if let Some(endpoint) = blueprint.logging.endpoint {
-            manifest_section.push_str(&format!("endpoint = \"{}\"\n", endpoint));
+        let endpoint = if blueprint.id == "fastly" {
+            Some(format!("{}_log", layout.project_mod))
+        } else {
+            blueprint.logging.endpoint.map(str::to_owned)
+        };
+        if let Some(endpoint) = endpoint {
+            manifest_section.push_str(&format!("endpoint = \"{endpoint}\"\n"));
         }
         manifest_section.push_str(&format!("level = \"{}\"\n", blueprint.logging.level));
         if let Some(echo_stdout) = blueprint.logging.echo_stdout {
@@ -279,23 +282,23 @@ fn collect_adapter_data(
             .readme
             .description
             .replace("{display}", blueprint.display_name);
-        readme_adapter_crates.push_str(&format!("- `crates/{}`: {}\n", crate_name, description));
+        readme_adapter_crates.push_str(&format!("- `crates/{crate_name}`: {description}\n"));
 
         let heading = blueprint
             .readme
             .dev_heading
             .replace("{display}", blueprint.display_name);
-        readme_adapter_dev.push_str(&format!("- {}:\n", heading));
+        readme_adapter_dev.push_str(&format!("- {heading}:\n"));
         for step in blueprint.readme.dev_steps {
             let formatted = step
                 .replace("{crate}", &crate_name)
                 .replace("{crate_dir}", &crate_dir_rel);
-            readme_adapter_dev.push_str(&format!("  - {}\n", formatted));
+            readme_adapter_dev.push_str(&format!("  - {formatted}\n"));
         }
         readme_adapter_dev.push('\n');
 
         manifest_sections.push_str(&manifest_section);
-        workspace_members.push(format!("  \"crates/{}\",", crate_name));
+        workspace_members.push(format!("  \"crates/{crate_name}\","));
         adapter_ids.push(blueprint.id.to_string());
 
         contexts.push(AdapterContext {
@@ -337,7 +340,7 @@ fn build_base_data(
     let adapter_list_str = artifacts
         .adapter_ids
         .iter()
-        .map(|id| format!("\"{}\"", id))
+        .map(|id| format!("\"{id}\""))
         .collect::<Vec<_>>()
         .join(", ");
     data.insert("adapter_list".into(), Value::String(adapter_list_str));
@@ -465,10 +468,7 @@ fn initialize_git_repo(out_dir: &Path) {
             eprintln!("[edgezero] warning: git init exited with status {status}");
         }
         Err(err) => {
-            eprintln!(
-                "[edgezero] warning: failed to initialize git repository: {}",
-                err
-            );
+            eprintln!("[edgezero] warning: failed to initialize git repository: {err}");
         }
     }
 }
@@ -532,7 +532,7 @@ mod tests {
                 .permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&git_path, perms).expect("chmod");
-        }
+        };
 
         let _path_guard = PathOverride::prepend(&bin_dir);
 

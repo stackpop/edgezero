@@ -60,7 +60,7 @@ fn is_json_content_type(value: &HeaderValue) -> bool {
         return false;
     };
 
-    let media_type = raw.split(';').next().map(str::trim).unwrap_or("");
+    let media_type = raw.split(';').next().map_or("", str::trim);
     if media_type.eq_ignore_ascii_case("application/json") {
         return true;
     }
@@ -168,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_json_content_type() {
+    fn json_content_type_detection() {
         assert!(is_json_content_type(&HeaderValue::from_static(
             "application/json"
         )));
