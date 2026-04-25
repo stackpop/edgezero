@@ -84,7 +84,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
             let mut core_request = match into_core_request(req).await {
                 Ok(req) => req,
                 Err(e) => {
-                    let mut err_response = Response::new(AxumBody::from(e.to_string()));
+                    let mut err_response = Response::new(AxumBody::from(e.clone()));
                     *err_response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
 
                     return Ok(err_response);
@@ -179,7 +179,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&body[..], b"injected");
+        assert_eq!(&*body, b"injected");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -216,7 +216,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&body[..], b"injected");
+        assert_eq!(&*body, b"injected");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -243,7 +243,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&body[..], b"has_config=false");
+        assert_eq!(&*body, b"has_config=false");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -285,7 +285,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&body[..], b"injected_value");
+        assert_eq!(&*body, b"injected_value");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -312,6 +312,6 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&body[..], b"has_kv=false");
+        assert_eq!(&*body, b"has_kv=false");
     }
 }

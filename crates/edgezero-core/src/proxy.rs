@@ -144,7 +144,7 @@ impl ProxyResponse {
 
     pub fn into_response(self) -> Response {
         let mut builder = response_builder().status(self.status);
-        for (name, value) in self.headers.iter() {
+        for (name, value) in &self.headers {
             builder = builder.header(name, value);
         }
         builder
@@ -394,7 +394,7 @@ mod tests {
         let mut req = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
         req.headers_mut()
             .insert("x-debug", HeaderValue::from_static("test"));
-        let debug = format!("{:?}", req);
+        let debug = format!("{req:?}");
         assert!(debug.contains("ProxyRequest"));
         assert!(debug.contains("GET"));
         assert!(debug.contains("example.com"));
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn proxy_response_extensions_mut_allows_modification() {
         let mut resp = ProxyResponse::new(StatusCode::OK, Body::empty());
-        resp.extensions_mut().insert(42i32);
+        resp.extensions_mut().insert(42_i32);
         assert_eq!(resp.extensions().get::<i32>(), Some(&42));
     }
 
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn proxy_response_debug_format() {
         let resp = ProxyResponse::new(StatusCode::NOT_FOUND, Body::empty());
-        let debug = format!("{:?}", resp);
+        let debug = format!("{resp:?}");
         assert!(debug.contains("ProxyResponse"));
         assert!(debug.contains("404"));
     }
@@ -581,7 +581,7 @@ mod tests {
         async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
             let mut resp = ProxyResponse::new(StatusCode::OK, Body::empty());
             // Echo back headers with x-echo- prefix
-            for (name, value) in request.headers().iter() {
+            for (name, value) in request.headers() {
                 let echo_name = format!("x-echo-{}", name.as_str());
                 if let Ok(header_name) = echo_name.parse::<http::header::HeaderName>() {
                     resp.headers_mut().insert(header_name, value.clone());

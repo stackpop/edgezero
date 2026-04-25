@@ -564,7 +564,10 @@ mod tests {
 
     #[test]
     fn validated_json_rejects_invalid_payloads() {
-        let body = Body::json(&ValidatedPayload { name: "".into() }).expect("json");
+        let body = Body::json(&ValidatedPayload {
+            name: String::new(),
+        })
+        .expect("json");
         let ctx = ctx(body, PathParams::default());
         let err = block_on(ValidatedJson::<ValidatedPayload>::from_request(&ctx))
             .err()
@@ -600,7 +603,7 @@ mod tests {
     }
 
     fn ctx_with_query(query: &str) -> RequestContext {
-        let uri = format!("/test?{}", query);
+        let uri = format!("/test?{query}");
         let request = request_builder()
             .method(Method::GET)
             .uri(uri)
@@ -1048,14 +1051,14 @@ mod tests {
         let kv = Kv(handle);
 
         // Debug works
-        let debug = format!("{:?}", kv);
+        let debug = format!("{kv:?}");
         assert!(debug.contains("Kv"));
 
         // Deref works
         let _: &KvHandle = &kv;
 
         // into_inner works
-        let _inner: KvHandle = kv.into_inner();
+        let _inner = kv.into_inner();
     }
 
     // -- Secrets extractor --------------------------------------------------

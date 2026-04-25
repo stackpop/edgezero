@@ -62,8 +62,7 @@ impl ConfigStoreMetadata {
         self.adapters
             .iter()
             .find(|entry| entry.adapter.eq_ignore_ascii_case(adapter))
-            .map(|entry| entry.name)
-            .unwrap_or(self.default_name)
+            .map_or(self.default_name, |entry| entry.name)
     }
 }
 

@@ -94,10 +94,8 @@ impl PersistentKvStore {
         let db_path = path.as_ref().to_path_buf();
         let db = Database::create(path).map_err(|e| {
             KvError::Internal(anyhow::anyhow!(
-                "Failed to open KV database at {:?}. If the file is corrupted or locked \
-                 by another process, try deleting it and restarting: {}",
-                db_path,
-                e
+                "Failed to open KV database at {db_path:?}. If the file is corrupted or locked \
+                 by another process, try deleting it and restarting: {e}"
             ))
         })?;
 
@@ -145,17 +143,17 @@ impl PersistentKvStore {
     fn begin_write(&self) -> Result<redb::WriteTransaction, KvError> {
         self.db
             .begin_write()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {}", e)))
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {e}")))
     }
 
-    fn open_table<'txn>(txn: &'txn redb::WriteTransaction) -> Result<KvTable<'txn>, KvError> {
+    fn open_table(txn: &redb::WriteTransaction) -> Result<KvTable<'_>, KvError> {
         txn.open_table(KV_TABLE)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))
     }
 
     fn commit(txn: redb::WriteTransaction) -> Result<(), KvError> {
         txn.commit()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {}", e)))
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {e}")))
     }
 
     fn cleanup_expired_keys(&self, expired_keys: &[String]) -> Result<(), KvError> {
@@ -169,15 +167,15 @@ impl PersistentKvStore {
             for key in expired_keys {
                 let still_expired = table
                     .get(key.as_str())
-                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {}", e)))?
+                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
                     .is_some_and(|entry| {
                         let (_, expires_at) = entry.value();
                         Self::is_expired(expires_at)
                     });
                 if still_expired {
-                    table.remove(key.as_str()).map_err(|e| {
-                        KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
-                    })?;
+                    table
+                        .remove(key.as_str())
+                        .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
                 }
             }
         }
@@ -191,15 +189,15 @@ impl KvStore for PersistentKvStore {
         let read_txn = self
             .db
             .begin_read()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin read txn: {}", e)))?;
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin read txn: {e}")))?;
 
         let table = read_txn
             .open_table(KV_TABLE)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {}", e)))?;
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))?;
 
         if let Some(entry) = table
             .get(key)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {}", e)))?
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
         {
             let (value_bytes, expires_at) = entry.value();
 
@@ -218,16 +216,14 @@ impl KvStore for PersistentKvStore {
                     // a fresh value between our read and this write.
                     let still_expired = table
                         .get(key)
-                        .map_err(|e| {
-                            KvError::Internal(anyhow::anyhow!("failed to get key: {}", e))
-                        })?
+                        .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
                         .is_some_and(|entry| {
                             let (_, exp) = entry.value();
                             Self::is_expired(exp)
                         });
                     if still_expired {
                         table.remove(key).map_err(|e| {
-                            KvError::Internal(anyhow::anyhow!("failed to remove: {}", e))
+                            KvError::Internal(anyhow::anyhow!("failed to remove: {e}"))
                         })?;
                     }
                 }
@@ -244,12 +240,11 @@ impl KvStore for PersistentKvStore {
 
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         let write_txn = self.begin_write()?;
-        {
-            let mut table = Self::open_table(&write_txn)?;
-            table
-                .insert(key, (value.as_ref(), None))
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {}", e)))?;
-        }
+        let mut table = Self::open_table(&write_txn)?;
+        table
+            .insert(key, (value.as_ref(), None))
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
+        drop(table);
         Self::commit(write_txn)
     }
 
@@ -263,23 +258,21 @@ impl KvStore for PersistentKvStore {
         let expires_at_millis = Self::system_time_to_millis(expires_at);
 
         let write_txn = self.begin_write()?;
-        {
-            let mut table = Self::open_table(&write_txn)?;
-            table
-                .insert(key, (value.as_ref(), Some(expires_at_millis)))
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {}", e)))?;
-        }
+        let mut table = Self::open_table(&write_txn)?;
+        table
+            .insert(key, (value.as_ref(), Some(expires_at_millis)))
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
+        drop(table);
         Self::commit(write_txn)
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         let write_txn = self.begin_write()?;
-        {
-            let mut table = Self::open_table(&write_txn)?;
-            table
-                .remove(key)
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {}", e)))?;
-        }
+        let mut table = Self::open_table(&write_txn)?;
+        table
+            .remove(key)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
+        drop(table);
         Self::commit(write_txn)
     }
 
@@ -310,12 +303,12 @@ impl KvStore for PersistentKvStore {
 
             {
                 let read_txn = self.db.begin_read().map_err(|e| {
-                    KvError::Internal(anyhow::anyhow!("failed to begin read txn: {}", e))
+                    KvError::Internal(anyhow::anyhow!("failed to begin read txn: {e}"))
                 })?;
 
-                let table = read_txn.open_table(KV_TABLE).map_err(|e| {
-                    KvError::Internal(anyhow::anyhow!("failed to open table: {}", e))
-                })?;
+                let table = read_txn
+                    .open_table(KV_TABLE)
+                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))?;
 
                 let mut iter = if prefix.is_empty() {
                     match scan_cursor.as_deref() {
@@ -332,7 +325,7 @@ impl KvStore for PersistentKvStore {
                         _ => table.range(prefix..),
                     }
                 }
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to create range: {}", e)))?;
+                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to create range: {e}")))?;
 
                 for _ in 0..Self::LIST_SCAN_BATCH_SIZE {
                     let Some(entry) = iter.next() else {
@@ -341,7 +334,7 @@ impl KvStore for PersistentKvStore {
                     };
 
                     let (key, value) = entry.map_err(|e| {
-                        KvError::Internal(anyhow::anyhow!("failed to read range entry: {}", e))
+                        KvError::Internal(anyhow::anyhow!("failed to read range entry: {e}"))
                     })?;
                     let key = key.value().to_string();
 
@@ -514,9 +507,9 @@ mod tests {
     #[tokio::test]
     async fn update_helper() {
         let (s, _dir) = store();
-        s.put("counter", &0i32).await.unwrap();
+        s.put("counter", &0_i32).await.unwrap();
         let val = s
-            .read_modify_write("counter", 0i32, |n| n + 5)
+            .read_modify_write("counter", 0_i32, |n| n + 5)
             .await
             .unwrap();
         assert_eq!(val, 5);
@@ -547,7 +540,7 @@ mod tests {
         // tokio::spawn is off-limits. Use OS threads instead — KvHandle is
         // Send + Sync, so each thread moves its own clone and runs its own
         // executor. This is genuinely concurrent at the OS level.
-        let threads: Vec<_> = (0..100i32)
+        let threads: Vec<_> = (0..100_i32)
             .map(|i| {
                 let h = handle.clone();
                 std::thread::spawn(move || {
@@ -565,7 +558,7 @@ mod tests {
 
         // Verify all 100 keys survived concurrent writes with correct values.
         futures::executor::block_on(async {
-            for i in 0..100i32 {
+            for i in 0..100_i32 {
                 let key = format!("key:{i}");
                 let val: i32 = handle.get_or(&key, -1).await.unwrap();
                 assert_eq!(val, i, "key:{i} has wrong value after concurrent writes");
@@ -579,13 +572,12 @@ mod tests {
         let db_path = temp_dir.path().join("test.redb");
 
         // Write data
-        {
-            let store = PersistentKvStore::new(&db_path).unwrap();
-            store
-                .put_bytes("persistent", Bytes::from("value"))
-                .await
-                .unwrap();
-        }
+        let store = PersistentKvStore::new(&db_path).unwrap();
+        store
+            .put_bytes("persistent", Bytes::from("value"))
+            .await
+            .unwrap();
+        drop(store);
 
         // Reopen and verify data persists
         {

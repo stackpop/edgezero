@@ -201,9 +201,11 @@ fn warn_missing_once(
     detail: &impl std::fmt::Display,
 ) {
     let set = cache.get_or_init(|| Mutex::new(RecentStringSet::default()));
-    let mut guard = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = set
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if guard.insert(name, WARNED_STORE_CACHE_LIMIT) {
-        log::warn!("{} '{}' not available: {}", item_type, name, detail);
+        log::warn!("{item_type} '{name}' not available: {detail}");
     }
 }
 
@@ -213,7 +215,7 @@ fn warn_missing_store_once(store_name: &str, detail: &str) {
         &WARNED_STORES,
         "configured Fastly config store",
         store_name,
-        &format!("{}; skipping config-store injection", detail),
+        &format!("{detail}; skipping config-store injection"),
     );
 }
 
@@ -330,8 +332,7 @@ pub(crate) fn resolve_kv_handle(
         Err(e) => {
             if kv_required {
                 return Err(FastlyError::msg(format!(
-                    "KV store '{}' is explicitly configured but could not be opened: {}",
-                    kv_store_name, e
+                    "KV store '{kv_store_name}' is explicitly configured but could not be opened: {e}"
                 )));
             }
             warn_missing_kv_store_once(kv_store_name, &e);

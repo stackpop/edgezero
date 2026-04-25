@@ -175,7 +175,7 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("cargo {subcommand} failed with status {}", status))
+        Err(format!("cargo {subcommand} failed with status {status}"))
     }
 }
 
@@ -190,15 +190,12 @@ fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
         .max_depth(8)
         .into_iter()
         .filter_map(Result::ok)
-        .map(|entry| entry.into_path())
+        .map(walkdir::DirEntry::into_path)
         .filter(|path| {
-            path.file_name()
-                .map(|name| name == "axum.toml")
-                .unwrap_or(false)
+            path.file_name().is_some_and(|name| name == "axum.toml")
                 && path
                     .parent()
-                    .map(|dir| dir.join("Cargo.toml").exists())
-                    .unwrap_or(false)
+                    .is_some_and(|dir| dir.join("Cargo.toml").exists())
         })
         .collect();
 
@@ -241,11 +238,8 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
         ));
     }
 
-    let crate_name = adapter
-        .get("crate")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
+    let crate_name = adapter.get("crate").and_then(Value::as_str).map_or_else(
+        || {
             read_package_name(&cargo_manifest).unwrap_or_else(|_| {
                 crate_dir
                     .file_name()
@@ -253,7 +247,9 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
                     .unwrap_or("axum-adapter")
                     .to_string()
             })
-        });
+        },
+        std::string::ToString::to_string,
+    );
 
     let port = match adapter.get("port").and_then(Value::as_integer) {
         Some(value) => u16::try_from(value)
@@ -510,7 +506,7 @@ mod tests {
         .unwrap();
 
         let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.port, 65535);
+        assert_eq!(project.port, 0xFFFF);
     }
 
     #[test]

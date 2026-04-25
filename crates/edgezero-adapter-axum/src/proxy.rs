@@ -29,7 +29,7 @@ impl ProxyClient for AxumProxyClient {
         let reqwest_method = reqwest_method(&method)?;
         let mut builder = self.client.request(reqwest_method, uri.to_string());
 
-        for (name, value) in headers.iter() {
+        for (name, value) in &headers {
             let header_name = header::HeaderName::from_bytes(name.as_str().as_bytes())
                 .map_err(EdgeError::internal)?;
             let header_value =
@@ -54,7 +54,7 @@ impl ProxyClient for AxumProxyClient {
             StatusCode::from_u16(response.status().as_u16()).map_err(EdgeError::internal)?;
         let mut proxy_response = ProxyResponse::new(status, Body::empty());
 
-        for (name, value) in response.headers().iter() {
+        for (name, value) in response.headers() {
             let header_name =
                 HeaderName::from_bytes(name.as_str().as_bytes()).map_err(EdgeError::internal)?;
             let header_value =
@@ -125,7 +125,7 @@ mod integration_tests {
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     #[tokio::test]
@@ -134,7 +134,7 @@ mod integration_tests {
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/test", base_url).parse().unwrap();
+        let uri: Uri = format!("{base_url}/test").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -142,7 +142,7 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"hello from server"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 
@@ -152,7 +152,7 @@ mod integration_tests {
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/echo", base_url).parse().unwrap();
+        let uri: Uri = format!("{base_url}/echo").parse().unwrap();
         let mut request = ProxyRequest::new(Method::POST, uri);
         *request.body_mut() = Body::from("request body data");
 
@@ -161,7 +161,7 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"request body data"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 
@@ -180,7 +180,7 @@ mod integration_tests {
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/headers", base_url).parse().unwrap();
+        let uri: Uri = format!("{base_url}/headers").parse().unwrap();
         let mut request = ProxyRequest::new(Method::GET, uri);
         request
             .headers_mut()
@@ -191,7 +191,7 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"custom-value"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 
@@ -209,7 +209,7 @@ mod integration_tests {
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/with-headers", base_url).parse().unwrap();
+        let uri: Uri = format!("{base_url}/with-headers").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -228,7 +228,7 @@ mod integration_tests {
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/nonexistent", base_url).parse().unwrap();
+        let uri: Uri = format!("{base_url}/nonexistent").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -244,7 +244,7 @@ mod integration_tests {
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/error", base_url).parse().unwrap();
+        let uri: Uri = format!("{base_url}/error").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -270,13 +270,13 @@ mod integration_tests {
             (Method::DELETE, "DELETE"),
             (Method::PATCH, "PATCH"),
         ] {
-            let uri: Uri = format!("{}/method", base_url).parse().unwrap();
+            let uri: Uri = format!("{base_url}/method").parse().unwrap();
             let request = ProxyRequest::new(method, uri);
             let response = client.send(request).await.expect("response");
             assert_eq!(response.status(), StatusCode::OK);
             match response.body() {
                 Body::Once(bytes) => assert_eq!(bytes.as_ref(), expected_body.as_bytes()),
-                _ => panic!("expected buffered body"),
+                Body::Stream(_) => panic!("expected buffered body"),
             }
         }
     }
@@ -306,7 +306,7 @@ mod integration_tests {
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/stream-echo", base_url).parse().unwrap();
+        let uri: Uri = format!("{base_url}/stream-echo").parse().unwrap();
         let mut request = ProxyRequest::new(Method::POST, uri);
 
         // Create a streaming body - Body::stream expects Stream<Item = Bytes>
@@ -323,7 +323,7 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"chunk1chunk2chunk3"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 }

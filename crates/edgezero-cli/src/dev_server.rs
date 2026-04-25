@@ -84,9 +84,8 @@ async fn dev_echo(Path(params): Path<EchoParams>) -> Text<String> {
 }
 
 fn try_run_manifest_axum() -> Result<bool, String> {
-    let manifest = match load_manifest_optional()? {
-        Some(manifest) => manifest,
-        None => return Ok(false),
+    let Some(manifest) = load_manifest_optional()? else {
+        return Ok(false);
     };
 
     if manifest.manifest().adapters.contains_key("axum") {
@@ -100,8 +99,7 @@ fn try_run_manifest_axum() -> Result<bool, String> {
 
 fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
     let path = std::env::var("EDGEZERO_MANIFEST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("edgezero.toml"));
+        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
 
     match ManifestLoader::from_path(&path) {
         Ok(manifest) => Ok(Some(manifest)),

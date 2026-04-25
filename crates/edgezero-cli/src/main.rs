@@ -158,8 +158,7 @@ fn ensure_adapter_defined(
         let available: Vec<String> = manifest.manifest().adapters.keys().cloned().collect();
         if available.is_empty() {
             Err(format!(
-                "adapter `{}` is not configured in edgezero.toml (no adapters defined)",
-                adapter_name
+                "adapter `{adapter_name}` is not configured in edgezero.toml (no adapters defined)"
             ))
         } else {
             Err(format!(
@@ -176,8 +175,7 @@ fn ensure_adapter_defined(
 #[cfg(feature = "cli")]
 fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
     let path = std::env::var("EDGEZERO_MANIFEST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("edgezero.toml"));
+        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
 
     match ManifestLoader::from_path(&path) {
         Ok(loader) => Ok(Some(loader)),
@@ -365,10 +363,10 @@ name = "MY_SECRETS"
     #[test]
     fn store_bindings_message_respects_secret_store_enabled() {
         let loader = ManifestLoader::load_from_str(
-            r#"
+            "
 [stores.secrets]
 enabled = false
-"#,
+",
         );
         assert!(store_bindings_message("fastly", &loader).is_none());
     }

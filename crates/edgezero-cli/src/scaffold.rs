@@ -114,15 +114,12 @@ pub fn resolve_dep_line(
     } else {
         let joined = features
             .iter()
-            .map(|f| format!("\"{}\"", f))
+            .map(|f| format!("\"{f}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        format!(", features = [{}]", joined)
+        format!(", features = [{joined}]")
     };
-    let crate_line = format!(
-        "{} = {{ workspace = true{} }}",
-        crate_name, feature_fragment
-    );
+    let crate_line = format!("{crate_name} = {{ workspace = true{feature_fragment} }}");
 
     ResolvedDependency {
         name: crate_name,

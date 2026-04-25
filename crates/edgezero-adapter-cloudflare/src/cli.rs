@@ -257,13 +257,10 @@ fn find_wrangler_manifest(start: &Path) -> Result<PathBuf, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
-            path.file_name()
-                .map(|n| n == "wrangler.toml")
-                .unwrap_or(false)
+            path.file_name().is_some_and(|n| n == "wrangler.toml")
                 && path
                     .parent()
-                    .map(|dir| dir.join("Cargo.toml").exists())
-                    .unwrap_or(false)
+                    .is_some_and(|dir| dir.join("Cargo.toml").exists())
         })
         .collect();
 
@@ -315,7 +312,6 @@ fn locate_artifact(
     }
 
     Err(format!(
-        "compiled artifact not found for {} (looked in manifest and workspace target directories)",
-        crate_name
+        "compiled artifact not found for {crate_name} (looked in manifest and workspace target directories)"
     ))
 }

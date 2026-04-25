@@ -36,8 +36,7 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
                 })?;
             if decoded.len() > MAX_DECOMPRESSED_SIZE {
                 return Err(EdgeError::internal(anyhow::anyhow!(
-                    "decompressed body exceeds maximum size of {} bytes",
-                    MAX_DECOMPRESSED_SIZE
+                    "decompressed body exceeds maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
                 )));
             }
             Ok(decoded)
@@ -54,8 +53,7 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
                 })?;
             if decoded.len() > MAX_DECOMPRESSED_SIZE {
                 return Err(EdgeError::internal(anyhow::anyhow!(
-                    "decompressed body exceeds maximum size of {} bytes",
-                    MAX_DECOMPRESSED_SIZE
+                    "decompressed body exceeds maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
                 )));
             }
             Ok(decoded)
@@ -94,10 +92,9 @@ mod tests {
     #[test]
     fn decompress_body_handles_brotli() {
         let mut compressed = Vec::new();
-        {
-            let mut compressor = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 21);
-            compressor.write_all(b"hello brotli").unwrap();
-        }
+        let mut compressor = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 21);
+        compressor.write_all(b"hello brotli").unwrap();
+        drop(compressor);
 
         let result = decompress_body(compressed, Some("br")).unwrap();
         assert_eq!(result, b"hello brotli");
@@ -108,7 +105,7 @@ mod tests {
         // Create a gzip payload that decompresses to more than MAX_DECOMPRESSED_SIZE.
         // We compress a stream of zeros which compresses extremely well.
         let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
-        let zeros = vec![0u8; 1024 * 1024]; // 1 MiB chunk
+        let zeros = vec![0_u8; 1024 * 1024]; // 1 MiB chunk
         for _ in 0..65 {
             encoder.write_all(&zeros).unwrap();
         }

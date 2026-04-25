@@ -133,10 +133,7 @@ mod tests {
     #[async_trait(?Send)]
     impl Middleware for RecordingMiddleware {
         async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-            {
-                let mut entries = self.log.lock().unwrap();
-                entries.push(self.name.to_string());
-            }
+            self.log.lock().unwrap().push(self.name.to_string());
             next.run(ctx).await
         }
     }

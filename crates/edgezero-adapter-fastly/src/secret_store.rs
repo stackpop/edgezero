@@ -27,10 +27,7 @@ impl FastlyNamedStore {
     /// is no `ok_or` unwrap here.
     pub fn open(name: &str) -> Result<Self, SecretError> {
         let store = fastly::secret_store::SecretStore::open(name).map_err(|e| {
-            SecretError::Internal(anyhow::anyhow!(
-                "failed to open secret store '{}': {e}",
-                name
-            ))
+            SecretError::Internal(anyhow::anyhow!("failed to open secret store '{name}': {e}"))
         })?;
         Ok(Self { store })
     }

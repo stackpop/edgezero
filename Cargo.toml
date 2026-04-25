@@ -106,48 +106,27 @@ doc_markdown = "allow"                       # 4:   bare identifiers in doc comm
 missing_errors_doc = "allow"                 # 4:   pub fn returning Result missing # Errors section
 missing_fields_in_debug = "allow"            # 4:   manual `Debug` impl skipping fields
 
-# -- Style / formatting (factor out by reformatting) ------------------------
-implicit_return = "allow"                    # 375: trailing-expression returns vs explicit `return` (intentional: idiomatic Rust)
-arbitrary_source_item_ordering = "allow"     # 165: ordering of items within a module (cosmetic)
-module_name_repetitions = "allow"            # 78:  `foo::FooConfig` style names that repeat the module
-min_ident_chars = "allow"                    # 54:  single/two-letter identifiers (e.g., `e`, `id`, `kv`)
-single_call_fn = "allow"                     # 37:  helper fns called from exactly one site (often intentional for clarity)
-unseparated_literal_suffix = "allow"         # 24:  `1u32` vs `1_u32`
-str_to_string = "allow"                      # 18:  `&str::to_string()` vs `String::from`/`.into()`
-shadow_reuse = "allow"                       # 15:  `let x = x.foo();` reusing a binding name
-uninlined_format_args = "allow"              # 13:  `format!("{}", x)` vs `format!("{x}")`
-single_char_lifetime_names = "allow"         # 6:   lifetimes like `'a` (intentional: idiomatic Rust)
-if_then_some_else_none = "allow"             # 6:   `if c { Some(x) } else { None }` vs `c.then(|| x)`
-match_wildcard_for_single_variants = "allow" # 5:   `_ => ...` matching a single remaining variant
-deref_by_slicing = "allow"                   # 5:   `&v[..]` vs `&*v`
-shadow_unrelated = "allow"                   # 5:   `let x = ...; let x = unrelated;`
-redundant_closure_for_method_calls = "allow" # 5:   `.map(|x| x.foo())` vs `.map(Foo::foo)`
-similar_names = "allow"                      # 4:   variables whose names differ only slightly
-unreadable_literal = "allow"                 # 4:   large numeric literals without `_` separators
-shadow_same = "allow"                        # 4:   `let x = x;` rebinding to the same value
-explicit_iter_loop = "allow"                 # 3:   `for x in xs.iter()` vs `for x in &xs`
-pub_with_shorthand = "allow"                 # 3:   `pub(super)` shorthand vs `pub(in super)`
-string_add = "allow"                         # 3:   `s + "..."` operator vs `format!`/`push_str`
-pathbuf_init_then_push = "allow"             # 3:   `PathBuf::new()` then `.push(...)` vs `PathBuf::from(...)`
-map_unwrap_or = "allow"                      # 3:   `.map(...).unwrap_or(...)` vs `.map_or(...)`
-pub_use = "allow"                            # 2:   `pub use` re-exports (intentional in our public API surface)
-semicolon_outside_block = "allow"            # 2:   `{ ... };` placement
-semicolon_if_nothing_returned = "allow"      # 2:   `expr` vs `expr;` at end of a `()` block
-non_ascii_literal = "allow"                  # 2:   non-ASCII characters in string literals
-elidable_lifetime_names = "allow"            # 2:   named lifetime that could use `'_`
-implicit_clone = "allow"                     # 2:   `x.to_owned()` where `.clone()` would do
-ip_constant = "allow"                        # 2:   hand-rolled `Ipv4Addr::new(127,0,0,1)` vs `Ipv4Addr::LOCALHOST`
-manual_let_else = "allow"                    # 2:   `match` / `if let` rewrite as `let ... else`
-too_many_lines = "allow"                     # 2:   fn body exceeding the (configurable) line threshold
-return_and_then = "allow"                    # 2:   `return x.and_then(...)` vs `x?` or `Ok(...)?`
-else_if_without_else = "allow"               # 2:   `if/else if` chain missing a final `else`
-manual_string_new = "allow"                  # 1:   `String::from("")` vs `String::new()`
-redundant_type_annotations = "allow"         # 1:   type annotation that the compiler can infer
-decimal_literal_representation = "allow"     # 1:   `1024` rendered better as `0x400`
-needless_raw_strings = "allow"               # 1:   `r"..."` with no escapes that needs raw-ness
-needless_raw_string_hashes = "allow"         # 1:   `r#"..."#` whose hashes are unnecessary
-format_push_string = "allow"                 # 1:   `s.push_str(&format!(...))` vs `write!`
-redundant_test_prefix = "allow"              # 1:   `fn test_foo()` inside a module already named `tests`
+# -- Style / formatting -----------------------------------------------------
+# Idiomatic Rust — fixing would make code worse:
+implicit_return = "allow"                # contradicts `needless_return`; trailing-expression is canonical
+question_mark_used = "allow"             # `?` is core syntax
+min_ident_chars = "allow"                # `e`, `id`, `i`, `kv`, `ty` are universal
+single_char_lifetime_names = "allow"     # `'a`, `'de`
+single_call_fn = "allow"                 # one-call helpers for clarity
+pub_use = "allow"                        # re-exports are the public-API technique
+str_to_string = "allow"                  # `.to_string()` on `&str`; rustc inlines identically to `String::from`
+# Mutually exclusive lint pairs — pick one side:
+separated_literal_suffix = "allow"       # using `1_u32` form (vs `1u32`)
+pub_with_shorthand = "allow"             # using `pub(crate)` (vs `pub(in crate)`)
+# Style choices held intentionally:
+format_push_string = "allow"             # `push_str(&format!(...))` chosen over `write!(s, ...).unwrap()` (no panic on OOM)
+shadow_reuse = "allow"                   # `let x = x.into()` etc. is idiomatic
+shadow_unrelated = "allow"               # remaining 5 sites case-by-case in tests
+similar_names = "allow"                  # 4 sites; lint flags any prefix-shared pair
+non_ascii_literal = "allow"              # 2 sites; intentional Unicode in test fixtures
+too_many_lines = "allow"                 # 2 sites; configurable threshold
+arbitrary_source_item_ordering = "allow" # alphabetical re-sort across 541 sites adds churn, not readability
+module_name_repetitions = "allow"        # `edgezero_core::CoreError` is clearer than `Error` in cross-crate use
 
 # -- Defensive coding -------------------------------------------------------
 # Test code is exempted via `clippy.toml` (allow-{unwrap,expect,panic,
@@ -156,7 +135,6 @@ redundant_test_prefix = "allow"              # 1:   `fn test_foo()` inside a mod
 # (use `.unwrap()`/`.unwrap_err()` instead — they print the value on failure).
 # Each remaining allow has been audited per-site at least once; the rationale
 # below describes the *category of site* the lint fires on, not just "noise".
-question_mark_used = "allow"                 # (intentional: `?` is core Rust idiom — the whole language design assumes it)
 pattern_type_mismatch = "allow"              # (intentional: every flagged site uses Rust 2018 match-ergonomics — `match &x { Variant(y) => ... }` where `y` is auto-`&T`. The "fix" is to manually write `match x { Variant(ref y) => ... }` or `match &x { &Variant(ref y) => ... }`, both *worse* than current code.)
 default_numeric_fallback = "allow"           # (intentional: requiring `0_u32`/`1.0_f64` on every literal in HTTP routing/parsing code is noise without bug-prevention value)
 arithmetic_side_effects = "allow"            # (audited: every flagged site is bounded by domain invariants — `SystemTime::now() + ttl`, path-component counts, byte offsets after `len()` checks. None can realistically overflow on inputs we accept.)
