@@ -74,7 +74,7 @@ fn run_shell(
     } else {
         format!("{} {}", command, shell_join(adapter_args))
     };
-    println!(
+    log::info!(
         "[edgezero] executing `{}` for adapter `{}` in {}",
         full_command,
         adapter_name,

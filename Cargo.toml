@@ -169,10 +169,6 @@ absolute_paths = "allow"                     # 200+ sites of `std::env::var()` /
 std_instead_of_alloc = "allow"               # intentional: not targeting `no_std`
 std_instead_of_core = "allow"                # intentional: not targeting `no_std`
 
-# -- Output / diagnostics (factor out by routing through `log`/`tracing`) ---
-print_stderr = "allow"                       # 16: `eprintln!`/`eprint!` in CLI top-level error reporters
-print_stdout = "allow"                       # 8: `println!` in CLI status output (`[edgezero] creating project at ...`)
-
 # -- Tests ------------------------------------------------------------------
 tests_outside_test_module = "allow"          # lint matches plain `#[cfg(test)] mod tests` only — doesn't recognize our `#[cfg(all(test, feature = "..."))]` modules or integration tests in `tests/` directory
 

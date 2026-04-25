@@ -154,9 +154,11 @@ fn locate_project() -> Result<AxumProject, String> {
 
 fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
     let display = project.crate_dir.display();
-    println!(
+    log::info!(
         "[edgezero] Axum {subcommand} ({}) in {} (port: {})",
-        project.crate_name, display, project.port
+        project.crate_name,
+        display,
+        project.port
     );
     let mut command = Command::new("cargo");
     command.arg(subcommand);

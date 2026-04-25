@@ -215,7 +215,7 @@ impl Adapter for FastlyCliAdapter {
         match action {
             AdapterAction::Build => {
                 let artifact = build(args)?;
-                println!("[edgezero] Fastly build complete -> {}", artifact.display());
+                log::info!("[edgezero] Fastly build complete -> {}", artifact.display());
                 Ok(())
             }
             AdapterAction::Deploy => deploy(args),

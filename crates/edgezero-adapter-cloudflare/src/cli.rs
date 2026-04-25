@@ -229,7 +229,7 @@ impl Adapter for CloudflareCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             AdapterAction::Build => build().map(|artifact| {
-                println!(
+                log::info!(
                     "[edgezero] Cloudflare build artifact -> {}",
                     artifact.display()
                 );

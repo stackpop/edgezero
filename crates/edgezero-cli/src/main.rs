@@ -18,16 +18,30 @@ use std::io::ErrorKind;
 #[cfg(feature = "cli")]
 use std::path::PathBuf;
 
+/// Initialize a CLI logger that prints messages without timestamps or level
+/// prefixes — the CLI's output IS the user-facing UX, not a debug log.
+#[cfg(feature = "cli")]
+fn init_cli_logger() {
+    use log::LevelFilter;
+    use simple_logger::SimpleLogger;
+    let _logger_init = SimpleLogger::new()
+        .with_level(LevelFilter::Info)
+        .without_timestamps()
+        .with_module_level("edgezero_cli", LevelFilter::Info)
+        .init();
+}
+
 #[cfg(feature = "cli")]
 fn main() {
     use args::{Args, Command};
     use clap::Parser as _;
 
+    init_cli_logger();
     let args = Args::parse();
     match args.cmd {
         Command::New(new_args) => {
             if let Err(e) = generator::generate_new(new_args) {
-                eprintln!("[edgezero] new error: {e}");
+                log::error!("[edgezero] new error: {e}");
                 std::process::exit(1);
             }
         }
@@ -36,7 +50,7 @@ fn main() {
             adapter_args,
         } => {
             if let Err(err) = handle_build(&adapter, &adapter_args) {
-                eprintln!("[edgezero] build error: {err}");
+                log::error!("[edgezero] build error: {err}");
                 std::process::exit(1);
             }
         }
@@ -45,13 +59,13 @@ fn main() {
             adapter_args,
         } => {
             if let Err(err) = handle_deploy(&adapter, &adapter_args) {
-                eprintln!("[edgezero] deploy error: {err}");
+                log::error!("[edgezero] deploy error: {err}");
                 std::process::exit(1);
             }
         }
         Command::Serve { adapter } => {
             if let Err(err) = handle_serve(&adapter) {
-                eprintln!("[edgezero] serve error: {err}");
+                log::error!("[edgezero] serve error: {err}");
                 std::process::exit(1);
             }
         }
@@ -63,7 +77,7 @@ fn main() {
 
             #[cfg(not(feature = "edgezero-adapter-axum"))]
             {
-                eprintln!(
+                log::error!(
                     "edgezero-cli built without `edgezero-adapter-axum`; rebuild with that feature to use `edgezero dev`."
                 );
                 std::process::exit(1);
@@ -74,7 +88,13 @@ fn main() {
 
 #[cfg(not(feature = "cli"))]
 fn main() {
-    eprintln!("edgezero-cli built without `cli` feature. Rebuild with `--features cli`.");
+    use log::LevelFilter;
+    use simple_logger::SimpleLogger;
+    let _logger_init = SimpleLogger::new()
+        .with_level(LevelFilter::Error)
+        .without_timestamps()
+        .init();
+    log::error!("edgezero-cli built without `cli` feature. Rebuild with `--features cli`.");
 }
 
 #[cfg(feature = "cli")]
@@ -103,7 +123,7 @@ fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Opti
 #[cfg(feature = "cli")]
 fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
     if let Some(message) = store_bindings_message(adapter_name, manifest) {
-        println!("{message}");
+        log::info!("{message}");
     }
 }
 
