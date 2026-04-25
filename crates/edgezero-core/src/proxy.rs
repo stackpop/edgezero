@@ -509,8 +509,7 @@ mod tests {
     fn proxy_handle_propagates_client_errors() {
         let handle = ProxyHandle::with_client(ErrorClient);
         let req = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
-        let result = block_on(handle.forward(req));
-        assert!(result.is_err());
+        block_on(handle.forward(req)).expect_err("ErrorClient propagates an error");
     }
 
     // Test various HTTP methods

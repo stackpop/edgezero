@@ -210,6 +210,7 @@ impl Manifest {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestApp {
     #[serde(default)]
     #[validate(length(min = 1))]
@@ -222,6 +223,7 @@ pub struct ManifestApp {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestTriggers {
     #[serde(default)]
     #[validate(nested)]
@@ -229,6 +231,7 @@ pub struct ManifestTriggers {
 }
 
 #[derive(Clone, Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestHttpTrigger {
     #[serde(default)]
     #[validate(length(min = 1))]
@@ -261,6 +264,7 @@ impl ManifestHttpTrigger {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestEnvironment {
     #[serde(default)]
     #[validate(nested)]
@@ -271,6 +275,7 @@ pub struct ManifestEnvironment {
 }
 
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestBinding {
     #[validate(length(min = 1))]
     pub name: String,
@@ -327,6 +332,7 @@ pub struct ResolvedEnvironment {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
@@ -343,6 +349,7 @@ pub struct ManifestAdapter {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapterDefinition {
     #[serde(rename = "crate")]
     #[serde(default)]
@@ -354,6 +361,7 @@ pub struct ManifestAdapterDefinition {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapterBuild {
     #[serde(default)]
     #[validate(length(min = 1))]
@@ -366,6 +374,7 @@ pub struct ManifestAdapterBuild {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapterCommands {
     #[serde(default)]
     #[validate(length(min = 1))]
@@ -384,6 +393,7 @@ pub struct ManifestAdapterCommands {
 
 /// Top-level `[stores]` section.
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestStores {
     #[serde(default)]
     #[validate(nested)]
@@ -398,6 +408,7 @@ pub struct ManifestStores {
 
 /// `[stores.config]` section — provider-neutral config store.
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestConfigStoreConfig {
     /// Global store/binding name used when no adapter-specific override is set.
     #[serde(default)]
@@ -416,6 +427,7 @@ pub struct ManifestConfigStoreConfig {
 
 /// `[stores.config.adapters.<adapter>]` override.
 #[derive(Debug, Deserialize, Serialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestConfigAdapterConfig {
     #[validate(length(min = 1))]
     pub name: String,
@@ -488,6 +500,7 @@ impl ManifestConfigStoreConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestLogging {
     #[serde(flatten)]
     #[validate(nested)]
@@ -495,6 +508,7 @@ pub struct ManifestLogging {
 }
 
 #[derive(Debug, Default, Deserialize, Clone, Validate)]
+#[non_exhaustive]
 pub struct ManifestLoggingConfig {
     #[serde(default)]
     pub level: Option<LogLevel>,
@@ -564,6 +578,7 @@ fn default_enabled() -> bool {
 
 /// Global KV store configuration.
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestKvConfig {
     /// Store / binding name (default: `"EDGEZERO_KV"`).
     #[serde(default = "default_kv_name")]
@@ -578,6 +593,7 @@ pub struct ManifestKvConfig {
 
 /// Per-adapter KV binding / store name override.
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestKvAdapterConfig {
     #[validate(length(min = 1))]
     pub name: String,
@@ -585,6 +601,7 @@ pub struct ManifestKvAdapterConfig {
 
 /// Global secret store configuration.
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestSecretsConfig {
     /// Whether the secret store is enabled for adapters without overrides.
     #[serde(default = "default_enabled")]
@@ -603,6 +620,7 @@ pub struct ManifestSecretsConfig {
 
 /// Per-adapter secret store name override.
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestSecretsAdapterConfig {
     /// Whether the secret store is enabled for this adapter.
     #[serde(default = "default_enabled")]
@@ -615,6 +633,7 @@ pub struct ManifestSecretsAdapterConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum HttpMethod {
     Get,
     Post,
@@ -662,6 +681,7 @@ impl<'de> Deserialize<'de> for HttpMethod {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BodyMode {
     Buffered,
     Stream,
@@ -685,6 +705,7 @@ impl<'de> Deserialize<'de> for BodyMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+#[non_exhaustive]
 pub enum LogLevel {
     Trace,
     Debug,

@@ -17,6 +17,7 @@ use thiserror::Error;
 ///
 /// Missing keys are represented as `Ok(None)` from [`ConfigStore::get`].
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigStoreError {
     /// The caller asked for a key that is malformed for the active backend.
     #[error("{message}")]

@@ -221,7 +221,7 @@ mod tests {
 
         let response = block_on(app.router().clone().call(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.body().as_bytes(), b"ok");
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"ok");
     }
 
     struct DefaultHooks;

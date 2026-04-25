@@ -67,7 +67,8 @@ mod tests {
         }
 
         let params = params(&[("id", "not-a-number")]);
-        let result: Result<NumericParams, _> = params.deserialize();
-        assert!(result.is_err());
+        params
+            .deserialize::<NumericParams>()
+            .expect_err("`id` is not a number");
     }
 }

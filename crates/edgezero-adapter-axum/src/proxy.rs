@@ -288,8 +288,10 @@ mod integration_tests {
         let uri: Uri = "http://127.0.0.1:1".parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
-        let result = client.send(request).await;
-        assert!(result.is_err());
+        client
+            .send(request)
+            .await
+            .expect_err("expected connection refused");
     }
 
     #[tokio::test]

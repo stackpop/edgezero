@@ -1023,8 +1023,7 @@ mod tests {
             .insert(KvHandle::new(Arc::new(NoopKvStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
-        let kv = block_on(Kv::from_request(&ctx));
-        assert!(kv.is_ok());
+        block_on(Kv::from_request(&ctx)).expect("Kv extractor when handle present");
     }
 
     #[test]
@@ -1075,8 +1074,7 @@ mod tests {
             .extensions_mut()
             .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
         let ctx = RequestContext::new(request, PathParams::default());
-        let result = block_on(Secrets::from_request(&ctx));
-        assert!(result.is_ok());
+        block_on(Secrets::from_request(&ctx)).expect("Secrets extractor when handle present");
     }
 
     #[test]

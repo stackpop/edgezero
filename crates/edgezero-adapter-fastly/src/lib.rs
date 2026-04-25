@@ -124,12 +124,13 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
         kv_required: manifest.stores.kv.is_some(),
         secrets_required: manifest.secret_store_enabled("fastly"),
     };
+    let logging: FastlyLogging = logging.into();
     run_app_with_stores::<A>(
-        logging.into(),
+        &logging,
         req,
         config_name.as_deref(),
         &kv_name,
-        requirements,
+        &requirements,
     )
 }
 
@@ -141,11 +142,11 @@ pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
     config_store_name: Option<&str>,
 ) -> Result<fastly::Response, fastly::Error> {
     run_app_with_stores::<A>(
-        logging,
+        &logging,
         req,
         config_store_name,
         DEFAULT_KV_STORE_NAME,
-        StoreRequirements::default(),
+        &StoreRequirements::default(),
     )
 }
 
@@ -156,11 +157,11 @@ pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
     run_app_with_stores::<A>(
-        logging,
+        &logging,
         req,
         None,
         DEFAULT_KV_STORE_NAME,
-        StoreRequirements::default(),
+        &StoreRequirements::default(),
     )
 }
 
@@ -177,11 +178,11 @@ struct StoreRequirements {
 
 #[cfg(feature = "fastly")]
 fn run_app_with_stores<A: edgezero_core::app::Hooks>(
-    logging: FastlyLogging,
+    logging: &FastlyLogging,
     req: fastly::Request,
     config_store_name: Option<&str>,
     kv_store_name: &str,
-    requirements: StoreRequirements,
+    requirements: &StoreRequirements,
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");

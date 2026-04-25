@@ -32,6 +32,7 @@ use crate::error::EdgeError;
 
 /// Errors returned by secret store operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SecretError {
     /// The requested secret was not found.
     #[error("secret not found: {name}")]

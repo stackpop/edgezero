@@ -10,6 +10,7 @@ use crate::response::{response_with_body, IntoResponse};
 
 /// Application-level error that carries an HTTP status code.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum EdgeError {
     #[error("{message}")]
     BadRequest { message: String },
@@ -245,7 +246,7 @@ mod tests {
         }
 
         let body = json_or_text(&FailingSerialize);
-        assert_eq!(body.as_bytes(), b"internal error");
+        assert_eq!(body.as_bytes().expect("buffered"), b"internal error");
     }
 
     #[test]
@@ -258,7 +259,7 @@ mod tests {
             .expect("content-type header");
         assert_eq!(content_type, HeaderValue::from_static("application/json"));
 
-        let body = response.into_body().into_bytes();
+        let body = response.into_body().into_bytes().expect("buffered");
         assert!(std::str::from_utf8(body.as_ref())
             .unwrap()
             .contains("invalid"));
