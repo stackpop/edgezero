@@ -13,6 +13,11 @@ mod request;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod response;
 
+// SpinConfigStore is available without the `spin` feature flag because it
+// gates its spin_sdk usage on `cfg(target_arch = "wasm32")` internally,
+// allowing the InMemory test backend to compile on all targets. SpinKvStore
+// and SpinSecretStore import spin_sdk types at the module level and therefore
+// require `all(feature = "spin", target_arch = "wasm32")`.
 pub use config_store::SpinConfigStore;
 pub use context::SpinRequestContext;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]

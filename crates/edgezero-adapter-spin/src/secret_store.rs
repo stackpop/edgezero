@@ -35,8 +35,16 @@ impl Default for SpinSecretStore {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl SecretStore for SpinSecretStore {
-    async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
+    async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         use spin_sdk::variables;
+        if !store_name.is_empty() {
+            // Spin's variable namespace is flat; named stores are not supported.
+            log::debug!(
+                "SpinSecretStore: store_name {:?} is ignored; \
+                 Spin uses a single flat variable namespace",
+                store_name
+            );
+        }
         // Spin variable names are always lowercase. Normalise the key so that
         // conventional uppercase secret names (e.g. "STRIPE_KEY") work without
         // callers needing to know the Spin naming convention.

@@ -70,6 +70,11 @@ impl ConfigStore for SpinConfigStore {
 mod tests {
     use super::*;
 
+    // These contract tests exercise the InMemory backend (not the real Spin
+    // variables API). Dotted keys such as "contract.key.a" are valid here but
+    // would trigger `InvalidName` on the real Spin backend, which requires
+    // lowercase variable names without dots. Real-backend behaviour is
+    // verified by the smoke tests in scripts/smoke_test_config.sh.
     edgezero_core::config_store_contract_tests!(spin_config_store_contract, {
         SpinConfigStore::from_entries([
             ("contract.key.a".to_string(), "value_a".to_string()),
