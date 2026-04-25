@@ -62,6 +62,9 @@ pub fn path_distance(a: &Path, b: &Path) -> usize {
 }
 
 /// Reads the crate name from a `Cargo.toml`, supporting both the inline and `[package]` forms.
+///
+/// # Errors
+/// Returns an error if the manifest cannot be read or its `[package].name` field is missing.
 pub fn read_package_name(manifest: &Path) -> Result<String, String> {
     let contents = fs::read_to_string(manifest)
         .map_err(|err| format!("failed to read {}: {err}", manifest.display()))?;

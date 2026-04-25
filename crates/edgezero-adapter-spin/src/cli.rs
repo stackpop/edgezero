@@ -15,6 +15,8 @@ use walkdir::WalkDir;
 
 const TARGET_TRIPLE: &str = "wasm32-wasip1";
 
+/// # Errors
+/// Returns an error if the Spin CLI build command fails.
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest = find_spin_manifest(
         std::env::current_dir()
@@ -57,6 +59,8 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// # Errors
+/// Returns an error if the Spin CLI deploy command fails.
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest = find_spin_manifest(
         std::env::current_dir()
@@ -80,6 +84,8 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// # Errors
+/// Returns an error if the Spin CLI up command fails.
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest = find_spin_manifest(
         std::env::current_dir()

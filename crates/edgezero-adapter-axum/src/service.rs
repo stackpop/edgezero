@@ -16,7 +16,7 @@ use tower::Service;
 use crate::request::into_core_request;
 use crate::response::into_axum_response;
 
-/// Tower service that adapts EdgeZero router requests to Axum/Hyper compatible responses.
+/// Tower service that adapts `EdgeZero` router requests to Axum/Hyper compatible responses.
 #[derive(Clone)]
 pub struct EdgeZeroAxumService {
     router: RouterService,

@@ -1,7 +1,7 @@
 //! Fastly secret store adapter.
 //!
 //! Implements `edgezero_core::secret_store::SecretStore` via
-//! `FastlySecretStore`, which opens a named Fastly SecretStore on
+//! `FastlySecretStore`, which opens a named Fastly `SecretStore` on
 //! each lookup.
 
 #[cfg(feature = "fastly")]
@@ -11,7 +11,7 @@ use bytes::Bytes;
 #[cfg(feature = "fastly")]
 use edgezero_core::secret_store::SecretError;
 
-/// Internal helper that opens a single named Fastly SecretStore.
+/// Internal helper that opens a single named Fastly `SecretStore`.
 #[cfg(feature = "fastly")]
 pub struct FastlyNamedStore {
     store: fastly::secret_store::SecretStore,
@@ -19,12 +19,15 @@ pub struct FastlyNamedStore {
 
 #[cfg(feature = "fastly")]
 impl FastlyNamedStore {
-    /// Open a Fastly SecretStore by name.
+    /// Open a Fastly `SecretStore` by name.
     ///
     /// Returns `SecretError::Internal` if the store does not exist or cannot
-    /// be opened. Unlike `KVStore::open`, the Fastly SecretStore API returns
+    /// be opened. Unlike `KVStore::open`, the Fastly `SecretStore` API returns
     /// `Result<Self, OpenError>` (not `Result<Option<Self>, _>`), so there
     /// is no `ok_or` unwrap here.
+    ///
+    /// # Errors
+    /// Returns [`SecretError::Internal`] if the named secret store cannot be opened.
     pub fn open(name: &str) -> Result<Self, SecretError> {
         let store = fastly::secret_store::SecretStore::open(name).map_err(|e| {
             SecretError::Internal(anyhow::anyhow!("failed to open secret store '{name}': {e}"))
@@ -47,7 +50,7 @@ impl FastlyNamedStore {
     }
 }
 
-/// Multi-store provider backed by Fastly's SecretStore API.
+/// Multi-store provider backed by Fastly's `SecretStore` API.
 ///
 /// Opens the named store per call — `FastlyNamedStore::open` is cheap
 /// (no network; just a handle) so there is no caching.

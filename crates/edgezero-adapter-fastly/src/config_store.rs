@@ -20,6 +20,9 @@ impl FastlyConfigStore {
     /// Open a Fastly Config Store by resource link name.
     ///
     /// Returns an error if the configured store cannot be opened.
+    ///
+    /// # Errors
+    /// Returns the underlying [`fastly::config_store::OpenError`] when the named store does not exist or cannot be opened.
     pub fn try_open(name: &str) -> Result<Self, fastly::config_store::OpenError> {
         fastly::ConfigStore::try_open(name).map(|inner| Self {
             inner: FastlyConfigStoreBackend::Fastly(inner),

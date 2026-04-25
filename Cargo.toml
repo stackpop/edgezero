@@ -98,13 +98,11 @@ restriction = { level = "deny", priority = -1 }
 # warns against. We do it deliberately as a discovery mechanism — allow it.
 blanket_clippy_restriction_lints = "allow"   # 6  (intentional: we opt in to the group wholesale)
 
-# -- Documentation (factor out by writing docs) -----------------------------
-missing_docs_in_private_items = "allow"      # 275: private items lack doc comments
-missing_panics_doc = "allow"                 # 10:  pub fn that may panic missing # Panics section
-missing_inline_in_public_items = "allow"     # 9:   pub items without #[inline] (intentional? revisit)
-doc_markdown = "allow"                       # 4:   bare identifiers in doc comments need backticks
-missing_errors_doc = "allow"                 # 4:   pub fn returning Result missing # Errors section
-missing_fields_in_debug = "allow"            # 4:   manual `Debug` impl skipping fields
+# -- Documentation ----------------------------------------------------------
+# `# Panics`, `# Errors`, `Debug` fields, and `doc_markdown` backticking
+# applied across every flagged public-API site.
+missing_docs_in_private_items = "allow"      # 275 sites; private docs aren't load-bearing for users — industry-standard "kept allowed"
+missing_inline_in_public_items = "allow"     # `#[inline]` on cross-crate items is a perf hint; rustc/LLVM make this decision better than we can
 
 # -- Style / formatting -----------------------------------------------------
 # Idiomatic Rust — fixing would make code worse:

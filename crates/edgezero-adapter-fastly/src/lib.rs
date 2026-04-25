@@ -59,6 +59,8 @@ impl From<edgezero_core::manifest::ResolvedLoggingConfig> for FastlyLogging {
     }
 }
 
+/// # Errors
+/// Returns [`log::SetLoggerError`] if a global logger is already installed.
 #[cfg(feature = "fastly")]
 pub fn init_logger(
     endpoint: &str,
@@ -82,6 +84,8 @@ pub trait AppExt {
     #[deprecated(
         note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
     )]
+    /// # Errors
+    /// Returns an error if the underlying handler returns an error or the response cannot be converted into a Fastly response.
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
 }
 
@@ -99,6 +103,9 @@ impl AppExt for edgezero_core::app::App {
 /// Entry point for a Fastly Compute application.
 ///
 /// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
+///
+/// # Errors
+/// Returns an error if the manifest is invalid or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 pub fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
@@ -141,6 +148,9 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
 }
 
 /// Dispatch with a config store. Prefer this over `run_app_with_logging` for new code.
+///
+/// # Errors
+/// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
 pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
     logging: FastlyLogging,
@@ -157,6 +167,9 @@ pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
 }
 
 /// Compatibility wrapper for callers that do not use a config store.
+///
+/// # Errors
+/// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
 pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
     logging: FastlyLogging,

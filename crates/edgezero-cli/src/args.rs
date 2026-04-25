@@ -9,7 +9,7 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create a new EdgeZero app skeleton (multi-crate workspace)
+    /// Create a new `EdgeZero` app skeleton (multi-crate workspace)
     New(NewArgs),
     /// Build the project for a target edge
     Build {

@@ -64,6 +64,9 @@ impl ConfigStoreError {
 /// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare env bindings
 pub trait ConfigStore: Send + Sync {
     /// Retrieve a config value by key. Returns `None` if the key does not exist.
+    ///
+    /// # Errors
+    /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
 }
 
@@ -90,6 +93,9 @@ impl ConfigStoreHandle {
     }
 
     /// Get a config value by key.
+    ///
+    /// # Errors
+    /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
     pub fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         self.store.get(key)
     }

@@ -93,7 +93,7 @@ impl fmt::Debug for ProxyRequest {
             .field("method", &self.method)
             .field("uri", &self.uri)
             .field("headers", &self.headers)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -142,6 +142,10 @@ impl ProxyResponse {
         &mut self.extensions
     }
 
+    /// # Panics
+    /// Panics if any header in the response is invalid for the underlying
+    /// `http::Response::builder()` — should be impossible because we only ever
+    /// store header names/values that were already validated when inserted.
     pub fn into_response(self) -> Response {
         let mut builder = response_builder().status(self.status);
         for (name, value) in &self.headers {
@@ -157,7 +161,7 @@ impl fmt::Debug for ProxyResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyResponse")
             .field("status", &self.status)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -184,6 +188,8 @@ impl ProxyHandle {
         Arc::clone(&self.client)
     }
 
+    /// # Errors
+    /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails.
     pub async fn forward(&self, request: ProxyRequest) -> Result<Response, EdgeError> {
         let response = self.client.send(request).await?;
         Ok(response.into_response())
@@ -209,6 +215,8 @@ impl<C> ProxyService<C>
 where
     C: ProxyClient,
 {
+    /// # Errors
+    /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails.
     pub async fn forward(&self, request: ProxyRequest) -> Result<Response, EdgeError> {
         let response = self.client.send(request).await?;
         Ok(response.into_response())

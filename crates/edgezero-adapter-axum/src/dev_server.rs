@@ -25,7 +25,7 @@ enum KvInitRequirement {
     Required,
 }
 
-/// Configuration used when running the dev server embedding EdgeZero into Axum.
+/// Configuration used when running the dev server embedding `EdgeZero` into Axum.
 #[derive(Clone)]
 pub struct AxumDevServerConfig {
     pub addr: SocketAddr,
@@ -55,7 +55,7 @@ struct Stores {
     secrets: Option<SecretHandle>,
 }
 
-/// Blocking dev server runner used by the EdgeZero CLI.
+/// Blocking dev server runner used by the `EdgeZero` CLI.
 pub struct AxumDevServer {
     router: RouterService,
     config: AxumDevServerConfig,
@@ -105,6 +105,8 @@ impl AxumDevServer {
         self
     }
 
+    /// # Errors
+    /// Returns an error if the dev server fails to bind, the Tokio runtime fails to start, or the underlying request loop returns an error.
     pub fn run(self) -> anyhow::Result<()> {
         let runtime = RuntimeBuilder::new_multi_thread()
             .enable_all()
@@ -265,6 +267,8 @@ async fn serve_with_stores(
     Ok(())
 }
 
+/// # Errors
+/// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let manifest = ManifestLoader::load_from_str(manifest_src);
     let m = manifest.manifest();

@@ -3,6 +3,8 @@ use crate::http::Response;
 use crate::response::IntoResponse;
 
 pub trait Responder: Sized {
+    /// # Errors
+    /// Returns [`EdgeError`] if the value cannot be turned into a response (e.g., a `Result`'s `Err` variant).
     fn respond(self) -> Result<Response, EdgeError>;
 }
 

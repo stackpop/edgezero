@@ -12,8 +12,11 @@ use edgezero_core::proxy::ProxyHandle;
 use crate::context::AxumRequestContext;
 use crate::proxy::AxumProxyClient;
 
-/// Convert an Axum/Hyper request into an EdgeZero core request while preserving streaming bodies
+/// Convert an Axum/Hyper request into an `EdgeZero` core request while preserving streaming bodies
 /// and exposing connection metadata through `AxumRequestContext`.
+///
+/// # Errors
+/// Returns an error if a buffered (`application/json`) body cannot be read into memory.
 pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest, String> {
     let (parts, body) = request.into_parts();
 

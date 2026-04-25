@@ -11,6 +11,10 @@ pub struct ManifestLoader {
 }
 
 impl ManifestLoader {
+    /// # Panics
+    /// Panics if `contents` is not valid TOML or fails manifest validation.
+    /// Callers parsing user-supplied input should use [`ManifestLoader::from_path`]
+    /// (returns `io::Result`); this entry point is for compile-time embedded manifests.
     pub fn load_from_str(contents: &str) -> Self {
         let mut manifest: Manifest =
             toml::from_str(contents).expect("edgezero manifest should be valid");
@@ -23,6 +27,8 @@ impl ManifestLoader {
         }
     }
 
+    /// # Errors
+    /// Returns an [`io::Error`] if `path` cannot be read, or the file content cannot be parsed/validated as an `EdgeZero` manifest.
     pub fn from_path(path: &Path) -> Result<Self, io::Error> {
         let contents = std::fs::read_to_string(path)?;
         let mut manifest: Manifest = toml::from_str(&contents)

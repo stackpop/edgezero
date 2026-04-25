@@ -38,6 +38,8 @@ impl RequestContext {
         &self.path_params
     }
 
+    /// # Errors
+    /// Returns [`EdgeError::bad_request`] if the path parameters cannot be deserialized into `T`.
     pub fn path<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,
@@ -47,6 +49,8 @@ impl RequestContext {
             .map_err(|err| EdgeError::bad_request(format!("invalid path parameters: {err}")))
     }
 
+    /// # Errors
+    /// Returns [`EdgeError::bad_request`] if the query string cannot be deserialized into `T`.
     pub fn query<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,
@@ -56,6 +60,8 @@ impl RequestContext {
             .map_err(|err| EdgeError::bad_request(format!("invalid query string: {err}")))
     }
 
+    /// # Errors
+    /// Returns [`EdgeError::bad_request`] if the body is not valid JSON for `T`.
     pub fn json<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,
@@ -70,6 +76,8 @@ impl RequestContext {
         self.request.body()
     }
 
+    /// # Errors
+    /// Returns [`EdgeError::bad_request`] if the body cannot be deserialized as form-urlencoded data into `T`, or the body is streaming.
     pub fn form<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,

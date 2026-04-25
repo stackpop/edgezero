@@ -1,4 +1,4 @@
-//! EdgeZero CLI.
+//! `EdgeZero` CLI.
 
 #[cfg(feature = "cli")]
 mod adapter;

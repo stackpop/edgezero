@@ -79,6 +79,8 @@ impl RouterBuilder {
         self.enable_route_listing_at(DEFAULT_ROUTE_LISTING_PATH)
     }
 
+    /// # Panics
+    /// Panics if `path` is empty or does not begin with `/`.
     #[must_use]
     pub fn enable_route_listing_at<S>(mut self, path: S) -> Self
     where
@@ -150,6 +152,8 @@ impl RouterBuilder {
         self
     }
 
+    /// # Panics
+    /// Panics if a route is registered for both an explicit path and the route-listing path.
     pub fn build(mut self) -> RouterService {
         let listing_path = self.route_listing_path.clone();
 

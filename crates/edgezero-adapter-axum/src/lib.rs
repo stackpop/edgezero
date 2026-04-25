@@ -1,4 +1,4 @@
-//! Axum adapter for EdgeZero routers and applications.
+//! Axum adapter for `EdgeZero` routers and applications.
 
 #[cfg(feature = "axum")]
 pub mod config_store;

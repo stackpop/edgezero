@@ -7,11 +7,16 @@ use tracing::error;
 use edgezero_core::body::Body;
 use edgezero_core::http::Response as CoreResponse;
 
-/// Convert an EdgeZero response into one consumable by Axum/Hyper.
+/// Convert an `EdgeZero` response into one consumable by Axum/Hyper.
 ///
 /// Streaming responses are collected into an in-memory buffer. While this sacrifices
 /// incremental flushing, it keeps the adapter compatible with the non-`Send` streaming type used by
 /// `edgezero_core::Body` and works well for local development.
+///
+/// # Panics
+/// Panics if the resulting response cannot be assembled by `axum`'s response
+/// builder — only possible if the supplied [`CoreResponse`] contains a header
+/// that fails axum's stricter byte-level validation.
 pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
     let (parts, body) = response.into_parts();
     let body = match body {

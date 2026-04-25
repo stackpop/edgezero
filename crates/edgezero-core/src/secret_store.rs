@@ -174,6 +174,9 @@ impl SecretHandle {
     }
 
     /// Retrieve a secret from a named store. Returns `Ok(None)` if not found.
+    ///
+    /// # Errors
+    /// Returns [`SecretError::Validation`] for invalid `store_name`/`key`, [`SecretError::Unavailable`] if the backend is offline, or [`SecretError::Internal`] on backend failure.
     pub async fn get_bytes(
         &self,
         store_name: &str,
@@ -185,6 +188,9 @@ impl SecretHandle {
     }
 
     /// Retrieve a secret as raw bytes. Returns `SecretError::NotFound` if absent.
+    ///
+    /// # Errors
+    /// Returns [`SecretError::NotFound`] if the secret is absent, plus the same errors as [`SecretHandle::get_bytes`].
     pub async fn require_bytes(&self, store_name: &str, key: &str) -> Result<Bytes, SecretError> {
         self.get_bytes(store_name, key)
             .await?
@@ -194,6 +200,9 @@ impl SecretHandle {
     }
 
     /// Retrieve a secret as a UTF-8 string. Returns `SecretError::NotFound` if absent.
+    ///
+    /// # Errors
+    /// Returns [`SecretError::Internal`] if the secret bytes are not valid UTF-8, plus the same errors as [`SecretHandle::require_bytes`].
     pub async fn require_str(&self, store_name: &str, key: &str) -> Result<String, SecretError> {
         let bytes = self.require_bytes(store_name, key).await?;
         String::from_utf8(bytes.into())
