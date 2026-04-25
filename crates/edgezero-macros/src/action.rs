@@ -41,6 +41,12 @@ pub(crate) fn expand_action_impl(
     inner_fn.sig.ident = inner_ident.clone();
     inner_fn.vis = syn::Visibility::Inherited;
     inner_fn.attrs.clear();
+    // `#[action]` requires the user fn to be `async` so we can `.await` it
+    // from the generated outer fn. Some handler bodies have no awaits of
+    // their own — silence `clippy::unused_async` for those.
+    inner_fn
+        .attrs
+        .push(syn::parse_quote!(#[allow(clippy::unused_async)]));
 
     if let Err(err) = normalize_request_context_patterns(&mut inner_fn) {
         return err.to_compile_error();
