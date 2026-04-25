@@ -328,7 +328,7 @@ mod tests {
             Some("value")
         );
         assert_eq!(ctx.path_params().get("id"), Some("123"));
-        assert_eq!(ctx.body().as_bytes(), b"payload");
+        assert_eq!(ctx.body().as_bytes().expect("buffered"), b"payload");
 
         let request = ctx.into_request();
         assert_eq!(request.uri().path(), "/items/123");

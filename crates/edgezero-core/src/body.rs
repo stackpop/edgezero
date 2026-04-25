@@ -45,17 +45,23 @@ impl Body {
         Self::Stream(stream.map(Ok::<Bytes, anyhow::Error>).boxed_local())
     }
 
-    pub fn as_bytes(&self) -> &[u8] {
+    /// Returns the in-memory bytes for a buffered body, or `None` if this is
+    /// a streaming body. To consume a streaming body into bytes, use
+    /// [`Body::into_bytes_bounded`].
+    pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
-            Body::Once(bytes) => bytes.as_ref(),
-            Body::Stream(_) => panic!("streaming body does not expose in-memory bytes"),
+            Body::Once(bytes) => Some(bytes.as_ref()),
+            Body::Stream(_) => None,
         }
     }
 
-    pub fn into_bytes(self) -> Bytes {
+    /// Consume a buffered body and return its bytes, or `None` if this is a
+    /// streaming body. To collect a streaming body, use
+    /// [`Body::into_bytes_bounded`].
+    pub fn into_bytes(self) -> Option<Bytes> {
         match self {
-            Body::Once(bytes) => bytes,
-            Body::Stream(_) => panic!("streaming body cannot be converted into bytes"),
+            Body::Once(bytes) => Some(bytes),
+            Body::Stream(_) => None,
         }
     }
 
@@ -92,7 +98,7 @@ impl Body {
             }
             Ok(Bytes::from(buf))
         } else {
-            let bytes = self.into_bytes();
+            let bytes = self.into_bytes().expect("checked !is_stream");
             if bytes.len() > max_size {
                 return Err(crate::error::EdgeError::bad_request(
                     "request body too large",
@@ -221,25 +227,24 @@ mod tests {
             Bytes::from_static(b"{"),
             Bytes::from_static(b"}"),
         ]));
-        assert!(body.to_json::<serde_json::Value>().is_err());
+        body.to_json::<serde_json::Value>()
+            .expect_err("streaming body cannot deserialize as JSON");
     }
 
     #[test]
-    fn into_bytes_panics_for_stream() {
+    fn into_bytes_returns_none_for_stream() {
         let body = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
             b"data",
         )]));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.into_bytes()));
-        assert!(result.is_err());
+        assert!(body.into_bytes().is_none());
     }
 
     #[test]
-    fn as_bytes_panics_for_stream() {
+    fn as_bytes_returns_none_for_stream() {
         let body = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
             b"data",
         )]));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_bytes()));
-        assert!(result.is_err());
+        assert!(body.as_bytes().is_none());
     }
 
     #[test]
@@ -257,7 +262,7 @@ mod tests {
     #[test]
     fn default_body_is_empty() {
         let body = Body::default();
-        assert!(body.as_bytes().is_empty());
+        assert!(body.as_bytes().expect("buffered").is_empty());
     }
 
     #[test]
@@ -276,7 +281,7 @@ mod tests {
     #[test]
     fn from_vec_u8_builds_buffered_body() {
         let body = Body::from(vec![1u8, 2u8, 3u8]);
-        assert_eq!(body.as_bytes(), &[1u8, 2u8, 3u8]);
+        assert_eq!(body.as_bytes().expect("buffered"), &[1u8, 2u8, 3u8]);
     }
 
     #[test]
@@ -289,8 +294,7 @@ mod tests {
     #[test]
     fn into_bytes_bounded_buffered_too_large() {
         let body = Body::from("hello");
-        let result = block_on(body.into_bytes_bounded(3));
-        assert!(result.is_err());
+        block_on(body.into_bytes_bounded(3)).expect_err("body exceeds max_size");
     }
 
     #[test]
@@ -309,7 +313,6 @@ mod tests {
             Bytes::from_static(b"ab"),
             Bytes::from_static(b"cd"),
         ]));
-        let result = block_on(body.into_bytes_bounded(3));
-        assert!(result.is_err());
+        block_on(body.into_bytes_bounded(3)).expect_err("stream exceeds max_size");
     }
 }

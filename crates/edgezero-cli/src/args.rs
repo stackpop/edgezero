@@ -87,6 +87,6 @@ mod tests {
 
     #[test]
     fn missing_required_adapter_returns_error() {
-        assert!(Args::try_parse_from(["edgezero", "build"]).is_err());
+        Args::try_parse_from(["edgezero", "build"]).expect_err("missing --adapter");
     }
 }

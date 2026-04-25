@@ -269,7 +269,7 @@ serve = "echo serve"
     #[test]
     fn ensure_adapter_defined_accepts_known_adapter() {
         let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
-        assert!(ensure_adapter_defined("fastly", Some(&loader)).is_ok());
+        ensure_adapter_defined("fastly", Some(&loader)).expect("known adapter");
     }
 
     #[test]
@@ -282,7 +282,7 @@ serve = "echo serve"
 
     #[test]
     fn ensure_adapter_defined_allows_when_manifest_missing() {
-        assert!(ensure_adapter_defined("fastly", None).is_ok());
+        ensure_adapter_defined("fastly", None).expect("manifest missing → permissive");
     }
 
     #[cfg(not(windows))]

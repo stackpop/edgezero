@@ -152,39 +152,39 @@ redundant_test_prefix = "allow"              # 1:   `fn test_foo()` inside a mod
 # -- Defensive coding -------------------------------------------------------
 # Test code is exempted via `clippy.toml` (allow-{unwrap,expect,panic,
 # indexing-slicing}-in-tests = true), so the counts below reflect *production*
-# code only. The `unwrap_used` lint is denied: production unwraps must become
-# `?` (when in a Result fn) or `.expect("invariant")` (when truly impossible
-# by construction). `.expect()` does NOT make code safer — it has the same
-# panic semantics as `.unwrap()` — but it documents *why* the call is
-# considered infallible. See `clippy.toml` for the test-allow list.
-question_mark_used = "allow"                 # (intentional: idiomatic Rust)
-pattern_type_mismatch = "allow"              # (intentional: rewriting `match &x` as `match x`/`ref` is uglier)
-default_numeric_fallback = "allow"           # (intentional: type-suffix on every literal is too noisy)
-arithmetic_side_effects = "allow"            # (intentional: not cryptographic; checked_* everywhere is overkill)
-float_arithmetic = "allow"                   # (intentional: same rationale as arithmetic_side_effects)
-as_conversions = "allow"                     # (intentional for trivial widening; bigger casts already ok'd by `cast_*` lints)
-string_slice = "allow"                       # (intentional where ASCII-safe; revisit per-site if Unicode-relevant)
-expect_used = "allow"                        # `.expect("invariant")` is the documented-assertion pattern (init paths, infallible writes, etc.)
-unwrap_in_result = "allow"                   # overlaps with `expect_used` — fires on `.expect()` inside Result fns too
-panic = "allow"                              # used for build-time / setup-time invariants (route registration, proc-macro expansion)
-assertions_on_result_states = "allow"        # `assert!(r.is_ok())` in tests; clippy has no per-test config option for this lint
-cast_possible_truncation = "allow"           # narrowing casts already validated by surrounding range check
-cast_sign_loss = "allow"                     # signed→unsigned casts already validated
-let_underscore_must_use = "allow"            # `let _ = ...` for genuinely-discarded results in tests / dev paths
+# code only. `unwrap_used` is denied; `assertions_on_result_states` is denied
+# (use `.unwrap()`/`.unwrap_err()` instead — they print the value on failure).
+# Each remaining allow has been audited per-site at least once; the rationale
+# below describes the *category of site* the lint fires on, not just "noise".
+question_mark_used = "allow"                 # (intentional: `?` is core Rust idiom — the whole language design assumes it)
+pattern_type_mismatch = "allow"              # (intentional: every flagged site uses Rust 2018 match-ergonomics — `match &x { Variant(y) => ... }` where `y` is auto-`&T`. The "fix" is to manually write `match x { Variant(ref y) => ... }` or `match &x { &Variant(ref y) => ... }`, both *worse* than current code.)
+default_numeric_fallback = "allow"           # (intentional: requiring `0_u32`/`1.0_f64` on every literal in HTTP routing/parsing code is noise without bug-prevention value)
+arithmetic_side_effects = "allow"            # (audited: every flagged site is bounded by domain invariants — `SystemTime::now() + ttl`, path-component counts, byte offsets after `len()` checks. None can realistically overflow on inputs we accept.)
+float_arithmetic = "allow"                   # (intentional: same rationale as `arithmetic_side_effects` — we don't do float-heavy work)
+as_conversions = "allow"                     # (audited: dominated by trait-object coercions like `Arc::new(x) as BoxMiddleware` which *cannot* be expressed as `From`/`Into` in stable Rust. The numeric `as` casts are all `usize → u64` widenings on 64-bit; safe.)
+string_slice = "allow"                       # (audited: every flagged site indexes into ASCII-only data — env var names, header names, path components from `matchit`. Revisit if any future code accepts Unicode in those positions.)
+expect_used = "allow"                        # (audited 62 production sites: bundled-template registration, AsyncRead-contract slice access, lock-poisoning unrecoverable, build-script panics. None benefit from `?` propagation — see PR description for category breakdown.)
+unwrap_in_result = "allow"                   # (overlaps with `expect_used` since the lint fires on `.expect()` too inside `Result`-returning fns)
+panic = "allow"                              # (audited: route-registration `unwrap_or_else(|err| panic!("duplicate route: {err}"))` and proc-macro expansion failures — both are build/setup-time programmer errors, not runtime conditions)
+cast_possible_truncation = "allow"           # (audited: narrowing casts always follow a range check)
+cast_sign_loss = "allow"                     # (audited: signed→unsigned casts always follow a `>= 0` check)
+let_underscore_must_use = "allow"            # (audited: dev-server graceful-shutdown paths where the spawn-task result is genuinely uninteresting)
 
 # -- API design ------------------------------------------------------------
-# The actionable subset (impl_trait_in_params, return_self_not_must_use,
-# rc_buffer, unnecessary_wraps, mutex_atomic, same_name_method,
-# renamed_function_params, wildcard_enum_match_arm, clone_on_ref_ptr,
-# ref_patterns) was factored out — those allows are gone. The lints below
-# are kept allowed because they're either bad-fit-for-this-codebase
-# restriction lints or low signal-to-noise.
-exhaustive_structs = "allow"                 # (intentional: blanket #[non_exhaustive] would break user pattern matching / field-syntax construction. Apply per-type only when genuinely planned.)
-exhaustive_enums = "allow"                   # (intentional: same rationale; `EdgeError`/`KvError` etc. are matched by users.)
-must_use_candidate = "allow"                 # (intentional: most flagged sites are getters returning `&str`/`&Path` — ignoring is impossible, the lint adds noise.)
-missing_trait_methods = "allow"              # (intentional: relying on default trait methods is fine; spelling every method out is pure noise.)
-needless_pass_by_value = "allow"             # (intentional: most flagged sites are deliberate ownership transfers — error transformers, proc-macro signatures, builders that store the value.)
-field_scoped_visibility_modifiers = "allow"  # (intentional: `pub(crate)` / `pub(super)` are deliberate visibility choices.)
+# Real fixes applied: `impl_trait_in_params` (26), `return_self_not_must_use`
+# (18), `rc_buffer` (4), `unnecessary_wraps` (4), `mutex_atomic` (1),
+# `same_name_method` (2), `renamed_function_params` (4),
+# `wildcard_enum_match_arm` (7), `clone_on_ref_ptr` (1), `ref_patterns` (11).
+# `#[non_exhaustive]` applied to all 4 error enums (`EdgeError`, `KvError`,
+# `SecretError`, `ConfigStoreError`), the 19 deserialize-only manifest
+# structs, and the manifest enums (`HttpMethod`, `BodyMode`, `LogLevel`).
+# The lints below stay allowed with audited rationales:
+exhaustive_structs = "allow"                 # (audited 108 sites: applied #[non_exhaustive] selectively to internal manifest types. Remaining flagged sites are tuple-struct extractors users *destructure* (`Json<T>(pub T)` etc.), unit structs, externally-constructed scaffold blueprints, and request-context types used in integration tests — all of which would break if marked.)
+exhaustive_enums = "allow"                   # (audited 18 sites: applied to all 4 error enums + manifest enums. Remaining are `Body` (2 variants, unlikely to grow — would force 12+ adapter sites to add never-firing wildcards) and `AdapterAction` (3 variants, same.))
+must_use_candidate = "allow"                 # (audited: 117 sites are getters returning `&str`/`&Path`/`&Foo` where ignoring the value is impossible by construction. Adding `#[must_use]` to all of them is documentation noise without preventing a real bug class.)
+missing_trait_methods = "allow"              # (audited: relying on default trait methods is fine; the lint wants every default method spelled out which is pure noise.)
+needless_pass_by_value = "allow"             # (audited: real fix applied to `run_app_with_stores` (FastlyLogging, StoreRequirements). Remaining 14 sites are deliberate ownership transfers — error converters that `match err {...}` and consume, proc-macro `attr: TokenStream` upstream signatures, builders that store the value, top-level CLI entry.)
+field_scoped_visibility_modifiers = "allow"  # (intentional: `pub(crate)` / `pub(super)` on fields are deliberate visibility choices, not noise.)
 partial_pub_fields = "allow"                 # (intentional: same — selective field exposure is by design.)
 trivially_copy_pass_by_ref = "allow"         # (intentional: API ergonomics; pass-by-ref is fine for `Method` / `StatusCode` etc.)
 

@@ -60,6 +60,7 @@ use crate::error::EdgeError;
 
 /// Errors returned by KV store operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum KvError {
     /// The requested key was not found (used by `delete` when strict).
     #[error("key not found: {key}")]

@@ -34,7 +34,7 @@ mod tests {
     fn responder_for_into_response_types() {
         let response = "hello".respond().expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.body().as_bytes(), b"hello");
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"hello");
     }
 
     #[test]

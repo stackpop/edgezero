@@ -38,7 +38,7 @@ fn build_test_app() -> App {
     }
 
     async fn mirror_body(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let bytes = ctx.request().body().as_bytes().to_vec();
+        let bytes = ctx.request().body().as_bytes().expect("buffered").to_vec();
         let response = response_builder()
             .status(StatusCode::OK)
             .body(Body::from(bytes))
@@ -112,7 +112,10 @@ fn into_core_request_preserves_method_uri_headers_body_and_context() {
         Some("1")
     );
 
-    assert_eq!(core_request.body().as_bytes(), b"payload");
+    assert_eq!(
+        core_request.body().as_bytes().expect("buffered"),
+        b"payload"
+    );
 
     let context = FastlyRequestContext::get(&core_request).expect("context");
     assert_eq!(context.client_ip, expected_ip);

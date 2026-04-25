@@ -381,7 +381,10 @@ mod tests {
 
         let response = block_on(service.clone().call(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.body().as_bytes(), b"hello world");
+        assert_eq!(
+            response.body().as_bytes().expect("buffered"),
+            b"hello world"
+        );
     }
 
     #[test]
@@ -405,7 +408,7 @@ mod tests {
         let response = block_on(service.clone().call(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.body().as_bytes();
+        let body = response.body().as_bytes().expect("buffered");
         let payload: Vec<serde_json::Value> = serde_json::from_slice(body).expect("json payload");
 
         assert!(payload.contains(&json!({
@@ -551,7 +554,10 @@ mod tests {
             .expect("request");
         let ok_response = block_on(service.clone().call(ok_request)).expect("response");
         assert_eq!(ok_response.status(), StatusCode::OK);
-        assert_eq!(ok_response.body().as_bytes(), b"hello 42");
+        assert_eq!(
+            ok_response.body().as_bytes().expect("buffered"),
+            b"hello 42"
+        );
 
         let request = request_builder()
             .method(Method::GET)

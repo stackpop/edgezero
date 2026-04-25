@@ -20,7 +20,7 @@ fn build_test_app() -> App {
     }
 
     async fn mirror_body(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let bytes = ctx.request().body().as_bytes().to_vec();
+        let bytes = ctx.request().body().as_bytes().expect("buffered").to_vec();
         let response = response_builder()
             .status(StatusCode::OK)
             .body(Body::from(bytes))
@@ -83,7 +83,10 @@ fn router_dispatches_get_and_returns_response() {
     let response = block_on(app.router().oneshot(request));
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.body().as_bytes(), b"http://example.com/uri");
+    assert_eq!(
+        response.body().as_bytes().expect("buffered"),
+        b"http://example.com/uri"
+    );
 }
 
 #[test]
@@ -98,7 +101,10 @@ fn router_dispatches_post_with_body() {
     let response = block_on(app.router().oneshot(request));
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.body().as_bytes(), b"echo-payload");
+    assert_eq!(
+        response.body().as_bytes().expect("buffered"),
+        b"echo-payload"
+    );
 }
 
 #[test]
