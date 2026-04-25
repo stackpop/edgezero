@@ -499,7 +499,7 @@ mod tests {
 
     impl Drop for PathOverride {
         fn drop(&mut self) {
-            if let Some(ref original) = self.original {
+            if let Some(original) = &self.original {
                 std::env::set_var("PATH", original);
             } else {
                 std::env::remove_var("PATH");

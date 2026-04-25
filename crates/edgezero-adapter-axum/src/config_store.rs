@@ -19,10 +19,11 @@ pub struct AxumConfigStore {
 
 impl AxumConfigStore {
     /// Create from env vars and optional manifest defaults.
-    pub fn new(
-        env: impl IntoIterator<Item = (String, String)>,
-        defaults: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
+    pub fn new<E, D>(env: E, defaults: D) -> Self
+    where
+        E: IntoIterator<Item = (String, String)>,
+        D: IntoIterator<Item = (String, String)>,
+    {
         Self {
             env: env.into_iter().collect(),
             defaults: defaults.into_iter().collect(),
@@ -30,12 +31,16 @@ impl AxumConfigStore {
     }
 
     /// Create from the current process environment and manifest defaults.
-    pub fn from_env(defaults: impl IntoIterator<Item = (String, String)>) -> Self {
+    pub fn from_env<D>(defaults: D) -> Self
+    where
+        D: IntoIterator<Item = (String, String)>,
+    {
         Self::from_lookup(defaults, |key| std::env::var(key).ok())
     }
 
-    fn from_lookup<F>(defaults: impl IntoIterator<Item = (String, String)>, mut lookup: F) -> Self
+    fn from_lookup<D, F>(defaults: D, mut lookup: F) -> Self
     where
+        D: IntoIterator<Item = (String, String)>,
         F: FnMut(&str) -> Option<String>,
     {
         let defaults: HashMap<String, String> = defaults.into_iter().collect();

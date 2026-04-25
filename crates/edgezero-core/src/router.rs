@@ -26,7 +26,7 @@ pub struct RouteInfo {
 }
 
 impl RouteInfo {
-    pub fn new(method: Method, path: impl Into<String>) -> Self {
+    pub fn new<S: Into<String>>(method: Method, path: S) -> Self {
         Self {
             method,
             path: path.into(),
@@ -74,10 +74,12 @@ impl RouterBuilder {
         Self::default()
     }
 
+    #[must_use]
     pub fn enable_route_listing(self) -> Self {
         self.enable_route_listing_at(DEFAULT_ROUTE_LISTING_PATH)
     }
 
+    #[must_use]
     pub fn enable_route_listing_at<S>(mut self, path: S) -> Self
     where
         S: Into<String>,
@@ -92,6 +94,7 @@ impl RouterBuilder {
         self
     }
 
+    #[must_use]
     pub fn route<H>(mut self, path: &str, method: Method, handler: H) -> Self
     where
         H: IntoHandler,
@@ -100,6 +103,7 @@ impl RouterBuilder {
         self
     }
 
+    #[must_use]
     pub fn get<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -107,6 +111,7 @@ impl RouterBuilder {
         self.route(path, Method::GET, handler)
     }
 
+    #[must_use]
     pub fn post<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -114,6 +119,7 @@ impl RouterBuilder {
         self.route(path, Method::POST, handler)
     }
 
+    #[must_use]
     pub fn put<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -121,6 +127,7 @@ impl RouterBuilder {
         self.route(path, Method::PUT, handler)
     }
 
+    #[must_use]
     pub fn delete<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -128,6 +135,7 @@ impl RouterBuilder {
         self.route(path, Method::DELETE, handler)
     }
 
+    #[must_use]
     pub fn middleware<M>(mut self, middleware: M) -> Self
     where
         M: Middleware,
@@ -136,6 +144,7 @@ impl RouterBuilder {
         self
     }
 
+    #[must_use]
     pub fn middleware_arc(mut self, middleware: BoxMiddleware) -> Self {
         self.middlewares.push(middleware);
         self
@@ -145,11 +154,11 @@ impl RouterBuilder {
         let listing_path = self.route_listing_path.clone();
 
         let mut route_info = self.route_info.clone();
-        if let Some(ref path) = listing_path {
+        if let Some(path) = &listing_path {
             route_info.push(RouteInfo::new(Method::GET, path.clone()));
         }
 
-        let route_index = Arc::new(route_info);
+        let route_index: Arc<[RouteInfo]> = Arc::from(route_info);
 
         if let Some(path) = listing_path {
             let index = Arc::clone(&route_index);
@@ -212,7 +221,7 @@ impl RouterService {
     fn new(
         routes: HashMap<Method, PathRouter<RouteEntry>>,
         middlewares: Vec<BoxMiddleware>,
-        route_index: Arc<Vec<RouteInfo>>,
+        route_index: Arc<[RouteInfo]>,
     ) -> Self {
         Self {
             inner: Arc::new(RouterInner {
@@ -228,7 +237,7 @@ impl RouterService {
     }
 
     pub fn routes(&self) -> Vec<RouteInfo> {
-        (*self.inner.route_index).clone()
+        self.inner.route_index.to_vec()
     }
 
     pub async fn oneshot(&self, request: Request) -> Response {
@@ -243,7 +252,7 @@ impl RouterService {
 struct RouterInner {
     routes: HashMap<Method, PathRouter<RouteEntry>>,
     middlewares: Vec<BoxMiddleware>,
-    route_index: Arc<Vec<RouteInfo>>,
+    route_index: Arc<[RouteInfo]>,
 }
 
 enum RouteMatch<'a> {
@@ -312,9 +321,9 @@ impl Service<Request> for RouterService {
         std::task::Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request) -> Self::Future {
+    fn call(&mut self, req: Request) -> Self::Future {
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move { inner.dispatch(request).await })
+        Box::pin(async move { inner.dispatch(req).await })
     }
 }
 

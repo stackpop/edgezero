@@ -54,14 +54,12 @@ mod tests {
     #[test]
     fn parses_new_command_with_defaults() {
         let args = Args::try_parse_from(["edgezero", "new", "demo-app"]).expect("parse new");
-        match args.cmd {
-            Command::New(new_args) => {
-                assert_eq!(new_args.name, "demo-app");
-                assert!(new_args.dir.is_none());
-                assert!(!new_args.local_core);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
+        let Command::New(new_args) = args.cmd else {
+            panic!("expected Command::New");
+        };
+        assert_eq!(new_args.name, "demo-app");
+        assert!(new_args.dir.is_none());
+        assert!(!new_args.local_core);
     }
 
     #[test]
@@ -76,16 +74,15 @@ mod tests {
             "value",
         ])
         .expect("parse build");
-        match args.cmd {
-            Command::Build {
-                adapter,
-                adapter_args,
-            } => {
-                assert_eq!(adapter, "fastly");
-                assert_eq!(adapter_args, vec!["--flag", "value"]);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
+        let Command::Build {
+            adapter,
+            adapter_args,
+        } = args.cmd
+        else {
+            panic!("expected Command::Build");
+        };
+        assert_eq!(adapter, "fastly");
+        assert_eq!(adapter_args, vec!["--flag", "value"]);
     }
 
     #[test]

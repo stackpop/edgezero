@@ -29,19 +29,19 @@ pub enum EdgeError {
 }
 
 impl EdgeError {
-    pub fn bad_request(message: impl Into<String>) -> Self {
+    pub fn bad_request<S: Into<String>>(message: S) -> Self {
         EdgeError::BadRequest {
             message: message.into(),
         }
     }
 
-    pub fn validation(message: impl Into<String>) -> Self {
+    pub fn validation<S: Into<String>>(message: S) -> Self {
         EdgeError::Validation {
             message: message.into(),
         }
     }
 
-    pub fn not_found(path: impl Into<String>) -> Self {
+    pub fn not_found<S: Into<String>>(path: S) -> Self {
         EdgeError::NotFound { path: path.into() }
     }
 
@@ -71,7 +71,7 @@ impl EdgeError {
         }
     }
 
-    pub fn service_unavailable(message: impl Into<String>) -> Self {
+    pub fn service_unavailable<S: Into<String>>(message: S) -> Self {
         EdgeError::ServiceUnavailable {
             message: message.into(),
         }
@@ -101,10 +101,22 @@ impl EdgeError {
         }
     }
 
+    /// Typed access to the wrapped [`AnyError`] for `EdgeError::Internal`.
+    /// Shadows [`std::error::Error::source`] (auto-derived by `thiserror`)
+    /// intentionally — the trait method returns a `&dyn Error`, this one
+    /// returns the concrete `&anyhow::Error` so callers can downcast.
+    #[allow(
+        clippy::same_name_method,
+        reason = "intentional: typed alternative to the trait-object Error::source"
+    )]
     pub fn source(&self) -> Option<&AnyError> {
         match self {
             EdgeError::Internal { source } => Some(source),
-            _ => None,
+            EdgeError::BadRequest { .. }
+            | EdgeError::NotFound { .. }
+            | EdgeError::MethodNotAllowed { .. }
+            | EdgeError::Validation { .. }
+            | EdgeError::ServiceUnavailable { .. } => None,
         }
     }
 }

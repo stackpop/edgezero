@@ -111,7 +111,7 @@ fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
 fn handle_build(adapter_name: &str, adapter_args: &[String]) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
-    if let Some(ref m) = manifest {
+    if let Some(m) = &manifest {
         log_store_bindings(adapter_name, m);
     }
     adapter::execute(
@@ -233,7 +233,7 @@ serve = "echo serve"
 
     impl Drop for EnvOverride {
         fn drop(&mut self) {
-            if let Some(ref original) = self.original {
+            if let Some(original) = &self.original {
                 std::env::set_var(self.key, original);
             } else {
                 std::env::remove_var(self.key);

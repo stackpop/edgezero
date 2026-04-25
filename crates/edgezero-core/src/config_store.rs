@@ -31,14 +31,14 @@ pub enum ConfigStoreError {
 
 impl ConfigStoreError {
     /// Create an error for malformed or backend-invalid keys.
-    pub fn invalid_key(message: impl Into<String>) -> Self {
+    pub fn invalid_key<S: Into<String>>(message: S) -> Self {
         Self::InvalidKey {
             message: message.into(),
         }
     }
 
     /// Create an error for temporarily unavailable backends.
-    pub fn unavailable(message: impl Into<String>) -> Self {
+    pub fn unavailable<S: Into<String>>(message: S) -> Self {
         Self::Unavailable {
             message: message.into(),
         }
