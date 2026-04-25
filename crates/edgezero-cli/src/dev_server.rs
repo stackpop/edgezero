@@ -22,11 +22,11 @@ pub fn run_dev() {
     match try_run_manifest_axum() {
         Ok(true) => return,
         Ok(false) => {}
-        Err(err) => eprintln!("[edgezero] dev manifest error: {err}"),
+        Err(err) => log::error!("[edgezero] dev manifest error: {err}"),
     }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
-    println!(
+    log::info!(
         "[edgezero] dev: starting local server on http://{}:{}",
         addr.ip(),
         addr.port()
@@ -40,7 +40,7 @@ pub fn run_dev() {
 
     let server = AxumDevServer::with_config(router, config);
     if let Err(err) = server.run() {
-        eprintln!("[edgezero] dev server error: {err}");
+        log::error!("[edgezero] dev server error: {err}");
     }
 }
 

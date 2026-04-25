@@ -41,7 +41,7 @@ impl ProjectLayout {
             ));
         }
 
-        println!("[edgezero] creating project at {}", out_dir.display());
+        log::info!("[edgezero] creating project at {}", out_dir.display());
 
         let crates_dir = out_dir.join("crates");
         let core_name = format!("{name}-core");
@@ -96,7 +96,7 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
     render_templates(&layout, &adapter_artifacts.contexts, &data_value)?;
     initialize_git_repo(&layout.out_dir);
 
-    println!(
+    log::info!(
         "[edgezero] created new multi-crate app at {}",
         layout.out_dir.display()
     );
@@ -382,7 +382,7 @@ fn render_templates(
     let mut hbs = Handlebars::new();
     register_templates(&mut hbs);
 
-    println!("[edgezero] writing workspace files");
+    log::info!("[edgezero] writing workspace files");
     write_tmpl(
         &hbs,
         "root_Cargo_toml",
@@ -408,7 +408,7 @@ fn render_templates(
         &layout.out_dir.join(".gitignore"),
     )?;
 
-    println!("[edgezero] writing core crate {}", layout.core_name);
+    log::info!("[edgezero] writing core crate {}", layout.core_name);
     write_tmpl(
         &hbs,
         "core_Cargo_toml",
@@ -429,7 +429,7 @@ fn render_templates(
     )?;
 
     for context in adapter_contexts {
-        println!(
+        log::info!(
             "[edgezero] writing adapter crate {}",
             context
                 .dir
@@ -451,7 +451,7 @@ fn render_templates(
 }
 
 fn initialize_git_repo(out_dir: &Path) {
-    println!("[edgezero] initializing git repository");
+    log::info!("[edgezero] initializing git repository");
     match Command::new("git")
         .arg("init")
         .arg("--quiet")
@@ -459,16 +459,16 @@ fn initialize_git_repo(out_dir: &Path) {
         .status()
     {
         Ok(status) if status.success() => {
-            println!(
+            log::info!(
                 "[edgezero] initialized empty Git repository in {}/.git/",
                 out_dir.display()
             );
         }
         Ok(status) => {
-            eprintln!("[edgezero] warning: git init exited with status {status}");
+            log::warn!("[edgezero] warning: git init exited with status {status}");
         }
         Err(err) => {
-            eprintln!("[edgezero] warning: failed to initialize git repository: {err}");
+            log::warn!("[edgezero] warning: failed to initialize git repository: {err}");
         }
     }
 }

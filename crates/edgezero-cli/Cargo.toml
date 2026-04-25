@@ -21,6 +21,7 @@ futures = { workspace = true }
 handlebars = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
+simple_logger = { workspace = true }
 serde_json = { workspace = true}
 toml = { workspace = true }
 

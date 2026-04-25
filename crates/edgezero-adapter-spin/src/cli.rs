@@ -209,7 +209,7 @@ impl Adapter for SpinCliAdapter {
         match action {
             AdapterAction::Build => {
                 let artifact = build(args)?;
-                println!("[edgezero] Spin build complete -> {}", artifact.display());
+                log::info!("[edgezero] Spin build complete -> {}", artifact.display());
                 Ok(())
             }
             AdapterAction::Deploy => deploy(args),
