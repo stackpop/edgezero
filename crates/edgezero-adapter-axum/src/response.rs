@@ -35,16 +35,16 @@ pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
                 Ok(buf) => AxumBody::from(buf),
                 Err(err) => {
                     error!("streaming response error: {err}");
-                    let body = AxumBody::from("streaming response error");
-                    let mut response = Response::builder()
+                    let error_body = AxumBody::from("streaming response error");
+                    let mut error_response = Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(body)
+                        .body(error_body)
                         .expect("error response");
-                    response.headers_mut().insert(
+                    error_response.headers_mut().insert(
                         axum::http::header::CONTENT_TYPE,
                         axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
                     );
-                    return response;
+                    return error_response;
                 }
             }
         }
@@ -87,8 +87,8 @@ mod tests {
 
         let collected = block_on(async {
             let mut data = Vec::new();
-            let mut stream = axum_response.into_body().into_data_stream();
-            while let Some(chunk) = stream.next().await {
+            let mut body_stream = axum_response.into_body().into_data_stream();
+            while let Some(chunk) = body_stream.next().await {
                 let chunk = chunk.expect("chunk");
                 data.extend_from_slice(&chunk);
             }

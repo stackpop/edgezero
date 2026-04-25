@@ -176,11 +176,11 @@ fn store_name_slug(store_name: &str) -> String {
         let mapped = ch.is_ascii_alphanumeric().then(|| ch.to_ascii_lowercase());
 
         match mapped {
-            Some(ch) => {
+            Some(lower_ch) => {
                 if slug.len() == MAX_SLUG_LEN {
                     break;
                 }
-                slug.push(ch);
+                slug.push(lower_ch);
                 last_was_separator = false;
             }
             None if !slug.is_empty() && !last_was_separator => {
@@ -246,20 +246,20 @@ async fn serve_with_stores(
         }
         service
     };
-    let router = Router::new().fallback_service(service_fn(move |req| {
+    let axum_router = Router::new().fallback_service(service_fn(move |req| {
         let mut svc = service.clone();
         async move { svc.call(req).await }
     }));
-    let make_service = router.into_make_service_with_connect_info::<SocketAddr>();
+    let make_service = axum_router.into_make_service_with_connect_info::<SocketAddr>();
 
     let shutdown = enable_ctrl_c.then_some(async {
         let _ctrl_c = signal::ctrl_c().await;
     });
 
     let server = axum::serve(listener, make_service);
-    if let Some(shutdown) = shutdown {
-        let server = server.with_graceful_shutdown(shutdown);
-        server.await.context("axum server error")?;
+    if let Some(shutdown_signal) = shutdown {
+        let graceful_server = server.with_graceful_shutdown(shutdown_signal);
+        graceful_server.await.context("axum server error")?;
     } else {
         server.await.context("axum server error")?;
     }
@@ -677,15 +677,16 @@ mod integration_tests {
 
         // Write a value
         let write_url = format!("{}/write", server.base_url);
-        let response = send_with_retry(&client, |client| client.post(write_url.as_str())).await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), "written");
+        let write_response =
+            send_with_retry(&client, |client| client.post(write_url.as_str())).await;
+        assert_eq!(write_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(write_response.text().await.unwrap(), "written");
 
         // Read it back — proves shared state across requests
         let read_url = format!("{}/read", server.base_url);
-        let response = send_with_retry(&client, |client| client.get(read_url.as_str())).await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), "42");
+        let read_response = send_with_retry(&client, |client| client.get(read_url.as_str())).await;
+        assert_eq!(read_response.status(), reqwest::StatusCode::OK);
+        assert_eq!(read_response.text().await.unwrap(), "42");
 
         server.handle.abort();
     }
@@ -719,22 +720,21 @@ mod integration_tests {
         let client = reqwest::Client::new();
 
         // Write
-        let url = format!("{}/write", server.base_url);
-        send_with_retry(&client, |c| c.post(url.as_str())).await;
+        let write_url = format!("{}/write", server.base_url);
+        send_with_retry(&client, |c| c.post(write_url.as_str())).await;
 
         // Verify exists
-        let url = format!("{}/check", server.base_url);
-        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
-        assert_eq!(resp.text().await.unwrap(), "exists=true");
+        let check_url = format!("{}/check", server.base_url);
+        let exists_before = send_with_retry(&client, |c| c.get(check_url.as_str())).await;
+        assert_eq!(exists_before.text().await.unwrap(), "exists=true");
 
         // Delete
-        let url = format!("{}/delete", server.base_url);
-        send_with_retry(&client, |c| c.post(url.as_str())).await;
+        let delete_url = format!("{}/delete", server.base_url);
+        send_with_retry(&client, |c| c.post(delete_url.as_str())).await;
 
         // Verify gone
-        let url = format!("{}/check", server.base_url);
-        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
-        assert_eq!(resp.text().await.unwrap(), "exists=false");
+        let exists_after = send_with_retry(&client, |c| c.get(check_url.as_str())).await;
+        assert_eq!(exists_after.text().await.unwrap(), "exists=false");
 
         server.handle.abort();
     }
@@ -826,14 +826,14 @@ mod integration_tests {
         let client = reqwest::Client::new();
 
         // Save profile
-        let url = format!("{}/save", server.base_url);
-        let resp = send_with_retry(&client, |c| c.post(url.as_str())).await;
-        assert_eq!(resp.text().await.unwrap(), "saved");
+        let save_url = format!("{}/save", server.base_url);
+        let save_resp = send_with_retry(&client, |c| c.post(save_url.as_str())).await;
+        assert_eq!(save_resp.text().await.unwrap(), "saved");
 
         // Load profile
-        let url = format!("{}/load", server.base_url);
-        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
-        assert_eq!(resp.text().await.unwrap(), "Alice:30");
+        let load_url = format!("{}/load", server.base_url);
+        let load_resp = send_with_retry(&client, |c| c.get(load_url.as_str())).await;
+        assert_eq!(load_resp.text().await.unwrap(), "Alice:30");
 
         server.handle.abort();
     }

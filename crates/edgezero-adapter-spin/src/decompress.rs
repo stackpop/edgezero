@@ -29,37 +29,37 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
     match encoding {
         Some("gzip") => {
             let mut decoder = flate2::read::GzDecoder::new(body.as_slice());
-            let mut decoded = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
+            let mut output = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
             decoder
                 .by_ref()
                 .take(MAX_DECOMPRESSED_SIZE as u64 + 1)
-                .read_to_end(&mut decoded)
+                .read_to_end(&mut output)
                 .map_err(|e| {
                     EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}"))
                 })?;
-            if decoded.len() > MAX_DECOMPRESSED_SIZE {
+            if output.len() > MAX_DECOMPRESSED_SIZE {
                 return Err(EdgeError::internal(anyhow::anyhow!(
                     "decompressed body exceeds maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
                 )));
             }
-            Ok(decoded)
+            Ok(output)
         }
         Some("br") => {
             let mut decoder = brotli::Decompressor::new(body.as_slice(), 8192);
-            let mut decoded = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
+            let mut output = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
             decoder
                 .by_ref()
                 .take(MAX_DECOMPRESSED_SIZE as u64 + 1)
-                .read_to_end(&mut decoded)
+                .read_to_end(&mut output)
                 .map_err(|e| {
                     EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {e}"))
                 })?;
-            if decoded.len() > MAX_DECOMPRESSED_SIZE {
+            if output.len() > MAX_DECOMPRESSED_SIZE {
                 return Err(EdgeError::internal(anyhow::anyhow!(
                     "decompressed body exceeds maximum size of {MAX_DECOMPRESSED_SIZE} bytes"
                 )));
             }
-            Ok(decoded)
+            Ok(output)
         }
         _ => Ok(body),
     }
@@ -75,11 +75,11 @@ mod tests {
     #[test]
     fn decompress_body_handles_identity() {
         let plain = b"hello plain".to_vec();
-        let result = decompress_body(plain.clone(), None).unwrap();
-        assert_eq!(result, plain);
+        let none_encoding = decompress_body(plain.clone(), None).unwrap();
+        assert_eq!(none_encoding, plain);
 
-        let result = decompress_body(plain.clone(), Some("identity")).unwrap();
-        assert_eq!(result, plain);
+        let identity_encoding = decompress_body(plain.clone(), Some("identity")).unwrap();
+        assert_eq!(identity_encoding, plain);
     }
 
     #[test]
