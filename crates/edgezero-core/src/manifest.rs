@@ -1248,7 +1248,7 @@ features = ["feature1", "feature2"]
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
         let m = loader.manifest();
-        let adapter = m.adapters.get("fastly").unwrap();
+        let adapter = &m.adapters["fastly"];
         assert_eq!(adapter.build.target.as_deref(), Some("wasm32-wasip1"));
         assert_eq!(adapter.build.profile.as_deref(), Some("release"));
         assert_eq!(adapter.build.features, vec!["feature1", "feature2"]);
@@ -1264,7 +1264,7 @@ deploy = "fastly compute deploy"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
         let m = loader.manifest();
-        let adapter = m.adapters.get("fastly").unwrap();
+        let adapter = &m.adapters["fastly"];
         assert_eq!(
             adapter.commands.build.as_deref(),
             Some("fastly compute build")
@@ -1288,7 +1288,7 @@ manifest = "fastly.toml"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
         let m = loader.manifest();
-        let adapter = m.adapters.get("fastly").unwrap();
+        let adapter = &m.adapters["fastly"];
         assert_eq!(
             adapter.adapter.crate_path.as_deref(),
             Some("crates/fastly-adapter")

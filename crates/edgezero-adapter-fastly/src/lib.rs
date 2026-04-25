@@ -185,7 +185,7 @@ fn run_app_with_stores<A: edgezero_core::app::Hooks>(
 ) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
-        init_logger(endpoint, logging.level, logging.echo_stdout).expect("init fastly logger");
+        init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
 
     let app = A::build_app();

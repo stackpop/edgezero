@@ -256,15 +256,15 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
         });
 
     let port = match adapter.get("port").and_then(Value::as_integer) {
-        Some(value) => {
-            if !(1..=u16::MAX as i64).contains(&value) {
-                return Err(format!(
+        Some(value) => u16::try_from(value)
+            .ok()
+            .filter(|p| *p > 0)
+            .ok_or_else(|| {
+                format!(
                     "adapter.port in {} must be between 1 and 65535",
                     manifest.display()
-                ));
-            }
-            value as u16
-        }
+                )
+            })?,
         None => 8787,
     };
 

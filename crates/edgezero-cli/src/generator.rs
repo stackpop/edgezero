@@ -7,7 +7,6 @@ use edgezero_adapter::scaffold::AdapterBlueprint;
 use handlebars::Handlebars;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,11 +29,10 @@ struct ProjectLayout {
 impl ProjectLayout {
     fn new(args: &NewArgs) -> std::io::Result<Self> {
         let name = sanitize_crate_name(&args.name);
-        let base_dir = args
-            .dir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let base_dir = match args.dir.as_deref() {
+            Some(dir) => PathBuf::from(dir),
+            None => std::env::current_dir()?,
+        };
         let out_dir = base_dir.join(&name);
         if out_dir.exists() {
             return Err(std::io::Error::new(
@@ -75,7 +73,7 @@ pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
     let layout = ProjectLayout::new(&args)?;
 
     let mut workspace_dependencies = seed_workspace_dependencies();
-    let cwd = std::env::current_dir().unwrap();
+    let cwd = std::env::current_dir()?;
     let core_crate_line = resolve_core_dependency(&layout, &cwd, &mut workspace_dependencies);
 
     let adapter_artifacts = collect_adapter_data(&layout, &cwd, &mut workspace_dependencies)?;
@@ -237,18 +235,14 @@ fn collect_adapter_data(
             .replace("{crate_dir}", &crate_dir_rel);
 
         let mut manifest_section = String::new();
-        writeln!(
-            manifest_section,
-            "[adapters.{}.adapter]\ncrate = \"crates/{}\"\nmanifest = \"crates/{}/{}\"\n",
-            blueprint.id, crate_name, crate_name, blueprint.manifest.manifest_filename
-        )
-        .unwrap();
-        writeln!(
-            manifest_section,
-            "[adapters.{}.build]\ntarget = \"{}\"\nprofile = \"{}\"",
-            blueprint.id, blueprint.manifest.build_target, blueprint.manifest.build_profile
-        )
-        .unwrap();
+        manifest_section.push_str(&format!(
+            "[adapters.{}.adapter]\ncrate = \"crates/{}\"\nmanifest = \"crates/{}/{}\"\n\n",
+            blueprint.id, crate_name, crate_name, blueprint.manifest.manifest_filename,
+        ));
+        manifest_section.push_str(&format!(
+            "[adapters.{}.build]\ntarget = \"{}\"\nprofile = \"{}\"\n",
+            blueprint.id, blueprint.manifest.build_target, blueprint.manifest.build_profile,
+        ));
         if !blueprint.manifest.build_features.is_empty() {
             let joined = blueprint
                 .manifest
@@ -257,36 +251,27 @@ fn collect_adapter_data(
                 .map(|f| format!("\"{}\"", f))
                 .collect::<Vec<_>>()
                 .join(", ");
-            writeln!(manifest_section, "features = [{}]", joined).unwrap();
+            manifest_section.push_str(&format!("features = [{}]\n", joined));
         }
         manifest_section.push('\n');
-        writeln!(
-            manifest_section,
-            "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n",
-            blueprint.id, build_cmd, deploy_cmd, serve_cmd
-        )
-        .unwrap();
+        manifest_section.push_str(&format!(
+            "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n\n",
+            blueprint.id, build_cmd, deploy_cmd, serve_cmd,
+        ));
 
         manifest_section.push('\n');
-        writeln!(manifest_section, "[adapters.{}.logging]", blueprint.id).unwrap();
+        manifest_section.push_str(&format!("[adapters.{}.logging]\n", blueprint.id));
         if blueprint.id == "fastly" {
-            writeln!(
-                manifest_section,
-                "endpoint = \"{}_log\"",
-                layout.project_mod
-            )
-            .unwrap();
+            manifest_section.push_str(&format!("endpoint = \"{}_log\"\n", layout.project_mod));
         } else if let Some(endpoint) = blueprint.logging.endpoint {
-            writeln!(manifest_section, "endpoint = \"{}\"", endpoint).unwrap();
+            manifest_section.push_str(&format!("endpoint = \"{}\"\n", endpoint));
         }
-        writeln!(manifest_section, "level = \"{}\"", blueprint.logging.level).unwrap();
+        manifest_section.push_str(&format!("level = \"{}\"\n", blueprint.logging.level));
         if let Some(echo_stdout) = blueprint.logging.echo_stdout {
-            writeln!(
-                manifest_section,
-                "echo_stdout = {}",
-                if echo_stdout { "true" } else { "false" }
-            )
-            .unwrap();
+            manifest_section.push_str(&format!(
+                "echo_stdout = {}\n",
+                if echo_stdout { "true" } else { "false" },
+            ));
         }
         manifest_section.push('\n');
 
@@ -443,7 +428,11 @@ fn render_templates(
     for context in adapter_contexts {
         println!(
             "[edgezero] writing adapter crate {}",
-            context.dir.file_name().unwrap().to_string_lossy()
+            context
+                .dir
+                .file_name()
+                .expect("adapter context dir has a file name")
+                .to_string_lossy()
         );
         for file in context.blueprint.files {
             write_tmpl(

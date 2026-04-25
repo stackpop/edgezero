@@ -521,7 +521,7 @@ mod tests {
     fn params(values: &[(&str, &str)]) -> PathParams {
         let map = values
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect::<HashMap<_, _>>();
         PathParams::new(map)
     }

@@ -5,6 +5,9 @@ version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 
+[lints]
+workspace = true
+
 [features]
 default = []
 cloudflare = ["dep:worker", "dep:serde_json"]

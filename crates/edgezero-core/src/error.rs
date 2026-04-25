@@ -90,13 +90,13 @@ impl EdgeError {
 
     pub fn message(&self) -> String {
         match self {
-            EdgeError::BadRequest { message } => message.clone(),
-            EdgeError::Validation { message } => message.clone(),
+            EdgeError::BadRequest { message }
+            | EdgeError::Validation { message }
+            | EdgeError::ServiceUnavailable { message } => message.clone(),
             EdgeError::NotFound { path } => format!("no route matched path: {path}"),
             EdgeError::MethodNotAllowed { method, allowed } => {
                 format!("method {} not allowed; allowed: {}", method, allowed)
             }
-            EdgeError::ServiceUnavailable { message } => message.clone(),
             EdgeError::Internal { source } => format!("internal error: {}", source),
         }
     }

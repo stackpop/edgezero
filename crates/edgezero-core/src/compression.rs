@@ -26,7 +26,11 @@ where
                 break;
             }
 
-            yield Bytes::copy_from_slice(&buffer[..read]);
+            yield Bytes::copy_from_slice(
+                buffer
+                    .get(..read)
+                    .expect("AsyncRead::read returns at most buffer.len()"),
+            );
         }
     }
 }
@@ -47,7 +51,11 @@ where
                 break;
             }
 
-            yield Bytes::copy_from_slice(&buffer[..read]);
+            yield Bytes::copy_from_slice(
+                buffer
+                    .get(..read)
+                    .expect("AsyncRead::read returns at most buffer.len()"),
+            );
         }
     }
 }

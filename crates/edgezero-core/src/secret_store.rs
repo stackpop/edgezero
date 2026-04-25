@@ -347,7 +347,7 @@ mod tests {
         let provider = InMemorySecretStore::new(
             entries
                 .iter()
-                .map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))),
+                .map(|(k, v)| ((*k).to_string(), Bytes::from((*v).to_string()))),
         );
         SecretHandle::new(std::sync::Arc::new(provider))
     }

@@ -530,7 +530,7 @@ mod tests {
             let id = params
                 .id
                 .parse::<u32>()
-                .map_err(|_| EdgeError::bad_request("invalid id"))?;
+                .map_err(|_e| EdgeError::bad_request("invalid id"))?;
             Ok(format!("hello {}", id))
         }
 
@@ -593,13 +593,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "route listing path cannot be empty")]
     fn route_listing_rejects_empty_path() {
-        let _ = RouterService::builder().enable_route_listing_at("");
+        let _builder = RouterService::builder().enable_route_listing_at("");
     }
 
     #[test]
     #[should_panic(expected = "route listing path must begin with '/'")]
     fn route_listing_rejects_missing_slash() {
-        let _ = RouterService::builder().enable_route_listing_at("routes");
+        let _builder = RouterService::builder().enable_route_listing_at("routes");
     }
 
     #[test]

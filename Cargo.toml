@@ -69,3 +69,156 @@ validator = { version = "0.20", features = ["derive"] }
 walkdir = { version = "2" }
 web-time = "1"
 worker = { version = "0.8", features = ["http"] }
+
+[workspace.lints.clippy]
+# Enable Pedantic lints for style.
+pedantic = { level = "warn", priority = -1 }
+# Enable the restriction group (the most severe/strict group).
+restriction = { level = "deny", priority = -1 }
+
+# ---------------------------------------------------------------------------
+# Allow-list for currently-failing lints under pedantic + restriction.
+#
+# These were captured as a baseline when the strict groups were first turned
+# on. Every entry is a TODO: pick one, remove the allow, fix the call sites,
+# re-enable. Keep the counts up to date so progress is visible. Lints marked
+# (intentional) are ones we likely do not want to enforce; the rest should
+# be factored out over time.
+#
+# Refresh counts with:
+#   cargo clippy --workspace --all-targets --all-features --message-format=json \
+#     | jq -r 'select(.reason=="compiler-message") | .message.code.code' \
+#     | sort | uniq -c | sort -rn
+# Note: clippy stops emitting after a per-file threshold, so iterate by
+# silencing the noisiest, re-running, and adding the next wave.
+# ---------------------------------------------------------------------------
+
+# -- Meta -------------------------------------------------------------------
+# Enabling the whole `restriction` group is what `blanket_clippy_restriction_lints`
+# warns against. We do it deliberately as a discovery mechanism — allow it.
+blanket_clippy_restriction_lints = "allow"   # 6  (intentional: we opt in to the group wholesale)
+
+# -- Documentation (factor out by writing docs) -----------------------------
+missing_docs_in_private_items = "allow"      # 275: private items lack doc comments
+missing_panics_doc = "allow"                 # 10:  pub fn that may panic missing # Panics section
+missing_inline_in_public_items = "allow"     # 9:   pub items without #[inline] (intentional? revisit)
+doc_markdown = "allow"                       # 4:   bare identifiers in doc comments need backticks
+missing_errors_doc = "allow"                 # 4:   pub fn returning Result missing # Errors section
+missing_fields_in_debug = "allow"            # 4:   manual `Debug` impl skipping fields
+
+# -- Style / formatting (factor out by reformatting) ------------------------
+implicit_return = "allow"                    # 375: trailing-expression returns vs explicit `return` (intentional: idiomatic Rust)
+arbitrary_source_item_ordering = "allow"     # 165: ordering of items within a module (cosmetic)
+module_name_repetitions = "allow"            # 78:  `foo::FooConfig` style names that repeat the module
+min_ident_chars = "allow"                    # 54:  single/two-letter identifiers (e.g., `e`, `id`, `kv`)
+single_call_fn = "allow"                     # 37:  helper fns called from exactly one site (often intentional for clarity)
+unseparated_literal_suffix = "allow"         # 24:  `1u32` vs `1_u32`
+str_to_string = "allow"                      # 18:  `&str::to_string()` vs `String::from`/`.into()`
+shadow_reuse = "allow"                       # 15:  `let x = x.foo();` reusing a binding name
+uninlined_format_args = "allow"              # 13:  `format!("{}", x)` vs `format!("{x}")`
+single_char_lifetime_names = "allow"         # 6:   lifetimes like `'a` (intentional: idiomatic Rust)
+if_then_some_else_none = "allow"             # 6:   `if c { Some(x) } else { None }` vs `c.then(|| x)`
+match_wildcard_for_single_variants = "allow" # 5:   `_ => ...` matching a single remaining variant
+deref_by_slicing = "allow"                   # 5:   `&v[..]` vs `&*v`
+shadow_unrelated = "allow"                   # 5:   `let x = ...; let x = unrelated;`
+redundant_closure_for_method_calls = "allow" # 5:   `.map(|x| x.foo())` vs `.map(Foo::foo)`
+similar_names = "allow"                      # 4:   variables whose names differ only slightly
+unreadable_literal = "allow"                 # 4:   large numeric literals without `_` separators
+shadow_same = "allow"                        # 4:   `let x = x;` rebinding to the same value
+explicit_iter_loop = "allow"                 # 3:   `for x in xs.iter()` vs `for x in &xs`
+pub_with_shorthand = "allow"                 # 3:   `pub(super)` shorthand vs `pub(in super)`
+string_add = "allow"                         # 3:   `s + "..."` operator vs `format!`/`push_str`
+pathbuf_init_then_push = "allow"             # 3:   `PathBuf::new()` then `.push(...)` vs `PathBuf::from(...)`
+map_unwrap_or = "allow"                      # 3:   `.map(...).unwrap_or(...)` vs `.map_or(...)`
+pub_use = "allow"                            # 2:   `pub use` re-exports (intentional in our public API surface)
+semicolon_outside_block = "allow"            # 2:   `{ ... };` placement
+semicolon_if_nothing_returned = "allow"      # 2:   `expr` vs `expr;` at end of a `()` block
+non_ascii_literal = "allow"                  # 2:   non-ASCII characters in string literals
+elidable_lifetime_names = "allow"            # 2:   named lifetime that could use `'_`
+implicit_clone = "allow"                     # 2:   `x.to_owned()` where `.clone()` would do
+ip_constant = "allow"                        # 2:   hand-rolled `Ipv4Addr::new(127,0,0,1)` vs `Ipv4Addr::LOCALHOST`
+manual_let_else = "allow"                    # 2:   `match` / `if let` rewrite as `let ... else`
+too_many_lines = "allow"                     # 2:   fn body exceeding the (configurable) line threshold
+return_and_then = "allow"                    # 2:   `return x.and_then(...)` vs `x?` or `Ok(...)?`
+else_if_without_else = "allow"               # 2:   `if/else if` chain missing a final `else`
+manual_string_new = "allow"                  # 1:   `String::from("")` vs `String::new()`
+redundant_type_annotations = "allow"         # 1:   type annotation that the compiler can infer
+decimal_literal_representation = "allow"     # 1:   `1024` rendered better as `0x400`
+needless_raw_strings = "allow"               # 1:   `r"..."` with no escapes that needs raw-ness
+needless_raw_string_hashes = "allow"         # 1:   `r#"..."#` whose hashes are unnecessary
+format_push_string = "allow"                 # 1:   `s.push_str(&format!(...))` vs `write!`
+redundant_test_prefix = "allow"              # 1:   `fn test_foo()` inside a module already named `tests`
+
+# -- Defensive coding -------------------------------------------------------
+# Test code is exempted via `clippy.toml` (allow-{unwrap,expect,panic,
+# indexing-slicing}-in-tests = true), so the counts below reflect *production*
+# code only. The `unwrap_used` lint is denied: production unwraps must become
+# `?` (when in a Result fn) or `.expect("invariant")` (when truly impossible
+# by construction). `.expect()` does NOT make code safer — it has the same
+# panic semantics as `.unwrap()` — but it documents *why* the call is
+# considered infallible. See `clippy.toml` for the test-allow list.
+question_mark_used = "allow"                 # (intentional: idiomatic Rust)
+pattern_type_mismatch = "allow"              # (intentional: rewriting `match &x` as `match x`/`ref` is uglier)
+default_numeric_fallback = "allow"           # (intentional: type-suffix on every literal is too noisy)
+arithmetic_side_effects = "allow"            # (intentional: not cryptographic; checked_* everywhere is overkill)
+float_arithmetic = "allow"                   # (intentional: same rationale as arithmetic_side_effects)
+as_conversions = "allow"                     # (intentional for trivial widening; bigger casts already ok'd by `cast_*` lints)
+string_slice = "allow"                       # (intentional where ASCII-safe; revisit per-site if Unicode-relevant)
+expect_used = "allow"                        # `.expect("invariant")` is the documented-assertion pattern (init paths, infallible writes, etc.)
+unwrap_in_result = "allow"                   # overlaps with `expect_used` — fires on `.expect()` inside Result fns too
+panic = "allow"                              # used for build-time / setup-time invariants (route registration, proc-macro expansion)
+assertions_on_result_states = "allow"        # `assert!(r.is_ok())` in tests; clippy has no per-test config option for this lint
+cast_possible_truncation = "allow"           # narrowing casts already validated by surrounding range check
+cast_sign_loss = "allow"                     # signed→unsigned casts already validated
+let_underscore_must_use = "allow"            # `let _ = ...` for genuinely-discarded results in tests / dev paths
+
+# -- API design (factor out by tightening visibility / making types final) --
+impl_trait_in_params = "allow"               # 20:  `fn f(x: impl Trait)` vs explicit generic
+return_self_not_must_use = "allow"           # 18:  builder-style fns returning `Self` should be `#[must_use]`
+exhaustive_structs = "allow"                 # 16:  pub struct without `#[non_exhaustive]`
+missing_trait_methods = "allow"              # 9:   trait impls relying on default methods
+must_use_candidate = "allow"                 # 6:   pub fn returning a value should be `#[must_use]`
+field_scoped_visibility_modifiers = "allow"  # 6:   `pub(crate)` / `pub(super)` on fields
+needless_pass_by_value = "allow"             # 4:   fn taking `T` that could take `&T`
+unnecessary_wraps = "allow"                  # 4:   fn returning `Result`/`Option` that always succeeds
+rc_buffer = "allow"                          # 4:   `Rc<String>` / `Rc<Vec<T>>` (prefer `Rc<str>` / `Rc<[T]>`)
+trivially_copy_pass_by_ref = "allow"         # 3:   fn taking `&T` for tiny Copy `T`
+partial_pub_fields = "allow"                 # 3:   struct mixing pub and private fields
+exhaustive_enums = "allow"                   # 2:   pub enum without `#[non_exhaustive]`
+renamed_function_params = "allow"            # 2:   trait impl renames a parameter from the trait definition
+same_name_method = "allow"                   # 2:   inherent method shadows a trait method of the same name
+ref_patterns = "allow"                       # 1:   `ref` patterns in `match`
+wildcard_enum_match_arm = "allow"            # 1:   `_ => ...` over an enum
+clone_on_ref_ptr = "allow"                   # 1:   `rc.clone()` vs `Rc::clone(&rc)`
+mutex_atomic = "allow"                       # 1:   `Mutex<bool>`/`Mutex<u32>` where an atomic would do
+
+# -- Imports / paths (factor out by adjusting use-statements) ---------------
+absolute_paths = "allow"                     # 19:  `::std::...` style paths
+unused_trait_names = "allow"                 # 6:   imported trait whose name isn't referenced
+non_std_lazy_statics = "allow"               # 6:   `once_cell::Lazy` instead of `std::sync::LazyLock` (Rust 1.80+)
+std_instead_of_alloc = "allow"               # 6:   `std::vec::Vec` etc. in no_std-compatible code
+iter_over_hash_type = "allow"                # 2:   iterating a `HashMap`/`HashSet` in non-deterministic order
+std_instead_of_core = "allow"                # 1:   `std::*` usage where `core::*` works
+
+# -- Output / diagnostics (factor out by routing through `log`/`tracing`) ---
+print_stderr = "allow"                       # 16:  `eprintln!`/`eprint!` (kept in CLI / build script for now)
+print_stdout = "allow"                       # 8:   `println!`/`print!` (kept in CLI / examples for now)
+unnecessary_debug_formatting = "allow"       # 2:   `{:?}` for types that have `Display`
+
+# -- Tests ------------------------------------------------------------------
+tests_outside_test_module = "allow"          # 1:   `#[test]` fn outside a `#[cfg(test)] mod tests`
+
+# -- Attributes -------------------------------------------------------------
+allow_attributes_without_reason = "allow"    # 5:   `#[allow(...)]` without `, reason = "..."`
+allow_attributes = "allow"                   # 3:   `#[allow]` instead of `#[expect]` on stable
+
+[workspace.lints.rust]
+# Disallow unsafe code by default. Individual items may opt in with
+# `#[allow(unsafe_code)]` plus a SAFETY comment when FFI/mmap
+# boundaries require it (e.g., llama.cpp Send/Sync, safetensors mmap).
+unsafe_code = "deny"
+# `#[expect(...)]` attrs the linter sweep added become "unfulfilled"
+# when the workspace later allow-lists the corresponding lint. Allow
+# the meta-lint until we either prune those attrs or switch the
+# workspace policy back to per-site allows.
+unfulfilled_lint_expectations = "allow"
