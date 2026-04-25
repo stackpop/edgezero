@@ -158,7 +158,7 @@ mod tests {
     use crate::error::EdgeError;
     use crate::http::{request_builder, Method, StatusCode};
     use futures::executor::block_on;
-    use tower_service::Service;
+    use tower_service::Service as _;
 
     fn empty_router() -> RouterService {
         RouterService::builder().build()

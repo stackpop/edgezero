@@ -5,7 +5,7 @@ use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderName, HeaderValue, Method, StatusCode};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
-use futures_util::StreamExt;
+use futures_util::StreamExt as _;
 use reqwest::{header, Client};
 
 pub struct AxumProxyClient {
@@ -116,7 +116,6 @@ mod integration_tests {
     use super::*;
     use axum::{routing::get, routing::post, Router};
     use edgezero_core::http::Uri;
-    use edgezero_core::proxy::ProxyClient;
     use tokio::net::TcpListener;
 
     async fn start_test_server(router: Router) -> String {

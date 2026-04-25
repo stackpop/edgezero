@@ -123,7 +123,7 @@ fn router_dispatches_streaming_route() {
     let (_, body) = response.into_parts();
     let mut stream = body.into_stream().expect("should be a stream");
     let collected = block_on(async {
-        use futures::StreamExt;
+        use futures::StreamExt as _;
         let mut out = Vec::new();
         while let Some(chunk) = stream.next().await {
             out.extend_from_slice(&chunk.expect("chunk"));

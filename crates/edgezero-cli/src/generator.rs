@@ -526,7 +526,7 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::PermissionsExt as _;
             let mut perms = std::fs::metadata(&git_path)
                 .expect("metadata")
                 .permissions();

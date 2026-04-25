@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn invalid_path_returns_bad_request() {
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "field exercised only via Deserialize")]
         #[derive(Debug, Deserialize)]
         struct NumericPath {
             id: u32,
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn invalid_query_returns_bad_request() {
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "field exercised only via Deserialize")]
         #[derive(Debug, Deserialize)]
         struct Query {
             page: u8,
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn invalid_form_returns_bad_request() {
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "field exercised only via Deserialize")]
         #[derive(Deserialize)]
         struct FormData {
             age: u8,

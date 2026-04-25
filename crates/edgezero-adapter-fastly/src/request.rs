@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::io::Read;
+use std::io::Read as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use edgezero_core::app::App;

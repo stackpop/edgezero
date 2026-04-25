@@ -1,11 +1,11 @@
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::Context as _;
 use axum::Router;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
-use tower::{service_fn, Service};
+use tower::{service_fn, Service as _};
 
 use edgezero_core::app::Hooks;
 use edgezero_core::config_store::ConfigStoreHandle;

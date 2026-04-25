@@ -166,25 +166,18 @@ field_scoped_visibility_modifiers = "allow"  # (intentional: `pub(crate)` / `pub
 partial_pub_fields = "allow"                 # (intentional: same — selective field exposure is by design.)
 trivially_copy_pass_by_ref = "allow"         # (intentional: API ergonomics; pass-by-ref is fine for `Method` / `StatusCode` etc.)
 
-# -- Imports / paths (factor out by adjusting use-statements) ---------------
-absolute_paths = "allow"                     # 19:  `::std::...` style paths
-unused_trait_names = "allow"                 # 6:   imported trait whose name isn't referenced
-non_std_lazy_statics = "allow"               # 6:   `once_cell::Lazy` instead of `std::sync::LazyLock` (Rust 1.80+)
-std_instead_of_alloc = "allow"               # 6:   `std::vec::Vec` etc. in no_std-compatible code
-iter_over_hash_type = "allow"                # 2:   iterating a `HashMap`/`HashSet` in non-deterministic order
-std_instead_of_core = "allow"                # 1:   `std::*` usage where `core::*` works
+# -- Imports / paths --------------------------------------------------------
+absolute_paths = "allow"                     # 200+ sites of `std::env::var()` / `std::fmt::Display` style; one-shot uses don't benefit from a `use` statement
+std_instead_of_alloc = "allow"               # intentional: not targeting `no_std`
+std_instead_of_core = "allow"                # intentional: not targeting `no_std`
 
 # -- Output / diagnostics (factor out by routing through `log`/`tracing`) ---
-print_stderr = "allow"                       # 16:  `eprintln!`/`eprint!` (kept in CLI / build script for now)
-print_stdout = "allow"                       # 8:   `println!`/`print!` (kept in CLI / examples for now)
-unnecessary_debug_formatting = "allow"       # 2:   `{:?}` for types that have `Display`
+print_stderr = "allow"                       # 16: `eprintln!`/`eprint!` in CLI top-level error reporters
+print_stdout = "allow"                       # 8: `println!` in CLI status output (`[edgezero] creating project at ...`)
 
 # -- Tests ------------------------------------------------------------------
-tests_outside_test_module = "allow"          # 1:   `#[test]` fn outside a `#[cfg(test)] mod tests`
+tests_outside_test_module = "allow"          # lint matches plain `#[cfg(test)] mod tests` only — doesn't recognize our `#[cfg(all(test, feature = "..."))]` modules or integration tests in `tests/` directory
 
-# -- Attributes -------------------------------------------------------------
-allow_attributes_without_reason = "allow"    # 5:   `#[allow(...)]` without `, reason = "..."`
-allow_attributes = "allow"                   # 3:   `#[allow]` instead of `#[expect]` on stable
 
 [workspace.lints.rust]
 # Disallow unsafe code by default. Individual items may opt in with

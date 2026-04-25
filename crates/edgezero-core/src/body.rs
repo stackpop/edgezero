@@ -181,7 +181,6 @@ impl From<String> for Body {
 mod tests {
     use super::*;
     use futures::executor::block_on;
-    use futures_util::StreamExt;
     use std::io;
 
     #[test]

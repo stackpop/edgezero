@@ -55,7 +55,8 @@ fn main() {
         for adapter in adapters {
             let crate_ident = adapter.replace('-', "_");
             generated.push_str(&format!(
-                "#[allow(unused_imports)]\npub(crate) use {crate_ident} as _{crate_ident};\n"
+                "#[expect(unused_imports, reason = \"adapter linked via feature gate\")]\n\
+                 pub(crate) use {crate_ident} as _{crate_ident};\n"
             ));
         }
     }

@@ -49,7 +49,6 @@ pub struct NewArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     #[test]
     fn parses_new_command_with_defaults() {

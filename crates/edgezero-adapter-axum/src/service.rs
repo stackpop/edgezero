@@ -121,7 +121,7 @@ mod tests {
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{response_builder, StatusCode};
     use std::sync::Arc;
-    use tower::ServiceExt;
+    use tower::ServiceExt as _;
 
     struct FixedConfigStore(String);
 

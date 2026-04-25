@@ -34,7 +34,7 @@ impl SecretStore for EnvSecretStore {
     async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         #[cfg(unix)]
         {
-            use std::os::unix::ffi::OsStringExt;
+            use std::os::unix::ffi::OsStringExt as _;
 
             match std::env::var_os(key) {
                 Some(value) => Ok(Some(Bytes::from(value.into_vec()))),
@@ -90,7 +90,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn get_bytes_preserves_non_utf8_secret_values() {
-        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::ffi::OsStringExt as _;
 
         let _guard = env_guard().lock().await;
         let _env = EnvOverride::set(

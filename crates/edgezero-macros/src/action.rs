@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned, Error, FnArg, ItemFn, Pat, PathArguments, Type};
+use syn::{spanned::Spanned as _, Error, FnArg, ItemFn, Pat, PathArguments, Type};
 
 pub fn expand_action(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_action_impl(attr.into(), item.into()).into()

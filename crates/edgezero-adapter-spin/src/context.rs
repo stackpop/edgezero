@@ -47,7 +47,7 @@ mod tests {
     use super::*;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
-    use std::str::FromStr;
+    use std::str::FromStr as _;
 
     #[test]
     fn inserts_and_retrieves_context() {

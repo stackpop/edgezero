@@ -21,7 +21,7 @@ use std::path::PathBuf;
 #[cfg(feature = "cli")]
 fn main() {
     use args::{Args, Command};
-    use clap::Parser;
+    use clap::Parser as _;
 
     let args = Args::parse();
     match args.cmd {

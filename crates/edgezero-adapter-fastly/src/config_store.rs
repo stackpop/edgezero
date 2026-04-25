@@ -48,7 +48,7 @@ fn map_lookup_error(err: fastly::config_store::LookupError) -> ConfigStoreError 
     // `LookupError` is from the `fastly` crate; using a wildcard arm guards
     // against new variants being added in upstream point releases without
     // forcing us into a breaking match every bump.
-    #[allow(
+    #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "external enum; new variants must remain unavailable→unavailable"
     )]

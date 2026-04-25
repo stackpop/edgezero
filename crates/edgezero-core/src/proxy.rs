@@ -222,7 +222,7 @@ mod tests {
     use crate::http::{request_builder, HeaderValue, Method, StatusCode, Uri};
     use bytes::Bytes;
     use futures::executor::block_on;
-    use futures_util::{stream, StreamExt};
+    use futures_util::{stream, StreamExt as _};
 
     struct TestClient;
 

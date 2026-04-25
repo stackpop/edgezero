@@ -50,7 +50,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition};
 use std::time::SystemTime;
 
 /// Table definition for the KV store.
@@ -91,10 +91,10 @@ impl PersistentKvStore {
     /// - If the file exists and is a valid redb database, it will be opened with existing data preserved
     /// - If the file exists but is not a valid redb database, returns an error
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, KvError> {
-        let db_path = path.as_ref().to_path_buf();
+        let db_path = path.as_ref().display().to_string();
         let db = Database::create(path).map_err(|e| {
             KvError::Internal(anyhow::anyhow!(
-                "Failed to open KV database at {db_path:?}. If the file is corrupted or locked \
+                "Failed to open KV database at {db_path}. If the file is corrupted or locked \
                  by another process, try deleting it and restarting: {e}"
             ))
         })?;
