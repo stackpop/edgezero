@@ -6,9 +6,12 @@ use std::fs;
 use std::path::PathBuf;
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Ident, LitStr, Token};
-use validator::Validate;
+use validator::Validate as _;
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "manifest types are deserialized into the proc-macro and not all fields are read"
+)]
 mod manifest_definitions {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

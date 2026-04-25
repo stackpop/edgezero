@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "helpers consumed conditionally via the `cli` feature in adapter crates"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

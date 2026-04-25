@@ -1,6 +1,5 @@
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 /// Static handlebars template registration provided by an adapter.
 #[derive(Clone, Copy)]
@@ -76,8 +75,8 @@ pub struct AdapterBlueprint {
     pub run_module: &'static str,
 }
 
-static BLUEPRINT_REGISTRY: Lazy<RwLock<HashMap<String, &'static AdapterBlueprint>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+static BLUEPRINT_REGISTRY: LazyLock<RwLock<HashMap<String, &'static AdapterBlueprint>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Registers the blueprint for an adapter. Latest registration wins.
 pub fn register_adapter_blueprint(blueprint: &'static AdapterBlueprint) {
@@ -100,8 +99,7 @@ pub fn registered_blueprints() -> Vec<&'static AdapterBlueprint> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
     static FIRST_TEMPLATE: TemplateRegistration = TemplateRegistration {
         name: "first",
@@ -192,7 +190,7 @@ mod tests {
         run_module: "module",
     };
 
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn registered_blueprints_sorted() {

@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn deserialize_propagates_errors() {
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "field exercised only via Deserialize")]
         #[derive(Debug, Deserialize)]
         struct NumericParams {
             id: u32,

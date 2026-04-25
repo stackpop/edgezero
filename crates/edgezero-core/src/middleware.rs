@@ -117,7 +117,7 @@ where
 mod tests {
     use super::*;
     use crate::body::Body;
-    use crate::handler::IntoHandler;
+    use crate::handler::IntoHandler as _;
     use crate::http::{request_builder, Method, Response, StatusCode};
     use crate::params::PathParams;
     use crate::response::response_with_body;

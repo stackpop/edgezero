@@ -24,7 +24,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
     use std::net::IpAddr;
-    use std::str::FromStr;
+    use std::str::FromStr as _;
 
     #[test]
     fn inserts_and_retrieves_client_ip() {

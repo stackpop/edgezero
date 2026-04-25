@@ -1,7 +1,7 @@
 use axum::body::Body as AxumBody;
 use axum::http::{Response, StatusCode};
 use futures::executor::block_on;
-use futures_util::{pin_mut, StreamExt};
+use futures_util::{pin_mut, StreamExt as _};
 use tracing::error;
 
 use edgezero_core::body::Body;

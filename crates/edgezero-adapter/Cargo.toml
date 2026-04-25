@@ -13,7 +13,6 @@ default = []
 cli = ["dep:toml"]
 
 [dependencies]
-once_cell = { workspace = true }
 toml = { workspace = true, optional = true }
 
 [dev-dependencies]

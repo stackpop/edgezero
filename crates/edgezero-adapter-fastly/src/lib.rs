@@ -25,7 +25,10 @@ pub use context::FastlyRequestContext;
 #[cfg(feature = "fastly")]
 pub use proxy::FastlyProxyClient;
 #[cfg(feature = "fastly")]
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "re-exporting deprecated entry points for back-compat"
+)]
 pub use request::{
     dispatch, dispatch_with_config, dispatch_with_config_handle, dispatch_with_kv,
     dispatch_with_kv_and_secrets, dispatch_with_secrets, into_core_request, DEFAULT_KV_STORE_NAME,
@@ -84,7 +87,10 @@ pub trait AppExt {
 
 #[cfg(feature = "fastly")]
 impl AppExt for edgezero_core::app::App {
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "implementing the deprecated trait method requires calling it"
+    )]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
         crate::request::dispatch_raw(self, req)
     }

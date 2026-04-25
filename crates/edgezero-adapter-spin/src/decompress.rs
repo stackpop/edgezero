@@ -1,8 +1,11 @@
 // Used by proxy.rs (wasm32-gated) and tests; not reachable on native non-test builds.
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "wasm32-gated callers; native non-test build has no consumer"
+)]
 
 use edgezero_core::error::EdgeError;
-use std::io::Read;
+use std::io::Read as _;
 
 /// Maximum decompressed body size (64 MiB). Prevents zip-bomb attacks
 /// where a small compressed payload expands to exhaust WASI memory.
@@ -67,7 +70,7 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::Write;
+    use std::io::Write as _;
 
     #[test]
     fn decompress_body_handles_identity() {

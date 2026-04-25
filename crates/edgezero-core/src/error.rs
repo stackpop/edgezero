@@ -106,7 +106,7 @@ impl EdgeError {
     /// Shadows [`std::error::Error::source`] (auto-derived by `thiserror`)
     /// intentionally — the trait method returns a `&dyn Error`, this one
     /// returns the concrete `&anyhow::Error` so callers can downcast.
-    #[allow(
+    #[expect(
         clippy::same_name_method,
         reason = "intentional: typed alternative to the trait-object Error::source"
     )]

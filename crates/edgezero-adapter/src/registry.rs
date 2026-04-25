@@ -1,6 +1,5 @@
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 /// Actions the EdgeZero CLI can request from an adapter implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,8 +18,8 @@ pub trait Adapter: Sync + Send {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
 }
 
-static REGISTRY: Lazy<RwLock<HashMap<String, &'static dyn Adapter>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Registers an adapter so it can be discovered by the CLI.
 pub fn register_adapter(adapter: &'static dyn Adapter) {
@@ -51,12 +50,11 @@ pub fn registered_adapters() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
     static HIT: AtomicUsize = AtomicUsize::new(0);
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct TestAdapter {
         name: &'static str,

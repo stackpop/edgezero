@@ -2,8 +2,8 @@ use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Response, Uri};
 use fastly::Response as FastlyResponse;
-use futures_util::StreamExt;
-use std::io::Write;
+use futures_util::StreamExt as _;
+use std::io::Write as _;
 
 pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeError> {
     let (parts, body) = response.into_parts();

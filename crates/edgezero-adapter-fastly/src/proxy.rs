@@ -10,8 +10,8 @@ use fastly::{
     error::anyhow, http::body::StreamingBody, Backend, Request as FastlyRequest,
     Response as FastlyResponse,
 };
-use futures_util::stream::{BoxStream, StreamExt};
-use std::io::{self, Write};
+use futures_util::stream::{BoxStream, StreamExt as _};
+use std::io::{self, Write as _};
 use std::time::Duration;
 
 const BACKEND_PREFIX: &str = "edgezero-dynamic-";
@@ -198,7 +198,6 @@ mod tests {
     use brotli::CompressorWriter;
     use flate2::{write::GzEncoder, Compression};
     use futures::executor::block_on;
-    use std::io::Write;
 
     #[test]
     fn stream_handles_identity_and_gzip() {

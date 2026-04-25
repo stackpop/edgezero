@@ -15,7 +15,7 @@ use crate::http::{
 };
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
-use crate::response::IntoResponse;
+use crate::response::IntoResponse as _;
 
 pub const DEFAULT_ROUTE_LISTING_PATH: &str = "/__edgezero/routes";
 
@@ -294,12 +294,12 @@ impl RouterInner {
             }
         }
 
-        let mut allowed = HashSet::new();
-        for (candidate_method, router) in &self.routes {
-            if router.at(path).is_ok() {
-                allowed.insert(candidate_method.clone());
-            }
-        }
+        let allowed: HashSet<Method> = self
+            .routes
+            .iter()
+            .filter(|(_, router)| router.at(path).is_ok())
+            .map(|(candidate_method, _)| candidate_method.clone())
+            .collect();
 
         if allowed.is_empty() {
             RouteMatch::NotFound
@@ -573,7 +573,7 @@ mod tests {
     fn streams_body_through_router() {
         use bytes::Bytes;
         use futures_util::stream;
-        use futures_util::StreamExt;
+        use futures_util::StreamExt as _;
 
         async fn handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
             let chunks = stream::iter(vec![
