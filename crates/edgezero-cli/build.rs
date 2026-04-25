@@ -23,12 +23,13 @@ fn main() {
             if !name.starts_with("edgezero-adapter-") {
                 return None;
             }
-            let optional = match spec {
-                Value::Table(ref table) => table
+            let optional = if let Value::Table(table) = &spec {
+                table
                     .get("optional")
                     .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                _ => false,
+                    .unwrap_or(false)
+            } else {
+                false
             };
             if !optional {
                 return None;

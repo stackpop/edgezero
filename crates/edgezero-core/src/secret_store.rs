@@ -124,7 +124,12 @@ pub struct InMemorySecretStore {
 #[cfg(any(test, feature = "test-utils"))]
 impl InMemorySecretStore {
     /// Build with entries of the form `("{store_name}/{key}", value)`.
-    pub fn new(entries: impl IntoIterator<Item = (impl Into<String>, impl Into<Bytes>)>) -> Self {
+    pub fn new<I, K, V>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<Bytes>,
+    {
         Self {
             secrets: entries
                 .into_iter()

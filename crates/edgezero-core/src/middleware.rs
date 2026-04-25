@@ -122,6 +122,7 @@ mod tests {
     use crate::params::PathParams;
     use crate::response::response_with_body;
     use futures::executor::block_on;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     struct RecordingMiddleware {
@@ -237,12 +238,12 @@ mod tests {
 
     #[test]
     fn middleware_fn_executes_closure() {
-        let called = Arc::new(Mutex::new(false));
+        let called = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&called);
         let middleware = middleware_fn(move |_ctx, _next| {
             let flag = Arc::clone(&flag);
             async move {
-                *flag.lock().unwrap() = true;
+                flag.store(true, Ordering::SeqCst);
                 Ok(response_with_body(StatusCode::OK, Body::empty()))
             }
         });
@@ -252,6 +253,6 @@ mod tests {
         let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(*called.lock().unwrap());
+        assert!(called.load(Ordering::SeqCst));
     }
 }

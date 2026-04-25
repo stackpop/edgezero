@@ -75,13 +75,13 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<AxumBody>) -> Self::Future {
+    fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
         let config_store_handle = self.config_store_handle.clone();
         let kv_handle = self.kv_handle.clone();
         let secret_handle = self.secret_handle.clone();
         Box::pin(async move {
-            let mut core_request = match into_core_request(request).await {
+            let mut core_request = match into_core_request(req).await {
                 Ok(req) => req,
                 Err(e) => {
                     let mut err_response = Response::new(AxumBody::from(e.to_string()));
@@ -188,8 +188,9 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
-        let store = Arc::new(PersistentKvStore::new(db_path).unwrap());
-        let handle = KvHandle::new(store.clone());
+        let store: Arc<dyn edgezero_core::KvStore> =
+            Arc::new(PersistentKvStore::new(db_path).unwrap());
+        let handle = KvHandle::new(Arc::clone(&store));
         handle.put("test_key", &"injected").await.unwrap();
 
         let router = RouterService::builder()

@@ -384,8 +384,8 @@ mod tests {
         assert_eq!(uri, Uri::from_static("https://example.com/resource"));
         assert!(headers.get("x-test").is_some());
         assert!(matches!(
-            body,
-            Body::Once(ref bytes) if bytes.as_ref() == b"body"
+            &body,
+            Body::Once(bytes) if bytes.as_ref() == b"body"
         ));
     }
 

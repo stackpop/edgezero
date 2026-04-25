@@ -73,7 +73,7 @@ pub fn response_with_body(status: StatusCode, body: Body) -> Response {
 
     let mut builder = response_builder().status(status);
 
-    if let Body::Once(ref bytes) = body {
+    if let Body::Once(bytes) = &body {
         if !bytes.is_empty() {
             builder = builder
                 .header(CONTENT_LENGTH, bytes.len().to_string())

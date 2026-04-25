@@ -172,25 +172,21 @@ cast_possible_truncation = "allow"           # narrowing casts already validated
 cast_sign_loss = "allow"                     # signed→unsigned casts already validated
 let_underscore_must_use = "allow"            # `let _ = ...` for genuinely-discarded results in tests / dev paths
 
-# -- API design (factor out by tightening visibility / making types final) --
-impl_trait_in_params = "allow"               # 20:  `fn f(x: impl Trait)` vs explicit generic
-return_self_not_must_use = "allow"           # 18:  builder-style fns returning `Self` should be `#[must_use]`
-exhaustive_structs = "allow"                 # 16:  pub struct without `#[non_exhaustive]`
-missing_trait_methods = "allow"              # 9:   trait impls relying on default methods
-must_use_candidate = "allow"                 # 6:   pub fn returning a value should be `#[must_use]`
-field_scoped_visibility_modifiers = "allow"  # 6:   `pub(crate)` / `pub(super)` on fields
-needless_pass_by_value = "allow"             # 4:   fn taking `T` that could take `&T`
-unnecessary_wraps = "allow"                  # 4:   fn returning `Result`/`Option` that always succeeds
-rc_buffer = "allow"                          # 4:   `Rc<String>` / `Rc<Vec<T>>` (prefer `Rc<str>` / `Rc<[T]>`)
-trivially_copy_pass_by_ref = "allow"         # 3:   fn taking `&T` for tiny Copy `T`
-partial_pub_fields = "allow"                 # 3:   struct mixing pub and private fields
-exhaustive_enums = "allow"                   # 2:   pub enum without `#[non_exhaustive]`
-renamed_function_params = "allow"            # 2:   trait impl renames a parameter from the trait definition
-same_name_method = "allow"                   # 2:   inherent method shadows a trait method of the same name
-ref_patterns = "allow"                       # 1:   `ref` patterns in `match`
-wildcard_enum_match_arm = "allow"            # 1:   `_ => ...` over an enum
-clone_on_ref_ptr = "allow"                   # 1:   `rc.clone()` vs `Rc::clone(&rc)`
-mutex_atomic = "allow"                       # 1:   `Mutex<bool>`/`Mutex<u32>` where an atomic would do
+# -- API design ------------------------------------------------------------
+# The actionable subset (impl_trait_in_params, return_self_not_must_use,
+# rc_buffer, unnecessary_wraps, mutex_atomic, same_name_method,
+# renamed_function_params, wildcard_enum_match_arm, clone_on_ref_ptr,
+# ref_patterns) was factored out — those allows are gone. The lints below
+# are kept allowed because they're either bad-fit-for-this-codebase
+# restriction lints or low signal-to-noise.
+exhaustive_structs = "allow"                 # (intentional: blanket #[non_exhaustive] would break user pattern matching / field-syntax construction. Apply per-type only when genuinely planned.)
+exhaustive_enums = "allow"                   # (intentional: same rationale; `EdgeError`/`KvError` etc. are matched by users.)
+must_use_candidate = "allow"                 # (intentional: most flagged sites are getters returning `&str`/`&Path` — ignoring is impossible, the lint adds noise.)
+missing_trait_methods = "allow"              # (intentional: relying on default trait methods is fine; spelling every method out is pure noise.)
+needless_pass_by_value = "allow"             # (intentional: most flagged sites are deliberate ownership transfers — error transformers, proc-macro signatures, builders that store the value.)
+field_scoped_visibility_modifiers = "allow"  # (intentional: `pub(crate)` / `pub(super)` are deliberate visibility choices.)
+partial_pub_fields = "allow"                 # (intentional: same — selective field exposure is by design.)
+trivially_copy_pass_by_ref = "allow"         # (intentional: API ergonomics; pass-by-ref is fine for `Method` / `StatusCode` etc.)
 
 # -- Imports / paths (factor out by adjusting use-statements) ---------------
 absolute_paths = "allow"                     # 19:  `::std::...` style paths

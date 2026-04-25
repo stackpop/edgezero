@@ -23,7 +23,7 @@ impl ProxyClient for FastlyProxyClient {
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _ext) = request.into_parts();
         let backend_name = ensure_backend(&uri)?;
-        let fastly_request = build_fastly_request(method, &uri, headers)?;
+        let fastly_request = build_fastly_request(method, &uri, headers);
         let (mut streaming_body, pending_request) = fastly_request
             .send_async_streaming(&backend_name)
             .map_err(EdgeError::internal)?;
@@ -31,7 +31,7 @@ impl ProxyClient for FastlyProxyClient {
         streaming_body.finish().map_err(EdgeError::internal)?;
         let mut fastly_response = pending_request.wait().map_err(EdgeError::internal)?;
 
-        let mut proxy_response = convert_response(&mut fastly_response)?;
+        let mut proxy_response = convert_response(&mut fastly_response);
         proxy_response.headers_mut().insert(
             edgezero_core::proxy::PROXY_HEADER,
             HeaderValue::from_static("fastly"),
@@ -40,11 +40,7 @@ impl ProxyClient for FastlyProxyClient {
     }
 }
 
-fn build_fastly_request(
-    method: Method,
-    uri: &Uri,
-    headers: HeaderMap,
-) -> Result<FastlyRequest, EdgeError> {
+fn build_fastly_request(method: Method, uri: &Uri, headers: HeaderMap) -> FastlyRequest {
     let mut fastly_request = FastlyRequest::new(method.clone(), uri.to_string());
     fastly_request.set_method(method);
 
@@ -59,7 +55,7 @@ fn build_fastly_request(
         fastly_request.set_header("Host", host);
     }
 
-    Ok(fastly_request)
+    fastly_request
 }
 
 async fn forward_request_body(
@@ -149,7 +145,7 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
     }
 }
 
-fn convert_response(fastly_response: &mut FastlyResponse) -> Result<ProxyResponse, EdgeError> {
+fn convert_response(fastly_response: &mut FastlyResponse) -> ProxyResponse {
     let status = fastly_response.get_status();
     let mut proxy_response = ProxyResponse::new(status, Body::empty());
 
@@ -177,7 +173,7 @@ fn convert_response(fastly_response: &mut FastlyResponse) -> Result<ProxyRespons
         proxy_response.headers_mut().remove(header::CONTENT_LENGTH);
     }
 
-    Ok(proxy_response)
+    proxy_response
 }
 
 type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;

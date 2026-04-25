@@ -34,7 +34,7 @@ impl EnvOverride {
 
 impl Drop for EnvOverride {
     fn drop(&mut self) {
-        if let Some(ref original) = self.original {
+        if let Some(original) = &self.original {
             std::env::set_var(self.key, original);
         } else {
             std::env::remove_var(self.key);
