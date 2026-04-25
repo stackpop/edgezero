@@ -5,6 +5,9 @@ edition = "2021"
 license = { workspace = true }
 description = "EdgeZero CLI: build and deploy to multiple edge adapters"
 
+[lints]
+workspace = true
+
 [dependencies]
 edgezero-core = { workspace = true }
 edgezero-adapter = { path = "../edgezero-adapter" }

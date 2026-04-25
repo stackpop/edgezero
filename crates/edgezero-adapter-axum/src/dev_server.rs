@@ -255,7 +255,7 @@ async fn serve_with_stores(
 
     let shutdown = if enable_ctrl_c {
         Some(async {
-            let _ = signal::ctrl_c().await;
+            let _ctrl_c = signal::ctrl_c().await;
         })
     } else {
         None
@@ -290,7 +290,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         LevelFilter::Off
     };
 
-    SimpleLogger::new().with_level(level).init().ok();
+    let _logger_init = SimpleLogger::new().with_level(level).init();
 
     let app = A::build_app();
     let router = app.router().clone();
@@ -519,7 +519,7 @@ mod integration_tests {
         let server = AxumDevServer::with_config(router, config).with_kv_handle(kv_handle);
 
         let handle = tokio::spawn(async move {
-            let _ = server.run_with_listener(listener).await;
+            let _result = server.run_with_listener(listener).await;
         });
 
         TestServer {
@@ -540,9 +540,11 @@ mod integration_tests {
             match make_request(client).send().await {
                 Ok(response) => return response,
                 Err(err) => {
-                    if start.elapsed() >= timeout {
-                        panic!("server did not respond before timeout: {}", err);
-                    }
+                    assert!(
+                        start.elapsed() < timeout,
+                        "server did not respond before timeout: {}",
+                        err
+                    );
                 }
             }
 
@@ -872,7 +874,7 @@ mod integration_tests {
             server = server.with_secret_handle(h);
         }
         let handle = tokio::spawn(async move {
-            let _ = server.run_with_listener(listener).await;
+            let _result = server.run_with_listener(listener).await;
         });
         TestServerSecrets {
             base_url: format!("http://{}", addr),

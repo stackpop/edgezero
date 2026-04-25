@@ -5,6 +5,9 @@ edition = "2021"
 license = { workspace = true }
 description = "Adapter registry and traits for EdgeZero adapters"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 cli = ["dep:toml"]

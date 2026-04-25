@@ -63,8 +63,11 @@ mod tests {
 
     fn store(env: &[(&str, &str)], defaults: &[(&str, &str)]) -> AxumConfigStore {
         AxumConfigStore::new(
-            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
-            defaults.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+            env.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+            defaults
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
         )
     }
 

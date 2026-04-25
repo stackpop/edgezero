@@ -5,6 +5,9 @@ version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 
+[lints]
+workspace = true
+
 [dependencies]
 edgezero-macros = { path = "../edgezero-macros" }
 anyhow = { workspace = true }

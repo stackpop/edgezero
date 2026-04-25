@@ -7,38 +7,38 @@ pub fn register_templates(hbs: &mut Handlebars) {
         "root_Cargo_toml",
         include_str!("templates/root/Cargo.toml.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "root_edgezero_toml",
         include_str!("templates/root/edgezero.toml.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "root_README_md",
         include_str!("templates/root/README.md.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "root_gitignore",
         include_str!("templates/root/gitignore.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     // Core
     hbs.register_template_string(
         "core_Cargo_toml",
         include_str!("templates/core/Cargo.toml.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "core_src_lib_rs",
         include_str!("templates/core/src/lib.rs.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "core_src_handlers_rs",
         include_str!("templates/core/src/handlers.rs.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     // Adapter-specific templates
     for adapter in scaffold::registered_blueprints() {
         for template in adapter.template_registrations {
@@ -147,8 +147,7 @@ pub fn relative_to(from: &std::path::Path, to: &std::path::Path) -> Option<Strin
         return Some(".".into());
     }
     let mut ups = String::new();
-    for i in 0..depth {
-        let _ = i;
+    for _ in 0..depth {
         if !ups.is_empty() {
             ups.push('/');
         }

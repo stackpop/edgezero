@@ -376,7 +376,7 @@ impl KvHandle {
         };
 
         let envelope: KvCursorEnvelope = serde_json::from_str(cursor)
-            .map_err(|_| KvError::Validation("list cursor is invalid or corrupted".to_string()))?;
+            .map_err(|_e| KvError::Validation("list cursor is invalid or corrupted".to_string()))?;
 
         if envelope.prefix != prefix {
             return Err(KvError::Validation(

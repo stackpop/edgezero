@@ -53,7 +53,13 @@ pub(crate) fn expand_action_impl(
     for (index, arg) in func.sig.inputs.iter().enumerate() {
         let pat_type = match arg {
             FnArg::Typed(pat_type) => pat_type,
-            FnArg::Receiver(_) => unreachable!(),
+            FnArg::Receiver(receiver) => {
+                return syn::Error::new(
+                    receiver.span(),
+                    "#[action] functions cannot have a `self` receiver",
+                )
+                .to_compile_error();
+            }
         };
 
         let ty = &pat_type.ty;

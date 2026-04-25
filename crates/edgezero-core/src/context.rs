@@ -129,7 +129,7 @@ mod tests {
     fn params(map: &[(&str, &str)]) -> PathParams {
         let inner = map
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect::<HashMap<_, _>>();
         PathParams::new(inner)
     }
