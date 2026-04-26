@@ -281,16 +281,22 @@ mod tests {
     #[test]
     fn root_returns_static_body() {
         let ctx = empty_context("/");
-        let response = block_on(root(ctx)).expect("handler ok").into_response();
-        let bytes = response.into_body().into_bytes();
+        let response = block_on(root(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"app-demo app");
     }
 
     #[test]
     fn echo_formats_name_from_path() {
         let ctx = context_with_params("/echo/alice", &[("name", "alice")]);
-        let response = block_on(echo(ctx)).expect("handler ok").into_response();
-        let bytes = response.into_body().into_bytes();
+        let response = block_on(echo(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"Hello, alice!");
     }
 
@@ -302,8 +308,11 @@ mod tests {
             HeaderValue::from_static("DemoAgent"),
         );
 
-        let response = block_on(headers(ctx)).expect("handler ok").into_response();
-        let bytes = response.into_body().into_bytes();
+        let response = block_on(headers(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"ua=DemoAgent");
     }
 
@@ -333,8 +342,9 @@ mod tests {
         let ctx = context_with_json("/echo", r#"{"name":"Edge"}"#);
         let response = block_on(echo_json(ctx))
             .expect("handler ok")
-            .into_response();
-        let bytes = response.into_body().into_bytes();
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"Hello, Edge!");
     }
 
@@ -483,7 +493,11 @@ mod tests {
         let response = block_on(config_get(ctx)).expect("handler ok");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.into_body().into_bytes().as_ref(),
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .as_ref(),
             b"hello from config store"
         );
     }
@@ -611,7 +625,7 @@ mod tests {
         let (ctx, _) = context_with_kv("/kv/counter", Method::POST, Body::empty(), &[]);
         let resp = block_on(kv_counter(ctx)).expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = resp.into_body().into_bytes();
+        let body = resp.into_body().into_bytes().expect("buffered");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["count"], 1);
     }
@@ -643,7 +657,10 @@ mod tests {
         };
         let resp = block_on(kv_note_get(ctx2)).expect("response");
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.into_body().into_bytes().as_ref(), b"hello world");
+        assert_eq!(
+            resp.into_body().into_bytes().expect("buffered").as_ref(),
+            b"hello world"
+        );
     }
 
     #[test]
@@ -714,8 +731,9 @@ mod tests {
         );
         let response = block_on(secrets_echo(ctx))
             .expect("handler ok")
-            .into_response();
-        let bytes = response.into_body().into_bytes();
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"my-secret-value");
     }
 
@@ -726,10 +744,18 @@ mod tests {
         let ctx = context_with_secrets("/secrets/echo", "name=SMOKE_SECRET_MISSING", &[]);
         let response = block_on(secrets_echo(ctx))
             .expect_err("should fail")
-            .into_response();
+            .into_response()
+            .expect("response");
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = String::from_utf8(response.into_body().into_bytes().to_vec()).expect("utf8");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .to_vec(),
+        )
+        .expect("utf8");
         assert!(body.contains("required secret is not configured"));
         assert!(!body.contains("SMOKE_SECRET_MISSING"));
     }
@@ -741,10 +767,18 @@ mod tests {
         let ctx = context_with_secrets("/secrets/echo", "name=API_KEY", &[("API_KEY", "secret")]);
         let response = block_on(secrets_echo(ctx))
             .expect_err("should reject arbitrary secret names")
-            .into_response();
+            .into_response()
+            .expect("response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = String::from_utf8(response.into_body().into_bytes().to_vec()).expect("utf8");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .to_vec(),
+        )
+        .expect("utf8");
         assert!(body.contains("only smoke-test secret names are allowed"));
         assert!(!body.contains("API_KEY"));
     }
