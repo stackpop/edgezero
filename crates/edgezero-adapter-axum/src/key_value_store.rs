@@ -374,6 +374,10 @@ impl KvStore for PersistentKvStore {
             keys: live_keys,
         })
     }
+
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Ok(self.get_bytes(key).await?.is_some())
+    }
 }
 
 #[cfg(test)]

@@ -358,6 +358,10 @@ impl Clone for RouteEntry {
             handler: Arc::clone(&self.handler),
         }
     }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.handler = Arc::clone(&source.handler);
+    }
 }
 
 #[cfg(test)]

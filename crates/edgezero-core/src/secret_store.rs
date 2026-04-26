@@ -18,6 +18,7 @@
 //! it never writes or deletes them. Provisioning secrets is the
 //! responsibility of each platform's deployment toolchain.
 
+#[cfg(any(test, feature = "test-utils"))]
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;

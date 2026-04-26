@@ -106,6 +106,10 @@ impl KvStore for FastlyKvStore {
             cursor: next_cursor,
         })
     }
+
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Ok(self.get_bytes(key).await?.is_some())
+    }
 }
 
 // TODO: integration tests require the Fastly compute environment.

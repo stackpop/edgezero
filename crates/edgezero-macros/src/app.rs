@@ -32,7 +32,11 @@ impl Parse for AppArgs {
 
 fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
     let Some(config) = manifest.stores.config.as_ref() else {
-        return quote! {};
+        return quote! {
+            fn config_store() -> Option<&'static edgezero_core::app::ConfigStoreMetadata> {
+                None
+            }
+        };
     };
 
     let fallback_name = config.name.as_deref().unwrap_or(DEFAULT_CONFIG_STORE_NAME);
@@ -147,11 +151,19 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
                 build_router()
             }
 
+            fn configure(_app: &mut edgezero_core::app::App) {}
+
             fn name() -> &'static str {
                 #app_name_lit
             }
 
             #config_store_tokens
+
+            fn build_app() -> edgezero_core::app::App {
+                let mut app = edgezero_core::app::App::with_name(Self::routes(), Self::name());
+                Self::configure(&mut app);
+                app
+            }
         }
 
         pub fn build_router() -> edgezero_core::router::RouterService {

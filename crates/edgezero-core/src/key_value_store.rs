@@ -233,6 +233,9 @@ impl KvStore for NoopKvStore {
     ) -> Result<KvPage, KvError> {
         Ok(KvPage::default())
     }
+    async fn exists(&self, _key: &str) -> Result<bool, KvError> {
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -890,6 +893,10 @@ mod tests {
                 cursor: has_more.then(|| keys.last().cloned()).flatten(),
                 keys,
             })
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool, KvError> {
+            Ok(self.get_bytes(key).await?.is_some())
         }
     }
 
