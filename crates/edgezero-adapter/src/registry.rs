@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{LazyLock, PoisonError, RwLock};
 
 /// Actions the `EdgeZero` CLI can request from an adapter implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,36 +25,23 @@ static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Registers an adapter so it can be discovered by the CLI.
-///
-/// # Panics
-/// Panics if the registry's [`RwLock`] is poisoned (only possible if a previous
-/// registration panicked while holding the write lock — unrecoverable).
+#[inline]
 pub fn register_adapter(adapter: &'static dyn Adapter) {
-    let mut registry = REGISTRY
-        .write()
-        .expect("edgezero adapter registry lock poisoned");
+    let mut registry = REGISTRY.write().unwrap_or_else(PoisonError::into_inner);
     registry.insert(adapter.name().to_ascii_lowercase(), adapter);
 }
 
 /// Looks up an adapter by name.
-///
-/// # Panics
-/// Panics if the registry's [`RwLock`] is poisoned.
+#[inline]
 pub fn get_adapter(name: &str) -> Option<&'static dyn Adapter> {
-    let registry = REGISTRY
-        .read()
-        .expect("edgezero adapter registry lock poisoned");
+    let registry = REGISTRY.read().unwrap_or_else(PoisonError::into_inner);
     registry.get(&name.to_ascii_lowercase()).copied()
 }
 
 /// Returns the names of all registered adapters.
-///
-/// # Panics
-/// Panics if the registry's [`RwLock`] is poisoned.
+#[inline]
 pub fn registered_adapters() -> Vec<String> {
-    let registry = REGISTRY
-        .read()
-        .expect("edgezero adapter registry lock poisoned");
+    let registry = REGISTRY.read().unwrap_or_else(PoisonError::into_inner);
     let mut names: Vec<String> = registry.keys().cloned().collect();
     names.sort();
     names
@@ -136,6 +123,6 @@ mod tests {
         register_adapter(&OTHER);
         register_adapter(&FIRST);
         let adapters = registered_adapters();
-        assert_eq!(adapters, vec!["dummy".to_string(), "other".to_string()]);
+        assert_eq!(adapters, vec!["dummy".to_owned(), "other".to_owned()]);
     }
 }

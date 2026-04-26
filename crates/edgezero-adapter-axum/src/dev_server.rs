@@ -270,7 +270,7 @@ async fn serve_with_stores(
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
-    let manifest = ManifestLoader::load_from_str(manifest_src);
+    let manifest = ManifestLoader::try_load_from_str(manifest_src)?;
     let m = manifest.manifest();
     let logging = m.logging_or_default(edgezero_core::app::AXUM_ADAPTER);
     let kv_init_requirement = kv_init_requirement(m);

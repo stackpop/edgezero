@@ -1,9 +1,10 @@
 use log::LevelFilter;
+use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{env, fs, io};
 use validator::{Validate, ValidationError};
 
 pub struct ManifestLoader {
@@ -11,29 +12,48 @@ pub struct ManifestLoader {
 }
 
 impl ManifestLoader {
+    /// Loads a manifest from a static, compile-time-embedded TOML string
+    /// (typically `include_str!("edgezero.toml")` inside an adapter binary).
+    ///
     /// # Panics
-    /// Panics if `contents` is not valid TOML or fails manifest validation.
-    /// Callers parsing user-supplied input should use [`ManifestLoader::from_path`]
-    /// (returns `io::Result`); this entry point is for compile-time embedded manifests.
+    /// Panics if `contents` is not valid TOML or fails validation. Because
+    /// `contents` is baked into the binary at build time, a parse/validation
+    /// failure means the binary itself is malformed — there is no runtime
+    /// recovery path, and surfacing the error as a panic with a clear
+    /// message is the correct behavior. Callers with a fallible input
+    /// source (file paths, network, user input) should use
+    /// [`ManifestLoader::try_load_from_str`] or [`ManifestLoader::from_path`].
+    #[expect(
+        clippy::panic,
+        reason = "load_from_str only consumes binary-embedded manifests; \
+                  a parse error means the binary is corrupt and cannot recover"
+    )]
+    #[must_use]
     pub fn load_from_str(contents: &str) -> Self {
-        let mut manifest: Manifest =
-            toml::from_str(contents).expect("edgezero manifest should be valid");
+        Self::try_load_from_str(contents).unwrap_or_else(|err| panic!("invalid manifest: {err}"))
+    }
+
+    /// # Errors
+    /// Returns an [`io::Error`] if `contents` is not valid TOML or fails manifest validation.
+    pub fn try_load_from_str(contents: &str) -> Result<Self, io::Error> {
+        let mut manifest: Manifest = toml::from_str(contents)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         manifest
             .validate()
-            .expect("edgezero manifest failed validation");
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         manifest.finalize();
-        Self {
+        Ok(Self {
             manifest: Arc::new(manifest),
-        }
+        })
     }
 
     /// # Errors
     /// Returns an [`io::Error`] if `path` cannot be read, or the file content cannot be parsed/validated as an `EdgeZero` manifest.
     pub fn from_path(path: &Path) -> Result<Self, io::Error> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = fs::read_to_string(path)?;
         let mut manifest: Manifest = toml::from_str(&contents)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let cwd = std::env::current_dir()?;
+        let cwd = env::current_dir()?;
         let root_path = resolve_root_path(path, &cwd);
         manifest.root = Some(root_path);
         manifest
@@ -63,6 +83,10 @@ pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
 const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
 
 #[derive(Debug, Deserialize, Validate)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "deserialized fields are pub for the public API; internal state is private"
+)]
 pub struct Manifest {
     #[serde(default)]
     #[validate(nested)]
@@ -83,9 +107,9 @@ pub struct Manifest {
     #[validate(nested)]
     pub logging: ManifestLogging,
     #[serde(skip)]
-    pub(crate) root: Option<PathBuf>,
+    root: Option<PathBuf>,
     #[serde(skip)]
-    pub(crate) logging_resolved: BTreeMap<String, ResolvedLoggingConfig>,
+    logging_resolved: BTreeMap<String, ResolvedLoggingConfig>,
 }
 
 impl Manifest {
@@ -140,7 +164,7 @@ impl Manifest {
                 if let Some(adapter_cfg) = kv
                     .adapters
                     .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&adapter_lower))
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
                 {
                     return &adapter_cfg.1.name;
                 }
@@ -163,7 +187,7 @@ impl Manifest {
                 if let Some(adapter_cfg) = secrets
                     .adapters
                     .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&adapter_lower))
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
                 {
                     if let Some(name) = adapter_cfg.1.name.as_deref() {
                         return name;
@@ -183,7 +207,7 @@ impl Manifest {
                 if let Some(adapter_cfg) = secrets
                     .adapters
                     .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&adapter_lower))
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
                 {
                     return adapter_cfg.1.enabled;
                 }
@@ -219,10 +243,10 @@ impl Manifest {
 #[non_exhaustive]
 pub struct ManifestApp {
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: Option<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub entry: Option<String>,
     #[serde(default)]
     pub middleware: Vec<String>,
@@ -240,19 +264,19 @@ pub struct ManifestTriggers {
 #[non_exhaustive]
 pub struct ManifestHttpTrigger {
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub id: Option<String>,
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub path: String,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub handler: Option<String>,
     #[serde(default)]
     pub methods: Vec<HttpMethod>,
     #[serde(default)]
     pub adapters: Vec<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub description: Option<String>,
     #[serde(rename = "body-mode")]
     #[serde(default)]
@@ -283,15 +307,15 @@ pub struct ManifestEnvironment {
 #[derive(Debug, Deserialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestBinding {
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: String,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub description: Option<String>,
     #[serde(default)]
     pub adapters: Vec<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub env: Option<String>,
     #[serde(default)]
     pub value: Option<String>,
@@ -359,10 +383,10 @@ pub struct ManifestAdapter {
 pub struct ManifestAdapterDefinition {
     #[serde(rename = "crate")]
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub crate_path: Option<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub manifest: Option<String>,
 }
 
@@ -370,10 +394,10 @@ pub struct ManifestAdapterDefinition {
 #[non_exhaustive]
 pub struct ManifestAdapterBuild {
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub target: Option<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub profile: Option<String>,
     #[serde(default)]
     pub features: Vec<String>,
@@ -383,13 +407,13 @@ pub struct ManifestAdapterBuild {
 #[non_exhaustive]
 pub struct ManifestAdapterCommands {
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub build: Option<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub serve: Option<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub deploy: Option<String>,
 }
 
@@ -418,7 +442,7 @@ pub struct ManifestStores {
 pub struct ManifestConfigStoreConfig {
     /// Global store/binding name used when no adapter-specific override is set.
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: Option<String>,
     /// Per-adapter name overrides, keyed by supported lowercase adapter name
     /// (`axum`, `cloudflare`, or `fastly`).
@@ -435,7 +459,7 @@ pub struct ManifestConfigStoreConfig {
 #[derive(Debug, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestConfigAdapterConfig {
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: String,
 }
 
@@ -519,7 +543,7 @@ pub struct ManifestLoggingConfig {
     #[serde(default)]
     pub level: Option<LogLevel>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub echo_stdout: Option<bool>,
@@ -568,14 +592,14 @@ impl ManifestLoggingConfig {
 pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
 
 fn default_kv_name() -> String {
-    DEFAULT_KV_STORE_NAME.to_string()
+    DEFAULT_KV_STORE_NAME.to_owned()
 }
 
 /// Default secret store / binding name used when `[stores.secrets]` is omitted.
 pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
 
 fn default_secret_name() -> String {
-    DEFAULT_SECRET_STORE_NAME.to_string()
+    DEFAULT_SECRET_STORE_NAME.to_owned()
 }
 
 fn default_enabled() -> bool {
@@ -588,7 +612,7 @@ fn default_enabled() -> bool {
 pub struct ManifestKvConfig {
     /// Store / binding name (default: `"EDGEZERO_KV"`).
     #[serde(default = "default_kv_name")]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: String,
 
     /// Per-adapter name overrides.
@@ -601,7 +625,7 @@ pub struct ManifestKvConfig {
 #[derive(Debug, Deserialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestKvAdapterConfig {
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: String,
 }
 
@@ -615,7 +639,7 @@ pub struct ManifestSecretsConfig {
 
     /// Store / binding name (default: `"EDGEZERO_SECRETS"`).
     #[serde(default = "default_secret_name")]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: String,
 
     /// Per-adapter name overrides.
@@ -634,7 +658,7 @@ pub struct ManifestSecretsAdapterConfig {
 
     /// Optional per-adapter secret store name override.
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: Option<String>,
 }
 
@@ -664,6 +688,14 @@ impl HttpMethod {
     }
 }
 
+// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
+// that defaults to `*place = Self::deserialize(deserializer)?`. For these
+// small Copy/clone enums there is nothing to gain from spelling out an
+// override — the default already does exactly the right thing.
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "default deserialize_in_place is identical to what we would write manually"
+)]
 impl<'de> Deserialize<'de> for HttpMethod {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -678,7 +710,7 @@ impl<'de> Deserialize<'de> for HttpMethod {
             "PATCH" => Ok(Self::Patch),
             "OPTIONS" => Ok(Self::Options),
             "HEAD" => Ok(Self::Head),
-            other => Err(serde::de::Error::custom(format!(
+            other => Err(DeError::custom(format!(
                 "unsupported HTTP method `{other}`"
             ))),
         }
@@ -692,6 +724,14 @@ pub enum BodyMode {
     Stream,
 }
 
+// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
+// that defaults to `*place = Self::deserialize(deserializer)?`. For these
+// small Copy/clone enums there is nothing to gain from spelling out an
+// override — the default already does exactly the right thing.
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "default deserialize_in_place is identical to what we would write manually"
+)]
 impl<'de> Deserialize<'de> for BodyMode {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -701,9 +741,7 @@ impl<'de> Deserialize<'de> for BodyMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "buffered" => Ok(Self::Buffered),
             "stream" => Ok(Self::Stream),
-            other => Err(serde::de::Error::custom(format!(
-                "unsupported body mode `{other}`"
-            ))),
+            other => Err(DeError::custom(format!("unsupported body mode `{other}`"))),
         }
     }
 }
@@ -721,7 +759,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Trace => "trace",
             Self::Debug => "debug",
@@ -746,6 +784,14 @@ impl From<LogLevel> for LevelFilter {
     }
 }
 
+// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
+// that defaults to `*place = Self::deserialize(deserializer)?`. For these
+// small Copy/clone enums there is nothing to gain from spelling out an
+// override — the default already does exactly the right thing.
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "default deserialize_in_place is identical to what we would write manually"
+)]
 impl<'de> Deserialize<'de> for LogLevel {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -759,7 +805,7 @@ impl<'de> Deserialize<'de> for LogLevel {
             "warn" => Ok(Self::Warn),
             "error" => Ok(Self::Error),
             "off" => Ok(Self::Off),
-            other => Err(serde::de::Error::custom(format!(
+            other => Err(DeError::custom(format!(
                 "logging level must be trace, debug, info, warn, error, or off (got `{other}`)"
             ))),
         }
@@ -769,8 +815,8 @@ impl<'de> Deserialize<'de> for LogLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::path::PathBuf;
+    use std::process;
     use tempfile::{tempdir, tempdir_in, NamedTempFile};
 
     const SAMPLE: &str = r#"
@@ -844,7 +890,7 @@ env = "APP_TOKEN"
 
     #[test]
     fn manifest_from_path_handles_relative_parent() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let dir = tempdir_in(&cwd).unwrap();
         let path = dir.path().join("edgezero.toml");
         fs::write(&path, "").unwrap();
@@ -857,7 +903,7 @@ env = "APP_TOKEN"
 
     #[test]
     fn manifest_from_path_uses_cwd_for_empty_parent() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let file = NamedTempFile::new_in(&cwd).unwrap();
         fs::write(file.path(), "").unwrap();
         let file_name = file.path().file_name().unwrap();
@@ -869,8 +915,8 @@ env = "APP_TOKEN"
 
     #[test]
     fn manifest_from_path_uses_cwd_when_parent_is_none() {
-        let cwd = std::env::current_dir().unwrap();
-        let file_name = format!("edgezero-test-manifest-{}.toml", std::process::id());
+        let cwd = env::current_dir().unwrap();
+        let file_name = format!("edgezero-test-manifest-{}.toml", process::id());
         let path = cwd.join(&file_name);
         fs::write(&path, "").unwrap();
 
@@ -972,15 +1018,15 @@ path = "/head"
 methods = ["HEAD"]
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http.len(), 7);
-        assert_eq!(m.triggers.http[0].methods(), vec!["GET"]);
-        assert_eq!(m.triggers.http[1].methods(), vec!["POST"]);
-        assert_eq!(m.triggers.http[2].methods(), vec!["PUT"]);
-        assert_eq!(m.triggers.http[3].methods(), vec!["DELETE"]);
-        assert_eq!(m.triggers.http[4].methods(), vec!["PATCH"]);
-        assert_eq!(m.triggers.http[5].methods(), vec!["OPTIONS"]);
-        assert_eq!(m.triggers.http[6].methods(), vec!["HEAD"]);
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http.len(), 7);
+        assert_eq!(mfest.triggers.http[0].methods(), vec!["GET"]);
+        assert_eq!(mfest.triggers.http[1].methods(), vec!["POST"]);
+        assert_eq!(mfest.triggers.http[2].methods(), vec!["PUT"]);
+        assert_eq!(mfest.triggers.http[3].methods(), vec!["DELETE"]);
+        assert_eq!(mfest.triggers.http[4].methods(), vec!["PATCH"]);
+        assert_eq!(mfest.triggers.http[5].methods(), vec!["OPTIONS"]);
+        assert_eq!(mfest.triggers.http[6].methods(), vec!["HEAD"]);
     }
 
     #[test]
@@ -1005,8 +1051,8 @@ path = "/test"
 methods = ["get", "Post", "PUT"]
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].methods(), vec!["GET", "POST", "PUT"]);
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].methods(), vec!["GET", "POST", "PUT"]);
     }
 
     #[test]
@@ -1016,8 +1062,8 @@ methods = ["get", "Post", "PUT"]
 path = "/test"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].methods(), vec!["GET"]);
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].methods(), vec!["GET"]);
     }
 
     // BodyMode parsing tests
@@ -1029,8 +1075,8 @@ path = "/test"
 body-mode = "buffered"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].body_mode, Some(BodyMode::Buffered));
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].body_mode, Some(BodyMode::Buffered));
     }
 
     #[test]
@@ -1041,8 +1087,8 @@ path = "/test"
 body-mode = "stream"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].body_mode, Some(BodyMode::Stream));
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].body_mode, Some(BodyMode::Stream));
     }
 
     #[test]
@@ -1082,13 +1128,22 @@ level = "error"
 level = "off"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.logging_for("adapter1").unwrap().level, LogLevel::Trace);
-        assert_eq!(m.logging_for("adapter2").unwrap().level, LogLevel::Debug);
-        assert_eq!(m.logging_for("adapter3").unwrap().level, LogLevel::Info);
-        assert_eq!(m.logging_for("adapter4").unwrap().level, LogLevel::Warn);
-        assert_eq!(m.logging_for("adapter5").unwrap().level, LogLevel::Error);
-        assert_eq!(m.logging_for("adapter6").unwrap().level, LogLevel::Off);
+        let mfest = loader.manifest();
+        assert_eq!(
+            mfest.logging_for("adapter1").unwrap().level,
+            LogLevel::Trace
+        );
+        assert_eq!(
+            mfest.logging_for("adapter2").unwrap().level,
+            LogLevel::Debug
+        );
+        assert_eq!(mfest.logging_for("adapter3").unwrap().level, LogLevel::Info);
+        assert_eq!(mfest.logging_for("adapter4").unwrap().level, LogLevel::Warn);
+        assert_eq!(
+            mfest.logging_for("adapter5").unwrap().level,
+            LogLevel::Error
+        );
+        assert_eq!(mfest.logging_for("adapter6").unwrap().level, LogLevel::Off);
     }
 
     #[test]
@@ -1130,8 +1185,8 @@ level = "off"
 name = "test"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let logging = m.logging_or_default("unknown");
+        let mfest = loader.manifest();
+        let logging = mfest.logging_or_default("unknown");
         assert_eq!(logging.level, LogLevel::Info);
         assert!(logging.endpoint.is_none());
         assert!(logging.echo_stdout.is_none());
@@ -1156,8 +1211,8 @@ endpoint = "https://logs.example.com"
 echo_stdout = true
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let logging = m.logging_for("axum").unwrap();
+        let mfest = loader.manifest();
+        let logging = mfest.logging_for("axum").unwrap();
         assert_eq!(logging.level, LogLevel::Debug);
         assert_eq!(
             logging.endpoint.as_deref(),
@@ -1174,8 +1229,8 @@ level = "error"
 endpoint = "https://fastly-logs.example.com"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let logging = m.logging_for("fastly").unwrap();
+        let mfest = loader.manifest();
+        let logging = mfest.logging_for("fastly").unwrap();
         assert_eq!(logging.level, LogLevel::Error);
         assert_eq!(
             logging.endpoint.as_deref(),
@@ -1193,8 +1248,8 @@ env = "ACTUAL_ENV_KEY"
 value = "some-value"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let env = m.environment_for("any-adapter");
+        let mfest = loader.manifest();
+        let env = mfest.environment_for("any-adapter");
         assert_eq!(env.variables[0].name, "MY_VAR");
         assert_eq!(env.variables[0].env, "ACTUAL_ENV_KEY");
         assert_eq!(env.variables[0].value.as_deref(), Some("some-value"));
@@ -1208,8 +1263,8 @@ name = "API_KEY"
 value = "secret"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let env = m.environment_for("any-adapter");
+        let mfest = loader.manifest();
+        let env = mfest.environment_for("any-adapter");
         assert_eq!(env.variables[0].name, "API_KEY");
         assert_eq!(env.variables[0].env, "API_KEY");
     }
@@ -1232,17 +1287,17 @@ name = "VAR3"
 value = "v3"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
+        let mfest = loader.manifest();
 
-        let fastly_env = m.environment_for("FASTLY");
+        let fastly_env = mfest.environment_for("FASTLY");
         assert_eq!(fastly_env.variables.len(), 2); // VAR1 and VAR3
-        assert!(fastly_env.variables.iter().any(|v| v.name == "VAR1"));
-        assert!(fastly_env.variables.iter().any(|v| v.name == "VAR3"));
+        assert!(fastly_env.variables.iter().any(|var| var.name == "VAR1"));
+        assert!(fastly_env.variables.iter().any(|var| var.name == "VAR3"));
 
-        let cf_env = m.environment_for("Cloudflare");
+        let cf_env = mfest.environment_for("Cloudflare");
         assert_eq!(cf_env.variables.len(), 2); // VAR2 and VAR3
-        assert!(cf_env.variables.iter().any(|v| v.name == "VAR2"));
-        assert!(cf_env.variables.iter().any(|v| v.name == "VAR3"));
+        assert!(cf_env.variables.iter().any(|var| var.name == "VAR2"));
+        assert!(cf_env.variables.iter().any(|var| var.name == "VAR3"));
     }
 
     #[test]
@@ -1253,8 +1308,8 @@ name = "DB_PASSWORD"
 description = "Database password for production"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let env = m.environment_for("any");
+        let mfest = loader.manifest();
+        let env = mfest.environment_for("any");
         assert_eq!(
             env.secrets[0].description.as_deref(),
             Some("Database password for production")
@@ -1271,8 +1326,8 @@ profile = "release"
 features = ["feature1", "feature2"]
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = &m.adapters["fastly"];
+        let mfest = loader.manifest();
+        let adapter = &mfest.adapters["fastly"];
         assert_eq!(adapter.build.target.as_deref(), Some("wasm32-wasip1"));
         assert_eq!(adapter.build.profile.as_deref(), Some("release"));
         assert_eq!(adapter.build.features, vec!["feature1", "feature2"]);
@@ -1287,8 +1342,8 @@ serve = "fastly compute serve"
 deploy = "fastly compute deploy"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = &m.adapters["fastly"];
+        let mfest = loader.manifest();
+        let adapter = &mfest.adapters["fastly"];
         assert_eq!(
             adapter.commands.build.as_deref(),
             Some("fastly compute build")
@@ -1311,8 +1366,8 @@ crate = "crates/fastly-adapter"
 manifest = "fastly.toml"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = &m.adapters["fastly"];
+        let mfest = loader.manifest();
+        let adapter = &mfest.adapters["fastly"];
         assert_eq!(
             adapter.adapter.crate_path.as_deref(),
             Some("crates/fastly-adapter")
@@ -1325,11 +1380,11 @@ manifest = "fastly.toml"
     fn empty_manifest_has_defaults() {
         let manifest = "";
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert!(m.app.name.is_none());
-        assert!(m.app.entry.is_none());
-        assert!(m.triggers.http.is_empty());
-        assert!(m.adapters.is_empty());
+        let mfest = loader.manifest();
+        assert!(mfest.app.name.is_none());
+        assert!(mfest.app.entry.is_none());
+        assert!(mfest.triggers.http.is_empty());
+        assert!(mfest.adapters.is_empty());
     }
 
     #[test]
@@ -1356,8 +1411,8 @@ manifest = "fastly.toml"
         // [stores.config] present but no name and no adapter overrides:
         // config_store_name() must return DEFAULT_CONFIG_STORE_NAME.
         let toml = "[stores.config]\n";
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(
             config.config_store_name("fastly"),
             DEFAULT_CONFIG_STORE_NAME
@@ -1382,8 +1437,8 @@ manifest = "fastly.toml"
 [stores.config]
 name = "app_config"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(config.config_store_name("fastly"), "app_config");
         assert_eq!(config.config_store_name("cloudflare"), "app_config");
         assert_eq!(config.config_store_name("axum"), "app_config");
@@ -1401,8 +1456,8 @@ name = "my-config-link"
 [stores.config.adapters.cloudflare]
 name = "APP_CONFIG_BINDING"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(config.config_store_name("fastly"), "my-config-link");
         assert_eq!(config.config_store_name("cloudflare"), "APP_CONFIG_BINDING");
         assert_eq!(config.config_store_name("axum"), "global_config");
@@ -1414,8 +1469,8 @@ name = "APP_CONFIG_BINDING"
 [stores.config.adapters.fastly]
 name = "fastly-store"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(config.config_store_name("FASTLY"), "fastly-store");
         assert_eq!(config.config_store_name("Fastly"), "fastly-store");
         assert_eq!(config.config_store_name("fastly"), "fastly-store");
@@ -1475,27 +1530,23 @@ name = "SPIN_CONFIG"
 "feature.checkout" = "true"
 "service.timeout_ms" = "1500"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         let defaults = config.config_store_defaults();
         assert_eq!(
-            defaults
-                .get("feature.checkout")
-                .map(std::string::String::as_str),
+            defaults.get("feature.checkout").map(String::as_str),
             Some("true")
         );
         assert_eq!(
-            defaults
-                .get("service.timeout_ms")
-                .map(std::string::String::as_str),
+            defaults.get("service.timeout_ms").map(String::as_str),
             Some("1500")
         );
     }
 
     #[test]
     fn empty_manifest_has_no_config_store() {
-        let m = ManifestLoader::load_from_str("");
-        assert!(m.manifest().stores.config.is_none());
+        let mfest = ManifestLoader::load_from_str("");
+        assert!(mfest.manifest().stores.config.is_none());
     }
 
     #[test]

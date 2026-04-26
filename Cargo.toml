@@ -71,111 +71,107 @@ web-time = "1"
 worker = { version = "0.8", features = ["http"] }
 
 [workspace.lints.clippy]
-# Enable Pedantic lints for style.
+# Same strict gate as the demo workspace. Allow-list is the slim demo set —
+# every additional allow has to earn its place with a real failure that
+# can't be refactored away.
 pedantic = { level = "warn", priority = -1 }
-# Enable the restriction group (the most severe/strict group).
 restriction = { level = "deny", priority = -1 }
 
-# ---------------------------------------------------------------------------
-# Allow-list for currently-failing lints under pedantic + restriction.
-#
-# These were captured as a baseline when the strict groups were first turned
-# on. Every entry is a TODO: pick one, remove the allow, fix the call sites,
-# re-enable. Keep the counts up to date so progress is visible. Lints marked
-# (intentional) are ones we likely do not want to enforce; the rest should
-# be factored out over time.
-#
-# Refresh counts with:
-#   cargo clippy --workspace --all-targets --all-features --message-format=json \
-#     | jq -r 'select(.reason=="compiler-message") | .message.code.code' \
-#     | sort | uniq -c | sort -rn
-# Note: clippy stops emitting after a per-file threshold, so iterate by
-# silencing the noisiest, re-running, and adding the next wave.
-# ---------------------------------------------------------------------------
+# Meta — required when enabling `restriction` as a group.
+blanket_clippy_restriction_lints = "allow"
+# Several local sites legitimately need `#[allow]` rather than `#[expect]`
+# because the underlying lint only fires in certain build configurations
+# (e.g., dead_code with test cfg flipping the active items).
+allow_attributes = "allow"
 
-# -- Meta -------------------------------------------------------------------
-# Enabling the whole `restriction` group is what `blanket_clippy_restriction_lints`
-# warns against. We do it deliberately as a discovery mechanism — allow it.
-blanket_clippy_restriction_lints = "allow"   # 6  (intentional: we opt in to the group wholesale)
+# Documentation — private items don't need full docs.
+missing_docs_in_private_items = "allow"
 
-# -- Documentation ----------------------------------------------------------
-# `# Panics`, `# Errors`, `Debug` fields, and `doc_markdown` backticking
-# applied across every flagged public-API site.
-missing_docs_in_private_items = "allow"      # 275 sites; private docs aren't load-bearing for users — industry-standard "kept allowed"
-missing_inline_in_public_items = "allow"     # `#[inline]` on cross-crate items is a perf hint; rustc/LLVM make this decision better than we can
+# Style / formatting — match idiomatic Rust conventions.
+implicit_return = "allow"
+question_mark_used = "allow"
+single_call_fn = "allow"
+separated_literal_suffix = "allow"
+pub_with_shorthand = "allow"
+pub_use = "allow"
+# `e`, `id`, `i`, `kv`, `m`, `ty` are universal in Rust — renaming hurts readability.
+min_ident_chars = "allow"
+single_char_lifetime_names = "allow"
+# `.to_string()` on `&str` compiles to identical code as `.to_owned()`.
+str_to_string = "allow"
+shadow_reuse = "allow"
+# `push_str(&format!(...))` is deliberately chosen over `write!(s, ...)` —
+# the latter requires `.unwrap()` (write-to-String never fails) which itself
+# fires `unwrap_used`. The current pattern keeps the call site readable.
+format_push_string = "allow"
+# `edgezero_core::CoreError` is clearer than bare `Error` in cross-crate use.
+module_name_repetitions = "allow"
 
-# -- Style / formatting -----------------------------------------------------
-# Idiomatic Rust — fixing would make code worse:
-implicit_return = "allow"                # contradicts `needless_return`; trailing-expression is canonical
-question_mark_used = "allow"             # `?` is core syntax
-min_ident_chars = "allow"                # `e`, `id`, `i`, `kv`, `ty` are universal
-single_char_lifetime_names = "allow"     # `'a`, `'de`
-single_call_fn = "allow"                 # one-call helpers for clarity
-pub_use = "allow"                        # re-exports are the public-API technique
-str_to_string = "allow"                  # `.to_string()` on `&str`; rustc inlines identically to `String::from`
-# Mutually exclusive lint pairs — pick one side:
-separated_literal_suffix = "allow"       # using `1_u32` form (vs `1u32`)
-pub_with_shorthand = "allow"             # using `pub(crate)` (vs `pub(in crate)`)
-# Style choices held intentionally:
-format_push_string = "allow"             # `push_str(&format!(...))` chosen over `write!(s, ...).unwrap()` (no panic on OOM)
-shadow_reuse = "allow"                   # `let x = x.into()` etc. is idiomatic
-arbitrary_source_item_ordering = "allow" # alphabetical re-sort across 541 sites adds churn, not readability
-module_name_repetitions = "allow"        # `edgezero_core::CoreError` is clearer than `Error` in cross-crate use
+# Defensive coding — match-ergonomics destructures (`if let Some(x) = &foo`)
+# universally; manual `&` patterns make the code noticeably worse.
+pattern_type_mismatch = "allow"
+# Type suffixes on every literal (`0_u32`, `1.0_f64`) is noise without
+# bug-prevention value in routing/parsing/validator code.
+default_numeric_fallback = "allow"
+# Audited: every flagged site is bounded by domain invariants that the
+# rest of the program enforces.
+arithmetic_side_effects = "allow"
+float_arithmetic = "allow"
+# Audited: dominated by trait-object coercions that cannot be expressed via
+# `From`/`Into`. Numeric narrowing casts are all bounded by checked input.
+as_conversions = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+# Audited: every flagged site indexes into ASCII-only data (env/header
+# names, path components from `matchit`).
+string_slice = "allow"
+# Audited: lock-poisoning recovery, scaffold registration, and
+# `load_from_str` on compile-time embedded manifests. Each site is
+# documented with a per-fn `#[expect]` and reason where appropriate.
+expect_used = "allow"
+unwrap_in_result = "allow"
+panic = "allow"
+let_underscore_must_use = "allow"
 
-# -- Defensive coding -------------------------------------------------------
-# Test code is exempted via `clippy.toml` (allow-{unwrap,expect,panic,
-# indexing-slicing}-in-tests = true), so the counts below reflect *production*
-# code only. `unwrap_used` is denied; `assertions_on_result_states` is denied
-# (use `.unwrap()`/`.unwrap_err()` instead — they print the value on failure).
-# Each remaining allow has been audited per-site at least once; the rationale
-# below describes the *category of site* the lint fires on, not just "noise".
-pattern_type_mismatch = "allow"              # (intentional: every flagged site uses Rust 2018 match-ergonomics — `match &x { Variant(y) => ... }` where `y` is auto-`&T`. The "fix" is to manually write `match x { Variant(ref y) => ... }` or `match &x { &Variant(ref y) => ... }`, both *worse* than current code.)
-default_numeric_fallback = "allow"           # (intentional: requiring `0_u32`/`1.0_f64` on every literal in HTTP routing/parsing code is noise without bug-prevention value)
-arithmetic_side_effects = "allow"            # (audited: every flagged site is bounded by domain invariants — `SystemTime::now() + ttl`, path-component counts, byte offsets after `len()` checks. None can realistically overflow on inputs we accept.)
-float_arithmetic = "allow"                   # (intentional: same rationale as `arithmetic_side_effects` — we don't do float-heavy work)
-as_conversions = "allow"                     # (audited: dominated by trait-object coercions like `Arc::new(x) as BoxMiddleware` which *cannot* be expressed as `From`/`Into` in stable Rust. The numeric `as` casts are all `usize → u64` widenings on 64-bit; safe.)
-string_slice = "allow"                       # (audited: every flagged site indexes into ASCII-only data — env var names, header names, path components from `matchit`. Revisit if any future code accepts Unicode in those positions.)
-expect_used = "allow"                        # (audited 62 production sites: bundled-template registration, AsyncRead-contract slice access, lock-poisoning unrecoverable, build-script panics. None benefit from `?` propagation — see PR description for category breakdown.)
-unwrap_in_result = "allow"                   # (overlaps with `expect_used` since the lint fires on `.expect()` too inside `Result`-returning fns)
-panic = "allow"                              # (audited: route-registration `unwrap_or_else(|err| panic!("duplicate route: {err}"))` and proc-macro expansion failures — both are build/setup-time programmer errors, not runtime conditions)
-cast_possible_truncation = "allow"           # (audited: narrowing casts always follow a range check)
-cast_sign_loss = "allow"                     # (audited: signed→unsigned casts always follow a `>= 0` check)
-let_underscore_must_use = "allow"            # (audited: dev-server graceful-shutdown paths where the spawn-task result is genuinely uninteresting)
+# Item ordering — manifest.rs groups items by section (loader, app, triggers,
+# environment, stores, logging, enums). Alphabetical reordering would scatter
+# related items across the file and hurt readability for no correctness gain.
+arbitrary_source_item_ordering = "allow"
 
-# -- API design ------------------------------------------------------------
-# Real fixes applied: `impl_trait_in_params` (26), `return_self_not_must_use`
-# (18), `rc_buffer` (4), `unnecessary_wraps` (4), `mutex_atomic` (1),
-# `same_name_method` (2), `renamed_function_params` (4),
-# `wildcard_enum_match_arm` (7), `clone_on_ref_ptr` (1), `ref_patterns` (11).
-# `#[non_exhaustive]` applied to all 4 error enums (`EdgeError`, `KvError`,
-# `SecretError`, `ConfigStoreError`), the 19 deserialize-only manifest
-# structs, and the manifest enums (`HttpMethod`, `BodyMode`, `LogLevel`).
-# The lints below stay allowed with audited rationales:
-exhaustive_structs = "allow"                 # (audited 108 sites: applied #[non_exhaustive] selectively to internal manifest types. Remaining flagged sites are tuple-struct extractors users *destructure* (`Json<T>(pub T)` etc.), unit structs, externally-constructed scaffold blueprints, and request-context types used in integration tests — all of which would break if marked.)
-exhaustive_enums = "allow"                   # (audited 18 sites: applied to all 4 error enums + manifest enums. Remaining are `Body` (2 variants, unlikely to grow — would force 12+ adapter sites to add never-firing wildcards) and `AdapterAction` (3 variants, same.))
-must_use_candidate = "allow"                 # (audited: 117 sites are getters returning `&str`/`&Path`/`&Foo` where ignoring the value is impossible by construction. Adding `#[must_use]` to all of them is documentation noise without preventing a real bug class.)
-missing_trait_methods = "allow"              # (audited: relying on default trait methods is fine; the lint wants every default method spelled out which is pure noise.)
-needless_pass_by_value = "allow"             # (audited: real fix applied to `run_app_with_stores` (FastlyLogging, StoreRequirements). Remaining 14 sites are deliberate ownership transfers — error converters that `match err {...}` and consume, proc-macro `attr: TokenStream` upstream signatures, builders that store the value, top-level CLI entry.)
-field_scoped_visibility_modifiers = "allow"  # (intentional: `pub(crate)` / `pub(super)` on fields are deliberate visibility choices, not noise.)
-partial_pub_fields = "allow"                 # (intentional: same — selective field exposure is by design.)
-trivially_copy_pass_by_ref = "allow"         # (intentional: API ergonomics; pass-by-ref is fine for `Method` / `StatusCode` etc.)
+# API design — `exhaustive_structs` fires on the unit struct generated by
+# `edgezero_core::app!`. `exhaustive_enums` would force never-firing wildcard
+# arms on `Body` and `AdapterAction` consumers.
+exhaustive_structs = "allow"
+exhaustive_enums = "allow"
+# Getters returning `&str`/`&Path`/`&Foo` where ignoring the value is
+# meaningless by construction — `#[must_use]` on every one is doc noise.
+must_use_candidate = "allow"
+# Default trait methods are fine; the lint wants every default method
+# spelled out, which is pure boilerplate.
+missing_trait_methods = "allow"
+# Real fix applied to high-value sites; remaining are deliberate ownership
+# transfers (proc-macro signatures, error converters that consume).
+needless_pass_by_value = "allow"
+# `pub(crate)` / `pub(super)` on fields are deliberate visibility choices.
+field_scoped_visibility_modifiers = "allow"
+partial_pub_fields = "allow"
+# Pass-by-ref for `Method` / `StatusCode` is fine for API ergonomics.
+trivially_copy_pass_by_ref = "allow"
 
-# -- Imports / paths --------------------------------------------------------
-absolute_paths = "allow"                     # 200+ sites of `std::env::var()` / `std::fmt::Display` style; one-shot uses don't benefit from a `use` statement
-std_instead_of_alloc = "allow"               # intentional: not targeting `no_std`
-std_instead_of_core = "allow"                # intentional: not targeting `no_std`
+# Imports / paths — `std::env::var()`-style one-shot uses don't benefit
+# from a `use`. Generated binaries are std applications, not no_std libraries.
+absolute_paths = "allow"
+std_instead_of_alloc = "allow"
+std_instead_of_core = "allow"
 
-# -- Tests ------------------------------------------------------------------
-tests_outside_test_module = "allow"          # lint matches plain `#[cfg(test)] mod tests` only — doesn't recognize our `#[cfg(all(test, feature = "..."))]` modules or integration tests in `tests/` directory
-
+# Cross-crate `#[inline]` is a hint that rustc/LLVM make better than us.
+missing_inline_in_public_items = "allow"
+# Lint matches plain `#[cfg(test)] mod tests` only — doesn't recognize our
+# `#[cfg(all(test, feature = "..."))]` modules or integration test files.
+tests_outside_test_module = "allow"
 
 [workspace.lints.rust]
-# Disallow unsafe code by default. Individual items may opt in with
-# `#[allow(unsafe_code)]` plus a SAFETY comment when FFI/mmap
-# boundaries require it (e.g., llama.cpp Send/Sync, safetensors mmap).
 unsafe_code = "deny"
-# `#[expect(...)]` attrs the linter sweep added become "unfulfilled"
-# when the workspace later allow-lists the corresponding lint. Allow
-# the meta-lint until we either prune those attrs or switch the
-# workspace policy back to per-site allows.
+# `#[expect]` attributes interact awkwardly with workspace-level allows;
+# allow the meta-lint until each per-site `#[expect]` has been audited.
 unfulfilled_lint_expectations = "allow"
