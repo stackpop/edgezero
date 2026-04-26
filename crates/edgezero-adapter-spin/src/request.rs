@@ -86,7 +86,7 @@ fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<Strin
 /// a Spin-compatible response.
 pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sdk::http::Response> {
     let core_request = into_core_request(req).await?;
-    let response = app.router().oneshot(core_request).await;
+    let response = app.router().oneshot(core_request).await?;
     Ok(from_core_response(response).await?)
 }
 
