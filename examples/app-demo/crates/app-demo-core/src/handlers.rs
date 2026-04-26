@@ -18,8 +18,8 @@ const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
 const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
 
 #[derive(serde::Deserialize)]
-pub(crate) struct EchoParams {
-    pub(crate) name: String,
+pub struct EchoParams {
+    pub name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -28,8 +28,8 @@ struct ConfigParams {
 }
 
 #[derive(serde::Deserialize)]
-pub(crate) struct EchoBody {
-    pub(crate) name: String,
+pub struct EchoBody {
+    pub name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -42,30 +42,30 @@ struct ProxyPath {
 const MAX_NOTE_ID_LEN: u64 = 507;
 
 #[derive(serde::Deserialize, validator::Validate)]
-pub(crate) struct NoteIdPath {
+pub struct NoteIdPath {
     #[validate(length(
         min = 1_u64,
         max = "MAX_NOTE_ID_LEN",
         message = "note id must be 1–507 bytes"
     ))]
-    pub(crate) id: String,
+    pub id: String,
 }
 
 /// Maximum request body size (25 MB, matches KV value limit).
 const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
 
 #[action]
-pub(crate) async fn root() -> Text<&'static str> {
+pub async fn root() -> Text<&'static str> {
     Text::new("app-demo app")
 }
 
 #[action]
-pub(crate) async fn echo(Path(params): Path<EchoParams>) -> Text<String> {
+pub async fn echo(Path(params): Path<EchoParams>) -> Text<String> {
     Text::new(format!("Hello, {}!", params.name))
 }
 
 #[action]
-pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
+pub async fn headers(Headers(headers): Headers) -> Text<String> {
     let ua = headers
         .get("user-agent")
         .and_then(|value| value.to_str().ok())
@@ -74,7 +74,7 @@ pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
 }
 
 #[action]
-pub(crate) async fn stream() -> Result<Response, EdgeError> {
+pub async fn stream() -> Result<Response, EdgeError> {
     let body = Body::stream(
         stream::iter(0_i32..3_i32).map(|index| Bytes::from(format!("chunk {index}\n"))),
     );
@@ -87,16 +87,16 @@ pub(crate) async fn stream() -> Result<Response, EdgeError> {
 }
 
 #[action]
-pub(crate) async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
+pub async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
     Text::new(format!("Hello, {}!", body.name))
 }
 
 #[action]
-pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
+pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let proxy_handle = ctx.proxy_handle();
     let request = ctx.into_request();
-    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_string());
+    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
     let target = build_proxy_target(&base, &params.rest, request.uri())?;
     let proxy_request = ProxyRequest::from_request(request, target);
 
@@ -108,7 +108,7 @@ pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Re
 }
 
 fn build_proxy_target(base: &str, rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> {
-    let mut target = base.trim_end_matches('/').to_string();
+    let mut target = base.trim_end_matches('/').to_owned();
     let trimmed_rest = rest.trim_start_matches('/');
     if !trimmed_rest.is_empty() {
         target.push('/');
@@ -147,7 +147,7 @@ fn text_response(status: StatusCode, message: impl Into<String>) -> Result<Respo
 }
 
 #[action]
-pub(crate) async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
+pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ConfigParams = ctx.path()?;
     if !ALLOWED_CONFIG_KEYS.contains(&params.name.as_str()) {
         return text_response(
@@ -174,9 +174,9 @@ pub(crate) async fn config_get(RequestContext(ctx): RequestContext) -> Result<Re
 
 /// Increment and return a visit counter stored in KV.
 #[action]
-pub(crate) async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
+pub async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
     let count: i64 = store
-        .read_modify_write("demo:counter", 0_i64, |n| n + 1)
+        .read_modify_write("demo:counter", 0_i64, |n| n.wrapping_add(1))
         .await?;
     let body = serde_json::json!({ "count": count }).to_string();
     http::response_builder()
@@ -188,7 +188,7 @@ pub(crate) async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
 
 /// Store a note by id (body = note text).
 #[action]
-pub(crate) async fn kv_note_put(
+pub async fn kv_note_put(
     Kv(store): Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
     RequestContext(ctx): RequestContext,
@@ -206,7 +206,7 @@ pub(crate) async fn kv_note_put(
 
 /// Read a note by id.
 #[action]
-pub(crate) async fn kv_note_get(
+pub async fn kv_note_get(
     Kv(store): Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
@@ -222,7 +222,7 @@ pub(crate) async fn kv_note_get(
 
 /// Delete a note by id.
 #[action]
-pub(crate) async fn kv_note_delete(
+pub async fn kv_note_delete(
     Kv(store): Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
@@ -244,7 +244,7 @@ pub(crate) async fn kv_note_delete(
 ///
 /// Usage: `GET /secrets/echo?name=SMOKE_SECRET`
 #[action]
-pub(crate) async fn secrets_echo(
+pub async fn secrets_echo(
     Secrets(store): Secrets,
     Query(params): Query<EchoParams>,
 ) -> Result<Text<String>, EdgeError> {
@@ -393,7 +393,7 @@ mod tests {
             .insert(ProxyHandle::with_client(TestProxyClient));
 
         let mut params = HashMap::new();
-        params.insert("rest".to_string(), "status/201".to_string());
+        params.insert("rest".to_owned(), "status/201".to_owned());
         let ctx = RequestContext::new(request, PathParams::new(params));
 
         let response = block_on(proxy_demo(ctx)).expect("response");
@@ -417,7 +417,7 @@ mod tests {
             .expect("request");
         let map = params
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|&(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<HashMap<_, _>>();
         RequestContext::new(request, PathParams::new(map))
     }
@@ -466,14 +466,14 @@ mod tests {
         let store = MapConfigStore(
             entries
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .map(|&(name, value)| (name.to_owned(), value.to_owned()))
                 .collect(),
         );
         request
             .extensions_mut()
             .insert(ConfigStoreHandle::new(Arc::new(store)));
         let mut params = HashMap::new();
-        params.insert("name".to_string(), key.to_string());
+        params.insert("name".to_owned(), key.to_owned());
         RequestContext::new(request, PathParams::new(params))
     }
 
@@ -487,7 +487,7 @@ mod tests {
             .extensions_mut()
             .insert(ConfigStoreHandle::new(Arc::new(UnavailableConfigStore)));
         let mut params = HashMap::new();
-        params.insert("name".to_string(), key.to_string());
+        params.insert("name".to_owned(), key.to_owned());
         RequestContext::new(request, PathParams::new(params))
     }
 
@@ -560,7 +560,7 @@ mod tests {
         }
 
         async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-            self.data.lock().unwrap().insert(key.to_string(), value);
+            self.data.lock().unwrap().insert(key.to_owned(), value);
             Ok(())
         }
 
@@ -570,7 +570,7 @@ mod tests {
             value: Bytes,
             _ttl: Duration,
         ) -> Result<(), KvError> {
-            self.data.lock().unwrap().insert(key.to_string(), value);
+            self.data.lock().unwrap().insert(key.to_owned(), value);
             Ok(())
         }
 
@@ -592,7 +592,9 @@ mod tests {
             let data = self.data.lock().unwrap();
             let mut keys = data
                 .keys()
-                .filter(|key| key.starts_with(prefix) && cursor.is_none_or(|c| key.as_str() > c))
+                .filter(|key| {
+                    key.starts_with(prefix) && cursor.is_none_or(|cur| key.as_str() > cur)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let has_more = keys.len() > limit;
@@ -621,7 +623,7 @@ mod tests {
         request.extensions_mut().insert(handle.clone());
         let map = params
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|&(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<HashMap<_, _>>();
         (RequestContext::new(request, PathParams::new(map)), handle)
     }
@@ -655,7 +657,7 @@ mod tests {
                 .expect("request");
             request.extensions_mut().insert(handle.clone());
             let mut map = HashMap::new();
-            map.insert("id".to_string(), "abc".to_string());
+            map.insert("id".to_owned(), "abc".to_owned());
             (
                 RequestContext::new(request, PathParams::new(map)),
                 handle.clone(),
@@ -703,7 +705,7 @@ mod tests {
                 .expect("request");
             request.extensions_mut().insert(handle.clone());
             let mut map = HashMap::new();
-            map.insert("id".to_string(), "del".to_string());
+            map.insert("id".to_owned(), "del".to_owned());
             (RequestContext::new(request, PathParams::new(map)), handle)
         };
         let resp = block_on(kv_note_delete(ctx2)).expect("response");
@@ -715,10 +717,10 @@ mod tests {
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
 
     fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
-        let provider = InMemorySecretStore::new(entries.iter().map(|(k, v)| {
+        let provider = InMemorySecretStore::new(entries.iter().map(|&(name, value)| {
             (
-                format!("{SECRET_STORE_NAME}/{k}"),
-                bytes::Bytes::from((*v).to_string()),
+                format!("{SECRET_STORE_NAME}/{name}"),
+                bytes::Bytes::from(value.to_owned()),
             )
         }));
         let handle = SecretHandle::new(Arc::new(provider));
