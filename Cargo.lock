@@ -735,6 +735,7 @@ dependencies = [
  "log",
  "log-fastly",
  "tempfile",
+ "thiserror 2.0.18",
  "walkdir",
 ]
 

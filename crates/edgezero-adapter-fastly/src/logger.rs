@@ -1,22 +1,36 @@
 use log::LevelFilter;
 
+/// Errors that can occur when initialising the Fastly logger.
+#[derive(Debug, thiserror::Error)]
+pub enum InitLoggerError {
+    /// The `log_fastly::Logger::builder()` rejected its inputs (e.g. the
+    /// endpoint string is empty).
+    #[error("failed to build Fastly logger: {0}")]
+    Build(String),
+    /// `log::set_boxed_logger` (via `fern`) failed because a global logger
+    /// was already installed.
+    #[error(transparent)]
+    SetLogger(#[from] log::SetLoggerError),
+}
+
 /// Initialize logging (opinionated): formatted timestamps using `fern`,
 /// chained to the Fastly logger.
+///
+/// # Errors
+/// Returns [`InitLoggerError::Build`] if the underlying logger builder
+/// rejects its inputs (e.g. an empty endpoint), or
+/// [`InitLoggerError::SetLogger`] if a global logger is already installed.
 pub fn init_logger(
     endpoint: &str,
     level: LevelFilter,
     echo_stdout: bool,
-) -> Result<(), log::SetLoggerError> {
-    // `.build()` only fails if the endpoint string is empty; callers pass a
-    // non-empty endpoint (defaulting to "stdout"). Keeping the panic here
-    // preserves the original behavior; widening the error type would be a
-    // breaking API change for marginal benefit.
+) -> Result<(), InitLoggerError> {
     let logger = log_fastly::Logger::builder()
         .default_endpoint(endpoint)
         .echo_stdout(echo_stdout)
         .max_level(level)
         .build()
-        .expect("non-empty Fastly logger endpoint");
+        .map_err(|err| InitLoggerError::Build(err.to_string()))?;
 
     // Format timestamps in RFC3339 with milliseconds using UTC to avoid TZ issues in WASM.
     let dispatch = fern::Dispatch::new()

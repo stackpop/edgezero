@@ -1,34 +1,44 @@
 use crate::body::Body;
+use crate::error::EdgeError;
 use crate::http::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
     HeaderValue, Response, StatusCode,
 };
 
 /// Convert common return types into `Response`.
+///
+/// **Breaking change (pre-1.0):** this trait now returns `Result<Response,
+/// EdgeError>`. Callers must propagate response-building failures (typically
+/// invalid headers) instead of letting them panic at the `http::Builder`
+/// boundary.
 pub trait IntoResponse {
-    fn into_response(self) -> Response;
+    /// # Errors
+    /// Returns [`EdgeError::internal`] if the underlying HTTP response cannot
+    /// be assembled — propagated so the request can fail cleanly instead of
+    /// crashing the worker.
+    fn into_response(self) -> Result<Response, EdgeError>;
 }
 
 impl IntoResponse for Response {
-    fn into_response(self) -> Response {
-        self
+    fn into_response(self) -> Result<Response, EdgeError> {
+        Ok(self)
     }
 }
 
 impl IntoResponse for Body {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, self)
     }
 }
 
 impl IntoResponse for &str {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, Body::text(self))
     }
 }
 
 impl IntoResponse for String {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, Body::text(self))
     }
 }
@@ -45,13 +55,13 @@ impl<T> IntoResponse for Text<T>
 where
     T: Into<String>,
 {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, Body::text(self.0.into()))
     }
 }
 
 impl IntoResponse for () {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::NO_CONTENT, Body::empty())
     }
 }
@@ -60,18 +70,18 @@ impl<T> IntoResponse for (StatusCode, T)
 where
     T: IntoResponse,
 {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         let (status, inner) = self;
-        let mut response = inner.into_response();
+        let mut response = inner.into_response()?;
         *response.status_mut() = status;
-        response
+        Ok(response)
     }
 }
 
-/// # Panics
-/// Panics if the supplied [`StatusCode`] cannot be set on the internal builder —
-/// not possible since `StatusCode` values are always valid by construction.
-pub fn response_with_body(status: StatusCode, body: Body) -> Response {
+/// # Errors
+/// Returns [`EdgeError::internal`] if the underlying [`http::response::Builder`]
+/// rejects the supplied status, headers, or body.
+pub fn response_with_body(status: StatusCode, body: Body) -> Result<Response, EdgeError> {
     use crate::http::response_builder;
 
     let mut builder = response_builder().status(status);
@@ -87,9 +97,7 @@ pub fn response_with_body(status: StatusCode, body: Body) -> Response {
         }
     }
 
-    builder
-        .body(body)
-        .expect("static response builder should not fail")
+    builder.body(body).map_err(EdgeError::internal)
 }
 
 #[cfg(test)]
@@ -98,7 +106,7 @@ mod tests {
 
     #[test]
     fn response_with_body_sets_length_and_type() {
-        let response = response_with_body(StatusCode::OK, Body::from("hello"));
+        let response = response_with_body(StatusCode::OK, Body::from("hello")).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         let headers = response.headers();
         assert_eq!(
@@ -119,27 +127,29 @@ mod tests {
 
     #[test]
     fn empty_body_does_not_set_length() {
-        let response = response_with_body(StatusCode::OK, Body::empty());
+        let response = response_with_body(StatusCode::OK, Body::empty()).expect("response");
         assert!(response.headers().get(CONTENT_LENGTH).is_none());
     }
 
     #[test]
     fn text_wrapper_builds_response() {
-        let response = Text::new("hello").into_response();
+        let response = Text::new("hello").into_response().expect("response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body().as_bytes().expect("buffered"), b"hello");
     }
 
     #[test]
     fn unit_type_sets_no_content() {
-        let response = ().into_response();
+        let response = ().into_response().expect("response");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert!(response.body().as_bytes().expect("buffered").is_empty());
     }
 
     #[test]
     fn status_code_tuple_overrides_status() {
-        let response = (StatusCode::CREATED, "created").into_response();
+        let response = (StatusCode::CREATED, "created")
+            .into_response()
+            .expect("response");
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(response.body().as_bytes().expect("buffered"), b"created");
     }

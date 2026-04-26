@@ -13,7 +13,7 @@ where
     T: IntoResponse,
 {
     fn respond(self) -> Result<Response, EdgeError> {
-        Ok(self.into_response())
+        self.into_response()
     }
 }
 
@@ -22,7 +22,7 @@ where
     T: IntoResponse,
 {
     fn respond(self) -> Result<Response, EdgeError> {
-        self.map(IntoResponse::into_response)
+        self.and_then(IntoResponse::into_response)
     }
 }
 

@@ -106,7 +106,15 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
             let core_response = task::block_in_place(move || {
                 Handle::current().block_on(router.oneshot(core_request))
             });
-            let response = into_axum_response(core_response);
+            let response = match core_response {
+                Ok(response) => into_axum_response(response),
+                Err(err) => {
+                    let body = AxumBody::from(format!("internal error: {err}"));
+                    let mut fallback = Response::new(body);
+                    *fallback.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    fallback
+                }
+            };
             Ok(response)
         })
     }

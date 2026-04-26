@@ -78,12 +78,7 @@ impl Body {
 
     /// Drain the body into a single `Bytes` buffer, enforcing `max_size`.
     ///
-    /// Works for both buffered and streaming variants. Returns an error if
-    /// the body exceeds `max_size` bytes.
-    ///
-    /// # Panics
-    /// Internal invariant only: `is_stream` is checked before unwrapping into the
-    /// matching variant. Cannot panic on any caller-controlled input.
+    /// Works for both buffered and streaming variants.
     ///
     /// # Errors
     /// Returns [`crate::error::EdgeError::bad_request`] if the body exceeds `max_size` bytes; or [`crate::error::EdgeError::internal`] if the upstream stream errors.
@@ -91,27 +86,28 @@ impl Body {
         self,
         max_size: usize,
     ) -> Result<Bytes, crate::error::EdgeError> {
-        if self.is_stream() {
-            let mut stream = self.into_stream().expect("checked is_stream");
-            let mut buf = Vec::new();
-            while let Some(chunk) = StreamExt::next(&mut stream).await {
-                let chunk = chunk.map_err(crate::error::EdgeError::internal)?;
-                buf.extend_from_slice(&chunk);
-                if buf.len() > max_size {
+        match self {
+            Body::Once(bytes) => {
+                if bytes.len() > max_size {
                     return Err(crate::error::EdgeError::bad_request(
                         "request body too large",
                     ));
                 }
+                Ok(bytes)
             }
-            Ok(Bytes::from(buf))
-        } else {
-            let bytes = self.into_bytes().expect("checked !is_stream");
-            if bytes.len() > max_size {
-                return Err(crate::error::EdgeError::bad_request(
-                    "request body too large",
-                ));
+            Body::Stream(mut stream) => {
+                let mut buf = Vec::new();
+                while let Some(chunk) = StreamExt::next(&mut stream).await {
+                    let chunk = chunk.map_err(crate::error::EdgeError::internal)?;
+                    buf.extend_from_slice(&chunk);
+                    if buf.len() > max_size {
+                        return Err(crate::error::EdgeError::bad_request(
+                            "request body too large",
+                        ));
+                    }
+                }
+                Ok(Bytes::from(buf))
             }
-            Ok(bytes)
         }
     }
 

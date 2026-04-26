@@ -18,10 +18,7 @@ where
 {
     fn call(&self, ctx: RequestContext) -> HandlerFuture {
         let fut = (self)(ctx);
-        Box::pin(async move {
-            let response = fut.await?.into_response();
-            Ok(response)
-        })
+        Box::pin(async move { fut.await?.into_response() })
     }
 }
 

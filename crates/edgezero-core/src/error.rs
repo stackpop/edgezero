@@ -137,7 +137,7 @@ fn json_or_text<T: Serialize>(payload: &T) -> Body {
 }
 
 impl IntoResponse for EdgeError {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         let payload = json!({
             "error": {
                 "status": self.status().as_u16(),
@@ -146,11 +146,11 @@ impl IntoResponse for EdgeError {
         });
 
         let body = json_or_text(&payload);
-        let mut response = response_with_body(self.status(), body);
+        let mut response = response_with_body(self.status(), body)?;
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        response
+        Ok(response)
     }
 }
 
@@ -251,7 +251,9 @@ mod tests {
 
     #[test]
     fn into_response_sets_json_payload() {
-        let response = EdgeError::bad_request("invalid").into_response();
+        let response = EdgeError::bad_request("invalid")
+            .into_response()
+            .expect("response");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let content_type = response
             .headers()

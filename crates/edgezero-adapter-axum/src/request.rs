@@ -51,9 +51,11 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
         );
     }
 
+    let proxy_client =
+        AxumProxyClient::try_new().map_err(|err| format!("failed to build proxy client: {err}"))?;
     core_request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(AxumProxyClient::default()));
+        .insert(ProxyHandle::with_client(proxy_client));
 
     Ok(core_request)
 }
