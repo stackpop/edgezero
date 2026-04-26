@@ -18,6 +18,7 @@
 //! it never writes or deletes them. Provisioning secrets is the
 //! responsibility of each platform's deployment toolchain.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -119,7 +120,7 @@ impl SecretStore for NoopSecretStore {
 /// across multiple named stores.
 #[cfg(any(test, feature = "test-utils"))]
 pub struct InMemorySecretStore {
-    secrets: std::collections::HashMap<String, Bytes>,
+    secrets: HashMap<String, Bytes>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]

@@ -8,6 +8,8 @@ use validator::Validate;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
 use crate::http::HeaderMap;
+use crate::key_value_store::KvHandle;
+use crate::secret_store::SecretHandle;
 
 #[async_trait(?Send)]
 pub trait FromRequest: Sized {
@@ -415,7 +417,7 @@ impl<T> ValidatedForm<T> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Kv(pub crate::key_value_store::KvHandle);
+pub struct Kv(pub KvHandle);
 
 #[async_trait(?Send)]
 impl FromRequest for Kv {
@@ -428,22 +430,22 @@ impl FromRequest for Kv {
     }
 }
 
-impl std::ops::Deref for Kv {
-    type Target = crate::key_value_store::KvHandle;
+impl Deref for Kv {
+    type Target = KvHandle;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl std::ops::DerefMut for Kv {
+impl DerefMut for Kv {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl Kv {
-    pub fn into_inner(self) -> crate::key_value_store::KvHandle {
+    pub fn into_inner(self) -> KvHandle {
         self.0
     }
 }
@@ -461,7 +463,7 @@ impl Kv {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Secrets(pub crate::secret_store::SecretHandle);
+pub struct Secrets(pub SecretHandle);
 
 #[async_trait(?Send)]
 impl FromRequest for Secrets {
@@ -477,22 +479,22 @@ impl FromRequest for Secrets {
     }
 }
 
-impl std::ops::Deref for Secrets {
-    type Target = crate::secret_store::SecretHandle;
+impl Deref for Secrets {
+    type Target = SecretHandle;
 
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl std::ops::DerefMut for Secrets {
+impl DerefMut for Secrets {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl Secrets {
-    pub fn into_inner(self) -> crate::secret_store::SecretHandle {
+    pub fn into_inner(self) -> SecretHandle {
         self.0
     }
 }

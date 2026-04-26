@@ -1,22 +1,27 @@
+use std::fs;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::Router;
+use tokio::net::TcpListener as TokioTcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
 use tower::{service_fn, Service as _};
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, AXUM_ADAPTER};
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::manifest::{Manifest, ManifestLoader, DEFAULT_KV_STORE_NAME};
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
 use crate::config_store::AxumConfigStore;
+use crate::key_value_store::PersistentKvStore;
+use crate::secret_store::EnvSecretStore;
 use crate::service::EdgeZeroAxumService;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,14 +135,14 @@ impl AxumDevServer {
             .set_nonblocking(true)
             .context("failed to set listener to non-blocking")?;
 
-        let listener = tokio::net::TcpListener::from_std(listener)
+        let listener = TokioTcpListener::from_std(listener)
             .context("failed to adopt std listener into tokio")?;
 
         serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
     }
 
     #[cfg(test)]
-    async fn run_with_listener(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+    async fn run_with_listener(self, listener: TokioTcpListener) -> anyhow::Result<()> {
         let AxumDevServer {
             router,
             config,
@@ -147,7 +152,7 @@ impl AxumDevServer {
     }
 }
 
-fn kv_init_requirement(manifest: &edgezero_core::manifest::Manifest) -> KvInitRequirement {
+fn kv_init_requirement(manifest: &Manifest) -> KvInitRequirement {
     if manifest.stores.kv.is_some() {
         KvInitRequirement::Required
     } else {
@@ -156,7 +161,7 @@ fn kv_init_requirement(manifest: &edgezero_core::manifest::Manifest) -> KvInitRe
 }
 
 fn kv_store_path(store_name: &str) -> PathBuf {
-    if store_name == edgezero_core::manifest::DEFAULT_KV_STORE_NAME {
+    if store_name == DEFAULT_KV_STORE_NAME {
         return PathBuf::from(".edgezero/kv.redb");
     }
 
@@ -215,21 +220,18 @@ fn stable_store_name_hash(store_name: &str) -> u64 {
     hash
 }
 
-fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<edgezero_core::key_value_store::KvHandle> {
+fn kv_handle_from_path(kv_path: &Path) -> anyhow::Result<KvHandle> {
     if let Some(parent) = kv_path.parent() {
-        std::fs::create_dir_all(parent).context("failed to create KV store directory")?;
+        fs::create_dir_all(parent).context("failed to create KV store directory")?;
     }
-    let kv_store = std::sync::Arc::new(
-        crate::key_value_store::PersistentKvStore::new(kv_path)
-            .context("failed to create KV store")?,
-    );
+    let kv_store = Arc::new(PersistentKvStore::new(kv_path).context("failed to create KV store")?);
     log::info!("KV store: {}", kv_path.display());
-    Ok(edgezero_core::key_value_store::KvHandle::new(kv_store))
+    Ok(KvHandle::new(kv_store))
 }
 
 async fn serve_with_stores(
     router: RouterService,
-    listener: tokio::net::TcpListener,
+    listener: TokioTcpListener,
     enable_ctrl_c: bool,
     stores: Stores,
 ) -> anyhow::Result<()> {
@@ -272,9 +274,9 @@ async fn serve_with_stores(
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let manifest = ManifestLoader::try_load_from_str(manifest_src)?;
     let m = manifest.manifest();
-    let logging = m.logging_or_default(edgezero_core::app::AXUM_ADAPTER);
+    let logging = m.logging_or_default(AXUM_ADAPTER);
     let kv_init_requirement = kv_init_requirement(m);
-    let kv_store_name = m.kv_store_name(edgezero_core::app::AXUM_ADAPTER).to_owned();
+    let kv_store_name = m.kv_store_name(AXUM_ADAPTER).to_owned();
     let kv_path = kv_store_path(&kv_store_name);
     let has_secret_store = m.secret_store_enabled("axum");
 
@@ -301,7 +303,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         listener
             .set_nonblocking(true)
             .context("failed to set listener to non-blocking")?;
-        let listener = tokio::net::TcpListener::from_std(listener)
+        let listener = TokioTcpListener::from_std(listener)
             .context("failed to adopt std listener into tokio")?;
 
         let kv_handle = match kv_handle_from_path(&kv_path) {
@@ -337,10 +339,10 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         let config_store_handle = m.stores.config.as_ref().map(|cfg| {
             let defaults = cfg.config_store_defaults().clone();
             let store = AxumConfigStore::from_env(defaults);
-            ConfigStoreHandle::new(std::sync::Arc::new(store))
+            ConfigStoreHandle::new(Arc::new(store))
         });
-        let secret = has_secret_store.then(||  { log::info!("Secret store: reading from environment variables"); SecretHandle::new(std::sync::Arc::new(
-                crate::secret_store::EnvSecretStore::new(),
+        let secret = has_secret_store.then(||  { log::info!("Secret store: reading from environment variables"); SecretHandle::new(Arc::new(
+                EnvSecretStore::new(),
             )) });
         let stores = Stores {
             config_store: config_store_handle,
@@ -416,7 +418,7 @@ mod tests {
     #[test]
     fn default_store_name_uses_legacy_kv_path() {
         assert_eq!(
-            kv_store_path(edgezero_core::manifest::DEFAULT_KV_STORE_NAME),
+            kv_store_path(DEFAULT_KV_STORE_NAME),
             PathBuf::from(".edgezero/kv.redb")
         );
     }
@@ -494,7 +496,7 @@ mod integration_tests {
     }
 
     async fn start_test_server(router: RouterService) -> TestServer {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
         let addr = listener.local_addr().expect("local addr");
@@ -851,7 +853,7 @@ mod integration_tests {
         router: RouterService,
         secret_handle: Option<edgezero_core::secret_store::SecretHandle>,
     ) -> TestServerSecrets {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind secrets test server");
         let addr = listener.local_addr().expect("local addr");

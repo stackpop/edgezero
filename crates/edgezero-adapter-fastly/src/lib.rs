@@ -1,6 +1,11 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
+#[cfg(feature = "fastly")]
+use edgezero_core::app::{Hooks, FASTLY_ADAPTER};
+#[cfg(feature = "fastly")]
+use edgezero_core::manifest::ManifestLoader;
+
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "fastly")]
@@ -112,33 +117,29 @@ impl AppExt for edgezero_core::app::App {
 /// # Errors
 /// Returns an error if the manifest is invalid or any required store cannot be opened.
 #[cfg(feature = "fastly")]
-pub fn run_app<A: edgezero_core::app::Hooks>(
+pub fn run_app<A: Hooks>(
     manifest_src: &str,
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
-    let manifest_loader = edgezero_core::manifest::ManifestLoader::try_load_from_str(manifest_src)
+    let manifest_loader = ManifestLoader::try_load_from_str(manifest_src)
         .map_err(|err| fastly::Error::msg(err.to_string()))?;
     let manifest = manifest_loader.manifest();
-    let logging = manifest.logging_or_default(edgezero_core::app::FASTLY_ADAPTER);
+    let logging = manifest.logging_or_default(FASTLY_ADAPTER);
     // Two-path resolution: `A::config_store()` is set at compile time by the
     // `#[app]` macro and is the common case. The manifest fallback handles
     // callers that implement `Hooks` manually without the macro — in that case
     // `A::config_store()` returns `None` while `[stores.config]` in
     // `edgezero.toml` may still be present.
     let config_name = A::config_store()
-        .map(|cfg| {
-            cfg.name_for_adapter(edgezero_core::app::FASTLY_ADAPTER)
-                .to_owned()
-        })
+        .map(|cfg| cfg.name_for_adapter(FASTLY_ADAPTER).to_owned())
         .or_else(|| {
-            manifest.stores.config.as_ref().map(|cfg| {
-                cfg.config_store_name(edgezero_core::app::FASTLY_ADAPTER)
-                    .to_owned()
-            })
+            manifest
+                .stores
+                .config
+                .as_ref()
+                .map(|cfg| cfg.config_store_name(FASTLY_ADAPTER).to_owned())
         });
-    let kv_name = manifest
-        .kv_store_name(edgezero_core::app::FASTLY_ADAPTER)
-        .to_owned();
+    let kv_name = manifest.kv_store_name(FASTLY_ADAPTER).to_owned();
     let requirements = StoreRequirements {
         kv_required: manifest.stores.kv.is_some(),
         secrets_required: manifest.secret_store_enabled("fastly"),
@@ -158,7 +159,7 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
 /// # Errors
 /// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
-pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
+pub fn run_app_with_config<A: Hooks>(
     logging: FastlyLogging,
     req: fastly::Request,
     config_store_name: Option<&str>,
@@ -177,7 +178,7 @@ pub fn run_app_with_config<A: edgezero_core::app::Hooks>(
 /// # Errors
 /// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
-pub fn run_app_with_logging<A: edgezero_core::app::Hooks>(
+pub fn run_app_with_logging<A: Hooks>(
     logging: FastlyLogging,
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
@@ -202,7 +203,7 @@ struct StoreRequirements {
 }
 
 #[cfg(feature = "fastly")]
-fn run_app_with_stores<A: edgezero_core::app::Hooks>(
+fn run_app_with_stores<A: Hooks>(
     logging: &FastlyLogging,
     req: fastly::Request,
     config_store_name: Option<&str>,

@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -147,7 +148,7 @@ struct AxumProject {
 }
 
 fn locate_project() -> Result<AxumProject, String> {
-    let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+    let cwd = env::current_dir().map_err(|err| err.to_string())?;
     let manifest = find_axum_manifest(&cwd)?;
     read_axum_project(&manifest)
 }
@@ -250,7 +251,7 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
                     .to_owned()
             })
         },
-        std::string::ToString::to_string,
+        ToString::to_string,
     );
 
     let port = match adapter.get("port").and_then(Value::as_integer) {

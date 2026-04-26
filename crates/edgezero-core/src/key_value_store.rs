@@ -606,7 +606,7 @@ macro_rules! key_value_store_contract_tests {
             use $crate::key_value_store::KvStore;
 
             fn run<F: std::future::Future>(f: F) -> F::Output {
-                futures::executor::block_on(f)
+                ::futures::executor::block_on(f)
             }
 
             #[test]
@@ -809,6 +809,7 @@ macro_rules! key_value_store_contract_tests {
 mod tests {
     use super::*;
     use crate::http::StatusCode;
+    use futures::executor::block_on;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -901,7 +902,7 @@ mod tests {
     #[test]
     fn raw_bytes_roundtrip() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put_bytes("k", Bytes::from("hello")).await.unwrap();
             assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
         });
@@ -910,7 +911,7 @@ mod tests {
     #[test]
     fn raw_bytes_missing_key_returns_none() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             assert_eq!(h.get_bytes("missing").await.unwrap(), None);
         });
     }
@@ -918,7 +919,7 @@ mod tests {
     #[test]
     fn raw_bytes_overwrite() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put_bytes("k", Bytes::from("a")).await.unwrap();
             h.put_bytes("k", Bytes::from("b")).await.unwrap();
             assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("b")));
@@ -935,7 +936,7 @@ mod tests {
     #[test]
     fn typed_get_put_roundtrip() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let data = Counter { count: 42 };
             h.put("counter", &data).await.unwrap();
             let out: Option<Counter> = h.get("counter").await.unwrap();
@@ -946,7 +947,7 @@ mod tests {
     #[test]
     fn typed_get_missing_returns_none() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let out: Option<Counter> = h.get("nope").await.unwrap();
             assert_eq!(out, None);
         });
@@ -955,7 +956,7 @@ mod tests {
     #[test]
     fn typed_get_or_returns_default() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let count: i32 = h.get_or("visits", 0_i32).await.unwrap();
             assert_eq!(count, 0_i32);
         });
@@ -964,7 +965,7 @@ mod tests {
     #[test]
     fn typed_get_or_returns_existing() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put("visits", &99_i32).await.unwrap();
             let count: i32 = h.get_or("visits", 0_i32).await.unwrap();
             assert_eq!(count, 99_i32);
@@ -974,7 +975,7 @@ mod tests {
     #[test]
     fn typed_get_bad_json_returns_serialization_error() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put_bytes("bad", Bytes::from("not json")).await.unwrap();
             let err = h.get::<Counter>("bad").await.unwrap_err();
             assert!(matches!(err, KvError::Serialization(_)));
@@ -986,7 +987,7 @@ mod tests {
     #[test]
     fn update_increments_counter() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put("c", &0_i32).await.unwrap();
             let after_first = h
                 .read_modify_write("c", 0_i32, |n| n + 1_i32)
@@ -1004,7 +1005,7 @@ mod tests {
     #[test]
     fn update_uses_default_when_missing() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let val = h
                 .read_modify_write("new", 10_i32, |n| n * 2_i32)
                 .await
@@ -1018,7 +1019,7 @@ mod tests {
     #[test]
     fn exists_returns_false_for_missing() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             assert!(!h.exists("nope").await.unwrap());
         });
     }
@@ -1026,7 +1027,7 @@ mod tests {
     #[test]
     fn exists_returns_true_for_present() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put_bytes("k", Bytes::from("v")).await.unwrap();
             assert!(h.exists("k").await.unwrap());
         });
@@ -1037,7 +1038,7 @@ mod tests {
     #[test]
     fn delete_removes_key() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put_bytes("k", Bytes::from("v")).await.unwrap();
             h.delete("k").await.unwrap();
             assert_eq!(h.get_bytes("k").await.unwrap(), None);
@@ -1047,7 +1048,7 @@ mod tests {
     #[test]
     fn delete_missing_key_is_ok() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.delete("nope").await.unwrap();
         });
     }
@@ -1055,7 +1056,7 @@ mod tests {
     #[test]
     fn list_keys_page_roundtrip() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put("app/a", &1_i32).await.unwrap();
             h.put("app/b", &2_i32).await.unwrap();
             h.put("app/c", &3_i32).await.unwrap();
@@ -1080,7 +1081,7 @@ mod tests {
     #[test]
     fn put_with_ttl_stores_value() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put_with_ttl("session", &"token123", Duration::from_secs(60))
                 .await
                 .unwrap();
@@ -1120,7 +1121,7 @@ mod tests {
     fn handle_is_cloneable_and_shares_state() {
         let h1 = handle();
         let h2 = h1.clone();
-        futures::executor::block_on(async {
+        block_on(async {
             h1.put("shared", &42_i32).await.unwrap();
             let val: i32 = h2.get_or("shared", 0_i32).await.unwrap();
             assert_eq!(val, 42_i32);
@@ -1132,7 +1133,7 @@ mod tests {
     #[test]
     fn empty_key_rejected() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h.put("", &"empty key").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("cannot be empty"));
@@ -1145,7 +1146,7 @@ mod tests {
         // file stays ASCII-only. The runtime bytes are identical.
         const JAPANESE_KEY: &str = "\u{65E5}\u{672C}\u{8A9E}\u{30AD}\u{30FC}";
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put(JAPANESE_KEY, &"value").await.unwrap();
             let val: Option<String> = h.get(JAPANESE_KEY).await.unwrap();
             assert_eq!(val, Some("value".to_owned()));
@@ -1155,7 +1156,7 @@ mod tests {
     #[test]
     fn large_value_roundtrip() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let large = "x".repeat(1_000_000); // 1MB string
             h.put("big", &large).await.unwrap();
             let val: Option<String> = h.get("big").await.unwrap();
@@ -1166,7 +1167,7 @@ mod tests {
     #[test]
     fn put_with_ttl_typed_helper() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let data = Counter { count: 7_i32 };
             h.put_with_ttl("ttl_key", &data, Duration::from_secs(600))
                 .await
@@ -1179,7 +1180,7 @@ mod tests {
     #[test]
     fn get_or_with_complex_default() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let default = Counter { count: 100_i32 };
             let val: Counter = h.get_or("missing_struct", default).await.unwrap();
             assert_eq!(val.count, 100_i32);
@@ -1189,7 +1190,7 @@ mod tests {
     #[test]
     fn update_with_struct() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let after_first = h
                 .read_modify_write("counter_struct", Counter { count: 0_i32 }, |mut c| {
                     c.count += 10_i32;
@@ -1231,7 +1232,7 @@ mod tests {
     #[test]
     fn validation_rejects_long_keys() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let long_key = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
             let err = h.get::<i32>(&long_key).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
@@ -1242,7 +1243,7 @@ mod tests {
     #[test]
     fn validation_rejects_dot_keys() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let single_dot_err = h.get::<i32>(".").await.unwrap_err();
             assert!(matches!(single_dot_err, KvError::Validation(_)));
             assert!(format!("{single_dot_err}").contains("cannot be exactly"));
@@ -1256,7 +1257,7 @@ mod tests {
     #[test]
     fn validation_rejects_control_chars() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h.get::<i32>("key\nwith\nnewline").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("control characters"));
@@ -1266,7 +1267,7 @@ mod tests {
     #[test]
     fn validation_rejects_large_values() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let large_val = vec![0_u8; KvHandle::MAX_VALUE_SIZE + 1];
             let err = h
                 .put_bytes("large", Bytes::from(large_val))
@@ -1280,7 +1281,7 @@ mod tests {
     #[test]
     fn validation_rejects_short_ttl() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h
                 .put_with_ttl("short", &"val", Duration::from_secs(10))
                 .await
@@ -1293,7 +1294,7 @@ mod tests {
     #[test]
     fn validation_rejects_long_ttl() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h
                 .put_with_ttl("long", &"val", KvHandle::MAX_TTL + Duration::from_secs(1))
                 .await
@@ -1306,7 +1307,7 @@ mod tests {
     #[test]
     fn validation_rejects_zero_list_limit() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h.list_keys_page("", None, 0).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("greater than zero"));
@@ -1316,7 +1317,7 @@ mod tests {
     #[test]
     fn validation_rejects_large_list_limit() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h
                 .list_keys_page("", None, KvHandle::MAX_LIST_PAGE_SIZE + 1)
                 .await
@@ -1329,7 +1330,7 @@ mod tests {
     #[test]
     fn validation_rejects_long_prefix() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let prefix = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
             let err = h.list_keys_page(&prefix, None, 1).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
@@ -1340,7 +1341,7 @@ mod tests {
     #[test]
     fn validation_rejects_control_chars_in_prefix() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h.list_keys_page("bad\nprefix", None, 1).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("control characters"));
@@ -1350,7 +1351,7 @@ mod tests {
     #[test]
     fn validation_rejects_malformed_list_cursor() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             let err = h
                 .list_keys_page("app/", Some("not-json"), 1)
                 .await
@@ -1363,7 +1364,7 @@ mod tests {
     #[test]
     fn validation_rejects_cursor_for_different_prefix() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put("app/a", &1_i32).await.unwrap();
             h.put("app/b", &2_i32).await.unwrap();
 
@@ -1380,7 +1381,7 @@ mod tests {
     #[test]
     fn exists_returns_false_after_delete() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put_bytes("ephemeral", Bytes::from("v")).await.unwrap();
             assert!(h.exists("ephemeral").await.unwrap());
             h.delete("ephemeral").await.unwrap();
@@ -1391,7 +1392,7 @@ mod tests {
     #[test]
     fn put_overwrite_changes_type() {
         let h = handle();
-        futures::executor::block_on(async {
+        block_on(async {
             h.put("flex", &42_i32).await.unwrap();
             let int_val: i32 = h.get_or("flex", 0_i32).await.unwrap();
             assert_eq!(int_val, 42_i32);
