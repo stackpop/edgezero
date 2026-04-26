@@ -57,7 +57,6 @@ implicit_return = "allow"
 question_mark_used = "allow"
 single_call_fn = "allow"
 separated_literal_suffix = "allow"
-arbitrary_source_item_ordering = "allow"
 
 # API design — `exhaustive_structs` fires once on the unit struct generated
 # by the `app!` macro.
