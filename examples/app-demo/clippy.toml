@@ -1,8 +1,8 @@
 # Clippy configuration. See https://doc.rust-lang.org/clippy/lint_configuration.html
 #
 # Test code uses `.unwrap()`, `.expect()`, `panic!`, `assert!`, indexing, and
-# other "if-this-fails-the-test-fails" idioms by convention. We keep the
-# corresponding restriction lints active in production code but exempt tests.
+# other "if-this-fails-the-test-fails" idioms by convention. Mirror the main
+# workspace and exempt tests from the corresponding restriction lints.
 allow-expect-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-panic-in-tests = true
