@@ -279,8 +279,8 @@ struct RouterInner {
     route_index: Arc<[RouteInfo]>,
 }
 
-enum RouteMatch<'a> {
-    Found(&'a RouteEntry, PathParams),
+enum RouteMatch<'route> {
+    Found(&'route RouteEntry, PathParams),
     MethodNotAllowed(Vec<Method>),
     NotFound,
 }

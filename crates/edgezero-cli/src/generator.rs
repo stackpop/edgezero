@@ -53,8 +53,8 @@ impl GeneratorError {
     }
 }
 
-struct AdapterContext<'a> {
-    blueprint: &'a AdapterBlueprint,
+struct AdapterContext<'blueprint> {
+    blueprint: &'blueprint AdapterBlueprint,
     dir: PathBuf,
     data_entries: Vec<(String, String)>,
 }
