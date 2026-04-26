@@ -1,5 +1,12 @@
 //! Adapter helpers for Spin (Fermyon).
 
+#![expect(
+    clippy::pub_use,
+    reason = "the adapter's public API is `pub use`-exported from private modules; the lint is \
+              module-scoped, so a file-level `expect` covers the small fixed set of re-exports \
+              below"
+)]
+
 #[cfg(feature = "cli")]
 pub mod cli;
 

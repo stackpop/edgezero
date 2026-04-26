@@ -1,5 +1,13 @@
 //! Core primitives for building portable edge workloads across edge adapters.
 
+#![expect(
+    clippy::pub_use,
+    reason = "proc-macros must be re-exported through the parent crate so downstream users depend \
+              only on edgezero-core (not edgezero-macros); the `pub_use` lint is module-scoped and \
+              cannot be silenced per-item, so this file-level `expect` covers the single re-export \
+              line below"
+)]
+
 pub mod app;
 pub mod body;
 pub mod compression;

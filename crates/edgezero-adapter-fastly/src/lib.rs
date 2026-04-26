@@ -1,6 +1,13 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
+#![expect(
+    clippy::pub_use,
+    reason = "the adapter's public API is `pub use`-exported from private modules; the lint is \
+              module-scoped, so a file-level `expect` covers the small fixed set of re-exports \
+              below"
+)]
+
 #[cfg(feature = "fastly")]
 use edgezero_core::app::{Hooks, FASTLY_ADAPTER};
 #[cfg(feature = "fastly")]
