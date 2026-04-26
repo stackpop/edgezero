@@ -6,11 +6,11 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
-use edgezero_adapter::{register_adapter, Adapter, AdapterAction};
 use walkdir::WalkDir;
 
 const TARGET_TRIPLE: &str = "wasm32-unknown-unknown";
@@ -236,6 +236,7 @@ impl Adapter for CloudflareCliAdapter {
             }),
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
+            other => Err(format!("cloudflare adapter does not support {other:?}")),
         }
     }
 }

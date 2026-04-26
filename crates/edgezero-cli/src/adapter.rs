@@ -1,4 +1,4 @@
-use edgezero_adapter::{self as adapter_registry, AdapterAction};
+use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::path::Path;

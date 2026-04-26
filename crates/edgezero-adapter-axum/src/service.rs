@@ -26,6 +26,7 @@ pub struct EdgeZeroAxumService {
 }
 
 impl EdgeZeroAxumService {
+    #[must_use]
     pub fn new(router: RouterService) -> Self {
         Self {
             router,

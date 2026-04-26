@@ -7,11 +7,36 @@ use std::sync::Arc;
 use std::{env, fs, io};
 use validator::{Validate, ValidationError};
 
+pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
+/// Default KV store / binding name used when `[stores.kv]` is omitted.
+pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
+/// Default secret store / binding name used when `[stores.secrets]` is omitted.
+pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
+const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
+
 pub struct ManifestLoader {
     manifest: Arc<Manifest>,
 }
 
 impl ManifestLoader {
+    /// # Errors
+    /// Returns an [`io::Error`] if `path` cannot be read, or the file content cannot be parsed/validated as an `EdgeZero` manifest.
+    pub fn from_path(path: &Path) -> Result<Self, io::Error> {
+        let contents = fs::read_to_string(path)?;
+        let mut manifest: Manifest = toml::from_str(&contents)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let cwd = env::current_dir()?;
+        let root_path = resolve_root_path(path, &cwd);
+        manifest.root = Some(root_path);
+        manifest
+            .validate()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        manifest.finalize();
+        Ok(Self {
+            manifest: Arc::new(manifest),
+        })
+    }
+
     /// Loads a manifest from a static, compile-time-embedded TOML string
     /// (typically `include_str!("edgezero.toml")` inside an adapter binary).
     ///
@@ -33,6 +58,11 @@ impl ManifestLoader {
         Self::try_load_from_str(contents).unwrap_or_else(|err| panic!("invalid manifest: {err}"))
     }
 
+    #[must_use]
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
     /// # Errors
     /// Returns an [`io::Error`] if `contents` is not valid TOML or fails manifest validation.
     pub fn try_load_from_str(contents: &str) -> Result<Self, io::Error> {
@@ -46,41 +76,7 @@ impl ManifestLoader {
             manifest: Arc::new(manifest),
         })
     }
-
-    /// # Errors
-    /// Returns an [`io::Error`] if `path` cannot be read, or the file content cannot be parsed/validated as an `EdgeZero` manifest.
-    pub fn from_path(path: &Path) -> Result<Self, io::Error> {
-        let contents = fs::read_to_string(path)?;
-        let mut manifest: Manifest = toml::from_str(&contents)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let cwd = env::current_dir()?;
-        let root_path = resolve_root_path(path, &cwd);
-        manifest.root = Some(root_path);
-        manifest
-            .validate()
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-        manifest.finalize();
-        Ok(Self {
-            manifest: Arc::new(manifest),
-        })
-    }
-
-    pub fn manifest(&self) -> &Manifest {
-        &self.manifest
-    }
 }
-
-fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
-    match path.parent() {
-        Some(parent) if parent.as_os_str().is_empty() => cwd.to_path_buf(),
-        Some(parent) if parent.is_relative() => cwd.join(parent),
-        Some(parent) => parent.to_path_buf(),
-        None => cwd.to_path_buf(),
-    }
-}
-
-pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
-const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
 
 #[derive(Debug, Deserialize, Validate)]
 #[expect(
@@ -90,39 +86,32 @@ const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly
 pub struct Manifest {
     #[serde(default)]
     #[validate(nested)]
-    pub app: ManifestApp,
+    pub adapters: BTreeMap<String, ManifestAdapter>,
     #[serde(default)]
     #[validate(nested)]
-    pub triggers: ManifestTriggers,
+    pub app: ManifestApp,
     #[serde(default)]
     #[validate(nested)]
     pub environment: ManifestEnvironment,
     #[serde(default)]
     #[validate(nested)]
+    pub logging: ManifestLogging,
+    #[serde(skip)]
+    logging_resolved: BTreeMap<String, ResolvedLoggingConfig>,
+    #[serde(skip)]
+    root: Option<PathBuf>,
+    #[serde(default)]
+    #[validate(nested)]
     pub stores: ManifestStores,
     #[serde(default)]
     #[validate(nested)]
-    pub adapters: BTreeMap<String, ManifestAdapter>,
-    #[serde(default)]
-    #[validate(nested)]
-    pub logging: ManifestLogging,
-    #[serde(skip)]
-    root: Option<PathBuf>,
-    #[serde(skip)]
-    logging_resolved: BTreeMap<String, ResolvedLoggingConfig>,
+    pub triggers: ManifestTriggers,
 }
 
 impl Manifest {
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
-    }
-
-    pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
-        self.logging_resolved.get(adapter)
-    }
-
-    pub fn logging_or_default(&self, adapter: &str) -> ResolvedLoggingConfig {
-        self.logging_for(adapter).cloned().unwrap_or_default()
+    #[must_use]
+    pub fn environment(&self) -> &ManifestEnvironment {
+        &self.environment
     }
 
     pub fn environment_for(&self, adapter: &str) -> ResolvedEnvironment {
@@ -144,77 +133,7 @@ impl Manifest {
             .map(ResolvedEnvironmentBinding::from_manifest)
             .collect();
 
-        ResolvedEnvironment { variables, secrets }
-    }
-
-    pub fn environment(&self) -> &ManifestEnvironment {
-        &self.environment
-    }
-
-    /// Returns the KV store name for a given adapter.
-    ///
-    /// Resolution order:
-    /// 1. Per-adapter override (`[stores.kv.adapters.<adapter>]`)
-    /// 2. Global name (`[stores.kv] name = "..."`)
-    /// 3. Default: `"EDGEZERO_KV"`
-    pub fn kv_store_name(&self, adapter: &str) -> &str {
-        match &self.stores.kv {
-            Some(kv) => {
-                let adapter_lower = adapter.to_ascii_lowercase();
-                if let Some(adapter_cfg) = kv
-                    .adapters
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
-                {
-                    return &adapter_cfg.1.name;
-                }
-                &kv.name
-            }
-            None => DEFAULT_KV_STORE_NAME,
-        }
-    }
-
-    /// Returns the secret store name for a given adapter.
-    ///
-    /// Resolution order:
-    /// 1. Per-adapter override (`[stores.secrets.adapters.<adapter>]`)
-    /// 2. Global name (`[stores.secrets] name = "..."`)
-    /// 3. Default: `"EDGEZERO_SECRETS"`
-    pub fn secret_store_name(&self, adapter: &str) -> &str {
-        match &self.stores.secrets {
-            Some(secrets) => {
-                let adapter_lower = adapter.to_ascii_lowercase();
-                if let Some(adapter_cfg) = secrets
-                    .adapters
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
-                {
-                    if let Some(name) = adapter_cfg.1.name.as_deref() {
-                        return name;
-                    }
-                }
-                &secrets.name
-            }
-            None => DEFAULT_SECRET_STORE_NAME,
-        }
-    }
-
-    /// Returns whether the secret store should be attached for a given adapter.
-    pub fn secret_store_enabled(&self, adapter: &str) -> bool {
-        match &self.stores.secrets {
-            Some(secrets) => {
-                let adapter_lower = adapter.to_ascii_lowercase();
-                if let Some(adapter_cfg) = secrets
-                    .adapters
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
-                {
-                    return adapter_cfg.1.enabled;
-                }
-                secrets.enabled
-            }
-            None => false,
-        }
+        ResolvedEnvironment { secrets, variables }
     }
 
     pub(crate) fn finalize(&mut self) {
@@ -237,6 +156,84 @@ impl Manifest {
 
         self.logging_resolved = resolved;
     }
+
+    /// Returns the KV store name for a given adapter.
+    ///
+    /// Resolution order:
+    /// 1. Per-adapter override (`[stores.kv.adapters.<adapter>]`)
+    /// 2. Global name (`[stores.kv] name = "..."`)
+    /// 3. Default: `"EDGEZERO_KV"`
+    #[must_use]
+    pub fn kv_store_name(&self, adapter: &str) -> &str {
+        let Some(kv) = self.stores.kv.as_ref() else {
+            return DEFAULT_KV_STORE_NAME;
+        };
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(adapter_cfg) = kv
+            .adapters
+            .iter()
+            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
+        {
+            return &adapter_cfg.1.name;
+        }
+        &kv.name
+    }
+
+    #[must_use]
+    pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
+        self.logging_resolved.get(adapter)
+    }
+
+    #[must_use]
+    pub fn logging_or_default(&self, adapter: &str) -> ResolvedLoggingConfig {
+        self.logging_for(adapter).cloned().unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// Returns whether the secret store should be attached for a given adapter.
+    #[must_use]
+    pub fn secret_store_enabled(&self, adapter: &str) -> bool {
+        let Some(secrets) = self.stores.secrets.as_ref() else {
+            return false;
+        };
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(adapter_cfg) = secrets
+            .adapters
+            .iter()
+            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
+        {
+            return adapter_cfg.1.enabled;
+        }
+        secrets.enabled
+    }
+
+    /// Returns the secret store name for a given adapter.
+    ///
+    /// Resolution order:
+    /// 1. Per-adapter override (`[stores.secrets.adapters.<adapter>]`)
+    /// 2. Global name (`[stores.secrets] name = "..."`)
+    /// 3. Default: `"EDGEZERO_SECRETS"`
+    #[must_use]
+    pub fn secret_store_name(&self, adapter: &str) -> &str {
+        let Some(secrets) = self.stores.secrets.as_ref() else {
+            return DEFAULT_SECRET_STORE_NAME;
+        };
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(adapter_cfg) = secrets
+            .adapters
+            .iter()
+            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
+        {
+            if let Some(name) = adapter_cfg.1.name.as_deref() {
+                return name;
+            }
+        }
+        &secrets.name
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -244,12 +241,12 @@ impl Manifest {
 pub struct ManifestApp {
     #[serde(default)]
     #[validate(length(min = 1_u64))]
-    pub name: Option<String>,
-    #[serde(default)]
-    #[validate(length(min = 1_u64))]
     pub entry: Option<String>,
     #[serde(default)]
     pub middleware: Vec<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -264,23 +261,23 @@ pub struct ManifestTriggers {
 #[non_exhaustive]
 pub struct ManifestHttpTrigger {
     #[serde(default)]
+    pub adapters: Vec<String>,
+    #[serde(rename = "body-mode")]
+    #[serde(default)]
+    pub body_mode: Option<BodyMode>,
+    #[serde(default)]
     #[validate(length(min = 1_u64))]
-    pub id: Option<String>,
-    #[validate(length(min = 1_u64))]
-    pub path: String,
+    pub description: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub handler: Option<String>,
     #[serde(default)]
-    pub methods: Vec<HttpMethod>,
-    #[serde(default)]
-    pub adapters: Vec<String>,
-    #[serde(default)]
     #[validate(length(min = 1_u64))]
-    pub description: Option<String>,
-    #[serde(rename = "body-mode")]
+    pub id: Option<String>,
     #[serde(default)]
-    pub body_mode: Option<BodyMode>,
+    pub methods: Vec<HttpMethod>,
+    #[validate(length(min = 1_u64))]
+    pub path: String,
 }
 
 impl ManifestHttpTrigger {
@@ -288,7 +285,11 @@ impl ManifestHttpTrigger {
         if self.methods.is_empty() {
             vec!["GET"]
         } else {
-            self.methods.iter().map(HttpMethod::as_str).collect()
+            self.methods
+                .iter()
+                .copied()
+                .map(HttpMethod::as_str)
+                .collect()
         }
     }
 }
@@ -298,25 +299,25 @@ impl ManifestHttpTrigger {
 pub struct ManifestEnvironment {
     #[serde(default)]
     #[validate(nested)]
-    pub variables: Vec<ManifestBinding>,
+    pub secrets: Vec<ManifestBinding>,
     #[serde(default)]
     #[validate(nested)]
-    pub secrets: Vec<ManifestBinding>,
+    pub variables: Vec<ManifestBinding>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestBinding {
-    #[validate(length(min = 1_u64))]
-    pub name: String,
-    #[serde(default)]
-    #[validate(length(min = 1_u64))]
-    pub description: Option<String>,
     #[serde(default)]
     pub adapters: Vec<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
+    pub description: Option<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
     pub env: Option<String>,
+    #[validate(length(min = 1_u64))]
+    pub name: String,
     #[serde(default)]
     pub value: Option<String>,
 }
@@ -349,16 +350,16 @@ impl ResolvedEnvironmentBinding {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedEnvironmentBinding {
-    pub name: String,
     pub description: Option<String>,
     pub env: String,
+    pub name: String,
     pub value: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedEnvironment {
-    pub variables: Vec<ResolvedEnvironmentBinding>,
     pub secrets: Vec<ResolvedEnvironmentBinding>,
+    pub variables: Vec<ResolvedEnvironmentBinding>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -394,13 +395,13 @@ pub struct ManifestAdapterDefinition {
 #[non_exhaustive]
 pub struct ManifestAdapterBuild {
     #[serde(default)]
-    #[validate(length(min = 1_u64))]
-    pub target: Option<String>,
+    pub features: Vec<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub profile: Option<String>,
     #[serde(default)]
-    pub features: Vec<String>,
+    #[validate(length(min = 1_u64))]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -411,10 +412,10 @@ pub struct ManifestAdapterCommands {
     pub build: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
-    pub serve: Option<String>,
+    pub deploy: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
-    pub deploy: Option<String>,
+    pub serve: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -440,10 +441,6 @@ pub struct ManifestStores {
 #[derive(Debug, Deserialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestConfigStoreConfig {
-    /// Global store/binding name used when no adapter-specific override is set.
-    #[serde(default)]
-    #[validate(length(min = 1_u64))]
-    pub name: Option<String>,
     /// Per-adapter name overrides, keyed by supported lowercase adapter name
     /// (`axum`, `cloudflare`, or `fastly`).
     #[serde(default)]
@@ -453,6 +450,10 @@ pub struct ManifestConfigStoreConfig {
     /// Optional default values used for local dev (Axum adapter).
     #[serde(default)]
     pub defaults: BTreeMap<String, String>,
+    /// Global store/binding name used when no adapter-specific override is set.
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub name: Option<String>,
 }
 
 /// `[stores.config.adapters.<adapter>]` override.
@@ -463,65 +464,26 @@ pub struct ManifestConfigAdapterConfig {
     pub name: String,
 }
 
-fn validate_config_store_adapter_keys(
-    adapters: &BTreeMap<String, ManifestConfigAdapterConfig>,
-) -> Result<(), ValidationError> {
-    let mixed_case_keys = adapters
-        .keys()
-        .filter(|key| key.as_str() != key.to_ascii_lowercase())
-        .cloned()
-        .collect::<Vec<_>>();
-    if !mixed_case_keys.is_empty() {
-        let mut error = ValidationError::new("config_store_adapter_keys_lowercase");
-        error.message = Some(
-            format!(
-                "config store adapter override keys must be lowercase: {}",
-                mixed_case_keys.join(", ")
-            )
-            .into(),
-        );
-        return Err(error);
-    }
-
-    let unknown_keys = adapters
-        .keys()
-        .filter(|key| !SUPPORTED_CONFIG_STORE_ADAPTERS.contains(&key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if unknown_keys.is_empty() {
-        return Ok(());
-    }
-
-    let mut error = ValidationError::new("config_store_adapter_keys_known");
-    error.message = Some(
-        format!(
-            "config store adapter override keys must match supported adapters ({}): {}",
-            SUPPORTED_CONFIG_STORE_ADAPTERS.join(", "),
-            unknown_keys.join(", ")
-        )
-        .into(),
-    );
-    Err(error)
-}
-
 impl ManifestConfigStoreConfig {
+    /// Access the default key-value pairs for local dev.
+    #[must_use]
+    pub fn config_store_defaults(&self) -> &BTreeMap<String, String> {
+        &self.defaults
+    }
+
     /// Resolve the config store name for a given adapter.
     ///
     /// Priority: adapter override → global name → `DEFAULT_CONFIG_STORE_NAME`.
+    #[must_use]
     pub fn config_store_name(&self, adapter: &str) -> &str {
         let adapter_lower = adapter.to_ascii_lowercase();
         if let Some(override_cfg) = self.adapters.get(&adapter_lower) {
             return &override_cfg.name;
         }
-        if let Some(name) = &self.name {
-            return name.as_str();
+        if let Some(name) = self.name.as_deref() {
+            return name;
         }
         DEFAULT_CONFIG_STORE_NAME
-    }
-
-    /// Access the default key-value pairs for local dev.
-    pub fn config_store_defaults(&self) -> &BTreeMap<String, String> {
-        &self.defaults
     }
 }
 
@@ -541,19 +503,19 @@ pub struct ManifestLogging {
 #[non_exhaustive]
 pub struct ManifestLoggingConfig {
     #[serde(default)]
-    pub level: Option<LogLevel>,
+    pub echo_stdout: Option<bool>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub endpoint: Option<String>,
     #[serde(default)]
-    pub echo_stdout: Option<bool>,
+    pub level: Option<LogLevel>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedLoggingConfig {
-    pub level: LogLevel,
-    pub endpoint: Option<String>,
     pub echo_stdout: Option<bool>,
+    pub endpoint: Option<String>,
+    pub level: LogLevel,
 }
 
 impl Default for ResolvedLoggingConfig {
@@ -572,7 +534,7 @@ impl ResolvedLoggingConfig {
         if let Some(level) = cfg.level {
             resolved.level = level;
         }
-        if let Some(endpoint) = &cfg.endpoint {
+        if let Some(endpoint) = cfg.endpoint.as_ref() {
             resolved.endpoint = Some(endpoint.clone());
         }
         if let Some(echo_stdout) = cfg.echo_stdout {
@@ -588,37 +550,19 @@ impl ManifestLoggingConfig {
     }
 }
 
-/// Default KV store / binding name used when `[stores.kv]` is omitted.
-pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
-
-fn default_kv_name() -> String {
-    DEFAULT_KV_STORE_NAME.to_owned()
-}
-
-/// Default secret store / binding name used when `[stores.secrets]` is omitted.
-pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
-
-fn default_secret_name() -> String {
-    DEFAULT_SECRET_STORE_NAME.to_owned()
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
 /// Global KV store configuration.
 #[derive(Debug, Deserialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestKvConfig {
-    /// Store / binding name (default: `"EDGEZERO_KV"`).
-    #[serde(default = "default_kv_name")]
-    #[validate(length(min = 1_u64))]
-    pub name: String,
-
     /// Per-adapter name overrides.
     #[serde(default)]
     #[validate(nested)]
     pub adapters: BTreeMap<String, ManifestKvAdapterConfig>,
+
+    /// Store / binding name (default: `"EDGEZERO_KV"`).
+    #[serde(default = "default_kv_name")]
+    #[validate(length(min = 1_u64))]
+    pub name: String,
 }
 
 /// Per-adapter KV binding / store name override.
@@ -633,6 +577,11 @@ pub struct ManifestKvAdapterConfig {
 #[derive(Debug, Deserialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestSecretsConfig {
+    /// Per-adapter name overrides.
+    #[serde(default)]
+    #[validate(nested)]
+    pub adapters: BTreeMap<String, ManifestSecretsAdapterConfig>,
+
     /// Whether the secret store is enabled for adapters without overrides.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -641,11 +590,6 @@ pub struct ManifestSecretsConfig {
     #[serde(default = "default_secret_name")]
     #[validate(length(min = 1_u64))]
     pub name: String,
-
-    /// Per-adapter name overrides.
-    #[serde(default)]
-    #[validate(nested)]
-    pub adapters: BTreeMap<String, ManifestSecretsAdapterConfig>,
 }
 
 /// Per-adapter secret store name override.
@@ -662,28 +606,29 @@ pub struct ManifestSecretsAdapterConfig {
     pub name: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum HttpMethod {
+    Delete,
     Get,
+    Head,
+    Options,
+    Patch,
     Post,
     Put,
-    Delete,
-    Patch,
-    Options,
-    Head,
 }
 
 impl HttpMethod {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
+            Self::Delete => "DELETE",
             Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Patch => "PATCH",
             Self::Post => "POST",
             Self::Put => "PUT",
-            Self::Delete => "DELETE",
-            Self::Patch => "PATCH",
-            Self::Options => "OPTIONS",
-            Self::Head => "HEAD",
         }
     }
 }
@@ -749,16 +694,17 @@ impl<'de> Deserialize<'de> for BodyMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 #[non_exhaustive]
 pub enum LogLevel {
-    Trace,
     Debug,
+    Error,
     #[default]
     Info,
-    Warn,
-    Error,
     Off,
+    Trace,
+    Warn,
 }
 
 impl LogLevel {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Trace => "trace",
@@ -810,6 +756,68 @@ impl<'de> Deserialize<'de> for LogLevel {
             ))),
         }
     }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_kv_name() -> String {
+    DEFAULT_KV_STORE_NAME.to_owned()
+}
+
+fn default_secret_name() -> String {
+    DEFAULT_SECRET_STORE_NAME.to_owned()
+}
+
+fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => cwd.to_path_buf(),
+        Some(parent) if parent.is_relative() => cwd.join(parent),
+        Some(parent) => parent.to_path_buf(),
+        None => cwd.to_path_buf(),
+    }
+}
+
+fn validate_config_store_adapter_keys(
+    adapters: &BTreeMap<String, ManifestConfigAdapterConfig>,
+) -> Result<(), ValidationError> {
+    let mixed_case_keys = adapters
+        .keys()
+        .filter(|key| key.as_str() != key.to_ascii_lowercase())
+        .cloned()
+        .collect::<Vec<_>>();
+    if !mixed_case_keys.is_empty() {
+        let mut error = ValidationError::new("config_store_adapter_keys_lowercase");
+        error.message = Some(
+            format!(
+                "config store adapter override keys must be lowercase: {}",
+                mixed_case_keys.join(", ")
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+
+    let unknown_keys = adapters
+        .keys()
+        .filter(|key| !SUPPORTED_CONFIG_STORE_ADAPTERS.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if unknown_keys.is_empty() {
+        return Ok(());
+    }
+
+    let mut error = ValidationError::new("config_store_adapter_keys_known");
+    error.message = Some(
+        format!(
+            "config store adapter override keys must match supported adapters ({}): {}",
+            SUPPORTED_CONFIG_STORE_ADAPTERS.join(", "),
+            unknown_keys.join(", ")
+        )
+        .into(),
+    );
+    Err(error)
 }
 
 #[cfg(test)]

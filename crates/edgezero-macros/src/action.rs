@@ -6,7 +6,7 @@ pub fn expand_action(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_action_impl(&attr.into(), item.into()).into()
 }
 
-pub(crate) fn expand_action_impl(
+fn expand_action_impl(
     attr: &proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {

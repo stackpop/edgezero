@@ -46,6 +46,7 @@ impl EdgeError {
         EdgeError::NotFound { path: path.into() }
     }
 
+    #[must_use]
     pub fn method_not_allowed(method: &Method, allowed: &[Method]) -> Self {
         let mut names = allowed
             .iter()
@@ -78,6 +79,7 @@ impl EdgeError {
         }
     }
 
+    #[must_use]
     pub fn status(&self) -> StatusCode {
         match self {
             EdgeError::BadRequest { .. } => StatusCode::BAD_REQUEST,
@@ -89,6 +91,7 @@ impl EdgeError {
         }
     }
 
+    #[must_use]
     pub fn message(&self) -> String {
         match self {
             EdgeError::BadRequest { message }
@@ -110,6 +113,7 @@ impl EdgeError {
         clippy::same_name_method,
         reason = "intentional: typed alternative to the trait-object Error::source"
     )]
+    #[must_use]
     pub fn source(&self) -> Option<&AnyError> {
         match self {
             EdgeError::Internal { source } => Some(source),

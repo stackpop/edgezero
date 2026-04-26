@@ -25,6 +25,7 @@ impl EnvOverride {
         Self { key, original }
     }
 
+    #[must_use]
     pub fn clear(key: &'static str) -> Self {
         let original = std::env::var_os(key);
         std::env::remove_var(key);

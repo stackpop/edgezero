@@ -9,6 +9,7 @@ pub struct PathParams {
 }
 
 impl PathParams {
+    #[must_use]
     pub fn new(inner: HashMap<String, String>) -> Self {
         Self { inner }
     }

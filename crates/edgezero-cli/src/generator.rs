@@ -106,8 +106,8 @@ struct AdapterArtifacts {
 /// # Errors
 /// Returns [`GeneratorError`] if any filesystem operation, template render,
 /// or layout invariant fails.
-pub fn generate_new(args: NewArgs) -> Result<(), GeneratorError> {
-    let layout = ProjectLayout::new(&args)?;
+pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
+    let layout = ProjectLayout::new(args)?;
 
     let mut workspace_dependencies = seed_workspace_dependencies();
     let cwd = std::env::current_dir().map_err(|e| GeneratorError::io(".", e))?;
@@ -636,7 +636,7 @@ mod tests {
             local_core: false,
         };
 
-        generate_new(args).expect("scaffold succeeds");
+        generate_new(&args).expect("scaffold succeeds");
 
         let project_dir = temp.path().join("demo-app");
         assert!(project_dir.is_dir(), "project directory created");

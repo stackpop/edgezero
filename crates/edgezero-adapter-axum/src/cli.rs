@@ -7,11 +7,11 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
-use edgezero_adapter::{register_adapter, Adapter, AdapterAction};
 use toml::Value;
 use walkdir::WalkDir;
 
@@ -112,6 +112,7 @@ impl Adapter for AxumCliAdapter {
             AdapterAction::Build => build(args),
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
+            other => Err(format!("axum adapter does not support {other:?}")),
         }
     }
 }

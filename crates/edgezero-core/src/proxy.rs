@@ -183,6 +183,7 @@ impl ProxyHandle {
         }
     }
 
+    #[must_use]
     pub fn client(&self) -> Arc<dyn ProxyClient> {
         Arc::clone(&self.client)
     }

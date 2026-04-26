@@ -17,6 +17,7 @@ pub enum Body {
 }
 
 impl Body {
+    #[must_use]
     pub fn empty() -> Self {
         Self::from_bytes(Bytes::new())
     }

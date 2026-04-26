@@ -1,3 +1,4 @@
+use crate::manifest_definitions::{Manifest, DEFAULT_CONFIG_STORE_NAME};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
@@ -8,21 +9,96 @@ use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Ident, LitStr, Token};
 use validator::Validate as _;
 
-// Many manifest fields exist for downstream consumers (CLI, runtime
-// adapters, etc.) but are unused inside the proc-macro itself, which only
-// reads enough of the structure to generate routing. Allow `dead_code` so
-// those fields don't trip warnings just because the macro doesn't touch them.
-#[allow(
-    dead_code,
-    reason = "macro-side reads only the routing-relevant fields"
-)]
-mod manifest_definitions {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../edgezero-core/src/manifest.rs"
-    ));
+struct AppArgs {
+    app_ident: Option<Ident>,
+    path: LitStr,
 }
-use manifest_definitions::{Manifest, DEFAULT_CONFIG_STORE_NAME};
+
+impl Parse for AppArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let path: LitStr = input.parse()?;
+        let app_ident = if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?;
+            Some(input.parse::<Ident>()?)
+        } else {
+            None
+        };
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after app! macro arguments"));
+        }
+        Ok(Self { app_ident, path })
+    }
+}
+
+fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
+    let Some(config) = manifest.stores.config.as_ref() else {
+        return quote! {};
+    };
+
+    let fallback_name = config.name.as_deref().unwrap_or(DEFAULT_CONFIG_STORE_NAME);
+    let fallback_name_lit = LitStr::new(fallback_name, Span::call_site());
+    let override_entries: Vec<_> = config
+        .adapters
+        .iter()
+        .map(|(adapter, cfg)| {
+            let adapter_lit = LitStr::new(adapter, Span::call_site());
+            let name_lit = LitStr::new(&cfg.name, Span::call_site());
+            quote! {
+                edgezero_core::app::ConfigStoreAdapterMetadata::new(#adapter_lit, #name_lit),
+            }
+        })
+        .collect();
+
+    quote! {
+        fn config_store() -> Option<&'static edgezero_core::app::ConfigStoreMetadata> {
+            static CONFIG_STORE: edgezero_core::app::ConfigStoreMetadata =
+                edgezero_core::app::ConfigStoreMetadata::new(
+                    #fallback_name_lit,
+                    &[
+                        #(#override_entries)*
+                    ],
+                );
+            Some(&CONFIG_STORE)
+        }
+    }
+}
+
+fn build_middleware_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
+    manifest
+        .app
+        .middleware
+        .iter()
+        .map(|middleware| {
+            let path = parse_handler_path(middleware);
+            quote! {
+                builder = builder.middleware(#path);
+            }
+        })
+        .collect()
+}
+
+fn build_route_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
+    manifest
+        .triggers
+        .http
+        .iter()
+        .filter_map(|trigger| {
+            let handler = trigger.handler.as_deref()?;
+            let handler_path = parse_handler_path(handler);
+            let path_lit = LitStr::new(&trigger.path, Span::call_site());
+
+            let methods = trigger.methods();
+
+            let mut tokens = Vec::new();
+            for method in methods {
+                let route_tokens = route_for_method(method, &path_lit, &handler_path);
+                tokens.push(route_tokens);
+            }
+            Some(tokens)
+        })
+        .flatten()
+        .collect()
+}
 
 pub fn expand_app(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as AppArgs);
@@ -89,94 +165,6 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     output.into()
 }
 
-/// Resolves the manifest path passed to `app!(...)` against the
-/// invoking crate's `CARGO_MANIFEST_DIR`.
-///
-/// `CARGO_MANIFEST_DIR` is unconditionally set by Cargo whenever a
-/// proc-macro runs against a normal crate, so the lookup cannot fail in
-/// practice. Treating it as fallible would require every caller of
-/// `app!(...)` to handle an outcome that has never been observed and
-/// cannot be triggered without bypassing Cargo entirely.
-#[expect(
-    clippy::expect_used,
-    reason = "CARGO_MANIFEST_DIR is a Cargo invariant during macro expansion; \
-              there is no realistic failure mode to propagate"
-)]
-fn resolve_manifest_path(relative: String) -> PathBuf {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR env var");
-    PathBuf::from(manifest_dir).join(relative)
-}
-
-fn build_route_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
-    manifest
-        .triggers
-        .http
-        .iter()
-        .filter_map(|trigger| {
-            let handler = trigger.handler.as_deref()?;
-            let handler_path = parse_handler_path(handler);
-            let path_lit = LitStr::new(&trigger.path, Span::call_site());
-
-            let methods = trigger.methods();
-
-            let mut tokens = Vec::new();
-            for method in methods {
-                let route_tokens = route_for_method(method, &path_lit, &handler_path);
-                tokens.push(route_tokens);
-            }
-            Some(tokens)
-        })
-        .flatten()
-        .collect()
-}
-
-fn build_middleware_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
-    manifest
-        .app
-        .middleware
-        .iter()
-        .map(|middleware| {
-            let path = parse_handler_path(middleware);
-            quote! {
-                builder = builder.middleware(#path);
-            }
-        })
-        .collect()
-}
-
-fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
-    let Some(config) = manifest.stores.config.as_ref() else {
-        return quote! {};
-    };
-
-    let fallback_name = config.name.as_deref().unwrap_or(DEFAULT_CONFIG_STORE_NAME);
-    let fallback_name_lit = LitStr::new(fallback_name, Span::call_site());
-    let override_entries: Vec<_> = config
-        .adapters
-        .iter()
-        .map(|(adapter, cfg)| {
-            let adapter_lit = LitStr::new(adapter, Span::call_site());
-            let name_lit = LitStr::new(&cfg.name, Span::call_site());
-            quote! {
-                edgezero_core::app::ConfigStoreAdapterMetadata::new(#adapter_lit, #name_lit),
-            }
-        })
-        .collect();
-
-    quote! {
-        fn config_store() -> Option<&'static edgezero_core::app::ConfigStoreMetadata> {
-            static CONFIG_STORE: edgezero_core::app::ConfigStoreMetadata =
-                edgezero_core::app::ConfigStoreMetadata::new(
-                    #fallback_name_lit,
-                    &[
-                        #(#override_entries)*
-                    ],
-                );
-            Some(&CONFIG_STORE)
-        }
-    }
-}
-
 /// Parses a handler reference like `crate::handlers::root` from `edgezero.toml`
 /// into the `syn::ExprPath` that the generated router code references.
 ///
@@ -214,6 +202,24 @@ fn parse_handler_path(handler: &str) -> syn::ExprPath {
         .unwrap_or_else(|err| panic!("invalid handler path `{handler}`: {err}"))
 }
 
+/// Resolves the manifest path passed to `app!(...)` against the
+/// invoking crate's `CARGO_MANIFEST_DIR`.
+///
+/// `CARGO_MANIFEST_DIR` is unconditionally set by Cargo whenever a
+/// proc-macro runs against a normal crate, so the lookup cannot fail in
+/// practice. Treating it as fallible would require every caller of
+/// `app!(...)` to handle an outcome that has never been observed and
+/// cannot be triggered without bypassing Cargo entirely.
+#[expect(
+    clippy::expect_used,
+    reason = "CARGO_MANIFEST_DIR is a Cargo invariant during macro expansion; \
+              there is no realistic failure mode to propagate"
+)]
+fn resolve_manifest_path(relative: String) -> PathBuf {
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR env var");
+    PathBuf::from(manifest_dir).join(relative)
+}
+
 fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> TokenStream2 {
     match method {
         "GET" => quote! { builder = builder.get(#path, #handler); },
@@ -231,26 +237,5 @@ fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> Tok
                 );
             }
         }
-    }
-}
-
-struct AppArgs {
-    path: LitStr,
-    app_ident: Option<Ident>,
-}
-
-impl Parse for AppArgs {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let path: LitStr = input.parse()?;
-        let app_ident = if input.peek(Token![,]) {
-            input.parse::<Token![,]>()?;
-            Some(input.parse::<Ident>()?)
-        } else {
-            None
-        };
-        if !input.is_empty() {
-            return Err(input.error("unexpected tokens after app! macro arguments"));
-        }
-        Ok(Self { path, app_ident })
     }
 }

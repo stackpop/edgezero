@@ -58,7 +58,7 @@ pub fn path_distance(left: &Path, right: &Path) -> usize {
     let common = left_components
         .iter()
         .zip(&right_components)
-        .take_while(|(lhs, rhs)| lhs == rhs)
+        .take_while(|&(lhs, rhs)| lhs == rhs)
         .count();
 
     left_components

@@ -1,5 +1,5 @@
 // Used by proxy.rs (wasm32-gated) and tests; not reachable on native non-test builds.
-#![expect(
+#![allow(
     dead_code,
     reason = "wasm32-gated callers; native non-test build has no consumer"
 )]
