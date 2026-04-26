@@ -373,11 +373,11 @@ impl KvHandle {
     }
 
     fn decode_list_cursor(prefix: &str, cursor: Option<&str>) -> Result<Option<String>, KvError> {
-        let Some(cursor) = cursor else {
+        let Some(encoded) = cursor else {
             return Ok(None);
         };
 
-        let envelope: KvCursorEnvelope = serde_json::from_str(cursor)
+        let envelope: KvCursorEnvelope = serde_json::from_str(encoded)
             .map_err(|_e| KvError::Validation("list cursor is invalid or corrupted".to_owned()))?;
 
         if envelope.prefix != prefix {
@@ -396,10 +396,10 @@ impl KvHandle {
 
     fn encode_list_cursor(prefix: &str, cursor: Option<String>) -> Result<Option<String>, KvError> {
         cursor
-            .map(|cursor| {
+            .map(|inner| {
                 serde_json::to_string(&KvCursorEnvelope {
                     prefix: prefix.to_owned(),
-                    cursor,
+                    cursor: inner,
                 })
                 .map_err(KvError::from)
             })
@@ -880,7 +880,7 @@ mod tests {
             let mut keys = data
                 .keys()
                 .filter(|key| {
-                    key.starts_with(prefix) && cursor.is_none_or(|cursor| key.as_str() > cursor)
+                    key.starts_with(prefix) && cursor.is_none_or(|cur| key.as_str() > cur)
                 })
                 .cloned()
                 .collect::<Vec<_>>();

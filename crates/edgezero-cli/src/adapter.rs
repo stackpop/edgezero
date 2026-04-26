@@ -26,13 +26,13 @@ impl From<Action> for AdapterAction {
 pub fn execute(
     adapter_name: &str,
     action: Action,
-    manifest: Option<&ManifestLoader>,
+    manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
 ) -> Result<(), String> {
-    if let Some(manifest) = manifest {
-        if let Some(command) = manifest_command(manifest.manifest(), adapter_name, action) {
-            let root = manifest.manifest().root().unwrap_or_else(|| Path::new("."));
-            let env = manifest.manifest().environment_for(adapter_name);
+    if let Some(loader) = manifest_loader {
+        if let Some(command) = manifest_command(loader.manifest(), adapter_name, action) {
+            let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
+            let env = loader.manifest().environment_for(adapter_name);
             return run_shell(command, root, adapter_name, action, Some(env), adapter_args);
         }
     }
@@ -40,7 +40,7 @@ pub fn execute(
     let adapter = adapter_registry::get_adapter(adapter_name).ok_or_else(|| {
         let available = adapter_registry::registered_adapters();
         if available.is_empty() {
-            if manifest.is_none() {
+            if manifest_loader.is_none() {
                 format!(
                     "adapter `{adapter_name}` is not registered in this build. Provide an `edgezero.toml` (or set `EDGEZERO_MANIFEST`) so the CLI can load adapters, or rebuild `edgezero-cli` with the `{adapter_name}` adapter feature enabled."
                 )

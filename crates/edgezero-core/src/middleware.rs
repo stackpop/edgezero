@@ -238,11 +238,11 @@ mod tests {
     #[test]
     fn middleware_fn_executes_closure() {
         let called = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&called);
+        let outer_flag = Arc::clone(&called);
         let middleware = middleware_fn(move |_ctx, _next| {
-            let flag = Arc::clone(&flag);
+            let inner_flag = Arc::clone(&outer_flag);
             async move {
-                flag.store(true, Ordering::SeqCst);
+                inner_flag.store(true, Ordering::SeqCst);
                 response_with_body(StatusCode::OK, Body::empty())
             }
         });

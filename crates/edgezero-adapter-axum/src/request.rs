@@ -18,17 +18,17 @@ use crate::proxy::AxumProxyClient;
 /// # Errors
 /// Returns an error if a buffered (`application/json`) body cannot be read into memory.
 pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest, String> {
-    let (parts, body) = request.into_parts();
+    let (parts, axum_body) = request.into_parts();
 
     let body = match parts.headers.get(CONTENT_TYPE) {
         Some(value) if is_json_content_type(value) => {
-            let bytes = axum::body::to_bytes(body, usize::MAX)
+            let bytes = axum::body::to_bytes(axum_body, usize::MAX)
                 .await
                 .map_err(|e| format!("Failed to convert body into bytes: {e}"))?;
             Body::from_bytes(bytes)
         }
         _ => {
-            let stream = body.into_data_stream();
+            let stream = axum_body.into_data_stream();
             Body::from_stream(stream)
         }
     };
@@ -70,7 +70,7 @@ fn is_json_content_type(value: &HeaderValue) -> bool {
         return true;
     }
 
-    let Some((ty, subtype)) = media_type.split_once('/') else {
+    let Some((ty, raw_subtype)) = media_type.split_once('/') else {
         return false;
     };
 
@@ -78,7 +78,7 @@ fn is_json_content_type(value: &HeaderValue) -> bool {
         return false;
     }
 
-    let subtype = subtype.trim();
+    let subtype = raw_subtype.trim();
     let Some(suffix_start) = subtype.len().checked_sub(5) else {
         return false;
     };

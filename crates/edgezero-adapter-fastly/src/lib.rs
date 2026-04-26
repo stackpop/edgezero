@@ -124,7 +124,7 @@ pub fn run_app<A: Hooks>(
     let manifest_loader = ManifestLoader::try_load_from_str(manifest_src)
         .map_err(|err| fastly::Error::msg(err.to_string()))?;
     let manifest = manifest_loader.manifest();
-    let logging = manifest.logging_or_default(FASTLY_ADAPTER);
+    let resolved_logging = manifest.logging_or_default(FASTLY_ADAPTER);
     // Two-path resolution: `A::config_store()` is set at compile time by the
     // `#[app]` macro and is the common case. The manifest fallback handles
     // callers that implement `Hooks` manually without the macro — in that case
@@ -144,7 +144,7 @@ pub fn run_app<A: Hooks>(
         kv_required: manifest.stores.kv.is_some(),
         secrets_required: manifest.secret_store_enabled("fastly"),
     };
-    let logging: FastlyLogging = logging.into();
+    let logging: FastlyLogging = resolved_logging.into();
     run_app_with_stores::<A>(
         &logging,
         req,

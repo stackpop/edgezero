@@ -83,7 +83,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
         let secret_handle = self.secret_handle.clone();
         Box::pin(async move {
             let mut core_request = match into_core_request(req).await {
-                Ok(req) => req,
+                Ok(converted) => converted,
                 Err(e) => {
                     let mut err_response = Response::new(AxumBody::from(e.clone()));
                     *err_response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -100,8 +100,8 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
                 core_request.extensions_mut().insert(handle);
             }
 
-            if let Some(secret_handle) = secret_handle {
-                core_request.extensions_mut().insert(secret_handle);
+            if let Some(handle) = secret_handle {
+                core_request.extensions_mut().insert(handle);
             }
 
             let core_response = task::block_in_place(move || {

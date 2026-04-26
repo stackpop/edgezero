@@ -309,8 +309,8 @@ mod tests {
             Body::Once(bytes) => bytes.to_vec(),
             Body::Stream(mut stream) => block_on(async {
                 let mut data = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.expect("chunk");
+                while let Some(result) = stream.next().await {
+                    let chunk = result.expect("chunk");
                     data.extend_from_slice(&chunk);
                 }
                 data

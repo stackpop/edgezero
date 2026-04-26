@@ -131,13 +131,13 @@ impl AxumDevServer {
         } = self;
 
         // Allow binding to already-open listener if caller created one to surface errors early.
-        let listener = StdTcpListener::bind(config.addr)
+        let std_listener = StdTcpListener::bind(config.addr)
             .with_context(|| format!("failed to bind dev server to {}", config.addr))?;
-        listener
+        std_listener
             .set_nonblocking(true)
             .context("failed to set listener to non-blocking")?;
 
-        let listener = TokioTcpListener::from_std(listener)
+        let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
 
         serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
@@ -282,9 +282,9 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let kv_path = kv_store_path(&kv_store_name);
     let has_secret_store = m.secret_store_enabled("axum");
 
-    let level: LevelFilter = logging.level.into();
+    let configured_level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
-        level
+        configured_level
     } else {
         LevelFilter::Off
     };
@@ -300,12 +300,12 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
 
     runtime.block_on(async move {
         let config = AxumDevServerConfig::default();
-        let listener = StdTcpListener::bind(config.addr)
+        let std_listener = StdTcpListener::bind(config.addr)
             .with_context(|| format!("failed to bind dev server to {}", config.addr))?;
-        listener
+        std_listener
             .set_nonblocking(true)
             .context("failed to set listener to non-blocking")?;
-        let listener = TokioTcpListener::from_std(listener)
+        let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
 
         let kv_handle = match kv_handle_from_path(&kv_path) {
@@ -556,7 +556,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/test", server.base_url);
-        let response = send_with_retry(&client, |client| client.get(url.as_str())).await;
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "hello from dev server");
@@ -571,7 +571,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/nonexistent", server.base_url);
-        let response = send_with_retry(&client, |client| client.get(url.as_str())).await;
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
@@ -589,7 +589,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/submit", server.base_url);
-        let response = send_with_retry(&client, |client| client.get(url.as_str())).await;
+        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 
@@ -613,8 +613,8 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/headers", server.base_url);
-        let response = send_with_retry(&client, |client| {
-            client.get(url.as_str()).header("x-custom", "my-value")
+        let response = send_with_retry(&client, |c| {
+            c.get(url.as_str()).header("x-custom", "my-value")
         })
         .await;
 
@@ -679,14 +679,13 @@ mod integration_tests {
 
         // Write a value
         let write_url = format!("{}/write", server.base_url);
-        let write_response =
-            send_with_retry(&client, |client| client.post(write_url.as_str())).await;
+        let write_response = send_with_retry(&client, |c| c.post(write_url.as_str())).await;
         assert_eq!(write_response.status(), reqwest::StatusCode::OK);
         assert_eq!(write_response.text().await.unwrap(), "written");
 
         // Read it back — proves shared state across requests
         let read_url = format!("{}/read", server.base_url);
-        let read_response = send_with_retry(&client, |client| client.get(read_url.as_str())).await;
+        let read_response = send_with_retry(&client, |c| c.get(read_url.as_str())).await;
         assert_eq!(read_response.status(), reqwest::StatusCode::OK);
         assert_eq!(read_response.text().await.unwrap(), "42");
 
