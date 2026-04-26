@@ -371,10 +371,10 @@ mod tests {
     #[test]
     fn proxy_request_extensions_mut_allows_modification() {
         let mut req = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
-        req.extensions_mut().insert("custom-data".to_string());
+        req.extensions_mut().insert("custom-data".to_owned());
         assert_eq!(
             req.extensions().get::<String>(),
-            Some(&"custom-data".to_string())
+            Some(&"custom-data".to_owned())
         );
     }
 
@@ -530,7 +530,7 @@ mod tests {
             let method_str = request.method().as_str();
             Ok(ProxyResponse::new(
                 StatusCode::OK,
-                Body::from(method_str.to_string()),
+                Body::from(method_str.to_owned()),
             ))
         }
     }

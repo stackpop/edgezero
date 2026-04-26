@@ -93,7 +93,7 @@ pub fn write_tmpl(
         std::fs::create_dir_all(parent).map_err(|e| ScaffoldError::io(parent, e))?;
     }
     let rendered = hbs.render(name, data).map_err(|e| ScaffoldError::Render {
-        name: name.to_string(),
+        name: name.to_owned(),
         message: e.to_string(),
     })?;
     std::fs::write(out_path, rendered).map_err(|e| ScaffoldError::io(out_path, e))
@@ -113,7 +113,7 @@ pub fn sanitize_crate_name(input: &str) -> String {
         }
     }
     if out.is_empty() {
-        "edgezero-app".to_string()
+        "edgezero-app".to_owned()
     } else {
         out
     }
@@ -132,17 +132,17 @@ pub fn resolve_dep_line(
     fallback: &str,
     features: &[&str],
 ) -> ResolvedDependency {
-    let crate_name = crate_name_from_repo_path(repo_rel_crate).to_string();
+    let crate_name = crate_name_from_repo_path(repo_rel_crate).to_owned();
     let candidate = repo_root.join(repo_rel_crate);
     let workspace_line = if candidate.exists() {
         if let Some(rel) = relative_to(workspace_dir, repo_root) {
             let dep_path = std::path::Path::new(&rel).join(repo_rel_crate);
             format!("{} = {{ path = \"{}\" }}", crate_name, dep_path.display())
         } else {
-            fallback.to_string()
+            fallback.to_owned()
         }
     } else {
-        fallback.to_string()
+        fallback.to_owned()
     };
 
     let feature_fragment = if features.is_empty() {

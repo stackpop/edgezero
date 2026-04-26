@@ -49,11 +49,11 @@ impl EdgeError {
     pub fn method_not_allowed(method: &Method, allowed: &[Method]) -> Self {
         let mut names = allowed
             .iter()
-            .map(|m| m.as_str().to_string())
+            .map(|m| m.as_str().to_owned())
             .collect::<Vec<_>>();
         names.sort();
         let allowed_list = if names.is_empty() {
-            "(none)".to_string()
+            "(none)".to_owned()
         } else {
             names.join(", ")
         };

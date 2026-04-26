@@ -172,8 +172,8 @@ impl RouterBuilder {
                     let payload: Vec<RouteListingEntry> = index
                         .iter()
                         .map(|route| RouteListingEntry {
-                            method: route.method().as_str().to_string(),
-                            path: route.path().to_string(),
+                            method: route.method().as_str().to_owned(),
+                            path: route.path().to_owned(),
                         })
                         .collect();
 
@@ -212,7 +212,7 @@ impl RouterBuilder {
             .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
 
         self.route_info
-            .push(RouteInfo::new(method, path.to_string()));
+            .push(RouteInfo::new(method, path.to_owned()));
     }
 }
 
@@ -271,7 +271,7 @@ enum RouteMatch<'a> {
 impl RouterInner {
     async fn dispatch(&self, request: Request) -> Result<Response, EdgeError> {
         let method = request.method().clone();
-        let path = request.uri().path().to_string();
+        let path = request.uri().path().to_owned();
 
         match self.find_route(&method, &path) {
             RouteMatch::Found(entry, params) => {
@@ -294,7 +294,7 @@ impl RouterInner {
                     matched
                         .params
                         .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
                         .collect(),
                 );
                 return RouteMatch::Found(matched.value, params);

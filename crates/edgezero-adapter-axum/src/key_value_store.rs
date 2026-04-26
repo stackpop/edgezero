@@ -339,7 +339,7 @@ impl KvStore for PersistentKvStore {
                     let (key, value) = entry.map_err(|e| {
                         KvError::Internal(anyhow::anyhow!("failed to read range entry: {e}"))
                     })?;
-                    let key = key.value().to_string();
+                    let key = key.value().to_owned();
 
                     if !prefix.is_empty() && !key.starts_with(prefix) {
                         reached_end = true;
@@ -463,7 +463,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
 
         let page = s.list_keys_page("app/", None, 10).await.unwrap();
-        assert_eq!(page.keys, vec!["app/live".to_string()]);
+        assert_eq!(page.keys, vec!["app/live".to_owned()]);
         assert_eq!(page.cursor, None);
     }
 
@@ -479,7 +479,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(200));
         s.put_bytes("race/key", Bytes::from("fresh")).await.unwrap();
 
-        s.cleanup_expired_keys(&["race/key".to_string()]).unwrap();
+        s.cleanup_expired_keys(&["race/key".to_owned()]).unwrap();
 
         assert_eq!(
             s.get_bytes("race/key").await.unwrap(),

@@ -46,7 +46,7 @@ pub struct RequestLogger;
 impl Middleware for RequestLogger {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let method = ctx.request().method().clone();
-        let path = ctx.request().uri().path().to_string();
+        let path = ctx.request().uri().path().to_owned();
         let start = Instant::now();
 
         match next.run(ctx).await {
@@ -135,7 +135,7 @@ mod tests {
     #[async_trait(?Send)]
     impl Middleware for RecordingMiddleware {
         async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-            self.log.lock().unwrap().push(self.name.to_string());
+            self.log.lock().unwrap().push(self.name.to_owned());
             next.run(ctx).await
         }
     }
@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(result.status(), StatusCode::OK);
 
         let calls = log.lock().unwrap().clone();
-        assert_eq!(calls, vec!["first".to_string(), "second".to_string()]);
+        assert_eq!(calls, vec!["first".to_owned(), "second".to_owned()]);
     }
 
     #[test]

@@ -143,38 +143,38 @@ pub fn generate_new(args: NewArgs) -> Result<(), GeneratorError> {
 
 fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     let mut deps = BTreeMap::new();
-    deps.insert("bytes".to_string(), "bytes = \"1\"".to_string());
-    deps.insert("anyhow".to_string(), "anyhow = \"1\"".to_string());
+    deps.insert("bytes".to_owned(), "bytes = \"1\"".to_owned());
+    deps.insert("anyhow".to_owned(), "anyhow = \"1\"".to_owned());
     deps.insert(
-        "futures".to_string(),
+        "futures".to_owned(),
         "futures = { version = \"0.3\", default-features = false, features = [\"std\", \"executor\"] }"
-            .to_string(),
+            .to_owned(),
     );
-    deps.insert("axum".to_string(), "axum = \"0.8\"".to_string());
+    deps.insert("axum".to_owned(), "axum = \"0.8\"".to_owned());
     deps.insert(
-        "serde".to_string(),
-        "serde = { version = \"1\", features = [\"derive\"] }".to_string(),
+        "serde".to_owned(),
+        "serde = { version = \"1\", features = [\"derive\"] }".to_owned(),
     );
-    deps.insert("log".to_string(), "log = \"0.4\"".to_string());
+    deps.insert("log".to_owned(), "log = \"0.4\"".to_owned());
     deps.insert(
-        "simple_logger".to_string(),
-        "simple_logger = \"4\"".to_string(),
+        "simple_logger".to_owned(),
+        "simple_logger = \"4\"".to_owned(),
     );
     deps.insert(
-        "worker".to_string(),
+        "worker".to_owned(),
         "worker = { version = \"0.7\", default-features = false, features = [\"http\"] }"
-            .to_string(),
+            .to_owned(),
     );
-    deps.insert("fastly".to_string(), "fastly = \"0.11\"".to_string());
-    deps.insert("once_cell".to_string(), "once_cell = \"1\"".to_string());
+    deps.insert("fastly".to_owned(), "fastly = \"0.11\"".to_owned());
+    deps.insert("once_cell".to_owned(), "once_cell = \"1\"".to_owned());
     deps.insert(
-        "tokio".to_string(),
-        "tokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }".to_string(),
+        "tokio".to_owned(),
+        "tokio = { version = \"1\", features = [\"macros\", \"rt-multi-thread\"] }".to_owned(),
     );
-    deps.insert("tracing".to_string(), "tracing = \"0.1\"".to_string());
+    deps.insert("tracing".to_owned(), "tracing = \"0.1\"".to_owned());
     deps.insert(
-        "spin-sdk".to_string(),
-        "spin-sdk = { version = \"5.2\", default-features = false }".to_string(),
+        "spin-sdk".to_owned(),
+        "spin-sdk = { version = \"5.2\", default-features = false }".to_owned(),
     );
     deps
 }
@@ -246,7 +246,7 @@ fn collect_adapter_data(
         );
 
         workspace_members.push(format!("  \"crates/{crate_name}\","));
-        adapter_ids.push(blueprint.id.to_string());
+        adapter_ids.push(blueprint.id.to_owned());
 
         contexts.push(AdapterContext {
             blueprint,
@@ -276,7 +276,7 @@ fn blueprint_data_entries(
     workspace_dependencies: &mut BTreeMap<String, String>,
 ) -> Vec<(String, String)> {
     let mut data_entries: Vec<(String, String)> = Vec::new();
-    data_entries.push((format!("proj_{}", blueprint.id), crate_name.to_string()));
+    data_entries.push((format!("proj_{}", blueprint.id), crate_name.to_owned()));
     data_entries.push((
         format!("proj_{}_underscored", blueprint.id),
         crate_name.replace('-', "_"),
@@ -295,7 +295,7 @@ fn blueprint_data_entries(
             dep.features,
         );
         workspace_dependencies.entry(name).or_insert(workspace_line);
-        data_entries.push((dep.key.to_string(), crate_line));
+        data_entries.push((dep.key.to_owned(), crate_line));
     }
 
     // Compute the relative path from the adapter crate to the workspace
@@ -422,7 +422,7 @@ fn build_base_data(
     data.insert("proj_mod".into(), Value::String(layout.project_mod.clone()));
     data.insert(
         "dep_edgezero_core".into(),
-        Value::String(core_crate_line.to_string()),
+        Value::String(core_crate_line.to_owned()),
     );
 
     let adapter_list_str = artifacts

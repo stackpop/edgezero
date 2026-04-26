@@ -128,17 +128,17 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     let config_name = A::config_store()
         .map(|cfg| {
             cfg.name_for_adapter(edgezero_core::app::FASTLY_ADAPTER)
-                .to_string()
+                .to_owned()
         })
         .or_else(|| {
             manifest.stores.config.as_ref().map(|cfg| {
                 cfg.config_store_name(edgezero_core::app::FASTLY_ADAPTER)
-                    .to_string()
+                    .to_owned()
             })
         });
     let kv_name = manifest
         .kv_store_name(edgezero_core::app::FASTLY_ADAPTER)
-        .to_string();
+        .to_owned();
     let requirements = StoreRequirements {
         kv_required: manifest.stores.kv.is_some(),
         secrets_required: manifest.secret_store_enabled("fastly"),
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn fastly_logging_from_manifest_converts_defaults() {
         let config = edgezero_core::manifest::ResolvedLoggingConfig {
-            endpoint: Some("endpoint".to_string()),
+            endpoint: Some("endpoint".to_owned()),
             echo_stdout: Some(false),
             level: edgezero_core::manifest::LogLevel::Debug,
         };

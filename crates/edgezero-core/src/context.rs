@@ -137,7 +137,7 @@ mod tests {
     fn params(map: &[(&str, &str)]) -> PathParams {
         let inner = map
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect::<HashMap<_, _>>();
         PathParams::new(inner)
     }
@@ -361,7 +361,7 @@ mod tests {
                 &self,
                 _key: &str,
             ) -> Result<Option<String>, crate::config_store::ConfigStoreError> {
-                Ok(Some("value".to_string()))
+                Ok(Some("value".to_owned()))
             }
         }
 
@@ -381,7 +381,7 @@ mod tests {
                 .unwrap()
                 .get("any")
                 .expect("config value"),
-            Some("value".to_string())
+            Some("value".to_owned())
         );
     }
 

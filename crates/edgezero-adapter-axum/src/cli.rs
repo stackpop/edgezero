@@ -247,7 +247,7 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("axum-adapter")
-                    .to_string()
+                    .to_owned()
             })
         },
         std::string::ToString::to_string,

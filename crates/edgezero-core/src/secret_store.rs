@@ -217,7 +217,7 @@ impl SecretHandle {
 pub(crate) fn validate_name(name: &str) -> Result<(), SecretError> {
     if name.is_empty() {
         return Err(SecretError::Validation(
-            "secret name cannot be empty".to_string(),
+            "secret name cannot be empty".to_owned(),
         ));
     }
     if name.len() > MAX_NAME_LEN {
@@ -229,7 +229,7 @@ pub(crate) fn validate_name(name: &str) -> Result<(), SecretError> {
     }
     if name.chars().any(char::is_control) {
         return Err(SecretError::Validation(
-            "secret name contains invalid control characters".to_string(),
+            "secret name contains invalid control characters".to_owned(),
         ));
     }
     Ok(())
@@ -362,7 +362,7 @@ mod tests {
         let provider = InMemorySecretStore::new(
             entries
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), Bytes::from((*v).to_string()))),
+                .map(|(k, v)| ((*k).to_owned(), Bytes::from((*v).to_owned()))),
         );
         SecretHandle::new(std::sync::Arc::new(provider))
     }
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn secret_error_not_found_does_not_leak_secret_name() {
         let err: EdgeError = SecretError::NotFound {
-            name: "API_KEY".to_string(),
+            name: "API_KEY".to_owned(),
         }
         .into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn secret_error_validation_does_not_leak_details() {
-        let err: EdgeError = SecretError::Validation("bad\x00name".to_string()).into();
+        let err: EdgeError = SecretError::Validation("bad\x00name".to_owned()).into();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!err.message().contains("bad"));
     }

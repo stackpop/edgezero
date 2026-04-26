@@ -199,7 +199,7 @@ fn store_name_slug(store_name: &str) -> String {
     }
 
     if slug.is_empty() {
-        "store".to_string()
+        "store".to_owned()
     } else {
         slug
     }
@@ -274,9 +274,7 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let m = manifest.manifest();
     let logging = m.logging_or_default(edgezero_core::app::AXUM_ADAPTER);
     let kv_init_requirement = kv_init_requirement(m);
-    let kv_store_name = m
-        .kv_store_name(edgezero_core::app::AXUM_ADAPTER)
-        .to_string();
+    let kv_store_name = m.kv_store_name(edgezero_core::app::AXUM_ADAPTER).to_owned();
     let kv_path = kv_store_path(&kv_store_name);
     let has_secret_store = m.secret_store_enabled("axum");
 
@@ -603,7 +601,7 @@ mod integration_tests {
                 .get("x-custom")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("missing");
-            Ok(value.to_string())
+            Ok(value.to_owned())
         }
 
         let router = RouterService::builder().get("/headers", handler).build();
@@ -801,7 +799,7 @@ mod integration_tests {
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
             let kv = ctx.kv_handle().expect("kv configured");
             let profile = UserProfile {
-                name: "Alice".to_string(),
+                name: "Alice".to_owned(),
                 age: 30,
                 active: true,
             };
@@ -814,7 +812,7 @@ mod integration_tests {
             let profile: Option<UserProfile> = kv.get("user:alice").await?;
             match profile {
                 Some(p) => Ok(format!("{}:{}", p.name, p.age)),
-                None => Ok("not found".to_string()),
+                None => Ok("not found".to_owned()),
             }
         }
 

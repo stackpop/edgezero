@@ -23,7 +23,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
@@ -67,7 +67,7 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
 
     let status = Command::new("fastly")
         .args(["compute", "deploy"])
@@ -92,7 +92,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
 
     let status = Command::new("fastly")
         .args(["compute", "serve"])
@@ -255,7 +255,7 @@ fn find_fastly_manifest(start: &Path) -> Result<PathBuf, String> {
         .collect();
 
     if candidates.is_empty() {
-        return Err("could not locate fastly.toml".to_string());
+        return Err("could not locate fastly.toml".to_owned());
     }
 
     candidates.sort_by_key(|path| {

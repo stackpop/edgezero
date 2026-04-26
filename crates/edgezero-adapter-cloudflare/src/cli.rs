@@ -25,7 +25,7 @@ pub fn build() -> Result<PathBuf, String> {
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
@@ -68,10 +68,10 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
     let config = manifest
         .to_str()
-        .ok_or_else(|| "invalid wrangler config path".to_string())?;
+        .ok_or_else(|| "invalid wrangler config path".to_owned())?;
 
     let status = Command::new("wrangler")
         .args(["deploy", "--config", config])
@@ -96,10 +96,10 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     )?;
     let manifest_dir = manifest
         .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_string())?;
+        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
     let config = manifest
         .to_str()
-        .ok_or_else(|| "invalid wrangler config path".to_string())?;
+        .ok_or_else(|| "invalid wrangler config path".to_owned())?;
 
     let status = Command::new("wrangler")
         .args(["dev", "--config", config])
@@ -271,7 +271,7 @@ fn find_wrangler_manifest(start: &Path) -> Result<PathBuf, String> {
         .collect();
 
     if candidates.is_empty() {
-        return Err("could not locate wrangler.toml".to_string());
+        return Err("could not locate wrangler.toml".to_owned());
     }
 
     candidates.sort_by_key(|path| {

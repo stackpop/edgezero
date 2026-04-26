@@ -70,7 +70,7 @@ fn run_shell(
     adapter_args: &[String],
 ) -> Result<(), String> {
     let full_command = if adapter_args.is_empty() {
-        command.to_string()
+        command.to_owned()
     } else {
         format!("{} {}", command, shell_join(adapter_args))
     };
@@ -110,12 +110,12 @@ fn shell_join(args: &[String]) -> String {
 
 fn shell_escape(arg: &str) -> String {
     if arg.is_empty() {
-        "''".to_string()
+        "''".to_owned()
     } else if arg
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "._-/:=@".contains(c))
     {
-        arg.to_string()
+        arg.to_owned()
     } else {
         format!("'{}'", arg.replace('\'', "'\"'\"'"))
     }
@@ -227,9 +227,9 @@ mod tests {
     #[test]
     fn shell_join_combines_arguments_with_escaping() {
         let args = vec![
-            "plain".to_string(),
-            "with space".to_string(),
-            "needs'quote".to_string(),
+            "plain".to_owned(),
+            "with space".to_owned(),
+            "needs'quote".to_owned(),
         ];
         let joined = super::shell_join(&args);
         assert_eq!(joined, "plain 'with space' 'needs'\"'\"'quote'");

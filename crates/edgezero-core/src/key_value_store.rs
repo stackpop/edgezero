@@ -290,7 +290,7 @@ impl KvHandle {
 
     fn validate_key(key: &str) -> Result<(), KvError> {
         if key.is_empty() {
-            return Err(KvError::Validation("key cannot be empty".to_string()));
+            return Err(KvError::Validation("key cannot be empty".to_owned()));
         }
         if key.len() > Self::MAX_KEY_SIZE {
             return Err(KvError::Validation(format!(
@@ -301,12 +301,12 @@ impl KvHandle {
         }
         if key == "." || key == ".." {
             return Err(KvError::Validation(
-                "key cannot be exactly '.' or '..'".to_string(),
+                "key cannot be exactly '.' or '..'".to_owned(),
             ));
         }
         if key.chars().any(char::is_control) {
             return Err(KvError::Validation(
-                "key contains invalid control characters".to_string(),
+                "key contains invalid control characters".to_owned(),
             ));
         }
         Ok(())
@@ -347,7 +347,7 @@ impl KvHandle {
         }
         if prefix.chars().any(char::is_control) {
             return Err(KvError::Validation(
-                "prefix contains invalid control characters".to_string(),
+                "prefix contains invalid control characters".to_owned(),
             ));
         }
         Ok(())
@@ -356,7 +356,7 @@ impl KvHandle {
     fn validate_list_limit(limit: usize) -> Result<(), KvError> {
         if limit == 0 {
             return Err(KvError::Validation(
-                "list limit must be greater than zero".to_string(),
+                "list limit must be greater than zero".to_owned(),
             ));
         }
         if limit > Self::MAX_LIST_PAGE_SIZE {
@@ -375,16 +375,16 @@ impl KvHandle {
         };
 
         let envelope: KvCursorEnvelope = serde_json::from_str(cursor)
-            .map_err(|_e| KvError::Validation("list cursor is invalid or corrupted".to_string()))?;
+            .map_err(|_e| KvError::Validation("list cursor is invalid or corrupted".to_owned()))?;
 
         if envelope.prefix != prefix {
             return Err(KvError::Validation(
-                "list cursor does not match the requested prefix".to_string(),
+                "list cursor does not match the requested prefix".to_owned(),
             ));
         }
         if envelope.cursor.is_empty() {
             return Err(KvError::Validation(
-                "list cursor payload cannot be empty".to_string(),
+                "list cursor payload cannot be empty".to_owned(),
             ));
         }
 
@@ -395,7 +395,7 @@ impl KvHandle {
         cursor
             .map(|cursor| {
                 serde_json::to_string(&KvCursorEnvelope {
-                    prefix: prefix.to_string(),
+                    prefix: prefix.to_owned(),
                     cursor,
                 })
                 .map_err(KvError::from)
@@ -722,9 +722,9 @@ macro_rules! key_value_store_contract_tests {
                 let store = $factory;
                 run(async {
                     let expected = vec![
-                        "app/one".to_string(),
-                        "app/two".to_string(),
-                        "other/three".to_string(),
+                        "app/one".to_owned(),
+                        "app/two".to_owned(),
+                        "other/three".to_owned(),
                     ];
                     for key in &expected {
                         store
@@ -842,7 +842,7 @@ mod tests {
 
         async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
             let mut data = self.data.lock().unwrap();
-            data.insert(key.to_string(), (value, None));
+            data.insert(key.to_owned(), (value, None));
             Ok(())
         }
 
@@ -853,7 +853,7 @@ mod tests {
             ttl: Duration,
         ) -> Result<(), KvError> {
             let mut data = self.data.lock().unwrap();
-            data.insert(key.to_string(), (value, Some(SystemTime::now() + ttl)));
+            data.insert(key.to_owned(), (value, Some(SystemTime::now() + ttl)));
             Ok(())
         }
 
@@ -1053,7 +1053,7 @@ mod tests {
             h.put("other/d", &4_i32).await.unwrap();
 
             let first = h.list_keys_page("app/", None, 2).await.unwrap();
-            assert_eq!(first.keys, vec!["app/a".to_string(), "app/b".to_string()]);
+            assert_eq!(first.keys, vec!["app/a".to_owned(), "app/b".to_owned()]);
             assert!(first.cursor.is_some());
             assert_ne!(first.cursor.as_deref(), Some("app/b"));
 
@@ -1061,7 +1061,7 @@ mod tests {
                 .list_keys_page("app/", first.cursor.as_deref(), 2)
                 .await
                 .unwrap();
-            assert_eq!(second.keys, vec!["app/c".to_string()]);
+            assert_eq!(second.keys, vec!["app/c".to_owned()]);
             assert_eq!(second.cursor, None);
         });
     }
@@ -1076,7 +1076,7 @@ mod tests {
                 .await
                 .unwrap();
             let val: Option<String> = h.get("session").await.unwrap();
-            assert_eq!(val, Some("token123".to_string()));
+            assert_eq!(val, Some("token123".to_owned()));
         });
     }
 
@@ -1139,7 +1139,7 @@ mod tests {
         futures::executor::block_on(async {
             h.put(JAPANESE_KEY, &"value").await.unwrap();
             let val: Option<String> = h.get(JAPANESE_KEY).await.unwrap();
-            assert_eq!(val, Some("value".to_string()));
+            assert_eq!(val, Some("value".to_owned()));
         });
     }
 

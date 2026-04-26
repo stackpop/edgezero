@@ -73,8 +73,8 @@ mod tests {
 
     edgezero_core::config_store_contract_tests!(fastly_config_store_contract, {
         FastlyConfigStore::from_entries([
-            ("contract.key.a".to_string(), "value_a".to_string()),
-            ("contract.key.b".to_string(), "value_b".to_string()),
+            ("contract.key.a".to_owned(), "value_a".to_owned()),
+            ("contract.key.b".to_owned(), "value_b".to_owned()),
         ])
     });
 

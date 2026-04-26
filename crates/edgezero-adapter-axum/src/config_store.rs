@@ -68,11 +68,10 @@ mod tests {
 
     fn store(env: &[(&str, &str)], defaults: &[(&str, &str)]) -> AxumConfigStore {
         AxumConfigStore::new(
-            env.iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+            env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
             defaults
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
         )
     }
 
@@ -81,7 +80,7 @@ mod tests {
         let s = store(&[("MY_KEY", "my_val")], &[]);
         assert_eq!(
             s.get("MY_KEY").expect("config value"),
-            Some("my_val".to_string())
+            Some("my_val".to_owned())
         );
     }
 
@@ -96,7 +95,7 @@ mod tests {
         let s = store(&[("KEY", "from_env")], &[("KEY", "from_default")]);
         assert_eq!(
             s.get("KEY").expect("config value"),
-            Some("from_env".to_string())
+            Some("from_env".to_owned())
         );
     }
 
@@ -105,7 +104,7 @@ mod tests {
         let s = store(&[], &[("KEY", "default_val")]);
         assert_eq!(
             s.get("KEY").expect("default config"),
-            Some("default_val".to_string())
+            Some("default_val".to_owned())
         );
     }
 
@@ -113,23 +112,23 @@ mod tests {
     fn axum_config_store_from_env_reads_only_declared_keys() {
         let s = AxumConfigStore::from_lookup(
             [
-                ("feature.new_checkout".to_string(), "false".to_string()),
-                ("service.timeout_ms".to_string(), "1500".to_string()),
+                ("feature.new_checkout".to_owned(), "false".to_owned()),
+                ("service.timeout_ms".to_owned(), "1500".to_owned()),
             ],
             |key| match key {
-                "feature.new_checkout" => Some("true".to_string()),
-                "DATABASE_URL" => Some("postgres://secret".to_string()),
+                "feature.new_checkout" => Some("true".to_owned()),
+                "DATABASE_URL" => Some("postgres://secret".to_owned()),
                 _ => None,
             },
         );
 
         assert_eq!(
             s.get("feature.new_checkout").expect("allowed env override"),
-            Some("true".to_string())
+            Some("true".to_owned())
         );
         assert_eq!(
             s.get("service.timeout_ms").expect("default fallback"),
-            Some("1500".to_string())
+            Some("1500".to_owned())
         );
         assert_eq!(
             s.get("DATABASE_URL")
@@ -142,8 +141,8 @@ mod tests {
     edgezero_core::config_store_contract_tests!(axum_config_store_env_contract, {
         AxumConfigStore::new(
             [
-                ("contract.key.a".to_string(), "value_a".to_string()),
-                ("contract.key.b".to_string(), "value_b".to_string()),
+                ("contract.key.a".to_owned(), "value_a".to_owned()),
+                ("contract.key.b".to_owned(), "value_b".to_owned()),
             ],
             [],
         )
@@ -154,8 +153,8 @@ mod tests {
         AxumConfigStore::new(
             [],
             [
-                ("contract.key.a".to_string(), "value_a".to_string()),
-                ("contract.key.b".to_string(), "value_b".to_string()),
+                ("contract.key.a".to_owned(), "value_a".to_owned()),
+                ("contract.key.b".to_owned(), "value_b".to_owned()),
             ],
         )
     });

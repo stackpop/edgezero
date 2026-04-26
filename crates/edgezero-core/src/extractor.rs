@@ -132,7 +132,7 @@ impl FromRequest for Host {
             .get(header::HOST)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("localhost")
-            .to_string();
+            .to_owned();
         Ok(Host(host))
     }
 }
@@ -178,7 +178,7 @@ impl FromRequest for ForwardedHost {
             .or_else(|| headers.get(header::HOST))
             .and_then(|v| v.to_str().ok())
             .unwrap_or("localhost")
-            .to_string();
+            .to_owned();
         Ok(ForwardedHost(host))
     }
 }
@@ -521,7 +521,7 @@ mod tests {
     fn params(values: &[(&str, &str)]) -> PathParams {
         let map = values
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect::<HashMap<_, _>>();
         PathParams::new(map)
     }
@@ -670,7 +670,7 @@ mod tests {
             .method(Method::POST)
             .uri("/test")
             .header("content-type", "application/x-www-form-urlencoded")
-            .body(Body::from(body.to_string()))
+            .body(Body::from(body.to_owned()))
             .expect("request");
         RequestContext::new(request, PathParams::default())
     }
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn host_deref_and_into_inner() {
-        let host = Host("example.com".to_string());
+        let host = Host("example.com".to_owned());
         assert_eq!(&*host, "example.com"); // Deref
         let inner = host.into_inner();
         assert_eq!(inner, "example.com");
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn forwarded_host_deref_and_into_inner() {
-        let host = ForwardedHost("example.com".to_string());
+        let host = ForwardedHost("example.com".to_owned());
         assert_eq!(&*host, "example.com"); // Deref
         let inner = host.into_inner();
         assert_eq!(inner, "example.com");
