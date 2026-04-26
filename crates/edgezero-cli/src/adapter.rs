@@ -161,11 +161,11 @@ impl std::fmt::Display for Action {
     }
 }
 
-fn manifest_command<'a>(
-    manifest: &'a Manifest,
+fn manifest_command<'manifest>(
+    manifest: &'manifest Manifest,
     adapter_name: &str,
     action: Action,
-) -> Option<&'a str> {
+) -> Option<&'manifest str> {
     let cfg = manifest.adapters.get(adapter_name)?;
     match action {
         Action::Build => cfg.commands.build.as_deref(),

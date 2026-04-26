@@ -16,13 +16,13 @@ pub trait Middleware: Send + Sync + 'static {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError>;
 }
 
-pub struct Next<'a> {
-    middlewares: &'a [BoxMiddleware],
-    handler: &'a dyn DynHandler,
+pub struct Next<'mw> {
+    middlewares: &'mw [BoxMiddleware],
+    handler: &'mw dyn DynHandler,
 }
 
-impl<'a> Next<'a> {
-    pub fn new(middlewares: &'a [BoxMiddleware], handler: &'a dyn DynHandler) -> Self {
+impl<'mw> Next<'mw> {
+    pub fn new(middlewares: &'mw [BoxMiddleware], handler: &'mw dyn DynHandler) -> Self {
         Self {
             middlewares,
             handler,
