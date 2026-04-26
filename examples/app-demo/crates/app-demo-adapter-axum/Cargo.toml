@@ -5,6 +5,9 @@ edition = "2021"
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "app-demo-adapter-axum"
 path = "src/main.rs"
