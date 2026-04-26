@@ -153,9 +153,11 @@ partial_pub_fields = "allow"
 # Pass-by-ref for `Method` / `StatusCode` is fine for API ergonomics.
 trivially_copy_pass_by_ref = "allow"
 
-# Imports / paths — `std::env::var()`-style one-shot uses don't benefit
-# from a `use`. Generated binaries are std applications, not no_std libraries.
+# Imports / paths — adapter test modules cross-reference framework types
+# (`axum::http::*`, `fastly::kv_store::*`, etc.) inline; one-shot uses don't
+# benefit from `use` statements at the test-fn level.
 absolute_paths = "allow"
+# Generated binaries are std applications, not no_std libraries.
 std_instead_of_alloc = "allow"
 std_instead_of_core = "allow"
 

@@ -14,7 +14,7 @@ impl PathParams {
     }
 
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.inner.get(key).map(std::string::String::as_str)
+        self.inner.get(key).map(String::as_str)
     }
 
     /// # Errors

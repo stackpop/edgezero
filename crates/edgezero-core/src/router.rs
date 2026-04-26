@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use matchit::Router as PathRouter;
 use serde::Serialize;
@@ -321,11 +322,8 @@ impl Service<Request> for RouterService {
     type Error = EdgeError;
     type Future = HandlerFuture;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Request) -> Self::Future {

@@ -85,6 +85,7 @@ fn reqwest_method(method: &Method) -> Result<reqwest::Method, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem;
 
     #[test]
     fn converts_method_to_reqwest() {
@@ -114,14 +115,18 @@ mod tests {
     fn default_client_creates_successfully() {
         let client = AxumProxyClient::try_new().expect("reqwest client init");
         // Just verify it builds without panicking
-        assert!(std::mem::size_of_val(&client) > 0);
+        assert!(mem::size_of_val(&client) > 0);
     }
 }
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use axum::{routing::get, routing::post, Router};
+    use axum::body::Bytes as AxumBytes;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{HeaderMap as AxumHeaderMap, StatusCode as AxumStatusCode};
+    use axum::routing::{delete, get, patch, post, put};
+    use axum::Router;
     use edgezero_core::http::Uri;
     use tokio::net::TcpListener;
 
@@ -154,7 +159,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn proxy_client_sends_post_with_body() {
-        let app = Router::new().route("/echo", post(|body: axum::body::Bytes| async move { body }));
+        let app = Router::new().route("/echo", post(|body: AxumBytes| async move { body }));
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::try_new().expect("reqwest client init");
@@ -175,7 +180,7 @@ mod integration_tests {
     async fn proxy_client_forwards_request_headers() {
         let app = Router::new().route(
             "/headers",
-            get(|headers: axum::http::HeaderMap| async move {
+            get(|headers: AxumHeaderMap| async move {
                 headers
                     .get("x-custom-header")
                     .and_then(|v| v.to_str().ok())
@@ -205,12 +210,7 @@ mod integration_tests {
     async fn proxy_client_receives_response_headers() {
         let app = Router::new().route(
             "/with-headers",
-            get(|| async {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    "{}",
-                )
-            }),
+            get(|| async { ([(CONTENT_TYPE, "application/json")], "{}") }),
         );
         let base_url = start_test_server(app).await;
 
@@ -245,7 +245,7 @@ mod integration_tests {
     async fn proxy_client_handles_500() {
         let app = Router::new().route(
             "/error",
-            get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error") }),
+            get(|| async { (AxumStatusCode::INTERNAL_SERVER_ERROR, "error") }),
         );
         let base_url = start_test_server(app).await;
 
@@ -262,9 +262,9 @@ mod integration_tests {
         let app = Router::new()
             .route("/method", get(|| async { "GET" }))
             .route("/method", post(|| async { "POST" }))
-            .route("/method", axum::routing::put(|| async { "PUT" }))
-            .route("/method", axum::routing::delete(|| async { "DELETE" }))
-            .route("/method", axum::routing::patch(|| async { "PATCH" }));
+            .route("/method", put(|| async { "PUT" }))
+            .route("/method", delete(|| async { "DELETE" }))
+            .route("/method", patch(|| async { "PATCH" }));
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::try_new().expect("reqwest client init");
@@ -305,10 +305,7 @@ mod integration_tests {
         use bytes::Bytes;
         use futures::stream;
 
-        let app = Router::new().route(
-            "/stream-echo",
-            post(|body: axum::body::Bytes| async move { body }),
-        );
+        let app = Router::new().route("/stream-echo", post(|body: AxumBytes| async move { body }));
         let base_url = start_test_server(app).await;
 
         let client = AxumProxyClient::try_new().expect("reqwest client init");

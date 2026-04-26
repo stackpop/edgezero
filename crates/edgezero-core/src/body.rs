@@ -6,6 +6,8 @@ use futures_util::stream::{LocalBoxStream, Stream, StreamExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::error::EdgeError;
+
 /// Lightweight HTTP body that can either contain a single `Bytes` buffer or a streaming source of
 /// chunks. The streaming variant is implemented with `LocalBoxStream` so it remains compatible with
 /// `wasm32` targets that lack thread support.
@@ -81,29 +83,22 @@ impl Body {
     /// Works for both buffered and streaming variants.
     ///
     /// # Errors
-    /// Returns [`crate::error::EdgeError::bad_request`] if the body exceeds `max_size` bytes; or [`crate::error::EdgeError::internal`] if the upstream stream errors.
-    pub async fn into_bytes_bounded(
-        self,
-        max_size: usize,
-    ) -> Result<Bytes, crate::error::EdgeError> {
+    /// Returns [`EdgeError::bad_request`] if the body exceeds `max_size` bytes; or [`EdgeError::internal`] if the upstream stream errors.
+    pub async fn into_bytes_bounded(self, max_size: usize) -> Result<Bytes, EdgeError> {
         match self {
             Body::Once(bytes) => {
                 if bytes.len() > max_size {
-                    return Err(crate::error::EdgeError::bad_request(
-                        "request body too large",
-                    ));
+                    return Err(EdgeError::bad_request("request body too large"));
                 }
                 Ok(bytes)
             }
             Body::Stream(mut stream) => {
                 let mut buf = Vec::new();
                 while let Some(chunk) = StreamExt::next(&mut stream).await {
-                    let chunk = chunk.map_err(crate::error::EdgeError::internal)?;
+                    let chunk = chunk.map_err(EdgeError::internal)?;
                     buf.extend_from_slice(&chunk);
                     if buf.len() > max_size {
-                        return Err(crate::error::EdgeError::bad_request(
-                            "request body too large",
-                        ));
+                        return Err(EdgeError::bad_request("request body too large"));
                     }
                 }
                 Ok(Bytes::from(buf))
@@ -188,11 +183,12 @@ impl From<String> for Body {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    use futures_util::stream;
     use std::io;
 
     #[test]
     fn collect_stream_body() {
-        let body = Body::stream(futures_util::stream::iter(vec![
+        let body = Body::stream(stream::iter(vec![
             Bytes::from_static(b"a"),
             Bytes::from_static(b"b"),
         ]));
@@ -211,7 +207,7 @@ mod tests {
 
     #[test]
     fn from_stream_maps_errors() {
-        let source = futures_util::stream::iter(vec![
+        let source = stream::iter(vec![
             Ok(Bytes::from_static(b"ok")),
             Err(io::Error::other("boom")),
         ]);
@@ -229,7 +225,7 @@ mod tests {
 
     #[test]
     fn to_json_fails_for_streaming_body() {
-        let body = Body::stream(futures_util::stream::iter(vec![
+        let body = Body::stream(stream::iter(vec![
             Bytes::from_static(b"{"),
             Bytes::from_static(b"}"),
         ]));
@@ -239,17 +235,13 @@ mod tests {
 
     #[test]
     fn into_bytes_returns_none_for_stream() {
-        let body = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
-            b"data",
-        )]));
+        let body = Body::stream(stream::iter(vec![Bytes::from_static(b"data")]));
         assert!(body.into_bytes().is_none());
     }
 
     #[test]
     fn as_bytes_returns_none_for_stream() {
-        let body = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
-            b"data",
-        )]));
+        let body = Body::stream(stream::iter(vec![Bytes::from_static(b"data")]));
         assert!(body.as_bytes().is_none());
     }
 
@@ -277,9 +269,7 @@ mod tests {
         let buffered_debug = format!("{buffered:?}");
         assert!(buffered_debug.contains("Body::Once"));
 
-        let stream = Body::stream(futures_util::stream::iter(vec![Bytes::from_static(
-            b"chunk",
-        )]));
+        let stream = Body::stream(stream::iter(vec![Bytes::from_static(b"chunk")]));
         let stream_debug = format!("{stream:?}");
         assert!(stream_debug.contains("Body::Stream"));
     }
@@ -305,7 +295,7 @@ mod tests {
 
     #[test]
     fn into_bytes_bounded_stream_ok() {
-        let body = Body::stream(futures_util::stream::iter(vec![
+        let body = Body::stream(stream::iter(vec![
             Bytes::from_static(b"ab"),
             Bytes::from_static(b"cd"),
         ]));
@@ -315,7 +305,7 @@ mod tests {
 
     #[test]
     fn into_bytes_bounded_stream_too_large() {
-        let body = Body::stream(futures_util::stream::iter(vec![
+        let body = Body::stream(stream::iter(vec![
             Bytes::from_static(b"ab"),
             Bytes::from_static(b"cd"),
         ]));
