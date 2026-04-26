@@ -4,6 +4,9 @@ use std::pin::Pin;
 use crate::body::Body;
 use crate::error::EdgeError;
 
+// CLAUDE.md mandates that application code never imports from the `http`
+// crate directly — every HTTP type must come through `edgezero_core::http`.
+// That contract is what these re-exports exist for.
 pub use http::header;
 pub use http::request::Builder as RequestBuilder;
 pub use http::response::Builder as ResponseBuilder;
