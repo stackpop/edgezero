@@ -13,10 +13,6 @@ use edgezero_core::http::Response as CoreResponse;
 /// incremental flushing, it keeps the adapter compatible with the non-`Send` streaming type used by
 /// `edgezero_core::Body` and works well for local development.
 ///
-/// # Panics
-/// Panics if the resulting response cannot be assembled by `axum`'s response
-/// builder — only possible if the supplied [`CoreResponse`] contains a header
-/// that fails axum's stricter byte-level validation.
 pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
     let (parts, body) = response.into_parts();
     let body = match body {
@@ -35,22 +31,25 @@ pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
                 Ok(buf) => AxumBody::from(buf),
                 Err(err) => {
                     error!("streaming response error: {err}");
-                    let error_body = AxumBody::from("streaming response error");
-                    let mut error_response = Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(error_body)
-                        .expect("error response");
-                    error_response.headers_mut().insert(
-                        axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                    );
-                    return error_response;
+                    return error_response_500("streaming response error");
                 }
             }
         }
     };
 
     Response::from_parts(parts, body)
+}
+
+/// Build a minimal 500 response without any builder steps that could fail.
+/// Used as a fallback on the request path so we never panic on synthesis.
+fn error_response_500(message: &'static str) -> Response<AxumBody> {
+    let mut response = Response::new(AxumBody::from(message));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 #[cfg(test)]

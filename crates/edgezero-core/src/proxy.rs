@@ -142,18 +142,17 @@ impl ProxyResponse {
         &mut self.extensions
     }
 
-    /// # Panics
-    /// Panics if any header in the response is invalid for the underlying
-    /// `http::Response::builder()` — should be impossible because we only ever
-    /// store header names/values that were already validated when inserted.
-    pub fn into_response(self) -> Response {
+    /// # Errors
+    /// Returns [`EdgeError::internal`] if the underlying `http::Response::builder()`
+    /// rejects a header — should be unreachable since we only store names/values
+    /// that were already validated, but propagation lets a faulty upstream stream
+    /// fail the request instead of crashing the worker.
+    pub fn into_response(self) -> Result<Response, EdgeError> {
         let mut builder = response_builder().status(self.status);
         for (name, value) in &self.headers {
             builder = builder.header(name, value);
         }
-        builder
-            .body(self.body)
-            .expect("proxy response builder should not fail")
+        builder.body(self.body).map_err(EdgeError::internal)
     }
 }
 
@@ -189,10 +188,11 @@ impl ProxyHandle {
     }
 
     /// # Errors
-    /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails.
+    /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails or the
+    /// response cannot be assembled.
     pub async fn forward(&self, request: ProxyRequest) -> Result<Response, EdgeError> {
         let response = self.client.send(request).await?;
-        Ok(response.into_response())
+        response.into_response()
     }
 }
 
@@ -216,10 +216,11 @@ where
     C: ProxyClient,
 {
     /// # Errors
-    /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails.
+    /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails or the
+    /// response cannot be assembled.
     pub async fn forward(&self, request: ProxyRequest) -> Result<Response, EdgeError> {
         let response = self.client.send(request).await?;
-        Ok(response.into_response())
+        response.into_response()
     }
 }
 
@@ -450,7 +451,7 @@ mod tests {
         resp.headers_mut()
             .insert("x-custom", HeaderValue::from_static("header"));
 
-        let http_resp = resp.into_response();
+        let http_resp = resp.into_response().expect("response");
         assert_eq!(http_resp.status(), StatusCode::CREATED);
         assert!(http_resp.headers().get("x-custom").is_some());
     }

@@ -338,7 +338,8 @@ fn dispatch_core_request(
     if let Some(handle) = stores.secrets {
         core_request.extensions_mut().insert(handle);
     }
-    let response = executor::block_on(app.router().oneshot(core_request));
+    let response =
+        executor::block_on(app.router().oneshot(core_request)).map_err(map_edge_error)?;
     from_core_response(response).map_err(map_edge_error)
 }
 

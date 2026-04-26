@@ -479,13 +479,15 @@ fn render_templates(
     )?;
 
     for context in adapter_contexts {
+        let crate_dir_name = context.dir.file_name().ok_or_else(|| {
+            std::io::Error::other(format!(
+                "adapter context directory has no file name: {}",
+                context.dir.display(),
+            ))
+        })?;
         log::info!(
             "[edgezero] writing adapter crate {}",
-            context
-                .dir
-                .file_name()
-                .expect("adapter context dir has a file name")
-                .to_string_lossy()
+            crate_dir_name.to_string_lossy(),
         );
         for file in context.blueprint.files {
             write_tmpl(

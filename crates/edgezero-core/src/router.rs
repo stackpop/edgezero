@@ -244,10 +244,13 @@ impl RouterService {
         self.inner.route_index.to_vec()
     }
 
-    pub async fn oneshot(&self, request: Request) -> Response {
+    /// # Errors
+    /// Returns [`EdgeError`] if the dispatched handler errors AND the error
+    /// itself fails to render as a response.
+    pub async fn oneshot(&self, request: Request) -> Result<Response, EdgeError> {
         let mut service = self.clone();
         match service.call(request).await {
-            Ok(response) => response,
+            Ok(response) => Ok(response),
             Err(err) => err.into_response(),
         }
     }
@@ -360,7 +363,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     async fn ok_handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
-        Ok(response_with_body(StatusCode::OK, Body::empty()))
+        response_with_body(StatusCode::OK, Body::empty())
     }
 
     #[test]
@@ -585,7 +588,7 @@ mod tests {
                 Bytes::from_static(b"chunk-two\n"),
             ]);
 
-            Ok((StatusCode::OK, Body::stream(chunks)).into_response())
+            (StatusCode::OK, Body::stream(chunks)).into_response()
         }
 
         let service = RouterService::builder().get("/stream", handler).build();
@@ -710,7 +713,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let response = block_on(service.oneshot(request));
+        let response = block_on(service.oneshot(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -723,7 +726,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let response = block_on(service.oneshot(request));
+        let response = block_on(service.oneshot(request)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 

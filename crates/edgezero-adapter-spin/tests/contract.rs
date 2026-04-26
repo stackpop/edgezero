@@ -80,7 +80,7 @@ fn router_dispatches_get_and_returns_response() {
         .body(Body::empty())
         .expect("request");
 
-    let response = block_on(app.router().oneshot(request));
+    let response = block_on(app.router().oneshot(request)).expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -98,7 +98,7 @@ fn router_dispatches_post_with_body() {
         .body(Body::from(b"echo-payload".to_vec()))
         .expect("request");
 
-    let response = block_on(app.router().oneshot(request));
+    let response = block_on(app.router().oneshot(request)).expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -116,7 +116,7 @@ fn router_dispatches_streaming_route() {
         .body(Body::empty())
         .expect("request");
 
-    let response = block_on(app.router().oneshot(request));
+    let response = block_on(app.router().oneshot(request)).expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
 

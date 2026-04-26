@@ -149,7 +149,7 @@ mod tests {
             _ctx: RequestContext,
             _next: Next<'_>,
         ) -> Result<Response, EdgeError> {
-            Ok(response_with_body(StatusCode::UNAUTHORIZED, Body::empty()))
+            response_with_body(StatusCode::UNAUTHORIZED, Body::empty())
         }
     }
 
@@ -163,7 +163,7 @@ mod tests {
     }
 
     async fn ok_handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
-        Ok(response_with_body(StatusCode::OK, Body::empty()))
+        response_with_body(StatusCode::OK, Body::empty())
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
         };
 
         let handler = (|_ctx: RequestContext| async move {
-            Ok::<Response, EdgeError>(response_with_body(StatusCode::OK, Body::empty()))
+            response_with_body(StatusCode::OK, Body::empty())
         })
         .into_handler();
 
@@ -243,7 +243,7 @@ mod tests {
             let flag = Arc::clone(&flag);
             async move {
                 flag.store(true, Ordering::SeqCst);
-                Ok(response_with_body(StatusCode::OK, Body::empty()))
+                response_with_body(StatusCode::OK, Body::empty())
             }
         });
 

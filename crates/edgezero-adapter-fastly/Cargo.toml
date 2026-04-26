@@ -37,6 +37,7 @@ log = { workspace = true }
 log-fastly = { workspace = true, optional = true }
 fern = { workspace = true }
 chrono = { workspace = true }
+thiserror = { workspace = true }
 walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]

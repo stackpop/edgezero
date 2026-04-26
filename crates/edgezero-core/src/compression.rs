@@ -11,10 +11,6 @@ use futures_util::TryStreamExt as _;
 const BUFFER_SIZE: usize = 8 * 1024;
 
 /// Decode a stream of gzip-compressed chunks into plain bytes.
-///
-/// # Panics
-/// Cannot panic on caller-controlled input. The internal slice access is
-/// proven safe by the `AsyncRead::read` contract (always returns ≤ `buffer.len()`).
 pub fn decode_gzip_stream<S>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>>
 where
     S: TryStream<Ok = Vec<u8>, Error = io::Error> + Unpin,
@@ -29,21 +25,17 @@ where
             if read == 0 {
                 break;
             }
-
-            yield Bytes::copy_from_slice(
-                buffer
-                    .get(..read)
-                    .expect("AsyncRead::read returns at most buffer.len()"),
-            );
+            let chunk = buffer.get(..read).ok_or_else(|| {
+                io::Error::other(format!(
+                    "decoder reported {read}-byte read into a {BUFFER_SIZE}-byte buffer"
+                ))
+            })?;
+            yield Bytes::copy_from_slice(chunk);
         }
     }
 }
 
 /// Decode a stream of brotli-compressed chunks into plain bytes.
-///
-/// # Panics
-/// Cannot panic on caller-controlled input. The internal slice access is
-/// proven safe by the `AsyncRead::read` contract (always returns ≤ `buffer.len()`).
 pub fn decode_brotli_stream<S>(stream: S) -> impl Stream<Item = Result<Bytes, io::Error>>
 where
     S: TryStream<Ok = Vec<u8>, Error = io::Error> + Unpin,
@@ -58,12 +50,12 @@ where
             if read == 0 {
                 break;
             }
-
-            yield Bytes::copy_from_slice(
-                buffer
-                    .get(..read)
-                    .expect("AsyncRead::read returns at most buffer.len()"),
-            );
+            let chunk = buffer.get(..read).ok_or_else(|| {
+                io::Error::other(format!(
+                    "decoder reported {read}-byte read into a {BUFFER_SIZE}-byte buffer"
+                ))
+            })?;
+            yield Bytes::copy_from_slice(chunk);
         }
     }
 }

@@ -12,13 +12,20 @@ pub struct AxumProxyClient {
     client: Client,
 }
 
-impl Default for AxumProxyClient {
-    fn default() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("reqwest client");
-        Self { client }
+impl AxumProxyClient {
+    /// Construct a proxy client with the workspace-default 30-second timeout.
+    ///
+    /// **Breaking change (pre-1.0):** previously `AxumProxyClient` implemented
+    /// `Default` and panicked if reqwest's TLS backend could not be initialised.
+    /// Construction is now fallible so callers can decide how to handle a
+    /// missing or misconfigured TLS backend.
+    ///
+    /// # Errors
+    /// Returns the underlying [`reqwest::Error`] if `reqwest::Client::builder().build()`
+    /// fails — typically because the TLS backend cannot be initialised on this target.
+    pub fn try_new() -> Result<Self, reqwest::Error> {
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+        Ok(Self { client })
     }
 }
 
@@ -105,7 +112,7 @@ mod tests {
 
     #[test]
     fn default_client_creates_successfully() {
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         // Just verify it builds without panicking
         assert!(std::mem::size_of_val(&client) > 0);
     }
@@ -132,7 +139,7 @@ mod integration_tests {
         let app = Router::new().route("/test", get(|| async { "hello from server" }));
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         let uri: Uri = format!("{base_url}/test").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
@@ -150,7 +157,7 @@ mod integration_tests {
         let app = Router::new().route("/echo", post(|body: axum::body::Bytes| async move { body }));
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         let uri: Uri = format!("{base_url}/echo").parse().unwrap();
         let mut request = ProxyRequest::new(Method::POST, uri);
         *request.body_mut() = Body::from("request body data");
@@ -178,7 +185,7 @@ mod integration_tests {
         );
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         let uri: Uri = format!("{base_url}/headers").parse().unwrap();
         let mut request = ProxyRequest::new(Method::GET, uri);
         request
@@ -207,7 +214,7 @@ mod integration_tests {
         );
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         let uri: Uri = format!("{base_url}/with-headers").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
@@ -226,7 +233,7 @@ mod integration_tests {
         let app = Router::new();
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         let uri: Uri = format!("{base_url}/nonexistent").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
@@ -242,7 +249,7 @@ mod integration_tests {
         );
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         let uri: Uri = format!("{base_url}/error").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
@@ -260,7 +267,7 @@ mod integration_tests {
             .route("/method", axum::routing::patch(|| async { "PATCH" }));
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
 
         for (method, expected_body) in [
             (Method::GET, "GET"),
@@ -282,7 +289,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn proxy_client_handles_connection_refused() {
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         // Use a port that's unlikely to have anything running
         let uri: Uri = "http://127.0.0.1:1".parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
@@ -304,7 +311,7 @@ mod integration_tests {
         );
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         let uri: Uri = format!("{base_url}/stream-echo").parse().unwrap();
         let mut request = ProxyRequest::new(Method::POST, uri);
 

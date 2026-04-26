@@ -9,7 +9,7 @@ mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
 #[cfg(feature = "fastly")]
-mod logger;
+pub mod logger;
 #[cfg(feature = "fastly")]
 mod proxy;
 #[cfg(feature = "fastly")]
@@ -60,16 +60,21 @@ impl From<edgezero_core::manifest::ResolvedLoggingConfig> for FastlyLogging {
 }
 
 /// # Errors
-/// Returns [`log::SetLoggerError`] if a global logger is already installed.
+/// Returns [`logger::InitLoggerError::Build`] if the underlying logger
+/// builder rejects its inputs (e.g. an empty endpoint), or
+/// [`logger::InitLoggerError::SetLogger`] if a global logger is already
+/// installed.
 #[cfg(feature = "fastly")]
 pub fn init_logger(
     endpoint: &str,
     level: log::LevelFilter,
     echo_stdout: bool,
-) -> Result<(), log::SetLoggerError> {
+) -> Result<(), logger::InitLoggerError> {
     logger::init_logger(endpoint, level, echo_stdout)
 }
 
+/// # Errors
+/// Never; this is a no-op stub on builds without the `fastly` feature.
 #[cfg(not(feature = "fastly"))]
 pub fn init_logger(
     _endpoint: &str,
