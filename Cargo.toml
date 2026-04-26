@@ -105,8 +105,11 @@ single_char_lifetime_names = "allow"
 shadow_reuse = "allow"
 # `edgezero_core::CoreError` is clearer than bare `Error` cross-crate.
 module_name_repetitions = "allow"
-# `push_str(&format!(...))` deliberately chosen over `write!(s, ...)` which
-# requires `.unwrap()` (write-to-String never fails) — keeps call sites tidy.
+# `push_str(&format!(...))` is deliberately chosen over `write!(s, ...)`:
+# `write!` to `String` returns `Result` that triggers `let_underscore_must_use`
+# under `let _ =`, `unwrap_used` under `.unwrap()`, and `expect_used` under
+# `.expect()` — all restriction-deny in this workspace. There is no in-tree
+# alternative that satisfies the full restriction set.
 format_push_string = "allow"
 
 # `pattern_type_mismatch` and `ref_patterns` are mutually exclusive in modern
