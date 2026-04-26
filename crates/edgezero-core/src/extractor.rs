@@ -533,7 +533,7 @@ mod tests {
 
     #[derive(Debug, Deserialize, Serialize, Validate)]
     struct ValidatedPayload {
-        #[validate(length(min = 1))]
+        #[validate(length(min = 1_u64))]
         name: String,
     }
 
@@ -643,7 +643,7 @@ mod tests {
 
     #[derive(Debug, Deserialize, Validate)]
     struct ValidatedQueryParams {
-        #[validate(range(min = 1, max = 100))]
+        #[validate(range(min = 1_u32, max = 100_u32))]
         page: u32,
     }
 
@@ -699,7 +699,7 @@ mod tests {
 
     #[derive(Debug, Deserialize, Validate)]
     struct ValidatedFormData {
-        #[validate(length(min = 3))]
+        #[validate(length(min = 3_u64))]
         username: String,
     }
 
@@ -722,7 +722,7 @@ mod tests {
     // ValidatedPath tests
     #[derive(Debug, Deserialize, Validate)]
     struct ValidatedPathParams {
-        #[validate(length(min = 1, max = 10))]
+        #[validate(length(min = 1_u64, max = 10_u64))]
         id: String,
     }
 

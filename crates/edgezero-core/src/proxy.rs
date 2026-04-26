@@ -442,7 +442,7 @@ mod tests {
     fn proxy_response_extensions_mut_allows_modification() {
         let mut resp = ProxyResponse::new(StatusCode::OK, Body::empty());
         resp.extensions_mut().insert(42_i32);
-        assert_eq!(resp.extensions().get::<i32>(), Some(&42));
+        assert_eq!(resp.extensions().get::<i32>(), Some(&42_i32));
     }
 
     #[test]
