@@ -566,6 +566,7 @@ dependencies = [
  "futures-util",
  "log",
  "log-fastly",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
