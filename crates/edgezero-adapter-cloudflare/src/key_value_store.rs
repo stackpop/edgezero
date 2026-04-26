@@ -116,6 +116,10 @@ impl KvStore for CloudflareKvStore {
                 .filter(|cursor| !cursor.is_empty()),
         })
     }
+
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Ok(self.get_bytes(key).await?.is_some())
+    }
 }
 
 // TODO: integration tests require a wasm32 target + wrangler.

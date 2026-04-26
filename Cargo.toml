@@ -120,10 +120,10 @@ as_conversions = "allow"
 # `edgezero_core::app!`. `exhaustive_enums` would force never-firing wildcard
 # arms on `Body` consumers.
 exhaustive_structs = "allow"
+# `Body { Once, Stream }` is matched in ~60 sites across the workspace; making
+# it `#[non_exhaustive]` would force a wildcard arm at every site that defeats
+# the type system. The other public enums are similarly load-bearing.
 exhaustive_enums = "allow"
-# Default trait methods are fine; the lint wants every default method
-# spelled out, which is pure boilerplate.
-missing_trait_methods = "allow"
 
 # Imports / paths
 absolute_paths = "allow"

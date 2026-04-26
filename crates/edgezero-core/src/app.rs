@@ -214,6 +214,12 @@ mod tests {
             );
             Some(&CONFIG_STORE)
         }
+
+        fn build_app() -> App {
+            let mut app = App::with_name(Self::routes(), Self::name());
+            Self::configure(&mut app);
+            app
+        }
     }
 
     #[test]
@@ -243,6 +249,22 @@ mod tests {
     impl Hooks for DefaultHooks {
         fn routes() -> RouterService {
             RouterService::builder().build()
+        }
+
+        fn configure(_app: &mut App) {}
+
+        fn name() -> &'static str {
+            App::default_name()
+        }
+
+        fn config_store() -> Option<&'static ConfigStoreMetadata> {
+            None
+        }
+
+        fn build_app() -> App {
+            let mut app = App::with_name(Self::routes(), Self::name());
+            Self::configure(&mut app);
+            app
         }
     }
 
