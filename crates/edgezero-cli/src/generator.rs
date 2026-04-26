@@ -8,6 +8,7 @@ use edgezero_adapter::scaffold::AdapterBlueprint;
 use handlebars::Handlebars;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
@@ -35,6 +36,12 @@ pub enum GeneratorError {
     /// written. Wraps [`ScaffoldError`] for context.
     #[error(transparent)]
     Scaffold(#[from] ScaffoldError),
+    /// `write!`/`writeln!` to an in-memory `String` buffer failed. In
+    /// practice the only way this can fire is a malformed `Display` impl in
+    /// one of the rendered values; surfaced as a typed error rather than a
+    /// silent unwrap.
+    #[error("failed to format generator output: {0}")]
+    Format(#[from] std::fmt::Error),
 }
 
 impl GeneratorError {
@@ -236,14 +243,14 @@ fn collect_adapter_data(
             blueprint,
             &crate_name,
             &crate_dir_rel,
-        ));
+        )?);
         append_readme_entries(
             blueprint,
             &crate_name,
             &crate_dir_rel,
             &mut readme_adapter_crates,
             &mut readme_adapter_dev,
-        );
+        )?;
 
         workspace_members.push(format!("  \"crates/{crate_name}\","));
         adapter_ids.push(blueprint.id.to_owned());
@@ -315,7 +322,7 @@ fn render_manifest_section(
     blueprint: &'static AdapterBlueprint,
     crate_name: &str,
     crate_dir_rel: &str,
-) -> String {
+) -> Result<String, std::fmt::Error> {
     let build_cmd = blueprint
         .commands
         .build
@@ -333,14 +340,16 @@ fn render_manifest_section(
         .replace("{crate_dir}", crate_dir_rel);
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "[adapters.{}.adapter]\ncrate = \"crates/{}\"\nmanifest = \"crates/{}/{}\"\n\n",
+    writeln!(
+        out,
+        "[adapters.{}.adapter]\ncrate = \"crates/{}\"\nmanifest = \"crates/{}/{}\"\n",
         blueprint.id, crate_name, crate_name, blueprint.manifest.manifest_filename,
-    ));
-    out.push_str(&format!(
-        "[adapters.{}.build]\ntarget = \"{}\"\nprofile = \"{}\"\n",
+    )?;
+    writeln!(
+        out,
+        "[adapters.{}.build]\ntarget = \"{}\"\nprofile = \"{}\"",
         blueprint.id, blueprint.manifest.build_target, blueprint.manifest.build_profile,
-    ));
+    )?;
     if !blueprint.manifest.build_features.is_empty() {
         let joined = blueprint
             .manifest
@@ -349,33 +358,35 @@ fn render_manifest_section(
             .map(|f| format!("\"{f}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        out.push_str(&format!("features = [{joined}]\n"));
+        writeln!(out, "features = [{joined}]")?;
     }
     out.push('\n');
-    out.push_str(&format!(
-        "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n\n",
+    writeln!(
+        out,
+        "[adapters.{}.commands]\nbuild = \"{}\"\ndeploy = \"{}\"\nserve = \"{}\"\n",
         blueprint.id, build_cmd, deploy_cmd, serve_cmd,
-    ));
+    )?;
 
     out.push('\n');
-    out.push_str(&format!("[adapters.{}.logging]\n", blueprint.id));
+    writeln!(out, "[adapters.{}.logging]", blueprint.id)?;
     let endpoint = if blueprint.id == "fastly" {
         Some(format!("{}_log", layout.project_mod))
     } else {
         blueprint.logging.endpoint.map(str::to_owned)
     };
     if let Some(endpoint) = endpoint {
-        out.push_str(&format!("endpoint = \"{endpoint}\"\n"));
+        writeln!(out, "endpoint = \"{endpoint}\"")?;
     }
-    out.push_str(&format!("level = \"{}\"\n", blueprint.logging.level));
+    writeln!(out, "level = \"{}\"", blueprint.logging.level)?;
     if let Some(echo_stdout) = blueprint.logging.echo_stdout {
-        out.push_str(&format!(
-            "echo_stdout = {}\n",
+        writeln!(
+            out,
+            "echo_stdout = {}",
             if echo_stdout { "true" } else { "false" },
-        ));
+        )?;
     }
     out.push('\n');
-    out
+    Ok(out)
 }
 
 /// Append the per-adapter README entries for crates list and dev-step list.
@@ -385,25 +396,29 @@ fn append_readme_entries(
     crate_dir_rel: &str,
     readme_adapter_crates: &mut String,
     readme_adapter_dev: &mut String,
-) {
+) -> Result<(), std::fmt::Error> {
     let description = blueprint
         .readme
         .description
         .replace("{display}", blueprint.display_name);
-    readme_adapter_crates.push_str(&format!("- `crates/{crate_name}`: {description}\n"));
+    writeln!(
+        readme_adapter_crates,
+        "- `crates/{crate_name}`: {description}"
+    )?;
 
     let heading = blueprint
         .readme
         .dev_heading
         .replace("{display}", blueprint.display_name);
-    readme_adapter_dev.push_str(&format!("- {heading}:\n"));
+    writeln!(readme_adapter_dev, "- {heading}:")?;
     for step in blueprint.readme.dev_steps {
         let formatted = step
             .replace("{crate}", crate_name)
             .replace("{crate_dir}", crate_dir_rel);
-        readme_adapter_dev.push_str(&format!("  - {formatted}\n"));
+        writeln!(readme_adapter_dev, "  - {formatted}")?;
     }
     readme_adapter_dev.push('\n');
+    Ok(())
 }
 
 fn build_base_data(
