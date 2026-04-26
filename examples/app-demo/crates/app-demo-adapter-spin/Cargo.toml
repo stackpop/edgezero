@@ -5,6 +5,9 @@ edition = "2021"
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [lib]
 crate-type = ["cdylib"]
 path = "src/lib.rs"

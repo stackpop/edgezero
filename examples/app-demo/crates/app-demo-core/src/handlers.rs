@@ -7,7 +7,7 @@ use edgezero_core::extractor::{Headers, Json, Kv, Path, Query, Secrets, Validate
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt as _};
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 const ALLOWED_CONFIG_KEYS: &[&str] = &["greeting", "feature.new_checkout", "service.timeout_ms"];
@@ -68,13 +68,13 @@ pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
         .get("user-agent")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("(unknown)");
-    Text::new(format!("ua={}", ua))
+    Text::new(format!("ua={ua}"))
 }
 
 #[action]
 pub(crate) async fn stream() -> Response {
     let body =
-        Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!("chunk {}\n", index))));
+        Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!("chunk {index}\n"))));
 
     http::response_builder()
         .status(StatusCode::OK)
@@ -173,7 +173,7 @@ pub(crate) async fn config_get(RequestContext(ctx): RequestContext) -> Result<Re
 #[action]
 pub(crate) async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
     let count: i64 = store
-        .read_modify_write("demo:counter", 0i64, |n| n + 1)
+        .read_modify_write("demo:counter", 0_i64, |n| n + 1)
         .await?;
     let body = serde_json::json!({ "count": count }).to_string();
     http::response_builder()
@@ -239,7 +239,7 @@ pub(crate) async fn kv_note_delete(
 
 /// Echo the value of an allowlisted smoke-test secret from the configured store.
 ///
-/// Usage: GET /secrets/echo?name=SMOKE_SECRET
+/// Usage: `GET /secrets/echo?name=SMOKE_SECRET`
 #[action]
 pub(crate) async fn secrets_echo(
     Secrets(store): Secrets,
@@ -273,8 +273,8 @@ mod tests {
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
-    use edgezero_core::response::IntoResponse;
-    use futures::{executor::block_on, StreamExt};
+    use edgezero_core::response::IntoResponse as _;
+    use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
 
@@ -462,7 +462,7 @@ mod tests {
         let store = MapConfigStore(
             entries
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
         );
         request
@@ -638,8 +638,8 @@ mod tests {
             Body::from("hello world"),
             &[("id", "abc")],
         );
-        let resp = block_on(kv_note_put(ctx)).expect("response");
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        let put_resp = block_on(kv_note_put(ctx)).expect("response");
+        assert_eq!(put_resp.status(), StatusCode::CREATED);
 
         let (ctx2, _) = {
             let mut request = request_builder()
@@ -655,10 +655,14 @@ mod tests {
                 handle.clone(),
             )
         };
-        let resp = block_on(kv_note_get(ctx2)).expect("response");
-        assert_eq!(resp.status(), StatusCode::OK);
+        let get_resp = block_on(kv_note_get(ctx2)).expect("response");
+        assert_eq!(get_resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.into_body().into_bytes().expect("buffered").as_ref(),
+            get_resp
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .as_ref(),
             b"hello world"
         );
     }
@@ -708,11 +712,11 @@ mod tests {
         let provider = InMemorySecretStore::new(entries.iter().map(|(k, v)| {
             (
                 format!("{SECRET_STORE_NAME}/{k}"),
-                bytes::Bytes::from(v.to_string()),
+                bytes::Bytes::from((*v).to_string()),
             )
         }));
         let handle = SecretHandle::new(std::sync::Arc::new(provider));
-        let uri = format!("{}?{}", path, query);
+        let uri = format!("{path}?{query}");
         let mut request = request_builder()
             .method(Method::GET)
             .uri(uri.as_str())
