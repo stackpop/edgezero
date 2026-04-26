@@ -49,6 +49,11 @@ pub fn register_templates(hbs: &mut Handlebars) {
         include_str!("templates/root/gitignore.hbs"),
     )
     .expect("compiled-in template is valid");
+    hbs.register_template_string(
+        "root_clippy_toml",
+        include_str!("templates/root/clippy.toml.hbs"),
+    )
+    .expect("compiled-in template is valid");
     // Core
     hbs.register_template_string(
         "core_Cargo_toml",
@@ -199,6 +204,7 @@ mod tests {
             "root_edgezero_toml",
             "root_README_md",
             "root_gitignore",
+            "root_clippy_toml",
             "core_Cargo_toml",
             "core_src_lib_rs",
             "core_src_handlers_rs",

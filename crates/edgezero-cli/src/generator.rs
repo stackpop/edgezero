@@ -495,6 +495,12 @@ fn render_templates(
         data_value,
         &layout.out_dir.join(".gitignore"),
     )?;
+    write_tmpl(
+        &hbs,
+        "root_clippy_toml",
+        data_value,
+        &layout.out_dir.join("clippy.toml"),
+    )?;
 
     log::info!("[edgezero] writing core crate {}", layout.core_name);
     write_tmpl(
@@ -668,5 +674,28 @@ mod tests {
         let gitignore =
             std::fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
         assert!(gitignore.contains("target/"));
+
+        let clippy =
+            std::fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
+        assert!(clippy.contains("allow-expect-in-tests = true"));
+
+        assert!(cargo_toml.contains("[workspace.lints.clippy]"));
+        assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
+
+        for crate_dir in [
+            "crates/demo-app-core",
+            "crates/demo-app-adapter-axum",
+            "crates/demo-app-adapter-cloudflare",
+            "crates/demo-app-adapter-fastly",
+            "crates/demo-app-adapter-spin",
+        ] {
+            let path = project_dir.join(crate_dir).join("Cargo.toml");
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("read {}", path.display()));
+            assert!(
+                body.contains("[lints]\nworkspace = true"),
+                "{crate_dir} must inherit workspace lints",
+            );
+        }
     }
 }
