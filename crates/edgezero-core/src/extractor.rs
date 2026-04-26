@@ -108,6 +108,7 @@ impl DerefMut for Headers {
 }
 
 impl Headers {
+    #[must_use]
     pub fn into_inner(self) -> HeaderMap {
         self.0
     }
@@ -148,6 +149,7 @@ impl Deref for Host {
 }
 
 impl Host {
+    #[must_use]
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -194,6 +196,7 @@ impl Deref for ForwardedHost {
 }
 
 impl ForwardedHost {
+    #[must_use]
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -445,6 +448,7 @@ impl DerefMut for Kv {
 }
 
 impl Kv {
+    #[must_use]
     pub fn into_inner(self) -> KvHandle {
         self.0
     }
@@ -494,6 +498,7 @@ impl DerefMut for Secrets {
 }
 
 impl Secrets {
+    #[must_use]
     pub fn into_inner(self) -> SecretHandle {
         self.0
     }

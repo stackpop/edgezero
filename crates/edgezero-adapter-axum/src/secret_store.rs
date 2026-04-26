@@ -18,6 +18,7 @@ use edgezero_core::secret_store::{SecretError, SecretStore};
 pub struct EnvSecretStore;
 
 impl EnvSecretStore {
+    #[must_use]
     pub fn new() -> Self {
         Self
     }

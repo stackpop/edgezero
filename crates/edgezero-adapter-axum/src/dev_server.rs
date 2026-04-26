@@ -68,6 +68,7 @@ pub struct AxumDevServer {
 }
 
 impl AxumDevServer {
+    #[must_use]
     pub fn new(router: RouterService) -> Self {
         Self {
             router,
@@ -76,6 +77,7 @@ impl AxumDevServer {
         }
     }
 
+    #[must_use]
     pub fn with_config(router: RouterService, config: AxumDevServerConfig) -> Self {
         Self {
             router,

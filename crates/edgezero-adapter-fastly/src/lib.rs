@@ -160,12 +160,12 @@ pub fn run_app<A: Hooks>(
 /// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
 pub fn run_app_with_config<A: Hooks>(
-    logging: FastlyLogging,
+    logging: &FastlyLogging,
     req: fastly::Request,
     config_store_name: Option<&str>,
 ) -> Result<fastly::Response, fastly::Error> {
     run_app_with_stores::<A>(
-        &logging,
+        logging,
         req,
         config_store_name,
         DEFAULT_KV_STORE_NAME,
@@ -179,11 +179,11 @@ pub fn run_app_with_config<A: Hooks>(
 /// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
 pub fn run_app_with_logging<A: Hooks>(
-    logging: FastlyLogging,
+    logging: &FastlyLogging,
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
     run_app_with_stores::<A>(
-        &logging,
+        logging,
         req,
         None,
         DEFAULT_KV_STORE_NAME,

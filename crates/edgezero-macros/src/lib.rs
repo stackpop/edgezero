@@ -1,5 +1,6 @@
 mod action;
 mod app;
+mod manifest_definitions;
 
 use proc_macro::TokenStream;
 

@@ -30,9 +30,9 @@ const WARNED_STORE_CACHE_LIMIT: usize = 64;
 /// ```
 #[derive(Default)]
 pub(crate) struct Stores {
-    pub(crate) config_store: Option<ConfigStoreHandle>,
-    pub(crate) kv: Option<KvHandle>,
-    pub(crate) secrets: Option<SecretHandle>,
+    pub config_store: Option<ConfigStoreHandle>,
+    pub kv: Option<KvHandle>,
+    pub secrets: Option<SecretHandle>,
 }
 
 /// Default Fastly KV Store name.
@@ -254,7 +254,7 @@ impl RecentStringSet {
     }
 }
 
-fn map_edge_error(err: EdgeError) -> FastlyError {
+fn map_edge_error(err: &EdgeError) -> FastlyError {
     FastlyError::msg(err.to_string())
 }
 
@@ -320,7 +320,7 @@ pub(crate) fn dispatch_with_handles(
     req: FastlyRequest,
     stores: Stores,
 ) -> Result<FastlyResponse, FastlyError> {
-    let core_request = into_core_request(req).map_err(map_edge_error)?;
+    let core_request = into_core_request(req).map_err(|err| map_edge_error(&err))?;
     dispatch_core_request(app, core_request, stores)
 }
 
@@ -338,9 +338,9 @@ fn dispatch_core_request(
     if let Some(handle) = stores.secrets {
         core_request.extensions_mut().insert(handle);
     }
-    let response =
-        executor::block_on(app.router().oneshot(core_request)).map_err(map_edge_error)?;
-    from_core_response(response).map_err(map_edge_error)
+    let response = executor::block_on(app.router().oneshot(core_request))
+        .map_err(|err| map_edge_error(&err))?;
+    from_core_response(response).map_err(|err| map_edge_error(&err))
 }
 
 pub(crate) fn resolve_kv_handle(

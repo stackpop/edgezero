@@ -27,6 +27,16 @@ impl ScaffoldError {
     }
 }
 
+/// Registers all compile-time-embedded templates.
+///
+/// Each `register_template_string` call uses `.expect(..)` because the inputs
+/// are static strings via `include_str!` — failure can only happen if the
+/// template source itself has invalid Handlebars syntax, which is a
+/// build-time programmer error caught the moment the binary is run.
+#[expect(
+    clippy::expect_used,
+    reason = "compile-time-embedded templates: parse failure is a build bug"
+)]
 pub fn register_templates(hbs: &mut Handlebars) {
     // Root
     hbs.register_template_string(

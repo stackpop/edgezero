@@ -1,3 +1,11 @@
+// Integration test target (`tests/contract.rs`) — clippy doesn't apply
+// `allow-*-in-tests` to integration tests by default, so opt back in here.
+#![allow(
+    clippy::expect_used,
+    clippy::tests_outside_test_module,
+    reason = "integration test target — top-level test fns are correct here"
+)]
+
 use bytes::Bytes;
 use edgezero_adapter_spin::SpinRequestContext;
 use edgezero_core::app::App;

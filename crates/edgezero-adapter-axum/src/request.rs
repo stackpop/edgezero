@@ -79,7 +79,12 @@ fn is_json_content_type(value: &HeaderValue) -> bool {
     }
 
     let subtype = subtype.trim();
-    subtype.len() >= 5 && subtype[subtype.len() - 5..].eq_ignore_ascii_case("+json")
+    let Some(suffix_start) = subtype.len().checked_sub(5) else {
+        return false;
+    };
+    subtype
+        .get(suffix_start..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json"))
 }
 
 #[cfg(test)]

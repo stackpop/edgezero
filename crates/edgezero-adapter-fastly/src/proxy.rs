@@ -23,7 +23,7 @@ impl ProxyClient for FastlyProxyClient {
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _ext) = request.into_parts();
         let backend_name = ensure_backend(&uri)?;
-        let fastly_request = build_fastly_request(method, &uri, headers);
+        let fastly_request = build_fastly_request(method, &uri, &headers);
         let (mut streaming_body, pending_request) = fastly_request
             .send_async_streaming(&backend_name)
             .map_err(EdgeError::internal)?;
@@ -40,11 +40,11 @@ impl ProxyClient for FastlyProxyClient {
     }
 }
 
-fn build_fastly_request(method: Method, uri: &Uri, headers: HeaderMap) -> FastlyRequest {
+fn build_fastly_request(method: Method, uri: &Uri, headers: &HeaderMap) -> FastlyRequest {
     let mut fastly_request = FastlyRequest::new(method.clone(), uri.to_string());
     fastly_request.set_method(method);
 
-    for (name, value) in &headers {
+    for (name, value) in headers {
         if name.as_str().eq_ignore_ascii_case("host") {
             continue;
         }

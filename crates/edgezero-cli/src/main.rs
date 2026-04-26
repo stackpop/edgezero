@@ -40,7 +40,7 @@ fn main() {
     let args = Args::parse();
     match args.cmd {
         Command::New(new_args) => {
-            if let Err(e) = generator::generate_new(new_args) {
+            if let Err(e) = generator::generate_new(&new_args) {
                 log::error!("[edgezero] new error: {e}");
                 std::process::exit(1);
             }

@@ -34,10 +34,12 @@ impl RouteInfo {
         }
     }
 
+    #[must_use]
     pub fn method(&self) -> &Method {
         &self.method
     }
 
+    #[must_use]
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -71,6 +73,7 @@ pub struct RouterBuilder {
 }
 
 impl RouterBuilder {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -155,6 +158,13 @@ impl RouterBuilder {
 
     /// # Panics
     /// Panics if a route is registered for both an explicit path and the route-listing path.
+    /// Both paths are programmer-supplied at build time; a duplicate is a routing-config bug
+    /// that should fail loudly before the binary ever serves traffic.
+    #[expect(
+        clippy::panic,
+        reason = "duplicate route is a build-time programmer error, not a runtime condition"
+    )]
+    #[must_use]
     pub fn build(mut self) -> RouterService {
         let listing_path = self.route_listing_path.clone();
 
@@ -197,6 +207,10 @@ impl RouterBuilder {
         RouterService::new(self.routes, self.middlewares, route_index)
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "duplicate route is a build-time programmer error, not a runtime condition"
+    )]
     fn add_route<H>(&mut self, path: &str, method: Method, handler: H)
     where
         H: IntoHandler,
@@ -237,10 +251,12 @@ impl RouterService {
         }
     }
 
+    #[must_use]
     pub fn builder() -> RouterBuilder {
         RouterBuilder::new()
     }
 
+    #[must_use]
     pub fn routes(&self) -> Vec<RouteInfo> {
         self.inner.route_index.to_vec()
     }
@@ -485,7 +501,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplicate route definition")]
     fn route_listing_duplicate_path_panics() {
-        RouterService::builder()
+        let _service = RouterService::builder()
             .enable_route_listing()
             .get(DEFAULT_ROUTE_LISTING_PATH, ok_handler)
             .build();
@@ -649,7 +665,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplicate route definition")]
     fn duplicate_route_definition_panics() {
-        RouterService::builder()
+        let _service = RouterService::builder()
             .get("/dup", ok_handler)
             .get("/dup", ok_handler)
             .build();

@@ -17,10 +17,12 @@ pub type Uri = http::Uri;
 pub type Version = http::Version;
 pub type Extensions = http::Extensions;
 
+#[must_use]
 pub fn request_builder() -> RequestBuilder {
     http::Request::builder()
 }
 
+#[must_use]
 pub fn response_builder() -> ResponseBuilder {
     http::Response::builder()
 }

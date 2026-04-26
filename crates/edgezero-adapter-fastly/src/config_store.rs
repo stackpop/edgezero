@@ -40,14 +40,16 @@ impl FastlyConfigStore {
 impl ConfigStore for FastlyConfigStore {
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
-            FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(key).map_err(map_lookup_error),
+            FastlyConfigStoreBackend::Fastly(inner) => {
+                inner.try_get(key).map_err(|err| map_lookup_error(&err))
+            }
             #[cfg(test)]
             FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(key).cloned()),
         }
     }
 }
 
-fn map_lookup_error(err: fastly::config_store::LookupError) -> ConfigStoreError {
+fn map_lookup_error(err: &fastly::config_store::LookupError) -> ConfigStoreError {
     // `LookupError` is from the `fastly` crate; using a wildcard arm guards
     // against new variants being added in upstream point releases without
     // forcing us into a breaking match every bump.
@@ -80,13 +82,13 @@ mod tests {
 
     #[test]
     fn key_invalid_maps_to_invalid_key_error() {
-        let err = map_lookup_error(fastly::config_store::LookupError::KeyInvalid);
+        let err = map_lookup_error(&fastly::config_store::LookupError::KeyInvalid);
         assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
     }
 
     #[test]
     fn key_too_long_maps_to_invalid_key_error() {
-        let err = map_lookup_error(fastly::config_store::LookupError::KeyTooLong);
+        let err = map_lookup_error(&fastly::config_store::LookupError::KeyTooLong);
         assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
     }
 }
