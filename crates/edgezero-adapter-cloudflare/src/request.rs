@@ -307,7 +307,10 @@ async fn dispatch_core_request(
         core_request.extensions_mut().insert(handle);
     }
     let svc = app.router().clone();
-    let response = svc.oneshot(core_request).await;
+    let response = svc
+        .oneshot(core_request)
+        .await
+        .map_err(edge_error_to_worker)?;
     from_core_response(response).map_err(edge_error_to_worker)
 }
 
