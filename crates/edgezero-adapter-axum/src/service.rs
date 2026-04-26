@@ -197,7 +197,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
-        let store: Arc<dyn edgezero_core::KvStore> =
+        let store: Arc<dyn edgezero_core::key_value_store::KvStore> =
             Arc::new(PersistentKvStore::new(db_path).unwrap());
         let handle = KvHandle::new(Arc::clone(&store));
         handle.put("test_key", &"injected").await.unwrap();

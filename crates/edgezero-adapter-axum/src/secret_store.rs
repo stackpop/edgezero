@@ -112,7 +112,7 @@ mod tests {
     use edgezero_core::secret_store_contract_tests;
 
     secret_store_contract_tests!(env_secret_contract, {
-        edgezero_core::InMemorySecretStore::new([
+        edgezero_core::secret_store::InMemorySecretStore::new([
             ("mystore/contract_key", Bytes::from("contract_value")),
             ("mystore/contract_key_2", Bytes::from("another_value")),
         ])
