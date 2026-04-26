@@ -1,5 +1,12 @@
 //! Axum adapter for `EdgeZero` routers and applications.
 
+#![expect(
+    clippy::pub_use,
+    reason = "the adapter's public API is `pub use`-exported from private modules; the lint is \
+              module-scoped, so a file-level `expect` covers the small fixed set of re-exports \
+              below"
+)]
+
 #[cfg(feature = "axum")]
 pub mod config_store;
 #[cfg(feature = "axum")]

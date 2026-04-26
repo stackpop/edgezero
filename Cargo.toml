@@ -93,12 +93,6 @@ single_call_fn = "allow"
 separated_literal_suffix = "allow"
 # rustfmt rewrites `pub(in crate)` → `pub(crate)`; we follow rustfmt.
 pub_with_shorthand = "allow"
-# `pub_use` is module-scoped (cannot be silenced per-item with `#[expect]`).
-# Required by two intentional public-API patterns: proc-macro re-export
-# (`pub use edgezero_macros::{action, app}` — users depend on edgezero-core
-# only) and the `edgezero_core::http` facade (CLAUDE.md mandates downstream
-# code never imports from the `http` crate directly).
-pub_use = "allow"
 # `e`, `id`, `i`, `kv`, `m`, `ty` are universal; renaming hurts readability.
 min_ident_chars = "allow"
 # `edgezero_core::CoreError` is clearer than bare `Error` cross-crate.

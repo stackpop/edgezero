@@ -1,4 +1,16 @@
 //! Adapter helpers for Cloudflare Workers.
+//
+// `clippy::pub_use` is silenced via a `cfg_attr`-gated `expect` because the
+// re-export sites are themselves gated on wasm32; an unconditional `expect`
+// would be unfulfilled on the host build.
+#![cfg_attr(
+    all(feature = "cloudflare", target_arch = "wasm32"),
+    expect(
+        clippy::pub_use,
+        reason = "the adapter's public API is `pub use`-exported from private modules; the lint \
+                  is module-scoped"
+    )
+)]
 
 #[cfg(feature = "cli")]
 pub mod cli;

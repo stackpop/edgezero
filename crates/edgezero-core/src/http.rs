@@ -6,10 +6,21 @@ use crate::error::EdgeError;
 
 // CLAUDE.md mandates that application code never imports from the `http`
 // crate directly — every HTTP type must come through `edgezero_core::http`.
-// That contract is what these re-exports exist for.
-pub use http::header;
-pub use http::request::Builder as RequestBuilder;
-pub use http::response::Builder as ResponseBuilder;
+// `Builder` types are exposed via `pub type` aliases (not `pub use`) so
+// only the `header` re-export remains, scoped to its own child module.
+pub type RequestBuilder = http::request::Builder;
+pub type ResponseBuilder = http::response::Builder;
+
+/// Re-exports of [`http::header`] used by adapters and handlers.
+pub mod header {
+    #![expect(
+        clippy::pub_use,
+        reason = "header constants/types must be re-exported through this module to satisfy the \
+                  CLAUDE.md `edgezero_core::http` facade rule; downstream code must not depend on \
+                  the `http` crate directly"
+    )]
+    pub use http::header::*;
+}
 
 pub type Method = http::Method;
 pub type StatusCode = http::StatusCode;
