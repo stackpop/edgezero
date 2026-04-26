@@ -1,6 +1,7 @@
 use crate::args::NewArgs;
 use crate::scaffold::{
     register_templates, resolve_dep_line, sanitize_crate_name, write_tmpl, ResolvedDependency,
+    ScaffoldError,
 };
 use edgezero_adapter::scaffold;
 use edgezero_adapter::scaffold::AdapterBlueprint;
@@ -9,6 +10,41 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use thiserror::Error;
+
+/// Errors produced by `edgezero new`.
+#[derive(Debug, Error)]
+pub enum GeneratorError {
+    /// The target output directory already exists; refusing to overwrite.
+    #[error("directory '{}' already exists", .0.display())]
+    OutputDirExists(PathBuf),
+    /// An adapter context was constructed with no terminal path component.
+    /// Should be unreachable given the layout we build, but propagated rather
+    /// than panicking on the request path.
+    #[error("adapter context directory has no file name: {}", .0.display())]
+    AdapterDirMissingFileName(PathBuf),
+    /// A filesystem read/write/metadata operation failed while preparing the
+    /// project skeleton.
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A template under the workspace scaffold could not be rendered or
+    /// written. Wraps [`ScaffoldError`] for context.
+    #[error(transparent)]
+    Scaffold(#[from] ScaffoldError),
+}
+
+impl GeneratorError {
+    fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        GeneratorError::Io {
+            path: path.into(),
+            source,
+        }
+    }
+}
 
 struct AdapterContext<'a> {
     blueprint: &'a AdapterBlueprint,
@@ -27,18 +63,15 @@ struct ProjectLayout {
 }
 
 impl ProjectLayout {
-    fn new(args: &NewArgs) -> std::io::Result<Self> {
+    fn new(args: &NewArgs) -> Result<Self, GeneratorError> {
         let name = sanitize_crate_name(&args.name);
         let base_dir = match args.dir.as_deref() {
             Some(dir) => PathBuf::from(dir),
-            None => std::env::current_dir()?,
+            None => std::env::current_dir().map_err(|e| GeneratorError::io(".", e))?,
         };
         let out_dir = base_dir.join(&name);
         if out_dir.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("directory '{}' already exists", out_dir.display()),
-            ));
+            return Err(GeneratorError::OutputDirExists(out_dir));
         }
 
         log::info!("[edgezero] creating project at {}", out_dir.display());
@@ -46,7 +79,8 @@ impl ProjectLayout {
         let crates_dir = out_dir.join("crates");
         let core_name = format!("{name}-core");
         let core_dir = crates_dir.join(&core_name);
-        std::fs::create_dir_all(core_dir.join("src"))?;
+        let core_src = core_dir.join("src");
+        std::fs::create_dir_all(&core_src).map_err(|e| GeneratorError::io(&core_src, e))?;
 
         Ok(ProjectLayout {
             project_mod: name.replace('-', "_"),
@@ -69,11 +103,14 @@ struct AdapterArtifacts {
     readme_adapter_dev: String,
 }
 
-pub fn generate_new(args: NewArgs) -> std::io::Result<()> {
+/// # Errors
+/// Returns [`GeneratorError`] if any filesystem operation, template render,
+/// or layout invariant fails.
+pub fn generate_new(args: NewArgs) -> Result<(), GeneratorError> {
     let layout = ProjectLayout::new(&args)?;
 
     let mut workspace_dependencies = seed_workspace_dependencies();
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir().map_err(|e| GeneratorError::io(".", e))?;
     let core_crate_line = resolve_core_dependency(&layout, &cwd, &mut workspace_dependencies);
 
     let adapter_artifacts = collect_adapter_data(&layout, &cwd, &mut workspace_dependencies)?;
@@ -167,7 +204,7 @@ fn collect_adapter_data(
     layout: &ProjectLayout,
     cwd: &Path,
     workspace_dependencies: &mut BTreeMap<String, String>,
-) -> std::io::Result<AdapterArtifacts> {
+) -> Result<AdapterArtifacts, GeneratorError> {
     let mut contexts = Vec::new();
     let mut adapter_ids = Vec::new();
     let mut workspace_members = Vec::new();
@@ -178,9 +215,10 @@ fn collect_adapter_data(
     for blueprint in scaffold::registered_blueprints().iter().copied() {
         let crate_name = format!("{}-{}", layout.name, blueprint.crate_suffix);
         let adapter_dir = layout.crates_dir.join(&crate_name);
-        std::fs::create_dir_all(&adapter_dir)?;
+        std::fs::create_dir_all(&adapter_dir).map_err(|e| GeneratorError::io(&adapter_dir, e))?;
         for dir_name in blueprint.extra_dirs {
-            std::fs::create_dir_all(adapter_dir.join(dir_name))?;
+            let extra = adapter_dir.join(dir_name);
+            std::fs::create_dir_all(&extra).map_err(|e| GeneratorError::io(&extra, e))?;
         }
 
         let crate_dir_rel = format!("crates/{crate_name}");
@@ -428,7 +466,7 @@ fn render_templates(
     layout: &ProjectLayout,
     adapter_contexts: &[AdapterContext],
     data_value: &Value,
-) -> std::io::Result<()> {
+) -> Result<(), GeneratorError> {
     let mut hbs = Handlebars::new();
     register_templates(&mut hbs);
 
@@ -479,12 +517,10 @@ fn render_templates(
     )?;
 
     for context in adapter_contexts {
-        let crate_dir_name = context.dir.file_name().ok_or_else(|| {
-            std::io::Error::other(format!(
-                "adapter context directory has no file name: {}",
-                context.dir.display(),
-            ))
-        })?;
+        let crate_dir_name = context
+            .dir
+            .file_name()
+            .ok_or_else(|| GeneratorError::AdapterDirMissingFileName(context.dir.clone()))?;
         log::info!(
             "[edgezero] writing adapter crate {}",
             crate_dir_name.to_string_lossy(),
