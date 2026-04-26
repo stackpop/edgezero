@@ -85,7 +85,7 @@ impl KvStore for FastlyKvStore {
         limit: usize,
     ) -> Result<KvPage, KvError> {
         let limit = u32::try_from(limit)
-            .map_err(|_e| KvError::Validation("list limit exceeds u32".to_string()))?;
+            .map_err(|_e| KvError::Validation("list limit exceeds u32".to_owned()))?;
 
         let mut request = self.store.build_list().limit(limit);
 

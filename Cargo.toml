@@ -97,8 +97,6 @@ pub_use = "allow"
 # `e`, `id`, `i`, `kv`, `m`, `ty` are universal in Rust — renaming hurts readability.
 min_ident_chars = "allow"
 single_char_lifetime_names = "allow"
-# `.to_string()` on `&str` compiles to identical code as `.to_owned()`.
-str_to_string = "allow"
 shadow_reuse = "allow"
 # `push_str(&format!(...))` is deliberately chosen over `write!(s, ...)` —
 # the latter requires `.unwrap()` (write-to-String never fails) which itself

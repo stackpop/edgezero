@@ -240,7 +240,7 @@ struct RecentStringSet {
 
 impl RecentStringSet {
     fn insert(&mut self, key: &str, limit: usize) -> bool {
-        let owned = key.to_string();
+        let owned = key.to_owned();
         if !self.keys.insert(owned.clone()) {
             return false;
         }

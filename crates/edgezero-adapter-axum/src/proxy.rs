@@ -180,7 +180,7 @@ mod integration_tests {
                     .get("x-custom-header")
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("missing")
-                    .to_string()
+                    .to_owned()
             }),
         );
         let base_url = start_test_server(app).await;

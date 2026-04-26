@@ -121,8 +121,8 @@ impl ConfigStoreHandle {
 /// edgezero_core::config_store_contract_tests!(axum_config_store_contract, {
 ///     AxumConfigStore::new(
 ///         [
-///             ("contract.key.a".to_string(), "value_a".to_string()),
-///             ("contract.key.b".to_string(), "value_b".to_string()),
+///             ("contract.key.a".to_owned(), "value_a".to_owned()),
+///             ("contract.key.b".to_owned(), "value_b".to_owned()),
 ///         ],
 ///         [],
 ///     )
@@ -140,7 +140,7 @@ macro_rules! config_store_contract_tests {
                 let store = $factory;
                 assert_eq!(
                     store.get("contract.key.a").expect("config value"),
-                    Some("value_a".to_string())
+                    Some("value_a".to_owned())
                 );
             }
 
@@ -155,11 +155,11 @@ macro_rules! config_store_contract_tests {
                 let store = $factory;
                 assert_eq!(
                     store.get("contract.key.a").expect("first config value"),
-                    Some("value_a".to_string())
+                    Some("value_a".to_owned())
                 );
                 assert_eq!(
                     store.get("contract.key.b").expect("second config value"),
-                    Some("value_b".to_string())
+                    Some("value_b".to_owned())
                 );
             }
 
@@ -191,7 +191,7 @@ macro_rules! config_store_contract_tests {
                 let handle = ConfigStoreHandle::new(Arc::new($factory));
                 assert_eq!(
                     handle.get("contract.key.a").expect("handle value"),
-                    Some("value_a".to_string())
+                    Some("value_a".to_owned())
                 );
                 assert_eq!(handle.get("contract.key.missing").expect("handle miss"), None);
             }
@@ -237,7 +237,7 @@ mod tests {
             Self {
                 data: entries
                     .iter()
-                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                     .collect(),
             }
         }
@@ -258,7 +258,7 @@ mod tests {
         let h = handle(&[("feature.checkout", "true")]);
         assert_eq!(
             h.get("feature.checkout").expect("config value"),
-            Some("true".to_string())
+            Some("true".to_owned())
         );
     }
 
@@ -273,7 +273,7 @@ mod tests {
         let h = handle(&[("timeout_ms", "1500")]);
         assert_eq!(
             h.get("timeout_ms").expect("config value"),
-            Some("1500".to_string())
+            Some("1500".to_owned())
         );
         assert_eq!(h.get("missing").expect("missing config"), None);
     }
@@ -292,10 +292,7 @@ mod tests {
     fn config_store_handle_new_accepts_arc() {
         let store = Arc::new(TestConfigStore::new(&[("a", "1")]));
         let h = ConfigStoreHandle::new(store);
-        assert_eq!(
-            h.get("a").expect("arc-backed config"),
-            Some("1".to_string())
-        );
+        assert_eq!(h.get("a").expect("arc-backed config"), Some("1".to_owned()));
     }
 
     #[test]

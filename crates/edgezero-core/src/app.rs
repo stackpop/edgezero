@@ -175,7 +175,7 @@ mod tests {
     impl Hooks for TestHooks {
         fn routes() -> RouterService {
             async fn handler(_ctx: RequestContext) -> Result<String, EdgeError> {
-                Ok("ok".to_string())
+                Ok("ok".to_owned())
             }
 
             RouterService::builder().get("/test", handler).build()

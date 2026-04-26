@@ -159,7 +159,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_config_store_handle_injects_into_request() {
-        let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("injected".to_string())));
+        let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("injected".to_owned())));
 
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {

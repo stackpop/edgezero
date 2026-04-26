@@ -58,7 +58,7 @@ mod tests {
 
         let context = SpinRequestContext {
             client_addr: Some(IpAddr::from_str("127.0.0.1").unwrap()),
-            full_url: Some("https://example.com/path".to_string()),
+            full_url: Some("https://example.com/path".to_owned()),
         };
         SpinRequestContext::insert(&mut request, context);
 
