@@ -131,9 +131,6 @@ std_instead_of_core = "allow"
 
 # Cross-crate `#[inline]` is a hint that rustc/LLVM make better than us.
 missing_inline_in_public_items = "allow"
-# Lint matches plain `#[cfg(test)]` only — doesn't recognize our
-# `#[cfg(all(test, feature = "..."))]` modules.
-tests_outside_test_module = "allow"
 
 # Item ordering — core crate files group items by section (struct,
 # inherent impl, trait impl, fns) for readability. Strict alphabetical

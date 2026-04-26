@@ -204,7 +204,8 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
     }
 }
 
-#[cfg(all(test, feature = "cli"))]
+#[cfg(test)]
+#[cfg(feature = "cli")]
 mod tests {
     use super::*;
     use edgezero_core::manifest::ManifestLoader;

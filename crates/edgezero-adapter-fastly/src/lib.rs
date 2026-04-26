@@ -226,7 +226,8 @@ fn run_app_with_stores<A: Hooks>(
     )
 }
 
-#[cfg(all(test, feature = "fastly"))]
+#[cfg(test)]
+#[cfg(feature = "fastly")]
 mod tests {
     use super::*;
 
