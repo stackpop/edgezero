@@ -14,8 +14,8 @@ use edgezero_core::http::Response as CoreResponse;
 /// `edgezero_core::Body` and works well for local development.
 ///
 pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
-    let (parts, body) = response.into_parts();
-    let body = match body {
+    let (parts, core_body) = response.into_parts();
+    let body = match core_body {
         Body::Once(bytes) => AxumBody::from(bytes),
         Body::Stream(stream) => {
             let result = block_on(async {
@@ -87,8 +87,8 @@ mod tests {
         let collected = block_on(async {
             let mut data = Vec::new();
             let mut body_stream = axum_response.into_body().into_data_stream();
-            while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk.expect("chunk");
+            while let Some(result) = body_stream.next().await {
+                let chunk = result.expect("chunk");
                 data.extend_from_slice(&chunk);
             }
             data

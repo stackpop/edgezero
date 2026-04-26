@@ -84,16 +84,16 @@ impl KvStore for FastlyKvStore {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<KvPage, KvError> {
-        let limit = u32::try_from(limit)
+        let limit_u32 = u32::try_from(limit)
             .map_err(|_e| KvError::Validation("list limit exceeds u32".to_owned()))?;
 
-        let mut request = self.store.build_list().limit(limit);
+        let mut request = self.store.build_list().limit(limit_u32);
 
         if !prefix.is_empty() {
             request = request.prefix(prefix);
         }
-        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-            request = request.cursor(cursor);
+        if let Some(token) = cursor.filter(|c| !c.is_empty()) {
+            request = request.cursor(token);
         }
 
         let page = request

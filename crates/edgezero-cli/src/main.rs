@@ -169,13 +169,13 @@ fn handle_serve(adapter_name: &str) -> Result<(), String> {
 #[cfg(feature = "cli")]
 fn ensure_adapter_defined(
     adapter_name: &str,
-    manifest: Option<&ManifestLoader>,
+    manifest_loader: Option<&ManifestLoader>,
 ) -> Result<(), String> {
-    if let Some(manifest) = manifest {
-        if manifest.manifest().adapters.contains_key(adapter_name) {
+    if let Some(loader) = manifest_loader {
+        if loader.manifest().adapters.contains_key(adapter_name) {
             return Ok(());
         }
-        let available: Vec<String> = manifest.manifest().adapters.keys().cloned().collect();
+        let available: Vec<String> = loader.manifest().adapters.keys().cloned().collect();
         if available.is_empty() {
             Err(format!(
                 "adapter `{adapter_name}` is not configured in edgezero.toml (no adapters defined)"

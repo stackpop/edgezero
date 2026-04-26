@@ -226,13 +226,13 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
         .and_then(Value::as_table)
         .ok_or_else(|| format!("adapter table missing in {}", manifest.display()))?;
 
-    let crate_dir = adapter
+    let crate_dir_rel = adapter
         .get("crate_dir")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("adapter.crate_dir missing in {}", manifest.display()))?;
 
     let manifest_dir = manifest.parent().unwrap_or_else(|| Path::new("."));
-    let crate_dir = manifest_dir.join(crate_dir);
+    let crate_dir = manifest_dir.join(crate_dir_rel);
     let cargo_manifest = crate_dir.join("Cargo.toml");
     if !cargo_manifest.exists() {
         return Err(format!(

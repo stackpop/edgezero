@@ -43,12 +43,15 @@ impl AxumConfigStore {
         D: IntoIterator<Item = (String, String)>,
         F: FnMut(&str) -> Option<String>,
     {
-        let defaults: HashMap<String, String> = defaults.into_iter().collect();
-        let env = defaults
+        let collected: HashMap<String, String> = defaults.into_iter().collect();
+        let env = collected
             .keys()
             .filter_map(|key| lookup(key).map(|value| (key.clone(), value)))
             .collect();
-        Self { env, defaults }
+        Self {
+            env,
+            defaults: collected,
+        }
     }
 }
 

@@ -95,8 +95,8 @@ impl Body {
             }
             Body::Stream(mut stream) => {
                 let mut buf = Vec::new();
-                while let Some(chunk) = StreamExt::next(&mut stream).await {
-                    let chunk = chunk.map_err(EdgeError::internal)?;
+                while let Some(result) = StreamExt::next(&mut stream).await {
+                    let chunk = result.map_err(EdgeError::internal)?;
                     buf.extend_from_slice(&chunk);
                     if buf.len() > max_size {
                         return Err(EdgeError::bad_request("request body too large"));
@@ -197,8 +197,8 @@ mod tests {
         let mut stream = body.into_stream().expect("stream");
         let collected = block_on(async {
             let mut data = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.expect("chunk");
+            while let Some(result) = stream.next().await {
+                let chunk = result.expect("chunk");
                 data.extend_from_slice(&chunk);
             }
             data

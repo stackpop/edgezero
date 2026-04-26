@@ -15,8 +15,8 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
         Body::Once(bytes) => fastly_response.set_body(bytes.to_vec()),
         Body::Stream(mut stream) => {
             let mut fastly_body = fastly::Body::new();
-            while let Some(chunk) = futures::executor::block_on(stream.next()) {
-                let chunk = chunk.map_err(EdgeError::internal)?;
+            while let Some(result) = futures::executor::block_on(stream.next()) {
+                let chunk = result.map_err(EdgeError::internal)?;
                 fastly_body.write_all(&chunk).map_err(EdgeError::internal)?;
             }
             fastly_response.set_body(fastly_body);

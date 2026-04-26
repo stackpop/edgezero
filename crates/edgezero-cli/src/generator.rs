@@ -369,12 +369,12 @@ fn render_manifest_section(
 
     out.push('\n');
     writeln!(out, "[adapters.{}.logging]", blueprint.id)?;
-    let endpoint = if blueprint.id == "fastly" {
+    let endpoint_value = if blueprint.id == "fastly" {
         Some(format!("{}_log", layout.project_mod))
     } else {
         blueprint.logging.endpoint.map(str::to_owned)
     };
-    if let Some(endpoint) = endpoint {
+    if let Some(endpoint) = endpoint_value {
         writeln!(out, "endpoint = \"{endpoint}\"")?;
     }
     writeln!(out, "level = \"{}\"", blueprint.logging.level)?;

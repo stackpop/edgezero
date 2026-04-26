@@ -71,8 +71,8 @@ async fn forward_request_body(
             }
         }
         Body::Stream(mut stream) => {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(EdgeError::internal)?;
+            while let Some(result) = stream.next().await {
+                let chunk = result.map_err(EdgeError::internal)?;
                 streaming_body
                     .write_all(&chunk)
                     .map_err(EdgeError::internal)?;
@@ -173,8 +173,8 @@ type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
 
 fn fastly_body_stream(mut body: fastly::Body) -> ChunkStream {
     try_stream! {
-        for chunk in body.read_chunks(8 * 1024) {
-            let chunk = chunk?;
+        for result in body.read_chunks(8 * 1024) {
+            let chunk = result?;
             yield chunk;
         }
     }

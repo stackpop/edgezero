@@ -336,10 +336,10 @@ impl KvStore for PersistentKvStore {
                         break;
                     };
 
-                    let (key, value) = entry.map_err(|e| {
+                    let (key_handle, value) = entry.map_err(|e| {
                         KvError::Internal(anyhow::anyhow!("failed to read range entry: {e}"))
                     })?;
-                    let key = key.value().to_owned();
+                    let key = key_handle.value().to_owned();
 
                     if !prefix.is_empty() && !key.starts_with(prefix) {
                         reached_end = true;

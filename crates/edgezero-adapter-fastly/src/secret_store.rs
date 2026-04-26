@@ -36,12 +36,12 @@ impl FastlyNamedStore {
     }
 
     pub(crate) fn get_bytes_sync(&self, key: &str) -> Result<Option<Bytes>, SecretError> {
-        let secret = self
+        let lookup = self
             .store
             .try_get(key)
             .map_err(|e| SecretError::Internal(anyhow::anyhow!("secret lookup failed: {e}")))?;
 
-        match secret {
+        match lookup {
             Some(secret) => secret.try_plaintext().map(Some).map_err(|e| {
                 SecretError::Internal(anyhow::anyhow!("secret decryption failed: {e}"))
             }),

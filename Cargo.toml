@@ -101,7 +101,6 @@ pub_with_shorthand = "allow"
 pub_use = "allow"
 # `e`, `id`, `i`, `kv`, `m`, `ty` are universal; renaming hurts readability.
 min_ident_chars = "allow"
-shadow_reuse = "allow"
 # `edgezero_core::CoreError` is clearer than bare `Error` cross-crate.
 module_name_repetitions = "allow"
 

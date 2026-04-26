@@ -90,13 +90,16 @@ impl RouterBuilder {
     where
         S: Into<String>,
     {
-        let path = path.into();
-        assert!(!path.is_empty(), "route listing path cannot be empty");
+        let route_listing_path = path.into();
         assert!(
-            path.starts_with('/'),
+            !route_listing_path.is_empty(),
+            "route listing path cannot be empty"
+        );
+        assert!(
+            route_listing_path.starts_with('/'),
             "route listing path must begin with '/'"
         );
-        self.route_listing_path = Some(path);
+        self.route_listing_path = Some(route_listing_path);
         self
     }
 
@@ -176,11 +179,11 @@ impl RouterBuilder {
         let route_index: Arc<[RouteInfo]> = Arc::from(route_info);
 
         if let Some(path) = listing_path {
-            let index = Arc::clone(&route_index);
+            let outer_index = Arc::clone(&route_index);
             let listing_handler = move |_ctx: RequestContext| {
-                let index = Arc::clone(&index);
+                let inner_index = Arc::clone(&outer_index);
                 async move {
-                    let payload: Vec<RouteListingEntry> = index
+                    let payload: Vec<RouteListingEntry> = inner_index
                         .iter()
                         .map(|route| RouteListingEntry {
                             method: route.method().as_str().to_owned(),
@@ -621,8 +624,8 @@ mod tests {
         let mut stream = response.into_body().into_stream().expect("stream body");
         let collected = block_on(async {
             let mut acc = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.expect("chunk");
+            while let Some(result) = stream.next().await {
+                let chunk = result.expect("chunk");
                 acc.extend_from_slice(&chunk);
             }
             acc
