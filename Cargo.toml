@@ -108,9 +108,6 @@ module_name_repetitions = "allow"
 # Defensive coding — match-ergonomics destructures (`if let Some(x) = &foo`)
 # universally; manual `&` patterns make the code noticeably worse.
 pattern_type_mismatch = "allow"
-# Type suffixes on every literal (`0_u32`, `1.0_f64`) is noise without
-# bug-prevention value in routing/parsing/validator code.
-default_numeric_fallback = "allow"
 # Audited: every flagged site is bounded by domain invariants that the
 # rest of the program enforces.
 arithmetic_side_effects = "allow"

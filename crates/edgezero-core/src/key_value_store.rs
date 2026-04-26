@@ -956,8 +956,8 @@ mod tests {
     fn typed_get_or_returns_default() {
         let h = handle();
         futures::executor::block_on(async {
-            let count: i32 = h.get_or("visits", 0).await.unwrap();
-            assert_eq!(count, 0);
+            let count: i32 = h.get_or("visits", 0_i32).await.unwrap();
+            assert_eq!(count, 0_i32);
         });
     }
 
@@ -965,9 +965,9 @@ mod tests {
     fn typed_get_or_returns_existing() {
         let h = handle();
         futures::executor::block_on(async {
-            h.put("visits", &99).await.unwrap();
-            let count: i32 = h.get_or("visits", 0).await.unwrap();
-            assert_eq!(count, 99);
+            h.put("visits", &99_i32).await.unwrap();
+            let count: i32 = h.get_or("visits", 0_i32).await.unwrap();
+            assert_eq!(count, 99_i32);
         });
     }
 
@@ -988,10 +988,16 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             h.put("c", &0_i32).await.unwrap();
-            let after_first = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
-            assert_eq!(after_first, 1);
-            let after_second = h.read_modify_write("c", 0_i32, |n| n + 1).await.unwrap();
-            assert_eq!(after_second, 2);
+            let after_first = h
+                .read_modify_write("c", 0_i32, |n| n + 1_i32)
+                .await
+                .unwrap();
+            assert_eq!(after_first, 1_i32);
+            let after_second = h
+                .read_modify_write("c", 0_i32, |n| n + 1_i32)
+                .await
+                .unwrap();
+            assert_eq!(after_second, 2_i32);
         });
     }
 
@@ -999,8 +1005,11 @@ mod tests {
     fn update_uses_default_when_missing() {
         let h = handle();
         futures::executor::block_on(async {
-            let val = h.read_modify_write("new", 10_i32, |n| n * 2).await.unwrap();
-            assert_eq!(val, 20);
+            let val = h
+                .read_modify_write("new", 10_i32, |n| n * 2_i32)
+                .await
+                .unwrap();
+            assert_eq!(val, 20_i32);
         });
     }
 
@@ -1113,8 +1122,8 @@ mod tests {
         let h2 = h1.clone();
         futures::executor::block_on(async {
             h1.put("shared", &42_i32).await.unwrap();
-            let val: i32 = h2.get_or("shared", 0).await.unwrap();
-            assert_eq!(val, 42);
+            let val: i32 = h2.get_or("shared", 0_i32).await.unwrap();
+            assert_eq!(val, 42_i32);
         });
     }
 
@@ -1158,12 +1167,12 @@ mod tests {
     fn put_with_ttl_typed_helper() {
         let h = handle();
         futures::executor::block_on(async {
-            let data = Counter { count: 7 };
+            let data = Counter { count: 7_i32 };
             h.put_with_ttl("ttl_key", &data, Duration::from_secs(600))
                 .await
                 .unwrap();
             let val: Option<Counter> = h.get("ttl_key").await.unwrap();
-            assert_eq!(val, Some(Counter { count: 7 }));
+            assert_eq!(val, Some(Counter { count: 7_i32 }));
         });
     }
 
@@ -1171,9 +1180,9 @@ mod tests {
     fn get_or_with_complex_default() {
         let h = handle();
         futures::executor::block_on(async {
-            let default = Counter { count: 100 };
+            let default = Counter { count: 100_i32 };
             let val: Counter = h.get_or("missing_struct", default).await.unwrap();
-            assert_eq!(val.count, 100);
+            assert_eq!(val.count, 100_i32);
         });
     }
 
@@ -1182,22 +1191,22 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             let after_first = h
-                .read_modify_write("counter_struct", Counter { count: 0 }, |mut c| {
-                    c.count += 10;
+                .read_modify_write("counter_struct", Counter { count: 0_i32 }, |mut c| {
+                    c.count += 10_i32;
                     c
                 })
                 .await
                 .unwrap();
-            assert_eq!(after_first.count, 10);
+            assert_eq!(after_first.count, 10_i32);
 
             let after_second = h
-                .read_modify_write("counter_struct", Counter { count: 0 }, |mut c| {
-                    c.count += 5;
+                .read_modify_write("counter_struct", Counter { count: 0_i32 }, |mut c| {
+                    c.count += 5_i32;
                     c
                 })
                 .await
                 .unwrap();
-            assert_eq!(after_second.count, 15);
+            assert_eq!(after_second.count, 15_i32);
         });
     }
 
@@ -1384,8 +1393,8 @@ mod tests {
         let h = handle();
         futures::executor::block_on(async {
             h.put("flex", &42_i32).await.unwrap();
-            let int_val: i32 = h.get_or("flex", 0).await.unwrap();
-            assert_eq!(int_val, 42);
+            let int_val: i32 = h.get_or("flex", 0_i32).await.unwrap();
+            assert_eq!(int_val, 42_i32);
 
             // Overwrite with a different type
             h.put("flex", &"now a string").await.unwrap();

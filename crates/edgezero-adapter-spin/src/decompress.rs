@@ -109,7 +109,7 @@ mod tests {
         // We compress a stream of zeros which compresses extremely well.
         let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
         let zeros = vec![0_u8; 1024 * 1024]; // 1 MiB chunk
-        for _ in 0..65 {
+        for _ in 0_i32..65_i32 {
             encoder.write_all(&zeros).unwrap();
         }
         let compressed = encoder.finish().unwrap();

@@ -512,10 +512,10 @@ mod tests {
         let (s, _dir) = store();
         s.put("counter", &0_i32).await.unwrap();
         let val = s
-            .read_modify_write("counter", 0_i32, |n| n + 5)
+            .read_modify_write("counter", 0_i32, |n| n + 5_i32)
             .await
             .unwrap();
-        assert_eq!(val, 5);
+        assert_eq!(val, 5_i32);
     }
 
     #[tokio::test]
@@ -543,7 +543,7 @@ mod tests {
         // tokio::spawn is off-limits. Use OS threads instead — KvHandle is
         // Send + Sync, so each thread moves its own clone and runs its own
         // executor. This is genuinely concurrent at the OS level.
-        let threads: Vec<_> = (0..100_i32)
+        let threads: Vec<_> = (0_i32..100_i32)
             .map(|i| {
                 let h = handle.clone();
                 std::thread::spawn(move || {
@@ -561,9 +561,9 @@ mod tests {
 
         // Verify all 100 keys survived concurrent writes with correct values.
         futures::executor::block_on(async {
-            for i in 0..100_i32 {
+            for i in 0_i32..100_i32 {
                 let key = format!("key:{i}");
-                let val: i32 = handle.get_or(&key, -1).await.unwrap();
+                let val: i32 = handle.get_or(&key, -1_i32).await.unwrap();
                 assert_eq!(val, i, "key:{i} has wrong value after concurrent writes");
             }
         });

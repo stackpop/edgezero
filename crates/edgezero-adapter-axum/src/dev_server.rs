@@ -661,7 +661,7 @@ mod integration_tests {
 
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let store = ctx.kv_handle().expect("kv configured");
-            let val: i32 = store.get_or("counter", 0).await?;
+            let val: i32 = store.get_or("counter", 0_i32).await?;
             Ok(val.to_string())
         }
 
@@ -741,7 +741,9 @@ mod integration_tests {
     async fn kv_store_update_across_requests() {
         async fn increment_handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let kv = ctx.kv_handle().expect("kv configured");
-            let val = kv.read_modify_write("counter", 0_i32, |n| n + 1).await?;
+            let val = kv
+                .read_modify_write("counter", 0_i32, |n| n + 1_i32)
+                .await?;
             Ok(val.to_string())
         }
 
@@ -753,7 +755,7 @@ mod integration_tests {
         let url = format!("{}/inc", server.base_url);
 
         // Increment 5 times, each should return incremented value
-        for expected in 1..=5_i32 {
+        for expected in 1_i32..=5_i32 {
             let resp = send_with_retry(&client, |c| c.post(url.as_str())).await;
             assert_eq!(
                 resp.text().await.unwrap(),
@@ -769,7 +771,7 @@ mod integration_tests {
     async fn kv_store_returns_not_found_gracefully() {
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let kv = ctx.kv_handle().expect("kv configured");
-            let val: i32 = kv.get_or("nonexistent", -1).await?;
+            let val: i32 = kv.get_or("nonexistent", -1_i32).await?;
             Ok(val.to_string())
         }
 
