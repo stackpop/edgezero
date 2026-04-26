@@ -1,3 +1,5 @@
+use std::env;
+
 use bytes::Bytes;
 use edgezero_core::action;
 use edgezero_core::body::Body;
@@ -42,7 +44,7 @@ const MAX_NOTE_ID_LEN: u64 = 507;
 #[derive(serde::Deserialize, validator::Validate)]
 pub(crate) struct NoteIdPath {
     #[validate(length(
-        min = 1,
+        min = 1_u64,
         max = "MAX_NOTE_ID_LEN",
         message = "note id must be 1–507 bytes"
     ))]
@@ -72,15 +74,16 @@ pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
 }
 
 #[action]
-pub(crate) async fn stream() -> Response {
-    let body =
-        Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!("chunk {index}\n"))));
+pub(crate) async fn stream() -> Result<Response, EdgeError> {
+    let body = Body::stream(
+        stream::iter(0_i32..3_i32).map(|index| Bytes::from(format!("chunk {index}\n"))),
+    );
 
     http::response_builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; charset=utf-8")
         .body(body)
-        .expect("static stream response")
+        .map_err(EdgeError::internal)
 }
 
 #[action]
@@ -93,7 +96,7 @@ pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Re
     let params: ProxyPath = ctx.path()?;
     let proxy_handle = ctx.proxy_handle();
     let request = ctx.into_request();
-    let base = std::env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_string());
+    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_string());
     let target = build_proxy_target(&base, &params.rest, request.uri())?;
     let proxy_request = ProxyRequest::from_request(request, target);
 
@@ -277,6 +280,7 @@ mod tests {
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn root_returns_static_body() {
@@ -325,8 +329,8 @@ mod tests {
         let mut chunks = response.into_body().into_stream().expect("stream body");
         let collected = block_on(async {
             let mut buf = Vec::new();
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk.expect("chunk");
+            while let Some(item) = chunks.next().await {
+                let chunk = item.expect("chunk");
                 buf.extend_from_slice(&chunk);
             }
             buf
@@ -564,7 +568,7 @@ mod tests {
             &self,
             key: &str,
             value: Bytes,
-            _ttl: std::time::Duration,
+            _ttl: Duration,
         ) -> Result<(), KvError> {
             self.data.lock().unwrap().insert(key.to_string(), value);
             Ok(())
@@ -573,6 +577,10 @@ mod tests {
         async fn delete(&self, key: &str) -> Result<(), KvError> {
             self.data.lock().unwrap().remove(key);
             Ok(())
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool, KvError> {
+            Ok(self.data.lock().unwrap().contains_key(key))
         }
 
         async fn list_keys_page(
@@ -584,9 +592,7 @@ mod tests {
             let data = self.data.lock().unwrap();
             let mut keys = data
                 .keys()
-                .filter(|key| {
-                    key.starts_with(prefix) && cursor.is_none_or(|cursor| key.as_str() > cursor)
-                })
+                .filter(|key| key.starts_with(prefix) && cursor.is_none_or(|c| key.as_str() > c))
                 .cloned()
                 .collect::<Vec<_>>();
             let has_more = keys.len() > limit;
@@ -627,7 +633,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().into_bytes().expect("buffered");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["count"], 1);
+        assert_eq!(json["count"], 1_i64);
     }
 
     #[test]
@@ -715,7 +721,7 @@ mod tests {
                 bytes::Bytes::from((*v).to_string()),
             )
         }));
-        let handle = SecretHandle::new(std::sync::Arc::new(provider));
+        let handle = SecretHandle::new(Arc::new(provider));
         let uri = format!("{path}?{query}");
         let mut request = request_builder()
             .method(Method::GET)
