@@ -11,16 +11,15 @@ use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
 use futures::{stream, StreamExt as _};
 
-const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 const ALLOWED_CONFIG_KEYS: &[&str] = &["greeting", "feature.new_checkout", "service.timeout_ms"];
-const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
-const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
+const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
+/// Maximum request body size (25 MB, matches KV value limit).
+const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
+// 512 (KV key limit) - 5 (len of "note:") = 507
+const MAX_NOTE_ID_LEN: u64 = 507;
 const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
-
-#[derive(serde::Deserialize)]
-pub struct EchoParams {
-    pub name: String,
-}
+const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
+const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
 
 #[derive(serde::Deserialize)]
 struct ConfigParams {
@@ -33,13 +32,9 @@ pub struct EchoBody {
 }
 
 #[derive(serde::Deserialize)]
-struct ProxyPath {
-    #[serde(default)]
-    rest: String,
+pub struct EchoParams {
+    pub name: String,
 }
-
-// 512 (KV key limit) - 5 (len of "note:") = 507
-const MAX_NOTE_ID_LEN: u64 = 507;
 
 #[derive(serde::Deserialize, validator::Validate)]
 pub struct NoteIdPath {
@@ -51,8 +46,11 @@ pub struct NoteIdPath {
     pub id: String,
 }
 
-/// Maximum request body size (25 MB, matches KV value limit).
-const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
+#[derive(serde::Deserialize)]
+struct ProxyPath {
+    #[serde(default)]
+    rest: String,
+}
 
 #[action]
 pub async fn root() -> Text<&'static str> {
@@ -277,272 +275,26 @@ mod tests {
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
+    use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    #[test]
-    fn root_returns_static_body() {
-        let ctx = empty_context("/");
-        let response = block_on(root(ctx))
-            .expect("handler ok")
-            .into_response()
-            .expect("response");
-        let bytes = response.into_body().into_bytes().expect("buffered");
-        assert_eq!(bytes.as_ref(), b"app-demo app");
-    }
+    struct MapConfigStore(HashMap<String, String>);
 
-    #[test]
-    fn echo_formats_name_from_path() {
-        let ctx = context_with_params("/echo/alice", &[("name", "alice")]);
-        let response = block_on(echo(ctx))
-            .expect("handler ok")
-            .into_response()
-            .expect("response");
-        let bytes = response.into_body().into_bytes().expect("buffered");
-        assert_eq!(bytes.as_ref(), b"Hello, alice!");
-    }
-
-    #[test]
-    fn headers_reports_user_agent() {
-        let ctx = context_with_header(
-            "/headers",
-            HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("DemoAgent"),
-        );
-
-        let response = block_on(headers(ctx))
-            .expect("handler ok")
-            .into_response()
-            .expect("response");
-        let bytes = response.into_body().into_bytes().expect("buffered");
-        assert_eq!(bytes.as_ref(), b"ua=DemoAgent");
-    }
-
-    #[test]
-    fn stream_emits_expected_chunks() {
-        let ctx = empty_context("/stream");
-        let response = block_on(stream(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let mut chunks = response.into_body().into_stream().expect("stream body");
-        let collected = block_on(async {
-            let mut buf = Vec::new();
-            while let Some(item) = chunks.next().await {
-                let chunk = item.expect("chunk");
-                buf.extend_from_slice(&chunk);
-            }
-            buf
-        });
-        assert_eq!(
-            String::from_utf8(collected).expect("utf8"),
-            "chunk 0\nchunk 1\nchunk 2\n"
-        );
-    }
-
-    #[test]
-    fn echo_json_formats_payload() {
-        let ctx = context_with_json("/echo", r#"{"name":"Edge"}"#);
-        let response = block_on(echo_json(ctx))
-            .expect("handler ok")
-            .into_response()
-            .expect("response");
-        let bytes = response.into_body().into_bytes().expect("buffered");
-        assert_eq!(bytes.as_ref(), b"Hello, Edge!");
-    }
-
-    #[test]
-    fn build_proxy_target_merges_segments_and_query() {
-        let original = Uri::from_static("/proxy/status?foo=bar");
-        let target = build_proxy_target("https://example.com/api", "status/200", &original)
-            .expect("target uri");
-        assert_eq!(
-            target.to_string(),
-            "https://example.com/api/status/200?foo=bar"
-        );
-    }
-
-    #[test]
-    fn proxy_demo_without_handle_returns_placeholder() {
-        let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
-        let response = block_on(proxy_demo(ctx)).expect("response");
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    struct MockKv {
+        data: Mutex<BTreeMap<String, Bytes>>,
     }
 
     struct TestProxyClient;
 
-    #[async_trait(?Send)]
-    impl ProxyClient for TestProxyClient {
-        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
-            let (_method, uri, _headers, _body, _) = request.into_parts();
-            assert!(uri.to_string().contains("status/201"));
-            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
-        }
-    }
-
-    #[test]
-    fn proxy_demo_uses_injected_handle() {
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/proxy/status/201")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(ProxyHandle::with_client(TestProxyClient));
-
-        let mut params = HashMap::new();
-        params.insert("rest".to_owned(), "status/201".to_owned());
-        let ctx = RequestContext::new(request, PathParams::new(params));
-
-        let response = block_on(proxy_demo(ctx)).expect("response");
-        assert_eq!(response.status(), StatusCode::CREATED);
-    }
-
-    fn empty_context(path: &str) -> RequestContext {
-        let request = request_builder()
-            .method(Method::GET)
-            .uri(path)
-            .body(Body::empty())
-            .expect("request");
-        RequestContext::new(request, PathParams::default())
-    }
-
-    fn context_with_params(path: &str, params: &[(&str, &str)]) -> RequestContext {
-        let request = request_builder()
-            .method(Method::GET)
-            .uri(path)
-            .body(Body::empty())
-            .expect("request");
-        let map = params
-            .iter()
-            .map(|&(key, value)| (key.to_owned(), value.to_owned()))
-            .collect::<HashMap<_, _>>();
-        RequestContext::new(request, PathParams::new(map))
-    }
-
-    fn context_with_header(path: &str, header: HeaderName, value: HeaderValue) -> RequestContext {
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri(path)
-            .body(Body::empty())
-            .expect("request");
-        request.headers_mut().insert(header, value);
-        RequestContext::new(request, PathParams::default())
-    }
-
-    fn context_with_json(path: &str, json: &str) -> RequestContext {
-        let request = request_builder()
-            .method(Method::POST)
-            .uri(path)
-            .body(Body::from(json))
-            .expect("request");
-        RequestContext::new(request, PathParams::default())
-    }
-
-    struct MapConfigStore(HashMap<String, String>);
+    struct UnavailableConfigStore;
 
     impl ConfigStore for MapConfigStore {
         fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.0.get(key).cloned())
         }
-    }
-
-    struct UnavailableConfigStore;
-
-    impl ConfigStore for UnavailableConfigStore {
-        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Err(ConfigStoreError::unavailable("backend offline"))
-        }
-    }
-
-    fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri(format!("/config/{key}"))
-            .body(Body::empty())
-            .expect("request");
-        let store = MapConfigStore(
-            entries
-                .iter()
-                .map(|&(name, value)| (name.to_owned(), value.to_owned()))
-                .collect(),
-        );
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(store)));
-        let mut params = HashMap::new();
-        params.insert("name".to_owned(), key.to_owned());
-        RequestContext::new(request, PathParams::new(params))
-    }
-
-    fn context_with_unavailable_config_store(key: &str) -> RequestContext {
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri(format!("/config/{key}"))
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(UnavailableConfigStore)));
-        let mut params = HashMap::new();
-        params.insert("name".to_owned(), key.to_owned());
-        RequestContext::new(request, PathParams::new(params))
-    }
-
-    #[test]
-    fn config_get_returns_value_when_key_exists() {
-        let ctx = context_with_config_key("greeting", &[("greeting", "hello from config store")]);
-        let response = block_on(config_get(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response
-                .into_body()
-                .into_bytes()
-                .expect("buffered")
-                .as_ref(),
-            b"hello from config store"
-        );
-    }
-
-    #[test]
-    fn config_get_returns_404_when_key_not_in_allowlist() {
-        let ctx = context_with_config_key("missing.key", &[("other.key", "value")]);
-        let response = block_on(config_get(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn config_get_returns_404_when_key_not_in_store() {
-        let ctx = context_with_config_key("greeting", &[("other_key", "value")]);
-        let response = block_on(config_get(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn config_get_returns_404_for_keys_outside_demo_allowlist() {
-        let ctx = context_with_config_key("missing.key", &[("missing.key", "value")]);
-        let response = block_on(config_get(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn config_get_returns_503_when_no_store_injected() {
-        let ctx = context_with_params("/config/greeting", &[("name", "greeting")]);
-        let response = block_on(config_get(ctx)).expect("handler ok");
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[test]
-    fn config_get_returns_503_when_store_lookup_fails() {
-        let ctx = context_with_unavailable_config_store("greeting");
-        let err = block_on(config_get(ctx)).expect_err("expected store error");
-        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    struct MockKv {
-        data: Mutex<BTreeMap<String, Bytes>>,
     }
 
     impl MockKv {
@@ -555,25 +307,6 @@ mod tests {
 
     #[async_trait(?Send)]
     impl KvStore for MockKv {
-        async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
-            Ok(self.data.lock().unwrap().get(key).cloned())
-        }
-
-        async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-            self.data.lock().unwrap().insert(key.to_owned(), value);
-            Ok(())
-        }
-
-        async fn put_bytes_with_ttl(
-            &self,
-            key: &str,
-            value: Bytes,
-            _ttl: Duration,
-        ) -> Result<(), KvError> {
-            self.data.lock().unwrap().insert(key.to_owned(), value);
-            Ok(())
-        }
-
         async fn delete(&self, key: &str) -> Result<(), KvError> {
             self.data.lock().unwrap().remove(key);
             Ok(())
@@ -581,6 +314,10 @@ mod tests {
 
         async fn exists(&self, key: &str) -> Result<bool, KvError> {
             Ok(self.data.lock().unwrap().contains_key(key))
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+            Ok(self.data.lock().unwrap().get(key).cloned())
         }
 
         async fn list_keys_page(
@@ -605,6 +342,136 @@ mod tests {
                 keys,
             })
         }
+
+        async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+            self.data.lock().unwrap().insert(key.to_owned(), value);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            key: &str,
+            value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            self.data.lock().unwrap().insert(key.to_owned(), value);
+            Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl ProxyClient for TestProxyClient {
+        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
+            let (_method, uri, _headers, _body, _) = request.into_parts();
+            assert!(uri.to_string().contains("status/201"));
+            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
+        }
+    }
+
+    impl ConfigStore for UnavailableConfigStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Err(ConfigStoreError::unavailable("backend offline"))
+        }
+    }
+
+    #[test]
+    fn build_proxy_target_merges_segments_and_query() {
+        let original = Uri::from_static("/proxy/status?foo=bar");
+        let target = build_proxy_target("https://example.com/api", "status/200", &original)
+            .expect("target uri");
+        assert_eq!(
+            target.to_string(),
+            "https://example.com/api/status/200?foo=bar"
+        );
+    }
+
+    #[test]
+    fn config_get_returns_404_for_keys_outside_demo_allowlist() {
+        let ctx = context_with_config_key("missing.key", &[("missing.key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_404_when_key_not_in_allowlist() {
+        let ctx = context_with_config_key("missing.key", &[("other.key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_404_when_key_not_in_store() {
+        let ctx = context_with_config_key("greeting", &[("other_key", "value")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_get_returns_503_when_no_store_injected() {
+        let ctx = context_with_params("/config/greeting", &[("name", "greeting")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn config_get_returns_503_when_store_lookup_fails() {
+        let ctx = context_with_unavailable_config_store("greeting");
+        let err = block_on(config_get(ctx)).expect_err("expected store error");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn config_get_returns_value_when_key_exists() {
+        let ctx = context_with_config_key("greeting", &[("greeting", "hello from config store")]);
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .as_ref(),
+            b"hello from config store"
+        );
+    }
+
+    fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!("/config/{key}"))
+            .body(Body::empty())
+            .expect("request");
+        let store = MapConfigStore(
+            entries
+                .iter()
+                .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+                .collect(),
+        );
+        request
+            .extensions_mut()
+            .insert(ConfigStoreHandle::new(Arc::new(store)));
+        let mut params = HashMap::new();
+        params.insert("name".to_owned(), key.to_owned());
+        RequestContext::new(request, PathParams::new(params))
+    }
+
+    fn context_with_header(path: &str, header: HeaderName, value: HeaderValue) -> RequestContext {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        request.headers_mut().insert(header, value);
+        RequestContext::new(request, PathParams::default())
+    }
+
+    fn context_with_json(path: &str, json: &str) -> RequestContext {
+        let request = request_builder()
+            .method(Method::POST)
+            .uri(path)
+            .body(Body::from(json))
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
     }
 
     fn context_with_kv(
@@ -628,6 +495,98 @@ mod tests {
         (RequestContext::new(request, PathParams::new(map)), handle)
     }
 
+    fn context_with_params(path: &str, params: &[(&str, &str)]) -> RequestContext {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        let map = params
+            .iter()
+            .map(|&(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<HashMap<_, _>>();
+        RequestContext::new(request, PathParams::new(map))
+    }
+
+    fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
+        let provider = InMemorySecretStore::new(entries.iter().map(|&(name, value)| {
+            (
+                format!("{SECRET_STORE_NAME}/{name}"),
+                bytes::Bytes::from(value.to_owned()),
+            )
+        }));
+        let handle = SecretHandle::new(Arc::new(provider));
+        let uri = format!("{path}?{query}");
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(uri.as_str())
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(handle);
+        RequestContext::new(request, PathParams::default())
+    }
+
+    fn context_with_unavailable_config_store(key: &str) -> RequestContext {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri(format!("/config/{key}"))
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ConfigStoreHandle::new(Arc::new(UnavailableConfigStore)));
+        let mut params = HashMap::new();
+        params.insert("name".to_owned(), key.to_owned());
+        RequestContext::new(request, PathParams::new(params))
+    }
+
+    #[test]
+    fn echo_formats_name_from_path() {
+        let ctx = context_with_params("/echo/alice", &[("name", "alice")]);
+        let response = block_on(echo(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
+        assert_eq!(bytes.as_ref(), b"Hello, alice!");
+    }
+
+    #[test]
+    fn echo_json_formats_payload() {
+        let ctx = context_with_json("/echo", r#"{"name":"Edge"}"#);
+        let response = block_on(echo_json(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
+        assert_eq!(bytes.as_ref(), b"Hello, Edge!");
+    }
+
+    fn empty_context(path: &str) -> RequestContext {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
+    }
+
+    #[test]
+    fn headers_reports_user_agent() {
+        let ctx = context_with_header(
+            "/headers",
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("DemoAgent"),
+        );
+
+        let response = block_on(headers(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
+        assert_eq!(bytes.as_ref(), b"ua=DemoAgent");
+    }
+
     #[test]
     fn kv_counter_increments() {
         let (ctx, _) = context_with_kv("/kv/counter", Method::POST, Body::empty(), &[]);
@@ -636,6 +595,43 @@ mod tests {
         let body = resp.into_body().into_bytes().expect("buffered");
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["count"], 1_i64);
+    }
+
+    #[test]
+    fn kv_note_delete_returns_no_content() {
+        let (ctx, handle) = context_with_kv(
+            "/kv/notes/del",
+            Method::POST,
+            Body::from("to-delete"),
+            &[("id", "del")],
+        );
+        block_on(kv_note_put(ctx)).unwrap();
+
+        let (ctx2, _) = {
+            let mut request = request_builder()
+                .method(Method::DELETE)
+                .uri("/kv/notes/del")
+                .body(Body::empty())
+                .expect("request");
+            request.extensions_mut().insert(handle.clone());
+            let mut map = HashMap::new();
+            map.insert("id".to_owned(), "del".to_owned());
+            (RequestContext::new(request, PathParams::new(map)), handle)
+        };
+        let resp = block_on(kv_note_delete(ctx2)).expect("response");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    fn kv_note_get_missing_returns_404() {
+        let (ctx, _) = context_with_kv(
+            "/kv/notes/xyz",
+            Method::GET,
+            Body::empty(),
+            &[("id", "xyz")],
+        );
+        let err = block_on(kv_note_get(ctx)).expect_err("should be NotFound");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -676,77 +672,63 @@ mod tests {
     }
 
     #[test]
-    fn kv_note_get_missing_returns_404() {
-        let (ctx, _) = context_with_kv(
-            "/kv/notes/xyz",
-            Method::GET,
-            Body::empty(),
-            &[("id", "xyz")],
-        );
-        let err = block_on(kv_note_get(ctx)).expect_err("should be NotFound");
-        assert_eq!(err.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn kv_note_delete_returns_no_content() {
-        let (ctx, handle) = context_with_kv(
-            "/kv/notes/del",
-            Method::POST,
-            Body::from("to-delete"),
-            &[("id", "del")],
-        );
-        block_on(kv_note_put(ctx)).unwrap();
-
-        let (ctx2, _) = {
-            let mut request = request_builder()
-                .method(Method::DELETE)
-                .uri("/kv/notes/del")
-                .body(Body::empty())
-                .expect("request");
-            request.extensions_mut().insert(handle.clone());
-            let mut map = HashMap::new();
-            map.insert("id".to_owned(), "del".to_owned());
-            (RequestContext::new(request, PathParams::new(map)), handle)
-        };
-        let resp = block_on(kv_note_delete(ctx2)).expect("response");
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    }
-
-    // -- Secrets handler tests ----------------------------------------------
-
-    use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
-
-    fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
-        let provider = InMemorySecretStore::new(entries.iter().map(|&(name, value)| {
-            (
-                format!("{SECRET_STORE_NAME}/{name}"),
-                bytes::Bytes::from(value.to_owned()),
-            )
-        }));
-        let handle = SecretHandle::new(Arc::new(provider));
-        let uri = format!("{path}?{query}");
+    fn proxy_demo_uses_injected_handle() {
         let mut request = request_builder()
             .method(Method::GET)
-            .uri(uri.as_str())
+            .uri("/proxy/status/201")
             .body(Body::empty())
             .expect("request");
-        request.extensions_mut().insert(handle);
-        RequestContext::new(request, PathParams::default())
+        request
+            .extensions_mut()
+            .insert(ProxyHandle::with_client(TestProxyClient));
+
+        let mut params = HashMap::new();
+        params.insert("rest".to_owned(), "status/201".to_owned());
+        let ctx = RequestContext::new(request, PathParams::new(params));
+
+        let response = block_on(proxy_demo(ctx)).expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
     }
 
     #[test]
-    fn secrets_echo_returns_secret_value() {
-        let ctx = context_with_secrets(
-            "/secrets/echo",
-            "name=SMOKE_SECRET",
-            &[("SMOKE_SECRET", "my-secret-value")],
-        );
-        let response = block_on(secrets_echo(ctx))
+    fn proxy_demo_without_handle_returns_placeholder() {
+        let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
+        let response = block_on(proxy_demo(ctx)).expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn root_returns_static_body() {
+        let ctx = empty_context("/");
+        let response = block_on(root(ctx))
             .expect("handler ok")
             .into_response()
             .expect("response");
         let bytes = response.into_body().into_bytes().expect("buffered");
-        assert_eq!(bytes.as_ref(), b"my-secret-value");
+        assert_eq!(bytes.as_ref(), b"app-demo app");
+    }
+
+    #[test]
+    fn secrets_echo_rejects_non_smoke_secret_names() {
+        use edgezero_core::http::StatusCode;
+
+        let ctx = context_with_secrets("/secrets/echo", "name=API_KEY", &[("API_KEY", "secret")]);
+        let response = block_on(secrets_echo(ctx))
+            .expect_err("should reject arbitrary secret names")
+            .into_response()
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .to_vec(),
+        )
+        .expect("utf8");
+        assert!(body.contains("only smoke-test secret names are allowed"));
+        assert!(!body.contains("API_KEY"));
     }
 
     #[test]
@@ -773,25 +755,38 @@ mod tests {
     }
 
     #[test]
-    fn secrets_echo_rejects_non_smoke_secret_names() {
-        use edgezero_core::http::StatusCode;
-
-        let ctx = context_with_secrets("/secrets/echo", "name=API_KEY", &[("API_KEY", "secret")]);
+    fn secrets_echo_returns_secret_value() {
+        let ctx = context_with_secrets(
+            "/secrets/echo",
+            "name=SMOKE_SECRET",
+            &[("SMOKE_SECRET", "my-secret-value")],
+        );
         let response = block_on(secrets_echo(ctx))
-            .expect_err("should reject arbitrary secret names")
+            .expect("handler ok")
             .into_response()
             .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
+        assert_eq!(bytes.as_ref(), b"my-secret-value");
+    }
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = String::from_utf8(
-            response
-                .into_body()
-                .into_bytes()
-                .expect("buffered")
-                .to_vec(),
-        )
-        .expect("utf8");
-        assert!(body.contains("only smoke-test secret names are allowed"));
-        assert!(!body.contains("API_KEY"));
+    #[test]
+    fn stream_emits_expected_chunks() {
+        let ctx = empty_context("/stream");
+        let response = block_on(stream(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut chunks = response.into_body().into_stream().expect("stream body");
+        let collected = block_on(async {
+            let mut buf = Vec::new();
+            while let Some(item) = chunks.next().await {
+                let chunk = item.expect("chunk");
+                buf.extend_from_slice(&chunk);
+            }
+            buf
+        });
+        assert_eq!(
+            String::from_utf8(collected).expect("utf8"),
+            "chunk 0\nchunk 1\nchunk 2\n"
+        );
     }
 }
