@@ -1,4 +1,4 @@
-#![expect(
+#![allow(
     dead_code,
     reason = "helpers consumed conditionally via the `cli` feature in adapter crates"
 )]
@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Walks up the directory tree looking for `manifest_name` alongside a `Cargo.toml`.
+#[inline]
+#[must_use]
 pub fn find_manifest_upwards(start: &Path, manifest_name: &str) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(dir) = current {
@@ -23,6 +25,8 @@ pub fn find_manifest_upwards(start: &Path, manifest_name: &str) -> Option<PathBu
 /// first `Cargo.toml` that contains a `[workspace]` table.  If no workspace
 /// table is found, falls back to the highest ancestor containing a `Cargo.toml`,
 /// and finally to `dir` itself.
+#[inline]
+#[must_use]
 pub fn find_workspace_root(dir: &Path) -> PathBuf {
     let mut current: Option<&Path> = Some(dir);
     let mut candidate: Option<PathBuf> = None;
@@ -32,7 +36,7 @@ pub fn find_workspace_root(dir: &Path) -> PathBuf {
         if cargo.exists() {
             candidate = Some(path.to_path_buf());
             if fs::read_to_string(&cargo)
-                .map(|s| s.contains("[workspace]"))
+                .map(|contents| contents.contains("[workspace]"))
                 .unwrap_or(false)
             {
                 break;
@@ -45,26 +49,29 @@ pub fn find_workspace_root(dir: &Path) -> PathBuf {
 }
 
 /// Calculates the path distance between two directories based on shared leading components.
-pub fn path_distance(a: &Path, b: &Path) -> usize {
-    let a_components: Vec<_> = a.components().collect();
-    let b_components: Vec<_> = b.components().collect();
+#[inline]
+#[must_use]
+pub fn path_distance(left: &Path, right: &Path) -> usize {
+    let left_components: Vec<_> = left.components().collect();
+    let right_components: Vec<_> = right.components().collect();
 
-    let mut common = 0;
-    for (ac, bc) in a_components.iter().zip(&b_components) {
-        if ac == bc {
-            common += 1;
-        } else {
-            break;
-        }
-    }
+    let common = left_components
+        .iter()
+        .zip(&right_components)
+        .take_while(|(lhs, rhs)| lhs == rhs)
+        .count();
 
-    (a_components.len() - common) + (b_components.len() - common)
+    left_components
+        .len()
+        .saturating_sub(common)
+        .saturating_add(right_components.len().saturating_sub(common))
 }
 
 /// Reads the crate name from a `Cargo.toml`, supporting both the inline and `[package]` forms.
 ///
 /// # Errors
 /// Returns an error if the manifest cannot be read or its `[package].name` field is missing.
+#[inline]
 pub fn read_package_name(manifest: &Path) -> Result<String, String> {
     let contents = fs::read_to_string(manifest)
         .map_err(|err| format!("failed to read {}: {err}", manifest.display()))?;
@@ -76,11 +83,11 @@ pub fn read_package_name(manifest: &Path) -> Result<String, String> {
         .and_then(|pkg| pkg.get("name"))
         .and_then(|value| value.as_str())
     {
-        return Ok(name.to_string());
+        return Ok(name.to_owned());
     }
 
     if let Some(name) = table.get("name").and_then(|value| value.as_str()) {
-        return Ok(name.to_string());
+        return Ok(name.to_owned());
     }
 
     Err(format!(
@@ -151,9 +158,9 @@ mod tests {
 
     #[test]
     fn path_distance_counts_divergence() {
-        let a = Path::new("/a/b/c");
-        let b = Path::new("/a/b/d/e");
-        assert_eq!(path_distance(a, b), 3);
+        let left = Path::new("/a/b/c");
+        let right = Path::new("/a/b/d/e");
+        assert_eq!(path_distance(left, right), 3);
     }
 
     #[test]

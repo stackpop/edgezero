@@ -96,7 +96,7 @@ pub trait AppExt {
 
 #[cfg(feature = "fastly")]
 impl AppExt for edgezero_core::app::App {
-    #[expect(
+    #[allow(
         deprecated,
         reason = "implementing the deprecated trait method requires calling it"
     )]
@@ -116,7 +116,8 @@ pub fn run_app<A: edgezero_core::app::Hooks>(
     manifest_src: &str,
     req: fastly::Request,
 ) -> Result<fastly::Response, fastly::Error> {
-    let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
+    let manifest_loader = edgezero_core::manifest::ManifestLoader::try_load_from_str(manifest_src)
+        .map_err(|err| fastly::Error::msg(err.to_string()))?;
     let manifest = manifest_loader.manifest();
     let logging = manifest.logging_or_default(edgezero_core::app::FASTLY_ADAPTER);
     // Two-path resolution: `A::config_store()` is set at compile time by the

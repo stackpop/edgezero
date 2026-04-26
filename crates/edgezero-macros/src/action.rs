@@ -3,11 +3,11 @@ use quote::{format_ident, quote};
 use syn::{spanned::Spanned as _, Error, FnArg, ItemFn, Pat, PathArguments, Type};
 
 pub fn expand_action(attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_action_impl(attr.into(), item.into()).into()
+    expand_action_impl(&attr.into(), item.into()).into()
 }
 
 pub(crate) fn expand_action_impl(
-    attr: proc_macro2::TokenStream,
+    attr: &proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     if !attr.is_empty() {
@@ -173,7 +173,7 @@ mod tests {
     use proc_macro2::TokenStream;
     use quote::quote;
 
-    fn render(tokens: TokenStream) -> String {
+    fn render(tokens: &TokenStream) -> String {
         tokens.to_string()
     }
 
@@ -191,8 +191,8 @@ mod tests {
                     .unwrap()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("__demo_inner"));
         assert!(rendered.contains("fn demo"));
         assert!(rendered.contains("responder :: Responder :: respond"));
@@ -203,8 +203,8 @@ mod tests {
         let input = quote! {
             fn invalid() {}
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("must be async"));
     }
 
@@ -215,8 +215,8 @@ mod tests {
                 unimplemented!()
             }
         };
-        let output = expand_action_impl(quote!(path = "/demo"), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&quote!(path = "/demo"), input);
+        let rendered = render(&output);
         assert!(rendered.contains("does not accept arguments"));
     }
 
@@ -227,8 +227,8 @@ mod tests {
                 unimplemented!()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("does not support self receivers"));
     }
 
@@ -248,8 +248,8 @@ mod tests {
                     .unwrap())
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         let collapsed = collapse_whitespace(&rendered);
         assert!(collapsed.contains("__with_ctx_inner(__ctx)"));
     }
@@ -270,8 +270,8 @@ mod tests {
                     .unwrap())
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         let collapsed = collapse_whitespace(&rendered);
         assert!(collapsed.contains("__tuple_ctx_inner(__ctx)"));
     }
@@ -284,8 +284,8 @@ mod tests {
                 second: ::edgezero_core::context::RequestContext,
             ) {}
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("support at most one RequestContext argument"));
     }
 
@@ -298,8 +298,8 @@ mod tests {
                 unimplemented!()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("expects exactly one binding"));
     }
 
@@ -316,8 +316,8 @@ mod tests {
                     .unwrap()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         let collapsed = collapse_whitespace(&rendered);
         assert!(
             collapsed.contains("FromRequest>::from_request"),

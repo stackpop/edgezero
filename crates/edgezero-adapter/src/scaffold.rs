@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{LazyLock, RwLock};
+use std::sync::{LazyLock, PoisonError, RwLock};
 
 /// Static handlebars template registration provided by an adapter.
 #[derive(Clone, Copy)]
@@ -79,26 +79,22 @@ static BLUEPRINT_REGISTRY: LazyLock<RwLock<HashMap<String, &'static AdapterBluep
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Registers the blueprint for an adapter. Latest registration wins.
-///
-/// # Panics
-/// Panics if the blueprint registry's [`RwLock`] is poisoned.
+#[inline]
 pub fn register_adapter_blueprint(blueprint: &'static AdapterBlueprint) {
     let mut registry = BLUEPRINT_REGISTRY
         .write()
-        .expect("edgezero blueprint registry lock poisoned");
+        .unwrap_or_else(PoisonError::into_inner);
     registry.insert(blueprint.id.to_ascii_lowercase(), blueprint);
 }
 
 /// Returns the known adapter blueprints sorted by adapter id.
-///
-/// # Panics
-/// Panics if the blueprint registry's [`RwLock`] is poisoned.
+#[inline]
 pub fn registered_blueprints() -> Vec<&'static AdapterBlueprint> {
     let registry = BLUEPRINT_REGISTRY
         .read()
-        .expect("edgezero blueprint registry lock poisoned");
+        .unwrap_or_else(PoisonError::into_inner);
     let mut values: Vec<&'static AdapterBlueprint> = registry.values().copied().collect();
-    values.sort_by(|a, b| a.id.cmp(b.id));
+    values.sort_by(|left, right| left.id.cmp(right.id));
     values
 }
 

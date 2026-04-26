@@ -8,9 +8,13 @@ use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Ident, LitStr, Token};
 use validator::Validate as _;
 
-#[expect(
+// Many manifest fields exist for downstream consumers (CLI, runtime
+// adapters, etc.) but are unused inside the proc-macro itself, which only
+// reads enough of the structure to generate routing. Allow `dead_code` so
+// those fields don't trip warnings just because the macro doesn't touch them.
+#[allow(
     dead_code,
-    reason = "manifest types are deserialized into the proc-macro and not all fields are read"
+    reason = "macro-side reads only the routing-relevant fields"
 )]
 mod manifest_definitions {
     include!(concat!(
@@ -24,14 +28,25 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as AppArgs);
 
     let manifest_path = resolve_manifest_path(args.path.value());
-    let manifest_source = fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
+    let manifest_source = match fs::read_to_string(&manifest_path) {
+        Ok(source) => source,
+        Err(err) => {
+            let msg = format!("failed to read {}: {err}", manifest_path.display());
+            return quote!(compile_error!(#msg);).into();
+        }
+    };
 
-    let mut manifest: Manifest = toml::from_str(&manifest_source)
-        .unwrap_or_else(|err| panic!("failed to parse {}: {err}", manifest_path.display()));
-    manifest
-        .validate()
-        .unwrap_or_else(|err| panic!("failed to validate {}: {err}", manifest_path.display()));
+    let mut manifest: Manifest = match toml::from_str(&manifest_source) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let msg = format!("failed to parse {}: {err}", manifest_path.display());
+            return quote!(compile_error!(#msg);).into();
+        }
+    };
+    if let Err(err) = manifest.validate() {
+        let msg = format!("failed to validate {}: {err}", manifest_path.display());
+        return quote!(compile_error!(#msg);).into();
+    }
     manifest.finalize();
 
     let app_ident = args
@@ -41,7 +56,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
         .app
         .name
         .clone()
-        .unwrap_or_else(|| "EdgeZero App".to_string());
+        .unwrap_or_else(|| "EdgeZero App".to_owned());
     let app_name_lit = LitStr::new(&app_name, Span::call_site());
 
     let middleware_tokens = build_middleware_tokens(&manifest);
@@ -74,6 +89,19 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     output.into()
 }
 
+/// Resolves the manifest path passed to `app!(...)` against the
+/// invoking crate's `CARGO_MANIFEST_DIR`.
+///
+/// `CARGO_MANIFEST_DIR` is unconditionally set by Cargo whenever a
+/// proc-macro runs against a normal crate, so the lookup cannot fail in
+/// practice. Treating it as fallible would require every caller of
+/// `app!(...)` to handle an outcome that has never been observed and
+/// cannot be triggered without bypassing Cargo entirely.
+#[expect(
+    clippy::expect_used,
+    reason = "CARGO_MANIFEST_DIR is a Cargo invariant during macro expansion; \
+              there is no realistic failure mode to propagate"
+)]
 fn resolve_manifest_path(relative: String) -> PathBuf {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR env var");
     PathBuf::from(manifest_dir).join(relative)
@@ -149,8 +177,20 @@ fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
     }
 }
 
+/// Parses a handler reference like `crate::handlers::root` from `edgezero.toml`
+/// into the `syn::ExprPath` that the generated router code references.
+///
+/// Called at proc-macro expansion time. If the user's manifest contains a
+/// syntactically-invalid handler path, the only useful recovery is to halt
+/// macro expansion with a clear message — there is no runtime to propagate
+/// the error to. The panic is caught by `rustc` and surfaces as a normal
+/// build failure with the file/line of the call site.
+#[expect(
+    clippy::panic,
+    reason = "macro-expansion-time error: rustc surfaces the panic as a build failure"
+)]
 fn parse_handler_path(handler: &str) -> syn::ExprPath {
-    let mut handler_str = handler.trim().to_string();
+    let mut handler_str = handler.trim().to_owned();
     if handler_str.starts_with("crate::")
         || handler_str.starts_with("self::")
         || handler_str.starts_with("super::")
@@ -161,7 +201,12 @@ fn parse_handler_path(handler: &str) -> syn::ExprPath {
             .map(|name| name.replace('-', "_"))
             .unwrap_or_default();
         if !crate_name.is_empty() && handler_str.starts_with(&format!("{crate_name}::")) {
-            handler_str = format!("crate::{}", &handler_str[crate_name.len() + 2..]);
+            handler_str = format!(
+                "crate::{}",
+                handler_str
+                    .get(crate_name.len().saturating_add(2)..)
+                    .unwrap_or_default(),
+            );
         }
     }
 

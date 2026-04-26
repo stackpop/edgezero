@@ -90,7 +90,8 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     ctx: worker::Context,
 ) -> Result<worker::Response, worker::Error> {
     init_logger().expect("init cloudflare logger");
-    let manifest_loader = edgezero_core::manifest::ManifestLoader::load_from_str(manifest_src);
+    let manifest_loader = edgezero_core::manifest::ManifestLoader::try_load_from_str(manifest_src)
+        .map_err(|err| worker::Error::RustError(err.to_string()))?;
     let manifest = manifest_loader.manifest();
     let kv_binding = manifest.kv_store_name(edgezero_core::app::CLOUDFLARE_ADAPTER);
     let kv_required = manifest.stores.kv.is_some();

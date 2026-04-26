@@ -1,15 +1,17 @@
 use std::env;
+use std::error::Error;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use toml::Value;
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let manifest_path = manifest_dir.join("Cargo.toml");
-    let manifest_str = fs::read_to_string(&manifest_path).expect("read Cargo.toml");
-    let manifest: Value = toml::from_str(&manifest_str).expect("parse Cargo.toml");
+    let manifest_str = fs::read_to_string(&manifest_path)?;
+    let manifest: Value = toml::from_str(&manifest_str)?;
 
     let dependencies = manifest
         .get("dependencies")
@@ -39,7 +41,9 @@ fn main() {
                 name.replace('-', "_").to_ascii_uppercase()
             );
             println!("cargo:rerun-if-env-changed={feature_env}");
-            let enabled = env::var(&feature_env).map(|v| v == "1").unwrap_or(false);
+            let enabled = env::var(&feature_env)
+                .map(|val| val == "1")
+                .unwrap_or(false);
             enabled.then_some(name)
         })
         .collect();
@@ -54,14 +58,15 @@ fn main() {
     } else {
         for adapter in adapters {
             let crate_ident = adapter.replace('-', "_");
-            generated.push_str(&format!(
+            writeln!(
+                generated,
                 "#[expect(unused_imports, reason = \"adapter linked via feature gate\")]\n\
-                 pub(crate) use {crate_ident} as _{crate_ident};\n"
-            ));
+                 pub(crate) use {crate_ident} as _{crate_ident};",
+            )?;
         }
     }
 
-    let out_path =
-        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR env")).join("linked_adapters.rs");
-    fs::write(out_path, generated).expect("write linked_adapters.rs");
+    let out_path = PathBuf::from(env::var("OUT_DIR")?).join("linked_adapters.rs");
+    fs::write(out_path, generated)?;
+    Ok(())
 }
