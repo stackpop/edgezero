@@ -1,6 +1,9 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use http::request::Builder as HttpRequestBuilder;
+use http::response::Builder as HttpResponseBuilder;
+
 use crate::body::Body;
 use crate::error::EdgeError;
 
@@ -8,8 +11,8 @@ use crate::error::EdgeError;
 // crate directly — every HTTP type must come through `edgezero_core::http`.
 // `Builder` types are exposed via `pub type` aliases (not `pub use`) so
 // only the `header` re-export remains, scoped to its own child module.
-pub type RequestBuilder = http::request::Builder;
-pub type ResponseBuilder = http::response::Builder;
+pub type RequestBuilder = HttpRequestBuilder;
+pub type ResponseBuilder = HttpResponseBuilder;
 
 /// Re-exports of [`http::header`] used by adapters and handlers.
 pub mod header {

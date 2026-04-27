@@ -384,7 +384,9 @@ impl KvStore for PersistentKvStore {
 mod tests {
     use super::*;
     use edgezero_core::key_value_store::KvHandle;
+    use futures::executor;
     use std::sync::Arc;
+    use std::thread;
 
     fn store() -> (KvHandle, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -440,7 +442,7 @@ mod tests {
             .await
             .unwrap();
         // 200ms gives the OS scheduler enough headroom on busy CI runners.
-        std::thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
         assert_eq!(s.get_bytes("temp").await.unwrap(), None);
     }
 
@@ -464,7 +466,7 @@ mod tests {
             .await
             .unwrap();
 
-        std::thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
 
         let page = s.list_keys_page("app/", None, 10).await.unwrap();
         assert_eq!(page.keys, vec!["app/live".to_owned()]);
@@ -480,7 +482,7 @@ mod tests {
         s.put_bytes_with_ttl("race/key", Bytes::from("stale"), Duration::from_millis(1))
             .await
             .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
+        thread::sleep(Duration::from_millis(200));
         s.put_bytes("race/key", Bytes::from("fresh")).await.unwrap();
 
         s.cleanup_expired_keys(&["race/key".to_owned()]).unwrap();
@@ -550,8 +552,8 @@ mod tests {
         let threads: Vec<_> = (0_i32..100_i32)
             .map(|i| {
                 let h = handle.clone();
-                std::thread::spawn(move || {
-                    futures::executor::block_on(async move {
+                thread::spawn(move || {
+                    executor::block_on(async move {
                         let key = format!("key:{i}");
                         h.put(&key, &i).await.unwrap();
                     });
@@ -564,7 +566,7 @@ mod tests {
         }
 
         // Verify all 100 keys survived concurrent writes with correct values.
-        futures::executor::block_on(async {
+        executor::block_on(async {
             for i in 0_i32..100_i32 {
                 let key = format!("key:{i}");
                 let val: i32 = handle.get_or(&key, -1_i32).await.unwrap();

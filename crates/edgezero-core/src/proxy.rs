@@ -229,6 +229,7 @@ where
 mod tests {
     use super::*;
     use crate::body::Body;
+    use crate::http::header::HeaderName;
     use crate::http::{request_builder, HeaderValue, Method, StatusCode, Uri};
     use bytes::Bytes;
     use futures::executor::block_on;
@@ -593,7 +594,7 @@ mod tests {
             // Echo back headers with x-echo- prefix
             for (name, value) in request.headers() {
                 let echo_name = format!("x-echo-{}", name.as_str());
-                if let Ok(header_name) = echo_name.parse::<http::header::HeaderName>() {
+                if let Ok(header_name) = echo_name.parse::<HeaderName>() {
                     resp.headers_mut().insert(header_name, value.clone());
                 }
             }

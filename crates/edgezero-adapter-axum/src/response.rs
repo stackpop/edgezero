@@ -1,5 +1,6 @@
 use axum::body::Body as AxumBody;
-use axum::http::{Response, StatusCode};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderValue, Response, StatusCode};
 use futures::executor::block_on;
 use futures_util::{pin_mut, StreamExt as _};
 use tracing::error;
@@ -46,8 +47,8 @@ fn error_response_500(message: &'static str) -> Response<AxumBody> {
     let mut response = Response::new(AxumBody::from(message));
     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     response.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     response
 }

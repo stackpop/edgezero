@@ -5,7 +5,7 @@ use edgezero_core::body::Body;
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderValue, Method, Uri};
-use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
+use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse, PROXY_HEADER};
 use fastly::{
     error::anyhow, http::body::StreamingBody, Backend, Request as FastlyRequest,
     Response as FastlyResponse,
@@ -32,10 +32,9 @@ impl ProxyClient for FastlyProxyClient {
         let mut fastly_response = pending_request.wait().map_err(EdgeError::internal)?;
 
         let mut proxy_response = convert_response(&mut fastly_response);
-        proxy_response.headers_mut().insert(
-            edgezero_core::proxy::PROXY_HEADER,
-            HeaderValue::from_static("fastly"),
-        );
+        proxy_response
+            .headers_mut()
+            .insert(PROXY_HEADER, HeaderValue::from_static("fastly"));
         Ok(proxy_response)
     }
 }

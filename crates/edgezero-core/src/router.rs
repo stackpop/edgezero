@@ -378,6 +378,7 @@ mod tests {
     use crate::response::response_with_body;
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
+    use serde::ser::Error as _;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -483,7 +484,7 @@ mod tests {
             where
                 S: serde::Serializer,
             {
-                Err(serde::ser::Error::custom("boom"))
+                Err(S::Error::custom("boom"))
             }
         }
 

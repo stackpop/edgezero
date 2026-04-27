@@ -1,6 +1,8 @@
 use edgezero_adapter::scaffold;
 use handlebars::Handlebars;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Errors produced while scaffolding files for a generated project.
@@ -11,7 +13,7 @@ pub enum ScaffoldError {
     Io {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     /// The Handlebars renderer rejected the template or its data.
     #[error("template '{name}' failed to render: {message}")]
@@ -19,7 +21,7 @@ pub enum ScaffoldError {
 }
 
 impl ScaffoldError {
-    pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+    pub(crate) fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
         ScaffoldError::Io {
             path: path.into(),
             source,
@@ -97,16 +99,16 @@ pub fn write_tmpl(
     hbs: &handlebars::Handlebars,
     name: &str,
     data: &serde_json::Value,
-    out_path: &std::path::Path,
+    out_path: &Path,
 ) -> Result<(), ScaffoldError> {
     if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| ScaffoldError::io(parent, e))?;
+        fs::create_dir_all(parent).map_err(|e| ScaffoldError::io(parent, e))?;
     }
     let rendered = hbs.render(name, data).map_err(|e| ScaffoldError::Render {
         name: name.to_owned(),
         message: e.to_string(),
     })?;
-    std::fs::write(out_path, rendered).map_err(|e| ScaffoldError::io(out_path, e))
+    fs::write(out_path, rendered).map_err(|e| ScaffoldError::io(out_path, e))
 }
 
 pub fn sanitize_crate_name(input: &str) -> String {
@@ -136,8 +138,8 @@ pub struct ResolvedDependency {
 }
 
 pub fn resolve_dep_line(
-    workspace_dir: &std::path::Path,
-    repo_root: &std::path::Path,
+    workspace_dir: &Path,
+    repo_root: &Path,
     repo_rel_crate: &str,
     fallback: &str,
     features: &[&str],
@@ -146,7 +148,7 @@ pub fn resolve_dep_line(
     let candidate = repo_root.join(repo_rel_crate);
     let workspace_line = if candidate.exists() {
         if let Some(rel) = relative_to(workspace_dir, repo_root) {
-            let dep_path = std::path::Path::new(&rel).join(repo_rel_crate);
+            let dep_path = Path::new(&rel).join(repo_rel_crate);
             format!("{} = {{ path = \"{}\" }}", crate_name, dep_path.display())
         } else {
             fallback.to_owned()
@@ -175,15 +177,15 @@ pub fn resolve_dep_line(
 }
 
 fn crate_name_from_repo_path(p: &str) -> &str {
-    std::path::Path::new(p)
+    Path::new(p)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(p)
 }
 
-pub fn relative_to(from: &std::path::Path, to: &std::path::Path) -> Option<String> {
-    let from_abs = std::fs::canonicalize(from).ok()?;
-    let to_abs = std::fs::canonicalize(to).ok()?;
+pub fn relative_to(from: &Path, to: &Path) -> Option<String> {
+    let from_abs = fs::canonicalize(from).ok()?;
+    let to_abs = fs::canonicalize(to).ok()?;
     let suffix = from_abs.strip_prefix(&to_abs).ok()?;
     let depth = suffix.components().count();
     if depth == 0 {

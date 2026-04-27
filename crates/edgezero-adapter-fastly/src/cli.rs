@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,11 +17,7 @@ use walkdir::WalkDir;
 /// # Errors
 /// Returns an error if the Fastly CLI build command fails.
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
-    let manifest = find_fastly_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
+    let manifest = find_fastly_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
@@ -60,11 +57,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 /// # Errors
 /// Returns an error if the Fastly CLI deploy command fails.
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_fastly_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
+    let manifest = find_fastly_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
@@ -85,11 +78,7 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
 /// # Errors
 /// Returns an error if the Fastly CLI serve command (Viceroy) fails.
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_fastly_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
+    let manifest = find_fastly_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
@@ -275,7 +264,7 @@ fn locate_artifact(
     let target_triple = "wasm32-wasip1";
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
-    if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
+    if let Some(custom) = env::var_os("CARGO_TARGET_DIR") {
         let candidate = PathBuf::from(custom)
             .join(target_triple)
             .join("release")

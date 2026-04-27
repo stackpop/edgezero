@@ -7,6 +7,8 @@
 //! API_KEY=mysecret cargo edgezero dev
 //! ```
 
+use std::env;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::secret_store::{SecretError, SecretStore};
@@ -37,7 +39,7 @@ impl SecretStore for EnvSecretStore {
         {
             use std::os::unix::ffi::OsStringExt as _;
 
-            match std::env::var_os(key) {
+            match env::var_os(key) {
                 Some(value) => Ok(Some(Bytes::from(value.into_vec()))),
                 None => Ok(None),
             }
@@ -45,12 +47,14 @@ impl SecretStore for EnvSecretStore {
 
         #[cfg(not(unix))]
         {
-            match std::env::var(key) {
+            use std::env::VarError;
+
+            match env::var(key) {
                 Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
-                Err(std::env::VarError::NotPresent) => Ok(None),
-                Err(std::env::VarError::NotUnicode(_)) => Err(SecretError::Internal(
-                    anyhow::anyhow!("secret store returned an invalid Unicode value"),
-                )),
+                Err(VarError::NotPresent) => Ok(None),
+                Err(VarError::NotUnicode(_)) => Err(SecretError::Internal(anyhow::anyhow!(
+                    "secret store returned an invalid Unicode value"
+                ))),
             }
         }
     }
@@ -109,10 +113,11 @@ mod tests {
     // Contract tests: use InMemorySecretStoreProvider since EnvSecretStore needs
     // real env vars, which are unsafe in parallel tests.
     // The EnvSecretStore is tested individually above.
+    use edgezero_core::secret_store::InMemorySecretStore;
     use edgezero_core::secret_store_contract_tests;
 
     secret_store_contract_tests!(env_secret_contract, {
-        edgezero_core::secret_store::InMemorySecretStore::new([
+        InMemorySecretStore::new([
             ("mystore/contract_key", Bytes::from("contract_value")),
             ("mystore/contract_key_2", Bytes::from("another_value")),
         ])

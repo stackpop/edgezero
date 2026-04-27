@@ -121,6 +121,7 @@ mod tests {
     use crate::proxy::{ProxyClient, ProxyHandle, ProxyRequest, ProxyResponse};
     use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::executor::block_on;
     use futures::stream;
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
@@ -346,21 +347,18 @@ mod tests {
     fn proxy_handle_forwards_with_dummy_client() {
         let handle = ProxyHandle::with_client(DummyClient);
         let request = ProxyRequest::new(Method::GET, Uri::from_static("https://example.com"));
-        let response = futures::executor::block_on(handle.forward(request)).expect("response");
+        let response = block_on(handle.forward(request)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
     fn config_store_is_retrieved_when_present() {
-        use crate::config_store::{ConfigStore, ConfigStoreHandle};
+        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
         use std::sync::Arc;
 
         struct FixedStore;
         impl ConfigStore for FixedStore {
-            fn get(
-                &self,
-                _key: &str,
-            ) -> Result<Option<String>, crate::config_store::ConfigStoreError> {
+            fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
                 Ok(Some("value".to_owned()))
             }
         }

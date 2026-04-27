@@ -163,6 +163,7 @@ mod tests {
     use super::*;
     use crate::http::Method;
     use serde::ser;
+    use std::str;
 
     #[test]
     fn bad_request_sets_status_and_message() {
@@ -266,8 +267,6 @@ mod tests {
         assert_eq!(content_type, HeaderValue::from_static("application/json"));
 
         let body = response.into_body().into_bytes().expect("buffered");
-        assert!(std::str::from_utf8(body.as_ref())
-            .unwrap()
-            .contains("invalid"));
+        assert!(str::from_utf8(body.as_ref()).unwrap().contains("invalid"));
     }
 }

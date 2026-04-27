@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use axum::body::Body as AxumBody;
+use axum::body::{to_bytes, Body as AxumBody};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::Request;
 use edgezero_core::body::Body;
@@ -22,7 +22,7 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
 
     let body = match parts.headers.get(CONTENT_TYPE) {
         Some(value) if is_json_content_type(value) => {
-            let bytes = axum::body::to_bytes(axum_body, usize::MAX)
+            let bytes = to_bytes(axum_body, usize::MAX)
                 .await
                 .map_err(|e| format!("Failed to convert body into bytes: {e}"))?;
             Body::from_bytes(bytes)

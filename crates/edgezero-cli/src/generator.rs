@@ -8,7 +8,10 @@ use edgezero_adapter::scaffold::AdapterBlueprint;
 use handlebars::Handlebars;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::env;
+use std::fmt::{self, Write as _};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
@@ -30,7 +33,7 @@ pub enum GeneratorError {
     Io {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     /// A template under the workspace scaffold could not be rendered or
     /// written. Wraps [`ScaffoldError`] for context.
@@ -41,11 +44,11 @@ pub enum GeneratorError {
     /// one of the rendered values; surfaced as a typed error rather than a
     /// silent unwrap.
     #[error("failed to format generator output: {0}")]
-    Format(#[from] std::fmt::Error),
+    Format(#[from] fmt::Error),
 }
 
 impl GeneratorError {
-    fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+    fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
         GeneratorError::Io {
             path: path.into(),
             source,
@@ -74,7 +77,7 @@ impl ProjectLayout {
         let name = sanitize_crate_name(&args.name);
         let base_dir = match args.dir.as_deref() {
             Some(dir) => PathBuf::from(dir),
-            None => std::env::current_dir().map_err(|e| GeneratorError::io(".", e))?,
+            None => env::current_dir().map_err(|e| GeneratorError::io(".", e))?,
         };
         let out_dir = base_dir.join(&name);
         if out_dir.exists() {
@@ -87,7 +90,7 @@ impl ProjectLayout {
         let core_name = format!("{name}-core");
         let core_dir = crates_dir.join(&core_name);
         let core_src = core_dir.join("src");
-        std::fs::create_dir_all(&core_src).map_err(|e| GeneratorError::io(&core_src, e))?;
+        fs::create_dir_all(&core_src).map_err(|e| GeneratorError::io(&core_src, e))?;
 
         Ok(ProjectLayout {
             project_mod: name.replace('-', "_"),
@@ -117,7 +120,7 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
     let layout = ProjectLayout::new(args)?;
 
     let mut workspace_dependencies = seed_workspace_dependencies();
-    let cwd = std::env::current_dir().map_err(|e| GeneratorError::io(".", e))?;
+    let cwd = env::current_dir().map_err(|e| GeneratorError::io(".", e))?;
     let core_crate_line = resolve_core_dependency(&layout, &cwd, &mut workspace_dependencies);
 
     let adapter_artifacts = collect_adapter_data(&layout, &cwd, &mut workspace_dependencies)?;
@@ -222,10 +225,10 @@ fn collect_adapter_data(
     for blueprint in scaffold::registered_blueprints().iter().copied() {
         let crate_name = format!("{}-{}", layout.name, blueprint.crate_suffix);
         let adapter_dir = layout.crates_dir.join(&crate_name);
-        std::fs::create_dir_all(&adapter_dir).map_err(|e| GeneratorError::io(&adapter_dir, e))?;
+        fs::create_dir_all(&adapter_dir).map_err(|e| GeneratorError::io(&adapter_dir, e))?;
         for dir_name in blueprint.extra_dirs {
             let extra = adapter_dir.join(dir_name);
-            std::fs::create_dir_all(&extra).map_err(|e| GeneratorError::io(&extra, e))?;
+            fs::create_dir_all(&extra).map_err(|e| GeneratorError::io(&extra, e))?;
         }
 
         let crate_dir_rel = format!("crates/{crate_name}");
@@ -322,7 +325,7 @@ fn render_manifest_section(
     blueprint: &'static AdapterBlueprint,
     crate_name: &str,
     crate_dir_rel: &str,
-) -> Result<String, std::fmt::Error> {
+) -> Result<String, fmt::Error> {
     let build_cmd = blueprint
         .commands
         .build
@@ -396,7 +399,7 @@ fn append_readme_entries(
     crate_dir_rel: &str,
     readme_adapter_crates: &mut String,
     readme_adapter_dev: &mut String,
-) -> Result<(), std::fmt::Error> {
+) -> Result<(), fmt::Error> {
     let description = blueprint
         .readme
         .description
@@ -588,20 +591,23 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    // `super::*` re-exports `env` and `fs` from outer `use` lines, so they're
+    // already in scope here.
+
     struct PathOverride {
         original: Option<String>,
     }
 
     impl PathOverride {
         fn prepend(path: &Path) -> Self {
-            let original = std::env::var("PATH").ok();
+            let original = env::var("PATH").ok();
             let sep = if cfg!(windows) { ";" } else { ":" };
             let prefix = path.to_string_lossy();
             let new_path = match &original {
                 Some(existing) if !existing.is_empty() => format!("{prefix}{sep}{existing}"),
                 _ => prefix.into_owned(),
             };
-            std::env::set_var("PATH", &new_path);
+            env::set_var("PATH", &new_path);
             Self { original }
         }
     }
@@ -609,9 +615,9 @@ mod tests {
     impl Drop for PathOverride {
         fn drop(&mut self) {
             if let Some(original) = &self.original {
-                std::env::set_var("PATH", original);
+                env::set_var("PATH", original);
             } else {
-                std::env::remove_var("PATH");
+                env::remove_var("PATH");
             }
         }
     }
@@ -620,7 +626,7 @@ mod tests {
     fn generate_new_scaffolds_workspace_layout() {
         let temp = TempDir::new().expect("temp dir");
         let bin_dir = temp.path().join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
         let git_path = if cfg!(windows) {
             bin_dir.join("git.cmd")
         } else {
@@ -628,19 +634,17 @@ mod tests {
         };
 
         if cfg!(windows) {
-            std::fs::write(&git_path, b"@echo off\r\nexit /b 0\r\n").expect("write git stub");
+            fs::write(&git_path, b"@echo off\r\nexit /b 0\r\n").expect("write git stub");
         } else {
-            std::fs::write(&git_path, b"#!/bin/sh\nexit 0\n").expect("write git stub");
+            fs::write(&git_path, b"#!/bin/sh\nexit 0\n").expect("write git stub");
         }
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mut perms = std::fs::metadata(&git_path)
-                .expect("metadata")
-                .permissions();
+            let mut perms = fs::metadata(&git_path).expect("metadata").permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(&git_path, perms).expect("chmod");
+            fs::set_permissions(&git_path, perms).expect("chmod");
         };
 
         let _path_guard = PathOverride::prepend(&bin_dir);
@@ -662,7 +666,7 @@ mod tests {
         assert!(project_dir.join("crates/demo-app-core/src/lib.rs").exists());
 
         let cargo_toml =
-            std::fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
+            fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
         assert!(cargo_toml.contains("crates/demo-app-core"));
         assert!(cargo_toml.contains("crates/demo-app-adapter-cloudflare"));
         assert!(cargo_toml.contains("crates/demo-app-adapter-fastly"));
@@ -672,7 +676,7 @@ mod tests {
         );
 
         let manifest =
-            std::fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
+            fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
         assert!(manifest.contains("[adapters.cloudflare.adapter]"));
         assert!(manifest.contains("[adapters.fastly.adapter]"));
         assert!(
@@ -687,11 +691,10 @@ mod tests {
         );
 
         let gitignore =
-            std::fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
+            fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
         assert!(gitignore.contains("target/"));
 
-        let clippy =
-            std::fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
+        let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
         assert!(clippy.contains("allow-expect-in-tests = true"));
 
         assert!(cargo_toml.contains("[workspace.lints.clippy]"));
@@ -705,8 +708,8 @@ mod tests {
             "crates/demo-app-adapter-spin",
         ] {
             let path = project_dir.join(crate_dir).join("Cargo.toml");
-            let body = std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| panic!("read {}", path.display()));
+            let body =
+                fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {}", path.display()));
             assert!(
                 body.contains("[lints]\nworkspace = true"),
                 "{crate_dir} must inherit workspace lints",

@@ -1,6 +1,8 @@
 use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
+use std::env;
+use std::fmt;
 use std::path::Path;
 use std::process::Command;
 
@@ -134,7 +136,7 @@ fn apply_environment(
 
     let mut missing = Vec::new();
     for binding in &environment.secrets {
-        if std::env::var_os(&binding.env).is_none() {
+        if env::var_os(&binding.env).is_none() {
             missing.push(format!("{} (env `{}`)", binding.name, binding.env));
         }
     }
@@ -150,8 +152,8 @@ fn apply_environment(
     Ok(())
 }
 
-impl std::fmt::Display for Action {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             Action::Build => "build",
             Action::Deploy => "deploy",
@@ -178,11 +180,12 @@ fn manifest_command<'manifest>(
 mod tests {
     use super::{apply_environment, ResolvedEnvironment};
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
+    use std::env;
     use std::process::Command;
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {
-        std::env::remove_var("EDGEZERO_TEST_SECRET");
+        env::remove_var("EDGEZERO_TEST_SECRET");
 
         let env = ResolvedEnvironment {
             variables: vec![ResolvedEnvironmentBinding {
@@ -204,7 +207,7 @@ mod tests {
         let result = apply_environment(adapter_name, &env, &mut Command::new("echo"));
         assert!(result.is_err());
 
-        std::env::set_var("EDGEZERO_TEST_SECRET", "set");
+        env::set_var("EDGEZERO_TEST_SECRET", "set");
         let mut cmd = Command::new("echo");
         apply_environment(adapter_name, &env, &mut cmd).expect("environment applied");
         let has_var = cmd.get_envs().any(|(key, value)| {
@@ -213,7 +216,7 @@ mod tests {
         });
         assert!(has_var);
 
-        std::env::remove_var("EDGEZERO_TEST_SECRET");
+        env::remove_var("EDGEZERO_TEST_SECRET");
     }
 
     #[test]
