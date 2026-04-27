@@ -79,9 +79,6 @@ restriction = { level = "deny", priority = -1 }
 
 # Meta — required when enabling `restriction` as a group.
 blanket_clippy_restriction_lints = "allow"
-# Several local sites need `#[allow]` rather than `#[expect]` because the
-# underlying lint only fires in certain build configurations or features.
-allow_attributes = "allow"
 
 # Documentation — private items don't need full docs.
 missing_docs_in_private_items = "allow"

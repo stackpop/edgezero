@@ -49,7 +49,6 @@ pub trait AppExt {
 
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 impl AppExt for edgezero_core::app::App {
-    #[allow(deprecated)]
     fn dispatch<'a>(
         &'a self,
         req: worker::Request,
