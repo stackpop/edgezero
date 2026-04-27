@@ -84,10 +84,6 @@ pub trait AppExt {
 
 #[cfg(feature = "fastly")]
 impl AppExt for edgezero_core::app::App {
-    #[allow(
-        deprecated,
-        reason = "implementing the deprecated trait method requires calling it"
-    )]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
         crate::request::dispatch_raw(self, req)
     }

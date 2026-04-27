@@ -3,10 +3,9 @@
 #![allow(deprecated)]
 
 use bytes::Bytes;
-use edgezero_adapter_fastly::{
-    dispatch, dispatch_with_config_handle, from_core_response, into_core_request,
-    FastlyRequestContext,
-};
+use edgezero_adapter_fastly::context::FastlyRequestContext;
+use edgezero_adapter_fastly::request::{dispatch, dispatch_with_config_handle, into_core_request};
+use edgezero_adapter_fastly::response::from_core_response;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
