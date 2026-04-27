@@ -7,7 +7,7 @@
 )]
 
 use bytes::Bytes;
-use edgezero_adapter_spin::SpinRequestContext;
+use edgezero_adapter_spin::context::SpinRequestContext;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
@@ -152,7 +152,7 @@ fn router_dispatches_streaming_route() {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod wasm {
     use super::*;
-    use edgezero_adapter_spin::from_core_response;
+    use edgezero_adapter_spin::response::from_core_response;
 
     #[test]
     fn from_core_response_translates_status_and_headers() {

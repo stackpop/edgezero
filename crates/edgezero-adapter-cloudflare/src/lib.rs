@@ -1,16 +1,4 @@
 //! Adapter helpers for Cloudflare Workers.
-//
-// `clippy::pub_use` is silenced via a `cfg_attr`-gated `expect` because the
-// re-export sites are themselves gated on wasm32; an unconditional `expect`
-// would be unfulfilled on the host build.
-#![cfg_attr(
-    all(feature = "cloudflare", target_arch = "wasm32"),
-    expect(
-        clippy::pub_use,
-        reason = "the adapter's public API is `pub use`-exported from private modules; the lint \
-                  is module-scoped"
-    )
-)]
 
 #[cfg(feature = "cli")]
 pub mod cli;
@@ -18,32 +6,17 @@ pub mod cli;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod config_store;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-mod context;
+pub mod context;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod key_value_store;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-mod proxy;
+pub mod proxy;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-mod request;
+pub mod request;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-mod response;
+pub mod response;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
-
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use config_store::CloudflareConfigStore;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use context::CloudflareRequestContext;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use proxy::CloudflareProxyClient;
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-#[allow(deprecated)]
-pub use request::{
-    dispatch, dispatch_with_config, dispatch_with_config_handle, dispatch_with_kv,
-    dispatch_with_kv_and_secrets, dispatch_with_secrets, into_core_request, DEFAULT_KV_BINDING,
-};
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub use response::from_core_response;
 
 /// # Errors
 /// Returns [`log::SetLoggerError`] if a global logger is already installed.

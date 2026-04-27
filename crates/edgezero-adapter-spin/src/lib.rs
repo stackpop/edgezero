@@ -1,31 +1,16 @@
 //! Adapter helpers for Spin (Fermyon).
 
-#![expect(
-    clippy::pub_use,
-    reason = "the adapter's public API is `pub use`-exported from private modules; the lint is \
-              module-scoped, so a file-level `expect` covers the small fixed set of re-exports \
-              below"
-)]
-
 #[cfg(feature = "cli")]
 pub mod cli;
 
-mod context;
+pub mod context;
 mod decompress;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-mod proxy;
+pub mod proxy;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-mod request;
+pub mod request;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-mod response;
-
-pub use context::SpinRequestContext;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use proxy::SpinProxyClient;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use request::{dispatch, into_core_request};
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use response::from_core_response;
+pub mod response;
 
 /// Initialize the logger for Spin.
 ///
@@ -92,5 +77,5 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     // would panic on every subsequent request.
     let _ = init_logger();
     let app = A::build_app();
-    dispatch(&app, req).await
+    request::dispatch(&app, req).await
 }

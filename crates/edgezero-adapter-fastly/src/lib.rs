@@ -1,54 +1,30 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
-#![expect(
-    clippy::pub_use,
-    reason = "the adapter's public API is `pub use`-exported from private modules; the lint is \
-              module-scoped, so a file-level `expect` covers the small fixed set of re-exports \
-              below"
-)]
-
 #[cfg(feature = "fastly")]
 use edgezero_core::app::{Hooks, FASTLY_ADAPTER};
 #[cfg(feature = "fastly")]
 use edgezero_core::manifest::ManifestLoader;
+#[cfg(feature = "fastly")]
+use request::DEFAULT_KV_STORE_NAME;
 
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "fastly")]
 pub mod config_store;
-mod context;
+pub mod context;
 #[cfg(feature = "fastly")]
 pub mod key_value_store;
 #[cfg(feature = "fastly")]
 pub mod logger;
 #[cfg(feature = "fastly")]
-mod proxy;
+pub mod proxy;
 #[cfg(feature = "fastly")]
-mod request;
+pub mod request;
 #[cfg(feature = "fastly")]
-mod response;
+pub mod response;
 #[cfg(feature = "fastly")]
 pub mod secret_store;
-
-#[cfg(feature = "fastly")]
-pub use config_store::FastlyConfigStore;
-pub use context::FastlyRequestContext;
-#[cfg(feature = "fastly")]
-pub use proxy::FastlyProxyClient;
-#[cfg(feature = "fastly")]
-#[expect(
-    deprecated,
-    reason = "re-exporting deprecated entry points for back-compat"
-)]
-pub use request::{
-    dispatch, dispatch_with_config, dispatch_with_config_handle, dispatch_with_kv,
-    dispatch_with_kv_and_secrets, dispatch_with_secrets, into_core_request, DEFAULT_KV_STORE_NAME,
-};
-#[cfg(feature = "fastly")]
-pub use response::from_core_response;
-#[cfg(feature = "fastly")]
-pub use secret_store::FastlySecretStore;
 
 #[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
