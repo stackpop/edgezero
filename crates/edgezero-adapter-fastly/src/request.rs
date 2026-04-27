@@ -29,10 +29,10 @@ const WARNED_STORE_CACHE_LIMIT: usize = 64;
 /// let stores = Stores { kv: Some(kv_handle), ..Default::default() };
 /// ```
 #[derive(Default)]
-pub(crate) struct Stores {
-    pub config_store: Option<ConfigStoreHandle>,
-    pub kv: Option<KvHandle>,
-    pub secrets: Option<SecretHandle>,
+struct Stores {
+    config_store: Option<ConfigStoreHandle>,
+    kv: Option<KvHandle>,
+    secrets: Option<SecretHandle>,
 }
 
 /// Default Fastly KV Store name.
@@ -315,7 +315,7 @@ pub fn dispatch_with_kv_and_secrets(
     )
 }
 
-pub(crate) fn dispatch_with_handles(
+fn dispatch_with_handles(
     app: &App,
     req: FastlyRequest,
     stores: Stores,
@@ -343,7 +343,7 @@ fn dispatch_core_request(
     from_core_response(response).map_err(|err| map_edge_error(&err))
 }
 
-pub(crate) fn resolve_kv_handle(
+fn resolve_kv_handle(
     kv_store_name: &str,
     kv_required: bool,
 ) -> Result<Option<KvHandle>, FastlyError> {
@@ -361,7 +361,7 @@ pub(crate) fn resolve_kv_handle(
     }
 }
 
-pub(crate) fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
+fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
     if !secrets_required {
         return None;
     }

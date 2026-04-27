@@ -14,7 +14,7 @@ use std::io::Read as _;
 /// module: proxy responses are untrusted external data that may legitimately
 /// decompress to a larger size, while response streams originate from the
 /// app's own handlers.
-pub(crate) const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 
 /// Decompress a buffered body based on the `Content-Encoding` value.
 ///
