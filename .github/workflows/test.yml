@@ -121,21 +121,16 @@ jobs:
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # `--force` is required because the cargo cache may restore an existing
+      # `~/.cargo/bin/<binary>` from a prior run, which `cargo install` rejects
+      # by default. Force-overwriting is safe — `--locked` pins the version.
       - name: Install wasm-bindgen test runner
         if: matrix.adapter == 'cloudflare'
-        run: |
-          required="${{ steps.wasm-bindgen-version.outputs.version }}"
-          if ! command -v wasm-bindgen-test-runner &>/dev/null \
-              || ! wasm-bindgen --version 2>/dev/null | grep -q "$required"; then
-            cargo install wasm-bindgen-cli --version "$required" --locked --force
-          fi
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
 
       - name: Setup Viceroy
         if: matrix.adapter == 'fastly'
-        run: |
-          if ! command -v viceroy &>/dev/null; then
-            cargo install viceroy --locked
-          fi
+        run: cargo install viceroy --locked --force
 
       - name: Setup Wasmtime
         if: matrix.adapter == 'spin'
