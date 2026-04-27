@@ -1,11 +1,12 @@
 //! Core primitives for building portable edge workloads across edge adapters.
 
+// Targets a single line — the proc-macro re-export at the bottom of this
+// file. The `pub_use` lint is module-scoped (cannot be `#[expect]`-ed
+// per-item), and proc-macros must be re-exported here so downstream users
+// depend only on `edgezero-core` (not `edgezero-macros`).
 #![expect(
     clippy::pub_use,
-    reason = "proc-macros must be re-exported through the parent crate so downstream users depend \
-              only on edgezero-core (not edgezero-macros); the `pub_use` lint is module-scoped and \
-              cannot be silenced per-item, so this file-level `expect` covers the single re-export \
-              line below"
+    reason = "proc-macros must be re-exported through the parent crate"
 )]
 
 pub mod app;
@@ -27,7 +28,4 @@ pub mod response;
 pub mod router;
 pub mod secret_store;
 
-// Proc macros must be re-exported through the parent crate so downstream
-// users depend only on `edgezero-core` rather than on `edgezero-macros`
-// directly. This is the canonical proc-macro distribution pattern.
 pub use edgezero_macros::{action, app};

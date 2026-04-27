@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use edgezero_adapter_axum::{AxumDevServer, AxumDevServerConfig};
+use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_core::manifest::ManifestLoader;
 use edgezero_core::router::RouterService;
 

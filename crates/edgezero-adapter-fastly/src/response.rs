@@ -30,7 +30,7 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
     Ok(fastly_response)
 }
 
-pub fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {
+pub(crate) fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {
     uri.parse::<Uri>()
         .map_err(|err| EdgeError::bad_request(format!("invalid request URI: {err}")))
 }

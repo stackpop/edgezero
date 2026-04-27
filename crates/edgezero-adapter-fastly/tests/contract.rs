@@ -187,7 +187,7 @@ fn dispatch_with_config_handle_injects_handle() {
 
 #[cfg(all(feature = "fastly", target_arch = "wasm32"))]
 mod secret_store_compile_check {
-    use edgezero_adapter_fastly::FastlySecretStore;
+    use edgezero_adapter_fastly::secret_store::FastlySecretStore;
     use edgezero_core::secret_store::SecretStore;
 
     fn _assert_provider_impl<T: SecretStore>() {}

@@ -3,10 +3,11 @@
 #![allow(deprecated)]
 
 use bytes::Bytes;
-use edgezero_adapter_cloudflare::{
-    dispatch, dispatch_with_config, dispatch_with_config_handle, from_core_response,
-    into_core_request, CloudflareRequestContext,
+use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
+use edgezero_adapter_cloudflare::request::{
+    dispatch, dispatch_with_config, dispatch_with_config_handle, into_core_request,
 };
+use edgezero_adapter_cloudflare::response::from_core_response;
 use edgezero_core::{
     app::App,
     body::Body,

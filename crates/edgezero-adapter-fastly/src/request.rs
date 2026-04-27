@@ -14,10 +14,10 @@ use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyR
 use futures::executor;
 
 use crate::config_store::FastlyConfigStore;
+use crate::context::FastlyRequestContext;
 use crate::key_value_store::FastlyKvStore;
 use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
-use crate::FastlyRequestContext;
 
 const WARNED_STORE_CACHE_LIMIT: usize = 64;
 

@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::config_store::CloudflareConfigStore;
+use crate::context::CloudflareRequestContext;
 use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
-use crate::CloudflareRequestContext;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
