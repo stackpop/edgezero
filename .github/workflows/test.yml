@@ -123,11 +123,19 @@ jobs:
 
       - name: Install wasm-bindgen test runner
         if: matrix.adapter == 'cloudflare'
-        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked
+        run: |
+          required="${{ steps.wasm-bindgen-version.outputs.version }}"
+          if ! command -v wasm-bindgen-test-runner &>/dev/null \
+              || ! wasm-bindgen --version 2>/dev/null | grep -q "$required"; then
+            cargo install wasm-bindgen-cli --version "$required" --locked --force
+          fi
 
       - name: Setup Viceroy
         if: matrix.adapter == 'fastly'
-        run: cargo install viceroy --locked
+        run: |
+          if ! command -v viceroy &>/dev/null; then
+            cargo install viceroy --locked
+          fi
 
       - name: Setup Wasmtime
         if: matrix.adapter == 'spin'
