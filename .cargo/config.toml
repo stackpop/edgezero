@@ -1,0 +1,11 @@
+# Workspace-level cargo config so wasm32-wasip1 tests run from the workspace
+# root via `-p <crate>`. Per-package `.cargo/config.toml` files only apply
+# when cwd is inside the package directory; this file makes the runners
+# discoverable from anywhere in the tree.
+#
+# Cargo invokes the runner with cwd set to the package's manifest directory
+# (e.g. `crates/edgezero-adapter-fastly/`), so the `-C` argument is relative
+# to that — `../../examples/...` resolves to the same fastly.toml regardless
+# of which adapter package is being tested.
+[target.wasm32-wasip1]
+runner = "viceroy run -C ../../examples/app-demo/crates/app-demo-adapter-fastly/fastly.toml -- "
