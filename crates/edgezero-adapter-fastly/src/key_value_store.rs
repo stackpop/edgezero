@@ -13,6 +13,8 @@ use bytes::Bytes;
 #[cfg(feature = "fastly")]
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 #[cfg(feature = "fastly")]
+use fastly::kv_store::{KVStore, KVStoreError};
+#[cfg(feature = "fastly")]
 use std::time::Duration;
 
 /// KV store backed by Fastly's KV Store API.
@@ -20,7 +22,7 @@ use std::time::Duration;
 /// Wraps a `fastly::kv_store::KVStore` handle obtained via `KVStore::open(name)`.
 #[cfg(feature = "fastly")]
 pub struct FastlyKvStore {
-    store: fastly::kv_store::KVStore,
+    store: KVStore,
 }
 
 #[cfg(feature = "fastly")]
@@ -32,7 +34,7 @@ impl FastlyKvStore {
     /// # Errors
     /// Returns [`KvError::Internal`] if the named KV store cannot be opened.
     pub fn open(name: &str) -> Result<Self, KvError> {
-        let store = fastly::kv_store::KVStore::open(name)
+        let store = KVStore::open(name)
             .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?
             .ok_or(KvError::Unavailable)?;
         Ok(Self { store })
@@ -48,7 +50,7 @@ impl KvStore for FastlyKvStore {
                 let bytes = response.take_body_bytes();
                 Ok(Some(Bytes::from(bytes)))
             }
-            Err(fastly::kv_store::KVStoreError::ItemNotFound) => Ok(None),
+            Err(KVStoreError::ItemNotFound) => Ok(None),
             Err(e) => Err(KvError::Internal(anyhow::anyhow!("lookup failed: {e}"))),
         }
     }

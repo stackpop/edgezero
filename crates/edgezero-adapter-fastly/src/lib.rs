@@ -2,9 +2,9 @@
 //! `edgezero-core` service abstractions.
 
 #[cfg(feature = "fastly")]
-use edgezero_core::app::{Hooks, FASTLY_ADAPTER};
+use edgezero_core::app::{App, Hooks, FASTLY_ADAPTER};
 #[cfg(feature = "fastly")]
-use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::manifest::{ManifestLoader, ResolvedLoggingConfig};
 #[cfg(feature = "fastly")]
 use request::DEFAULT_KV_STORE_NAME;
 
@@ -36,8 +36,8 @@ pub struct FastlyLogging {
 }
 
 #[cfg(feature = "fastly")]
-impl From<edgezero_core::manifest::ResolvedLoggingConfig> for FastlyLogging {
-    fn from(config: edgezero_core::manifest::ResolvedLoggingConfig) -> Self {
+impl From<ResolvedLoggingConfig> for FastlyLogging {
+    fn from(config: ResolvedLoggingConfig) -> Self {
         Self {
             endpoint: config.endpoint,
             level: config.level.into(),
@@ -83,9 +83,9 @@ pub trait AppExt {
 }
 
 #[cfg(feature = "fastly")]
-impl AppExt for edgezero_core::app::App {
+impl AppExt for App {
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-        crate::request::dispatch_raw(self, req)
+        request::dispatch_raw(self, req)
     }
 }
 
@@ -195,7 +195,7 @@ fn run_app_with_stores<A: Hooks>(
     }
 
     let app = A::build_app();
-    crate::request::dispatch_with_store_names(
+    request::dispatch_with_store_names(
         &app,
         req,
         config_store_name,
@@ -209,13 +209,14 @@ fn run_app_with_stores<A: Hooks>(
 #[cfg(feature = "fastly")]
 mod tests {
     use super::*;
+    use edgezero_core::manifest::LogLevel;
 
     #[test]
     fn fastly_logging_from_manifest_converts_defaults() {
-        let config = edgezero_core::manifest::ResolvedLoggingConfig {
+        let config = ResolvedLoggingConfig {
             endpoint: Some("endpoint".to_owned()),
             echo_stdout: Some(false),
-            level: edgezero_core::manifest::LogLevel::Debug,
+            level: LogLevel::Debug,
         };
 
         let logging: FastlyLogging = config.into();

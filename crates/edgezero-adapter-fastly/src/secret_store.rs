@@ -9,12 +9,14 @@ use async_trait::async_trait;
 #[cfg(feature = "fastly")]
 use bytes::Bytes;
 #[cfg(feature = "fastly")]
-use edgezero_core::secret_store::SecretError;
+use edgezero_core::secret_store::{SecretError, SecretStore};
+#[cfg(feature = "fastly")]
+use fastly::secret_store::SecretStore as FastlyNativeSecretStore;
 
 /// Internal helper that opens a single named Fastly `SecretStore`.
 #[cfg(feature = "fastly")]
 pub struct FastlyNamedStore {
-    store: fastly::secret_store::SecretStore,
+    store: FastlyNativeSecretStore,
 }
 
 #[cfg(feature = "fastly")]
@@ -29,7 +31,7 @@ impl FastlyNamedStore {
     /// # Errors
     /// Returns [`SecretError::Internal`] if the named secret store cannot be opened.
     pub fn open(name: &str) -> Result<Self, SecretError> {
-        let store = fastly::secret_store::SecretStore::open(name).map_err(|e| {
+        let store = FastlyNativeSecretStore::open(name).map_err(|e| {
             SecretError::Internal(anyhow::anyhow!("failed to open secret store '{name}': {e}"))
         })?;
         Ok(Self { store })
@@ -59,12 +61,8 @@ pub struct FastlySecretStore;
 
 #[cfg(feature = "fastly")]
 #[async_trait(?Send)]
-impl edgezero_core::secret_store::SecretStore for FastlySecretStore {
-    async fn get_bytes(
-        &self,
-        store_name: &str,
-        key: &str,
-    ) -> Result<Option<bytes::Bytes>, edgezero_core::secret_store::SecretError> {
+impl SecretStore for FastlySecretStore {
+    async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         let store = FastlyNamedStore::open(store_name)?;
         store.get_bytes_sync(key)
     }

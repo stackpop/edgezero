@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Display;
 use std::io::Read as _;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
@@ -8,6 +9,7 @@ use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request};
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::manifest::DEFAULT_KV_STORE_NAME as CORE_DEFAULT_KV_STORE_NAME;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
@@ -18,6 +20,7 @@ use crate::context::FastlyRequestContext;
 use crate::key_value_store::FastlyKvStore;
 use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
+use crate::secret_store::FastlySecretStore;
 
 const WARNED_STORE_CACHE_LIMIT: usize = 64;
 
@@ -39,7 +42,7 @@ struct Stores {
 ///
 /// If a KV Store with this name exists in your Fastly service, it will
 /// be automatically available to handlers via the `Kv` extractor.
-pub const DEFAULT_KV_STORE_NAME: &str = edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
+pub const DEFAULT_KV_STORE_NAME: &str = CORE_DEFAULT_KV_STORE_NAME;
 
 /// # Errors
 /// Returns [`EdgeError::Internal`] if the Fastly request cannot be reconstituted into a core request (e.g., method or URI conversion failure).
@@ -211,12 +214,10 @@ fn warn_missing_once(
     cache: &'static OnceLock<Mutex<RecentStringSet>>,
     item_type: &str,
     name: &str,
-    detail: &impl std::fmt::Display,
+    detail: &impl Display,
 ) {
     let set = cache.get_or_init(|| Mutex::new(RecentStringSet::default()));
-    let mut guard = set
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = set.lock().unwrap_or_else(PoisonError::into_inner);
     if guard.insert(name, WARNED_STORE_CACHE_LIMIT) {
         log::warn!("{item_type} '{name}' not available: {detail}");
     }
@@ -258,7 +259,7 @@ fn map_edge_error(err: &EdgeError) -> FastlyError {
     FastlyError::msg(err.to_string())
 }
 
-fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl std::fmt::Display) {
+fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl Display) {
     static WARNED_KV_STORES: OnceLock<Mutex<RecentStringSet>> = OnceLock::new();
     warn_missing_once(&WARNED_KV_STORES, "KV store", kv_store_name, error);
 }
@@ -348,7 +349,7 @@ fn resolve_kv_handle(
     kv_required: bool,
 ) -> Result<Option<KvHandle>, FastlyError> {
     match FastlyKvStore::open(kv_store_name) {
-        Ok(store) => Ok(Some(KvHandle::new(std::sync::Arc::new(store)))),
+        Ok(store) => Ok(Some(KvHandle::new(Arc::new(store)))),
         Err(e) => {
             if kv_required {
                 return Err(FastlyError::msg(format!(
@@ -365,7 +366,5 @@ fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
     if !secrets_required {
         return None;
     }
-    Some(SecretHandle::new(std::sync::Arc::new(
-        crate::secret_store::FastlySecretStore,
-    )))
+    Some(SecretHandle::new(Arc::new(FastlySecretStore)))
 }

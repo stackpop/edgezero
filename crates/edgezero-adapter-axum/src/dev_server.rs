@@ -489,11 +489,15 @@ mod integration_tests {
     use edgezero_core::error::EdgeError;
     use edgezero_core::extractor::Secrets;
     use edgezero_core::router::RouterService;
+    use edgezero_core::secret_store::SecretHandle as CoreSecretHandle;
+    use std::iter;
     use std::time::{Duration, Instant};
+    use tokio::task::{spawn_blocking, JoinHandle};
+    use tokio::time::sleep;
 
     struct TestServer {
         base_url: String,
-        handle: tokio::task::JoinHandle<()>,
+        handle: JoinHandle<()>,
         _temp_dir: tempfile::TempDir,
     }
 
@@ -541,7 +545,7 @@ mod integration_tests {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -627,7 +631,7 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn server_fails_to_bind_to_used_port() {
         // First bind to a port
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind first");
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind first");
         let addr = listener.local_addr().expect("listener addr");
 
         // Try to start server on same port
@@ -639,7 +643,7 @@ mod integration_tests {
         let server = AxumDevServer::with_config(router, config);
 
         // Run in blocking mode to capture the error
-        let result = tokio::task::spawn_blocking(move || server.run()).await;
+        let result = spawn_blocking(move || server.run()).await;
 
         match result {
             Ok(Err(e)) => {
@@ -847,12 +851,12 @@ mod integration_tests {
 
     struct TestServerSecrets {
         base_url: String,
-        handle: tokio::task::JoinHandle<()>,
+        handle: JoinHandle<()>,
     }
 
     async fn start_test_server_with_secret_handle(
         router: RouterService,
-        secret_handle: Option<edgezero_core::secret_store::SecretHandle>,
+        secret_handle: Option<CoreSecretHandle>,
     ) -> TestServerSecrets {
         let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
@@ -918,7 +922,7 @@ mod integration_tests {
         let router = RouterService::builder()
             .get("/secret", secret_value_handler)
             .build();
-        let store = InMemorySecretStore::new(std::iter::empty::<(&str, bytes::Bytes)>());
+        let store = InMemorySecretStore::new(iter::empty::<(&str, bytes::Bytes)>());
         let handle = SecretHandle::new(Arc::new(store));
         let server = start_test_server_with_secret_handle(router, Some(handle)).await;
 

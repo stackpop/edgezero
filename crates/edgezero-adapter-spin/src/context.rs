@@ -1,4 +1,6 @@
 use std::net::IpAddr;
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+use std::net::SocketAddr;
 
 use edgezero_core::http::Request;
 
@@ -23,7 +25,7 @@ pub struct SpinRequestContext {
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 pub(crate) fn parse_client_addr(raw: &str) -> Option<IpAddr> {
     // Try `ip:port` (IPv4) or `[ip]:port` (IPv6 bracket notation).
-    if let Ok(sock) = raw.parse::<std::net::SocketAddr>() {
+    if let Ok(sock) = raw.parse::<SocketAddr>() {
         return Some(sock.ip());
     }
     // Bare IP with no port.

@@ -1,5 +1,7 @@
 #![cfg(feature = "edgezero-adapter-axum")]
 
+use std::env;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -98,12 +100,12 @@ fn try_run_manifest_axum() -> Result<bool, String> {
 }
 
 fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
-    let path = std::env::var("EDGEZERO_MANIFEST")
+    let path = env::var("EDGEZERO_MANIFEST")
         .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
 
     match ManifestLoader::from_path(&path) {
         Ok(manifest) => Ok(Some(manifest)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
         Err(err) => Err(format!("failed to load {}: {err}", path.display())),
     }
 }

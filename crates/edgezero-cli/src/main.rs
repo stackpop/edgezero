@@ -14,9 +14,13 @@ mod scaffold;
 #[cfg(feature = "cli")]
 use edgezero_core::manifest::ManifestLoader;
 #[cfg(feature = "cli")]
+use std::env;
+#[cfg(feature = "cli")]
 use std::io::ErrorKind;
 #[cfg(feature = "cli")]
 use std::path::PathBuf;
+#[cfg(feature = "cli")]
+use std::process;
 
 /// Initialize a CLI logger that prints messages without timestamps or level
 /// prefixes — the CLI's output IS the user-facing UX, not a debug log.
@@ -42,7 +46,7 @@ fn main() {
         Command::New(new_args) => {
             if let Err(e) = generator::generate_new(&new_args) {
                 log::error!("[edgezero] new error: {e}");
-                std::process::exit(1);
+                process::exit(1);
             }
         }
         Command::Build {
@@ -51,7 +55,7 @@ fn main() {
         } => {
             if let Err(err) = handle_build(&adapter, &adapter_args) {
                 log::error!("[edgezero] build error: {err}");
-                std::process::exit(1);
+                process::exit(1);
             }
         }
         Command::Deploy {
@@ -60,13 +64,13 @@ fn main() {
         } => {
             if let Err(err) = handle_deploy(&adapter, &adapter_args) {
                 log::error!("[edgezero] deploy error: {err}");
-                std::process::exit(1);
+                process::exit(1);
             }
         }
         Command::Serve { adapter } => {
             if let Err(err) = handle_serve(&adapter) {
                 log::error!("[edgezero] serve error: {err}");
-                std::process::exit(1);
+                process::exit(1);
             }
         }
         Command::Dev => {
@@ -80,7 +84,7 @@ fn main() {
                 log::error!(
                     "edgezero-cli built without `edgezero-adapter-axum`; rebuild with that feature to use `edgezero dev`."
                 );
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     }
@@ -194,7 +198,7 @@ fn ensure_adapter_defined(
 
 #[cfg(feature = "cli")]
 fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
-    let path = std::env::var("EDGEZERO_MANIFEST")
+    let path = env::var("EDGEZERO_MANIFEST")
         .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
 
     match ManifestLoader::from_path(&path) {
@@ -244,8 +248,8 @@ serve = "echo serve"
 
     impl EnvOverride {
         fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            let original = env::var(key).ok();
+            env::set_var(key, value);
             Self { key, original }
         }
     }
@@ -253,9 +257,9 @@ serve = "echo serve"
     impl Drop for EnvOverride {
         fn drop(&mut self) {
             if let Some(original) = &self.original {
-                std::env::set_var(self.key, original);
+                env::set_var(self.key, original);
             } else {
-                std::env::remove_var(self.key);
+                env::remove_var(self.key);
             }
         }
     }

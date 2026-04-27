@@ -120,7 +120,6 @@ exhaustive_structs = "allow"
 exhaustive_enums = "allow"
 
 # Imports / paths
-absolute_paths = "allow"
 std_instead_of_alloc = "allow"
 std_instead_of_core = "allow"
 

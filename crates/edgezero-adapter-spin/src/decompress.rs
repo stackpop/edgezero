@@ -5,6 +5,7 @@
 )]
 
 use edgezero_core::error::EdgeError;
+use flate2::read::GzDecoder;
 use std::io::Read as _;
 
 /// Maximum decompressed body size (64 MiB). Prevents zip-bomb attacks
@@ -28,7 +29,7 @@ const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<Vec<u8>, EdgeError> {
     match encoding {
         Some("gzip") => {
-            let mut decoder = flate2::read::GzDecoder::new(body.as_slice());
+            let mut decoder = GzDecoder::new(body.as_slice());
             let mut output = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
             decoder
                 .by_ref()

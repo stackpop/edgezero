@@ -366,7 +366,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), Bytes::from((*v).to_owned()))),
         );
-        SecretHandle::new(std::sync::Arc::new(provider))
+        SecretHandle::new(Arc::new(provider))
     }
 
     #[test]

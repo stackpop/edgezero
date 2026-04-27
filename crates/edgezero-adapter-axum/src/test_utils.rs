@@ -1,4 +1,5 @@
-use std::ffi::OsString;
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 
@@ -19,16 +20,16 @@ pub struct EnvOverride {
 }
 
 impl EnvOverride {
-    pub fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let original = std::env::var_os(key);
-        std::env::set_var(key, value);
+    pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let original = env::var_os(key);
+        env::set_var(key, value);
         Self { key, original }
     }
 
     #[must_use]
     pub fn clear(key: &'static str) -> Self {
-        let original = std::env::var_os(key);
-        std::env::remove_var(key);
+        let original = env::var_os(key);
+        env::remove_var(key);
         Self { key, original }
     }
 }
@@ -36,9 +37,9 @@ impl EnvOverride {
 impl Drop for EnvOverride {
     fn drop(&mut self) {
         if let Some(original) = &self.original {
-            std::env::set_var(self.key, original);
+            env::set_var(self.key, original);
         } else {
-            std::env::remove_var(self.key);
+            env::remove_var(self.key);
         }
     }
 }

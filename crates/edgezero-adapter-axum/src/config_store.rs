@@ -1,6 +1,7 @@
 //! Axum adapter config store: env vars with in-memory defaults fallback.
 
 use std::collections::HashMap;
+use std::env;
 
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 
@@ -35,7 +36,7 @@ impl AxumConfigStore {
     where
         D: IntoIterator<Item = (String, String)>,
     {
-        Self::from_lookup(defaults, |key| std::env::var(key).ok())
+        Self::from_lookup(defaults, |key| env::var(key).ok())
     }
 
     fn from_lookup<D, F>(defaults: D, mut lookup: F) -> Self

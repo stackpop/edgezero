@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,11 +19,8 @@ const TARGET_TRIPLE: &str = "wasm32-unknown-unknown";
 /// # Errors
 /// Returns an error if the Cloudflare wrangler build command fails.
 pub fn build() -> Result<PathBuf, String> {
-    let manifest = find_wrangler_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
+    let manifest =
+        find_wrangler_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
@@ -61,11 +59,8 @@ pub fn build() -> Result<PathBuf, String> {
 /// # Errors
 /// Returns an error if the Cloudflare wrangler deploy command fails.
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_wrangler_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
+    let manifest =
+        find_wrangler_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
@@ -89,11 +84,8 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
 /// # Errors
 /// Returns an error if the Cloudflare wrangler dev command fails.
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_wrangler_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
+    let manifest =
+        find_wrangler_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
@@ -290,7 +282,7 @@ fn locate_artifact(
 ) -> Result<PathBuf, String> {
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
-    if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
+    if let Some(custom) = env::var_os("CARGO_TARGET_DIR") {
         let candidate = PathBuf::from(custom)
             .join(TARGET_TRIPLE)
             .join("release")

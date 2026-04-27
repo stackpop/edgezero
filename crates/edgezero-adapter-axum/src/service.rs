@@ -124,11 +124,13 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::to_bytes;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
     use edgezero_core::http::{response_builder, StatusCode};
+    use edgezero_core::key_value_store::KvStore;
     use std::sync::Arc;
     use tower::ServiceExt as _;
 
@@ -185,9 +187,7 @@ mod tests {
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&*body, b"injected");
     }
 
@@ -197,8 +197,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
-        let store: Arc<dyn edgezero_core::key_value_store::KvStore> =
-            Arc::new(PersistentKvStore::new(db_path).unwrap());
+        let store: Arc<dyn KvStore> = Arc::new(PersistentKvStore::new(db_path).unwrap());
         let handle = KvHandle::new(Arc::clone(&store));
         handle.put("test_key", &"injected").await.unwrap();
 
@@ -222,9 +221,7 @@ mod tests {
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&*body, b"injected");
     }
 
@@ -249,9 +246,7 @@ mod tests {
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&*body, b"has_config=false");
     }
 
@@ -291,9 +286,7 @@ mod tests {
             .unwrap();
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&*body, b"injected_value");
     }
 
@@ -318,9 +311,7 @@ mod tests {
         let response = service.ready().await.unwrap().call(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&*body, b"has_kv=false");
     }
 }
