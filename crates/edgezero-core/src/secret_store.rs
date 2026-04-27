@@ -216,7 +216,7 @@ impl SecretHandle {
 // Shared validation
 // ---------------------------------------------------------------------------
 
-pub(crate) fn validate_name(name: &str) -> Result<(), SecretError> {
+fn validate_name(name: &str) -> Result<(), SecretError> {
     if name.is_empty() {
         return Err(SecretError::Validation(
             "secret name cannot be empty".to_owned(),
