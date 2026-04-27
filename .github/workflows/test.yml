@@ -55,9 +55,6 @@ jobs:
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
-      - name: Check Spin wasm32 compilation
-        run: cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
-
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests
     runs-on: ubuntu-latest
@@ -69,17 +66,14 @@ jobs:
             target: wasm32-unknown-unknown
             runner_env: CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER
             runner_value: wasm-bindgen-test-runner
-            extra_check: true
           - adapter: fastly
             target: wasm32-wasip1
             runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
             runner_value: viceroy run
-            extra_check: true
           - adapter: spin
             target: wasm32-wasip1
             runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
             runner_value: wasmtime run
-            extra_check: false
     steps:
       - uses: actions/checkout@v4
 
@@ -152,5 +146,4 @@ jobs:
         run: cargo test -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --test contract
 
       - name: Check ${{ matrix.adapter }} wasm target
-        if: matrix.extra_check
         run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}
