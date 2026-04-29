@@ -130,7 +130,8 @@ jobs:
 
       - name: Setup Viceroy
         if: matrix.adapter == 'fastly'
-        run: cargo install viceroy --locked --force
+        # Pinned to 0.16: viceroy 0.17 requires rustc 1.95; we ship rustc 1.91.
+        run: cargo install viceroy --version "^0.16" --locked --force
 
       - name: Setup Wasmtime
         if: matrix.adapter == 'spin'
