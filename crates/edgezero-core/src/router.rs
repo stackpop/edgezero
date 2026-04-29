@@ -419,7 +419,10 @@ mod tests {
 
         let service = RouterService::builder()
             .middleware(first)
-            .middleware_arc(Arc::new(second) as BoxMiddleware)
+            .middleware_arc({
+                let arc: BoxMiddleware = Arc::new(second);
+                arc
+            })
             .get("/test", ok_handler)
             .build();
 

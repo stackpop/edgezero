@@ -162,12 +162,7 @@ fn handle_deploy(adapter_name: &str, adapter_args: &[String]) -> Result<(), Stri
 fn handle_serve(adapter_name: &str) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
-    adapter::execute(
-        adapter_name,
-        adapter::Action::Serve,
-        manifest.as_ref(),
-        &[] as &[String],
-    )
+    adapter::execute(adapter_name, adapter::Action::Serve, manifest.as_ref(), &[])
 }
 
 #[cfg(feature = "cli")]

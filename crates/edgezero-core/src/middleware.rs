@@ -170,7 +170,7 @@ mod tests {
     fn middleware_can_short_circuit() {
         let handler = ok_handler.into_handler();
 
-        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(ShortCircuit) as BoxMiddleware];
+        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(ShortCircuit)];
         let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -194,10 +194,7 @@ mod tests {
         })
         .into_handler();
 
-        let middlewares: Vec<BoxMiddleware> = vec![
-            Arc::new(first) as BoxMiddleware,
-            Arc::new(second) as BoxMiddleware,
-        ];
+        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(first), Arc::new(second)];
 
         let result = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
             .expect("response");
@@ -220,7 +217,7 @@ mod tests {
         });
 
         let handler = ok_handler.into_handler();
-        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(middleware) as BoxMiddleware];
+        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(middleware)];
         let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);

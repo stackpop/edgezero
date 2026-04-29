@@ -16,6 +16,10 @@ use std::io::Read as _;
 /// decompress to a larger size, while response streams originate from the
 /// app's own handlers.
 const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+/// Same value as [`MAX_DECOMPRESSED_SIZE`] expressed as `u64` for the
+/// `Read::take` API. Defined as a sibling constant so neither callsite
+/// needs a numeric conversion.
+const MAX_DECOMPRESSED_SIZE_U64: u64 = 64 * 1024 * 1024;
 
 /// Decompress a buffered body based on the `Content-Encoding` value.
 ///
@@ -33,7 +37,7 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
             let mut output = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
             decoder
                 .by_ref()
-                .take(MAX_DECOMPRESSED_SIZE as u64 + 1)
+                .take(MAX_DECOMPRESSED_SIZE_U64.saturating_add(1))
                 .read_to_end(&mut output)
                 .map_err(|e| {
                     EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}"))
@@ -50,7 +54,7 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
             let mut output = Vec::with_capacity(body.len().min(MAX_DECOMPRESSED_SIZE));
             decoder
                 .by_ref()
-                .take(MAX_DECOMPRESSED_SIZE as u64 + 1)
+                .take(MAX_DECOMPRESSED_SIZE_U64.saturating_add(1))
                 .read_to_end(&mut output)
                 .map_err(|e| {
                     EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {e}"))
