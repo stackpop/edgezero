@@ -13,20 +13,36 @@ use futures::executor::block_on;
 use futures::stream;
 use std::sync::Arc;
 
-struct FixedConfigStore(&'static str);
+/// Config store that returns a value only for the expected key.
+struct FixedConfigStore {
+    key: &'static str,
+    value: &'static str,
+}
 
 impl ConfigStore for FixedConfigStore {
-    fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(Some(self.0.to_string()))
+    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        if key == self.key {
+            Ok(Some(self.value.to_string()))
+        } else {
+            Ok(None)
+        }
     }
 }
 
-struct StubKvStore;
+/// KV store that returns a fixed value for one key; everything else is absent.
+struct FixedKvStore {
+    key: &'static str,
+    value: &'static [u8],
+}
 
 #[async_trait::async_trait(?Send)]
-impl KvStore for StubKvStore {
-    async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
-        Ok(None)
+impl KvStore for FixedKvStore {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        if key == self.key {
+            Ok(Some(Bytes::from_static(self.value)))
+        } else {
+            Ok(None)
+        }
     }
     async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
         Ok(())
@@ -42,8 +58,8 @@ impl KvStore for StubKvStore {
     async fn delete(&self, _key: &str) -> Result<(), KvError> {
         Ok(())
     }
-    async fn exists(&self, _key: &str) -> Result<bool, KvError> {
-        Ok(false)
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Ok(key == self.key)
     }
     async fn list_keys_page(
         &self,
@@ -52,18 +68,26 @@ impl KvStore for StubKvStore {
         _limit: usize,
     ) -> Result<KvPage, KvError> {
         Ok(KvPage {
-            keys: vec![],
+            keys: vec![self.key.to_string()],
             cursor: None,
         })
     }
 }
 
-struct StubSecretStore;
+/// Secret store that returns a fixed value for one (store, key) pair.
+struct FixedSecretStore {
+    key: &'static str,
+    value: &'static [u8],
+}
 
 #[async_trait::async_trait(?Send)]
-impl SecretStore for StubSecretStore {
-    async fn get_bytes(&self, _store_name: &str, _key: &str) -> Result<Option<Bytes>, SecretError> {
-        Ok(None)
+impl SecretStore for FixedSecretStore {
+    async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
+        if key == self.key {
+            Ok(Some(Bytes::from_static(self.value)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -111,28 +135,36 @@ fn build_test_app() -> App {
         Ok(response)
     }
 
-    async fn kv_presence(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let body = Body::text(if ctx.kv_handle().is_some() {
-            "yes"
+    async fn kv_value(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let value = if let Some(handle) = ctx.kv_handle() {
+            match handle.get_bytes("test-key").await {
+                Ok(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
+                Ok(None) => "missing".to_string(),
+                Err(_) => "error".to_string(),
+            }
         } else {
-            "no"
-        });
+            "no-handle".to_string()
+        };
         let response = response_builder()
             .status(StatusCode::OK)
-            .body(body)
+            .body(Body::text(value))
             .expect("response");
         Ok(response)
     }
 
-    async fn secret_presence(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let body = Body::text(if ctx.secret_handle().is_some() {
-            "yes"
+    async fn secret_value(ctx: RequestContext) -> Result<Response, EdgeError> {
+        let value = if let Some(handle) = ctx.secret_handle() {
+            match handle.get_bytes("default", "test-secret").await {
+                Ok(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
+                Ok(None) => "missing".to_string(),
+                Err(_) => "error".to_string(),
+            }
         } else {
-            "no"
-        });
+            "no-handle".to_string()
+        };
         let response = response_builder()
             .status(StatusCode::OK)
-            .body(body)
+            .body(Body::text(value))
             .expect("response");
         Ok(response)
     }
@@ -142,8 +174,8 @@ fn build_test_app() -> App {
         .post("/mirror", mirror_body)
         .get("/stream", stream_response)
         .get("/config", config_value)
-        .get("/has-kv", kv_presence)
-        .get("/has-secret", secret_presence)
+        .get("/kv-value", kv_value)
+        .get("/secret-value", secret_value)
         .build();
 
     App::new(router)
@@ -231,7 +263,7 @@ fn router_dispatches_streaming_route() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn config_store_handle_is_accessible_from_handler() {
+fn config_store_reads_value_from_handler() {
     let app = build_test_app();
     let mut request = request_builder()
         .method("GET")
@@ -240,9 +272,10 @@ fn config_store_handle_is_accessible_from_handler() {
         .expect("request");
     request
         .extensions_mut()
-        .insert(ConfigStoreHandle::new(Arc::new(FixedConfigStore(
-            "hello-spin",
-        ))));
+        .insert(ConfigStoreHandle::new(Arc::new(FixedConfigStore {
+            key: "greeting",
+            value: "hello-spin",
+        })));
 
     let response = block_on(app.router().oneshot(request));
 
@@ -251,39 +284,45 @@ fn config_store_handle_is_accessible_from_handler() {
 }
 
 #[test]
-fn kv_handle_is_accessible_from_handler() {
+fn kv_store_reads_value_from_handler() {
     let app = build_test_app();
     let mut request = request_builder()
         .method("GET")
-        .uri("http://example.com/has-kv")
+        .uri("http://example.com/kv-value")
         .body(Body::empty())
         .expect("request");
     request
         .extensions_mut()
-        .insert(KvHandle::new(Arc::new(StubKvStore)));
+        .insert(KvHandle::new(Arc::new(FixedKvStore {
+            key: "test-key",
+            value: b"kv-payload",
+        })));
 
     let response = block_on(app.router().oneshot(request));
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.body().as_bytes(), b"yes");
+    assert_eq!(response.body().as_bytes(), b"kv-payload");
 }
 
 #[test]
-fn secret_handle_is_accessible_from_handler() {
+fn secret_store_reads_value_from_handler() {
     let app = build_test_app();
     let mut request = request_builder()
         .method("GET")
-        .uri("http://example.com/has-secret")
+        .uri("http://example.com/secret-value")
         .body(Body::empty())
         .expect("request");
     request
         .extensions_mut()
-        .insert(SecretHandle::new(Arc::new(StubSecretStore)));
+        .insert(SecretHandle::new(Arc::new(FixedSecretStore {
+            key: "test-secret",
+            value: b"s3cr3t",
+        })));
 
     let response = block_on(app.router().oneshot(request));
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.body().as_bytes(), b"yes");
+    assert_eq!(response.body().as_bytes(), b"s3cr3t");
 }
 
 #[test]
@@ -295,24 +334,30 @@ fn missing_store_handles_return_absent_values_in_handler() {
         .uri("http://example.com/config")
         .body(Body::empty())
         .expect("request");
-    let config_response = block_on(app.router().oneshot(config_req));
-    assert_eq!(config_response.body().as_bytes(), b"missing");
+    assert_eq!(
+        block_on(app.router().oneshot(config_req)).body().as_bytes(),
+        b"missing"
+    );
 
     let kv_req = request_builder()
         .method("GET")
-        .uri("http://example.com/has-kv")
+        .uri("http://example.com/kv-value")
         .body(Body::empty())
         .expect("request");
-    let kv_response = block_on(app.router().oneshot(kv_req));
-    assert_eq!(kv_response.body().as_bytes(), b"no");
+    assert_eq!(
+        block_on(app.router().oneshot(kv_req)).body().as_bytes(),
+        b"no-handle"
+    );
 
     let secret_req = request_builder()
         .method("GET")
-        .uri("http://example.com/has-secret")
+        .uri("http://example.com/secret-value")
         .body(Body::empty())
         .expect("request");
-    let secret_response = block_on(app.router().oneshot(secret_req));
-    assert_eq!(secret_response.body().as_bytes(), b"no");
+    assert_eq!(
+        block_on(app.router().oneshot(secret_req)).body().as_bytes(),
+        b"no-handle"
+    );
 }
 
 // ---------------------------------------------------------------------------

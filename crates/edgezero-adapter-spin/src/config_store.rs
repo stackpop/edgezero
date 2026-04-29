@@ -42,14 +42,12 @@ impl Default for SpinConfigStore {
 }
 
 impl ConfigStore for SpinConfigStore {
-    // `key` is unused in the _Uninhabited arm on native non-test builds
-    #[allow(unused_variables)]
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
             #[cfg(target_arch = "wasm32")]
             SpinConfigBackend::Spin => {
                 use spin_sdk::variables;
-                match variables::get(key) {
+                match variables::get(_key) {
                     Ok(value) => Ok(Some(value)),
                     Err(variables::Error::Undefined(_)) => Ok(None),
                     Err(variables::Error::InvalidName(msg)) => {
@@ -59,7 +57,7 @@ impl ConfigStore for SpinConfigStore {
                 }
             }
             #[cfg(test)]
-            SpinConfigBackend::InMemory(data) => Ok(data.get(key).cloned()),
+            SpinConfigBackend::InMemory(data) => Ok(data.get(_key).cloned()),
             #[cfg(not(any(target_arch = "wasm32", test)))]
             SpinConfigBackend::_Uninhabited(never) => match *never {},
         }

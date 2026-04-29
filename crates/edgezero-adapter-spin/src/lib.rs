@@ -18,14 +18,15 @@ mod response;
 // allowing the InMemory test backend to compile on all targets. SpinKvStore
 // and SpinSecretStore import spin_sdk types at the module level and therefore
 // require `all(feature = "spin", target_arch = "wasm32")`.
-pub use config_store::SpinConfigStore;
-pub use context::SpinRequestContext;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod key_value_store;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use key_value_store::SpinKvStore;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod secret_store;
+
+pub use config_store::SpinConfigStore;
+pub use context::SpinRequestContext;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub use key_value_store::SpinKvStore;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use proxy::SpinProxyClient;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]

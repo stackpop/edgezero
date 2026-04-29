@@ -95,9 +95,24 @@ fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<Strin
 ///
 /// Injects all available stores into request extensions:
 /// - `ConfigStoreHandle` backed by `SpinConfigStore` (Spin component variables)
-/// - `KvHandle` backed by `SpinKvStore` for the `"default"` KV label (best-effort;
-///   a warning is logged and the handle is omitted if the label is not configured)
+/// - `KvHandle` backed by `SpinKvStore` opened on the `"default"` label (best-effort;
+///   logged and omitted if the label is not declared in `spin.toml`)
 /// - `SecretHandle` backed by `SpinSecretStore` (Spin component variables)
+///
+/// # KV label limitation
+///
+/// Only the `"default"` KV label is opened automatically. If your `spin.toml`
+/// uses a different label, skip `run_app` and call `into_core_request` /
+/// `from_core_response` directly, inserting your own `KvHandle`:
+///
+/// ```ignore
+/// let mut req = into_core_request(incoming).await?;
+/// req.extensions_mut().insert(KvHandle::new(Arc::new(
+///     SpinKvStore::open("my-label")?,
+/// )));
+/// let resp = app.router().oneshot(req).await;
+/// Ok(from_core_response(resp).await?)
+/// ```
 pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sdk::http::Response> {
     let mut core_request = into_core_request(req).await?;
 

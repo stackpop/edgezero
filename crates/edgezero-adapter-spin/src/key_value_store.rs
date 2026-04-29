@@ -9,14 +9,15 @@
 //!   `put_bytes_with_ttl` store the value without expiry and emit a
 //!   `log::warn!`.
 //! - **Listing**: `spin_sdk::key_value::Store::get_keys()` returns all keys
-//!   with no prefix or cursor support. All keys are fetched from the host,
-//!   then prefix filtering and pagination are performed in-process. A
-//!   configurable cap (`max_list_keys`, default [`DEFAULT_MAX_LIST_KEYS`])
-//!   limits how many keys may be processed; when the store contains more keys
-//!   than the cap, `list_keys_page` returns `KvError::Validation` so the
-//!   caller can detect the condition and raise the cap via
-//!   [`SpinKvStore::with_max_list_keys`] rather than silently receiving
-//!   incomplete results.
+//!   with no prefix or cursor support. Every call to `list_keys_page` pays a
+//!   full host round-trip that fetches **all** keys in the store regardless of
+//!   prefix or page size — O(n) I/O per page. Prefix filtering and pagination
+//!   are performed in-process after the fetch. A configurable cap
+//!   (`max_list_keys`, default [`DEFAULT_MAX_LIST_KEYS`]) limits how many keys
+//!   may be processed; when the store contains more keys than the cap,
+//!   `list_keys_page` returns `KvError::Validation` so the caller can detect
+//!   the condition and raise the cap via [`SpinKvStore::with_max_list_keys`]
+//!   rather than silently receiving incomplete results.
 //!
 //! # Note
 //!
@@ -155,9 +156,9 @@ impl KvStore for SpinKvStore {
             0
         };
 
-        let remaining = &keys[start..];
-        let page_keys: Vec<String> = remaining.iter().take(limit).cloned().collect();
-        let has_more = remaining.len() > limit;
+        let tail = &keys[start..];
+        let page_keys: Vec<String> = tail.iter().take(limit).cloned().collect();
+        let has_more = tail.len() > limit;
         let next_cursor = if has_more {
             page_keys.last().cloned()
         } else {

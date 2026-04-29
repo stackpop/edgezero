@@ -45,9 +45,13 @@ impl SecretStore for SpinSecretStore {
                 store_name
             );
         }
-        // Spin variable names are always lowercase. Normalise the key so that
-        // conventional uppercase secret names (e.g. "STRIPE_KEY") work without
-        // callers needing to know the Spin naming convention.
+        // Spin variable names must be lowercase. Normalise via ascii_lowercase
+        // so that SCREAMING_SNAKE_CASE keys (e.g. "STRIPE_KEY" → "stripe_key")
+        // work without callers knowing the Spin convention. Note: only
+        // UPPER_SNAKE → lower_snake is safe; camelCase or mixed-case keys will
+        // be lowercased in a way that may not match any declared variable
+        // (e.g. "stripeKey" → "stripekey"). Document accepted key formats at
+        // the call site.
         let lower = key.to_ascii_lowercase();
         match variables::get(&lower) {
             Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
