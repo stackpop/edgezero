@@ -19,14 +19,17 @@ use thiserror::Error;
 /// Errors produced by `edgezero new`.
 #[derive(Debug, Error)]
 pub enum GeneratorError {
-    /// The target output directory already exists; refusing to overwrite.
-    #[error("directory '{}' already exists", .0.display())]
-    OutputDirExists(PathBuf),
     /// An adapter context was constructed with no terminal path component.
     /// Should be unreachable given the layout we build, but propagated rather
     /// than panicking on the request path.
     #[error("adapter context directory has no file name: {}", .0.display())]
     AdapterDirMissingFileName(PathBuf),
+    /// `write!`/`writeln!` to an in-memory `String` buffer failed. In
+    /// practice the only way this can fire is a malformed `Display` impl in
+    /// one of the rendered values; surfaced as a typed error rather than a
+    /// silent unwrap.
+    #[error("failed to format generator output: {0}")]
+    Format(#[from] fmt::Error),
     /// A filesystem read/write/metadata operation failed while preparing the
     /// project skeleton.
     #[error("io error at {path}: {source}")]
@@ -35,16 +38,13 @@ pub enum GeneratorError {
         #[source]
         source: io::Error,
     },
+    /// The target output directory already exists; refusing to overwrite.
+    #[error("directory '{}' already exists", .0.display())]
+    OutputDirExists(PathBuf),
     /// A template under the workspace scaffold could not be rendered or
     /// written. Wraps [`ScaffoldError`] for context.
     #[error(transparent)]
     Scaffold(#[from] ScaffoldError),
-    /// `write!`/`writeln!` to an in-memory `String` buffer failed. In
-    /// practice the only way this can fire is a malformed `Display` impl in
-    /// one of the rendered values; surfaced as a typed error rather than a
-    /// silent unwrap.
-    #[error("failed to format generator output: {0}")]
-    Format(#[from] fmt::Error),
 }
 
 impl GeneratorError {
@@ -58,18 +58,18 @@ impl GeneratorError {
 
 struct AdapterContext<'blueprint> {
     blueprint: &'blueprint AdapterBlueprint,
-    dir: PathBuf,
     data_entries: Vec<(String, String)>,
+    dir: PathBuf,
 }
 
 struct ProjectLayout {
+    core_dir: PathBuf,
+    core_mod: String,
+    core_name: String,
+    crates_dir: PathBuf,
     name: String,
     out_dir: PathBuf,
-    crates_dir: PathBuf,
-    core_name: String,
-    core_dir: PathBuf,
     project_mod: String,
-    core_mod: String,
 }
 
 impl ProjectLayout {
@@ -92,25 +92,27 @@ impl ProjectLayout {
         let core_src = core_dir.join("src");
         fs::create_dir_all(&core_src).map_err(|e| GeneratorError::io(&core_src, e))?;
 
+        let project_mod = name.replace('-', "_");
+        let core_mod = core_name.replace('-', "_");
         Ok(ProjectLayout {
-            project_mod: name.replace('-', "_"),
-            core_mod: core_name.replace('-', "_"),
-            core_name,
             core_dir,
+            core_mod,
+            core_name,
             crates_dir,
-            out_dir,
             name,
+            out_dir,
+            project_mod,
         })
     }
 }
 
 struct AdapterArtifacts {
-    contexts: Vec<AdapterContext<'static>>,
     adapter_ids: Vec<String>,
-    workspace_members: Vec<String>,
+    contexts: Vec<AdapterContext<'static>>,
     manifest_sections: String,
     readme_adapter_crates: String,
     readme_adapter_dev: String,
+    workspace_members: Vec<String>,
 }
 
 /// # Errors
@@ -260,18 +262,18 @@ fn collect_adapter_data(
 
         contexts.push(AdapterContext {
             blueprint,
-            dir: adapter_dir,
             data_entries,
+            dir: adapter_dir,
         });
     }
 
     Ok(AdapterArtifacts {
-        contexts,
         adapter_ids,
-        workspace_members,
+        contexts,
         manifest_sections,
         readme_adapter_crates,
         readme_adapter_dev,
+        workspace_members,
     })
 }
 

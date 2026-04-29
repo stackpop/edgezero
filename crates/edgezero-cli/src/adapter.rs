@@ -15,6 +15,17 @@ pub enum Action {
     Serve,
 }
 
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Action::Build => "build",
+            Action::Deploy => "deploy",
+            Action::Serve => "serve",
+        };
+        f.write_str(label)
+    }
+}
+
 impl From<Action> for AdapterAction {
     fn from(value: Action) -> Self {
         match value {
@@ -23,6 +34,35 @@ impl From<Action> for AdapterAction {
             Action::Serve => AdapterAction::Serve,
         }
     }
+}
+
+fn apply_environment(
+    adapter_name: &str,
+    environment: &ResolvedEnvironment,
+    command: &mut Command,
+) -> Result<(), String> {
+    for binding in &environment.variables {
+        if let Some(value) = &binding.value {
+            command.env(&binding.env, value);
+        }
+    }
+
+    let mut missing = Vec::new();
+    for binding in &environment.secrets {
+        if env::var_os(&binding.env).is_none() {
+            missing.push(format!("{} (env `{}`)", binding.name, binding.env));
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(format!(
+            "adapter `{}` requires the following secrets to be set: {}",
+            adapter_name,
+            missing.join(", ")
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn execute(
@@ -61,6 +101,19 @@ pub fn execute(
     })?;
 
     adapter.execute(AdapterAction::from(action), adapter_args)
+}
+
+fn manifest_command<'manifest>(
+    manifest: &'manifest Manifest,
+    adapter_name: &str,
+    action: Action,
+) -> Option<&'manifest str> {
+    let cfg = manifest.adapters.get(adapter_name)?;
+    match action {
+        Action::Build => cfg.commands.build.as_deref(),
+        Action::Deploy => cfg.commands.deploy.as_deref(),
+        Action::Serve => cfg.commands.serve.as_deref(),
+    }
 }
 
 fn run_shell(
@@ -103,13 +156,6 @@ fn run_shell(
     }
 }
 
-fn shell_join(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| shell_escape(arg.as_str()))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn shell_escape(arg: &str) -> String {
     if arg.is_empty() {
         "''".to_owned()
@@ -123,57 +169,11 @@ fn shell_escape(arg: &str) -> String {
     }
 }
 
-fn apply_environment(
-    adapter_name: &str,
-    environment: &ResolvedEnvironment,
-    command: &mut Command,
-) -> Result<(), String> {
-    for binding in &environment.variables {
-        if let Some(value) = &binding.value {
-            command.env(&binding.env, value);
-        }
-    }
-
-    let mut missing = Vec::new();
-    for binding in &environment.secrets {
-        if env::var_os(&binding.env).is_none() {
-            missing.push(format!("{} (env `{}`)", binding.name, binding.env));
-        }
-    }
-
-    if !missing.is_empty() {
-        return Err(format!(
-            "adapter `{}` requires the following secrets to be set: {}",
-            adapter_name,
-            missing.join(", ")
-        ));
-    }
-
-    Ok(())
-}
-
-impl fmt::Display for Action {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            Action::Build => "build",
-            Action::Deploy => "deploy",
-            Action::Serve => "serve",
-        };
-        f.write_str(label)
-    }
-}
-
-fn manifest_command<'manifest>(
-    manifest: &'manifest Manifest,
-    adapter_name: &str,
-    action: Action,
-) -> Option<&'manifest str> {
-    let cfg = manifest.adapters.get(adapter_name)?;
-    match action {
-        Action::Build => cfg.commands.build.as_deref(),
-        Action::Deploy => cfg.commands.deploy.as_deref(),
-        Action::Serve => cfg.commands.serve.as_deref(),
-    }
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_escape(arg.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -188,17 +188,17 @@ mod tests {
         env::remove_var("EDGEZERO_TEST_SECRET");
 
         let env = ResolvedEnvironment {
-            variables: vec![ResolvedEnvironmentBinding {
-                name: "Base".into(),
-                description: None,
-                env: "EDGEZERO_TEST_BASE".into(),
-                value: Some("https://demo".into()),
-            }],
             secrets: vec![ResolvedEnvironmentBinding {
-                name: "Secret".into(),
                 description: None,
                 env: "EDGEZERO_TEST_SECRET".into(),
+                name: "Secret".into(),
                 value: None,
+            }],
+            variables: vec![ResolvedEnvironmentBinding {
+                description: None,
+                env: "EDGEZERO_TEST_BASE".into(),
+                name: "Base".into(),
+                value: Some("https://demo".into()),
             }],
         };
 

@@ -16,6 +16,8 @@ use std::time::Duration;
 
 const BACKEND_PREFIX: &str = "edgezero-dynamic-";
 
+type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
+
 pub struct FastlyProxyClient;
 
 #[async_trait(?Send)]
@@ -57,31 +59,35 @@ fn build_fastly_request(method: Method, uri: &Uri, headers: &HeaderMap) -> Fastl
     fastly_request
 }
 
-async fn forward_request_body(
-    body: Body,
-    streaming_body: &mut StreamingBody,
-) -> Result<(), EdgeError> {
-    match body {
-        Body::Once(bytes) => {
-            if !bytes.is_empty() {
-                streaming_body
-                    .write_all(bytes.as_ref())
-                    .map_err(EdgeError::internal)?;
-            }
-        }
-        Body::Stream(mut stream) => {
-            while let Some(result) = stream.next().await {
-                let chunk = result.map_err(EdgeError::internal)?;
-                streaming_body
-                    .write_all(&chunk)
-                    .map_err(EdgeError::internal)?;
-            }
+fn convert_response(fastly_response: &mut FastlyResponse) -> ProxyResponse {
+    let status = fastly_response.get_status();
+    let mut proxy_response = ProxyResponse::new(status, Body::empty());
+
+    for header in fastly_response.get_header_names() {
+        if let Some(value) = fastly_response.get_header(header) {
+            proxy_response.headers_mut().insert(header, value.clone());
         }
     }
 
-    streaming_body.flush().map_err(EdgeError::internal)?;
+    let encoding = proxy_response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase);
 
-    Ok(())
+    let body = fastly_response.take_body();
+
+    let chunk_stream = fastly_body_stream(body);
+    let body_stream = transform_stream(chunk_stream, encoding.as_deref());
+    *proxy_response.body_mut() = Body::from_stream(body_stream);
+    if encoding.as_deref() == Some("gzip") || encoding.as_deref() == Some("br") {
+        proxy_response
+            .headers_mut()
+            .remove(header::CONTENT_ENCODING);
+        proxy_response.headers_mut().remove(header::CONTENT_LENGTH);
+    }
+
+    proxy_response
 }
 
 fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
@@ -137,39 +143,6 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
     }
 }
 
-fn convert_response(fastly_response: &mut FastlyResponse) -> ProxyResponse {
-    let status = fastly_response.get_status();
-    let mut proxy_response = ProxyResponse::new(status, Body::empty());
-
-    for header in fastly_response.get_header_names() {
-        if let Some(value) = fastly_response.get_header(header) {
-            proxy_response.headers_mut().insert(header, value.clone());
-        }
-    }
-
-    let encoding = proxy_response
-        .headers()
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_ascii_lowercase);
-
-    let body = fastly_response.take_body();
-
-    let chunk_stream = fastly_body_stream(body);
-    let body_stream = transform_stream(chunk_stream, encoding.as_deref());
-    *proxy_response.body_mut() = Body::from_stream(body_stream);
-    if encoding.as_deref() == Some("gzip") || encoding.as_deref() == Some("br") {
-        proxy_response
-            .headers_mut()
-            .remove(header::CONTENT_ENCODING);
-        proxy_response.headers_mut().remove(header::CONTENT_LENGTH);
-    }
-
-    proxy_response
-}
-
-type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
-
 fn fastly_body_stream(mut body: fastly::Body) -> ChunkStream {
     try_stream! {
         for result in body.read_chunks(8 * 1024) {
@@ -178,6 +151,33 @@ fn fastly_body_stream(mut body: fastly::Body) -> ChunkStream {
         }
     }
     .boxed()
+}
+
+async fn forward_request_body(
+    body: Body,
+    streaming_body: &mut StreamingBody,
+) -> Result<(), EdgeError> {
+    match body {
+        Body::Once(bytes) => {
+            if !bytes.is_empty() {
+                streaming_body
+                    .write_all(bytes.as_ref())
+                    .map_err(EdgeError::internal)?;
+            }
+        }
+        Body::Stream(mut stream) => {
+            while let Some(result) = stream.next().await {
+                let chunk = result.map_err(EdgeError::internal)?;
+                streaming_body
+                    .write_all(&chunk)
+                    .map_err(EdgeError::internal)?;
+            }
+        }
+    }
+
+    streaming_body.flush().map_err(EdgeError::internal)?;
+
+    Ok(())
 }
 
 fn transform_stream(
@@ -198,21 +198,17 @@ mod tests {
     use flate2::{write::GzEncoder, Compression};
     use futures::executor::block_on;
 
-    #[test]
-    fn stream_handles_identity_and_gzip() {
-        let mut plain = fastly::Body::new();
-        plain.write_all(b"plain").unwrap();
-        let plain_body = Body::from_stream(transform_stream(fastly_body_stream(plain), None));
-        assert_eq!(collect_body(plain_body), b"plain");
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"hello gzip").unwrap();
-        let compressed = encoder.finish().unwrap();
-        let mut gz_body = fastly::Body::new();
-        gz_body.write_all(&compressed).unwrap();
-        let gzip_body =
-            Body::from_stream(transform_stream(fastly_body_stream(gz_body), Some("gzip")));
-        assert_eq!(collect_body(gzip_body), b"hello gzip");
+    fn collect_body(body: Body) -> Vec<u8> {
+        match body {
+            Body::Once(bytes) => bytes.to_vec(),
+            Body::Stream(mut stream) => block_on(async {
+                let mut out = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    out.extend_from_slice(&chunk.expect("chunk"));
+                }
+                out
+            }),
+        }
     }
 
     #[test]
@@ -229,16 +225,20 @@ mod tests {
         assert_eq!(collected, b"hello brotli");
     }
 
-    fn collect_body(body: Body) -> Vec<u8> {
-        match body {
-            Body::Once(bytes) => bytes.to_vec(),
-            Body::Stream(mut stream) => block_on(async {
-                let mut out = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    out.extend_from_slice(&chunk.expect("chunk"));
-                }
-                out
-            }),
-        }
+    #[test]
+    fn stream_handles_identity_and_gzip() {
+        let mut plain = fastly::Body::new();
+        plain.write_all(b"plain").unwrap();
+        let plain_body = Body::from_stream(transform_stream(fastly_body_stream(plain), None));
+        assert_eq!(collect_body(plain_body), b"plain");
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"hello gzip").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut gz_body = fastly::Body::new();
+        gz_body.write_all(&compressed).unwrap();
+        let gzip_body =
+            Body::from_stream(transform_stream(fastly_body_stream(gz_body), Some("gzip")));
+        assert_eq!(collect_body(gzip_body), b"hello gzip");
     }
 }

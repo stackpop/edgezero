@@ -19,9 +19,9 @@ use crate::response::into_axum_response;
 /// Tower service that adapts `EdgeZero` router requests to Axum/Hyper compatible responses.
 #[derive(Clone)]
 pub struct EdgeZeroAxumService {
-    router: RouterService,
     config_store_handle: Option<ConfigStoreHandle>,
     kv_handle: Option<KvHandle>,
+    router: RouterService,
     secret_handle: Option<SecretHandle>,
 }
 
@@ -29,9 +29,9 @@ impl EdgeZeroAxumService {
     #[must_use]
     pub fn new(router: RouterService) -> Self {
         Self {
-            router,
             config_store_handle: None,
             kv_handle: None,
+            router,
             secret_handle: None,
         }
     }
@@ -68,13 +68,9 @@ impl EdgeZeroAxumService {
 }
 
 impl Service<Request<AxumBody>> for EdgeZeroAxumService {
-    type Response = Response<AxumBody>;
     type Error = Infallible;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
+    type Response = Response<AxumBody>;
 
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
@@ -118,6 +114,10 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
             };
             Ok(response)
         })
+    }
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 }
 

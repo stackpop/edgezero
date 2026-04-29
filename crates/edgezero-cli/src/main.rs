@@ -236,22 +236,9 @@ deploy = "echo deploy"
 serve = "echo serve"
 "#;
 
-    fn manifest_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
-    }
-
     struct EnvOverride {
         key: &'static str,
         original: Option<String>,
-    }
-
-    impl EnvOverride {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = env::var(key).ok();
-            env::set_var(key, value);
-            Self { key, original }
-        }
     }
 
     impl Drop for EnvOverride {
@@ -262,6 +249,19 @@ serve = "echo serve"
                 env::remove_var(self.key);
             }
         }
+    }
+
+    impl EnvOverride {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var(key).ok();
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    fn manifest_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     #[test]

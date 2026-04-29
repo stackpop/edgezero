@@ -14,19 +14,19 @@ use crate::response::{response_with_body, IntoResponse};
 pub enum EdgeError {
     #[error("{message}")]
     BadRequest { message: String },
-    #[error("no route matched path: {path}")]
-    NotFound { path: String },
-    #[error("method {method} not allowed; allowed: {allowed}")]
-    MethodNotAllowed { method: Method, allowed: String },
-    #[error("validation error: {message}")]
-    Validation { message: String },
-    #[error("service unavailable: {message}")]
-    ServiceUnavailable { message: String },
     #[error("internal error: {source}")]
     Internal {
         #[from]
         source: AnyError,
     },
+    #[error("method {method} not allowed; allowed: {allowed}")]
+    MethodNotAllowed { method: Method, allowed: String },
+    #[error("no route matched path: {path}")]
+    NotFound { path: String },
+    #[error("service unavailable: {message}")]
+    ServiceUnavailable { message: String },
+    #[error("validation error: {message}")]
+    Validation { message: String },
 }
 
 impl EdgeError {
@@ -36,14 +36,27 @@ impl EdgeError {
         }
     }
 
-    pub fn validation<S: Into<String>>(message: S) -> Self {
-        EdgeError::Validation {
-            message: message.into(),
+    pub fn internal<E>(error: E) -> Self
+    where
+        E: Into<AnyError>,
+    {
+        EdgeError::Internal {
+            source: error.into(),
         }
     }
 
-    pub fn not_found<S: Into<String>>(path: S) -> Self {
-        EdgeError::NotFound { path: path.into() }
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            EdgeError::BadRequest { message }
+            | EdgeError::Validation { message }
+            | EdgeError::ServiceUnavailable { message } => message.clone(),
+            EdgeError::NotFound { path } => format!("no route matched path: {path}"),
+            EdgeError::MethodNotAllowed { method, allowed } => {
+                format!("method {method} not allowed; allowed: {allowed}")
+            }
+            EdgeError::Internal { source } => format!("internal error: {source}"),
+        }
     }
 
     #[must_use]
@@ -64,44 +77,13 @@ impl EdgeError {
         }
     }
 
-    pub fn internal<E>(error: E) -> Self
-    where
-        E: Into<AnyError>,
-    {
-        EdgeError::Internal {
-            source: error.into(),
-        }
+    pub fn not_found<S: Into<String>>(path: S) -> Self {
+        EdgeError::NotFound { path: path.into() }
     }
 
     pub fn service_unavailable<S: Into<String>>(message: S) -> Self {
         EdgeError::ServiceUnavailable {
             message: message.into(),
-        }
-    }
-
-    #[must_use]
-    pub fn status(&self) -> StatusCode {
-        match self {
-            EdgeError::BadRequest { .. } => StatusCode::BAD_REQUEST,
-            EdgeError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
-            EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
-            EdgeError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            EdgeError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-
-    #[must_use]
-    pub fn message(&self) -> String {
-        match self {
-            EdgeError::BadRequest { message }
-            | EdgeError::Validation { message }
-            | EdgeError::ServiceUnavailable { message } => message.clone(),
-            EdgeError::NotFound { path } => format!("no route matched path: {path}"),
-            EdgeError::MethodNotAllowed { method, allowed } => {
-                format!("method {method} not allowed; allowed: {allowed}")
-            }
-            EdgeError::Internal { source } => format!("internal error: {source}"),
         }
     }
 
@@ -124,6 +106,24 @@ impl EdgeError {
             | EdgeError::ServiceUnavailable { .. } => None,
         }
     }
+
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        match self {
+            EdgeError::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            EdgeError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
+            EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
+            EdgeError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            EdgeError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub fn validation<S: Into<String>>(message: S) -> Self {
+        EdgeError::Validation {
+            message: message.into(),
+        }
+    }
 }
 
 impl From<ConfigStoreError> for EdgeError {
@@ -134,10 +134,6 @@ impl From<ConfigStoreError> for EdgeError {
             ConfigStoreError::Internal { source } => EdgeError::internal(source),
         }
     }
-}
-
-fn json_or_text<T: Serialize>(payload: &T) -> Body {
-    Body::json(payload).unwrap_or_else(|_| Body::text("internal error"))
 }
 
 impl IntoResponse for EdgeError {
@@ -158,6 +154,10 @@ impl IntoResponse for EdgeError {
     }
 }
 
+fn json_or_text<T: Serialize>(payload: &T) -> Body {
+    Body::json(payload).unwrap_or_else(|_| Body::text("internal error"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,10 +173,24 @@ mod tests {
     }
 
     #[test]
-    fn method_not_allowed_lists_methods_sorted() {
-        let err = EdgeError::method_not_allowed(&Method::POST, &[Method::GET, Method::DELETE]);
-        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert!(err.message().contains("allowed: DELETE, GET"));
+    fn config_store_error_internal_maps_to_internal_server_error() {
+        let err = EdgeError::from(ConfigStoreError::internal(anyhow::anyhow!("boom")));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("boom"));
+    }
+
+    #[test]
+    fn config_store_error_invalid_key_maps_to_bad_request() {
+        let err = EdgeError::from(ConfigStoreError::invalid_key("invalid config key"));
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.message(), "invalid config key");
+    }
+
+    #[test]
+    fn config_store_error_unavailable_maps_to_service_unavailable() {
+        let err = EdgeError::from(ConfigStoreError::unavailable("backend offline"));
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), "backend offline");
     }
 
     #[test]
@@ -188,53 +202,19 @@ mod tests {
     }
 
     #[test]
-    fn not_found_sets_status_and_message() {
-        let err = EdgeError::not_found("/missing");
-        assert_eq!(err.status(), StatusCode::NOT_FOUND);
-        assert!(err.message().contains("/missing"));
-    }
+    fn into_response_sets_json_payload() {
+        let response = EdgeError::bad_request("invalid")
+            .into_response()
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("content-type header");
+        assert_eq!(content_type, HeaderValue::from_static("application/json"));
 
-    #[test]
-    fn validation_sets_status_and_message() {
-        let err = EdgeError::validation("invalid input");
-        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(err.message(), "invalid input");
-        assert!(err.source().is_none());
-    }
-
-    #[test]
-    fn method_not_allowed_handles_empty_allowed_list() {
-        let err = EdgeError::method_not_allowed(&Method::GET, &[]);
-        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert!(err.message().contains("(none)"));
-    }
-
-    #[test]
-    fn service_unavailable_sets_status_and_message() {
-        let err = EdgeError::service_unavailable("config store unavailable");
-        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(err.message(), "config store unavailable");
-    }
-
-    #[test]
-    fn config_store_error_unavailable_maps_to_service_unavailable() {
-        let err = EdgeError::from(ConfigStoreError::unavailable("backend offline"));
-        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(err.message(), "backend offline");
-    }
-
-    #[test]
-    fn config_store_error_invalid_key_maps_to_bad_request() {
-        let err = EdgeError::from(ConfigStoreError::invalid_key("invalid config key"));
-        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(err.message(), "invalid config key");
-    }
-
-    #[test]
-    fn config_store_error_internal_maps_to_internal_server_error() {
-        let err = EdgeError::from(ConfigStoreError::internal(anyhow::anyhow!("boom")));
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(err.message().contains("boom"));
+        let body = response.into_body().into_bytes().expect("buffered");
+        assert!(str::from_utf8(body.as_ref()).unwrap().contains("invalid"));
     }
 
     #[test]
@@ -255,18 +235,38 @@ mod tests {
     }
 
     #[test]
-    fn into_response_sets_json_payload() {
-        let response = EdgeError::bad_request("invalid")
-            .into_response()
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .expect("content-type header");
-        assert_eq!(content_type, HeaderValue::from_static("application/json"));
+    fn method_not_allowed_handles_empty_allowed_list() {
+        let err = EdgeError::method_not_allowed(&Method::GET, &[]);
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(err.message().contains("(none)"));
+    }
 
-        let body = response.into_body().into_bytes().expect("buffered");
-        assert!(str::from_utf8(body.as_ref()).unwrap().contains("invalid"));
+    #[test]
+    fn method_not_allowed_lists_methods_sorted() {
+        let err = EdgeError::method_not_allowed(&Method::POST, &[Method::GET, Method::DELETE]);
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(err.message().contains("allowed: DELETE, GET"));
+    }
+
+    #[test]
+    fn not_found_sets_status_and_message() {
+        let err = EdgeError::not_found("/missing");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(err.message().contains("/missing"));
+    }
+
+    #[test]
+    fn service_unavailable_sets_status_and_message() {
+        let err = EdgeError::service_unavailable("config store unavailable");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.message(), "config store unavailable");
+    }
+
+    #[test]
+    fn validation_sets_status_and_message() {
+        let err = EdgeError::validation("invalid input");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.message(), "invalid input");
+        assert!(err.source().is_none());
     }
 }

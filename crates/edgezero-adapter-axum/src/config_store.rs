@@ -14,23 +14,11 @@ use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 /// declared in `[stores.config.defaults]`. Use an empty-string default when a
 /// key should be overrideable from env without carrying a real default value.
 pub struct AxumConfigStore {
-    env: HashMap<String, String>,
     defaults: HashMap<String, String>,
+    env: HashMap<String, String>,
 }
 
 impl AxumConfigStore {
-    /// Create from env vars and optional manifest defaults.
-    pub fn new<E, D>(env: E, defaults: D) -> Self
-    where
-        E: IntoIterator<Item = (String, String)>,
-        D: IntoIterator<Item = (String, String)>,
-    {
-        Self {
-            env: env.into_iter().collect(),
-            defaults: defaults.into_iter().collect(),
-        }
-    }
-
     /// Create from the current process environment and manifest defaults.
     pub fn from_env<D>(defaults: D) -> Self
     where
@@ -50,8 +38,20 @@ impl AxumConfigStore {
             .filter_map(|key| lookup(key).map(|value| (key.clone(), value)))
             .collect();
         Self {
-            env,
             defaults: collected,
+            env,
+        }
+    }
+
+    /// Create from env vars and optional manifest defaults.
+    pub fn new<E, D>(env: E, defaults: D) -> Self
+    where
+        E: IntoIterator<Item = (String, String)>,
+        D: IntoIterator<Item = (String, String)>,
+    {
+        Self {
+            defaults: defaults.into_iter().collect(),
+            env: env.into_iter().collect(),
         }
     }
 }
@@ -68,6 +68,28 @@ impl ConfigStore for AxumConfigStore {
 
 #[cfg(test)]
 mod tests {
+    // Run the shared contract tests against AxumConfigStore (defaults path).
+    edgezero_core::config_store_contract_tests!(axum_config_store_defaults_contract, {
+        AxumConfigStore::new(
+            [],
+            [
+                ("contract.key.a".to_owned(), "value_a".to_owned()),
+                ("contract.key.b".to_owned(), "value_b".to_owned()),
+            ],
+        )
+    });
+
+    // Run the shared contract tests against AxumConfigStore (env path).
+    edgezero_core::config_store_contract_tests!(axum_config_store_env_contract, {
+        AxumConfigStore::new(
+            [
+                ("contract.key.a".to_owned(), "value_a".to_owned()),
+                ("contract.key.b".to_owned(), "value_b".to_owned()),
+            ],
+            [],
+        )
+    });
+
     use super::*;
 
     fn store(env: &[(&str, &str)], defaults: &[(&str, &str)]) -> AxumConfigStore {
@@ -77,21 +99,6 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
         )
-    }
-
-    #[test]
-    fn axum_config_store_returns_values() {
-        let s = store(&[("MY_KEY", "my_val")], &[]);
-        assert_eq!(
-            s.get("MY_KEY").expect("config value"),
-            Some("my_val".to_owned())
-        );
-    }
-
-    #[test]
-    fn axum_config_store_returns_none_for_missing() {
-        let s = store(&[], &[]);
-        assert_eq!(s.get("NOPE").expect("missing config"), None);
     }
 
     #[test]
@@ -141,25 +148,18 @@ mod tests {
         );
     }
 
-    // Run the shared contract tests against AxumConfigStore (env path).
-    edgezero_core::config_store_contract_tests!(axum_config_store_env_contract, {
-        AxumConfigStore::new(
-            [
-                ("contract.key.a".to_owned(), "value_a".to_owned()),
-                ("contract.key.b".to_owned(), "value_b".to_owned()),
-            ],
-            [],
-        )
-    });
+    #[test]
+    fn axum_config_store_returns_none_for_missing() {
+        let s = store(&[], &[]);
+        assert_eq!(s.get("NOPE").expect("missing config"), None);
+    }
 
-    // Run the shared contract tests against AxumConfigStore (defaults path).
-    edgezero_core::config_store_contract_tests!(axum_config_store_defaults_contract, {
-        AxumConfigStore::new(
-            [],
-            [
-                ("contract.key.a".to_owned(), "value_a".to_owned()),
-                ("contract.key.b".to_owned(), "value_b".to_owned()),
-            ],
-        )
-    });
+    #[test]
+    fn axum_config_store_returns_values() {
+        let s = store(&[("MY_KEY", "my_val")], &[]);
+        assert_eq!(
+            s.get("MY_KEY").expect("config value"),
+            Some("my_val".to_owned())
+        );
+    }
 }

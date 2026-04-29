@@ -11,21 +11,48 @@ use crate::http::Response;
 
 pub type BoxMiddleware = Arc<dyn Middleware>;
 
+pub struct FnMiddleware<F>
+where
+    F: Send + Sync + 'static,
+{
+    f: F,
+}
+
+impl<F> FnMiddleware<F>
+where
+    F: Send + Sync + 'static,
+{
+    pub fn new(f: F) -> Self {
+        Self { f }
+    }
+}
+
+#[async_trait(?Send)]
+impl<F, Fut> Middleware for FnMiddleware<F>
+where
+    F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Response, EdgeError>>,
+{
+    async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        (self.f)(ctx, next).await
+    }
+}
+
 #[async_trait(?Send)]
 pub trait Middleware: Send + Sync + 'static {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError>;
 }
 
 pub struct Next<'mw> {
-    middlewares: &'mw [BoxMiddleware],
     handler: &'mw dyn DynHandler,
+    middlewares: &'mw [BoxMiddleware],
 }
 
 impl<'mw> Next<'mw> {
     pub fn new(middlewares: &'mw [BoxMiddleware], handler: &'mw dyn DynHandler) -> Self {
         Self {
-            middlewares,
             handler,
+            middlewares,
         }
     }
 
@@ -80,33 +107,6 @@ impl Middleware for RequestLogger {
     }
 }
 
-pub struct FnMiddleware<F>
-where
-    F: Send + Sync + 'static,
-{
-    f: F,
-}
-
-impl<F> FnMiddleware<F>
-where
-    F: Send + Sync + 'static,
-{
-    pub fn new(f: F) -> Self {
-        Self { f }
-    }
-}
-
-#[async_trait(?Send)]
-impl<F, Fut> Middleware for FnMiddleware<F>
-where
-    F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Response, EdgeError>>,
-{
-    async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        (self.f)(ctx, next).await
-    }
-}
-
 pub fn middleware_fn<F, Fut>(f: F) -> FnMiddleware<F>
 where
     F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,
@@ -132,6 +132,8 @@ mod tests {
         name: &'static str,
     }
 
+    struct ShortCircuit;
+
     #[async_trait(?Send)]
     impl Middleware for RecordingMiddleware {
         async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
@@ -139,8 +141,6 @@ mod tests {
             next.run(ctx).await
         }
     }
-
-    struct ShortCircuit;
 
     #[async_trait(?Send)]
     impl Middleware for ShortCircuit {
@@ -164,6 +164,16 @@ mod tests {
 
     async fn ok_handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, Body::empty())
+    }
+
+    #[test]
+    fn middleware_can_short_circuit() {
+        let handler = ok_handler.into_handler();
+
+        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(ShortCircuit) as BoxMiddleware];
+        let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -198,13 +208,23 @@ mod tests {
     }
 
     #[test]
-    fn middleware_can_short_circuit() {
-        let handler = ok_handler.into_handler();
+    fn middleware_fn_executes_closure() {
+        let called = Arc::new(AtomicBool::new(false));
+        let outer_flag = Arc::clone(&called);
+        let middleware = middleware_fn(move |_ctx, _next| {
+            let inner_flag = Arc::clone(&outer_flag);
+            async move {
+                inner_flag.store(true, Ordering::SeqCst);
+                response_with_body(StatusCode::OK, Body::empty())
+            }
+        });
 
-        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(ShortCircuit) as BoxMiddleware];
+        let handler = ok_handler.into_handler();
+        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(middleware) as BoxMiddleware];
         let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
             .expect("response");
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(called.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -233,25 +253,5 @@ mod tests {
         let err = block_on(RequestLogger.handle(empty_context(), Next::new(&[], handler.as_ref())))
             .expect_err("error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn middleware_fn_executes_closure() {
-        let called = Arc::new(AtomicBool::new(false));
-        let outer_flag = Arc::clone(&called);
-        let middleware = middleware_fn(move |_ctx, _next| {
-            let inner_flag = Arc::clone(&outer_flag);
-            async move {
-                inner_flag.store(true, Ordering::SeqCst);
-                response_with_body(StatusCode::OK, Body::empty())
-            }
-        });
-
-        let handler = ok_handler.into_handler();
-        let middlewares: Vec<BoxMiddleware> = vec![Arc::new(middleware) as BoxMiddleware];
-        let response = block_on(Next::new(&middlewares, handler.as_ref()).run(empty_context()))
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(called.load(Ordering::SeqCst));
     }
 }

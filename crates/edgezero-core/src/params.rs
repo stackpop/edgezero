@@ -9,15 +9,6 @@ pub struct PathParams {
 }
 
 impl PathParams {
-    #[must_use]
-    pub fn new(inner: HashMap<String, String>) -> Self {
-        Self { inner }
-    }
-
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.inner.get(key).map(String::as_str)
-    }
-
     /// # Errors
     /// Returns [`serde_json::Error`] if the path parameters cannot be deserialized into `T`.
     pub fn deserialize<T>(&self) -> Result<T, serde_json::Error>
@@ -27,6 +18,15 @@ impl PathParams {
         let value = serde_json::to_value(&self.inner)?;
         serde_json::from_value(value)
     }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.inner.get(key).map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn new(inner: HashMap<String, String>) -> Self {
+        Self { inner }
+    }
 }
 
 #[cfg(test)]
@@ -34,24 +34,17 @@ mod tests {
     use super::*;
     use serde::Deserialize;
 
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct StringParams {
+        id: String,
+    }
+
     fn params(map: &[(&str, &str)]) -> PathParams {
         let inner = map
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         PathParams::new(inner)
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct StringParams {
-        id: String,
-    }
-
-    #[test]
-    fn get_returns_expected_value() {
-        let params = params(&[("id", "7")]);
-        assert_eq!(params.get("id"), Some("7"));
-        assert_eq!(params.get("missing"), None);
     }
 
     #[test]
@@ -73,5 +66,12 @@ mod tests {
         params
             .deserialize::<NumericParams>()
             .expect_err("`id` is not a number");
+    }
+
+    #[test]
+    fn get_returns_expected_value() {
+        let params = params(&[("id", "7")]);
+        assert_eq!(params.get("id"), Some("7"));
+        assert_eq!(params.get("missing"), None);
     }
 }

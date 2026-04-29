@@ -18,6 +18,18 @@ pub struct SpinRequestContext {
     pub full_url: Option<String>,
 }
 
+impl SpinRequestContext {
+    /// Retrieve a previously-inserted context from request extensions.
+    pub fn get(request: &Request) -> Option<&SpinRequestContext> {
+        request.extensions().get::<SpinRequestContext>()
+    }
+
+    /// Store this context in the request's extensions.
+    pub fn insert(request: &mut Request, context: SpinRequestContext) {
+        request.extensions_mut().insert(context);
+    }
+}
+
 /// Parse an IP address from a `host:port` string.
 ///
 /// Falls back to parsing the raw value as a bare IP (no port) and also
@@ -32,24 +44,22 @@ pub(crate) fn parse_client_addr(raw: &str) -> Option<IpAddr> {
     raw.parse::<IpAddr>().ok()
 }
 
-impl SpinRequestContext {
-    /// Store this context in the request's extensions.
-    pub fn insert(request: &mut Request, context: SpinRequestContext) {
-        request.extensions_mut().insert(context);
-    }
-
-    /// Retrieve a previously-inserted context from request extensions.
-    pub fn get(request: &Request) -> Option<&SpinRequestContext> {
-        request.extensions().get::<SpinRequestContext>()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
     use std::str::FromStr as _;
+
+    #[test]
+    fn get_returns_none_when_missing() {
+        let request = request_builder()
+            .uri("https://example.com")
+            .body(Body::empty())
+            .expect("request");
+
+        assert!(SpinRequestContext::get(&request).is_none());
+    }
 
     #[test]
     fn inserts_and_retrieves_context() {
@@ -76,19 +86,8 @@ mod tests {
     }
 
     #[test]
-    fn get_returns_none_when_missing() {
-        let request = request_builder()
-            .uri("https://example.com")
-            .body(Body::empty())
-            .expect("request");
-
-        assert!(SpinRequestContext::get(&request).is_none());
-    }
-
-    #[test]
-    fn parse_client_addr_ipv4_with_port() {
-        let ip = parse_client_addr("192.168.1.1:8080").unwrap();
-        assert_eq!(ip, IpAddr::from_str("192.168.1.1").unwrap());
+    fn parse_client_addr_invalid() {
+        assert!(parse_client_addr("not-an-ip").is_none());
     }
 
     #[test]
@@ -98,9 +97,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_client_addr_ipv6_bracket() {
-        let ip = parse_client_addr("[::1]:3000").unwrap();
-        assert_eq!(ip, IpAddr::from_str("::1").unwrap());
+    fn parse_client_addr_ipv4_with_port() {
+        let ip = parse_client_addr("192.168.1.1:8080").unwrap();
+        assert_eq!(ip, IpAddr::from_str("192.168.1.1").unwrap());
     }
 
     #[test]
@@ -110,7 +109,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_client_addr_invalid() {
-        assert!(parse_client_addr("not-an-ip").is_none());
+    fn parse_client_addr_ipv6_bracket() {
+        let ip = parse_client_addr("[::1]:3000").unwrap();
+        assert_eq!(ip, IpAddr::from_str("::1").unwrap());
     }
 }

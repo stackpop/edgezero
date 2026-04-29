@@ -21,6 +21,20 @@ pub struct FastlyNamedStore {
 
 #[cfg(feature = "fastly")]
 impl FastlyNamedStore {
+    pub(crate) fn get_bytes_sync(&self, key: &str) -> Result<Option<Bytes>, SecretError> {
+        let lookup = self
+            .store
+            .try_get(key)
+            .map_err(|e| SecretError::Internal(anyhow::anyhow!("secret lookup failed: {e}")))?;
+
+        match lookup {
+            Some(secret) => secret.try_plaintext().map(Some).map_err(|e| {
+                SecretError::Internal(anyhow::anyhow!("secret decryption failed: {e}"))
+            }),
+            None => Ok(None),
+        }
+    }
+
     /// Open a Fastly `SecretStore` by name.
     ///
     /// Returns `SecretError::Internal` if the store does not exist or cannot
@@ -35,20 +49,6 @@ impl FastlyNamedStore {
             SecretError::Internal(anyhow::anyhow!("failed to open secret store '{name}': {e}"))
         })?;
         Ok(Self { store })
-    }
-
-    pub(crate) fn get_bytes_sync(&self, key: &str) -> Result<Option<Bytes>, SecretError> {
-        let lookup = self
-            .store
-            .try_get(key)
-            .map_err(|e| SecretError::Internal(anyhow::anyhow!("secret lookup failed: {e}")))?;
-
-        match lookup {
-            Some(secret) => secret.try_plaintext().map(Some).map_err(|e| {
-                SecretError::Internal(anyhow::anyhow!("secret decryption failed: {e}"))
-            }),
-            None => Ok(None),
-        }
     }
 }
 

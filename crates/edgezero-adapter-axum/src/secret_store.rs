@@ -62,11 +62,41 @@ impl SecretStore for EnvSecretStore {
 
 #[cfg(test)]
 mod tests {
+    // Contract tests: use InMemorySecretStoreProvider since EnvSecretStore needs
+    // real env vars, which are unsafe in parallel tests.
+    // The EnvSecretStore is tested individually above.
+    secret_store_contract_tests!(env_secret_contract, {
+        InMemorySecretStore::new([
+            ("mystore/contract_key", Bytes::from("contract_value")),
+            ("mystore/contract_key_2", Bytes::from("another_value")),
+        ])
+    });
+
     use super::*;
     use crate::test_utils::{env_guard, EnvOverride};
     use bytes::Bytes;
+    use edgezero_core::secret_store::InMemorySecretStore;
+    use edgezero_core::secret_store_contract_tests;
     #[cfg(unix)]
     use std::ffi::OsString;
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_bytes_preserves_non_utf8_secret_values() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let _guard = env_guard().lock().await;
+        let _env = EnvOverride::set(
+            "__EDGEZERO_TEST_BINARY_SECRET__",
+            OsString::from_vec(vec![0xff, 0x61]),
+        );
+        let store = EnvSecretStore::new();
+        let result = store
+            .get_bytes("env", "__EDGEZERO_TEST_BINARY_SECRET__")
+            .await
+            .unwrap();
+        assert_eq!(result, Some(Bytes::from_static(&[0xff, 0x61])));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn get_bytes_returns_none_when_var_not_set() {
@@ -91,35 +121,4 @@ mod tests {
             .unwrap();
         assert_eq!(result, Some(Bytes::from("test_value_123")));
     }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn get_bytes_preserves_non_utf8_secret_values() {
-        use std::os::unix::ffi::OsStringExt as _;
-
-        let _guard = env_guard().lock().await;
-        let _env = EnvOverride::set(
-            "__EDGEZERO_TEST_BINARY_SECRET__",
-            OsString::from_vec(vec![0xff, 0x61]),
-        );
-        let store = EnvSecretStore::new();
-        let result = store
-            .get_bytes("env", "__EDGEZERO_TEST_BINARY_SECRET__")
-            .await
-            .unwrap();
-        assert_eq!(result, Some(Bytes::from_static(&[0xff, 0x61])));
-    }
-
-    // Contract tests: use InMemorySecretStoreProvider since EnvSecretStore needs
-    // real env vars, which are unsafe in parallel tests.
-    // The EnvSecretStore is tested individually above.
-    use edgezero_core::secret_store::InMemorySecretStore;
-    use edgezero_core::secret_store_contract_tests;
-
-    secret_store_contract_tests!(env_secret_contract, {
-        InMemorySecretStore::new([
-            ("mystore/contract_key", Bytes::from("contract_value")),
-            ("mystore/contract_key_2", Bytes::from("another_value")),
-        ])
-    });
 }

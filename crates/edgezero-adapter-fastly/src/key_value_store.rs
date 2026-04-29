@@ -44,6 +44,16 @@ impl FastlyKvStore {
 #[cfg(feature = "fastly")]
 #[async_trait(?Send)]
 impl KvStore for FastlyKvStore {
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.store
+            .delete(key)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Ok(self.get_bytes(key).await?.is_some())
+    }
+
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         match self.store.lookup(key) {
             Ok(mut response) => {
@@ -53,31 +63,6 @@ impl KvStore for FastlyKvStore {
             Err(KVStoreError::ItemNotFound) => Ok(None),
             Err(e) => Err(KvError::Internal(anyhow::anyhow!("lookup failed: {e}"))),
         }
-    }
-
-    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-        self.store
-            .insert(key, value.as_ref())
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert failed: {e}")))
-    }
-
-    async fn put_bytes_with_ttl(
-        &self,
-        key: &str,
-        value: Bytes,
-        ttl: Duration,
-    ) -> Result<(), KvError> {
-        self.store
-            .build_insert()
-            .time_to_live(ttl)
-            .execute(key, value.as_ref())
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert with ttl failed: {e}")))
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), KvError> {
-        self.store
-            .delete(key)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
     }
 
     async fn list_keys_page(
@@ -104,13 +89,28 @@ impl KvStore for FastlyKvStore {
         let next_cursor = page.next_cursor().filter(|c| !c.is_empty());
 
         Ok(KvPage {
-            keys: page.into_keys(),
             cursor: next_cursor,
+            keys: page.into_keys(),
         })
     }
 
-    async fn exists(&self, key: &str) -> Result<bool, KvError> {
-        Ok(self.get_bytes(key).await?.is_some())
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        self.store
+            .insert(key, value.as_ref())
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert failed: {e}")))
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        self.store
+            .build_insert()
+            .time_to_live(ttl)
+            .execute(key, value.as_ref())
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert with ttl failed: {e}")))
     }
 }
 

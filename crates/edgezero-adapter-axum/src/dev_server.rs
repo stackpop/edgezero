@@ -62,8 +62,8 @@ struct Stores {
 
 /// Blocking dev server runner used by the `EdgeZero` CLI.
 pub struct AxumDevServer {
-    router: RouterService,
     config: AxumDevServerConfig,
+    router: RouterService,
     stores: Stores,
 }
 
@@ -71,45 +71,10 @@ impl AxumDevServer {
     #[must_use]
     pub fn new(router: RouterService) -> Self {
         Self {
-            router,
             config: AxumDevServerConfig::default(),
-            stores: Stores::default(),
-        }
-    }
-
-    #[must_use]
-    pub fn with_config(router: RouterService, config: AxumDevServerConfig) -> Self {
-        Self {
             router,
-            config,
             stores: Stores::default(),
         }
-    }
-
-    #[must_use]
-    pub fn with_config_store(mut self, handle: ConfigStoreHandle) -> Self {
-        self.stores.config_store = Some(handle);
-        self
-    }
-
-    /// Attach a KV store to the dev server.
-    ///
-    /// The handle is shared across all requests, making the `Kv` extractor
-    /// available in handlers.
-    #[must_use]
-    pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
-        self.stores.kv = Some(handle);
-        self
-    }
-
-    /// Attach a secret store to the dev server.
-    ///
-    /// The handle is shared across all requests, making the `Secrets` extractor
-    /// available in handlers.
-    #[must_use]
-    pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
-        self.stores.secrets = Some(handle);
-        self
     }
 
     /// # Errors
@@ -151,6 +116,41 @@ impl AxumDevServer {
             stores,
         } = self;
         serve_with_stores(router, listener, config.enable_ctrl_c, stores).await
+    }
+
+    #[must_use]
+    pub fn with_config(router: RouterService, config: AxumDevServerConfig) -> Self {
+        Self {
+            config,
+            router,
+            stores: Stores::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_config_store(mut self, handle: ConfigStoreHandle) -> Self {
+        self.stores.config_store = Some(handle);
+        self
+    }
+
+    /// Attach a KV store to the dev server.
+    ///
+    /// The handle is shared across all requests, making the `Kv` extractor
+    /// available in handlers.
+    #[must_use]
+    pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
+        self.stores.kv = Some(handle);
+        self
+    }
+
+    /// Attach a secret store to the dev server.
+    ///
+    /// The handle is shared across all requests, making the `Secrets` extractor
+    /// available in handlers.
+    #[must_use]
+    pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
+        self.stores.secrets = Some(handle);
+        self
     }
 }
 
@@ -496,9 +496,14 @@ mod integration_tests {
     use tokio::time::sleep;
 
     struct TestServer {
+        _temp_dir: tempfile::TempDir,
         base_url: String,
         handle: JoinHandle<()>,
-        _temp_dir: tempfile::TempDir,
+    }
+
+    struct TestServerSecrets {
+        base_url: String,
+        handle: JoinHandle<()>,
     }
 
     async fn start_test_server(router: RouterService) -> TestServer {
@@ -800,9 +805,9 @@ mod integration_tests {
 
         #[derive(Serialize, Deserialize, PartialEq, Debug)]
         struct UserProfile {
-            name: String,
-            age: u32,
             active: bool,
+            age: u32,
+            name: String,
         }
 
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
@@ -848,11 +853,6 @@ mod integration_tests {
     // -----------------------------------------------------------------------
     // Secret store helpers
     // -----------------------------------------------------------------------
-
-    struct TestServerSecrets {
-        base_url: String,
-        handle: JoinHandle<()>,
-    }
 
     async fn start_test_server_with_secret_handle(
         router: RouterService,
