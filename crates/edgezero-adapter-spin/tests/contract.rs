@@ -387,7 +387,7 @@ mod wasm {
             assert_eq!(*spin_response.status(), 201);
             let header = spin_response
                 .headers()
-                .find(|(name, _)| name == "x-edgezero-res");
+                .find(|(name, _)| *name == "x-edgezero-res");
             assert!(header.is_some());
         });
     }
