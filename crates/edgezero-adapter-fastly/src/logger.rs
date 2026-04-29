@@ -43,7 +43,10 @@ pub fn init_logger(
                 message
             ));
         })
-        .chain(Box::new(logger) as Box<dyn log::Log>);
+        .chain({
+            let boxed: Box<dyn log::Log> = Box::new(logger);
+            boxed
+        });
 
     dispatch.apply()?;
     log::set_max_level(level);
