@@ -312,7 +312,7 @@ fn blueprint_data_entries(
 
     // Compute the relative path from the adapter crate to the workspace
     // target directory so templates can reference build artifacts.
-    let depth = crate_dir_rel.matches('/').count() + 1;
+    let depth = crate_dir_rel.matches('/').count().saturating_add(1);
     data_entries.push((
         format!("target_dir_{}", blueprint.id),
         format!("{}target", "../".repeat(depth)),

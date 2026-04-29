@@ -264,18 +264,18 @@ impl KvStore for PersistentKvStore {
         let mut reached_end = false;
         let mut batch_count: usize = 0;
 
-        while live_keys.len() < limit + 1 && !reached_end {
+        while live_keys.len() < limit.saturating_add(1) && !reached_end {
             if batch_count >= Self::MAX_SCAN_BATCHES {
                 log::warn!(
                     "list_keys_page: scanned {} batches ({} entries) without filling the \
                      requested page; the database likely contains a large number of expired \
                      entries. Returning partial page. Run a KV cleanup to improve performance.",
                     Self::MAX_SCAN_BATCHES,
-                    Self::MAX_SCAN_BATCHES * Self::LIST_SCAN_BATCH_SIZE,
+                    Self::MAX_SCAN_BATCHES.saturating_mul(Self::LIST_SCAN_BATCH_SIZE),
                 );
                 break;
             }
-            batch_count += 1;
+            batch_count = batch_count.saturating_add(1);
             let mut expired_keys = Vec::new();
 
             {
@@ -329,7 +329,7 @@ impl KvStore for PersistentKvStore {
                     }
 
                     live_keys.push(key);
-                    if live_keys.len() == limit + 1 {
+                    if live_keys.len() == limit.saturating_add(1) {
                         break;
                     }
                 }
@@ -365,7 +365,9 @@ impl KvStore for PersistentKvStore {
         value: Bytes,
         ttl: Duration,
     ) -> Result<(), KvError> {
-        let expires_at = SystemTime::now() + ttl;
+        let expires_at = SystemTime::now()
+            .checked_add(ttl)
+            .ok_or_else(|| KvError::Internal(anyhow::anyhow!("ttl overflows system time")))?;
         let expires_at_millis = Self::system_time_to_millis(expires_at);
 
         let write_txn = self.begin_write()?;
