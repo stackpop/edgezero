@@ -879,7 +879,10 @@ mod tests {
             ttl: Duration,
         ) -> Result<(), KvError> {
             let mut data = self.data.lock().unwrap();
-            data.insert(key.to_owned(), (value, Some(SystemTime::now() + ttl)));
+            let expires_at = SystemTime::now()
+                .checked_add(ttl)
+                .ok_or_else(|| KvError::Internal(anyhow::anyhow!("ttl overflows system time")))?;
+            data.insert(key.to_owned(), (value, Some(expires_at)));
             Ok(())
         }
     }
