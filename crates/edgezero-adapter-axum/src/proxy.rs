@@ -183,7 +183,7 @@ mod integration_tests {
             get(|headers: AxumHeaderMap| async move {
                 headers
                     .get("x-custom-header")
-                    .and_then(|v| v.to_str().ok())
+                    .and_then(|val| val.to_str().ok())
                     .unwrap_or("missing")
                     .to_owned()
             }),
@@ -224,7 +224,7 @@ mod integration_tests {
         let content_type = response
             .headers()
             .get("content-type")
-            .and_then(|v| v.to_str().ok());
+            .and_then(|val| val.to_str().ok());
         assert_eq!(content_type, Some("application/json"));
     }
 

@@ -88,8 +88,6 @@ implicit_return = "allow"
 question_mark_used = "allow"
 single_call_fn = "allow"
 separated_literal_suffix = "allow"
-# `e`, `id`, `i`, `kv`, `m`, `ty` are universal; renaming hurts readability.
-min_ident_chars = "allow"
 # `edgezero_core::CoreError` is clearer than bare `Error` cross-crate.
 module_name_repetitions = "allow"
 # `pub_with_shorthand` wants `pub(in crate)` but rustfmt unconditionally

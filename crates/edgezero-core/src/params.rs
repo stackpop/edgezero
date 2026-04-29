@@ -42,7 +42,7 @@ mod tests {
     fn params(map: &[(&str, &str)]) -> PathParams {
         let inner = map
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         PathParams::new(inner)
     }

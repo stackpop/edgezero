@@ -112,14 +112,14 @@ mod tests {
         assert_eq!(
             headers
                 .get(CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
+                .and_then(|value| value.to_str().ok())
                 .unwrap(),
             "5"
         );
         assert_eq!(
             headers
                 .get(CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
+                .and_then(|value| value.to_str().ok())
                 .unwrap(),
             "text/plain; charset=utf-8"
         );

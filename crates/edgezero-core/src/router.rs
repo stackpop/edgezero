@@ -261,7 +261,7 @@ impl RouterInner {
                 next.run(ctx).await
             }
             RouteMatch::MethodNotAllowed(mut allowed) => {
-                allowed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                allowed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
                 Err(EdgeError::method_not_allowed(&method, &allowed))
             }
             RouteMatch::NotFound => Err(EdgeError::not_found(path)),
@@ -275,7 +275,7 @@ impl RouterInner {
                     matched
                         .params
                         .iter()
-                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                        .map(|(key, value)| (key.to_owned(), value.to_owned()))
                         .collect(),
                 );
                 return RouteMatch::Found(matched.value, params);

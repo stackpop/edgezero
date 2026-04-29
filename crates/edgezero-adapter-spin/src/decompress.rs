@@ -39,8 +39,8 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
                 .by_ref()
                 .take(MAX_DECOMPRESSED_SIZE_U64.saturating_add(1))
                 .read_to_end(&mut output)
-                .map_err(|e| {
-                    EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {e}"))
+                .map_err(|err| {
+                    EdgeError::internal(anyhow::anyhow!("gzip decompression failed: {err}"))
                 })?;
             if output.len() > MAX_DECOMPRESSED_SIZE {
                 return Err(EdgeError::internal(anyhow::anyhow!(
@@ -56,8 +56,8 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
                 .by_ref()
                 .take(MAX_DECOMPRESSED_SIZE_U64.saturating_add(1))
                 .read_to_end(&mut output)
-                .map_err(|e| {
-                    EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {e}"))
+                .map_err(|err| {
+                    EdgeError::internal(anyhow::anyhow!("brotli decompression failed: {err}"))
                 })?;
             if output.len() > MAX_DECOMPRESSED_SIZE {
                 return Err(EdgeError::internal(anyhow::anyhow!(

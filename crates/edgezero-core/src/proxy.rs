@@ -404,14 +404,14 @@ mod tests {
             response
                 .headers()
                 .get("x-echo-x-custom-header")
-                .and_then(|v| v.to_str().ok()),
+                .and_then(|value| value.to_str().ok()),
             Some("custom-value")
         );
         assert_eq!(
             response
                 .headers()
                 .get("x-echo-authorization")
-                .and_then(|v| v.to_str().ok()),
+                .and_then(|value| value.to_str().ok()),
             Some("Bearer token123")
         );
     }
@@ -520,7 +520,7 @@ mod tests {
             proxy_req
                 .headers()
                 .get("x-custom")
-                .and_then(|v| v.to_str().ok()),
+                .and_then(|value| value.to_str().ok()),
             Some("value")
         );
     }
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(req.method(), &Method::GET);
         assert_eq!(req.uri(), &Uri::from_static("https://example.com"));
         assert!(req.headers().is_empty());
-        assert!(matches!(req.body(), Body::Once(b) if b.is_empty()));
+        assert!(matches!(req.body(), Body::Once(bytes) if bytes.is_empty()));
     }
 
     #[test]

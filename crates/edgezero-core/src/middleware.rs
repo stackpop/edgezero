@@ -15,15 +15,15 @@ pub struct FnMiddleware<F>
 where
     F: Send + Sync + 'static,
 {
-    f: F,
+    func: F,
 }
 
 impl<F> FnMiddleware<F>
 where
     F: Send + Sync + 'static,
 {
-    pub fn new(f: F) -> Self {
-        Self { f }
+    pub fn new(func: F) -> Self {
+        Self { func }
     }
 }
 
@@ -34,7 +34,7 @@ where
     Fut: Future<Output = Result<Response, EdgeError>>,
 {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        (self.f)(ctx, next).await
+        (self.func)(ctx, next).await
     }
 }
 
@@ -107,12 +107,12 @@ impl Middleware for RequestLogger {
     }
 }
 
-pub fn middleware_fn<F, Fut>(f: F) -> FnMiddleware<F>
+pub fn middleware_fn<F, Fut>(func: F) -> FnMiddleware<F>
 where
     F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Response, EdgeError>>,
 {
-    FnMiddleware::new(f)
+    FnMiddleware::new(func)
 }
 
 #[cfg(test)]

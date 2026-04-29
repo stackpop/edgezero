@@ -214,7 +214,7 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
     let port = match adapter.get("port").and_then(Value::as_integer) {
         Some(port_value) => u16::try_from(port_value)
             .ok()
-            .filter(|p| *p > 0)
+            .filter(|port| *port > 0)
             .ok_or_else(|| {
                 format!(
                     "adapter.port in {} must be between 1 and 65535",
@@ -472,7 +472,7 @@ mod tests {
         let result = read_axum_project(&root.join("axum.toml"));
         match result {
             Ok(_) => panic!("expected error"),
-            Err(e) => assert!(e.contains("must be between 1 and 65535")),
+            Err(err) => assert!(err.contains("must be between 1 and 65535")),
         }
     }
 
@@ -490,7 +490,7 @@ mod tests {
         let result = read_axum_project(&root.join("axum.toml"));
         match result {
             Ok(_) => panic!("expected error"),
-            Err(e) => assert!(e.contains("adapter table missing")),
+            Err(err) => assert!(err.contains("adapter table missing")),
         }
     }
 
@@ -510,7 +510,7 @@ mod tests {
         let result = read_axum_project(&root.join("axum.toml"));
         match result {
             Ok(_) => panic!("expected error"),
-            Err(e) => assert!(e.contains("Cargo.toml missing")),
+            Err(err) => assert!(err.contains("Cargo.toml missing")),
         }
     }
 
@@ -528,7 +528,7 @@ mod tests {
         let result = read_axum_project(&root.join("axum.toml"));
         match result {
             Ok(_) => panic!("expected error"),
-            Err(e) => assert!(e.contains("crate_dir missing")),
+            Err(err) => assert!(err.contains("crate_dir missing")),
         }
     }
 

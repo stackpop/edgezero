@@ -35,11 +35,11 @@ impl ScaffoldError {
     }
 }
 
-fn crate_name_from_repo_path(p: &str) -> &str {
-    Path::new(p)
+fn crate_name_from_repo_path(path: &str) -> &str {
+    Path::new(path)
         .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(p)
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
 }
 
 /// Registers all compile-time-embedded templates.
@@ -147,7 +147,7 @@ pub fn resolve_dep_line(
     } else {
         let joined = features
             .iter()
-            .map(|f| format!("\"{f}\""))
+            .map(|feat| format!("\"{feat}\""))
             .collect::<Vec<_>>()
             .join(", ");
         format!(", features = [{joined}]")
@@ -192,13 +192,15 @@ pub fn write_tmpl(
     out_path: &Path,
 ) -> Result<(), ScaffoldError> {
     if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| ScaffoldError::io(parent, e))?;
+        fs::create_dir_all(parent).map_err(|err| ScaffoldError::io(parent, err))?;
     }
-    let rendered = hbs.render(name, data).map_err(|e| ScaffoldError::Render {
-        message: e.to_string(),
-        name: name.to_owned(),
-    })?;
-    fs::write(out_path, rendered).map_err(|e| ScaffoldError::io(out_path, e))
+    let rendered = hbs
+        .render(name, data)
+        .map_err(|err| ScaffoldError::Render {
+            message: err.to_string(),
+            name: name.to_owned(),
+        })?;
+    fs::write(out_path, rendered).map_err(|err| ScaffoldError::io(out_path, err))
 }
 
 #[cfg(test)]

@@ -25,11 +25,11 @@ impl FastlyNamedStore {
         let lookup = self
             .store
             .try_get(key)
-            .map_err(|e| SecretError::Internal(anyhow::anyhow!("secret lookup failed: {e}")))?;
+            .map_err(|err| SecretError::Internal(anyhow::anyhow!("secret lookup failed: {err}")))?;
 
         match lookup {
-            Some(secret) => secret.try_plaintext().map(Some).map_err(|e| {
-                SecretError::Internal(anyhow::anyhow!("secret decryption failed: {e}"))
+            Some(secret) => secret.try_plaintext().map(Some).map_err(|err| {
+                SecretError::Internal(anyhow::anyhow!("secret decryption failed: {err}"))
             }),
             None => Ok(None),
         }
@@ -45,8 +45,10 @@ impl FastlyNamedStore {
     /// # Errors
     /// Returns [`SecretError::Internal`] if the named secret store cannot be opened.
     pub fn open(name: &str) -> Result<Self, SecretError> {
-        let store = FastlyNativeSecretStore::open(name).map_err(|e| {
-            SecretError::Internal(anyhow::anyhow!("failed to open secret store '{name}': {e}"))
+        let store = FastlyNativeSecretStore::open(name).map_err(|err| {
+            SecretError::Internal(anyhow::anyhow!(
+                "failed to open secret store '{name}': {err}"
+            ))
         })?;
         Ok(Self { store })
     }

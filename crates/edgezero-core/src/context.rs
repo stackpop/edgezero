@@ -152,7 +152,7 @@ mod tests {
     fn params(map: &[(&str, &str)]) -> PathParams {
         let inner = map
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect::<HashMap<_, _>>();
         PathParams::new(inner)
     }
@@ -403,7 +403,7 @@ mod tests {
             ctx.request()
                 .headers()
                 .get("x-test")
-                .and_then(|v| v.to_str().ok()),
+                .and_then(|value| value.to_str().ok()),
             Some("value")
         );
         assert_eq!(ctx.path_params().get("id"), Some("123"));
