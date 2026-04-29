@@ -5,6 +5,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub struct ResolvedDependency {
+    pub crate_line: String,
+    pub name: String,
+    pub workspace_line: String,
+}
+
 /// Errors produced while scaffolding files for a generated project.
 #[derive(Debug, Error)]
 pub enum ScaffoldError {
@@ -17,7 +23,7 @@ pub enum ScaffoldError {
     },
     /// The Handlebars renderer rejected the template or its data.
     #[error("template '{name}' failed to render: {message}")]
-    Render { name: String, message: String },
+    Render { message: String, name: String },
 }
 
 impl ScaffoldError {
@@ -27,6 +33,13 @@ impl ScaffoldError {
             source,
         }
     }
+}
+
+fn crate_name_from_repo_path(p: &str) -> &str {
+    Path::new(p)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(p)
 }
 
 /// Registers all compile-time-embedded templates.
@@ -91,50 +104,22 @@ pub fn register_templates(hbs: &mut Handlebars) {
     }
 }
 
-/// # Errors
-/// Returns [`ScaffoldError::Io`] if the parent directory cannot be created
-/// or the rendered template cannot be written; [`ScaffoldError::Render`] if
-/// Handlebars rejects the template or its data.
-pub fn write_tmpl(
-    hbs: &handlebars::Handlebars,
-    name: &str,
-    data: &serde_json::Value,
-    out_path: &Path,
-) -> Result<(), ScaffoldError> {
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| ScaffoldError::io(parent, e))?;
+pub fn relative_to(from: &Path, to: &Path) -> Option<String> {
+    let from_abs = fs::canonicalize(from).ok()?;
+    let to_abs = fs::canonicalize(to).ok()?;
+    let suffix = from_abs.strip_prefix(&to_abs).ok()?;
+    let depth = suffix.components().count();
+    if depth == 0 {
+        return Some(".".into());
     }
-    let rendered = hbs.render(name, data).map_err(|e| ScaffoldError::Render {
-        name: name.to_owned(),
-        message: e.to_string(),
-    })?;
-    fs::write(out_path, rendered).map_err(|e| ScaffoldError::io(out_path, e))
-}
-
-pub fn sanitize_crate_name(input: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in input.chars().enumerate() {
-        let valid = ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_';
-        if valid {
-            if i == 0 && ch.is_ascii_digit() {
-                out.push('_');
-            }
-            out.push(ch);
-        } else {
-            out.push('-');
+    let mut ups = String::new();
+    for _ in 0..depth {
+        if !ups.is_empty() {
+            ups.push('/');
         }
+        ups.push_str("..");
     }
-    if out.is_empty() {
-        "edgezero-app".to_owned()
-    } else {
-        out
-    }
-}
-
-pub struct ResolvedDependency {
-    pub name: String,
-    pub workspace_line: String,
-    pub crate_line: String,
+    Some(ups)
 }
 
 pub fn resolve_dep_line(
@@ -170,35 +155,50 @@ pub fn resolve_dep_line(
     let crate_line = format!("{crate_name} = {{ workspace = true{feature_fragment} }}");
 
     ResolvedDependency {
+        crate_line,
         name: crate_name,
         workspace_line,
-        crate_line,
     }
 }
 
-fn crate_name_from_repo_path(p: &str) -> &str {
-    Path::new(p)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(p)
-}
-
-pub fn relative_to(from: &Path, to: &Path) -> Option<String> {
-    let from_abs = fs::canonicalize(from).ok()?;
-    let to_abs = fs::canonicalize(to).ok()?;
-    let suffix = from_abs.strip_prefix(&to_abs).ok()?;
-    let depth = suffix.components().count();
-    if depth == 0 {
-        return Some(".".into());
-    }
-    let mut ups = String::new();
-    for _ in 0..depth {
-        if !ups.is_empty() {
-            ups.push('/');
+pub fn sanitize_crate_name(input: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in input.chars().enumerate() {
+        let valid = ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_';
+        if valid {
+            if i == 0 && ch.is_ascii_digit() {
+                out.push('_');
+            }
+            out.push(ch);
+        } else {
+            out.push('-');
         }
-        ups.push_str("..");
     }
-    Some(ups)
+    if out.is_empty() {
+        "edgezero-app".to_owned()
+    } else {
+        out
+    }
+}
+
+/// # Errors
+/// Returns [`ScaffoldError::Io`] if the parent directory cannot be created
+/// or the rendered template cannot be written; [`ScaffoldError::Render`] if
+/// Handlebars rejects the template or its data.
+pub fn write_tmpl(
+    hbs: &handlebars::Handlebars,
+    name: &str,
+    data: &serde_json::Value,
+    out_path: &Path,
+) -> Result<(), ScaffoldError> {
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| ScaffoldError::io(parent, e))?;
+    }
+    let rendered = hbs.render(name, data).map_err(|e| ScaffoldError::Render {
+        message: e.to_string(),
+        name: name.to_owned(),
+    })?;
+    fs::write(out_path, rendered).map_err(|e| ScaffoldError::io(out_path, e))
 }
 
 #[cfg(test)]

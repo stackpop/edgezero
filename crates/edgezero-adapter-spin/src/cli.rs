@@ -14,7 +14,117 @@ use edgezero_adapter::scaffold::{
 };
 use walkdir::WalkDir;
 
+static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
+
+static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
+    id: "spin",
+    display_name: "Spin (Fermyon)",
+    crate_suffix: "adapter-spin",
+    dependency_crate: "edgezero-adapter-spin",
+    dependency_repo_path: "crates/edgezero-adapter-spin",
+    template_registrations: SPIN_TEMPLATE_REGISTRATIONS,
+    files: SPIN_FILE_SPECS,
+    extra_dirs: &["src"],
+    dependencies: SPIN_DEPENDENCIES,
+    manifest: ManifestSpec {
+        manifest_filename: "spin.toml",
+        build_target: "wasm32-wasip1",
+        build_profile: "release",
+        build_features: &["spin"],
+    },
+    commands: CommandTemplates {
+        build: "cargo build --target wasm32-wasip1 --release -p {crate}",
+        deploy: "spin deploy --from {crate_dir}",
+        serve: "spin up --from {crate_dir}",
+    },
+    logging: LoggingDefaults {
+        endpoint: None,
+        level: "info",
+        echo_stdout: None,
+    },
+    readme: ReadmeInfo {
+        description: "{display} entrypoint.",
+        dev_heading: "{display} (local)",
+        dev_steps: &["`edgezero-cli serve --adapter spin`"],
+    },
+    run_module: "edgezero_adapter_spin",
+};
+
+static SPIN_DEPENDENCIES: &[DependencySpec] = &[
+    DependencySpec {
+        key: "dep_edgezero_core_spin",
+        repo_crate: "crates/edgezero-core",
+        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
+        features: &[],
+    },
+    DependencySpec {
+        key: "dep_edgezero_adapter_spin",
+        repo_crate: "crates/edgezero-adapter-spin",
+        fallback:
+            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
+        features: &[],
+    },
+    DependencySpec {
+        key: "dep_edgezero_adapter_spin_wasm",
+        repo_crate: "crates/edgezero-adapter-spin",
+        fallback:
+            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
+        features: &["spin"],
+    },
+];
+
+static SPIN_FILE_SPECS: &[AdapterFileSpec] = &[
+    AdapterFileSpec {
+        template: "spin_Cargo_toml",
+        output: "Cargo.toml",
+    },
+    AdapterFileSpec {
+        template: "spin_src_lib_rs",
+        output: "src/lib.rs",
+    },
+    AdapterFileSpec {
+        template: "spin_spin_toml",
+        output: "spin.toml",
+    },
+];
+
+static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
+    TemplateRegistration {
+        name: "spin_Cargo_toml",
+        contents: include_str!("templates/Cargo.toml.hbs"),
+    },
+    TemplateRegistration {
+        name: "spin_src_lib_rs",
+        contents: include_str!("templates/src/lib.rs.hbs"),
+    },
+    TemplateRegistration {
+        name: "spin_spin_toml",
+        contents: include_str!("templates/spin.toml.hbs"),
+    },
+];
+
 const TARGET_TRIPLE: &str = "wasm32-wasip1";
+
+struct SpinCliAdapter;
+
+impl Adapter for SpinCliAdapter {
+    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+        match action {
+            AdapterAction::Build => {
+                let artifact = build(args)?;
+                log::info!("[edgezero] Spin build complete -> {}", artifact.display());
+                Ok(())
+            }
+            AdapterAction::Deploy => deploy(args),
+            AdapterAction::Serve => serve(args),
+            other => Err(format!("spin adapter does not support {other:?}")),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        "spin"
+    }
+}
 
 /// # Errors
 /// Returns an error if the Spin CLI build command fails.
@@ -75,147 +185,6 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// # Errors
-/// Returns an error if the Spin CLI up command fails.
-pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_spin_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
-
-    let status = Command::new("spin")
-        .args(["up"])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
-    if !status.success() {
-        return Err(format!("spin up failed with status {status}"));
-    }
-
-    Ok(())
-}
-
-struct SpinCliAdapter;
-
-static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
-    TemplateRegistration {
-        name: "spin_Cargo_toml",
-        contents: include_str!("templates/Cargo.toml.hbs"),
-    },
-    TemplateRegistration {
-        name: "spin_src_lib_rs",
-        contents: include_str!("templates/src/lib.rs.hbs"),
-    },
-    TemplateRegistration {
-        name: "spin_spin_toml",
-        contents: include_str!("templates/spin.toml.hbs"),
-    },
-];
-
-static SPIN_FILE_SPECS: &[AdapterFileSpec] = &[
-    AdapterFileSpec {
-        template: "spin_Cargo_toml",
-        output: "Cargo.toml",
-    },
-    AdapterFileSpec {
-        template: "spin_src_lib_rs",
-        output: "src/lib.rs",
-    },
-    AdapterFileSpec {
-        template: "spin_spin_toml",
-        output: "spin.toml",
-    },
-];
-
-static SPIN_DEPENDENCIES: &[DependencySpec] = &[
-    DependencySpec {
-        key: "dep_edgezero_core_spin",
-        repo_crate: "crates/edgezero-core",
-        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
-        features: &[],
-    },
-    DependencySpec {
-        key: "dep_edgezero_adapter_spin",
-        repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
-        features: &[],
-    },
-    DependencySpec {
-        key: "dep_edgezero_adapter_spin_wasm",
-        repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
-        features: &["spin"],
-    },
-];
-
-static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
-    id: "spin",
-    display_name: "Spin (Fermyon)",
-    crate_suffix: "adapter-spin",
-    dependency_crate: "edgezero-adapter-spin",
-    dependency_repo_path: "crates/edgezero-adapter-spin",
-    template_registrations: SPIN_TEMPLATE_REGISTRATIONS,
-    files: SPIN_FILE_SPECS,
-    extra_dirs: &["src"],
-    dependencies: SPIN_DEPENDENCIES,
-    manifest: ManifestSpec {
-        manifest_filename: "spin.toml",
-        build_target: "wasm32-wasip1",
-        build_profile: "release",
-        build_features: &["spin"],
-    },
-    commands: CommandTemplates {
-        build: "cargo build --target wasm32-wasip1 --release -p {crate}",
-        deploy: "spin deploy --from {crate_dir}",
-        serve: "spin up --from {crate_dir}",
-    },
-    logging: LoggingDefaults {
-        endpoint: None,
-        level: "info",
-        echo_stdout: None,
-    },
-    readme: ReadmeInfo {
-        description: "{display} entrypoint.",
-        dev_heading: "{display} (local)",
-        dev_steps: &["`edgezero-cli serve --adapter spin`"],
-    },
-    run_module: "edgezero_adapter_spin",
-};
-
-static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
-
-impl Adapter for SpinCliAdapter {
-    fn name(&self) -> &'static str {
-        "spin"
-    }
-
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
-        match action {
-            AdapterAction::Build => {
-                let artifact = build(args)?;
-                log::info!("[edgezero] Spin build complete -> {}", artifact.display());
-                Ok(())
-            }
-            AdapterAction::Deploy => deploy(args),
-            AdapterAction::Serve => serve(args),
-            other => Err(format!("spin adapter does not support {other:?}")),
-        }
-    }
-}
-
-pub fn register() {
-    register_adapter(&SPIN_ADAPTER);
-    register_adapter_blueprint(&SPIN_BLUEPRINT);
-}
-
-#[ctor]
-fn register_ctor() {
-    register();
 }
 
 fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
@@ -291,10 +260,61 @@ fn locate_artifact(
     ))
 }
 
+pub fn register() {
+    register_adapter(&SPIN_ADAPTER);
+    register_adapter_blueprint(&SPIN_BLUEPRINT);
+}
+
+#[ctor]
+fn register_ctor() {
+    register();
+}
+
+/// # Errors
+/// Returns an error if the Spin CLI up command fails.
+pub fn serve(extra_args: &[String]) -> Result<(), String> {
+    let manifest = find_spin_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
+
+    let status = Command::new("spin")
+        .args(["up"])
+        .args(extra_args)
+        .current_dir(manifest_dir)
+        .status()
+        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
+    if !status.success() {
+        return Err(format!("spin up failed with status {status}"));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn finds_closest_manifest_when_multiple_exist() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let first = root.join("crates/first");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
+        fs::write(first.join("spin.toml"), "spin_manifest_version = 2").unwrap();
+
+        let second = root.join("examples/second");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
+        fs::write(second.join("spin.toml"), "spin_manifest_version = 2").unwrap();
+
+        let found = find_spin_manifest(&second).unwrap();
+        assert_eq!(found, second.join("spin.toml"));
+    }
 
     #[test]
     fn finds_manifest_in_current_directory() {
@@ -335,25 +355,5 @@ mod tests {
 
         let located = locate_artifact(workspace, &manifest_dir, "my-cool-crate").unwrap();
         assert_eq!(located, artifact);
-    }
-
-    #[test]
-    fn finds_closest_manifest_when_multiple_exist() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
-
-        let first = root.join("crates/first");
-        fs::create_dir_all(&first).unwrap();
-        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
-        fs::write(first.join("spin.toml"), "spin_manifest_version = 2").unwrap();
-
-        let second = root.join("examples/second");
-        fs::create_dir_all(&second).unwrap();
-        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
-        fs::write(second.join("spin.toml"), "spin_manifest_version = 2").unwrap();
-
-        let found = find_spin_manifest(&second).unwrap();
-        assert_eq!(found, second.join("spin.toml"));
     }
 }

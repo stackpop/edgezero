@@ -9,8 +9,6 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Create a new `EdgeZero` app skeleton (multi-crate workspace)
-    New(NewArgs),
     /// Build the project for a target edge
     Build {
         #[arg(long = "adapter", required = true)]
@@ -25,25 +23,27 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         adapter_args: Vec<String>,
     },
+    /// Run a local simulation (if available)
+    Dev,
+    /// Create a new `EdgeZero` app skeleton (multi-crate workspace)
+    New(NewArgs),
     /// Run a local simulation (adapter-specific)
     Serve {
         #[arg(long = "adapter", required = true)]
         adapter: String,
     },
-    /// Run a local simulation (if available)
-    Dev,
 }
 
 #[derive(clap::Args, Debug)]
 pub struct NewArgs {
-    /// App name (e.g., my-edge-app)
-    pub name: String,
     /// Directory to create the app in (default: current dir)
     #[arg(long)]
     pub dir: Option<String>,
     /// Force using a local path dependency to edgezero-core (if available)
     #[arg(long)]
     pub local_core: bool,
+    /// App name (e.g., my-edge-app)
+    pub name: String,
 }
 
 #[cfg(test)]
@@ -51,14 +51,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_new_command_with_defaults() {
-        let args = Args::try_parse_from(["edgezero", "new", "demo-app"]).expect("parse new");
-        let Command::New(new_args) = args.cmd else {
-            panic!("expected Command::New");
-        };
-        assert_eq!(new_args.name, "demo-app");
-        assert!(new_args.dir.is_none());
-        assert!(!new_args.local_core);
+    fn missing_required_adapter_returns_error() {
+        Args::try_parse_from(["edgezero", "build"]).expect_err("missing --adapter");
     }
 
     #[test]
@@ -85,7 +79,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_adapter_returns_error() {
-        Args::try_parse_from(["edgezero", "build"]).expect_err("missing --adapter");
+    fn parses_new_command_with_defaults() {
+        let args = Args::try_parse_from(["edgezero", "new", "demo-app"]).expect("parse new");
+        let Command::New(new_args) = args.cmd else {
+            panic!("expected Command::New");
+        };
+        assert_eq!(new_args.name, "demo-app");
+        assert!(new_args.dir.is_none());
+        assert!(!new_args.local_core);
     }
 }

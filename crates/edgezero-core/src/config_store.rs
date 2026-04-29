@@ -10,98 +10,6 @@ use anyhow::Error as AnyError;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
-// Trait
-// ---------------------------------------------------------------------------
-
-/// Errors returned by config-store backends.
-///
-/// Missing keys are represented as `Ok(None)` from [`ConfigStore::get`].
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum ConfigStoreError {
-    /// The caller asked for a key that is malformed for the active backend.
-    #[error("{message}")]
-    InvalidKey { message: String },
-    /// The configured backend cannot currently serve requests.
-    #[error("config store unavailable: {message}")]
-    Unavailable { message: String },
-    /// An unexpected backend or provider failure occurred.
-    #[error("config store error: {source}")]
-    Internal { source: AnyError },
-}
-
-impl ConfigStoreError {
-    /// Create an error for malformed or backend-invalid keys.
-    pub fn invalid_key<S: Into<String>>(message: S) -> Self {
-        Self::InvalidKey {
-            message: message.into(),
-        }
-    }
-
-    /// Create an error for temporarily unavailable backends.
-    pub fn unavailable<S: Into<String>>(message: S) -> Self {
-        Self::Unavailable {
-            message: message.into(),
-        }
-    }
-
-    /// Wrap an unexpected backend or provider failure.
-    pub fn internal<E>(error: E) -> Self
-    where
-        E: Into<AnyError>,
-    {
-        Self::Internal {
-            source: error.into(),
-        }
-    }
-}
-
-/// Object-safe interface for read-only configuration store backends.
-///
-/// Implementations exist per adapter:
-/// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
-/// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
-/// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare env bindings
-pub trait ConfigStore: Send + Sync {
-    /// Retrieve a config value by key. Returns `None` if the key does not exist.
-    ///
-    /// # Errors
-    /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
-}
-
-// ---------------------------------------------------------------------------
-// Handle
-// ---------------------------------------------------------------------------
-
-/// A cloneable handle to a config store.
-#[derive(Clone)]
-pub struct ConfigStoreHandle {
-    store: Arc<dyn ConfigStore>,
-}
-
-impl fmt::Debug for ConfigStoreHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ConfigStoreHandle").finish_non_exhaustive()
-    }
-}
-
-impl ConfigStoreHandle {
-    /// Create a new handle wrapping a config store implementation.
-    pub fn new(store: Arc<dyn ConfigStore>) -> Self {
-        Self { store }
-    }
-
-    /// Get a config value by key.
-    ///
-    /// # Errors
-    /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
-    pub fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-        self.store.get(key)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Contract test macro
 // ---------------------------------------------------------------------------
 
@@ -220,16 +128,128 @@ macro_rules! config_store_contract_tests {
 }
 
 // ---------------------------------------------------------------------------
+// Trait
+// ---------------------------------------------------------------------------
+
+/// Errors returned by config-store backends.
+///
+/// Missing keys are represented as `Ok(None)` from [`ConfigStore::get`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ConfigStoreError {
+    /// An unexpected backend or provider failure occurred.
+    #[error("config store error: {source}")]
+    Internal { source: AnyError },
+    /// The caller asked for a key that is malformed for the active backend.
+    #[error("{message}")]
+    InvalidKey { message: String },
+    /// The configured backend cannot currently serve requests.
+    #[error("config store unavailable: {message}")]
+    Unavailable { message: String },
+}
+
+impl ConfigStoreError {
+    /// Wrap an unexpected backend or provider failure.
+    pub fn internal<E>(error: E) -> Self
+    where
+        E: Into<AnyError>,
+    {
+        Self::Internal {
+            source: error.into(),
+        }
+    }
+
+    /// Create an error for malformed or backend-invalid keys.
+    pub fn invalid_key<S: Into<String>>(message: S) -> Self {
+        Self::InvalidKey {
+            message: message.into(),
+        }
+    }
+
+    /// Create an error for temporarily unavailable backends.
+    pub fn unavailable<S: Into<String>>(message: S) -> Self {
+        Self::Unavailable {
+            message: message.into(),
+        }
+    }
+}
+
+/// Object-safe interface for read-only configuration store backends.
+///
+/// Implementations exist per adapter:
+/// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
+/// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
+/// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare env bindings
+pub trait ConfigStore: Send + Sync {
+    /// Retrieve a config value by key. Returns `None` if the key does not exist.
+    ///
+    /// # Errors
+    /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
+    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+}
+
+// ---------------------------------------------------------------------------
+// Handle
+// ---------------------------------------------------------------------------
+
+/// A cloneable handle to a config store.
+#[derive(Clone)]
+pub struct ConfigStoreHandle {
+    store: Arc<dyn ConfigStore>,
+}
+
+impl fmt::Debug for ConfigStoreHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigStoreHandle").finish_non_exhaustive()
+    }
+}
+
+impl ConfigStoreHandle {
+    /// Get a config value by key.
+    ///
+    /// # Errors
+    /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
+    pub fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        self.store.get(key)
+    }
+
+    /// Create a new handle wrapping a config store implementation.
+    pub fn new(store: Arc<dyn ConfigStore>) -> Self {
+        Self { store }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    // Run the shared contract tests against TestConfigStore.
+    crate::config_store_contract_tests!(
+        test_config_store_contract,
+        TestConfigStore::new(&[("contract.key.a", "value_a"), ("contract.key.b", "value_b"),])
+    );
+
     use super::*;
     use std::collections::HashMap;
 
+    struct FailingConfigStore;
+
     struct TestConfigStore {
         data: HashMap<String, String>,
+    }
+
+    impl ConfigStore for FailingConfigStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Err(ConfigStoreError::unavailable("backend offline"))
+        }
+    }
+
+    impl ConfigStore for TestConfigStore {
+        fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(self.data.get(key).cloned())
+        }
     }
 
     impl TestConfigStore {
@@ -243,14 +263,14 @@ mod tests {
         }
     }
 
-    impl ConfigStore for TestConfigStore {
-        fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(self.data.get(key).cloned())
-        }
-    }
-
     fn handle(entries: &[(&str, &str)]) -> ConfigStoreHandle {
         ConfigStoreHandle::new(Arc::new(TestConfigStore::new(entries)))
+    }
+
+    #[test]
+    fn config_store_get_returns_none_for_missing_key() {
+        let h = handle(&[]);
+        assert_eq!(h.get("nonexistent").expect("missing config"), None);
     }
 
     #[test]
@@ -263,19 +283,10 @@ mod tests {
     }
 
     #[test]
-    fn config_store_get_returns_none_for_missing_key() {
+    fn config_store_handle_debug_output() {
         let h = handle(&[]);
-        assert_eq!(h.get("nonexistent").expect("missing config"), None);
-    }
-
-    #[test]
-    fn config_store_handle_wraps_and_delegates() {
-        let h = handle(&[("timeout_ms", "1500")]);
-        assert_eq!(
-            h.get("timeout_ms").expect("config value"),
-            Some("1500".to_owned())
-        );
-        assert_eq!(h.get("missing").expect("missing config"), None);
+        let debug = format!("{h:?}");
+        assert!(debug.contains("ConfigStoreHandle"));
     }
 
     #[test]
@@ -296,21 +307,6 @@ mod tests {
     }
 
     #[test]
-    fn config_store_handle_debug_output() {
-        let h = handle(&[]);
-        let debug = format!("{h:?}");
-        assert!(debug.contains("ConfigStoreHandle"));
-    }
-
-    struct FailingConfigStore;
-
-    impl ConfigStore for FailingConfigStore {
-        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Err(ConfigStoreError::unavailable("backend offline"))
-        }
-    }
-
-    #[test]
     fn config_store_handle_propagates_backend_errors() {
         let handle = ConfigStoreHandle::new(Arc::new(FailingConfigStore));
         let err = handle
@@ -319,9 +315,13 @@ mod tests {
         assert!(matches!(err, ConfigStoreError::Unavailable { .. }));
     }
 
-    // Run the shared contract tests against TestConfigStore.
-    crate::config_store_contract_tests!(
-        test_config_store_contract,
-        TestConfigStore::new(&[("contract.key.a", "value_a"), ("contract.key.b", "value_b"),])
-    );
+    #[test]
+    fn config_store_handle_wraps_and_delegates() {
+        let h = handle(&[("timeout_ms", "1500")]);
+        assert_eq!(
+            h.get("timeout_ms").expect("config value"),
+            Some("1500".to_owned())
+        );
+        assert_eq!(h.get("missing").expect("missing config"), None);
+    }
 }

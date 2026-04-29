@@ -19,6 +19,13 @@ enum FastlyConfigStoreBackend {
 }
 
 impl FastlyConfigStore {
+    #[cfg(test)]
+    fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            inner: FastlyConfigStoreBackend::InMemory(entries.into_iter().collect()),
+        }
+    }
+
     /// Open a Fastly Config Store by resource link name.
     ///
     /// Returns an error if the configured store cannot be opened.
@@ -29,13 +36,6 @@ impl FastlyConfigStore {
         FastlyConfigStoreInner::try_open(name).map(|inner| Self {
             inner: FastlyConfigStoreBackend::Fastly(inner),
         })
-    }
-
-    #[cfg(test)]
-    fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            inner: FastlyConfigStoreBackend::InMemory(entries.into_iter().collect()),
-        }
     }
 }
 

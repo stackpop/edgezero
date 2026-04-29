@@ -83,6 +83,62 @@ impl PersistentKvStore {
     /// call. A warning is logged once so operators know cleanup is needed.
     const MAX_SCAN_BATCHES: usize = 100;
 
+    fn begin_write(&self) -> Result<redb::WriteTransaction, KvError> {
+        self.db
+            .begin_write()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {e}")))
+    }
+
+    fn cleanup_expired_keys(&self, expired_keys: &[String]) -> Result<(), KvError> {
+        if expired_keys.is_empty() {
+            return Ok(());
+        }
+
+        let write_txn = self.begin_write()?;
+        {
+            let mut table = Self::open_table(&write_txn)?;
+            for key in expired_keys {
+                let still_expired = table
+                    .get(key.as_str())
+                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
+                    .is_some_and(|entry| {
+                        let (_, expires_at) = entry.value();
+                        Self::is_expired(expires_at)
+                    });
+                if still_expired {
+                    table
+                        .remove(key.as_str())
+                        .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
+                }
+            }
+        }
+        Self::commit(write_txn)
+    }
+
+    fn commit(txn: redb::WriteTransaction) -> Result<(), KvError> {
+        txn.commit()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {e}")))
+    }
+
+    /// Check if an entry is expired based on its expiration timestamp.
+    ///
+    /// If the system clock is before UNIX epoch (highly unlikely), treats entries
+    /// as not expired to avoid incorrectly deleting data.
+    fn is_expired(expires_at_millis: Option<u128>) -> bool {
+        if let Some(exp) = expires_at_millis {
+            match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(now) => now.as_millis() >= exp,
+                Err(_) => {
+                    // System clock is before UNIX epoch - treat as not expired
+                    // to avoid incorrectly deleting data
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
     /// Create a new persistent KV store at the given path.
     ///
     /// # Behavior
@@ -113,23 +169,9 @@ impl PersistentKvStore {
         Ok(store)
     }
 
-    /// Check if an entry is expired based on its expiration timestamp.
-    ///
-    /// If the system clock is before UNIX epoch (highly unlikely), treats entries
-    /// as not expired to avoid incorrectly deleting data.
-    fn is_expired(expires_at_millis: Option<u128>) -> bool {
-        if let Some(exp) = expires_at_millis {
-            match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-                Ok(now) => now.as_millis() >= exp,
-                Err(_) => {
-                    // System clock is before UNIX epoch - treat as not expired
-                    // to avoid incorrectly deleting data
-                    false
-                }
-            }
-        } else {
-            false
-        }
+    fn open_table(txn: &redb::WriteTransaction) -> Result<KvTable<'_>, KvError> {
+        txn.open_table(KV_TABLE)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))
     }
 
     /// Convert `SystemTime` to milliseconds since UNIX epoch.
@@ -140,54 +182,24 @@ impl PersistentKvStore {
             .map(|d| d.as_millis())
             .unwrap_or(0)
     }
-
-    // -- Transaction helpers ------------------------------------------------
-
-    fn begin_write(&self) -> Result<redb::WriteTransaction, KvError> {
-        self.db
-            .begin_write()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {e}")))
-    }
-
-    fn open_table(txn: &redb::WriteTransaction) -> Result<KvTable<'_>, KvError> {
-        txn.open_table(KV_TABLE)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))
-    }
-
-    fn commit(txn: redb::WriteTransaction) -> Result<(), KvError> {
-        txn.commit()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {e}")))
-    }
-
-    fn cleanup_expired_keys(&self, expired_keys: &[String]) -> Result<(), KvError> {
-        if expired_keys.is_empty() {
-            return Ok(());
-        }
-
-        let write_txn = self.begin_write()?;
-        {
-            let mut table = Self::open_table(&write_txn)?;
-            for key in expired_keys {
-                let still_expired = table
-                    .get(key.as_str())
-                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
-                    .is_some_and(|entry| {
-                        let (_, expires_at) = entry.value();
-                        Self::is_expired(expires_at)
-                    });
-                if still_expired {
-                    table
-                        .remove(key.as_str())
-                        .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
-                }
-            }
-        }
-        Self::commit(write_txn)
-    }
 }
 
 #[async_trait(?Send)]
 impl KvStore for PersistentKvStore {
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        let write_txn = self.begin_write()?;
+        let mut table = Self::open_table(&write_txn)?;
+        table
+            .remove(key)
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
+        drop(table);
+        Self::commit(write_txn)
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Ok(self.get_bytes(key).await?.is_some())
+    }
+
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         let read_txn = self
             .db
@@ -239,44 +251,6 @@ impl KvStore for PersistentKvStore {
         } else {
             Ok(None)
         }
-    }
-
-    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
-        let write_txn = self.begin_write()?;
-        let mut table = Self::open_table(&write_txn)?;
-        table
-            .insert(key, (value.as_ref(), None))
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
-        drop(table);
-        Self::commit(write_txn)
-    }
-
-    async fn put_bytes_with_ttl(
-        &self,
-        key: &str,
-        value: Bytes,
-        ttl: Duration,
-    ) -> Result<(), KvError> {
-        let expires_at = SystemTime::now() + ttl;
-        let expires_at_millis = Self::system_time_to_millis(expires_at);
-
-        let write_txn = self.begin_write()?;
-        let mut table = Self::open_table(&write_txn)?;
-        table
-            .insert(key, (value.as_ref(), Some(expires_at_millis)))
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
-        drop(table);
-        Self::commit(write_txn)
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), KvError> {
-        let write_txn = self.begin_write()?;
-        let mut table = Self::open_table(&write_txn)?;
-        table
-            .remove(key)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
-        drop(table);
-        Self::commit(write_txn)
     }
 
     async fn list_keys_page(
@@ -375,102 +349,65 @@ impl KvStore for PersistentKvStore {
         })
     }
 
-    async fn exists(&self, key: &str) -> Result<bool, KvError> {
-        Ok(self.get_bytes(key).await?.is_some())
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        let write_txn = self.begin_write()?;
+        let mut table = Self::open_table(&write_txn)?;
+        table
+            .insert(key, (value.as_ref(), None))
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
+        drop(table);
+        Self::commit(write_txn)
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        let expires_at = SystemTime::now() + ttl;
+        let expires_at_millis = Self::system_time_to_millis(expires_at);
+
+        let write_txn = self.begin_write()?;
+        let mut table = Self::open_table(&write_txn)?;
+        table
+            .insert(key, (value.as_ref(), Some(expires_at_millis)))
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
+        drop(table);
+        Self::commit(write_txn)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // Run the shared contract tests against PersistentKvStore.
+    // `Box::leak` intentionally extends the TempDir's lifetime to 'static so
+    // it remains alive for the duration of the test process. The directory is
+    // deleted when the process exits, unlike `.keep()` which leaves it behind
+    // permanently.
+    edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
+        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let db_path = dir.path().join("contract.redb");
+        PersistentKvStore::new(db_path).unwrap()
+    });
+
     use super::*;
     use edgezero_core::key_value_store::KvHandle;
     use futures::executor;
     use std::sync::Arc;
     use std::thread;
 
+    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+    struct Config {
+        enabled: bool,
+        name: String,
+    }
+
     fn store() -> (KvHandle, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
         let store = PersistentKvStore::new(db_path).unwrap();
         (KvHandle::new(Arc::new(store)), temp_dir)
-    }
-
-    // -- Raw bytes -----------------------------------------------------------
-
-    #[tokio::test]
-    async fn put_and_get_bytes() {
-        let (s, _dir) = store();
-        s.put_bytes("k", Bytes::from("hello")).await.unwrap();
-        assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
-    }
-
-    #[tokio::test]
-    async fn get_missing_key_returns_none() {
-        let (s, _dir) = store();
-        assert_eq!(s.get_bytes("missing").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn put_overwrites_existing() {
-        let (s, _dir) = store();
-        s.put_bytes("k", Bytes::from("first")).await.unwrap();
-        s.put_bytes("k", Bytes::from("second")).await.unwrap();
-        assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("second")));
-    }
-
-    #[tokio::test]
-    async fn delete_removes_key() {
-        let (s, _dir) = store();
-        s.put_bytes("k", Bytes::from("v")).await.unwrap();
-        s.delete("k").await.unwrap();
-        assert_eq!(s.get_bytes("k").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn delete_nonexistent_is_ok() {
-        let (s, _dir) = store();
-        s.delete("nope").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn ttl_expires_entry() {
-        // Use the store impl directly to bypass validation limits (min TTL 60s)
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.redb");
-        let s = PersistentKvStore::new(db_path).unwrap();
-        s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_millis(1))
-            .await
-            .unwrap();
-        // 200ms gives the OS scheduler enough headroom on busy CI runners.
-        thread::sleep(Duration::from_millis(200));
-        assert_eq!(s.get_bytes("temp").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn ttl_not_expired_returns_value() {
-        let (s, _dir) = store();
-        s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_secs(60))
-            .await
-            .unwrap();
-        assert_eq!(s.get_bytes("temp").await.unwrap(), Some(Bytes::from("val")));
-    }
-
-    #[tokio::test]
-    async fn list_keys_page_skips_expired_entries() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.redb");
-        let s = PersistentKvStore::new(db_path).unwrap();
-
-        s.put_bytes("app/live", Bytes::from("value")).await.unwrap();
-        s.put_bytes_with_ttl("app/expired", Bytes::from("gone"), Duration::from_millis(1))
-            .await
-            .unwrap();
-
-        thread::sleep(Duration::from_millis(200));
-
-        let page = s.list_keys_page("app/", None, 10).await.unwrap();
-        assert_eq!(page.keys, vec!["app/live".to_owned()]);
-        assert_eq!(page.cursor, None);
     }
 
     #[tokio::test]
@@ -491,51 +428,6 @@ mod tests {
             s.get_bytes("race/key").await.unwrap(),
             Some(Bytes::from("fresh"))
         );
-    }
-
-    // -- Typed helpers via KvHandle ----------------------------------------
-
-    #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-    struct Config {
-        name: String,
-        enabled: bool,
-    }
-
-    #[tokio::test]
-    async fn typed_roundtrip() {
-        let (s, _dir) = store();
-        let cfg = Config {
-            name: "test".into(),
-            enabled: true,
-        };
-        s.put("config", &cfg).await.unwrap();
-        let out: Option<Config> = s.get("config").await.unwrap();
-        assert_eq!(out, Some(cfg));
-    }
-
-    #[tokio::test]
-    async fn update_helper() {
-        let (s, _dir) = store();
-        s.put("counter", &0_i32).await.unwrap();
-        let val = s
-            .read_modify_write("counter", 0_i32, |n| n + 5_i32)
-            .await
-            .unwrap();
-        assert_eq!(val, 5_i32);
-    }
-
-    #[tokio::test]
-    async fn exists_helper() {
-        let (s, _dir) = store();
-        assert!(!s.exists("nope").await.unwrap());
-        s.put_bytes("k", Bytes::from("v")).await.unwrap();
-        assert!(s.exists("k").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn new_store_is_empty() {
-        let (s, _dir) = store();
-        assert!(!s.exists("anything").await.unwrap());
     }
 
     #[test]
@@ -596,14 +488,116 @@ mod tests {
         }
     }
 
-    // Run the shared contract tests against PersistentKvStore.
-    // `Box::leak` intentionally extends the TempDir's lifetime to 'static so
-    // it remains alive for the duration of the test process. The directory is
-    // deleted when the process exits, unlike `.keep()` which leaves it behind
-    // permanently.
-    edgezero_core::key_value_store_contract_tests!(persistent_kv_contract, {
-        let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let db_path = dir.path().join("contract.redb");
-        PersistentKvStore::new(db_path).unwrap()
-    });
+    #[tokio::test]
+    async fn delete_nonexistent_is_ok() {
+        let (s, _dir) = store();
+        s.delete("nope").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_removes_key() {
+        let (s, _dir) = store();
+        s.put_bytes("k", Bytes::from("v")).await.unwrap();
+        s.delete("k").await.unwrap();
+        assert_eq!(s.get_bytes("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn exists_helper() {
+        let (s, _dir) = store();
+        assert!(!s.exists("nope").await.unwrap());
+        s.put_bytes("k", Bytes::from("v")).await.unwrap();
+        assert!(s.exists("k").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_missing_key_returns_none() {
+        let (s, _dir) = store();
+        assert_eq!(s.get_bytes("missing").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn list_keys_page_skips_expired_entries() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let s = PersistentKvStore::new(db_path).unwrap();
+
+        s.put_bytes("app/live", Bytes::from("value")).await.unwrap();
+        s.put_bytes_with_ttl("app/expired", Bytes::from("gone"), Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        thread::sleep(Duration::from_millis(200));
+
+        let page = s.list_keys_page("app/", None, 10).await.unwrap();
+        assert_eq!(page.keys, vec!["app/live".to_owned()]);
+        assert_eq!(page.cursor, None);
+    }
+
+    #[tokio::test]
+    async fn new_store_is_empty() {
+        let (s, _dir) = store();
+        assert!(!s.exists("anything").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn put_and_get_bytes() {
+        let (s, _dir) = store();
+        s.put_bytes("k", Bytes::from("hello")).await.unwrap();
+        assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
+    }
+
+    #[tokio::test]
+    async fn put_overwrites_existing() {
+        let (s, _dir) = store();
+        s.put_bytes("k", Bytes::from("first")).await.unwrap();
+        s.put_bytes("k", Bytes::from("second")).await.unwrap();
+        assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("second")));
+    }
+
+    #[tokio::test]
+    async fn ttl_expires_entry() {
+        // Use the store impl directly to bypass validation limits (min TTL 60s)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let s = PersistentKvStore::new(db_path).unwrap();
+        s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_millis(1))
+            .await
+            .unwrap();
+        // 200ms gives the OS scheduler enough headroom on busy CI runners.
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(s.get_bytes("temp").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn ttl_not_expired_returns_value() {
+        let (s, _dir) = store();
+        s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(s.get_bytes("temp").await.unwrap(), Some(Bytes::from("val")));
+    }
+
+    #[tokio::test]
+    async fn typed_roundtrip() {
+        let (s, _dir) = store();
+        let cfg = Config {
+            enabled: true,
+            name: "test".into(),
+        };
+        s.put("config", &cfg).await.unwrap();
+        let out: Option<Config> = s.get("config").await.unwrap();
+        assert_eq!(out, Some(cfg));
+    }
+
+    #[tokio::test]
+    async fn update_helper() {
+        let (s, _dir) = store();
+        s.put("counter", &0_i32).await.unwrap();
+        let val = s
+            .read_modify_write("counter", 0_i32, |n| n + 5_i32)
+            .await
+            .unwrap();
+        assert_eq!(val, 5_i32);
+    }
 }

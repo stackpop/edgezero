@@ -516,6 +516,52 @@ mod tests {
     use std::collections::HashMap;
     use validator::Validate;
 
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct FormData {
+        age: Option<u32>,
+        username: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct PathPayload {
+        id: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    struct Payload {
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct QueryParams {
+        page: Option<u32>,
+        q: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedFormData {
+        #[validate(length(min = 3_u64))]
+        username: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    struct ValidatedPayload {
+        #[validate(length(min = 1_u64))]
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedPathParams {
+        #[validate(length(min = 1_u64, max = 10_u64))]
+        id: String,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedQueryParams {
+        #[validate(range(min = 1_u32, max = 100_u32))]
+        page: u32,
+    }
+
     fn ctx(body: Body, params: PathParams) -> RequestContext {
         let request = request_builder()
             .method(Method::POST)
@@ -525,28 +571,32 @@ mod tests {
         RequestContext::new(request, params)
     }
 
+    fn ctx_with_form(body: &str) -> RequestContext {
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_owned()))
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
+    }
+
+    fn ctx_with_query(query: &str) -> RequestContext {
+        let uri = format!("/test?{query}");
+        let request = request_builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
+    }
+
     fn params(values: &[(&str, &str)]) -> PathParams {
         let map = values
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect::<HashMap<_, _>>();
         PathParams::new(map)
-    }
-
-    #[derive(Debug, Deserialize, Serialize, PartialEq)]
-    struct Payload {
-        name: String,
-    }
-
-    #[derive(Debug, Deserialize, Serialize, Validate)]
-    struct ValidatedPayload {
-        #[validate(length(min = 1_u64))]
-        name: String,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct PathPayload {
-        id: String,
     }
 
     #[test]
@@ -602,23 +652,6 @@ mod tests {
         );
     }
 
-    // Query extractor tests
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct QueryParams {
-        page: Option<u32>,
-        q: Option<String>,
-    }
-
-    fn ctx_with_query(query: &str) -> RequestContext {
-        let uri = format!("/test?{query}");
-        let request = request_builder()
-            .method(Method::GET)
-            .uri(uri)
-            .body(Body::empty())
-            .expect("request");
-        RequestContext::new(request, PathParams::default())
-    }
-
     #[test]
     fn query_extractor_parses_params() {
         let ctx = ctx_with_query("page=5&q=hello");
@@ -648,12 +681,6 @@ mod tests {
         assert_eq!(query.q, None);
     }
 
-    #[derive(Debug, Deserialize, Validate)]
-    struct ValidatedQueryParams {
-        #[validate(range(min = 1_u32, max = 100_u32))]
-        page: u32,
-    }
-
     #[test]
     fn validated_query_accepts_valid_params() {
         let ctx = ctx_with_query("page=50");
@@ -669,23 +696,6 @@ mod tests {
             .err()
             .expect("expected validation error");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    // Form extractor tests
-    fn ctx_with_form(body: &str) -> RequestContext {
-        let request = request_builder()
-            .method(Method::POST)
-            .uri("/test")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(Body::from(body.to_owned()))
-            .expect("request");
-        RequestContext::new(request, PathParams::default())
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct FormData {
-        username: String,
-        age: Option<u32>,
     }
 
     #[test]
@@ -704,12 +714,6 @@ mod tests {
         assert_eq!(form.age, None);
     }
 
-    #[derive(Debug, Deserialize, Validate)]
-    struct ValidatedFormData {
-        #[validate(length(min = 3_u64))]
-        username: String,
-    }
-
     #[test]
     fn validated_form_accepts_valid_data() {
         let ctx = ctx_with_form("username=alice");
@@ -724,13 +728,6 @@ mod tests {
             .err()
             .expect("expected validation error");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    // ValidatedPath tests
-    #[derive(Debug, Deserialize, Validate)]
-    struct ValidatedPathParams {
-        #[validate(length(min = 1_u64, max = 10_u64))]
-        id: String,
     }
 
     #[test]

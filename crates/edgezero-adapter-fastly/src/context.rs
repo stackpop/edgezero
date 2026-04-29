@@ -9,12 +9,12 @@ pub struct FastlyRequestContext {
 }
 
 impl FastlyRequestContext {
-    pub fn insert(request: &mut Request, context: FastlyRequestContext) {
-        request.extensions_mut().insert(context);
-    }
-
     pub fn get(request: &Request) -> Option<&FastlyRequestContext> {
         request.extensions().get::<FastlyRequestContext>()
+    }
+
+    pub fn insert(request: &mut Request, context: FastlyRequestContext) {
+        request.extensions_mut().insert(context);
     }
 }
 

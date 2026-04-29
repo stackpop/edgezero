@@ -17,6 +17,16 @@ pub enum Body {
 }
 
 impl Body {
+    /// Returns the in-memory bytes for a buffered body, or `None` if this is
+    /// a streaming body. To consume a streaming body into bytes, use
+    /// [`Body::into_bytes_bounded`].
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Body::Once(bytes) => Some(bytes.as_ref()),
+            Body::Stream(_) => None,
+        }
+    }
+
     #[must_use]
     pub fn empty() -> Self {
         Self::from_bytes(Bytes::new())
@@ -41,23 +51,6 @@ impl Body {
         )
     }
 
-    pub fn stream<S>(stream: S) -> Self
-    where
-        S: Stream<Item = Bytes> + 'static,
-    {
-        Self::Stream(stream.map(Ok::<Bytes, anyhow::Error>).boxed_local())
-    }
-
-    /// Returns the in-memory bytes for a buffered body, or `None` if this is
-    /// a streaming body. To consume a streaming body into bytes, use
-    /// [`Body::into_bytes_bounded`].
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Body::Once(bytes) => Some(bytes.as_ref()),
-            Body::Stream(_) => None,
-        }
-    }
-
     /// Consume a buffered body and return its bytes, or `None` if this is a
     /// streaming body. To collect a streaming body, use
     /// [`Body::into_bytes_bounded`].
@@ -66,17 +59,6 @@ impl Body {
             Body::Once(bytes) => Some(bytes),
             Body::Stream(_) => None,
         }
-    }
-
-    pub fn into_stream(self) -> Option<LocalBoxStream<'static, Result<Bytes, anyhow::Error>>> {
-        match self {
-            Body::Once(_) => None,
-            Body::Stream(stream) => Some(stream),
-        }
-    }
-
-    pub fn is_stream(&self) -> bool {
-        matches!(self, Body::Stream(_))
     }
 
     /// Drain the body into a single `Bytes` buffer, enforcing `max_size`.
@@ -107,11 +89,15 @@ impl Body {
         }
     }
 
-    pub fn text<S>(text: S) -> Self
-    where
-        S: Into<String>,
-    {
-        Self::from_bytes(text.into().into_bytes())
+    pub fn into_stream(self) -> Option<LocalBoxStream<'static, Result<Bytes, anyhow::Error>>> {
+        match self {
+            Body::Once(_) => None,
+            Body::Stream(stream) => Some(stream),
+        }
+    }
+
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Body::Stream(_))
     }
 
     /// # Errors
@@ -121,6 +107,20 @@ impl Body {
         T: Serialize,
     {
         serde_json::to_vec(value).map(Self::from_bytes)
+    }
+
+    pub fn stream<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Bytes> + 'static,
+    {
+        Self::Stream(stream.map(Ok::<Bytes, anyhow::Error>).boxed_local())
+    }
+
+    pub fn text<S>(text: S) -> Self
+    where
+        S: Into<String>,
+    {
+        Self::from_bytes(text.into().into_bytes())
     }
 
     /// # Errors
@@ -188,6 +188,12 @@ mod tests {
     use std::io;
 
     #[test]
+    fn as_bytes_returns_none_for_stream() {
+        let body = Body::stream(stream::iter(vec![Bytes::from_static(b"data")]));
+        assert!(body.as_bytes().is_none());
+    }
+
+    #[test]
     fn collect_stream_body() {
         let body = Body::stream(stream::iter(vec![
             Bytes::from_static(b"a"),
@@ -207,6 +213,23 @@ mod tests {
     }
 
     #[test]
+    fn debug_formats_both_body_variants() {
+        let buffered = Body::from("payload");
+        let buffered_debug = format!("{buffered:?}");
+        assert!(buffered_debug.contains("Body::Once"));
+
+        let stream = Body::stream(stream::iter(vec![Bytes::from_static(b"chunk")]));
+        let stream_debug = format!("{stream:?}");
+        assert!(stream_debug.contains("Body::Stream"));
+    }
+
+    #[test]
+    fn default_body_is_empty() {
+        let body = Body::default();
+        assert!(body.as_bytes().expect("buffered").is_empty());
+    }
+
+    #[test]
     fn from_stream_maps_errors() {
         let source = stream::iter(vec![
             Ok(Bytes::from_static(b"ok")),
@@ -222,57 +245,6 @@ mod tests {
         assert_eq!(first, Bytes::from_static(b"ok"));
         let err = second.expect_err("error");
         assert!(err.to_string().contains("boom"));
-    }
-
-    #[test]
-    fn to_json_fails_for_streaming_body() {
-        let body = Body::stream(stream::iter(vec![
-            Bytes::from_static(b"{"),
-            Bytes::from_static(b"}"),
-        ]));
-        body.to_json::<serde_json::Value>()
-            .expect_err("streaming body cannot deserialize as JSON");
-    }
-
-    #[test]
-    fn into_bytes_returns_none_for_stream() {
-        let body = Body::stream(stream::iter(vec![Bytes::from_static(b"data")]));
-        assert!(body.into_bytes().is_none());
-    }
-
-    #[test]
-    fn as_bytes_returns_none_for_stream() {
-        let body = Body::stream(stream::iter(vec![Bytes::from_static(b"data")]));
-        assert!(body.as_bytes().is_none());
-    }
-
-    #[test]
-    fn into_stream_returns_none_for_buffered_body() {
-        let body = Body::from("payload");
-        assert!(body.into_stream().is_none());
-    }
-
-    #[test]
-    fn is_stream_returns_false_for_buffered_body() {
-        let body = Body::from("payload");
-        assert!(!body.is_stream());
-    }
-
-    #[test]
-    fn default_body_is_empty() {
-        let body = Body::default();
-        assert!(body.as_bytes().expect("buffered").is_empty());
-    }
-
-    #[test]
-    fn debug_formats_both_body_variants() {
-        let buffered = Body::from("payload");
-        let buffered_debug = format!("{buffered:?}");
-        assert!(buffered_debug.contains("Body::Once"));
-
-        let stream = Body::stream(stream::iter(vec![Bytes::from_static(b"chunk")]));
-        let stream_debug = format!("{stream:?}");
-        assert!(stream_debug.contains("Body::Stream"));
     }
 
     #[test]
@@ -311,5 +283,33 @@ mod tests {
             Bytes::from_static(b"cd"),
         ]));
         block_on(body.into_bytes_bounded(3)).expect_err("stream exceeds max_size");
+    }
+
+    #[test]
+    fn into_bytes_returns_none_for_stream() {
+        let body = Body::stream(stream::iter(vec![Bytes::from_static(b"data")]));
+        assert!(body.into_bytes().is_none());
+    }
+
+    #[test]
+    fn into_stream_returns_none_for_buffered_body() {
+        let body = Body::from("payload");
+        assert!(body.into_stream().is_none());
+    }
+
+    #[test]
+    fn is_stream_returns_false_for_buffered_body() {
+        let body = Body::from("payload");
+        assert!(!body.is_stream());
+    }
+
+    #[test]
+    fn to_json_fails_for_streaming_body() {
+        let body = Body::stream(stream::iter(vec![
+            Bytes::from_static(b"{"),
+            Bytes::from_static(b"}"),
+        ]));
+        body.to_json::<serde_json::Value>()
+            .expect_err("streaming body cannot deserialize as JSON");
     }
 }

@@ -1,13 +1,6 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
-#[cfg(feature = "fastly")]
-use edgezero_core::app::{App, Hooks, FASTLY_ADAPTER};
-#[cfg(feature = "fastly")]
-use edgezero_core::manifest::{ManifestLoader, ResolvedLoggingConfig};
-#[cfg(feature = "fastly")]
-use request::DEFAULT_KV_STORE_NAME;
-
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "fastly")]
@@ -27,11 +20,35 @@ pub mod response;
 pub mod secret_store;
 
 #[cfg(feature = "fastly")]
+use edgezero_core::app::{App, Hooks, FASTLY_ADAPTER};
+#[cfg(feature = "fastly")]
+use edgezero_core::manifest::{ManifestLoader, ResolvedLoggingConfig};
+#[cfg(feature = "fastly")]
+use request::DEFAULT_KV_STORE_NAME;
+
+#[cfg(feature = "fastly")]
+pub trait AppExt {
+    #[deprecated(
+        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
+    )]
+    /// # Errors
+    /// Returns an error if the underlying handler returns an error or the response cannot be converted into a Fastly response.
+    fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
+}
+
+#[cfg(feature = "fastly")]
+impl AppExt for App {
+    fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
+        request::dispatch_raw(self, req)
+    }
+}
+
+#[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
 pub struct FastlyLogging {
+    pub echo_stdout: bool,
     pub endpoint: Option<String>,
     pub level: log::LevelFilter,
-    pub echo_stdout: bool,
     pub use_fastly_logger: bool,
 }
 
@@ -39,12 +56,23 @@ pub struct FastlyLogging {
 impl From<ResolvedLoggingConfig> for FastlyLogging {
     fn from(config: ResolvedLoggingConfig) -> Self {
         Self {
+            echo_stdout: config.echo_stdout.unwrap_or(true),
             endpoint: config.endpoint,
             level: config.level.into(),
-            echo_stdout: config.echo_stdout.unwrap_or(true),
             use_fastly_logger: true,
         }
     }
+}
+
+/// Whether each optional store is required to be present at startup.
+///
+/// Using a named struct instead of positional `bool` arguments prevents
+/// accidental parameter swaps between `kv_required` and `secrets_required`.
+#[cfg(feature = "fastly")]
+#[derive(Default)]
+struct StoreRequirements {
+    kv_required: bool,
+    secrets_required: bool,
 }
 
 /// # Errors
@@ -70,23 +98,6 @@ pub fn init_logger(
     _echo_stdout: bool,
 ) -> Result<(), log::SetLoggerError> {
     Ok(())
-}
-
-#[cfg(feature = "fastly")]
-pub trait AppExt {
-    #[deprecated(
-        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
-    )]
-    /// # Errors
-    /// Returns an error if the underlying handler returns an error or the response cannot be converted into a Fastly response.
-    fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
-}
-
-#[cfg(feature = "fastly")]
-impl AppExt for App {
-    fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-        request::dispatch_raw(self, req)
-    }
 }
 
 /// Entry point for a Fastly Compute application.
@@ -170,17 +181,6 @@ pub fn run_app_with_logging<A: Hooks>(
     )
 }
 
-/// Whether each optional store is required to be present at startup.
-///
-/// Using a named struct instead of positional `bool` arguments prevents
-/// accidental parameter swaps between `kv_required` and `secrets_required`.
-#[cfg(feature = "fastly")]
-#[derive(Default)]
-struct StoreRequirements {
-    kv_required: bool,
-    secrets_required: bool,
-}
-
 #[cfg(feature = "fastly")]
 fn run_app_with_stores<A: Hooks>(
     logging: &FastlyLogging,
@@ -214,8 +214,8 @@ mod tests {
     #[test]
     fn fastly_logging_from_manifest_converts_defaults() {
         let config = ResolvedLoggingConfig {
-            endpoint: Some("endpoint".to_owned()),
             echo_stdout: Some(false),
+            endpoint: Some("endpoint".to_owned()),
             level: LogLevel::Debug,
         };
 
