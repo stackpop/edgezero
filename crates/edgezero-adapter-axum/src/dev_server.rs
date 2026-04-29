@@ -275,12 +275,12 @@ async fn serve_with_stores(
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let manifest = ManifestLoader::try_load_from_str(manifest_src)?;
-    let m = manifest.manifest();
-    let logging = m.logging_or_default(AXUM_ADAPTER);
-    let kv_init_requirement = kv_init_requirement(m);
-    let kv_store_name = m.kv_store_name(AXUM_ADAPTER).to_owned();
+    let manifest_data = manifest.manifest();
+    let logging = manifest_data.logging_or_default(AXUM_ADAPTER);
+    let kv_init_requirement = kv_init_requirement(manifest_data);
+    let kv_store_name = manifest_data.kv_store_name(AXUM_ADAPTER).to_owned();
     let kv_path = kv_store_path(&kv_store_name);
-    let has_secret_store = m.secret_store_enabled("axum");
+    let has_secret_store = manifest_data.secret_store_enabled("axum");
 
     let configured_level: LevelFilter = logging.level.into();
     let level = if logging.echo_stdout.unwrap_or(true) {
@@ -335,10 +335,10 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         // Unlike Fastly and Cloudflare, it does not check A::config_store() first.
         // If a user implements Hooks::config_store() without a [stores.config] section
         // in edgezero.toml, the override is silently ignored on Axum.
-        if A::config_store().is_some() && m.stores.config.is_none() {
+        if A::config_store().is_some() && manifest_data.stores.config.is_none() {
             log::warn!("A::config_store() is set but [stores.config] is missing in the manifest. This override is ignored on Axum.");
         }
-        let config_store_handle = m.stores.config.as_ref().map(|cfg| {
+        let config_store_handle = manifest_data.stores.config.as_ref().map(|cfg| {
             let defaults = cfg.config_store_defaults().clone();
             let store = AxumConfigStore::from_env(defaults);
             ConfigStoreHandle::new(Arc::new(store))
@@ -565,7 +565,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/test", server.base_url);
-        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        let response = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "hello from dev server");
@@ -580,7 +580,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/nonexistent", server.base_url);
-        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        let response = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
@@ -598,7 +598,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/submit", server.base_url);
-        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        let response = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
 
@@ -612,7 +612,7 @@ mod integration_tests {
                 .request()
                 .headers()
                 .get("x-custom")
-                .and_then(|v| v.to_str().ok())
+                .and_then(|val| val.to_str().ok())
                 .unwrap_or("missing");
             Ok(value.to_owned())
         }
@@ -622,8 +622,8 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/headers", server.base_url);
-        let response = send_with_retry(&client, |c| {
-            c.get(url.as_str()).header("x-custom", "my-value")
+        let response = send_with_retry(&client, |http_client| {
+            http_client.get(url.as_str()).header("x-custom", "my-value")
         })
         .await;
 
@@ -651,8 +651,8 @@ mod integration_tests {
         let result = spawn_blocking(move || server.run()).await;
 
         match result {
-            Ok(Err(e)) => {
-                let err_str = e.to_string();
+            Ok(Err(err)) => {
+                let err_str = err.to_string();
                 assert!(
                     err_str.contains("bind") || err_str.contains("address"),
                     "expected bind error, got: {err_str}"
@@ -688,13 +688,15 @@ mod integration_tests {
 
         // Write a value
         let write_url = format!("{}/write", server.base_url);
-        let write_response = send_with_retry(&client, |c| c.post(write_url.as_str())).await;
+        let write_response =
+            send_with_retry(&client, |http_client| http_client.post(write_url.as_str())).await;
         assert_eq!(write_response.status(), reqwest::StatusCode::OK);
         assert_eq!(write_response.text().await.unwrap(), "written");
 
         // Read it back — proves shared state across requests
         let read_url = format!("{}/read", server.base_url);
-        let read_response = send_with_retry(&client, |c| c.get(read_url.as_str())).await;
+        let read_response =
+            send_with_retry(&client, |http_client| http_client.get(read_url.as_str())).await;
         assert_eq!(read_response.status(), reqwest::StatusCode::OK);
         assert_eq!(read_response.text().await.unwrap(), "42");
 
@@ -731,19 +733,21 @@ mod integration_tests {
 
         // Write
         let write_url = format!("{}/write", server.base_url);
-        send_with_retry(&client, |c| c.post(write_url.as_str())).await;
+        send_with_retry(&client, |http_client| http_client.post(write_url.as_str())).await;
 
         // Verify exists
         let check_url = format!("{}/check", server.base_url);
-        let exists_before = send_with_retry(&client, |c| c.get(check_url.as_str())).await;
+        let exists_before =
+            send_with_retry(&client, |http_client| http_client.get(check_url.as_str())).await;
         assert_eq!(exists_before.text().await.unwrap(), "exists=true");
 
         // Delete
         let delete_url = format!("{}/delete", server.base_url);
-        send_with_retry(&client, |c| c.post(delete_url.as_str())).await;
+        send_with_retry(&client, |http_client| http_client.post(delete_url.as_str())).await;
 
         // Verify gone
-        let exists_after = send_with_retry(&client, |c| c.get(check_url.as_str())).await;
+        let exists_after =
+            send_with_retry(&client, |http_client| http_client.get(check_url.as_str())).await;
         assert_eq!(exists_after.text().await.unwrap(), "exists=false");
 
         server.handle.abort();
@@ -768,7 +772,7 @@ mod integration_tests {
 
         // Increment 5 times, each should return incremented value
         for expected in 1_i32..=5_i32 {
-            let resp = send_with_retry(&client, |c| c.post(url.as_str())).await;
+            let resp = send_with_retry(&client, |http_client| http_client.post(url.as_str())).await;
             assert_eq!(
                 resp.text().await.unwrap(),
                 expected.to_string(),
@@ -792,7 +796,7 @@ mod integration_tests {
         let client = reqwest::Client::new();
 
         let url = format!("{}/read", server.base_url);
-        let resp = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        let resp = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "-1");
 
@@ -825,7 +829,7 @@ mod integration_tests {
             let kv = ctx.kv_handle().expect("kv configured");
             let profile: Option<UserProfile> = kv.get("user:alice").await?;
             match profile {
-                Some(p) => Ok(format!("{}:{}", p.name, p.age)),
+                Some(found) => Ok(format!("{}:{}", found.name, found.age)),
                 None => Ok("not found".to_owned()),
             }
         }
@@ -839,12 +843,14 @@ mod integration_tests {
 
         // Save profile
         let save_url = format!("{}/save", server.base_url);
-        let save_resp = send_with_retry(&client, |c| c.post(save_url.as_str())).await;
+        let save_resp =
+            send_with_retry(&client, |http_client| http_client.post(save_url.as_str())).await;
         assert_eq!(save_resp.text().await.unwrap(), "saved");
 
         // Load profile
         let load_url = format!("{}/load", server.base_url);
-        let load_resp = send_with_retry(&client, |c| c.get(load_url.as_str())).await;
+        let load_resp =
+            send_with_retry(&client, |http_client| http_client.get(load_url.as_str())).await;
         assert_eq!(load_resp.text().await.unwrap(), "Alice:30");
 
         server.handle.abort();
@@ -867,8 +873,8 @@ mod integration_tests {
             enable_ctrl_c: false,
         };
         let mut server = super::AxumDevServer::with_config(router, config);
-        if let Some(h) = secret_handle {
-            server = server.with_secret_handle(h);
+        if let Some(handle) = secret_handle {
+            server = server.with_secret_handle(handle);
         }
         let handle = tokio::spawn(async move {
             let _result = server.run_with_listener(listener).await;
@@ -906,7 +912,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/secret", server.base_url);
-        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        let response = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "s3cr3t");
@@ -928,7 +934,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/secret", server.base_url);
-        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        let response = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
 
         assert_eq!(
             response.status(),
@@ -950,7 +956,7 @@ mod integration_tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/secret", server.base_url);
-        let response = send_with_retry(&client, |c| c.get(url.as_str())).await;
+        let response = send_with_retry(&client, |http_client| http_client.get(url.as_str())).await;
 
         assert_eq!(
             response.status(),

@@ -161,7 +161,7 @@ fn shell_escape(arg: &str) -> String {
         "''".to_owned()
     } else if arg
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._-/:=@".contains(c))
+        .all(|ch| ch.is_ascii_alphanumeric() || "._-/:=@".contains(ch))
     {
         arg.to_owned()
     } else {
@@ -212,7 +212,7 @@ mod tests {
         apply_environment(adapter_name, &env, &mut cmd).expect("environment applied");
         let has_var = cmd.get_envs().any(|(key, value)| {
             key.to_str() == Some("EDGEZERO_TEST_BASE")
-                && value.and_then(|v| v.to_str()) == Some("https://demo")
+                && value.and_then(|val| val.to_str()) == Some("https://demo")
         });
         assert!(has_var);
 

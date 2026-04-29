@@ -80,8 +80,8 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
         Box::pin(async move {
             let mut core_request = match into_core_request(req).await {
                 Ok(converted) => converted,
-                Err(e) => {
-                    let mut err_response = Response::new(AxumBody::from(e.clone()));
+                Err(err) => {
+                    let mut err_response = Response::new(AxumBody::from(err.clone()));
                     *err_response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
 
                     return Ok(err_response);
@@ -269,7 +269,7 @@ mod tests {
                     .get_bytes("env", "__EDGEZERO_SERVICE_TEST_SECRET__")
                     .await
                     .unwrap()
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                     .unwrap_or_default();
                 let response = response_builder()
                     .status(StatusCode::OK)

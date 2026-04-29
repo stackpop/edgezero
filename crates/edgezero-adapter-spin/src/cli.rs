@@ -129,7 +129,8 @@ impl Adapter for SpinCliAdapter {
 /// # Errors
 /// Returns an error if the Spin CLI build command fails.
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
-    let manifest = find_spin_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
+    let manifest =
+        find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -149,7 +150,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
         ])
         .args(extra_args)
         .status()
-        .map_err(|e| format!("failed to run cargo build: {e}"))?;
+        .map_err(|err| format!("failed to run cargo build: {err}"))?;
     if !status.success() {
         return Err(format!("cargo build failed with status {status}"));
     }
@@ -158,10 +159,10 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let artifact = locate_artifact(&workspace_root, manifest_dir, &crate_name)?;
     let pkg_dir = workspace_root.join("pkg");
     fs::create_dir_all(&pkg_dir)
-        .map_err(|e| format!("failed to create {}: {e}", pkg_dir.display()))?;
+        .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
     let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
     fs::copy(&artifact, &dest)
-        .map_err(|e| format!("failed to copy artifact to {}: {e}", dest.display()))?;
+        .map_err(|err| format!("failed to copy artifact to {}: {err}", dest.display()))?;
 
     Ok(dest)
 }
@@ -169,7 +170,8 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 /// # Errors
 /// Returns an error if the Spin CLI deploy command fails.
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_spin_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
+    let manifest =
+        find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -179,7 +181,7 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
         .args(extra_args)
         .current_dir(manifest_dir)
         .status()
-        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
+        .map_err(|err| format!("failed to run spin CLI: {err}"))?;
     if !status.success() {
         return Err(format!("spin deploy failed with status {status}"));
     }
@@ -273,7 +275,8 @@ fn register_ctor() {
 /// # Errors
 /// Returns an error if the Spin CLI up command fails.
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_spin_manifest(env::current_dir().map_err(|e| e.to_string())?.as_path())?;
+    let manifest =
+        find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
@@ -283,7 +286,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
         .args(extra_args)
         .current_dir(manifest_dir)
         .status()
-        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
+        .map_err(|err| format!("failed to run spin CLI: {err}"))?;
     if !status.success() {
         return Err(format!("spin up failed with status {status}"));
     }

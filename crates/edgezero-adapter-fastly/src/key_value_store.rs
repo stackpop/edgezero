@@ -35,7 +35,7 @@ impl FastlyKvStore {
     /// Returns [`KvError::Internal`] if the named KV store cannot be opened.
     pub fn open(name: &str) -> Result<Self, KvError> {
         let store = KVStore::open(name)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open kv store: {err}")))?
             .ok_or(KvError::Unavailable)?;
         Ok(Self { store })
     }
@@ -47,7 +47,7 @@ impl KvStore for FastlyKvStore {
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         self.store
             .delete(key)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("delete failed: {err}")))
     }
 
     async fn exists(&self, key: &str) -> Result<bool, KvError> {
@@ -61,7 +61,7 @@ impl KvStore for FastlyKvStore {
                 Ok(Some(Bytes::from(bytes)))
             }
             Err(KVStoreError::ItemNotFound) => Ok(None),
-            Err(e) => Err(KvError::Internal(anyhow::anyhow!("lookup failed: {e}"))),
+            Err(err) => Err(KvError::Internal(anyhow::anyhow!("lookup failed: {err}"))),
         }
     }
 
@@ -79,14 +79,14 @@ impl KvStore for FastlyKvStore {
         if !prefix.is_empty() {
             request = request.prefix(prefix);
         }
-        if let Some(token) = cursor.filter(|c| !c.is_empty()) {
+        if let Some(token) = cursor.filter(|token| !token.is_empty()) {
             request = request.cursor(token);
         }
 
         let page = request
             .execute()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("list failed: {e}")))?;
-        let next_cursor = page.next_cursor().filter(|c| !c.is_empty());
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("list failed: {err}")))?;
+        let next_cursor = page.next_cursor().filter(|token| !token.is_empty());
 
         Ok(KvPage {
             cursor: next_cursor,
@@ -97,7 +97,7 @@ impl KvStore for FastlyKvStore {
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         self.store
             .insert(key, value.as_ref())
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert failed: {e}")))
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("insert failed: {err}")))
     }
 
     async fn put_bytes_with_ttl(
@@ -110,7 +110,7 @@ impl KvStore for FastlyKvStore {
             .build_insert()
             .time_to_live(ttl)
             .execute(key, value.as_ref())
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert with ttl failed: {e}")))
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("insert with ttl failed: {err}")))
     }
 }
 

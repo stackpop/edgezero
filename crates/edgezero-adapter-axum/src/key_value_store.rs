@@ -86,7 +86,7 @@ impl PersistentKvStore {
     fn begin_write(&self) -> Result<redb::WriteTransaction, KvError> {
         self.db
             .begin_write()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {e}")))
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to begin write txn: {err}")))
     }
 
     fn cleanup_expired_keys(&self, expired_keys: &[String]) -> Result<(), KvError> {
@@ -100,15 +100,15 @@ impl PersistentKvStore {
             for key in expired_keys {
                 let still_expired = table
                     .get(key.as_str())
-                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
+                    .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?
                     .is_some_and(|entry| {
                         let (_, expires_at) = entry.value();
                         Self::is_expired(expires_at)
                     });
                 if still_expired {
-                    table
-                        .remove(key.as_str())
-                        .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
+                    table.remove(key.as_str()).map_err(|err| {
+                        KvError::Internal(anyhow::anyhow!("failed to remove: {err}"))
+                    })?;
                 }
             }
         }
@@ -117,7 +117,7 @@ impl PersistentKvStore {
 
     fn commit(txn: redb::WriteTransaction) -> Result<(), KvError> {
         txn.commit()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to commit: {e}")))
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to commit: {err}")))
     }
 
     /// Check if an entry is expired based on its expiration timestamp.
@@ -151,10 +151,10 @@ impl PersistentKvStore {
     /// Returns an error if the database file cannot be opened or initialised (corrupted file, locked by another process, or insufficient permissions).
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, KvError> {
         let db_path = path.as_ref().display().to_string();
-        let db = Database::create(path).map_err(|e| {
+        let db = Database::create(path).map_err(|err| {
             KvError::Internal(anyhow::anyhow!(
                 "Failed to open KV database at {db_path}. If the file is corrupted or locked \
-                 by another process, try deleting it and restarting: {e}"
+                 by another process, try deleting it and restarting: {err}"
             ))
         })?;
 
@@ -171,7 +171,7 @@ impl PersistentKvStore {
 
     fn open_table(txn: &redb::WriteTransaction) -> Result<KvTable<'_>, KvError> {
         txn.open_table(KV_TABLE)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open table: {err}")))
     }
 
     /// Convert `SystemTime` to milliseconds since UNIX epoch.
@@ -179,7 +179,7 @@ impl PersistentKvStore {
     /// Returns 0 if the time is before UNIX epoch (should never happen in practice).
     fn system_time_to_millis(time: SystemTime) -> u128 {
         time.duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis())
+            .map(|duration| duration.as_millis())
             .unwrap_or(0)
     }
 }
@@ -191,7 +191,7 @@ impl KvStore for PersistentKvStore {
         let mut table = Self::open_table(&write_txn)?;
         table
             .remove(key)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to remove: {e}")))?;
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to remove: {err}")))?;
         drop(table);
         Self::commit(write_txn)
     }
@@ -204,15 +204,15 @@ impl KvStore for PersistentKvStore {
         let read_txn = self
             .db
             .begin_read()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to begin read txn: {e}")))?;
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to begin read txn: {err}")))?;
 
         let table = read_txn
             .open_table(KV_TABLE)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))?;
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open table: {err}")))?;
 
         if let Some(entry) = table
             .get(key)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to get key: {err}")))?
         {
             let (value_bytes, expires_at) = entry.value();
 
@@ -231,14 +231,16 @@ impl KvStore for PersistentKvStore {
                     // a fresh value between our read and this write.
                     let still_expired = write_table
                         .get(key)
-                        .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to get key: {e}")))?
+                        .map_err(|err| {
+                            KvError::Internal(anyhow::anyhow!("failed to get key: {err}"))
+                        })?
                         .is_some_and(|fresh_entry| {
                             let (_, exp) = fresh_entry.value();
                             Self::is_expired(exp)
                         });
                     if still_expired {
-                        write_table.remove(key).map_err(|e| {
-                            KvError::Internal(anyhow::anyhow!("failed to remove: {e}"))
+                        write_table.remove(key).map_err(|err| {
+                            KvError::Internal(anyhow::anyhow!("failed to remove: {err}"))
                         })?;
                     }
                 }
@@ -279,13 +281,13 @@ impl KvStore for PersistentKvStore {
             let mut expired_keys = Vec::new();
 
             {
-                let read_txn = self.db.begin_read().map_err(|e| {
-                    KvError::Internal(anyhow::anyhow!("failed to begin read txn: {e}"))
+                let read_txn = self.db.begin_read().map_err(|err| {
+                    KvError::Internal(anyhow::anyhow!("failed to begin read txn: {err}"))
                 })?;
 
-                let table = read_txn
-                    .open_table(KV_TABLE)
-                    .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open table: {e}")))?;
+                let table = read_txn.open_table(KV_TABLE).map_err(|err| {
+                    KvError::Internal(anyhow::anyhow!("failed to open table: {err}"))
+                })?;
 
                 let mut iter = if prefix.is_empty() {
                     match scan_cursor.as_deref() {
@@ -302,7 +304,9 @@ impl KvStore for PersistentKvStore {
                         _ => table.range(prefix..),
                     }
                 }
-                .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to create range: {e}")))?;
+                .map_err(|err| {
+                    KvError::Internal(anyhow::anyhow!("failed to create range: {err}"))
+                })?;
 
                 for _ in 0..Self::LIST_SCAN_BATCH_SIZE {
                     let Some(entry) = iter.next() else {
@@ -310,8 +314,8 @@ impl KvStore for PersistentKvStore {
                         break;
                     };
 
-                    let (key_handle, value) = entry.map_err(|e| {
-                        KvError::Internal(anyhow::anyhow!("failed to read range entry: {e}"))
+                    let (key_handle, value) = entry.map_err(|err| {
+                        KvError::Internal(anyhow::anyhow!("failed to read range entry: {err}"))
                     })?;
                     let key = key_handle.value().to_owned();
 
@@ -354,7 +358,7 @@ impl KvStore for PersistentKvStore {
         let mut table = Self::open_table(&write_txn)?;
         table
             .insert(key, (value.as_ref(), None))
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to insert: {err}")))?;
         drop(table);
         Self::commit(write_txn)
     }
@@ -374,7 +378,7 @@ impl KvStore for PersistentKvStore {
         let mut table = Self::open_table(&write_txn)?;
         table
             .insert(key, (value.as_ref(), Some(expires_at_millis)))
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to insert: {e}")))?;
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to insert: {err}")))?;
         drop(table);
         Self::commit(write_txn)
     }
@@ -416,18 +420,24 @@ mod tests {
     async fn cleanup_expired_keys_does_not_delete_fresh_overwrite() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
-        let s = PersistentKvStore::new(db_path).unwrap();
+        let kv_store = PersistentKvStore::new(db_path).unwrap();
 
-        s.put_bytes_with_ttl("race/key", Bytes::from("stale"), Duration::from_millis(1))
+        kv_store
+            .put_bytes_with_ttl("race/key", Bytes::from("stale"), Duration::from_millis(1))
             .await
             .unwrap();
         thread::sleep(Duration::from_millis(200));
-        s.put_bytes("race/key", Bytes::from("fresh")).await.unwrap();
+        kv_store
+            .put_bytes("race/key", Bytes::from("fresh"))
+            .await
+            .unwrap();
 
-        s.cleanup_expired_keys(&["race/key".to_owned()]).unwrap();
+        kv_store
+            .cleanup_expired_keys(&["race/key".to_owned()])
+            .unwrap();
 
         assert_eq!(
-            s.get_bytes("race/key").await.unwrap(),
+            kv_store.get_bytes("race/key").await.unwrap(),
             Some(Bytes::from("fresh"))
         );
     }
@@ -436,35 +446,38 @@ mod tests {
     fn concurrent_writes_dont_panic() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
-        let s = PersistentKvStore::new(db_path).unwrap();
-        let handle = KvHandle::new(Arc::new(s));
+        let kv_store = PersistentKvStore::new(db_path).unwrap();
+        let handle = KvHandle::new(Arc::new(kv_store));
 
         // KvHandle futures are !Send (async_trait(?Send) for WASM compat), so
         // tokio::spawn is off-limits. Use OS threads instead — KvHandle is
         // Send + Sync, so each thread moves its own clone and runs its own
         // executor. This is genuinely concurrent at the OS level.
         let threads: Vec<_> = (0_i32..100_i32)
-            .map(|i| {
-                let h = handle.clone();
+            .map(|idx| {
+                let kv_handle = handle.clone();
                 thread::spawn(move || {
                     executor::block_on(async move {
-                        let key = format!("key:{i}");
-                        h.put(&key, &i).await.unwrap();
+                        let key = format!("key:{idx}");
+                        kv_handle.put(&key, &idx).await.unwrap();
                     });
                 })
             })
             .collect();
 
-        for t in threads {
-            t.join().expect("writer thread panicked");
+        for thread in threads {
+            thread.join().expect("writer thread panicked");
         }
 
         // Verify all 100 keys survived concurrent writes with correct values.
         executor::block_on(async {
-            for i in 0_i32..100_i32 {
-                let key = format!("key:{i}");
+            for idx in 0_i32..100_i32 {
+                let key = format!("key:{idx}");
                 let val: i32 = handle.get_or(&key, -1_i32).await.unwrap();
-                assert_eq!(val, i, "key:{i} has wrong value after concurrent writes");
+                assert_eq!(
+                    val, idx,
+                    "key:{idx} has wrong value after concurrent writes"
+                );
             }
         });
     }
@@ -492,69 +505,82 @@ mod tests {
 
     #[tokio::test]
     async fn delete_nonexistent_is_ok() {
-        let (s, _dir) = store();
-        s.delete("nope").await.unwrap();
+        let (kv_store, _dir) = store();
+        kv_store.delete("nope").await.unwrap();
     }
 
     #[tokio::test]
     async fn delete_removes_key() {
-        let (s, _dir) = store();
-        s.put_bytes("k", Bytes::from("v")).await.unwrap();
-        s.delete("k").await.unwrap();
-        assert_eq!(s.get_bytes("k").await.unwrap(), None);
+        let (kv_store, _dir) = store();
+        kv_store.put_bytes("k", Bytes::from("v")).await.unwrap();
+        kv_store.delete("k").await.unwrap();
+        assert_eq!(kv_store.get_bytes("k").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn exists_helper() {
-        let (s, _dir) = store();
-        assert!(!s.exists("nope").await.unwrap());
-        s.put_bytes("k", Bytes::from("v")).await.unwrap();
-        assert!(s.exists("k").await.unwrap());
+        let (kv_store, _dir) = store();
+        assert!(!kv_store.exists("nope").await.unwrap());
+        kv_store.put_bytes("k", Bytes::from("v")).await.unwrap();
+        assert!(kv_store.exists("k").await.unwrap());
     }
 
     #[tokio::test]
     async fn get_missing_key_returns_none() {
-        let (s, _dir) = store();
-        assert_eq!(s.get_bytes("missing").await.unwrap(), None);
+        let (kv_store, _dir) = store();
+        assert_eq!(kv_store.get_bytes("missing").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn list_keys_page_skips_expired_entries() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
-        let s = PersistentKvStore::new(db_path).unwrap();
+        let kv_store = PersistentKvStore::new(db_path).unwrap();
 
-        s.put_bytes("app/live", Bytes::from("value")).await.unwrap();
-        s.put_bytes_with_ttl("app/expired", Bytes::from("gone"), Duration::from_millis(1))
+        kv_store
+            .put_bytes("app/live", Bytes::from("value"))
+            .await
+            .unwrap();
+        kv_store
+            .put_bytes_with_ttl("app/expired", Bytes::from("gone"), Duration::from_millis(1))
             .await
             .unwrap();
 
         thread::sleep(Duration::from_millis(200));
 
-        let page = s.list_keys_page("app/", None, 10).await.unwrap();
+        let page = kv_store.list_keys_page("app/", None, 10).await.unwrap();
         assert_eq!(page.keys, vec!["app/live".to_owned()]);
         assert_eq!(page.cursor, None);
     }
 
     #[tokio::test]
     async fn new_store_is_empty() {
-        let (s, _dir) = store();
-        assert!(!s.exists("anything").await.unwrap());
+        let (kv_store, _dir) = store();
+        assert!(!kv_store.exists("anything").await.unwrap());
     }
 
     #[tokio::test]
     async fn put_and_get_bytes() {
-        let (s, _dir) = store();
-        s.put_bytes("k", Bytes::from("hello")).await.unwrap();
-        assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
+        let (kv_store, _dir) = store();
+        kv_store.put_bytes("k", Bytes::from("hello")).await.unwrap();
+        assert_eq!(
+            kv_store.get_bytes("k").await.unwrap(),
+            Some(Bytes::from("hello"))
+        );
     }
 
     #[tokio::test]
     async fn put_overwrites_existing() {
-        let (s, _dir) = store();
-        s.put_bytes("k", Bytes::from("first")).await.unwrap();
-        s.put_bytes("k", Bytes::from("second")).await.unwrap();
-        assert_eq!(s.get_bytes("k").await.unwrap(), Some(Bytes::from("second")));
+        let (kv_store, _dir) = store();
+        kv_store.put_bytes("k", Bytes::from("first")).await.unwrap();
+        kv_store
+            .put_bytes("k", Bytes::from("second"))
+            .await
+            .unwrap();
+        assert_eq!(
+            kv_store.get_bytes("k").await.unwrap(),
+            Some(Bytes::from("second"))
+        );
     }
 
     #[tokio::test]
@@ -562,42 +588,47 @@ mod tests {
         // Use the store impl directly to bypass validation limits (min TTL 60s)
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
-        let s = PersistentKvStore::new(db_path).unwrap();
-        s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_millis(1))
+        let kv_store = PersistentKvStore::new(db_path).unwrap();
+        kv_store
+            .put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_millis(1))
             .await
             .unwrap();
         // 200ms gives the OS scheduler enough headroom on busy CI runners.
         thread::sleep(Duration::from_millis(200));
-        assert_eq!(s.get_bytes("temp").await.unwrap(), None);
+        assert_eq!(kv_store.get_bytes("temp").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn ttl_not_expired_returns_value() {
-        let (s, _dir) = store();
-        s.put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_secs(60))
+        let (kv_store, _dir) = store();
+        kv_store
+            .put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_secs(60))
             .await
             .unwrap();
-        assert_eq!(s.get_bytes("temp").await.unwrap(), Some(Bytes::from("val")));
+        assert_eq!(
+            kv_store.get_bytes("temp").await.unwrap(),
+            Some(Bytes::from("val"))
+        );
     }
 
     #[tokio::test]
     async fn typed_roundtrip() {
-        let (s, _dir) = store();
+        let (kv_store, _dir) = store();
         let cfg = Config {
             enabled: true,
             name: "test".into(),
         };
-        s.put("config", &cfg).await.unwrap();
-        let out: Option<Config> = s.get("config").await.unwrap();
+        kv_store.put("config", &cfg).await.unwrap();
+        let out: Option<Config> = kv_store.get("config").await.unwrap();
         assert_eq!(out, Some(cfg));
     }
 
     #[tokio::test]
     async fn update_helper() {
-        let (s, _dir) = store();
-        s.put("counter", &0_i32).await.unwrap();
-        let val = s
-            .read_modify_write("counter", 0_i32, |n| n + 5_i32)
+        let (kv_store, _dir) = store();
+        kv_store.put("counter", &0_i32).await.unwrap();
+        let val = kv_store
+            .read_modify_write("counter", 0_i32, |num| num + 5_i32)
             .await
             .unwrap();
         assert_eq!(val, 5_i32);

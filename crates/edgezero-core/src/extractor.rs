@@ -133,7 +133,7 @@ impl FromRequest for Host {
         let headers = ctx.request().headers();
         let host = headers
             .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("localhost")
             .to_owned();
         Ok(Host(host))
@@ -180,7 +180,7 @@ impl FromRequest for ForwardedHost {
         let host = headers
             .get("x-forwarded-host")
             .or_else(|| headers.get(header::HOST))
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("localhost")
             .to_owned();
         Ok(ForwardedHost(host))
@@ -535,7 +535,8 @@ mod tests {
     #[derive(Debug, Deserialize, PartialEq)]
     struct QueryParams {
         page: Option<u32>,
-        q: Option<String>,
+        #[serde(rename = "q")]
+        query_term: Option<String>,
     }
 
     #[derive(Debug, Deserialize, Validate)]
@@ -594,7 +595,7 @@ mod tests {
     fn params(values: &[(&str, &str)]) -> PathParams {
         let map = values
             .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect::<HashMap<_, _>>();
         PathParams::new(map)
     }
@@ -647,7 +648,10 @@ mod tests {
             .insert("x-test", HeaderValue::from_static("value"));
         let headers = block_on(Headers::from_request(&ctx)).expect("headers");
         assert_eq!(
-            headers.get("x-test").and_then(|v| v.to_str().ok()).unwrap(),
+            headers
+                .get("x-test")
+                .and_then(|value| value.to_str().ok())
+                .unwrap(),
             "value"
         );
     }
@@ -657,7 +661,7 @@ mod tests {
         let ctx = ctx_with_query("page=5&q=hello");
         let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
         assert_eq!(query.page, Some(5));
-        assert_eq!(query.q.as_deref(), Some("hello"));
+        assert_eq!(query.query_term.as_deref(), Some("hello"));
     }
 
     #[test]
@@ -665,7 +669,7 @@ mod tests {
         let ctx = ctx_with_query("page=1");
         let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
         assert_eq!(query.page, Some(1));
-        assert_eq!(query.q, None);
+        assert_eq!(query.query_term, None);
     }
 
     #[test]
@@ -678,7 +682,7 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
         assert_eq!(query.page, None);
-        assert_eq!(query.q, None);
+        assert_eq!(query.query_term, None);
     }
 
     #[test]
@@ -769,7 +773,7 @@ mod tests {
     fn query_deref_and_into_inner() {
         let query = Query(QueryParams {
             page: Some(1),
-            q: None,
+            query_term: None,
         });
         assert_eq!(query.page, Some(1)); // Deref
         let inner = query.into_inner();
@@ -780,7 +784,7 @@ mod tests {
     fn query_deref_mut() {
         let mut query = Query(QueryParams {
             page: Some(1),
-            q: None,
+            query_term: None,
         });
         query.page = Some(2); // DerefMut
         assert_eq!(query.page, Some(2));

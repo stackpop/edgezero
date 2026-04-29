@@ -77,7 +77,7 @@ impl ProjectLayout {
         let name = sanitize_crate_name(&args.name);
         let base_dir = match args.dir.as_deref() {
             Some(dir) => PathBuf::from(dir),
-            None => env::current_dir().map_err(|e| GeneratorError::io(".", e))?,
+            None => env::current_dir().map_err(|err| GeneratorError::io(".", err))?,
         };
         let out_dir = base_dir.join(&name);
         if out_dir.exists() {
@@ -90,7 +90,7 @@ impl ProjectLayout {
         let core_name = format!("{name}-core");
         let core_dir = crates_dir.join(&core_name);
         let core_src = core_dir.join("src");
-        fs::create_dir_all(&core_src).map_err(|e| GeneratorError::io(&core_src, e))?;
+        fs::create_dir_all(&core_src).map_err(|err| GeneratorError::io(&core_src, err))?;
 
         let project_mod = name.replace('-', "_");
         let core_mod = core_name.replace('-', "_");
@@ -122,7 +122,7 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
     let layout = ProjectLayout::new(args)?;
 
     let mut workspace_dependencies = seed_workspace_dependencies();
-    let cwd = env::current_dir().map_err(|e| GeneratorError::io(".", e))?;
+    let cwd = env::current_dir().map_err(|err| GeneratorError::io(".", err))?;
     let core_crate_line = resolve_core_dependency(&layout, &cwd, &mut workspace_dependencies);
 
     let adapter_artifacts = collect_adapter_data(&layout, &cwd, &mut workspace_dependencies)?;
@@ -227,10 +227,10 @@ fn collect_adapter_data(
     for blueprint in scaffold::registered_blueprints().iter().copied() {
         let crate_name = format!("{}-{}", layout.name, blueprint.crate_suffix);
         let adapter_dir = layout.crates_dir.join(&crate_name);
-        fs::create_dir_all(&adapter_dir).map_err(|e| GeneratorError::io(&adapter_dir, e))?;
+        fs::create_dir_all(&adapter_dir).map_err(|err| GeneratorError::io(&adapter_dir, err))?;
         for dir_name in blueprint.extra_dirs {
             let extra = adapter_dir.join(dir_name);
-            fs::create_dir_all(&extra).map_err(|e| GeneratorError::io(&extra, e))?;
+            fs::create_dir_all(&extra).map_err(|err| GeneratorError::io(&extra, err))?;
         }
 
         let crate_dir_rel = format!("crates/{crate_name}");
@@ -360,7 +360,7 @@ fn render_manifest_section(
             .manifest
             .build_features
             .iter()
-            .map(|f| format!("\"{f}\""))
+            .map(|feat| format!("\"{feat}\""))
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(out, "features = [{joined}]")?;

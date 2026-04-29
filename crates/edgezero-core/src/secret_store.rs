@@ -47,8 +47,8 @@ macro_rules! secret_store_contract_tests {
             use bytes::Bytes;
             use $crate::secret_store::SecretStore;
 
-            fn run<F: std::future::Future>(f: F) -> F::Output {
-                futures::executor::block_on(f)
+            fn run<Fut: std::future::Future>(future: Fut) -> Fut::Output {
+                futures::executor::block_on(future)
             }
 
             #[test]
@@ -170,7 +170,7 @@ impl InMemorySecretStore {
         Self {
             secrets: entries
                 .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
+                .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
         }
     }
@@ -259,8 +259,9 @@ impl SecretHandle {
     /// Returns [`SecretError::Internal`] if the secret bytes are not valid UTF-8, plus the same errors as [`SecretHandle::require_bytes`].
     pub async fn require_str(&self, store_name: &str, key: &str) -> Result<String, SecretError> {
         let bytes = self.require_bytes(store_name, key).await?;
-        String::from_utf8(bytes.into())
-            .map_err(|e| SecretError::Internal(anyhow::anyhow!("secret is not valid UTF-8: {e}")))
+        String::from_utf8(bytes.into()).map_err(|err| {
+            SecretError::Internal(anyhow::anyhow!("secret is not valid UTF-8: {err}"))
+        })
     }
 }
 
@@ -327,7 +328,7 @@ mod tests {
         let provider = InMemorySecretStore::new(
             entries
                 .iter()
-                .map(|(k, v)| ((*k).to_owned(), Bytes::from((*v).to_owned()))),
+                .map(|(key, value)| ((*key).to_owned(), Bytes::from((*value).to_owned()))),
         );
         SecretHandle::new(Arc::new(provider))
     }
@@ -343,82 +344,82 @@ mod tests {
 
     #[test]
     fn provider_handle_get_bytes_returns_none_for_missing() {
-        let h = provider_handle_with(&[]);
+        let handle = provider_handle_with(&[]);
         block_on(async {
-            let result = h.get_bytes("store", "missing").await.unwrap();
+            let result = handle.get_bytes("store", "missing").await.unwrap();
             assert!(result.is_none());
         });
     }
 
     #[test]
     fn provider_handle_get_bytes_returns_value() {
-        let h = provider_handle_with(&[("signing-keys/current", "abc123")]);
+        let handle = provider_handle_with(&[("signing-keys/current", "abc123")]);
         block_on(async {
-            let result = h.get_bytes("signing-keys", "current").await.unwrap();
+            let result = handle.get_bytes("signing-keys", "current").await.unwrap();
             assert_eq!(result, Some(Bytes::from("abc123")));
         });
     }
 
     #[test]
     fn provider_handle_require_bytes_errors_for_missing() {
-        let h = provider_handle_with(&[]);
+        let handle = provider_handle_with(&[]);
         block_on(async {
-            let err = h.require_bytes("store", "missing").await.unwrap_err();
+            let err = handle.require_bytes("store", "missing").await.unwrap_err();
             assert!(matches!(err, SecretError::NotFound { .. }));
         });
     }
 
     #[test]
     fn provider_handle_require_str_returns_value() {
-        let h = provider_handle_with(&[("api-keys/prod", "secret_val")]);
+        let handle = provider_handle_with(&[("api-keys/prod", "secret_val")]);
         block_on(async {
-            let val = h.require_str("api-keys", "prod").await.unwrap();
+            let val = handle.require_str("api-keys", "prod").await.unwrap();
             assert_eq!(val, "secret_val");
         });
     }
 
     #[test]
     fn provider_handle_validates_control_chars_in_key() {
-        let h = provider_handle_with(&[]);
+        let handle = provider_handle_with(&[]);
         block_on(async {
-            let err = h.get_bytes("store", "bad\x00key").await.unwrap_err();
+            let err = handle.get_bytes("store", "bad\x00key").await.unwrap_err();
             assert!(matches!(err, SecretError::Validation(_)));
         });
     }
 
     #[test]
     fn provider_handle_validates_control_chars_in_store_name() {
-        let h = provider_handle_with(&[]);
+        let handle = provider_handle_with(&[]);
         block_on(async {
-            let err = h.get_bytes("bad\x00store", "key").await.unwrap_err();
+            let err = handle.get_bytes("bad\x00store", "key").await.unwrap_err();
             assert!(matches!(err, SecretError::Validation(_)));
         });
     }
 
     #[test]
     fn provider_handle_validates_empty_key() {
-        let h = provider_handle_with(&[]);
+        let handle = provider_handle_with(&[]);
         block_on(async {
-            let err = h.get_bytes("store", "").await.unwrap_err();
+            let err = handle.get_bytes("store", "").await.unwrap_err();
             assert!(matches!(err, SecretError::Validation(_)));
         });
     }
 
     #[test]
     fn provider_handle_validates_empty_store_name() {
-        let h = provider_handle_with(&[]);
+        let handle = provider_handle_with(&[]);
         block_on(async {
-            let err = h.get_bytes("", "key").await.unwrap_err();
+            let err = handle.get_bytes("", "key").await.unwrap_err();
             assert!(matches!(err, SecretError::Validation(_)));
         });
     }
 
     #[test]
     fn provider_handle_validates_oversized_name() {
-        let h = provider_handle_with(&[]);
+        let handle = provider_handle_with(&[]);
         block_on(async {
             let name = "x".repeat(MAX_NAME_LEN + 1);
-            let err = h.get_bytes(&name, "key").await.unwrap_err();
+            let err = handle.get_bytes(&name, "key").await.unwrap_err();
             assert!(matches!(err, SecretError::Validation(_)));
         });
     }

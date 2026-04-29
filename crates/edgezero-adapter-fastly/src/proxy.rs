@@ -99,7 +99,7 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
     let is_https = scheme.eq_ignore_ascii_case("https");
 
     let target_port = match (uri.port_u16(), is_https) {
-        (Some(p), _) => p,
+        (Some(port), _) => port,
         (None, true) => 443,
         (None, false) => 80,
     };
@@ -129,8 +129,8 @@ fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
             log::debug!("created dynamic backend: {backend_name} -> {host_with_port}");
             Ok(backend_name)
         }
-        Err(e) => {
-            let msg = e.to_string();
+        Err(err) => {
+            let msg = err.to_string();
             if msg.contains("NameInUse") || msg.contains("already in use") {
                 log::debug!("reusing existing dynamic backend: {backend_name}");
                 Ok(backend_name)

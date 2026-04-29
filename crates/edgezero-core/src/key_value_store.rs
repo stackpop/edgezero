@@ -85,8 +85,8 @@ macro_rules! key_value_store_contract_tests {
             use bytes::Bytes;
             use $crate::key_value_store::KvStore;
 
-            fn run<F: std::future::Future>(f: F) -> F::Output {
-                ::futures::executor::block_on(f)
+            fn run<Fut: std::future::Future>(future: Fut) -> Fut::Output {
+                ::futures::executor::block_on(future)
             }
 
             #[test]
@@ -549,14 +549,19 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if any of the read, mutate, or write steps fail.
-    pub async fn read_modify_write<T, F>(&self, key: &str, default: T, f: F) -> Result<T, KvError>
+    pub async fn read_modify_write<T, Mutator>(
+        &self,
+        key: &str,
+        default: T,
+        mutator: Mutator,
+    ) -> Result<T, KvError>
     where
         T: DeserializeOwned + Serialize,
-        F: FnOnce(T) -> T,
+        Mutator: FnOnce(T) -> T,
     {
         // Validation happens in get_or and put
         let current = self.get_or(key, default).await?;
-        let updated = f(current);
+        let updated = mutator(current);
         self.put(key, &updated).await?;
         Ok(updated)
     }
@@ -648,11 +653,13 @@ impl From<KvError> for EdgeError {
         match err {
             KvError::NotFound { key } => EdgeError::not_found(format!("kv key: {key}")),
             KvError::Unavailable => EdgeError::service_unavailable("kv store unavailable"),
-            KvError::Validation(e) => EdgeError::bad_request(format!("kv validation error: {e}")),
-            KvError::Serialization(e) => {
-                EdgeError::internal(anyhow::anyhow!("kv serialization error: {e}"))
+            KvError::Validation(msg) => {
+                EdgeError::bad_request(format!("kv validation error: {msg}"))
             }
-            KvError::Internal(e) => EdgeError::internal(e),
+            KvError::Serialization(msg) => {
+                EdgeError::internal(anyhow::anyhow!("kv serialization error: {msg}"))
+            }
+            KvError::Internal(source) => EdgeError::internal(source),
         }
     }
 }
@@ -835,7 +842,7 @@ mod tests {
                     return Ok(None);
                 }
             }
-            Ok(data.get(key).map(|(v, _)| v.clone()))
+            Ok(data.get(key).map(|(value, _)| value.clone()))
         }
 
         async fn list_keys_page(
@@ -901,27 +908,27 @@ mod tests {
 
     #[test]
     fn delete_missing_key_is_ok() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.delete("nope").await.unwrap();
+            kv.delete("nope").await.unwrap();
         });
     }
 
     #[test]
     fn delete_removes_key() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put_bytes("k", Bytes::from("v")).await.unwrap();
-            h.delete("k").await.unwrap();
-            assert_eq!(h.get_bytes("k").await.unwrap(), None);
+            kv.put_bytes("k", Bytes::from("v")).await.unwrap();
+            kv.delete("k").await.unwrap();
+            assert_eq!(kv.get_bytes("k").await.unwrap(), None);
         });
     }
 
     #[test]
     fn empty_key_rejected() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h.put("", &"empty key").await.unwrap_err();
+            let err = kv.put("", &"empty key").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("cannot be empty"));
         });
@@ -929,38 +936,38 @@ mod tests {
 
     #[test]
     fn exists_returns_false_after_delete() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put_bytes("ephemeral", Bytes::from("v")).await.unwrap();
-            assert!(h.exists("ephemeral").await.unwrap());
-            h.delete("ephemeral").await.unwrap();
-            assert!(!h.exists("ephemeral").await.unwrap());
+            kv.put_bytes("ephemeral", Bytes::from("v")).await.unwrap();
+            assert!(kv.exists("ephemeral").await.unwrap());
+            kv.delete("ephemeral").await.unwrap();
+            assert!(!kv.exists("ephemeral").await.unwrap());
         });
     }
 
     #[test]
     fn exists_returns_false_for_missing() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            assert!(!h.exists("nope").await.unwrap());
+            assert!(!kv.exists("nope").await.unwrap());
         });
     }
 
     #[test]
     fn exists_returns_true_for_present() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put_bytes("k", Bytes::from("v")).await.unwrap();
-            assert!(h.exists("k").await.unwrap());
+            kv.put_bytes("k", Bytes::from("v")).await.unwrap();
+            assert!(kv.exists("k").await.unwrap());
         });
     }
 
     #[test]
     fn get_or_with_complex_default() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
             let default = Counter { count: 100_i32 };
-            let val: Counter = h.get_or("missing_struct", default).await.unwrap();
+            let val: Counter = kv.get_or("missing_struct", default).await.unwrap();
             assert_eq!(val.count, 100_i32);
         });
     }
@@ -1010,37 +1017,37 @@ mod tests {
 
     #[test]
     fn kv_handle_debug_output() {
-        let h = handle();
-        let debug = format!("{h:?}");
+        let kv = handle();
+        let debug = format!("{kv:?}");
         assert!(debug.contains("KvHandle"));
     }
 
     #[test]
     fn large_value_roundtrip() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
             let large = "x".repeat(1_000_000); // 1MB string
-            h.put("big", &large).await.unwrap();
-            let val: Option<String> = h.get("big").await.unwrap();
+            kv.put("big", &large).await.unwrap();
+            let val: Option<String> = kv.get("big").await.unwrap();
             assert_eq!(val.as_deref(), Some(large.as_str()));
         });
     }
 
     #[test]
     fn list_keys_page_roundtrip() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put("app/a", &1_i32).await.unwrap();
-            h.put("app/b", &2_i32).await.unwrap();
-            h.put("app/c", &3_i32).await.unwrap();
-            h.put("other/d", &4_i32).await.unwrap();
+            kv.put("app/a", &1_i32).await.unwrap();
+            kv.put("app/b", &2_i32).await.unwrap();
+            kv.put("app/c", &3_i32).await.unwrap();
+            kv.put("other/d", &4_i32).await.unwrap();
 
-            let first = h.list_keys_page("app/", None, 2).await.unwrap();
+            let first = kv.list_keys_page("app/", None, 2).await.unwrap();
             assert_eq!(first.keys, vec!["app/a".to_owned(), "app/b".to_owned()]);
             assert!(first.cursor.is_some());
             assert_ne!(first.cursor.as_deref(), Some("app/b"));
 
-            let second = h
+            let second = kv
                 .list_keys_page("app/", first.cursor.as_deref(), 2)
                 .await
                 .unwrap();
@@ -1051,116 +1058,116 @@ mod tests {
 
     #[test]
     fn put_overwrite_changes_type() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put("flex", &42_i32).await.unwrap();
-            let int_val: i32 = h.get_or("flex", 0_i32).await.unwrap();
+            kv.put("flex", &42_i32).await.unwrap();
+            let int_val: i32 = kv.get_or("flex", 0_i32).await.unwrap();
             assert_eq!(int_val, 42_i32);
 
             // Overwrite with a different type
-            h.put("flex", &"now a string").await.unwrap();
-            let str_val: String = h.get_or("flex", String::new()).await.unwrap();
+            kv.put("flex", &"now a string").await.unwrap();
+            let str_val: String = kv.get_or("flex", String::new()).await.unwrap();
             assert_eq!(str_val, "now a string");
         });
     }
 
     #[test]
     fn put_with_ttl_stores_value() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put_with_ttl("session", &"token123", Duration::from_secs(60))
+            kv.put_with_ttl("session", &"token123", Duration::from_secs(60))
                 .await
                 .unwrap();
-            let val: Option<String> = h.get("session").await.unwrap();
+            let val: Option<String> = kv.get("session").await.unwrap();
             assert_eq!(val, Some("token123".to_owned()));
         });
     }
 
     #[test]
     fn put_with_ttl_typed_helper() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
             let data = Counter { count: 7_i32 };
-            h.put_with_ttl("ttl_key", &data, Duration::from_secs(600))
+            kv.put_with_ttl("ttl_key", &data, Duration::from_secs(600))
                 .await
                 .unwrap();
-            let val: Option<Counter> = h.get("ttl_key").await.unwrap();
+            let val: Option<Counter> = kv.get("ttl_key").await.unwrap();
             assert_eq!(val, Some(Counter { count: 7_i32 }));
         });
     }
 
     #[test]
     fn raw_bytes_missing_key_returns_none() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            assert_eq!(h.get_bytes("missing").await.unwrap(), None);
+            assert_eq!(kv.get_bytes("missing").await.unwrap(), None);
         });
     }
 
     #[test]
     fn raw_bytes_overwrite() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put_bytes("k", Bytes::from("a")).await.unwrap();
-            h.put_bytes("k", Bytes::from("b")).await.unwrap();
-            assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("b")));
+            kv.put_bytes("k", Bytes::from("a")).await.unwrap();
+            kv.put_bytes("k", Bytes::from("b")).await.unwrap();
+            assert_eq!(kv.get_bytes("k").await.unwrap(), Some(Bytes::from("b")));
         });
     }
 
     #[test]
     fn raw_bytes_roundtrip() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put_bytes("k", Bytes::from("hello")).await.unwrap();
-            assert_eq!(h.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
+            kv.put_bytes("k", Bytes::from("hello")).await.unwrap();
+            assert_eq!(kv.get_bytes("k").await.unwrap(), Some(Bytes::from("hello")));
         });
     }
 
     #[test]
     fn typed_get_bad_json_returns_serialization_error() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put_bytes("bad", Bytes::from("not json")).await.unwrap();
-            let err = h.get::<Counter>("bad").await.unwrap_err();
+            kv.put_bytes("bad", Bytes::from("not json")).await.unwrap();
+            let err = kv.get::<Counter>("bad").await.unwrap_err();
             assert!(matches!(err, KvError::Serialization(_)));
         });
     }
 
     #[test]
     fn typed_get_missing_returns_none() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let out: Option<Counter> = h.get("nope").await.unwrap();
+            let out: Option<Counter> = kv.get("nope").await.unwrap();
             assert_eq!(out, None);
         });
     }
 
     #[test]
     fn typed_get_or_returns_default() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let count: i32 = h.get_or("visits", 0_i32).await.unwrap();
+            let count: i32 = kv.get_or("visits", 0_i32).await.unwrap();
             assert_eq!(count, 0_i32);
         });
     }
 
     #[test]
     fn typed_get_or_returns_existing() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put("visits", &99_i32).await.unwrap();
-            let count: i32 = h.get_or("visits", 0_i32).await.unwrap();
+            kv.put("visits", &99_i32).await.unwrap();
+            let count: i32 = kv.get_or("visits", 0_i32).await.unwrap();
             assert_eq!(count, 99_i32);
         });
     }
 
     #[test]
     fn typed_get_put_roundtrip() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
             let data = Counter { count: 42 };
-            h.put("counter", &data).await.unwrap();
-            let out: Option<Counter> = h.get("counter").await.unwrap();
+            kv.put("counter", &data).await.unwrap();
+            let out: Option<Counter> = kv.get("counter").await.unwrap();
             assert_eq!(out, Some(data));
         });
     }
@@ -1170,26 +1177,26 @@ mod tests {
         // "日本語キー" — the literal is written as Unicode escapes so the source
         // file stays ASCII-only. The runtime bytes are identical.
         const JAPANESE_KEY: &str = "\u{65E5}\u{672C}\u{8A9E}\u{30AD}\u{30FC}";
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put(JAPANESE_KEY, &"value").await.unwrap();
-            let val: Option<String> = h.get(JAPANESE_KEY).await.unwrap();
+            kv.put(JAPANESE_KEY, &"value").await.unwrap();
+            let val: Option<String> = kv.get(JAPANESE_KEY).await.unwrap();
             assert_eq!(val, Some("value".to_owned()));
         });
     }
 
     #[test]
     fn update_increments_counter() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put("c", &0_i32).await.unwrap();
-            let after_first = h
-                .read_modify_write("c", 0_i32, |n| n + 1_i32)
+            kv.put("c", &0_i32).await.unwrap();
+            let after_first = kv
+                .read_modify_write("c", 0_i32, |num| num + 1_i32)
                 .await
                 .unwrap();
             assert_eq!(after_first, 1_i32);
-            let after_second = h
-                .read_modify_write("c", 0_i32, |n| n + 1_i32)
+            let after_second = kv
+                .read_modify_write("c", 0_i32, |num| num + 1_i32)
                 .await
                 .unwrap();
             assert_eq!(after_second, 2_i32);
@@ -1198,10 +1205,10 @@ mod tests {
 
     #[test]
     fn update_uses_default_when_missing() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let val = h
-                .read_modify_write("new", 10_i32, |n| n * 2_i32)
+            let val = kv
+                .read_modify_write("new", 10_i32, |num| num * 2_i32)
                 .await
                 .unwrap();
             assert_eq!(val, 20_i32);
@@ -1210,21 +1217,21 @@ mod tests {
 
     #[test]
     fn update_with_struct() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let after_first = h
-                .read_modify_write("counter_struct", Counter { count: 0_i32 }, |mut c| {
-                    c.count += 10_i32;
-                    c
+            let after_first = kv
+                .read_modify_write("counter_struct", Counter { count: 0_i32 }, |mut counter| {
+                    counter.count += 10_i32;
+                    counter
                 })
                 .await
                 .unwrap();
             assert_eq!(after_first.count, 10_i32);
 
-            let after_second = h
-                .read_modify_write("counter_struct", Counter { count: 0_i32 }, |mut c| {
-                    c.count += 5_i32;
-                    c
+            let after_second = kv
+                .read_modify_write("counter_struct", Counter { count: 0_i32 }, |mut counter| {
+                    counter.count += 5_i32;
+                    counter
                 })
                 .await
                 .unwrap();
@@ -1234,9 +1241,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_control_chars() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h.get::<i32>("key\nwith\nnewline").await.unwrap_err();
+            let err = kv.get::<i32>("key\nwith\nnewline").await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("control characters"));
         });
@@ -1244,9 +1251,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_control_chars_in_prefix() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h.list_keys_page("bad\nprefix", None, 1).await.unwrap_err();
+            let err = kv.list_keys_page("bad\nprefix", None, 1).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("control characters"));
         });
@@ -1254,13 +1261,13 @@ mod tests {
 
     #[test]
     fn validation_rejects_cursor_for_different_prefix() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            h.put("app/a", &1_i32).await.unwrap();
-            h.put("app/b", &2_i32).await.unwrap();
+            kv.put("app/a", &1_i32).await.unwrap();
+            kv.put("app/b", &2_i32).await.unwrap();
 
-            let page = h.list_keys_page("app/", None, 1).await.unwrap();
-            let err = h
+            let page = kv.list_keys_page("app/", None, 1).await.unwrap();
+            let err = kv
                 .list_keys_page("other/", page.cursor.as_deref(), 1)
                 .await
                 .unwrap_err();
@@ -1271,13 +1278,13 @@ mod tests {
 
     #[test]
     fn validation_rejects_dot_keys() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let single_dot_err = h.get::<i32>(".").await.unwrap_err();
+            let single_dot_err = kv.get::<i32>(".").await.unwrap_err();
             assert!(matches!(single_dot_err, KvError::Validation(_)));
             assert!(format!("{single_dot_err}").contains("cannot be exactly"));
 
-            let double_dot_err = h.get::<i32>("..").await.unwrap_err();
+            let double_dot_err = kv.get::<i32>("..").await.unwrap_err();
             assert!(matches!(double_dot_err, KvError::Validation(_)));
             assert!(format!("{double_dot_err}").contains("cannot be exactly"));
         });
@@ -1285,9 +1292,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_large_list_limit() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h
+            let err = kv
                 .list_keys_page("", None, KvHandle::MAX_LIST_PAGE_SIZE + 1)
                 .await
                 .unwrap_err();
@@ -1298,10 +1305,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_large_values() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
             let large_val = vec![0_u8; KvHandle::MAX_VALUE_SIZE + 1];
-            let err = h
+            let err = kv
                 .put_bytes("large", Bytes::from(large_val))
                 .await
                 .unwrap_err();
@@ -1312,10 +1319,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_long_keys() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
             let long_key = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
-            let err = h.get::<i32>(&long_key).await.unwrap_err();
+            let err = kv.get::<i32>(&long_key).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("key length"));
         });
@@ -1323,10 +1330,10 @@ mod tests {
 
     #[test]
     fn validation_rejects_long_prefix() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
             let prefix = "a".repeat(KvHandle::MAX_KEY_SIZE + 1);
-            let err = h.list_keys_page(&prefix, None, 1).await.unwrap_err();
+            let err = kv.list_keys_page(&prefix, None, 1).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("prefix length"));
         });
@@ -1334,9 +1341,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_long_ttl() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h
+            let err = kv
                 .put_with_ttl("long", &"val", KvHandle::MAX_TTL + Duration::from_secs(1))
                 .await
                 .unwrap_err();
@@ -1347,9 +1354,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_malformed_list_cursor() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h
+            let err = kv
                 .list_keys_page("app/", Some("not-json"), 1)
                 .await
                 .unwrap_err();
@@ -1360,9 +1367,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_short_ttl() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h
+            let err = kv
                 .put_with_ttl("short", &"val", Duration::from_secs(10))
                 .await
                 .unwrap_err();
@@ -1373,9 +1380,9 @@ mod tests {
 
     #[test]
     fn validation_rejects_zero_list_limit() {
-        let h = handle();
+        let kv = handle();
         block_on(async {
-            let err = h.list_keys_page("", None, 0).await.unwrap_err();
+            let err = kv.list_keys_page("", None, 0).await.unwrap_err();
             assert!(matches!(err, KvError::Validation(_)));
             assert!(format!("{err}").contains("greater than zero"));
         });

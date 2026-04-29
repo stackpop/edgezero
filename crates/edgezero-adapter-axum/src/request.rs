@@ -24,7 +24,7 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
         Some(value) if is_json_content_type(value) => {
             let bytes = to_bytes(axum_body, usize::MAX)
                 .await
-                .map_err(|e| format!("Failed to convert body into bytes: {e}"))?;
+                .map_err(|err| format!("Failed to convert body into bytes: {err}"))?;
             Body::from_bytes(bytes)
         }
         _ => {

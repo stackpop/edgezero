@@ -87,7 +87,7 @@ macro_rules! config_store_contract_tests {
                     Ok(None) => {}
                     Ok(Some(_)) => panic!("empty key should not return a value"),
                     Err($crate::config_store::ConfigStoreError::InvalidKey { .. }) => {}
-                    Err(e) => panic!("unexpected error for empty key: {}", e),
+                    Err(err) => panic!("unexpected error for empty key: {}", err),
                 }
             }
 
@@ -257,7 +257,7 @@ mod tests {
             Self {
                 data: entries
                     .iter()
-                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
                     .collect(),
             }
         }
@@ -269,23 +269,26 @@ mod tests {
 
     #[test]
     fn config_store_get_returns_none_for_missing_key() {
-        let h = handle(&[]);
-        assert_eq!(h.get("nonexistent").expect("missing config"), None);
+        let store_handle = handle(&[]);
+        assert_eq!(
+            store_handle.get("nonexistent").expect("missing config"),
+            None
+        );
     }
 
     #[test]
     fn config_store_get_returns_value_for_existing_key() {
-        let h = handle(&[("feature.checkout", "true")]);
+        let store_handle = handle(&[("feature.checkout", "true")]);
         assert_eq!(
-            h.get("feature.checkout").expect("config value"),
+            store_handle.get("feature.checkout").expect("config value"),
             Some("true".to_owned())
         );
     }
 
     #[test]
     fn config_store_handle_debug_output() {
-        let h = handle(&[]);
-        let debug = format!("{h:?}");
+        let store_handle = handle(&[]);
+        let debug = format!("{store_handle:?}");
         assert!(debug.contains("ConfigStoreHandle"));
     }
 
@@ -302,8 +305,11 @@ mod tests {
     #[test]
     fn config_store_handle_new_accepts_arc() {
         let store = Arc::new(TestConfigStore::new(&[("a", "1")]));
-        let h = ConfigStoreHandle::new(store);
-        assert_eq!(h.get("a").expect("arc-backed config"), Some("1".to_owned()));
+        let store_handle = ConfigStoreHandle::new(store);
+        assert_eq!(
+            store_handle.get("a").expect("arc-backed config"),
+            Some("1".to_owned())
+        );
     }
 
     #[test]
@@ -317,11 +323,11 @@ mod tests {
 
     #[test]
     fn config_store_handle_wraps_and_delegates() {
-        let h = handle(&[("timeout_ms", "1500")]);
+        let store_handle = handle(&[("timeout_ms", "1500")]);
         assert_eq!(
-            h.get("timeout_ms").expect("config value"),
+            store_handle.get("timeout_ms").expect("config value"),
             Some("1500".to_owned())
         );
-        assert_eq!(h.get("missing").expect("missing config"), None);
+        assert_eq!(store_handle.get("missing").expect("missing config"), None);
     }
 }

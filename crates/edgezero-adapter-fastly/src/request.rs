@@ -322,13 +322,13 @@ fn resolve_kv_handle(
 ) -> Result<Option<KvHandle>, FastlyError> {
     match FastlyKvStore::open(kv_store_name) {
         Ok(store) => Ok(Some(KvHandle::new(Arc::new(store)))),
-        Err(e) => {
+        Err(err) => {
             if kv_required {
                 return Err(FastlyError::msg(format!(
-                    "KV store '{kv_store_name}' is explicitly configured but could not be opened: {e}"
+                    "KV store '{kv_store_name}' is explicitly configured but could not be opened: {err}"
                 )));
             }
-            warn_missing_kv_store_once(kv_store_name, &e);
+            warn_missing_kv_store_once(kv_store_name, &err);
             Ok(None)
         }
     }

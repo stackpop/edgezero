@@ -94,34 +94,35 @@ mod tests {
 
     fn store(env: &[(&str, &str)], defaults: &[(&str, &str)]) -> AxumConfigStore {
         AxumConfigStore::new(
-            env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            env.iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
             defaults
                 .iter()
-                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
         )
     }
 
     #[test]
     fn axum_config_store_env_overrides_defaults() {
-        let s = store(&[("KEY", "from_env")], &[("KEY", "from_default")]);
+        let cs = store(&[("KEY", "from_env")], &[("KEY", "from_default")]);
         assert_eq!(
-            s.get("KEY").expect("config value"),
+            cs.get("KEY").expect("config value"),
             Some("from_env".to_owned())
         );
     }
 
     #[test]
     fn axum_config_store_falls_back_to_defaults() {
-        let s = store(&[], &[("KEY", "default_val")]);
+        let cs = store(&[], &[("KEY", "default_val")]);
         assert_eq!(
-            s.get("KEY").expect("default config"),
+            cs.get("KEY").expect("default config"),
             Some("default_val".to_owned())
         );
     }
 
     #[test]
     fn axum_config_store_from_env_reads_only_declared_keys() {
-        let s = AxumConfigStore::from_lookup(
+        let cs = AxumConfigStore::from_lookup(
             [
                 ("feature.new_checkout".to_owned(), "false".to_owned()),
                 ("service.timeout_ms".to_owned(), "1500".to_owned()),
@@ -134,15 +135,16 @@ mod tests {
         );
 
         assert_eq!(
-            s.get("feature.new_checkout").expect("allowed env override"),
+            cs.get("feature.new_checkout")
+                .expect("allowed env override"),
             Some("true".to_owned())
         );
         assert_eq!(
-            s.get("service.timeout_ms").expect("default fallback"),
+            cs.get("service.timeout_ms").expect("default fallback"),
             Some("1500".to_owned())
         );
         assert_eq!(
-            s.get("DATABASE_URL")
+            cs.get("DATABASE_URL")
                 .expect("undeclared key should stay hidden"),
             None
         );
@@ -150,15 +152,15 @@ mod tests {
 
     #[test]
     fn axum_config_store_returns_none_for_missing() {
-        let s = store(&[], &[]);
-        assert_eq!(s.get("NOPE").expect("missing config"), None);
+        let cs = store(&[], &[]);
+        assert_eq!(cs.get("NOPE").expect("missing config"), None);
     }
 
     #[test]
     fn axum_config_store_returns_values() {
-        let s = store(&[("MY_KEY", "my_val")], &[]);
+        let cs = store(&[("MY_KEY", "my_val")], &[]);
         assert_eq!(
-            s.get("MY_KEY").expect("config value"),
+            cs.get("MY_KEY").expect("config value"),
             Some("my_val".to_owned())
         );
     }

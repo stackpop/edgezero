@@ -44,8 +44,8 @@ fn main() {
     let args = Args::parse();
     match args.cmd {
         Command::New(new_args) => {
-            if let Err(e) = generator::generate_new(&new_args) {
-                log::error!("[edgezero] new error: {e}");
+            if let Err(err) = generator::generate_new(&new_args) {
+                log::error!("[edgezero] new error: {err}");
                 process::exit(1);
             }
         }
@@ -103,12 +103,12 @@ fn main() {
 
 #[cfg(feature = "cli")]
 fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Option<String> {
-    let m = manifest.manifest();
-    if !m.secret_store_enabled(adapter_name) {
+    let manifest_data = manifest.manifest();
+    if !manifest_data.secret_store_enabled(adapter_name) {
         return None;
     }
 
-    let binding_name = m.secret_store_name(adapter_name);
+    let binding_name = manifest_data.secret_store_name(adapter_name);
     let message = match adapter_name {
         "axum" => format!(
             "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs (configured store name: '{binding_name}')"
@@ -135,8 +135,8 @@ fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
 fn handle_build(adapter_name: &str, adapter_args: &[String]) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
-    if let Some(m) = &manifest {
-        log_store_bindings(adapter_name, m);
+    if let Some(loader) = &manifest {
+        log_store_bindings(adapter_name, loader);
     }
     adapter::execute(
         adapter_name,
