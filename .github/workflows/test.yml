@@ -132,9 +132,12 @@ jobs:
 
       - name: Setup Viceroy
         if: matrix.adapter == 'fastly'
+        env:
+          VICEROY_VERSION: 0.16.5
         run: |
-          if ! command -v viceroy &>/dev/null; then
-            cargo install viceroy --locked
+          if ! command -v viceroy &>/dev/null \
+              || ! viceroy --version 2>/dev/null | grep -qF "$VICEROY_VERSION"; then
+            cargo install viceroy --version "$VICEROY_VERSION" --locked
           fi
 
       - name: Setup Wasmtime
@@ -144,7 +147,7 @@ jobs:
         run: |
           if ! command -v wasmtime &>/dev/null \
               || ! wasmtime --version 2>/dev/null | grep -qF "${WASMTIME_VERSION#v}"; then
-            curl https://wasmtime.dev/install.sh -sSf | bash -s -- "$WASMTIME_VERSION"
+            curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version "$WASMTIME_VERSION"
             echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
           fi
 
