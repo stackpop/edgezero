@@ -79,9 +79,9 @@ impl Middleware for RequestLogger {
         match next.run(ctx).await {
             Ok(response) => {
                 let status = response.status();
-                let elapsed = start.elapsed().as_secs_f64() * 1_000.0_f64;
+                let elapsed = start.elapsed().as_millis();
                 tracing::info!(
-                    "request method={} path={} status={} elapsed_ms={:.2}",
+                    "request method={} path={} status={} elapsed_ms={}",
                     method,
                     path,
                     status.as_u16(),
@@ -92,9 +92,9 @@ impl Middleware for RequestLogger {
             Err(err) => {
                 let status = err.status();
                 let message = err.message();
-                let elapsed = start.elapsed().as_secs_f64() * 1_000.0_f64;
+                let elapsed = start.elapsed().as_millis();
                 tracing::error!(
-                    "request method={} path={} status={} error={} elapsed_ms={:.2}",
+                    "request method={} path={} status={} error={} elapsed_ms={}",
                     method,
                     path,
                     status.as_u16(),
