@@ -38,6 +38,7 @@ pub struct AxumDevServerConfig {
 }
 
 impl Default for AxumDevServerConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             addr: SocketAddr::from(([127, 0, 0, 1], 8787)),
@@ -69,6 +70,7 @@ pub struct AxumDevServer {
 
 impl AxumDevServer {
     #[must_use]
+    #[inline]
     pub fn new(router: RouterService) -> Self {
         Self {
             config: AxumDevServerConfig::default(),
@@ -79,6 +81,7 @@ impl AxumDevServer {
 
     /// # Errors
     /// Returns an error if the dev server fails to bind, the Tokio runtime fails to start, or the underlying request loop returns an error.
+    #[inline]
     pub fn run(self) -> anyhow::Result<()> {
         let runtime = RuntimeBuilder::new_multi_thread()
             .enable_all()
@@ -119,6 +122,7 @@ impl AxumDevServer {
     }
 
     #[must_use]
+    #[inline]
     pub fn with_config(router: RouterService, config: AxumDevServerConfig) -> Self {
         Self {
             config,
@@ -128,6 +132,7 @@ impl AxumDevServer {
     }
 
     #[must_use]
+    #[inline]
     pub fn with_config_store(mut self, handle: ConfigStoreHandle) -> Self {
         self.stores.config_store = Some(handle);
         self
@@ -138,6 +143,7 @@ impl AxumDevServer {
     /// The handle is shared across all requests, making the `Kv` extractor
     /// available in handlers.
     #[must_use]
+    #[inline]
     pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
         self.stores.kv = Some(handle);
         self
@@ -148,6 +154,7 @@ impl AxumDevServer {
     /// The handle is shared across all requests, making the `Secrets` extractor
     /// available in handlers.
     #[must_use]
+    #[inline]
     pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
         self.stores.secrets = Some(handle);
         self
@@ -273,6 +280,7 @@ async fn serve_with_stores(
 
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
+#[inline]
 pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
     let manifest = ManifestLoader::try_load_from_str(manifest_src)?;
     let manifest_data = manifest.manifest();

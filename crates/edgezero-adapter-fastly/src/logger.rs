@@ -20,6 +20,7 @@ pub enum InitLoggerError {
 /// Returns [`InitLoggerError::Build`] if the underlying logger builder
 /// rejects its inputs (e.g. an empty endpoint), or
 /// [`InitLoggerError::SetLogger`] if a global logger is already installed.
+#[inline]
 pub fn init_logger(
     endpoint: &str,
     level: LevelFilter,

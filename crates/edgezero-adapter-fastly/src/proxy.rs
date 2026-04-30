@@ -22,6 +22,7 @@ pub struct FastlyProxyClient;
 
 #[async_trait(?Send)]
 impl ProxyClient for FastlyProxyClient {
+    #[inline]
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _ext) = request.into_parts();
         let backend_name = ensure_backend(&uri)?;

@@ -145,6 +145,7 @@ impl Adapter for CloudflareCliAdapter {
 
 /// # Errors
 /// Returns an error if the Cloudflare wrangler build command fails.
+#[inline]
 pub fn build() -> Result<PathBuf, String> {
     let manifest =
         find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
@@ -185,6 +186,7 @@ pub fn build() -> Result<PathBuf, String> {
 
 /// # Errors
 /// Returns an error if the Cloudflare wrangler deploy command fails.
+#[inline]
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
@@ -280,6 +282,7 @@ fn locate_artifact(
     ))
 }
 
+#[inline]
 pub fn register() {
     register_adapter(&CLOUDFLARE_ADAPTER);
     register_adapter_blueprint(&CLOUDFLARE_BLUEPRINT);
@@ -292,6 +295,7 @@ fn register_ctor() {
 
 /// # Errors
 /// Returns an error if the Cloudflare wrangler dev command fails.
+#[inline]
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;

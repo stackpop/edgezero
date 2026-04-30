@@ -129,6 +129,7 @@ pub enum SecretError {
 }
 
 impl From<SecretError> for EdgeError {
+    #[inline]
     fn from(err: SecretError) -> Self {
         match err {
             SecretError::NotFound { .. } => {
@@ -161,6 +162,7 @@ pub struct InMemorySecretStore {
 #[cfg(any(test, feature = "test-utils"))]
 impl InMemorySecretStore {
     /// Build with entries of the form `("{store_name}/{key}", value)`.
+    #[inline]
     pub fn new<I, K, V>(entries: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
@@ -179,6 +181,7 @@ impl InMemorySecretStore {
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait(?Send)]
 impl SecretStore for InMemorySecretStore {
+    #[inline]
     async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         let compound = format!("{store_name}/{key}");
         Ok(self.secrets.get(&compound).cloned())
@@ -198,6 +201,7 @@ pub struct NoopSecretStore;
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait(?Send)]
 impl SecretStore for NoopSecretStore {
+    #[inline]
     async fn get_bytes(&self, _store_name: &str, _key: &str) -> Result<Option<Bytes>, SecretError> {
         Ok(None)
     }
@@ -216,6 +220,7 @@ pub struct SecretHandle {
 }
 
 impl fmt::Debug for SecretHandle {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretHandle").finish_non_exhaustive()
     }
@@ -226,6 +231,7 @@ impl SecretHandle {
     ///
     /// # Errors
     /// Returns [`SecretError::Validation`] for invalid `store_name`/`key`, [`SecretError::Unavailable`] if the backend is offline, or [`SecretError::Internal`] on backend failure.
+    #[inline]
     pub async fn get_bytes(
         &self,
         store_name: &str,
@@ -237,6 +243,7 @@ impl SecretHandle {
     }
 
     /// Create a new handle wrapping a multi-store provider.
+    #[inline]
     pub fn new(provider: Arc<dyn SecretStore>) -> Self {
         Self { provider }
     }
@@ -245,6 +252,7 @@ impl SecretHandle {
     ///
     /// # Errors
     /// Returns [`SecretError::NotFound`] if the secret is absent, plus the same errors as [`SecretHandle::get_bytes`].
+    #[inline]
     pub async fn require_bytes(&self, store_name: &str, key: &str) -> Result<Bytes, SecretError> {
         self.get_bytes(store_name, key)
             .await?
@@ -257,6 +265,7 @@ impl SecretHandle {
     ///
     /// # Errors
     /// Returns [`SecretError::Internal`] if the secret bytes are not valid UTF-8, plus the same errors as [`SecretHandle::require_bytes`].
+    #[inline]
     pub async fn require_str(&self, store_name: &str, key: &str) -> Result<String, SecretError> {
         let bytes = self.require_bytes(store_name, key).await?;
         String::from_utf8(bytes.into()).map_err(|err| {

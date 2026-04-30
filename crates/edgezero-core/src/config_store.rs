@@ -150,6 +150,7 @@ pub enum ConfigStoreError {
 
 impl ConfigStoreError {
     /// Wrap an unexpected backend or provider failure.
+    #[inline]
     pub fn internal<E>(error: E) -> Self
     where
         E: Into<AnyError>,
@@ -160,6 +161,7 @@ impl ConfigStoreError {
     }
 
     /// Create an error for malformed or backend-invalid keys.
+    #[inline]
     pub fn invalid_key<S: Into<String>>(message: S) -> Self {
         Self::InvalidKey {
             message: message.into(),
@@ -167,6 +169,7 @@ impl ConfigStoreError {
     }
 
     /// Create an error for temporarily unavailable backends.
+    #[inline]
     pub fn unavailable<S: Into<String>>(message: S) -> Self {
         Self::Unavailable {
             message: message.into(),
@@ -199,6 +202,7 @@ pub struct ConfigStoreHandle {
 }
 
 impl fmt::Debug for ConfigStoreHandle {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConfigStoreHandle").finish_non_exhaustive()
     }
@@ -209,11 +213,13 @@ impl ConfigStoreHandle {
     ///
     /// # Errors
     /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
+    #[inline]
     pub fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         self.store.get(key)
     }
 
     /// Create a new handle wrapping a config store implementation.
+    #[inline]
     pub fn new(store: Arc<dyn ConfigStore>) -> Self {
         Self { store }
     }

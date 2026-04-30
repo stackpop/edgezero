@@ -134,6 +134,7 @@ impl Adapter for FastlyCliAdapter {
 
 /// # Errors
 /// Returns an error if the Fastly CLI build command fails.
+#[inline]
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest =
         find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
@@ -175,6 +176,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 
 /// # Errors
 /// Returns an error if the Fastly CLI deploy command fails.
+#[inline]
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
@@ -269,6 +271,7 @@ fn locate_artifact(
     ))
 }
 
+#[inline]
 pub fn register() {
     register_adapter(&FASTLY_ADAPTER);
     register_adapter_blueprint(&FASTLY_BLUEPRINT);
@@ -281,6 +284,7 @@ fn register_ctor() {
 
 /// # Errors
 /// Returns an error if the Fastly CLI serve command (Viceroy) fails.
+#[inline]
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;

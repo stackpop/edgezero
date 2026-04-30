@@ -9,10 +9,12 @@ pub struct AxumRequestContext {
 }
 
 impl AxumRequestContext {
+    #[inline]
     pub fn get(request: &Request) -> Option<&AxumRequestContext> {
         request.extensions().get::<AxumRequestContext>()
     }
 
+    #[inline]
     pub fn insert(request: &mut Request, context: AxumRequestContext) {
         request.extensions_mut().insert(context);
     }

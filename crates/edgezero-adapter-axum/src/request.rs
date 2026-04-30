@@ -17,6 +17,7 @@ use crate::proxy::AxumProxyClient;
 ///
 /// # Errors
 /// Returns an error if a buffered (`application/json`) body cannot be read into memory.
+#[inline]
 pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest, String> {
     let (parts, axum_body) = request.into_parts();
 

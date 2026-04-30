@@ -11,6 +11,7 @@ pub struct PathParams {
 impl PathParams {
     /// # Errors
     /// Returns [`serde_json::Error`] if the path parameters cannot be deserialized into `T`.
+    #[inline]
     pub fn deserialize<T>(&self) -> Result<T, serde_json::Error>
     where
         T: DeserializeOwned,
@@ -19,11 +20,13 @@ impl PathParams {
         serde_json::from_value(value)
     }
 
+    #[inline]
     pub fn get(&self, key: &str) -> Option<&str> {
         self.inner.get(key).map(String::as_str)
     }
 
     #[must_use]
+    #[inline]
     pub fn new(inner: HashMap<String, String>) -> Self {
         Self { inner }
     }

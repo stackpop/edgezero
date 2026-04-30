@@ -19,35 +19,41 @@ pub struct App {
 impl App {
     /// Default name used when none is provided.
     #[must_use]
+    #[inline]
     pub fn default_name() -> &'static str {
         DEFAULT_APP_NAME
     }
 
     /// Consume the app and return the contained router service.
     #[must_use]
+    #[inline]
     pub fn into_router(self) -> RouterService {
         self.router
     }
 
     /// Name assigned to the application.
     #[must_use]
+    #[inline]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Create a new application wrapper from the supplied router service.
     #[must_use]
+    #[inline]
     pub fn new(router: RouterService) -> Self {
         Self::with_name(router, DEFAULT_APP_NAME)
     }
 
     /// Access the underlying router service.
     #[must_use]
+    #[inline]
     pub fn router(&self) -> &RouterService {
         &self.router
     }
 
     /// Update the application name.
+    #[inline]
     pub fn set_name<S>(&mut self, name: S)
     where
         S: Into<String>,
@@ -56,6 +62,7 @@ impl App {
     }
 
     /// Construct a new application with the provided router and name.
+    #[inline]
     pub fn with_name<S>(router: RouterService, name: S) -> Self
     where
         S: Into<String>,
@@ -76,16 +83,19 @@ pub struct ConfigStoreAdapterMetadata {
 
 impl ConfigStoreAdapterMetadata {
     #[must_use]
+    #[inline]
     pub fn adapter(&self) -> &'static str {
         self.adapter
     }
 
     #[must_use]
+    #[inline]
     pub fn name(&self) -> &'static str {
         self.name
     }
 
     #[must_use]
+    #[inline]
     pub const fn new(adapter: &'static str, name: &'static str) -> Self {
         Self { adapter, name }
     }
@@ -100,16 +110,19 @@ pub struct ConfigStoreMetadata {
 
 impl ConfigStoreMetadata {
     #[must_use]
+    #[inline]
     pub fn adapters(&self) -> &'static [ConfigStoreAdapterMetadata] {
         self.adapters
     }
 
     #[must_use]
+    #[inline]
     pub fn default_name(&self) -> &'static str {
         self.default_name
     }
 
     #[must_use]
+    #[inline]
     pub fn name_for_adapter(&self, adapter: &str) -> &'static str {
         self.adapters
             .iter()
@@ -118,6 +131,7 @@ impl ConfigStoreMetadata {
     }
 
     #[must_use]
+    #[inline]
     pub const fn new(
         default_name: &'static str,
         adapters: &'static [ConfigStoreAdapterMetadata],
@@ -133,6 +147,7 @@ impl ConfigStoreMetadata {
 pub trait Hooks {
     /// Construct an `App` by wiring the routes and invoking the configuration hook.
     #[must_use]
+    #[inline]
     fn build_app() -> App
     where
         Self: Sized,
@@ -146,16 +161,19 @@ pub trait Hooks {
     ///
     /// Macro-generated apps derive this from `[stores.config]` in `edgezero.toml`.
     #[must_use]
+    #[inline]
     fn config_store() -> Option<&'static ConfigStoreMetadata> {
         None
     }
 
     /// Allow implementations to mutate the freshly constructed application before use.
     /// The default implementation performs no changes.
+    #[inline]
     fn configure(_app: &mut App) {}
 
     /// Display name for the application. Defaults to `"EdgeZero App"`.
     #[must_use]
+    #[inline]
     fn name() -> &'static str {
         App::default_name()
     }

@@ -12,6 +12,7 @@ impl<T> Responder for T
 where
     T: IntoResponse,
 {
+    #[inline]
     fn respond(self) -> Result<Response, EdgeError> {
         self.into_response()
     }
@@ -21,6 +22,7 @@ impl<T> Responder for Result<T, EdgeError>
 where
     T: IntoResponse,
 {
+    #[inline]
     fn respond(self) -> Result<Response, EdgeError> {
         self.and_then(IntoResponse::into_response)
     }

@@ -77,6 +77,7 @@ struct Stores {
 )]
 /// # Errors
 /// Returns an error if request conversion fails or the underlying handler returns an error.
+#[inline]
 pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
     dispatch_raw(app, req)
 }
@@ -114,6 +115,7 @@ pub(crate) fn dispatch_raw(app: &App, req: FastlyRequest) -> Result<FastlyRespon
 ///
 /// # Errors
 /// Returns an error if the named config store cannot be opened or the underlying handler returns an error.
+#[inline]
 pub fn dispatch_with_config(
     app: &App,
     req: FastlyRequest,
@@ -148,6 +150,7 @@ pub fn dispatch_with_config(
 ///
 /// # Errors
 /// Returns an error if request conversion fails or the underlying handler returns an error.
+#[inline]
 pub fn dispatch_with_config_handle(
     app: &App,
     req: FastlyRequest,
@@ -182,6 +185,7 @@ fn dispatch_with_handles(
 ///
 /// # Errors
 /// Returns an error if the named KV store cannot be opened or the underlying handler returns an error.
+#[inline]
 pub fn dispatch_with_kv(
     app: &App,
     req: FastlyRequest,
@@ -207,6 +211,7 @@ pub fn dispatch_with_kv(
 ///
 /// # Errors
 /// Returns an error if a required store cannot be opened or the underlying handler returns an error.
+#[inline]
 pub fn dispatch_with_kv_and_secrets(
     app: &App,
     req: FastlyRequest,
@@ -235,6 +240,7 @@ pub fn dispatch_with_kv_and_secrets(
 ///
 /// # Errors
 /// Returns an error if the named secret store is required but cannot be opened, or the underlying handler returns an error.
+#[inline]
 pub fn dispatch_with_secrets(
     app: &App,
     req: FastlyRequest,
@@ -284,6 +290,7 @@ pub(crate) fn dispatch_with_store_names(
 
 /// # Errors
 /// Returns [`EdgeError::Internal`] if the Fastly request cannot be reconstituted into a core request (e.g., method or URI conversion failure).
+#[inline]
 pub fn into_core_request(mut req: FastlyRequest) -> Result<Request, EdgeError> {
     let method = req.get_method().clone();
     let uri = parse_uri(req.get_url_str())?;

@@ -27,6 +27,7 @@ pub struct EdgeZeroAxumService {
 
 impl EdgeZeroAxumService {
     #[must_use]
+    #[inline]
     pub fn new(router: RouterService) -> Self {
         Self {
             config_store_handle: None,
@@ -41,6 +42,7 @@ impl EdgeZeroAxumService {
     /// The handle is cloned into every request's extensions, making
     /// `ctx.config_store()` available in handlers.
     #[must_use]
+    #[inline]
     pub fn with_config_store_handle(mut self, handle: ConfigStoreHandle) -> Self {
         self.config_store_handle = Some(handle);
         self
@@ -51,6 +53,7 @@ impl EdgeZeroAxumService {
     /// The handle is cloned into every request's extensions, making
     /// the `Kv` extractor available in handlers.
     #[must_use]
+    #[inline]
     pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
         self.kv_handle = Some(handle);
         self
@@ -61,6 +64,7 @@ impl EdgeZeroAxumService {
     /// The handle is cloned into every request's extensions, making
     /// the `Secrets` extractor available in handlers.
     #[must_use]
+    #[inline]
     pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
         self.secret_handle = Some(handle);
         self
@@ -72,6 +76,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
     type Response = Response<AxumBody>;
 
+    #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
         let config_store_handle = self.config_store_handle.clone();
@@ -116,6 +121,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
         })
     }
 
+    #[inline]
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }

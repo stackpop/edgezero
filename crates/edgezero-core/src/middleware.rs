@@ -22,6 +22,7 @@ impl<F> FnMiddleware<F>
 where
     F: Send + Sync + 'static,
 {
+    #[inline]
     pub fn new(func: F) -> Self {
         Self { func }
     }
@@ -33,6 +34,7 @@ where
     F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Response, EdgeError>>,
 {
+    #[inline]
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         (self.func)(ctx, next).await
     }
@@ -49,6 +51,7 @@ pub struct Next<'mw> {
 }
 
 impl<'mw> Next<'mw> {
+    #[inline]
     pub fn new(middlewares: &'mw [BoxMiddleware], handler: &'mw dyn DynHandler) -> Self {
         Self {
             handler,
@@ -58,6 +61,7 @@ impl<'mw> Next<'mw> {
 
     /// # Errors
     /// Returns whatever error the next middleware or the final handler produces.
+    #[inline]
     pub async fn run(self, ctx: RequestContext) -> Result<Response, EdgeError> {
         if let Some((head, tail)) = self.middlewares.split_first() {
             head.handle(ctx, Next::new(tail, self.handler)).await
@@ -71,6 +75,7 @@ pub struct RequestLogger;
 
 #[async_trait(?Send)]
 impl Middleware for RequestLogger {
+    #[inline]
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let method = ctx.request().method().clone();
         let path = ctx.request().uri().path().to_owned();
@@ -107,6 +112,7 @@ impl Middleware for RequestLogger {
     }
 }
 
+#[inline]
 pub fn middleware_fn<F, Fut>(func: F) -> FnMiddleware<F>
 where
     F: Fn(RequestContext, Next<'_>) -> Fut + Send + Sync + 'static,

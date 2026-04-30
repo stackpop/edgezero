@@ -25,6 +25,7 @@ pub struct ProxyHandle {
 
 impl ProxyHandle {
     #[must_use]
+    #[inline]
     pub fn client(&self) -> Arc<dyn ProxyClient> {
         Arc::clone(&self.client)
     }
@@ -32,15 +33,18 @@ impl ProxyHandle {
     /// # Errors
     /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails or the
     /// response cannot be assembled.
+    #[inline]
     pub async fn forward(&self, request: ProxyRequest) -> Result<Response, EdgeError> {
         let response = self.client.send(request).await?;
         response.into_response()
     }
 
+    #[inline]
     pub fn new(client: Arc<dyn ProxyClient>) -> Self {
         Self { client }
     }
 
+    #[inline]
     pub fn with_client<C>(client: C) -> Self
     where
         C: ProxyClient + 'static,
@@ -61,6 +65,7 @@ pub struct ProxyRequest {
 }
 
 impl fmt::Debug for ProxyRequest {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyRequest")
             .field("method", &self.method)
@@ -71,22 +76,27 @@ impl fmt::Debug for ProxyRequest {
 }
 
 impl ProxyRequest {
+    #[inline]
     pub fn body(&self) -> &Body {
         &self.body
     }
 
+    #[inline]
     pub fn body_mut(&mut self) -> &mut Body {
         &mut self.body
     }
 
+    #[inline]
     pub fn extensions(&self) -> &Extensions {
         &self.extensions
     }
 
+    #[inline]
     pub fn extensions_mut(&mut self) -> &mut Extensions {
         &mut self.extensions
     }
 
+    #[inline]
     pub fn from_request(request: Request, uri: Uri) -> Self {
         let (parts, body) = request.into_parts();
         Self {
@@ -98,14 +108,17 @@ impl ProxyRequest {
         }
     }
 
+    #[inline]
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
+    #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }
 
+    #[inline]
     pub fn into_parts(self) -> (Method, Uri, HeaderMap, Body, Extensions) {
         (
             self.method,
@@ -116,10 +129,12 @@ impl ProxyRequest {
         )
     }
 
+    #[inline]
     pub fn method(&self) -> &Method {
         &self.method
     }
 
+    #[inline]
     pub fn new(method: Method, uri: Uri) -> Self {
         Self {
             body: Body::empty(),
@@ -130,6 +145,7 @@ impl ProxyRequest {
         }
     }
 
+    #[inline]
     pub fn uri(&self) -> &Uri {
         &self.uri
     }
@@ -143,6 +159,7 @@ pub struct ProxyResponse {
 }
 
 impl fmt::Debug for ProxyResponse {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProxyResponse")
             .field("status", &self.status)
@@ -151,26 +168,32 @@ impl fmt::Debug for ProxyResponse {
 }
 
 impl ProxyResponse {
+    #[inline]
     pub fn body(&self) -> &Body {
         &self.body
     }
 
+    #[inline]
     pub fn body_mut(&mut self) -> &mut Body {
         &mut self.body
     }
 
+    #[inline]
     pub fn extensions(&self) -> &Extensions {
         &self.extensions
     }
 
+    #[inline]
     pub fn extensions_mut(&mut self) -> &mut Extensions {
         &mut self.extensions
     }
 
+    #[inline]
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
     }
 
+    #[inline]
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
     }
@@ -180,6 +203,7 @@ impl ProxyResponse {
     /// rejects a header — should be unreachable since we only store names/values
     /// that were already validated, but propagation lets a faulty upstream stream
     /// fail the request instead of crashing the worker.
+    #[inline]
     pub fn into_response(self) -> Result<Response, EdgeError> {
         let mut builder = response_builder().status(self.status);
         for (name, value) in &self.headers {
@@ -188,6 +212,7 @@ impl ProxyResponse {
         builder.body(self.body).map_err(EdgeError::internal)
     }
 
+    #[inline]
     pub fn new(status: StatusCode, body: Body) -> Self {
         Self {
             body,
@@ -197,6 +222,7 @@ impl ProxyResponse {
         }
     }
 
+    #[inline]
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -207,6 +233,7 @@ pub struct ProxyService<C> {
 }
 
 impl<C> ProxyService<C> {
+    #[inline]
     pub fn new(client: C) -> Self {
         Self { client }
     }
@@ -219,6 +246,7 @@ where
     /// # Errors
     /// Returns [`EdgeError`] if the underlying [`ProxyClient`] fails or the
     /// response cannot be assembled.
+    #[inline]
     pub async fn forward(&self, request: ProxyRequest) -> Result<Response, EdgeError> {
         let response = self.client.send(request).await?;
         response.into_response()

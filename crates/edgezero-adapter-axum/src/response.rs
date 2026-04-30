@@ -14,6 +14,7 @@ use edgezero_core::http::Response as CoreResponse;
 /// incremental flushing, it keeps the adapter compatible with the non-`Send` streaming type used by
 /// `edgezero_core::Body` and works well for local development.
 ///
+#[inline]
 pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
     let (parts, core_body) = response.into_parts();
     let body = match core_body {

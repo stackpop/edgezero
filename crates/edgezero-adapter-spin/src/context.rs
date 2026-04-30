@@ -20,11 +20,13 @@ pub struct SpinRequestContext {
 
 impl SpinRequestContext {
     /// Retrieve a previously-inserted context from request extensions.
+    #[inline]
     pub fn get(request: &Request) -> Option<&SpinRequestContext> {
         request.extensions().get::<SpinRequestContext>()
     }
 
     /// Store this context in the request's extensions.
+    #[inline]
     pub fn insert(request: &mut Request, context: SpinRequestContext) {
         request.extensions_mut().insert(context);
     }

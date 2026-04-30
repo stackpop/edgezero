@@ -149,6 +149,7 @@ impl PersistentKvStore {
     ///
     /// # Errors
     /// Returns an error if the database file cannot be opened or initialised (corrupted file, locked by another process, or insufficient permissions).
+    #[inline]
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, KvError> {
         let db_path = path.as_ref().display().to_string();
         let db = Database::create(path).map_err(|err| {
@@ -186,6 +187,7 @@ impl PersistentKvStore {
 
 #[async_trait(?Send)]
 impl KvStore for PersistentKvStore {
+    #[inline]
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         let write_txn = self.begin_write()?;
         let mut table = Self::open_table(&write_txn)?;
@@ -196,10 +198,12 @@ impl KvStore for PersistentKvStore {
         Self::commit(write_txn)
     }
 
+    #[inline]
     async fn exists(&self, key: &str) -> Result<bool, KvError> {
         Ok(self.get_bytes(key).await?.is_some())
     }
 
+    #[inline]
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         let read_txn = self
             .db
@@ -255,6 +259,7 @@ impl KvStore for PersistentKvStore {
         }
     }
 
+    #[inline]
     async fn list_keys_page(
         &self,
         prefix: &str,
@@ -353,6 +358,7 @@ impl KvStore for PersistentKvStore {
         })
     }
 
+    #[inline]
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         let write_txn = self.begin_write()?;
         let mut table = Self::open_table(&write_txn)?;
@@ -363,6 +369,7 @@ impl KvStore for PersistentKvStore {
         Self::commit(write_txn)
     }
 
+    #[inline]
     async fn put_bytes_with_ttl(
         &self,
         key: &str,

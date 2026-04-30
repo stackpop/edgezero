@@ -33,6 +33,7 @@ impl FastlyKvStore {
     ///
     /// # Errors
     /// Returns [`KvError::Internal`] if the named KV store cannot be opened.
+    #[inline]
     pub fn open(name: &str) -> Result<Self, KvError> {
         let store = KVStore::open(name)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open kv store: {err}")))?
@@ -44,16 +45,19 @@ impl FastlyKvStore {
 #[cfg(feature = "fastly")]
 #[async_trait(?Send)]
 impl KvStore for FastlyKvStore {
+    #[inline]
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         self.store
             .delete(key)
             .map_err(|err| KvError::Internal(anyhow::anyhow!("delete failed: {err}")))
     }
 
+    #[inline]
     async fn exists(&self, key: &str) -> Result<bool, KvError> {
         Ok(self.get_bytes(key).await?.is_some())
     }
 
+    #[inline]
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         match self.store.lookup(key) {
             Ok(mut response) => {
@@ -65,6 +69,7 @@ impl KvStore for FastlyKvStore {
         }
     }
 
+    #[inline]
     async fn list_keys_page(
         &self,
         prefix: &str,
@@ -94,12 +99,14 @@ impl KvStore for FastlyKvStore {
         })
     }
 
+    #[inline]
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         self.store
             .insert(key, value.as_ref())
             .map_err(|err| KvError::Internal(anyhow::anyhow!("insert failed: {err}")))
     }
 
+    #[inline]
     async fn put_bytes_with_ttl(
         &self,
         key: &str,

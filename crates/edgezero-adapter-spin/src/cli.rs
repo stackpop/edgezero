@@ -128,6 +128,7 @@ impl Adapter for SpinCliAdapter {
 
 /// # Errors
 /// Returns an error if the Spin CLI build command fails.
+#[inline]
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest =
         find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
@@ -169,6 +170,7 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 
 /// # Errors
 /// Returns an error if the Spin CLI deploy command fails.
+#[inline]
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
@@ -262,6 +264,7 @@ fn locate_artifact(
     ))
 }
 
+#[inline]
 pub fn register() {
     register_adapter(&SPIN_ADAPTER);
     register_adapter_blueprint(&SPIN_BLUEPRINT);
@@ -274,6 +277,7 @@ fn register_ctor() {
 
 /// # Errors
 /// Returns an error if the Spin CLI up command fails.
+#[inline]
 pub fn serve(extra_args: &[String]) -> Result<(), String> {
     let manifest =
         find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;

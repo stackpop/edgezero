@@ -44,10 +44,12 @@ pub struct RouteInfo {
 
 impl RouteInfo {
     #[must_use]
+    #[inline]
     pub fn method(&self) -> &Method {
         &self.method
     }
 
+    #[inline]
     pub fn new<S: Into<String>>(method: Method, path: S) -> Self {
         Self {
             method,
@@ -56,6 +58,7 @@ impl RouteInfo {
     }
 
     #[must_use]
+    #[inline]
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -114,6 +117,7 @@ impl RouterBuilder {
         reason = "duplicate route is a build-time programmer error, not a runtime condition"
     )]
     #[must_use]
+    #[inline]
     pub fn build(mut self) -> RouterService {
         let listing_path = self.route_listing_path.clone();
 
@@ -157,6 +161,7 @@ impl RouterBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn delete<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -165,6 +170,7 @@ impl RouterBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn enable_route_listing(self) -> Self {
         self.enable_route_listing_at(DEFAULT_ROUTE_LISTING_PATH)
     }
@@ -172,6 +178,7 @@ impl RouterBuilder {
     /// # Panics
     /// Panics if `path` is empty or does not begin with `/`.
     #[must_use]
+    #[inline]
     pub fn enable_route_listing_at<S>(mut self, path: S) -> Self
     where
         S: Into<String>,
@@ -190,6 +197,7 @@ impl RouterBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn get<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -198,6 +206,7 @@ impl RouterBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn middleware<M>(mut self, middleware: M) -> Self
     where
         M: Middleware,
@@ -207,17 +216,20 @@ impl RouterBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn middleware_arc(mut self, middleware: BoxMiddleware) -> Self {
         self.middlewares.push(middleware);
         self
     }
 
     #[must_use]
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
     #[must_use]
+    #[inline]
     pub fn post<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -226,6 +238,7 @@ impl RouterBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn put<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
@@ -234,6 +247,7 @@ impl RouterBuilder {
     }
 
     #[must_use]
+    #[inline]
     pub fn route<H>(mut self, path: &str, method: Method, handler: H) -> Self
     where
         H: IntoHandler,
@@ -307,11 +321,13 @@ impl Service<Request> for RouterService {
     type Future = HandlerFuture;
     type Response = Response;
 
+    #[inline]
     fn call(&mut self, req: Request) -> Self::Future {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move { inner.dispatch(req).await })
     }
 
+    #[inline]
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
@@ -319,6 +335,7 @@ impl Service<Request> for RouterService {
 
 impl RouterService {
     #[must_use]
+    #[inline]
     pub fn builder() -> RouterBuilder {
         RouterBuilder::new()
     }
@@ -340,6 +357,7 @@ impl RouterService {
     /// # Errors
     /// Returns [`EdgeError`] if the dispatched handler errors AND the error
     /// itself fails to render as a response.
+    #[inline]
     pub async fn oneshot(&self, request: Request) -> Result<Response, EdgeError> {
         let mut service = self.clone();
         match service.call(request).await {
@@ -349,6 +367,7 @@ impl RouterService {
     }
 
     #[must_use]
+    #[inline]
     pub fn routes(&self) -> Vec<RouteInfo> {
         self.inner.route_index.to_vec()
     }

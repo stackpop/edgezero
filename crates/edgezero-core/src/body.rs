@@ -20,6 +20,7 @@ impl Body {
     /// Returns the in-memory bytes for a buffered body, or `None` if this is
     /// a streaming body. To consume a streaming body into bytes, use
     /// [`Body::into_bytes_bounded`].
+    #[inline]
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Body::Once(bytes) => Some(bytes.as_ref()),
@@ -28,10 +29,12 @@ impl Body {
     }
 
     #[must_use]
+    #[inline]
     pub fn empty() -> Self {
         Self::from_bytes(Bytes::new())
     }
 
+    #[inline]
     pub fn from_bytes<B>(bytes: B) -> Self
     where
         B: Into<Bytes>,
@@ -39,6 +42,7 @@ impl Body {
         Self::Once(bytes.into())
     }
 
+    #[inline]
     pub fn from_stream<S, E>(stream: S) -> Self
     where
         S: Stream<Item = Result<Bytes, E>> + 'static,
@@ -54,6 +58,7 @@ impl Body {
     /// Consume a buffered body and return its bytes, or `None` if this is a
     /// streaming body. To collect a streaming body, use
     /// [`Body::into_bytes_bounded`].
+    #[inline]
     pub fn into_bytes(self) -> Option<Bytes> {
         match self {
             Body::Once(bytes) => Some(bytes),
@@ -67,6 +72,7 @@ impl Body {
     ///
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the body exceeds `max_size` bytes; or [`EdgeError::internal`] if the upstream stream errors.
+    #[inline]
     pub async fn into_bytes_bounded(self, max_size: usize) -> Result<Bytes, EdgeError> {
         match self {
             Body::Once(bytes) => {
@@ -89,6 +95,7 @@ impl Body {
         }
     }
 
+    #[inline]
     pub fn into_stream(self) -> Option<LocalBoxStream<'static, Result<Bytes, anyhow::Error>>> {
         match self {
             Body::Once(_) => None,
@@ -96,12 +103,14 @@ impl Body {
         }
     }
 
+    #[inline]
     pub fn is_stream(&self) -> bool {
         matches!(self, Body::Stream(_))
     }
 
     /// # Errors
     /// Returns the underlying [`serde_json::Error`] if `value` cannot be serialized.
+    #[inline]
     pub fn json<T>(value: &T) -> Result<Self, serde_json::Error>
     where
         T: Serialize,
@@ -109,6 +118,7 @@ impl Body {
         serde_json::to_vec(value).map(Self::from_bytes)
     }
 
+    #[inline]
     pub fn stream<S>(stream: S) -> Self
     where
         S: Stream<Item = Bytes> + 'static,
@@ -116,6 +126,7 @@ impl Body {
         Self::Stream(stream.map(Ok::<Bytes, anyhow::Error>).boxed_local())
     }
 
+    #[inline]
     pub fn text<S>(text: S) -> Self
     where
         S: Into<String>,
@@ -125,6 +136,7 @@ impl Body {
 
     /// # Errors
     /// Returns [`serde_json::Error`] if the body is streaming or its bytes are not valid JSON for `T`.
+    #[inline]
     pub fn to_json<T>(&self) -> Result<T, serde_json::Error>
     where
         T: DeserializeOwned,
@@ -139,12 +151,14 @@ impl Body {
 }
 
 impl Default for Body {
+    #[inline]
     fn default() -> Self {
         Self::empty()
     }
 }
 
 impl fmt::Debug for Body {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Body::Once(bytes) => f
@@ -157,24 +171,28 @@ impl fmt::Debug for Body {
 }
 
 impl From<Vec<u8>> for Body {
+    #[inline]
     fn from(value: Vec<u8>) -> Self {
         Body::from_bytes(value)
     }
 }
 
 impl From<&[u8]> for Body {
+    #[inline]
     fn from(value: &[u8]) -> Self {
         Body::from_bytes(Bytes::copy_from_slice(value))
     }
 }
 
 impl From<&str> for Body {
+    #[inline]
     fn from(value: &str) -> Self {
         Body::text(value)
     }
 }
 
 impl From<String> for Body {
+    #[inline]
     fn from(value: String) -> Self {
         Body::text(value)
     }

@@ -23,6 +23,7 @@ impl<T> FromRequest for Json<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.json().map(Json)
     }
@@ -31,18 +32,21 @@ where
 impl<T> Deref for Json<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Json<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Json<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -55,6 +59,7 @@ impl<T> FromRequest for ValidatedJson<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Json(value) = Json::<T>::from_request(ctx).await?;
         value
@@ -67,18 +72,21 @@ where
 impl<T> Deref for ValidatedJson<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedJson<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedJson<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -88,6 +96,7 @@ pub struct Headers(pub HeaderMap);
 
 #[async_trait(?Send)]
 impl FromRequest for Headers {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         Ok(Headers(ctx.request().headers().clone()))
     }
@@ -96,12 +105,14 @@ impl FromRequest for Headers {
 impl Deref for Headers {
     type Target = HeaderMap;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl DerefMut for Headers {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -109,6 +120,7 @@ impl DerefMut for Headers {
 
 impl Headers {
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> HeaderMap {
         self.0
     }
@@ -129,6 +141,7 @@ pub struct Host(pub String);
 
 #[async_trait(?Send)]
 impl FromRequest for Host {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let headers = ctx.request().headers();
         let host = headers
@@ -143,6 +156,7 @@ impl FromRequest for Host {
 impl Deref for Host {
     type Target = String;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -150,6 +164,7 @@ impl Deref for Host {
 
 impl Host {
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -175,6 +190,7 @@ pub struct ForwardedHost(pub String);
 
 #[async_trait(?Send)]
 impl FromRequest for ForwardedHost {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let headers = ctx.request().headers();
         let host = headers
@@ -190,6 +206,7 @@ impl FromRequest for ForwardedHost {
 impl Deref for ForwardedHost {
     type Target = String;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -197,6 +214,7 @@ impl Deref for ForwardedHost {
 
 impl ForwardedHost {
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -209,6 +227,7 @@ impl<T> FromRequest for Query<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.query().map(Query)
     }
@@ -217,18 +236,21 @@ where
 impl<T> Deref for Query<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Query<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Query<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -241,6 +263,7 @@ impl<T> FromRequest for ValidatedQuery<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Query(value) = Query::<T>::from_request(ctx).await?;
         value
@@ -253,18 +276,21 @@ where
 impl<T> Deref for ValidatedQuery<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedQuery<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedQuery<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -277,6 +303,7 @@ impl<T> FromRequest for Path<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.path().map(Path)
     }
@@ -285,18 +312,21 @@ where
 impl<T> Deref for Path<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Path<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Path<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -309,6 +339,7 @@ impl<T> FromRequest for ValidatedPath<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Path(value) = Path::<T>::from_request(ctx).await?;
         value
@@ -321,18 +352,21 @@ where
 impl<T> Deref for ValidatedPath<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedPath<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedPath<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -345,6 +379,7 @@ impl<T> FromRequest for Form<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.form().map(Form)
     }
@@ -353,18 +388,21 @@ where
 impl<T> Deref for Form<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Form<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Form<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -377,6 +415,7 @@ impl<T> FromRequest for ValidatedForm<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Form(value) = Form::<T>::from_request(ctx).await?;
         value
@@ -389,18 +428,21 @@ where
 impl<T> Deref for ValidatedForm<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedForm<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedForm<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -424,6 +466,7 @@ pub struct Kv(pub KvHandle);
 
 #[async_trait(?Send)]
 impl FromRequest for Kv {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.kv_handle().map(Kv).ok_or_else(|| {
             EdgeError::internal(anyhow::anyhow!(
@@ -436,12 +479,14 @@ impl FromRequest for Kv {
 impl Deref for Kv {
     type Target = KvHandle;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl DerefMut for Kv {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -449,6 +494,7 @@ impl DerefMut for Kv {
 
 impl Kv {
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> KvHandle {
         self.0
     }
@@ -471,6 +517,7 @@ pub struct Secrets(pub SecretHandle);
 
 #[async_trait(?Send)]
 impl FromRequest for Secrets {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         // ctx.secret_handle() returns a handle object, not secret bytes.
         // The error message below contains only store configuration info — no secret values
@@ -486,12 +533,14 @@ impl FromRequest for Secrets {
 impl Deref for Secrets {
     type Target = SecretHandle;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl DerefMut for Secrets {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
@@ -499,6 +548,7 @@ impl DerefMut for Secrets {
 
 impl Secrets {
     #[must_use]
+    #[inline]
     pub fn into_inner(self) -> SecretHandle {
         self.0
     }

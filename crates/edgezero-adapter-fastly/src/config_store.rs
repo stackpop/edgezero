@@ -32,6 +32,7 @@ impl FastlyConfigStore {
     ///
     /// # Errors
     /// Returns the underlying [`fastly::config_store::OpenError`] when the named store does not exist or cannot be opened.
+    #[inline]
     pub fn try_open(name: &str) -> Result<Self, OpenError> {
         FastlyConfigStoreInner::try_open(name).map(|inner| Self {
             inner: FastlyConfigStoreBackend::Fastly(inner),
@@ -40,6 +41,7 @@ impl FastlyConfigStore {
 }
 
 impl ConfigStore for FastlyConfigStore {
+    #[inline]
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
             FastlyConfigStoreBackend::Fastly(inner) => {

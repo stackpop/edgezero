@@ -21,12 +21,14 @@ pub struct EnvSecretStore;
 
 impl EnvSecretStore {
     #[must_use]
+    #[inline]
     pub fn new() -> Self {
         Self
     }
 }
 
 impl Default for EnvSecretStore {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -34,6 +36,7 @@ impl Default for EnvSecretStore {
 
 #[async_trait(?Send)]
 impl SecretStore for EnvSecretStore {
+    #[inline]
     async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         #[cfg(unix)]
         {

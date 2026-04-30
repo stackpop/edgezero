@@ -15,10 +15,12 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
+    #[inline]
     pub fn body(&self) -> &Body {
         self.request.body()
     }
 
+    #[inline]
     pub fn config_store(&self) -> Option<ConfigStoreHandle> {
         self.request
             .extensions()
@@ -28,6 +30,7 @@ impl RequestContext {
 
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the body cannot be deserialized as form-urlencoded data into `T`, or the body is streaming.
+    #[inline]
     pub fn form<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,
@@ -41,12 +44,14 @@ impl RequestContext {
         }
     }
 
+    #[inline]
     pub fn into_request(self) -> Request {
         self.request
     }
 
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the body is not valid JSON for `T`.
+    #[inline]
     pub fn json<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,
@@ -58,10 +63,12 @@ impl RequestContext {
     }
 
     /// Returns the KV store handle if one was configured for this request.
+    #[inline]
     pub fn kv_handle(&self) -> Option<KvHandle> {
         self.request.extensions().get::<KvHandle>().cloned()
     }
 
+    #[inline]
     pub fn new(request: Request, params: PathParams) -> Self {
         Self {
             path_params: params,
@@ -71,6 +78,7 @@ impl RequestContext {
 
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the path parameters cannot be deserialized into `T`.
+    #[inline]
     pub fn path<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,
@@ -80,16 +88,19 @@ impl RequestContext {
             .map_err(|err| EdgeError::bad_request(format!("invalid path parameters: {err}")))
     }
 
+    #[inline]
     pub fn path_params(&self) -> &PathParams {
         &self.path_params
     }
 
+    #[inline]
     pub fn proxy_handle(&self) -> Option<ProxyHandle> {
         self.request.extensions().get::<ProxyHandle>().cloned()
     }
 
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the query string cannot be deserialized into `T`.
+    #[inline]
     pub fn query<T>(&self) -> Result<T, EdgeError>
     where
         T: DeserializeOwned,
@@ -99,15 +110,18 @@ impl RequestContext {
             .map_err(|err| EdgeError::bad_request(format!("invalid query string: {err}")))
     }
 
+    #[inline]
     pub fn request(&self) -> &Request {
         &self.request
     }
 
+    #[inline]
     pub fn request_mut(&mut self) -> &mut Request {
         &mut self.request
     }
 
     /// Returns the secret store handle if one was configured for this request.
+    #[inline]
     pub fn secret_handle(&self) -> Option<SecretHandle> {
         self.request.extensions().get::<SecretHandle>().cloned()
     }

@@ -20,6 +20,7 @@ pub struct AxumConfigStore {
 
 impl AxumConfigStore {
     /// Create from the current process environment and manifest defaults.
+    #[inline]
     pub fn from_env<D>(defaults: D) -> Self
     where
         D: IntoIterator<Item = (String, String)>,
@@ -44,6 +45,7 @@ impl AxumConfigStore {
     }
 
     /// Create from env vars and optional manifest defaults.
+    #[inline]
     pub fn new<E, D>(env: E, defaults: D) -> Self
     where
         E: IntoIterator<Item = (String, String)>,
@@ -57,6 +59,7 @@ impl AxumConfigStore {
 }
 
 impl ConfigStore for AxumConfigStore {
+    #[inline]
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         Ok(self
             .env

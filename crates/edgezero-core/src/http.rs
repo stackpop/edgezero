@@ -37,11 +37,13 @@ pub type Uri = http::Uri;
 pub type Version = http::Version;
 
 #[must_use]
+#[inline]
 pub fn request_builder() -> RequestBuilder {
     http::Request::builder()
 }
 
 #[must_use]
+#[inline]
 pub fn response_builder() -> ResponseBuilder {
     http::Response::builder()
 }
