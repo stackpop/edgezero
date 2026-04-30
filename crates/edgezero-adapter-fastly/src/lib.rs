@@ -38,6 +38,7 @@ pub trait AppExt {
 
 #[cfg(feature = "fastly")]
 impl AppExt for App {
+    #[inline]
     fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
         request::dispatch_raw(self, req)
     }
@@ -54,6 +55,7 @@ pub struct FastlyLogging {
 
 #[cfg(feature = "fastly")]
 impl From<ResolvedLoggingConfig> for FastlyLogging {
+    #[inline]
     fn from(config: ResolvedLoggingConfig) -> Self {
         Self {
             echo_stdout: config.echo_stdout.unwrap_or(true),
@@ -81,6 +83,7 @@ struct StoreRequirements {
 /// [`logger::InitLoggerError::SetLogger`] if a global logger is already
 /// installed.
 #[cfg(feature = "fastly")]
+#[inline]
 pub fn init_logger(
     endpoint: &str,
     level: log::LevelFilter,
@@ -107,6 +110,7 @@ pub fn init_logger(
 /// # Errors
 /// Returns an error if the manifest is invalid or any required store cannot be opened.
 #[cfg(feature = "fastly")]
+#[inline]
 pub fn run_app<A: Hooks>(
     manifest_src: &str,
     req: fastly::Request,
@@ -149,6 +153,7 @@ pub fn run_app<A: Hooks>(
 /// # Errors
 /// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
+#[inline]
 pub fn run_app_with_config<A: Hooks>(
     logging: &FastlyLogging,
     req: fastly::Request,
@@ -168,6 +173,7 @@ pub fn run_app_with_config<A: Hooks>(
 /// # Errors
 /// Returns an error if logger setup fails or the underlying handler returns an error.
 #[cfg(feature = "fastly")]
+#[inline]
 pub fn run_app_with_logging<A: Hooks>(
     logging: &FastlyLogging,
     req: fastly::Request,

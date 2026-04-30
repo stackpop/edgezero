@@ -232,6 +232,7 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
     })
 }
 
+#[inline]
 pub fn register() {
     register_adapter(&AXUM_ADAPTER);
     register_adapter_blueprint(&AXUM_BLUEPRINT);

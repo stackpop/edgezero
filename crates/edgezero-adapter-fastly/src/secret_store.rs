@@ -44,6 +44,7 @@ impl FastlyNamedStore {
     ///
     /// # Errors
     /// Returns [`SecretError::Internal`] if the named secret store cannot be opened.
+    #[inline]
     pub fn open(name: &str) -> Result<Self, SecretError> {
         let store = FastlyNativeSecretStore::open(name).map_err(|err| {
             SecretError::Internal(anyhow::anyhow!(
@@ -64,6 +65,7 @@ pub struct FastlySecretStore;
 #[cfg(feature = "fastly")]
 #[async_trait(?Send)]
 impl SecretStore for FastlySecretStore {
+    #[inline]
     async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         let store = FastlyNamedStore::open(store_name)?;
         store.get_bytes_sync(key)

@@ -134,8 +134,6 @@ exhaustive_enums = "allow"
 std_instead_of_alloc = "allow"
 std_instead_of_core = "allow"
 
-# Cross-crate `#[inline]` is a hint that rustc/LLVM make better than us.
-missing_inline_in_public_items = "allow"
 
 
 [workspace.lints.rust]

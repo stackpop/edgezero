@@ -8,6 +8,7 @@ use std::io::Write as _;
 
 /// # Errors
 /// Returns [`EdgeError::Internal`] if the response body cannot be streamed to the Fastly send-channel.
+#[inline]
 pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeError> {
     let (parts, body) = response.into_parts();
     let mut fastly_response = FastlyResponse::from_status(parts.status.as_u16());

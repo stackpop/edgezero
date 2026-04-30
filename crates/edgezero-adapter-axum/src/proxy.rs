@@ -23,6 +23,7 @@ impl AxumProxyClient {
     /// # Errors
     /// Returns the underlying [`reqwest::Error`] if `reqwest::Client::builder().build()`
     /// fails — typically because the TLS backend cannot be initialised on this target.
+    #[inline]
     pub fn try_new() -> Result<Self, reqwest::Error> {
         let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
         Ok(Self { client })
@@ -31,6 +32,7 @@ impl AxumProxyClient {
 
 #[async_trait(?Send)]
 impl ProxyClient for AxumProxyClient {
+    #[inline]
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _extensions) = request.into_parts();
         let reqwest_method = reqwest_method(&method)?;

@@ -30,12 +30,14 @@ pub enum EdgeError {
 }
 
 impl EdgeError {
+    #[inline]
     pub fn bad_request<S: Into<String>>(message: S) -> Self {
         EdgeError::BadRequest {
             message: message.into(),
         }
     }
 
+    #[inline]
     pub fn internal<E>(error: E) -> Self
     where
         E: Into<AnyError>,
@@ -46,6 +48,7 @@ impl EdgeError {
     }
 
     #[must_use]
+    #[inline]
     pub fn message(&self) -> String {
         match self {
             EdgeError::BadRequest { message }
@@ -60,6 +63,7 @@ impl EdgeError {
     }
 
     #[must_use]
+    #[inline]
     pub fn method_not_allowed(method: &Method, allowed: &[Method]) -> Self {
         let mut names = allowed
             .iter()
@@ -77,10 +81,12 @@ impl EdgeError {
         }
     }
 
+    #[inline]
     pub fn not_found<S: Into<String>>(path: S) -> Self {
         EdgeError::NotFound { path: path.into() }
     }
 
+    #[inline]
     pub fn service_unavailable<S: Into<String>>(message: S) -> Self {
         EdgeError::ServiceUnavailable {
             message: message.into(),
@@ -96,6 +102,7 @@ impl EdgeError {
         reason = "intentional: typed alternative to the trait-object Error::source"
     )]
     #[must_use]
+    #[inline]
     pub fn source(&self) -> Option<&AnyError> {
         match self {
             EdgeError::Internal { source } => Some(source),
@@ -108,6 +115,7 @@ impl EdgeError {
     }
 
     #[must_use]
+    #[inline]
     pub fn status(&self) -> StatusCode {
         match self {
             EdgeError::BadRequest { .. } => StatusCode::BAD_REQUEST,
@@ -119,6 +127,7 @@ impl EdgeError {
         }
     }
 
+    #[inline]
     pub fn validation<S: Into<String>>(message: S) -> Self {
         EdgeError::Validation {
             message: message.into(),
@@ -127,6 +136,7 @@ impl EdgeError {
 }
 
 impl From<ConfigStoreError> for EdgeError {
+    #[inline]
     fn from(err: ConfigStoreError) -> Self {
         match err {
             ConfigStoreError::InvalidKey { message } => EdgeError::bad_request(message),
@@ -137,6 +147,7 @@ impl From<ConfigStoreError> for EdgeError {
 }
 
 impl IntoResponse for EdgeError {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         let payload = json!({
             "error": {

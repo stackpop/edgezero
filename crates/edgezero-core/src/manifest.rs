@@ -21,6 +21,7 @@ pub struct ManifestLoader {
 impl ManifestLoader {
     /// # Errors
     /// Returns an [`io::Error`] if `path` cannot be read, or the file content cannot be parsed/validated as an `EdgeZero` manifest.
+    #[inline]
     pub fn from_path(path: &Path) -> Result<Self, io::Error> {
         let contents = fs::read_to_string(path)?;
         let mut manifest: Manifest = toml::from_str(&contents)
@@ -54,17 +55,20 @@ impl ManifestLoader {
                   a parse error means the binary is corrupt and cannot recover"
     )]
     #[must_use]
+    #[inline]
     pub fn load_from_str(contents: &str) -> Self {
         Self::try_load_from_str(contents).unwrap_or_else(|err| panic!("invalid manifest: {err}"))
     }
 
     #[must_use]
+    #[inline]
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
     /// # Errors
     /// Returns an [`io::Error`] if `contents` is not valid TOML or fails manifest validation.
+    #[inline]
     pub fn try_load_from_str(contents: &str) -> Result<Self, io::Error> {
         let mut manifest: Manifest = toml::from_str(contents)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -110,10 +114,12 @@ pub struct Manifest {
 
 impl Manifest {
     #[must_use]
+    #[inline]
     pub fn environment(&self) -> &ManifestEnvironment {
         &self.environment
     }
 
+    #[inline]
     pub fn environment_for(&self, adapter: &str) -> ResolvedEnvironment {
         let adapter_lower = adapter.to_ascii_lowercase();
 
@@ -164,6 +170,7 @@ impl Manifest {
     /// 2. Global name (`[stores.kv] name = "..."`)
     /// 3. Default: `"EDGEZERO_KV"`
     #[must_use]
+    #[inline]
     pub fn kv_store_name(&self, adapter: &str) -> &str {
         let Some(kv) = self.stores.kv.as_ref() else {
             return DEFAULT_KV_STORE_NAME;
@@ -180,22 +187,26 @@ impl Manifest {
     }
 
     #[must_use]
+    #[inline]
     pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
         self.logging_resolved.get(adapter)
     }
 
     #[must_use]
+    #[inline]
     pub fn logging_or_default(&self, adapter: &str) -> ResolvedLoggingConfig {
         self.logging_for(adapter).cloned().unwrap_or_default()
     }
 
     #[must_use]
+    #[inline]
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
     }
 
     /// Returns whether the secret store should be attached for a given adapter.
     #[must_use]
+    #[inline]
     pub fn secret_store_enabled(&self, adapter: &str) -> bool {
         let Some(secrets) = self.stores.secrets.as_ref() else {
             return false;
@@ -218,6 +229,7 @@ impl Manifest {
     /// 2. Global name (`[stores.secrets] name = "..."`)
     /// 3. Default: `"EDGEZERO_SECRETS"`
     #[must_use]
+    #[inline]
     pub fn secret_store_name(&self, adapter: &str) -> &str {
         let Some(secrets) = self.stores.secrets.as_ref() else {
             return DEFAULT_SECRET_STORE_NAME;
@@ -281,6 +293,7 @@ pub struct ManifestHttpTrigger {
 }
 
 impl ManifestHttpTrigger {
+    #[inline]
     pub fn methods(&self) -> Vec<&str> {
         if self.methods.is_empty() {
             vec!["GET"]
@@ -467,6 +480,7 @@ pub struct ManifestConfigAdapterConfig {
 impl ManifestConfigStoreConfig {
     /// Access the default key-value pairs for local dev.
     #[must_use]
+    #[inline]
     pub fn config_store_defaults(&self) -> &BTreeMap<String, String> {
         &self.defaults
     }
@@ -475,6 +489,7 @@ impl ManifestConfigStoreConfig {
     ///
     /// Priority: adapter override → global name → `DEFAULT_CONFIG_STORE_NAME`.
     #[must_use]
+    #[inline]
     pub fn config_store_name(&self, adapter: &str) -> &str {
         let adapter_lower = adapter.to_ascii_lowercase();
         if let Some(override_cfg) = self.adapters.get(&adapter_lower) {
@@ -519,6 +534,7 @@ pub struct ResolvedLoggingConfig {
 }
 
 impl Default for ResolvedLoggingConfig {
+    #[inline]
     fn default() -> Self {
         Self {
             level: LogLevel::Info,
@@ -620,6 +636,7 @@ pub enum HttpMethod {
 
 impl HttpMethod {
     #[must_use]
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Delete => "DELETE",
@@ -642,6 +659,7 @@ impl HttpMethod {
     reason = "default deserialize_in_place is identical to what we would write manually"
 )]
 impl<'de> Deserialize<'de> for HttpMethod {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -678,6 +696,7 @@ pub enum BodyMode {
     reason = "default deserialize_in_place is identical to what we would write manually"
 )]
 impl<'de> Deserialize<'de> for BodyMode {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -705,6 +724,7 @@ pub enum LogLevel {
 
 impl LogLevel {
     #[must_use]
+    #[inline]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Trace => "trace",
@@ -718,6 +738,7 @@ impl LogLevel {
 }
 
 impl From<LogLevel> for LevelFilter {
+    #[inline]
     fn from(level: LogLevel) -> Self {
         match level {
             LogLevel::Trace => LevelFilter::Trace,
@@ -739,6 +760,7 @@ impl From<LogLevel> for LevelFilter {
     reason = "default deserialize_in_place is identical to what we would write manually"
 )]
 impl<'de> Deserialize<'de> for LogLevel {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,

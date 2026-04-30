@@ -28,6 +28,7 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 /// # Errors
 /// Never; this is a no-op stub on non-wasm targets.
 #[cfg(not(all(feature = "cloudflare", target_arch = "wasm32")))]
+#[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }

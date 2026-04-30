@@ -16,6 +16,7 @@ where
     Fut: Future<Output = Result<Res, EdgeError>> + 'static,
     Res: IntoResponse,
 {
+    #[inline]
     fn call(&self, ctx: RequestContext) -> HandlerFuture {
         let fut = (self)(ctx);
         Box::pin(async move { fut.await?.into_response() })
@@ -32,6 +33,7 @@ impl<H> IntoHandler for H
 where
     H: DynHandler + Sized + 'static,
 {
+    #[inline]
     fn into_handler(self) -> BoxHandler {
         Arc::new(self)
     }

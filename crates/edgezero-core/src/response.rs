@@ -20,24 +20,28 @@ pub trait IntoResponse {
 }
 
 impl IntoResponse for Response {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         Ok(self)
     }
 }
 
 impl IntoResponse for Body {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, self)
     }
 }
 
 impl IntoResponse for &str {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, Body::text(self))
     }
 }
 
 impl IntoResponse for String {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, Body::text(self))
     }
@@ -46,6 +50,7 @@ impl IntoResponse for String {
 pub struct Text<T>(T);
 
 impl<T> Text<T> {
+    #[inline]
     pub fn new(value: T) -> Self {
         Self(value)
     }
@@ -55,12 +60,14 @@ impl<T> IntoResponse for Text<T>
 where
     T: Into<String>,
 {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::OK, Body::text(self.0.into()))
     }
 }
 
 impl IntoResponse for () {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         response_with_body(StatusCode::NO_CONTENT, Body::empty())
     }
@@ -70,6 +77,7 @@ impl<T> IntoResponse for (StatusCode, T)
 where
     T: IntoResponse,
 {
+    #[inline]
     fn into_response(self) -> Result<Response, EdgeError> {
         let (status, inner) = self;
         let mut response = inner.into_response()?;
@@ -81,6 +89,7 @@ where
 /// # Errors
 /// Returns [`EdgeError::internal`] if the underlying [`http::response::Builder`]
 /// rejects the supplied status, headers, or body.
+#[inline]
 pub fn response_with_body(status: StatusCode, body: Body) -> Result<Response, EdgeError> {
     use crate::http::response_builder;
 

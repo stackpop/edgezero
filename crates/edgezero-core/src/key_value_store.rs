@@ -337,6 +337,7 @@ pub struct KvHandle {
 }
 
 impl fmt::Debug for KvHandle {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KvHandle").finish_non_exhaustive()
     }
@@ -384,6 +385,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if the backend rejects the delete.
+    #[inline]
     pub async fn delete(&self, key: &str) -> Result<(), KvError> {
         Self::validate_key(key)?;
         self.store.delete(key).await
@@ -405,6 +407,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if the backend lookup fails.
+    #[inline]
     pub async fn exists(&self, key: &str) -> Result<bool, KvError> {
         Self::validate_key(key)?;
         self.store.exists(key).await
@@ -416,6 +419,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if the lookup fails or the stored bytes cannot be deserialized into `T`.
+    #[inline]
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, KvError> {
         Self::validate_key(key)?;
         match self.store.get_bytes(key).await? {
@@ -431,6 +435,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if the backend lookup fails.
+    #[inline]
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         Self::validate_key(key)?;
         self.store.get_bytes(key).await
@@ -440,6 +445,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if the lookup fails or the stored bytes cannot be deserialized into `T`.
+    #[inline]
     pub async fn get_or<T: DeserializeOwned>(&self, key: &str, default: T) -> Result<T, KvError> {
         Ok(self.get(key).await?.unwrap_or(default))
     }
@@ -453,6 +459,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError::Validation`] if `cursor` is malformed or `prefix` exceeds backend limits; [`KvError::Internal`] on backend failure.
+    #[inline]
     pub async fn list_keys_page(
         &self,
         prefix: &str,
@@ -474,6 +481,7 @@ impl KvHandle {
     }
 
     /// Create a new handle wrapping a KV store implementation.
+    #[inline]
     pub fn new(store: Arc<dyn KvStore>) -> Self {
         Self { store }
     }
@@ -482,6 +490,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if the value cannot be serialized or the backend rejects the write.
+    #[inline]
     pub async fn put<T: Serialize>(&self, key: &str, value: &T) -> Result<(), KvError> {
         Self::validate_key(key)?;
         let bytes = serde_json::to_vec(value)?;
@@ -493,6 +502,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError::Validation`] for invalid keys or oversized values; [`KvError::Internal`] on backend failure.
+    #[inline]
     pub async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         Self::validate_key(key)?;
         Self::validate_value(&value)?;
@@ -503,6 +513,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError::Validation`] for invalid input; [`KvError::Internal`] on backend failure.
+    #[inline]
     pub async fn put_bytes_with_ttl(
         &self,
         key: &str,
@@ -519,6 +530,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if the value cannot be serialized or the backend rejects the write.
+    #[inline]
     pub async fn put_with_ttl<T: Serialize>(
         &self,
         key: &str,
@@ -549,6 +561,7 @@ impl KvHandle {
     ///
     /// # Errors
     /// Returns [`KvError`] if any of the read, mutate, or write steps fail.
+    #[inline]
     pub async fn read_modify_write<T, Mutator>(
         &self,
         key: &str,
@@ -649,6 +662,7 @@ impl KvHandle {
 }
 
 impl From<KvError> for EdgeError {
+    #[inline]
     fn from(err: KvError) -> Self {
         match err {
             KvError::NotFound { key } => EdgeError::not_found(format!("kv key: {key}")),
@@ -705,6 +719,7 @@ pub trait KvStore: Send + Sync {
     ///
     /// The default implementation delegates to `get_bytes`. Backends that
     /// support a cheaper existence check should override this.
+    #[inline]
     async fn exists(&self, key: &str) -> Result<bool, KvError> {
         Ok(self.get_bytes(key).await?.is_some())
     }
@@ -765,15 +780,19 @@ pub struct NoopKvStore;
 #[cfg(any(test, feature = "test-utils"))]
 #[async_trait(?Send)]
 impl KvStore for NoopKvStore {
+    #[inline]
     async fn delete(&self, _key: &str) -> Result<(), KvError> {
         Ok(())
     }
+    #[inline]
     async fn exists(&self, _key: &str) -> Result<bool, KvError> {
         Ok(false)
     }
+    #[inline]
     async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
         Ok(None)
     }
+    #[inline]
     async fn list_keys_page(
         &self,
         _prefix: &str,
@@ -782,9 +801,11 @@ impl KvStore for NoopKvStore {
     ) -> Result<KvPage, KvError> {
         Ok(KvPage::default())
     }
+    #[inline]
     async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
         Ok(())
     }
+    #[inline]
     async fn put_bytes_with_ttl(
         &self,
         _key: &str,

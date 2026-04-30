@@ -21,6 +21,7 @@ pub mod response;
 // TODO: wire in real Spin logger when available
 /// # Errors
 /// Returns [`log::SetLoggerError`] if a global logger is already installed.
+#[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
