@@ -204,6 +204,31 @@ impl Manifest {
         self.root.as_deref()
     }
 
+    /// Returns the secret store binding identifier for a given adapter.
+    ///
+    /// Resolution order:
+    /// 1. Per-adapter override (`[stores.secrets.adapters.<adapter>]`)
+    /// 2. Global name (`[stores.secrets] name = "..."`)
+    /// 3. Default: `"EDGEZERO_SECRETS"`
+    #[must_use]
+    #[inline]
+    pub fn secret_store_binding(&self, adapter: &str) -> &str {
+        let Some(secrets) = self.stores.secrets.as_ref() else {
+            return DEFAULT_SECRET_STORE_NAME;
+        };
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(adapter_cfg) = secrets
+            .adapters
+            .iter()
+            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
+        {
+            if let Some(name) = adapter_cfg.1.name.as_deref() {
+                return name;
+            }
+        }
+        &secrets.name
+    }
+
     /// Returns whether the secret store should be attached for a given adapter.
     #[must_use]
     #[inline]
@@ -220,31 +245,6 @@ impl Manifest {
             return adapter_cfg.1.enabled;
         }
         secrets.enabled
-    }
-
-    /// Returns the secret store name for a given adapter.
-    ///
-    /// Resolution order:
-    /// 1. Per-adapter override (`[stores.secrets.adapters.<adapter>]`)
-    /// 2. Global name (`[stores.secrets] name = "..."`)
-    /// 3. Default: `"EDGEZERO_SECRETS"`
-    #[must_use]
-    #[inline]
-    pub fn secret_store_name(&self, adapter: &str) -> &str {
-        let Some(secrets) = self.stores.secrets.as_ref() else {
-            return DEFAULT_SECRET_STORE_NAME;
-        };
-        let adapter_lower = adapter.to_ascii_lowercase();
-        if let Some(adapter_cfg) = secrets
-            .adapters
-            .iter()
-            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
-        {
-            if let Some(name) = adapter_cfg.1.name.as_deref() {
-                return name;
-            }
-        }
-        &secrets.name
     }
 }
 
@@ -1688,39 +1688,39 @@ name = "FASTLY_STORE"
     // -- Secret store config -----------------------------------------------
 
     #[test]
-    fn secret_store_name_defaults_to_constant_when_absent() {
+    fn secret_store_binding_defaults_to_constant_when_absent() {
         let manifest = ManifestLoader::load_from_str("[app]\nname = \"x\"\n");
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             DEFAULT_SECRET_STORE_NAME
         );
     }
 
     #[test]
-    fn secret_store_name_uses_global_name_when_declared() {
+    fn secret_store_binding_uses_global_name_when_declared() {
         let manifest = ManifestLoader::load_from_str("[stores.secrets]\nname = \"MY_SECRETS\"\n");
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             "MY_SECRETS"
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("cloudflare"),
+            manifest.manifest().secret_store_binding("cloudflare"),
             "MY_SECRETS"
         );
     }
 
     #[test]
-    fn secret_store_name_uses_per_adapter_override() {
+    fn secret_store_binding_uses_per_adapter_override() {
         let manifest = ManifestLoader::load_from_str(
             "[stores.secrets]\nname = \"MY_SECRETS\"\n\
              [stores.secrets.adapters.fastly]\nname = \"FASTLY_STORE\"\n",
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             "FASTLY_STORE"
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("cloudflare"),
+            manifest.manifest().secret_store_binding("cloudflare"),
             "MY_SECRETS"
         );
     }
@@ -1770,11 +1770,11 @@ name = "FASTLY_STORE"
         assert!(manifest.manifest().secret_store_enabled("fastly"));
         assert!(!manifest.manifest().secret_store_enabled("cloudflare"));
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             "FASTLY_STORE"
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("cloudflare"),
+            manifest.manifest().secret_store_binding("cloudflare"),
             DEFAULT_SECRET_STORE_NAME
         );
     }
