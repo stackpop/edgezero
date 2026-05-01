@@ -108,7 +108,7 @@ fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Opti
         return None;
     }
 
-    let binding_name = manifest_data.secret_store_name(adapter_name);
+    let binding_name = manifest_data.secret_store_binding(adapter_name);
     let message = match adapter_name {
         "axum" => format!(
             "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs (configured store name: '{binding_name}')"
@@ -342,7 +342,7 @@ serve = "echo serve"
     }
 
     #[test]
-    fn secret_store_name_is_readable_from_manifest() {
+    fn secret_store_binding_is_readable_from_manifest() {
         let manifest_with_secrets = r#"
 [app]
 name = "demo-app"
@@ -357,7 +357,10 @@ deploy = "echo deploy"
 serve = "echo serve"
 "#;
         let loader = ManifestLoader::load_from_str(manifest_with_secrets);
-        assert_eq!(loader.manifest().secret_store_name("fastly"), "MY_SECRETS");
+        assert_eq!(
+            loader.manifest().secret_store_binding("fastly"),
+            "MY_SECRETS"
+        );
         assert!(loader.manifest().stores.secrets.is_some());
     }
 
