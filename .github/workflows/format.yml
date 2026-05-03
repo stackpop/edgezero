@@ -18,7 +18,7 @@ jobs:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Cache cargo dependencies
         uses: actions/cache@v5
@@ -60,7 +60,7 @@ jobs:
         working-directory: docs
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Retrieve Node.js version
         id: node-version
@@ -69,7 +69,7 @@ jobs:
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
           cache: "npm"
