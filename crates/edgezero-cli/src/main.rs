@@ -108,20 +108,18 @@ fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Opti
         return None;
     }
 
-    let binding_name = manifest_data.secret_store_binding(adapter_name);
+    // Note: the configured binding identifier is intentionally NOT included in
+    // this log line. CodeQL's `rust/cleartext-logging` rule taints any value
+    // returned by a function whose name contains "secret" (it can't tell
+    // metadata from secret material), and adapters/operators can read the
+    // binding name from their own `edgezero.toml` if they need to verify it.
     let message = match adapter_name {
-        "axum" => format!(
-            "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs (configured store name: '{binding_name}')"
-        ),
-        "cloudflare" => format!(
-            "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler (configured store name: '{binding_name}' is metadata only)"
-        ),
-        _ => format!(
-            "[edgezero] secret store '{binding_name}' enabled for {adapter_name} -- ensure it is provisioned on the target platform"
-        ),
+        "axum" => "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs",
+        "cloudflare" => "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler",
+        _ => "[edgezero] secrets enabled -- ensure the configured secret store is provisioned on the target platform",
     };
 
-    Some(message)
+    Some(message.to_owned())
 }
 
 #[cfg(feature = "cli")]
@@ -380,7 +378,7 @@ name = "MY_SECRETS"
         assert!(cloudflare.contains("wrangler"));
 
         let fastly = store_bindings_message("fastly", &loader).expect("fastly message");
-        assert!(fastly.contains("secret store 'MY_SECRETS'"));
+        assert!(fastly.contains("secrets enabled"));
     }
 
     #[test]
