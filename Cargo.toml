@@ -134,7 +134,5 @@ exhaustive_enums = "allow"
 std_instead_of_alloc = "allow"
 std_instead_of_core = "allow"
 
-
-
 [workspace.lints.rust]
 unsafe_code = "deny"
