@@ -30,7 +30,7 @@ pub use key_value_store::SpinKvStore;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use proxy::SpinProxyClient;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use request::{dispatch, into_core_request};
+pub use request::{dispatch, dispatch_with_kv_label, into_core_request};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use response::from_core_response;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]

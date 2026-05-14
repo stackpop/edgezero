@@ -90,37 +90,41 @@ fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<Strin
         .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
 }
 
+/// Dispatch a Spin request through the EdgeZero router using the `"default"`
+/// KV store label.
+///
+/// This is a convenience wrapper around [`dispatch_with_kv_label`]. Use that
+/// function directly when your `spin.toml` declares a KV store under a label
+/// other than `"default"` (e.g. because `[stores.kv.adapters.spin].name` in
+/// `edgezero.toml` is set to a custom value).
+pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sdk::http::Response> {
+    dispatch_with_kv_label(app, req, "default").await
+}
+
 /// Dispatch a Spin request through the EdgeZero router and return
-/// a Spin-compatible response.
+/// a Spin-compatible response, opening the KV store under `kv_label`.
 ///
 /// Injects all available stores into request extensions:
 /// - `ConfigStoreHandle` backed by `SpinConfigStore` (Spin component variables)
-/// - `KvHandle` backed by `SpinKvStore` opened on the `"default"` label (best-effort;
+/// - `KvHandle` backed by `SpinKvStore` opened on `kv_label` (best-effort;
 ///   logged and omitted if the label is not declared in `spin.toml`)
 /// - `SecretHandle` backed by `SpinSecretStore` (Spin component variables)
 ///
-/// # KV label limitation
-///
-/// Only the `"default"` KV label is opened automatically. If your `spin.toml`
-/// uses a different label, skip `run_app` and call `into_core_request` /
-/// `from_core_response` directly, inserting your own `KvHandle`:
-///
-/// ```ignore
-/// let mut req = into_core_request(incoming).await?;
-/// req.extensions_mut().insert(KvHandle::new(Arc::new(
-///     SpinKvStore::open("my-label")?,
-/// )));
-/// let resp = app.router().oneshot(req).await;
-/// Ok(from_core_response(resp).await?)
-/// ```
-pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sdk::http::Response> {
+/// Pass the label that matches your `spin.toml` `key_value_stores` entry.
+/// If `[stores.kv.adapters.spin].name` in `edgezero.toml` is `"my-store"`,
+/// that same string must appear in `spin.toml` and must be passed here.
+pub async fn dispatch_with_kv_label(
+    app: &App,
+    req: IncomingRequest,
+    kv_label: &str,
+) -> anyhow::Result<spin_sdk::http::Response> {
     let mut core_request = into_core_request(req).await?;
 
     core_request
         .extensions_mut()
         .insert(ConfigStoreHandle::new(Arc::new(SpinConfigStore::new())));
 
-    match SpinKvStore::open_default() {
+    match SpinKvStore::open(kv_label) {
         Ok(store) => {
             core_request
                 .extensions_mut()
@@ -128,8 +132,9 @@ pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sd
         }
         Err(e) => {
             log::warn!(
-                "SpinKvStore: could not open default KV store (label \"default\"); \
-                 KV operations will be unavailable: {e}"
+                "SpinKvStore: could not open KV store (label {:?}); \
+                 KV operations will be unavailable: {e}",
+                kv_label
             );
         }
     }
