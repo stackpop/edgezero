@@ -509,7 +509,7 @@ mod integration_tests {
         handle: JoinHandle<()>,
     }
 
-    struct TestServerSecrets {
+    struct TestServerWithStore {
         base_url: String,
         handle: JoinHandle<()>,
     }
@@ -868,10 +868,10 @@ mod integration_tests {
     // Secret store helpers
     // -----------------------------------------------------------------------
 
-    async fn start_test_server_with_secret_handle(
+    async fn start_test_server_with_store_handle(
         router: RouterService,
         secret_handle: Option<CoreSecretHandle>,
-    ) -> TestServerSecrets {
+    ) -> TestServerWithStore {
         let listener = TokioTcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind secrets test server");
@@ -887,7 +887,7 @@ mod integration_tests {
         let handle = tokio::spawn(async move {
             let _result = server.run_with_listener(listener).await;
         });
-        TestServerSecrets {
+        TestServerWithStore {
             base_url: format!("http://{addr}"),
             handle,
         }
@@ -916,7 +916,7 @@ mod integration_tests {
         let store =
             InMemorySecretStore::new([("test-store/API_KEY", bytes::Bytes::from("s3cr3t"))]);
         let handle = SecretHandle::new(Arc::new(store));
-        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+        let server = start_test_server_with_store_handle(router, Some(handle)).await;
 
         let client = reqwest::Client::new();
         let url = format!("{}/secret", server.base_url);
@@ -938,7 +938,7 @@ mod integration_tests {
             .build();
         let store = InMemorySecretStore::new(iter::empty::<(&str, bytes::Bytes)>());
         let handle = SecretHandle::new(Arc::new(store));
-        let server = start_test_server_with_secret_handle(router, Some(handle)).await;
+        let server = start_test_server_with_store_handle(router, Some(handle)).await;
 
         let client = reqwest::Client::new();
         let url = format!("{}/secret", server.base_url);
@@ -960,7 +960,7 @@ mod integration_tests {
         let router = RouterService::builder()
             .get("/secret", secret_value_handler)
             .build();
-        let server = start_test_server_with_secret_handle(router, None).await;
+        let server = start_test_server_with_store_handle(router, None).await;
 
         let client = reqwest::Client::new();
         let url = format!("{}/secret", server.base_url);
