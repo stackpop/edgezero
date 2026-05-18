@@ -885,6 +885,37 @@ env = "APP_TOKEN"
     }
 
     #[test]
+    fn try_load_from_str_rejects_invalid_toml() {
+        let err = ManifestLoader::try_load_from_str("not a [valid manifest\n")
+            .err()
+            .expect("expected err");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().to_lowercase().contains("toml")
+                || err.to_string().to_lowercase().contains("expected"),
+            "expected toml-parse error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_load_from_str_rejects_failed_validation() {
+        // `[stores.config]` requires a non-empty `name` when set; an empty
+        // string trips `validator` and surfaces as InvalidData.
+        let err = ManifestLoader::try_load_from_str(
+            r#"
+[app]
+name = "demo"
+
+[stores.config]
+name = ""
+"#,
+        )
+        .err()
+        .expect("expected err");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn environment_resolves_for_adapters() {
         let loader = ManifestLoader::load_from_str(SAMPLE);
         let manifest = loader.manifest();

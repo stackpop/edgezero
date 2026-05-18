@@ -625,6 +625,19 @@ mod tests {
     }
 
     #[test]
+    fn generator_error_format_displays_underlying_fmt_error() {
+        // `writeln!`-to-`String` cannot actually fail in production, but the
+        // variant is part of the public error surface and `From<fmt::Error>`
+        // wiring must keep working. Construct one and verify the Display
+        // string carries the underlying error.
+        let err: GeneratorError = fmt::Error.into();
+        assert!(matches!(err, GeneratorError::Format(_)));
+        assert!(err
+            .to_string()
+            .contains("failed to format generator output"));
+    }
+
+    #[test]
     fn generate_new_scaffolds_workspace_layout() {
         let temp = TempDir::new().expect("temp dir");
         let bin_dir = temp.path().join("bin");
