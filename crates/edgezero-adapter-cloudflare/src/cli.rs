@@ -288,7 +288,7 @@ pub fn register() {
     register_adapter_blueprint(&CLOUDFLARE_BLUEPRINT);
 }
 
-#[ctor]
+#[ctor(unsafe)]
 fn register_ctor() {
     register();
 }

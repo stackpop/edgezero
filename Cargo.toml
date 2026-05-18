@@ -31,7 +31,7 @@ axum = { version = "0.8", default-features = true }
 brotli = "8"
 bytes = "1"
 chrono = "0.4"
-ctor = "0.10"
+ctor = "1.0"
 edgezero-adapter = { path = "crates/edgezero-adapter" }
 edgezero-adapter-axum = { path = "crates/edgezero-adapter-axum", default-features = false }
 edgezero-adapter-cloudflare = { path = "crates/edgezero-adapter-cloudflare", default-features = false }
@@ -56,6 +56,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 simple_logger = "5"
+# spin-sdk 6.0 raises MSRV to rustc 1.93; this workspace ships rustc 1.91.1
+# (see .tool-versions). Stay on the latest 5.x release until we bump the
+# toolchain.
 spin-sdk = { version = "5.2", default-features = false }
 tempfile = "3"
 thiserror = "2"
