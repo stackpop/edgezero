@@ -424,6 +424,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_bytes_with_ttl_propagates_overflow_as_internal_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("ttl-overflow.redb");
+        let store = PersistentKvStore::new(db_path).unwrap();
+
+        let err = store
+            .put_bytes_with_ttl("key", Bytes::from("value"), Duration::MAX)
+            .await
+            .expect_err("Duration::MAX must overflow SystemTime");
+        assert!(matches!(err, KvError::Internal(_)));
+        assert!(
+            err.to_string().contains("ttl overflows system time"),
+            "expected ttl-overflow error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_expired_keys_does_not_delete_fresh_overwrite() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("test.redb");
