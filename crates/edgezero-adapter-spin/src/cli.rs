@@ -270,7 +270,7 @@ pub fn register() {
     register_adapter_blueprint(&SPIN_BLUEPRINT);
 }
 
-#[ctor]
+#[ctor(unsafe)]
 fn register_ctor() {
     register();
 }

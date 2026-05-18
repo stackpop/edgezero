@@ -238,7 +238,7 @@ pub fn register() {
     register_adapter_blueprint(&AXUM_BLUEPRINT);
 }
 
-#[ctor]
+#[ctor(unsafe)]
 fn register_ctor() {
     register();
 }
