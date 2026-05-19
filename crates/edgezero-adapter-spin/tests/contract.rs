@@ -6,6 +6,17 @@
     reason = "integration test target — top-level test fns are correct here"
 )]
 
+//! Spin adapter contract tests.
+//!
+//! Scope: in-process unit-style tests that exercise this adapter's internal
+//! routing/dispatch logic and the `RouterService` integration. They build to
+//! `wasm32-wasip1` and run under `wasmtime run`.
+//!
+//! Out of scope: the Spin host ABI itself. `SpinRequestContext` is a plain
+//! Rust struct (no `spin_sdk`/WIT imports), so a breaking change in the Spin
+//! runtime's WIT interface would not be caught here — that requires the
+//! actual Spin runtime, which is outside the test surface CI runs.
+
 use bytes::Bytes;
 use edgezero_adapter_spin::context::SpinRequestContext;
 use edgezero_core::app::App;
