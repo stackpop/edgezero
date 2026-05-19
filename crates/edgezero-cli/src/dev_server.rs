@@ -20,6 +20,12 @@ use app_demo_core::App;
 #[cfg(feature = "dev-example")]
 use edgezero_core::app::Hooks as _;
 
+#[cfg(not(feature = "dev-example"))]
+#[derive(serde::Deserialize)]
+struct EchoParams {
+    name: String,
+}
+
 pub fn run_dev() {
     match try_run_manifest_axum() {
         Ok(true) => return,
@@ -65,12 +71,6 @@ fn default_router() -> RouterService {
         .get("/", dev_root)
         .get("/echo/{name}", dev_echo)
         .build()
-}
-
-#[cfg(not(feature = "dev-example"))]
-#[derive(serde::Deserialize)]
-struct EchoParams {
-    name: String,
 }
 
 #[cfg(not(feature = "dev-example"))]

@@ -95,6 +95,7 @@ pub fn init_logger(
 /// # Errors
 /// Never; this is a no-op stub on builds without the `fastly` feature.
 #[cfg(not(feature = "fastly"))]
+#[inline]
 pub fn init_logger(
     _endpoint: &str,
     _level: log::LevelFilter,
