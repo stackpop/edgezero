@@ -91,11 +91,13 @@ implicit_return = "allow"
 question_mark_used = "allow"
 single_call_fn = "allow"
 separated_literal_suffix = "allow"
-# `pub_with_shorthand` wants `pub(in crate)` but rustfmt unconditionally
-# rewrites that to `pub(crate)`. Five legitimate cross-file `pub(crate)`
-# items remain (dispatch_raw, dispatch_with_store_names, parse_uri,
-# parse_client_addr, decompress_body) — they need at least crate visibility,
-# and there is no spelling that satisfies both the lint and rustfmt.
+# `pub_with_shorthand` flags the shorthand `pub(crate)` form and wants the
+# longhand `pub(in crate)` form. Our codebase uses the shorthand because
+# rustfmt unconditionally rewrites `pub(in crate)` → `pub(crate)` on save,
+# so there is no spelling that satisfies both clippy and rustfmt. Six
+# legitimate cross-file `pub(crate)` items currently fire: dispatch_raw,
+# dispatch_with_store_names, parse_uri, parse_client_addr, decompress_body,
+# and one extra in fastly/request.rs.
 pub_with_shorthand = "allow"
 # `module_name_repetitions` was attempted: 39 sites in edgezero-core,
 # centred on three concrete blockers that surfaced during the rename:
