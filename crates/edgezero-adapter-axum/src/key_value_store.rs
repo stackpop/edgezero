@@ -54,7 +54,7 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition}
 use std::time::SystemTime;
 
 /// Table definition for the KV store.
-/// Key: `String`, Value: `(Bytes, Option<expiration_timestamp_millis>)`
+/// Key: `String`, Value: `(Bytes, Option<expiration_timestamp_millis>)`.
 const KV_TABLE: TableDefinition<&str, (&[u8], Option<u128>)> = TableDefinition::new("kv");
 
 /// Type alias for a writable KV table handle.
@@ -180,8 +180,7 @@ impl PersistentKvStore {
     /// Returns 0 if the time is before UNIX epoch (should never happen in practice).
     fn system_time_to_millis(time: SystemTime) -> u128 {
         time.duration_since(SystemTime::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or(0)
+            .map_or(0, |duration| duration.as_millis())
     }
 }
 
@@ -267,7 +266,7 @@ impl KvStore for PersistentKvStore {
         limit: usize,
     ) -> Result<KvPage, KvError> {
         let mut live_keys = Vec::with_capacity(limit.saturating_add(1));
-        let mut scan_cursor = cursor.map(str::to_string);
+        let mut scan_cursor = cursor.map(str::to_owned);
         let mut reached_end = false;
         let mut batch_count: usize = 0;
 
@@ -626,7 +625,7 @@ mod tests {
     async fn ttl_not_expired_returns_value() {
         let (kv_store, _dir) = store();
         kv_store
-            .put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_secs(60))
+            .put_bytes_with_ttl("temp", Bytes::from("val"), Duration::from_mins(1))
             .await
             .unwrap();
         assert_eq!(

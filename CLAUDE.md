@@ -27,9 +27,9 @@ scripts/                      # Build/deploy/test helper scripts
 
 ## Toolchain & Versions
 
-- **Rust**: 1.91.1 (from `.tool-versions`)
+- **Rust**: 1.95.0 (from `.tool-versions`)
 - **Node.js**: 24.12.0 (for docs site only)
-- **Fastly CLI**: v13.0.0
+- **Fastly CLI**: 15.1.0
 - **Edition**: 2021
 - **Resolver**: 2
 - **License**: Apache-2.0

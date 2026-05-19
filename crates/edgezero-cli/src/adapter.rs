@@ -27,6 +27,7 @@ impl fmt::Display for Action {
 }
 
 impl From<Action> for AdapterAction {
+    #[inline]
     fn from(value: Action) -> Self {
         match value {
             Action::Build => AdapterAction::Build,
