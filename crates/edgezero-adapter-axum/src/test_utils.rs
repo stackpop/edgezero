@@ -12,12 +12,14 @@ pub struct EnvOverride {
 
 impl EnvOverride {
     #[must_use]
+    #[inline]
     pub fn clear(key: &'static str) -> Self {
         let original = env::var_os(key);
         env::remove_var(key);
         Self { key, original }
     }
 
+    #[inline]
     pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
         let original = env::var_os(key);
         env::set_var(key, value);
@@ -26,6 +28,7 @@ impl EnvOverride {
 }
 
 impl Drop for EnvOverride {
+    #[inline]
     fn drop(&mut self) {
         if let Some(original) = &self.original {
             env::set_var(self.key, original);
@@ -39,6 +42,7 @@ impl Drop for EnvOverride {
 ///
 /// Both `secret_store` and `service` tests share this lock to avoid data races across
 /// test threads when setting or clearing environment variables.
+#[inline]
 pub fn env_guard() -> &'static Mutex<()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD.get_or_init(|| Mutex::new(()))

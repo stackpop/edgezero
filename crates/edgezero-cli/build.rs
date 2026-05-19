@@ -41,9 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 name.replace('-', "_").to_ascii_uppercase()
             );
             println!("cargo:rerun-if-env-changed={feature_env}");
-            let enabled = env::var(&feature_env)
-                .map(|val| val == "1")
-                .unwrap_or(false);
+            let enabled = env::var(&feature_env).is_ok_and(|val| val == "1");
             enabled.then_some(name)
         })
         .collect();

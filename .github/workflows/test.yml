@@ -137,8 +137,7 @@ jobs:
       - name: Setup Viceroy
         if: matrix.adapter == 'fastly'
         # Version comes from .tool-versions (single source of truth shared with
-        # local dev). viceroy 0.17 raises MSRV to rustc 1.95; we ship 1.91, so
-        # the .tool-versions entry pins us to a 0.16.x build.
+        # local dev).
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.version }}" --locked --force
 
       - name: Setup Wasmtime

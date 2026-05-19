@@ -157,7 +157,7 @@ macro_rules! key_value_store_contract_tests {
                         .put_bytes_with_ttl(
                             "ttl_key",
                             Bytes::from("ttl_val"),
-                            std::time::Duration::from_secs(300),
+                            std::time::Duration::from_mins(5),
                         )
                         .await
                         .unwrap();
@@ -351,12 +351,20 @@ impl KvHandle {
     pub const MAX_LIST_PAGE_SIZE: usize = 1_000;
 
     /// Maximum TTL (1 year). Prevents overflow when adding to `SystemTime::now()`.
+    #[expect(
+        clippy::duration_suboptimal_units,
+        reason = "`Duration::from_days` is not stable in const context (1.95)"
+    )]
     pub const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
     /// Maximum value size in bytes (Standard limit).
     pub const MAX_VALUE_SIZE: usize = 25 * 1024 * 1024;
 
-    /// Minimum TTL in seconds (Cloudflare limit).
+    /// Minimum TTL (Cloudflare limit).
+    #[expect(
+        clippy::duration_suboptimal_units,
+        reason = "`Duration::from_mins` is not stable in const context (1.95)"
+    )]
     pub const MIN_TTL: Duration = Duration::from_secs(60);
 
     fn decode_list_cursor(prefix: &str, cursor: Option<&str>) -> Result<Option<String>, KvError> {
@@ -1096,7 +1104,7 @@ mod tests {
     fn put_with_ttl_stores_value() {
         let kv = handle();
         block_on(async {
-            kv.put_with_ttl("session", &"token123", Duration::from_secs(60))
+            kv.put_with_ttl("session", &"token123", Duration::from_mins(1))
                 .await
                 .unwrap();
             let val: Option<String> = kv.get("session").await.unwrap();
@@ -1109,7 +1117,7 @@ mod tests {
         let kv = handle();
         block_on(async {
             let data = Counter { count: 7_i32 };
-            kv.put_with_ttl("ttl_key", &data, Duration::from_secs(600))
+            kv.put_with_ttl("ttl_key", &data, Duration::from_mins(10))
                 .await
                 .unwrap();
             let val: Option<Counter> = kv.get("ttl_key").await.unwrap();

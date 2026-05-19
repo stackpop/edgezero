@@ -35,10 +35,7 @@ pub fn find_workspace_root(dir: &Path) -> PathBuf {
         let cargo = path.join("Cargo.toml");
         if cargo.exists() {
             candidate = Some(path.to_path_buf());
-            if fs::read_to_string(&cargo)
-                .map(|contents| contents.contains("[workspace]"))
-                .unwrap_or(false)
-            {
+            if fs::read_to_string(&cargo).is_ok_and(|contents| contents.contains("[workspace]")) {
                 break;
             }
         }

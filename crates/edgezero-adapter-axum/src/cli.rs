@@ -208,7 +208,7 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
                     .to_owned()
             })
         },
-        ToString::to_string,
+        str::to_owned,
     );
 
     let port = match adapter.get("port").and_then(Value::as_integer) {

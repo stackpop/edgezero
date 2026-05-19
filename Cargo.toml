@@ -56,9 +56,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 simple_logger = "5"
-# spin-sdk 6.0 raises MSRV to rustc 1.93; this workspace ships rustc 1.91.1
-# (see .tool-versions). Stay on the latest 5.x release until we bump the
-# toolchain.
+# TODO: spin-sdk 6.0 is API-breaking (Method variants → http::Method constants,
+# IncomingRequest removed, Builder::build → .body()). Migration deferred to a
+# focused PR; stay on 5.2 until then.
 spin-sdk = { version = "5.2", default-features = false }
 tempfile = "3"
 thiserror = "2"
