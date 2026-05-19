@@ -67,41 +67,34 @@ fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
     }
 }
 
-fn build_middleware_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
+fn build_middleware_tokens(manifest: &Manifest) -> Result<Vec<TokenStream2>, String> {
     manifest
         .app
         .middleware
         .iter()
         .map(|middleware| {
-            let path = parse_handler_path(middleware);
-            quote! {
+            let path = parse_handler_path(middleware)?;
+            Ok(quote! {
                 builder = builder.middleware(#path);
-            }
+            })
         })
         .collect()
 }
 
-fn build_route_tokens(manifest: &Manifest) -> Vec<TokenStream2> {
-    manifest
-        .triggers
-        .http
-        .iter()
-        .filter_map(|trigger| {
-            let handler = trigger.handler.as_deref()?;
-            let handler_path = parse_handler_path(handler);
-            let path_lit = LitStr::new(&trigger.path, Span::call_site());
+fn build_route_tokens(manifest: &Manifest) -> Result<Vec<TokenStream2>, String> {
+    let mut tokens = Vec::new();
+    for trigger in &manifest.triggers.http {
+        let Some(handler) = trigger.handler.as_deref() else {
+            continue;
+        };
+        let handler_path = parse_handler_path(handler)?;
+        let path_lit = LitStr::new(&trigger.path, Span::call_site());
 
-            let methods = trigger.methods();
-
-            let mut tokens = Vec::new();
-            for method in methods {
-                let route_tokens = route_for_method(method, &path_lit, &handler_path);
-                tokens.push(route_tokens);
-            }
-            Some(tokens)
-        })
-        .flatten()
-        .collect()
+        for method in trigger.methods() {
+            tokens.push(route_for_method(method, &path_lit, &handler_path));
+        }
+    }
+    Ok(tokens)
 }
 
 pub fn expand_app(input: TokenStream) -> TokenStream {
@@ -139,8 +132,14 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
         .unwrap_or_else(|| "EdgeZero App".to_owned());
     let app_name_lit = LitStr::new(&app_name, Span::call_site());
 
-    let middleware_tokens = build_middleware_tokens(&manifest);
-    let route_tokens = build_route_tokens(&manifest);
+    let middleware_tokens = match build_middleware_tokens(&manifest) {
+        Ok(tokens) => tokens,
+        Err(msg) => return quote!(compile_error!(#msg);).into(),
+    };
+    let route_tokens = match build_route_tokens(&manifest) {
+        Ok(tokens) => tokens,
+        Err(msg) => return quote!(compile_error!(#msg);).into(),
+    };
     let config_store_tokens = build_config_store_tokens(&manifest);
 
     let output = quote! {
@@ -180,16 +179,11 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 /// Parses a handler reference like `crate::handlers::root` from `edgezero.toml`
 /// into the `syn::ExprPath` that the generated router code references.
 ///
-/// Called at proc-macro expansion time. If the user's manifest contains a
-/// syntactically-invalid handler path, the only useful recovery is to halt
-/// macro expansion with a clear message — there is no runtime to propagate
-/// the error to. The panic is caught by `rustc` and surfaces as a normal
-/// build failure with the file/line of the call site.
-#[expect(
-    clippy::panic,
-    reason = "macro-expansion-time error: rustc surfaces the panic as a build failure"
-)]
-fn parse_handler_path(handler: &str) -> syn::ExprPath {
+/// Returns `Err(message)` when the manifest contains a syntactically-invalid
+/// handler path. Callers propagate the message into a `compile_error!()` so
+/// rustc surfaces it as a normal build failure with the file/line of the
+/// `app!(...)` call site, instead of as a "proc-macro panicked".
+fn parse_handler_path(handler: &str) -> Result<syn::ExprPath, String> {
     let mut handler_str = handler.trim().to_owned();
     if handler_str.starts_with("crate::")
         || handler_str.starts_with("self::")
@@ -211,7 +205,7 @@ fn parse_handler_path(handler: &str) -> syn::ExprPath {
     }
 
     syn::parse_str::<syn::ExprPath>(&handler_str)
-        .unwrap_or_else(|err| panic!("invalid handler path `{handler}`: {err}"))
+        .map_err(|err| format!("invalid handler path `{handler}`: {err}"))
 }
 
 /// Resolves the manifest path passed to `app!(...)` against the
@@ -249,5 +243,31 @@ fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> Tok
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_handler_path;
+
+    #[test]
+    fn parse_handler_path_accepts_absolute_crate_path() {
+        let parsed =
+            parse_handler_path("crate::handlers::root").expect("valid handler path should parse");
+        let rendered = quote::quote!(#parsed).to_string();
+        assert_eq!(rendered, "crate :: handlers :: root");
+    }
+
+    #[test]
+    fn parse_handler_path_rejects_invalid_syntax_with_message() {
+        let err = parse_handler_path("not a valid path!").expect_err("expected parse failure");
+        assert!(
+            err.contains("invalid handler path"),
+            "error message should name the failure, got: {err}"
+        );
+        assert!(
+            err.contains("not a valid path!"),
+            "error message should echo the offending input, got: {err}"
+        );
     }
 }
