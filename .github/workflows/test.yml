@@ -140,12 +140,27 @@ jobs:
         # local dev).
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.version }}" --locked --force
 
+      - name: Resolve Wasmtime version
+        if: matrix.adapter == 'spin'
+        id: wasmtime-version
+        shell: bash
+        run: echo "version=$(grep '^wasmtime ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
       - name: Setup Wasmtime
         if: matrix.adapter == 'spin'
+        # Direct GitHub-release tarball install. The official
+        # `https://wasmtime.dev/install.sh` script broke as of
+        # 2026-05-19 (interpolation failure: tried to download
+        # version literal `{`), so we pin via .tool-versions.
         run: |
           if ! command -v wasmtime &>/dev/null; then
-            curl https://wasmtime.dev/install.sh -sSf | bash
-            echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+            version="${{ steps.wasmtime-version.outputs.version }}"
+            tag="v${version}"
+            archive="wasmtime-${tag}-x86_64-linux"
+            curl -fL "https://github.com/bytecodealliance/wasmtime/releases/download/${tag}/${archive}.tar.xz" -o /tmp/wasmtime.tar.xz
+            tar -xJf /tmp/wasmtime.tar.xz -C /tmp
+            sudo install -m 0755 "/tmp/${archive}/wasmtime" /usr/local/bin/wasmtime
+            wasmtime --version
           fi
 
       - name: Fetch dependencies (locked)
