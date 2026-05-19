@@ -92,12 +92,20 @@ question_mark_used = "allow"
 single_call_fn = "allow"
 separated_literal_suffix = "allow"
 # `pub_with_shorthand` flags the shorthand `pub(crate)` form and wants the
-# longhand `pub(in crate)` form. Our codebase uses the shorthand because
-# rustfmt unconditionally rewrites `pub(in crate)` → `pub(crate)` on save,
-# so there is no spelling that satisfies both clippy and rustfmt. Six
-# legitimate cross-file `pub(crate)` items currently fire: dispatch_raw,
-# dispatch_with_store_names, parse_uri, parse_client_addr, decompress_body,
-# and one extra in fastly/request.rs.
+# longhand `pub(in crate)` form. Verified by removing this allow on
+# clippy 1.95: 6 errors of the form
+#
+#   error: usage of `pub` without `in`
+#     |  pub(crate) fn decompress_body(...)
+#     |  ^^^^^^^^^^ help: add it: `pub(in crate)`
+#     = help: ...index.html#pub_with_shorthand
+#
+# So the lint flags `pub(crate)` and suggests `pub(in crate)`. We use
+# `pub(crate)` because rustfmt unconditionally rewrites `pub(in crate)`
+# → `pub(crate)` on save; no spelling satisfies both clippy and rustfmt.
+# Six legitimate cross-file `pub(crate)` items currently fire:
+# dispatch_raw, dispatch_with_store_names, parse_uri, parse_client_addr,
+# decompress_body, and one extra in fastly/request.rs.
 pub_with_shorthand = "allow"
 # `module_name_repetitions` was attempted: 39 sites in edgezero-core,
 # centred on three concrete blockers that surfaced during the rename:
