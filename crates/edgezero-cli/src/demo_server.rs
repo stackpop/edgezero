@@ -26,33 +26,36 @@ struct EchoParams {
     name: String,
 }
 
-pub fn run_dev() {
+/// Run the example app locally on the axum demo server.
+///
+/// Returns `Ok(())` on graceful shutdown, `Err` on startup failure.
+pub fn run_demo() -> Result<(), String> {
     match try_run_manifest_axum() {
-        Ok(true) => return,
+        Ok(true) => return Ok(()),
         Ok(false) => {}
-        Err(err) => log::error!("[edgezero] dev manifest error: {err}"),
+        Err(err) => log::error!("[edgezero] demo manifest error: {err}"),
     }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
     log::info!(
-        "[edgezero] dev: starting local server on http://{}:{}",
+        "[edgezero] demo: starting local server on http://{}:{}",
         addr.ip(),
         addr.port()
     );
 
-    let router = build_dev_router();
+    let router = build_demo_router();
     let config = AxumDevServerConfig {
         addr,
         ..AxumDevServerConfig::default()
     };
 
     let server = AxumDevServer::with_config(router, config);
-    if let Err(err) = server.run() {
-        log::error!("[edgezero] dev server error: {err}");
-    }
+    server
+        .run()
+        .map_err(|err| format!("demo server error: {err}"))
 }
 
-fn build_dev_router() -> RouterService {
+fn build_demo_router() -> RouterService {
     #[cfg(feature = "dev-example")]
     {
         let demo_app = App::build_app();
@@ -68,20 +71,20 @@ fn build_dev_router() -> RouterService {
 #[cfg(not(feature = "dev-example"))]
 fn default_router() -> RouterService {
     RouterService::builder()
-        .get("/", dev_root)
-        .get("/echo/{name}", dev_echo)
+        .get("/", demo_root)
+        .get("/echo/{name}", demo_echo)
         .build()
 }
 
 #[cfg(not(feature = "dev-example"))]
 #[action]
-async fn dev_root() -> Text<&'static str> {
-    Text::new("EdgeZero dev server")
+async fn demo_root() -> Text<&'static str> {
+    Text::new("EdgeZero demo server")
 }
 
 #[cfg(not(feature = "dev-example"))]
 #[action]
-async fn dev_echo(Path(params): Path<EchoParams>) -> Text<String> {
+async fn demo_echo(Path(params): Path<EchoParams>) -> Text<String> {
     Text::new(format!("hello {}", params.name))
 }
 

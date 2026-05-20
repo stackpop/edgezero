@@ -28,17 +28,18 @@ cd my-app
 This generates a workspace with:
 
 - `crates/my-app-core` - Your shared handlers and routing logic
+- `crates/my-app-cli` - Your project's own CLI binary, built on the `edgezero-cli` library
 - `crates/my-app-adapter-fastly` - Fastly Compute entrypoint
 - `crates/my-app-adapter-cloudflare` - Cloudflare Workers entrypoint
 - `crates/my-app-adapter-axum` - Native Axum entrypoint
 - `edgezero.toml` - Manifest describing routes, middleware, and adapter config
 
-## Start the Dev Server
+## Start the Demo Server
 
-Run the local Axum-powered development server:
+Run the example app locally on the axum demo server:
 
 ```bash
-edgezero dev
+edgezero demo
 ```
 
 Your app is now running at `http://127.0.0.1:8787`. Try the generated endpoints:

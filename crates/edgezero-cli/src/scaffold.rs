@@ -95,6 +95,17 @@ pub fn register_templates(hbs: &mut Handlebars) {
         include_str!("templates/core/src/handlers.rs.hbs"),
     )
     .expect("compiled-in template is valid");
+    // CLI
+    hbs.register_template_string(
+        "cli_Cargo_toml",
+        include_str!("templates/cli/Cargo.toml.hbs"),
+    )
+    .expect("compiled-in template is valid");
+    hbs.register_template_string(
+        "cli_src_main_rs",
+        include_str!("templates/cli/src/main.rs.hbs"),
+    )
+    .expect("compiled-in template is valid");
     // Adapter-specific templates
     for adapter in scaffold::registered_blueprints() {
         for template in adapter.template_registrations {
@@ -222,6 +233,8 @@ mod tests {
             "core_Cargo_toml",
             "core_src_lib_rs",
             "core_src_handlers_rs",
+            "cli_Cargo_toml",
+            "cli_src_main_rs",
         ] {
             assert!(hbs.has_template(name), "missing template {name}");
         }

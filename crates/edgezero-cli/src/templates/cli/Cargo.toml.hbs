@@ -1,0 +1,13 @@
+[package]
+name = "{{proj_cli}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+{{{dep_edgezero_cli}}}
+clap = { workspace = true }
+log = { workspace = true }

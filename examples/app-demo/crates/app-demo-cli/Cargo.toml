@@ -1,0 +1,14 @@
+[package]
+name = "app-demo-cli"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }
+edgezero-cli = { workspace = true }
+log = { workspace = true }

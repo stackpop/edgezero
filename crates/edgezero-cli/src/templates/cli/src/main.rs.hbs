@@ -1,0 +1,45 @@
+//! {{name}} CLI — built on the `edgezero-cli` library.
+//!
+//! This binary reuses every built-in `edgezero` command via the
+//! `edgezero_cli` library and is the place to add your own subcommands.
+
+use clap::{Parser, Subcommand};
+use edgezero_cli::args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
+
+#[derive(Parser, Debug)]
+#[command(name = "{{proj_cli}}", about = "{{name}} edge CLI")]
+struct Args {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Build the project for a target edge.
+    Build(BuildArgs),
+    /// Run the example app locally on the axum demo server.
+    Demo,
+    /// Deploy to a target edge.
+    Deploy(DeployArgs),
+    /// Create a new `EdgeZero` app skeleton.
+    New(NewArgs),
+    /// Run a local simulation (adapter-specific).
+    Serve(ServeArgs),
+}
+
+fn main() {
+    use std::process;
+
+    edgezero_cli::init_cli_logger();
+    let result = match Args::parse().cmd {
+        Cmd::Build(args) => edgezero_cli::run_build(&args),
+        Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Cmd::Demo => edgezero_cli::run_demo(),
+        Cmd::New(args) => edgezero_cli::run_new(&args),
+        Cmd::Serve(args) => edgezero_cli::run_serve(&args),
+    };
+    if let Err(err) = result {
+        log::error!("[{{name}}] {err}");
+        process::exit(1);
+    }
+}
