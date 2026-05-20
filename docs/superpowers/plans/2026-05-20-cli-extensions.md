@@ -15,7 +15,15 @@
 ## Preconditions (do before commit 2)
 
 - [ ] **PR #253 (`feat/spin-store-support`) is merged into the working branch.** The current branch has **no** Spin store support — `crates/edgezero-adapter-spin/src/` has no `config_store.rs` / `key_value_store.rs` / `secret_store.rs`, and `lib.rs` explicitly rejects `[stores.*]` for spin. Commit 2 wires `SpinKvStore` / `SpinConfigStore` / `SpinSecretStore` into the multi-store runtime; they must exist first. Commit 1 does **not** need PR #253. Verify with: `ls crates/edgezero-adapter-spin/src/` shows the three store files before starting commit 2.
-- [ ] Working on branch `docs/extensible-cli-library-spec` (or a fresh feature branch off it). The spec lives in `docs/superpowers/`, which is gitignored — keep using `git add -f` for spec/plan files only.
+- [ ] Working on branch `feature/extensible-cli` (stacked on `chore/strict-clippy` / PR #257). The spec and plan live in `docs/superpowers/`, which is gitignored — keep using `git add -f` for spec/plan files only.
+
+## Status
+
+- **Commit 1 — DONE.** Landed as `1d582dd` (extensible `edgezero-cli`
+  library + generator + `app-demo-cli`) plus follow-up `06f4b72`
+  (`demo` is example-only; `serve --adapter axum` runs the axum
+  adapter). §7 below is kept for reference — do **not** re-do it.
+- **Commits 2–8 — pending.** Commit 2 is gated on PR #253.
 
 ## Codebase facts this plan relies on
 
@@ -98,7 +106,7 @@ docs/.vitepress/config.mts      # M (commits 2, 8): sidebar
 
 ---
 
-# Commit 1 — Extensible `edgezero-cli` library + generator + `app-demo-cli` skeleton
+# Commit 1 — Extensible `edgezero-cli` library + generator + `app-demo-cli` skeleton ✅ DONE (`1d582dd`, `06f4b72`)
 
 Spec §7. No PR #253 dependency. Goal: `edgezero-cli` becomes lib + bin; the `demo` subcommand replaces `dev`; the generator scaffolds `<name>-cli`; a handwritten `app-demo-cli` exists.
 
@@ -196,7 +204,7 @@ Expected: `cargo check --workspace` in the generated project succeeds.
 - Create: `examples/app-demo/crates/app-demo-cli/Cargo.toml`, `examples/app-demo/crates/app-demo-cli/src/main.rs`, `examples/app-demo/crates/app-demo-cli/tests/help.rs`
 - Modify: `examples/app-demo/Cargo.toml`
 
-- [ ] **Step 1:** Add `"crates/app-demo-cli"` to `examples/app-demo/Cargo.toml` `members`. Add `edgezero-cli = { path = "../../../../crates/edgezero-cli" }` to that workspace's `[workspace.dependencies]`.
+- [ ] **Step 1:** Add `"crates/app-demo-cli"` to `examples/app-demo/Cargo.toml` `members`. Add `edgezero-cli = { path = "../../crates/edgezero-cli" }` to that workspace's `[workspace.dependencies]` — the path is relative to the workspace manifest (`examples/app-demo/Cargo.toml`), matching the existing `edgezero-core = { path = "../../crates/edgezero-core" }` line.
 
 - [ ] **Step 2:** Write `app-demo-cli/Cargo.toml` — `name = "app-demo-cli"`, `publish = false`, `[lints] workspace = true`, deps `edgezero-cli = { workspace = true }`, `clap = { version = "4", features = ["derive"] }`, `log = { workspace = true }`.
 
@@ -334,7 +342,13 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 
 - [ ] **Step 2: cloudflare.** KV registry. **Config rewritten from `[vars]` to KV** (§6.9) — `CloudflareConfigStore` does an async `env.<NAMESPACE>.get(key)`; one namespace per config id. Secrets from worker secrets (Single).
 
-- [ ] **Step 3: fastly.** KV / config / secret store registries (all `Multi`).
+- [ ] **Step 3: fastly.** Fastly is `Multi` for **all three** kinds (KV, config, secrets) — the only adapter that is. Build a `StoreRegistry<H>` per kind from `[adapters.fastly.stores.<kind>.*]`:
+  - **KV:** one Fastly KV store per logical id, opened by the per-id `name`. The existing `FastlyKvStore` is constructed once per id; the registry maps `<id>` → handle.
+  - **Config:** one Fastly config store per logical id, opened by the per-id `name`. The existing `FastlyConfigStore` becomes per-id; `get` stays async after the §6.4 trait change.
+  - **Secrets:** one Fastly secret store per logical id, opened by the per-id `name`.
+  - For every kind, an absent per-id `name` mapping is already a manifest-validation error (§6.6); the adapter setup can rely on each declared id having a `name`.
+  - Resolution: at request setup the adapter reads the `Hooks` store metadata, opens each `(kind, id)` Fastly resource by its `name`, and inserts the three `StoreRegistry` values into the context.
+  - **Tests:** the Fastly contract suite must cover **two logical stores of each kind** (e.g. `[stores.kv] ids = ["a", "b"]`) and assert `ctx.kv_store("a")` / `ctx.kv_store("b")` resolve to distinct stores, `ctx.kv_store("missing")` is `None`, and `kv_store_default()` resolves the manifest default — same id-keyed contract-factory shape as the other adapters (Step 5). Run under Viceroy on `wasm32-wasip1`.
 
 - [ ] **Step 4: spin.** Wire `SpinKvStore` (label registry, honor `max_list_keys`, return `KvError::LimitExceeded` past the cap, `KvError::Unsupported` for TTL writes), `SpinConfigStore` (single flat-variable store, `.`→`__` lowercase key translation), `SpinSecretStore` (single flat-variable store, `store_name` ignored). Stop rejecting `[stores.*]` for spin in `lib.rs`. Labels come from `[adapters.spin.stores.kv.*].name`.
 
