@@ -52,12 +52,14 @@ myapp`) build their own CLI binary that:
 Alongside the extensibility substrate, ship:
 
 - A **multi-store manifest model**: the app declares logical stores it
-  uses (`[stores.kv] ids = ["foo", "bar"]`); each adapter maps every
-  logical id to a platform-specific `name`, with room for
-  adapter-specific tuning. Stores are addressed in code by logical id.
-  Per-adapter, per-kind **capability rules** (§6.6) constrain what is
-  valid — some adapters support multiple named stores of a kind, others
-  only a single flat one.
+  uses (`[stores.kv] ids = ["foo", "bar"]`); for each store kind an
+  adapter is *Multi-capable* for, it maps every logical id to a
+  platform-specific `name`, with room for adapter-specific tuning.
+  Stores are addressed in code by logical id. Per-adapter, per-kind
+  **capability rules** (§6.6) constrain what is valid — some adapters
+  support multiple named stores of a kind, others only a single flat
+  one, and the per-adapter mapping block is required for the former and
+  forbidden for the latter.
 - A **typed per-service app-config file** (`myapp.toml`) with a
   Rust-defined schema, validated by `config validate`, uploaded by
   `config push`. `#[secret]` / `#[secret(store_ref)]` fields are
@@ -89,8 +91,8 @@ flags; new subcommands are added.
 - No direct REST API calls; everything goes through the platform's
   native CLI.
 - No environment-sectioned app-config (`[config.production]` etc.).
-  Single `[config]` table per file. (Env-var *override* is in scope;
-  per-environment *files* are not.)
+  Single `[config]` table per file. (Env-var _override_ is in scope;
+  per-environment _files_ are not.)
 - No live-platform CI smoke tests. Mock `CommandRunner` only.
 - **No backward compatibility** with the old manifest schema or runtime
   store API. A pre-rewrite `edgezero.toml` is a hard load error.
@@ -134,7 +136,7 @@ Key contracts:
 - **Bound store handles**: only `RequestContext` yields them (binding
   needs per-request adapter state).
 - **Static store metadata**: `Hooks` / `ConfigStoreMetadata` are
-  compile-time, id-keyed store *metadata* (emitted by `app!`). Adapters
+  compile-time, id-keyed store _metadata_ (emitted by `app!`). Adapters
   consume them at request setup to build runtime registries.
 - **Cloudflare config on KV**; **Spin config / secrets on flat Spin
   variables** (§6.7).
@@ -310,17 +312,17 @@ App config can be nested (`service: ServiceConfig { timeout_ms }`).
 does not store JSON blobs for nested structs. The canonical,
 handler-facing key form is **dotted**: `service.timeout_ms`.
 
-Genuine compound *values* (arrays, maps — not nested structs) are
+Genuine compound _values_ (arrays, maps — not nested structs) are
 JSON-encoded into a single string value; the key stays flat.
 
 Each platform's config store has different key constraints, so the key
 form is translated per adapter:
 
-| Adapter    | Stored key form for `service.timeout_ms` |
-|------------|-------------------------------------------|
-| axum       | `service.timeout_ms` (local JSON file; dots fine) |
-| cloudflare | `service.timeout_ms` (KV key; arbitrary strings) |
-| fastly     | `service.timeout_ms` (config-store key; dots fine) |
+| Adapter    | Stored key form for `service.timeout_ms`                                                             |
+| ---------- | ---------------------------------------------------------------------------------------------------- |
+| axum       | `service.timeout_ms` (local JSON file; dots fine)                                                    |
+| cloudflare | `service.timeout_ms` (KV key; arbitrary strings)                                                     |
+| fastly     | `service.timeout_ms` (config-store key; dots fine)                                                   |
 | spin       | `service__timeout_ms` (Spin variable; see §6.7 — dots and uppercase are invalid Spin variable names) |
 
 The translation is an **adapter-internal detail**. Handlers always use
@@ -389,34 +391,38 @@ name = "sessions"          # Spin KV store label
 [adapters.cloudflare.stores.config.app_config]
 name = "APP_CONFIG_KV"
 
-[adapters.spin.stores.config.app_config]
-# name is accepted but vestigial for Spin config (flat variables, §6.7)
+# NOTE: there is deliberately no [adapters.spin.stores.config.*] block.
+# Spin config is Single-capability (flat variables) — a per-id mapping
+# block for a Single (adapter, kind) pair is a validation error (§6.6).
 ```
 
 **Field reference:**
 
-| Field | Where | Role |
-|---|---|---|
-| `[stores.<kind>].ids` | top level | logical ids (`Vec<String>`, non-empty) |
-| `[stores.<kind>].default` | top level | resolved default; **required when `ids.len() > 1`**, optional (resolves to `ids[0]`) when exactly one id; must be in `ids` |
-| `[adapters.<X>.stores.<kind>.<id>].name` | per-adapter | platform name (see capability rules for whether required) |
-| other fields in that block | per-adapter | free-form `BTreeMap<String, toml::Value>` tuning |
+| Field                                    | Where       | Role                                                                                                                       |
+| ---------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `[stores.<kind>].ids`                    | top level   | logical ids (`Vec<String>`, non-empty)                                                                                     |
+| `[stores.<kind>].default`                | top level   | resolved default; **required when `ids.len() > 1`**, optional (resolves to `ids[0]`) when exactly one id; must be in `ids` |
+| `[adapters.<X>.stores.<kind>.<id>].name` | per-adapter | platform name (see capability rules for whether required)                                                                  |
+| other fields in that block               | per-adapter | free-form `BTreeMap<String, toml::Value>` tuning                                                                           |
 
 **Adapter × kind capability matrix.** A single flat
 `STORES_SUPPORTED_ADAPTERS` list is too coarse. Each (adapter, kind)
 pair has a capability:
 
 | Adapter    | KV               | Config                  | Secrets                 |
-|------------|------------------|-------------------------|-------------------------|
+| ---------- | ---------------- | ----------------------- | ----------------------- |
 | axum       | Multi (local)    | Multi (local files)     | Single (env vars)       |
 | cloudflare | Multi (KV ns)    | Multi (KV ns)           | Single (worker secrets) |
 | fastly     | Multi (KV store) | Multi (config store)    | Multi (secret store)    |
 | spin       | Multi (KV label) | Single (flat variables) | Single (flat variables) |
 
 - **Multi**: the adapter supports multiple named stores of that kind.
-  A per-id `name` mapping is **required** for every id.
-- **Single**: the adapter has exactly one flat store of that kind. The
-  per-id `name` is accepted but vestigial.
+  A per-id `[adapters.<X>.stores.<kind>.<id>]` block with a `name` is
+  **required** for every id.
+- **Single**: the adapter has exactly one flat store of that kind.
+  A per-id `[adapters.<X>.stores.<kind>.<id>]` block is **forbidden** —
+  there is nothing to configure per id, and a vestigial no-op block is
+  misleading. Its presence is a validation error.
 
 **Validation rules (in `ManifestLoader`):**
 
@@ -430,7 +436,8 @@ pair has a capability:
   flat namespace. The error names the offending adapter and kind.
 - For each (adapter, kind) that is `Multi`, every id must have a
   `[adapters.<X>.stores.<kind>.<id>]` block with a `name`. For
-  `Single` (adapter, kind) pairs, the block is optional.
+  `Single` (adapter, kind) pairs, **any such block is a validation
+  error** — the runtime ignores per-id naming there.
 - `name` under `[adapters.cloudflare.stores.*]` must be a JavaScript
   identifier; `name` under `[adapters.spin.stores.kv.*]` must be a
   valid Spin KV label. Invalid names are errors.
@@ -448,38 +455,97 @@ Cloudflare/Fastly and the spec must encode that explicitly.
 **KV — label-backed, multi-store.** `SpinKvStore` is backed by
 `spin_sdk::key_value`. Each logical KV id maps to a Spin KV store
 **label** via `[adapters.spin.stores.kv.<id>].name`. Multiple labels
-are fine. Constraints: no TTL; **listing is capped** (`SpinKvStore`
-has a `max_list_keys` cap and returns `KvError::Validation` rather
-than silently truncating when the cap is exceeded). The runtime
-adapter opens each configured label and registers it by logical id.
+are fine. The runtime adapter opens each configured label and
+registers it by logical id.
+
+- **TTL is unsupported.** `spin_sdk::key_value` has no expiry. The
+  `BoundKvStore` surface still exposes `put_*_with_ttl` (used by other
+  adapters). On Spin, those operations **must return a deterministic
+  error** (`KvError::Unsupported`), never silently store the value
+  without expiry — generic code must not believe an expiry was applied
+  when it was not. The Spin KV contract test asserts this error.
+- **Listing is capped.** `SpinKvStore` carries a `max_list_keys` cap
+  and returns an error rather than silently truncating when exceeded.
+  *Open concern inherited from PR #253:* #253 currently uses
+  `KvError::Validation` for this. A store growing beyond a cap is a
+  server/limit condition, not a malformed client request, so
+  `Validation` (which an adapter may map to HTTP 400) is arguably the
+  wrong variant. This spec does not block on it, but flags it: the
+  implementation of commit 2 should reconcile the listing-cap error
+  with PR #253 — prefer a limit/server-side error variant — and test
+  the pagination logic directly. If #253's variant is kept, that is a
+  conscious decision recorded in the commit.
 
 **Config — flat Spin variables, single-store.** `SpinConfigStore` is
 backed by `spin_sdk::variables`. Spin has **one** flat variable
 namespace per component — there is no notion of multiple named config
 stores. Therefore `[stores.config].ids` must have exactly one id for
-any project targeting Spin (enforced by the §6.6 capability check).
-`[adapters.spin.stores.config.<id>].name` is accepted but vestigial.
-**Spin variable names must match `[a-z][a-z0-9_]*`** — lowercase, no
-dots, no uppercase. The config-store impl translates the canonical
-dotted key (`service.timeout_ms`) to a Spin variable
-(`service__timeout_ms`); a dotted or uppercase key reaching the real
-Spin backend yields `InvalidName`.
+any project targeting Spin (enforced by the §6.6 capability check),
+and a `[adapters.spin.stores.config.*]` block is a validation error
+(Single capability, §6.6).
 
-**Secrets — flat Spin variables, single-store, shared namespace.**
+Spin variable names must match `^[a-z][a-z0-9_]*$` — lowercase,
+starting with a letter, alphanumeric + underscore. **This is Spin's
+own rule** (see the Spin manifest reference,
+<https://spinframework.dev/manifest-reference>), not an EdgeZero-added
+restriction; the EdgeZero config-store impl simply conforms to it. The
+impl translates the canonical dotted key (`service.timeout_ms`) to a
+Spin variable (`service__timeout_ms`); a dotted or uppercase key
+reaching the real Spin backend yields `InvalidName`.
+
+**Secrets — flat Spin variables, single-store, manual declaration.**
 `SpinSecretStore` is also backed by `spin_sdk::variables` — the **same
-flat namespace** as Spin config. `store_name` passed to
-`get_bytes` is ignored (the adapter logs a debug line when it is
-non-empty). `[stores.secrets].ids` must have exactly one id for a
-Spin project. Because config and secret variables share one
-namespace, their effective key spaces must not collide; this is
-guaranteed within a single `AppConfig` struct (config fields and
-`#[secret]` fields are distinct sibling fields → distinct variable
-names).
+flat namespace** as Spin config. `store_name` passed to `get_bytes` is
+ignored (the adapter logs a debug line when non-empty).
+`[stores.secrets].ids` must have exactly one id for a Spin project,
+and `[adapters.spin.stores.secrets.*]` is a validation error.
 
-**Implication for app config targeting Spin.** If the project's
-adapter set includes `spin`, `config validate` additionally checks
-that every flattened config key, after `.`→`__` translation, matches
-`[a-z][a-z0-9_]*` — i.e. config field names must be lowercase
+Spin **secret variables are declared manually** by the developer in
+`spin.toml` (as `[variables]` entries with `secret = true`, bound via
+`[component.<component>.variables]`). Neither `provision` nor `config
+push` writes secret variables — `config push` skips `SECRET_FIELDS`,
+and the secret key names are not reliably knowable: a
+`#[secret(store_ref)]` field's runtime key (e.g.
+`ctx.secret_store(&cfg.vault)?.require_str("active")`) is code-local,
+appearing in neither the manifest nor `<name>.toml`. The CLI cannot
+infer it, so secret-variable declaration stays with the developer.
+The `cli-walkthrough.md` doc shows the required `spin.toml` entries.
+
+**Config/secret variable collision check (replaces an over-strong
+guarantee).** Spin config and secret variables share one flat
+namespace, so their *effective Spin variable names* must not collide.
+The earlier claim that distinct struct fields guarantee this is wrong:
+a `#[secret]` field's **value** (not its Rust field name) is the
+secret key, so a config key `api_token` and a `#[secret]` field whose
+value is `"api_token"` would collide. When `spin` is in the adapter
+set, `config validate` computes the effective Spin variable name set —
+{flattened config keys} ∪ {`#[secret]` field values} — each after
+`.`→`__` lowercase translation, and **errors on any duplicate**.
+`#[secret(store_ref)]` runtime keys are code-local and outside this
+check; the walkthrough doc warns the developer to keep them clear of
+config keys.
+
+**Spin component discovery.** Writing `[component.<component>.*]`
+tables (for KV labels in `provision`, for variable bindings in `config
+push`) needs the **component id**, not just the `spin.toml` path.
+`[adapters.spin.adapter].manifest` points at `spin.toml`, which may
+declare several components. Resolution rule:
+
+- The CLI parses `spin.toml` and enumerates `[component.*]` ids.
+- If exactly one component exists, it is used.
+- If more than one exists, `[adapters.spin.adapter]` **must** carry an
+  explicit `component = "<id>"` field; otherwise the command errors.
+- An explicit `component` that does not match any `[component.*]` id
+  is an error.
+
+`config validate` performs this resolution as part of `--strict`
+checks when `spin` is in the adapter set, so the failure surfaces
+before `provision` / `config push` run.
+
+**Implication for app config targeting Spin.** If the adapter set
+includes `spin`, `config validate` additionally checks that every
+flattened config key, after `.`→`__` translation, matches
+`^[a-z][a-z0-9_]*$` — i.e. config field names must be lowercase
 snake_case. This is consistent with idiomatic serde field naming.
 
 ### 6.8 Secret annotations via `#[derive(AppConfig)]`
@@ -649,12 +715,15 @@ API are coupled; with a hard cutoff they ship together as one commit
 **Tests:** manifest round-trip + validation (non-empty ids; default
 required when `ids.len() > 1`; capability check — declaring two config
 ids with spin present → error; per-adapter completeness for `Multi`
-pairs; Cloudflare JS-identifier + Spin KV-label checks; pre-rewrite
-manifest → hard error with migration message); id-keyed contract-test
-factories across all four adapters; cross-adapter named-KV test;
-Cloudflare config-from-KV async round-trip; Spin config `.`→`__`
-translation test; `Kv`/`Secrets`/`Config` extractor tests; `app!`
-macro metadata registry test.
+pairs; a per-id block on a `Single` (adapter, kind) pair → error;
+Cloudflare JS-identifier + Spin KV-label checks; pre-rewrite manifest →
+hard error with migration message); id-keyed contract-test factories
+across all four adapters; cross-adapter named-KV test; Cloudflare
+config-from-KV async round-trip; Spin config `.`→`__` translation test;
+**Spin TTL write returns `KvError::Unsupported`** (contract test);
+Spin KV listing-cap pagination test (and its error-variant decision,
+§6.7); `Kv`/`Secrets`/`Config` extractor tests; `app!` macro metadata
+registry test.
 
 **Ship gate:** multi-store handlers work on axum, cloudflare, fastly,
 and spin; async config reads work; all four CI gates green (including
@@ -700,13 +769,24 @@ Bound: `DeserializeOwned + Validate + AppConfigMeta` (no `Serialize`).
 App-config validation: TOML syntax; `[config]` present; deserialises
 into `C`; types; `validator` rules; unknown fields rejected when `C`
 opts in; `#[secret]` non-empty; `#[secret(store_ref)]` in
-`[stores.secrets].ids`. **When `spin` is in the adapter set:** every
-flattened config key, `.`→`__` translated, must match `[a-z][a-z0-9_]*`
-(§6.7). Manifest: `ManifestLoader` checks; under `--strict`,
-capability-aware completeness and well-formed handler paths.
+`[stores.secrets].ids`. **When `spin` is in the adapter set**, three
+additional Spin checks (all per §6.7):
 
-**Tests:** dedicated fixtures per failure mode incl. the Spin
-key-syntax check; env-overlay on/off.
+1. every flattened config key, `.`→`__` translated, matches
+   `^[a-z][a-z0-9_]*$`;
+2. the effective Spin variable name set — {flattened config keys} ∪
+   {`#[secret]` field values}, after `.`→`__` translation — has no
+   duplicate (config/secret namespace collision check);
+3. Spin component discovery resolves (exactly one `[component.*]` in
+   `spin.toml`, or an explicit, matching `[adapters.spin.adapter]
+   .component`).
+
+Manifest: `ManifestLoader` checks; under `--strict`, capability-aware
+completeness and well-formed handler paths.
+
+**Tests:** dedicated fixtures per failure mode incl. all three Spin
+checks above (key-syntax, collision, component discovery); env-overlay
+on/off.
 
 **Ship gate:** `app-demo-cli config validate --strict` exits 0;
 corrupted fixtures fail with expected messages.
@@ -765,22 +845,31 @@ push` resolves them on demand (§13).
 
 **spin** — no remote `create` step (Spin KV stores and variables are
 provisioned by the Spin runtime / Fermyon at deploy). `provision
---adapter spin` performs `spin.toml` writeback:
-- KV: ensure each label appears in the component's
-  `key_value_stores` list (`[component.<component>.key_value_stores]`).
-- Config + secrets: ensure each Spin variable is declared in the
-  top-level `[variables]` table and bound in
-  `[component.<component>.variables]`. (The component name comes from
-  the Spin adapter's `[adapters.spin.adapter]` manifest reference.)
-No `CommandRunner` calls for Spin — it is pure manifest editing.
+--adapter spin` performs **KV-label `spin.toml` writeback only**:
+
+- KV: ensure each KV label (`[adapters.spin.stores.kv.<id>].name`)
+  appears in the resolved component's `key_value_stores` array field
+  (`key_value_stores = [...]` under `[component.<component>]`).
+- **Config and secret variables are NOT handled by `provision`.** The
+  manifest only carries store *ids*, not app-config field keys or
+  secret key names — `provision` cannot know which Spin variables to
+  declare. Config-variable declaration is done by `config push
+  --adapter spin` (which loads `<name>.toml` and therefore knows the
+  keys; see §13). Secret-variable declaration is **manual** — the
+  developer declares Spin secret variables in `spin.toml` themselves
+  (§6.7); the CLI never writes secret variables.
+
+Component resolution for the KV writeback follows §6.7's rule. No
+`CommandRunner` calls for Spin — it is pure manifest editing.
 
 `--dry-run` prints the would-be `CommandSpec`s and would-be manifest
 edits without performing them.
 
 **Tests:** per-(adapter, kind) mock-runner for cloudflare/fastly with
 scripted stdout; golden ID-extraction parsers; temp-fixture writeback
-verified for `wrangler.toml`, `fastly.toml`, and `spin.toml`; axum
-no-op output asserted; `--dry-run` performs nothing.
+verified for `wrangler.toml`, `fastly.toml`, and the Spin
+`key_value_stores` array in `spin.toml`; axum no-op output asserted;
+`--dry-run` performs nothing.
 
 ## 13. Sub-project 7 — `config push` command
 
@@ -804,17 +893,38 @@ overlay unless `--no-env`); flatten + serialise per §6.4/§6.5 (skip
 `SECRET_FIELDS`); resolve target id (`--store` or resolved default).
 Push is **split by adapter** — there is no single "resource-ID" model:
 
-| Adapter    | Push behaviour |
-|------------|----------------|
-| axum       | Write resolved values to `.edgezero/local-config-<id>.json` (the file the axum config store reads, §15). No runner call. |
-| cloudflare | Read the namespace id from `wrangler.toml` (error "did you run `provision`?" if absent); `wrangler kv bulk put <tempfile.json> --namespace-id=<id>`. Keys in dotted form. |
+| Adapter    | Push behaviour                                                                                                                                                                                                            |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| axum       | Write resolved values to `.edgezero/local-config-<id>.json` (the file the axum config store reads, §15). No runner call.                                                                                                  |
+| cloudflare | Read the namespace id from `wrangler.toml` (error "did you run `provision`?" if absent); `wrangler kv bulk put <tempfile.json> --namespace-id=<id>`. Keys in dotted form.                                                 |
 | fastly     | Resolve the store id on demand: `fastly config-store list --json`, match by `<name>`; per key `fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>` (`--stdin` for large values). Keys in dotted form. |
-| spin       | Write each value as a Spin variable into `spin.toml`'s `[variables]` table (static default values), keys in `.`→`__` lowercase form (§6.7). No remote call — live Fermyon Cloud variable push is out of scope (§2). |
+| spin       | Declare + set each config value as a Spin variable, writing **both** `spin.toml` tables (see below). Keys in `.`→`__` lowercase form (§6.7). No remote call — live Fermyon Cloud variable push is out of scope (§2). |
+
+**Spin `config push` writes two `spin.toml` tables.** A Spin variable
+is not readable by a component unless it is both *declared* and
+*bound*. `config push --adapter spin` therefore writes:
+
+1. `[variables].<key>` — the application-level variable declaration,
+   with `default = "<resolved value>"`.
+2. `[component.<component>.variables].<key>` — the component binding,
+   `<key> = "{{ <key> }}"`, surfacing the application variable into the
+   component. Without this, the component cannot read the variable.
+
+If the component-bindings table is missing entries for keys this push
+needs and `config push` cannot resolve the component (§6.7), it
+errors rather than writing a half-configured manifest. The component
+is resolved per §6.7's discovery rule. Config-variable *declaration*
+lives here (not in `provision`) because only `config push` loads
+`<name>.toml` and thus knows the keys. Secret variables remain manual
+(§6.7) — `config push` skips `SECRET_FIELDS` and never writes secret
+variables.
 
 **Tests:** typed + raw; per-adapter mock-runner / fixture with golden
 payloads; `#[secret]` / `#[secret(store_ref)]` absent from payload;
 missing native-manifest id (cloudflare) → clear error; Spin key
-`.`→`__` translation asserted; `--store` selection; `--dry-run`
+`.`→`__` translation asserted; Spin writeback updates **both**
+`[variables]` and `[component.<component>.variables]`; Spin push errors
+when the component cannot be resolved; `--store` selection; `--dry-run`
 performs nothing; env-overlay on vs `--no-env`. **Explicit "validate
 passes, push serialization fails" cases:** non-object typed config,
 unsupported compound shape, `skip_serializing_if`, `Option::None`,
@@ -843,19 +953,30 @@ all four adapters.
 - **Async config:** a handler does
   `ctx.config_store_default()?.get("greeting").await?`.
 - **Nested config + Spin key encoding:** `AppDemoConfig.service.
-  timeout_ms` is read at runtime; the Spin path proves `.`→`__`
+timeout_ms` is read at runtime; the Spin path proves `.`→`__`
   translation.
 - **Env-var override:** an integration test sets
   `APP_DEMO__SERVICE__TIMEOUT_MS` and asserts the override.
 - **Secrets:** one `#[secret]` (`api_token`) and one
-  `#[secret(store_ref)]` (`vault`); a handler reads each.
+  `#[secret(store_ref)]` (`vault`); a handler reads each. `app-demo`'s
+  `spin.toml` **manually declares** its Spin secret variables (with
+  `secret = true`, bound under `[component.<component>.variables]`),
+  demonstrating the §6.7 manual-secret rule. The `app-demo-core`
+  handler keeps its `#[secret(store_ref)]` runtime key clear of every
+  config key so the Spin flat namespace does not collide.
+- **Spin component:** `app-demo`'s `spin.toml` is single-component, so
+  component discovery resolves implicitly; the walkthrough doc also
+  shows the explicit `[adapters.spin.adapter].component` form.
 - **`config validate` / `config push`:** CI runs `config validate
-  --strict` (exit 0) then `config push --adapter axum` and reads the
-  value back through a running axum dev server on `/config/greeting`.
-  `config push --adapter spin --dry-run` is asserted to produce
-  `__`-encoded keys.
+--strict` (exit 0 — including the three Spin checks of §10) then
+  `config push --adapter axum` and reads the value back through a
+  running axum dev server on `/config/greeting`. `config push
+  --adapter spin --dry-run` is asserted to produce `__`-encoded keys
+  and to write **both** `spin.toml` tables.
 - **`auth` / `provision`:** exercised against `MockCommandRunner` (and,
   for spin/axum provision, against temp-fixture manifests) in tests.
+  Spin `provision` is asserted to write only the `key_value_stores`
+  array, not variables.
 
 **Axum config store backing.** The axum config store is backed by
 `.edgezero/local-config-<id>.json` (gitignored). `config push
@@ -878,16 +999,16 @@ contract + mock tests.
 The whole effort is **a single pull request containing eight commits**,
 one per sub-project, applied in this order:
 
-| Commit | § | Title | Risk |
-|--------|---|-------|------|
-| 1 | §7  | Extensible lib + scaffold | M |
-| 2 | §8  | Manifest + runtime rewrite (atomic, all four adapters) | H |
-| 3 | §9  | App-config schema + derive macro + env-overlay loader | M |
-| 4 | §10 | `config validate` | L |
-| 5 | §11 | `auth` + `CommandRunner` | M |
-| 6 | §12 | `provision` | H |
-| 7 | §13 | `config push` | M |
-| 8 | §15 | `app-demo` polish (all four adapters) | M |
+| Commit | §   | Title                                                  | Risk |
+| ------ | --- | ------------------------------------------------------ | ---- |
+| 1      | §7  | Extensible lib + scaffold                              | M    |
+| 2      | §8  | Manifest + runtime rewrite (atomic, all four adapters) | H    |
+| 3      | §9  | App-config schema + derive macro + env-overlay loader  | M    |
+| 4      | §10 | `config validate`                                      | L    |
+| 5      | §11 | `auth` + `CommandRunner`                               | M    |
+| 6      | §12 | `provision`                                            | H    |
+| 7      | §13 | `config push`                                          | M    |
+| 8      | §15 | `app-demo` polish (all four adapters)                  | M    |
 
 **CI and bisectability.** CI gates the PR as a whole on its head
 commit; all four gates (`fmt`, `clippy -D warnings`, `cargo test`,
@@ -931,6 +1052,20 @@ writeback across four adapters (`wrangler.toml`, `fastly.toml`,
 - **Spin config is build-time:** `config push --adapter spin` writes
   static `spin.toml` variables; changing them needs a redeploy. Live
   Spin variable providers are out of scope (§2).
+- **Spin secret variables are manual:** the CLI never declares Spin
+  secret variables (their key names are not reliably knowable, §6.7).
+  A project targeting Spin must declare them in `spin.toml` by hand;
+  the walkthrough doc covers this. `#[secret(store_ref)]` is the
+  awkward case on Spin (single flat secret namespace, code-local
+  keys) — supported, but the developer owns the `spin.toml` entries.
+- **Spin KV TTL / listing-cap:** TTL writes return
+  `KvError::Unsupported` on Spin (deterministic, not silent). The
+  listing-cap error variant is an open reconciliation point with
+  PR #253 (§6.7) — resolved in commit 2, not a blocker.
+- **Spin component discovery:** writing `[component.<name>.*]` tables
+  needs the component id; single-component `spin.toml` resolves
+  implicitly, multi-component requires `[adapters.spin.adapter]
+  .component`. `config validate --strict` surfaces a failure early.
 - **Env overlay surprising `config push`:** `--no-env` is the escape
   hatch.
 - **Shell-out + ID-writeback fragility:** current platform syntax
@@ -943,13 +1078,13 @@ writeback across four adapters (`wrangler.toml`, `fastly.toml`,
 ## 18. What this spec does not cover
 
 - Anthropic credentials, edge DNS / TLS, observability / metrics.
-- Per-environment config *files* (env-var override is in scope).
+- Per-environment config _files_ (env-var override is in scope).
 - Restructuring `app-demo-core` handlers beyond what §15 requires.
 - `edgezero-core` changes beyond `app_config`, the rewritten
   `manifest` / `RequestContext` / `Hooks` / `ConfigStore` (async) /
   extractor / `ConfigStoreMetadata` / `app!` surface, and the
   Cloudflare adapter config backend.
-- A migration *tool*; migration is manual via the published guide.
+- A migration _tool_; migration is manual via the published guide.
 - Dynamic Spin variable providers (Fermyon Cloud variable push, Vault).
 
 When all eight sub-projects ship, `edgezero new myapp` produces a
