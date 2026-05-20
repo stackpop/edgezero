@@ -591,12 +591,25 @@ only on scalar string fields; error if combined with
 declared. `StoreRef` — value appears in `[stores.secrets].ids`.
 **Push:** both kinds skipped.
 
+**Interaction with the secrets capability matrix.** Axum, Cloudflare,
+and Spin are all `Single` for secrets (§6.6) — only Fastly is `Multi`.
+So any project whose adapter set includes axum, cloudflare, or spin
+can declare exactly **one** secrets id (the capability check forces
+`[stores.secrets].ids.len() == 1`). For such a project — which
+includes any all-four-adapter app — every `#[secret(store_ref)]`
+field's value must be that single secrets id; there is no other valid
+target. `#[secret(store_ref)]` only buys multiple distinct secret
+stores on a Fastly-only project. `config validate` already enforces
+"value ∈ `[stores.secrets].ids`", so a wrong id fails validation; the
+walkthrough doc calls this out explicitly.
+
 **Runtime usage:**
 
 ```rust
 // #[secret] (KeyInDefault):
 let token = ctx.secret_store_default()?.require_str(&cfg.api_token).await?;
-// #[secret(store_ref)] (StoreRef):
+// #[secret(store_ref)] (StoreRef) — on an all-four-adapter app,
+// cfg.vault is necessarily the single declared secrets id:
 let token = ctx.secret_store(&cfg.vault)?.require_str("active").await?;
 ```
 
@@ -766,8 +779,15 @@ API are coupled; with a hard cutoff they ship together as one commit
 - **Migrate in-tree:** `examples/app-demo/edgezero.toml` rewritten to
   the new schema with all four adapters declaring stores
   (≥2 KV ids `sessions`+`cache`; exactly one config id and one
-  secrets id, as the Spin capability rule requires); `app-demo`
-  handlers updated to id-keyed accessors.
+  secrets id, as the Spin capability rule requires). `app-demo`
+  handlers are migrated **only for the store-accessor change** in
+  commit 2 — `ctx.kv_store(id)` / `config_store` / the refactored
+  `Kv` / `Secrets` / `Config` extractors. Commit 2 does **not**
+  introduce `AppDemoConfig` or any typed-app-config handler work:
+  that type is created in commit 3 (§9), and `examples/app-demo/
+  app-demo.toml` does not exist yet. This keeps commit 2
+  independently buildable — no commit-2 code references a type that
+  lands in commit 3.
 - **`docs/guide/manifest-store-migration.md`** published.
 
 **Tests:** manifest round-trip + validation (non-empty ids; default
@@ -1016,6 +1036,17 @@ passes, push serialization fails" cases:** non-object typed config,
 unsupported compound shape, `skip_serializing_if`, `Option::None`,
 `#[serde(flatten)]` on a non-secret field.
 
+**Spin `spin.toml` golden test.** A golden-file test captures the
+generated `spin.toml` after a Spin `config push` and asserts: every
+written variable name matches `^[a-z][a-z0-9_]*$` (§6.7); the
+generated manifest **parses** (round-trips through the same TOML /
+Spin-manifest parser the runtime uses), so the
+`^[a-z][a-z0-9_]*$` rule cannot silently drift from Spin's actual
+manifest behaviour. If `spin_sdk` exposes a manifest-validation entry
+point, the test calls it; otherwise it parses with `toml` and checks
+the variable-name regex. The golden file is regenerated only on an
+intentional format change.
+
 **Ship gate:** `app-demo-cli config push --adapter cloudflare
 --dry-run` and `--adapter spin --dry-run` each show the expected
 output; secret fields absent; Spin keys `__`-encoded.
@@ -1044,12 +1075,17 @@ timeout_ms` is read at runtime; the Spin path proves `.`→`__`
 - **Env-var override:** an integration test sets
   `APP_DEMO__SERVICE__TIMEOUT_MS` and asserts the override.
 - **Secrets:** one `#[secret]` (`api_token`) and one
-  `#[secret(store_ref)]` (`vault`); a handler reads each. `app-demo`'s
-  `spin.toml` **manually declares** its Spin secret variables (with
-  `secret = true`, bound under `[component.<component>.variables]`),
-  demonstrating the §6.7 manual-secret rule. The `app-demo-core`
-  handler keeps its `#[secret(store_ref)]` runtime key clear of every
-  config key so the Spin flat namespace does not collide.
+  `#[secret(store_ref)]` (`vault`); a handler reads each. `app-demo`
+  targets all four adapters, so `[stores.secrets].ids` has exactly one
+  id (§6.6 capability rule) and the `vault` field's value **is** that
+  single secrets id — the walkthrough doc explicitly shows
+  `#[secret(store_ref)]` resolving to the one declared id for an
+  all-four-adapter app (§6.8). `app-demo`'s `spin.toml` **manually
+  declares** its Spin secret variables (with `secret = true`, bound
+  under `[component.<component>.variables]`), demonstrating the §6.7
+  manual-secret rule. The `app-demo-core` handler keeps its
+  `#[secret(store_ref)]` runtime key clear of every config key so the
+  Spin flat namespace does not collide.
 - **Spin component:** `app-demo`'s `spin.toml` is single-component, so
   component discovery resolves implicitly; the walkthrough doc also
   shows the explicit `[adapters.spin.adapter].component` form.
