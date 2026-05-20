@@ -10,30 +10,42 @@ pub struct Args {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Build the project for a target edge.
-    Build {
-        #[arg(long = "adapter", required = true)]
-        adapter: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        adapter_args: Vec<String>,
-    },
+    Build(BuildArgs),
+    /// Run the example app locally on the axum demo server.
+    Demo,
     /// Deploy to a target edge.
-    Deploy {
-        #[arg(long = "adapter", required = true)]
-        adapter: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        adapter_args: Vec<String>,
-    },
-    /// Run a local simulation (if available).
-    Dev,
+    Deploy(DeployArgs),
     /// Create a new `EdgeZero` app skeleton (multi-crate workspace).
     New(NewArgs),
     /// Run a local simulation (adapter-specific).
-    Serve {
-        #[arg(long = "adapter", required = true)]
-        adapter: String,
-    },
+    Serve(ServeArgs),
 }
 
+/// Arguments for the `build` command.
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct BuildArgs {
+    /// Target adapter name.
+    #[arg(long = "adapter", required = true)]
+    pub adapter: String,
+    /// Arguments passed through to the adapter build command.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub adapter_args: Vec<String>,
+}
+
+/// Arguments for the `deploy` command.
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct DeployArgs {
+    /// Target adapter name.
+    #[arg(long = "adapter", required = true)]
+    pub adapter: String,
+    /// Arguments passed through to the adapter deploy command.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub adapter_args: Vec<String>,
+}
+
+/// Arguments for the `new` command.
 #[derive(clap::Args, Debug)]
 pub struct NewArgs {
     /// Directory to create the app in (default: current dir).
@@ -46,9 +58,25 @@ pub struct NewArgs {
     pub name: String,
 }
 
+/// Arguments for the `serve` command.
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct ServeArgs {
+    /// Target adapter name.
+    #[arg(long = "adapter", required = true)]
+    pub adapter: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_args_derives_default() {
+        let args = BuildArgs::default();
+        assert!(args.adapter.is_empty());
+        assert!(args.adapter_args.is_empty());
+    }
 
     #[test]
     fn missing_required_adapter_returns_error() {
@@ -67,10 +95,10 @@ mod tests {
             "value",
         ])
         .expect("parse build");
-        let Command::Build {
+        let Command::Build(BuildArgs {
             adapter,
             adapter_args,
-        } = args.cmd
+        }) = args.cmd
         else {
             panic!("expected Command::Build");
         };

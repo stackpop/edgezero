@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/app-demo-core",
+  "crates/app-demo-cli",
   "crates/app-demo-adapter-axum",
   "crates/app-demo-adapter-cloudflare",
   "crates/app-demo-adapter-fastly",
@@ -16,10 +17,12 @@ anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 bytes = "1"
+clap = { version = "4", features = ["derive"] }
 edgezero-adapter-axum = { path = "../../crates/edgezero-adapter-axum" }
 edgezero-adapter-cloudflare = { path = "../../crates/edgezero-adapter-cloudflare" }
 edgezero-adapter-fastly = { path = "../../crates/edgezero-adapter-fastly" }
 edgezero-adapter-spin = { path = "../../crates/edgezero-adapter-spin" }
+edgezero-cli = { path = "../../crates/edgezero-cli" }
 edgezero-core = { path = "../../crates/edgezero-core" }
 spin-sdk = { version = "5.2", default-features = false }
 fastly = "0.12"

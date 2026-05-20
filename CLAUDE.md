@@ -19,7 +19,7 @@ crates/
   edgezero-adapter-cloudflare/# Cloudflare Workers bridge (wasm32-unknown-unknown)
   edgezero-adapter-spin/      # Fermyon Spin bridge (wasm32-wasip1)
   edgezero-adapter-axum/      # Axum/Tokio bridge (native, dev server)
-  edgezero-cli/               # CLI: new, build, deploy, dev, serve
+  edgezero-cli/               # CLI lib + bin: new, build, deploy, demo, serve
 examples/app-demo/            # Reference app with all 4 adapters (excluded from workspace)
 docs/                         # VitePress documentation site (Node.js)
 scripts/                      # Build/deploy/test helper scripts
@@ -55,8 +55,8 @@ cargo check --workspace --all-targets --features "fastly cloudflare spin"
 # Spin wasm32 compilation check
 cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
 
-# Run the demo dev server
-cargo run -p edgezero-cli --features dev-example -- dev
+# Run the demo server
+cargo run -p edgezero-cli --features dev-example -- demo
 
 # Docs site
 cd docs && npm ci && npm run dev

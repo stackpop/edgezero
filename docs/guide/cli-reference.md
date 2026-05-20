@@ -50,23 +50,26 @@ my-app/
 
 The scaffolder includes all adapters registered at CLI build time.
 
-### edgezero dev
+### edgezero demo
 
-Start the local development server:
+Run the example app locally on the axum demo server:
 
 ```bash
-edgezero dev
+edgezero demo
 ```
 
 **Example:**
 
 ```bash
-edgezero dev
+edgezero demo
 # Server starts at http://127.0.0.1:8787
 ```
 
-If `edgezero.toml` defines an Axum adapter command, `edgezero dev` delegates to it. Otherwise it
-starts the built-in dev server (default routes).
+If `edgezero.toml` defines an Axum adapter command, `edgezero demo` delegates to it. Otherwise it
+starts the built-in demo server (default routes).
+
+> The subcommand is named `demo` — the name `dev` is reserved for a future
+> dev-workflow command.
 
 ### edgezero build
 
@@ -219,6 +222,45 @@ Install the provider CLI:
 
 - Fastly: https://developer.fastly.com/learning/compute/
 - Cloudflare: `npm install -g wrangler`
+
+## Building Your Own CLI
+
+`edgezero-cli` is published as a library as well as a binary. Every built-in
+command is exposed as a `(*Args, run_*)` pair (`BuildArgs` / `run_build`,
+`DeployArgs` / `run_deploy`, `NewArgs` / `run_new`, `ServeArgs` / `run_serve`,
+`run_demo`), so a downstream project can build its own CLI binary that reuses
+any subset of the built-ins and adds its own subcommands:
+
+```rust
+use clap::{Parser, Subcommand};
+use edgezero_cli::args::{BuildArgs, DeployArgs};
+
+#[derive(Parser)]
+struct Args {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    Build(BuildArgs),       // reuse the built-in
+    Deploy(DeployArgs),     // reuse the built-in
+    Migrate,                // your own subcommand
+}
+
+fn main() {
+    edgezero_cli::init_cli_logger();
+    let result = match Args::parse().cmd {
+        Cmd::Build(args) => edgezero_cli::run_build(&args),
+        Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Cmd::Migrate => run_migrate(),
+    };
+    // ...
+}
+```
+
+`edgezero new <name>` scaffolds exactly this pattern into a `crates/<name>-cli`
+crate, and `examples/app-demo/crates/app-demo-cli` is the in-tree reference.
 
 ## Next Steps
 

@@ -63,6 +63,8 @@ struct AdapterContext<'blueprint> {
 }
 
 struct ProjectLayout {
+    cli_dir: PathBuf,
+    cli_name: String,
     core_dir: PathBuf,
     core_mod: String,
     core_name: String,
@@ -92,9 +94,16 @@ impl ProjectLayout {
         let core_src = core_dir.join("src");
         fs::create_dir_all(&core_src).map_err(|err| GeneratorError::io(&core_src, err))?;
 
+        let cli_name = format!("{name}-cli");
+        let cli_dir = crates_dir.join(&cli_name);
+        let cli_src = cli_dir.join("src");
+        fs::create_dir_all(&cli_src).map_err(|err| GeneratorError::io(&cli_src, err))?;
+
         let project_mod = name.replace('-', "_");
         let core_mod = core_name.replace('-', "_");
         Ok(ProjectLayout {
+            cli_dir,
+            cli_name,
             core_dir,
             core_mod,
             core_name,
@@ -124,12 +133,14 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
     let mut workspace_dependencies = seed_workspace_dependencies();
     let cwd = env::current_dir().map_err(|err| GeneratorError::io(".", err))?;
     let core_crate_line = resolve_core_dependency(&layout, &cwd, &mut workspace_dependencies);
+    let cli_crate_line = resolve_cli_dependency(&layout, &cwd, &mut workspace_dependencies);
 
     let adapter_artifacts = collect_adapter_data(&layout, &cwd, &mut workspace_dependencies)?;
 
     let mut data_map = build_base_data(
         &layout,
         &core_crate_line,
+        &cli_crate_line,
         &adapter_artifacts,
         &workspace_dependencies,
     );
@@ -164,6 +175,10 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     );
     deps.insert("axum".to_owned(), "axum = \"0.8\"".to_owned());
     deps.insert(
+        "clap".to_owned(),
+        "clap = { version = \"4\", features = [\"derive\"] }".to_owned(),
+    );
+    deps.insert(
         "serde".to_owned(),
         "serde = { version = \"1\", features = [\"derive\"] }".to_owned(),
     );
@@ -189,6 +204,27 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "spin-sdk = { version = \"5.2\", default-features = false }".to_owned(),
     );
     deps
+}
+
+fn resolve_cli_dependency(
+    layout: &ProjectLayout,
+    cwd: &Path,
+    workspace_dependencies: &mut BTreeMap<String, String>,
+) -> String {
+    let ResolvedDependency {
+        name,
+        workspace_line,
+        crate_line,
+    } = resolve_dep_line(
+        &layout.out_dir,
+        cwd,
+        "crates/edgezero-cli",
+        "edgezero-cli = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-cli\" }",
+        &[],
+    );
+
+    workspace_dependencies.entry(name).or_insert(workspace_line);
+    crate_line
 }
 
 fn resolve_core_dependency(
@@ -429,12 +465,14 @@ fn append_readme_entries(
 fn build_base_data(
     layout: &ProjectLayout,
     core_crate_line: &str,
+    cli_crate_line: &str,
     artifacts: &AdapterArtifacts,
     workspace_dependencies: &BTreeMap<String, String>,
 ) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert("name".into(), Value::String(layout.name.clone()));
     data.insert("proj_core".into(), Value::String(layout.core_name.clone()));
+    data.insert("proj_cli".into(), Value::String(layout.cli_name.clone()));
     data.insert(
         "proj_core_mod".into(),
         Value::String(layout.core_mod.clone()),
@@ -443,6 +481,10 @@ fn build_base_data(
     data.insert(
         "dep_edgezero_core".into(),
         Value::String(core_crate_line.to_owned()),
+    );
+    data.insert(
+        "dep_edgezero_cli".into(),
+        Value::String(cli_crate_line.to_owned()),
     );
 
     let adapter_list_str = artifacts
@@ -542,6 +584,20 @@ fn render_templates(
         &layout.core_dir.join("src/handlers.rs"),
     )?;
 
+    log::info!("[edgezero] writing cli crate {}", layout.cli_name);
+    write_tmpl(
+        &hbs,
+        "cli_Cargo_toml",
+        data_value,
+        &layout.cli_dir.join("Cargo.toml"),
+    )?;
+    write_tmpl(
+        &hbs,
+        "cli_src_main_rs",
+        data_value,
+        &layout.cli_dir.join("src/main.rs"),
+    )?;
+
     for context in adapter_contexts {
         let crate_dir_name = context
             .dir
@@ -637,58 +693,67 @@ mod tests {
             .contains("failed to format generator output"));
     }
 
-    #[test]
-    fn generate_new_scaffolds_workspace_layout() {
-        let temp = TempDir::new().expect("temp dir");
-        let bin_dir = temp.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
+    fn write_git_stub(bin_dir: &Path) {
+        fs::create_dir_all(bin_dir).expect("bin dir");
         let git_path = if cfg!(windows) {
             bin_dir.join("git.cmd")
         } else {
             bin_dir.join("git")
         };
-
         if cfg!(windows) {
             fs::write(&git_path, b"@echo off\r\nexit /b 0\r\n").expect("write git stub");
         } else {
             fs::write(&git_path, b"#!/bin/sh\nexit 0\n").expect("write git stub");
         }
-
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let mut perms = fs::metadata(&git_path).expect("metadata").permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&git_path, perms).expect("chmod");
-        };
+        }
+    }
 
-        let _path_guard = PathOverride::prepend(&bin_dir);
-
-        let args = NewArgs {
-            name: "demo-app".into(),
-            dir: Some(temp.path().to_string_lossy().into_owned()),
-            local_core: false,
-        };
-
-        generate_new(&args).expect("scaffold succeeds");
-
-        let project_dir = temp.path().join("demo-app");
+    fn assert_scaffold_files(project_dir: &Path) {
         assert!(project_dir.is_dir(), "project directory created");
         assert!(project_dir.join("Cargo.toml").exists());
         assert!(project_dir.join("edgezero.toml").exists());
         assert!(project_dir.join(".gitignore").exists());
         assert!(project_dir.join("README.md").exists());
         assert!(project_dir.join("crates/demo-app-core/src/lib.rs").exists());
+        assert!(
+            project_dir.join("crates/demo-app-cli/Cargo.toml").exists(),
+            "<name>-cli crate Cargo.toml should be scaffolded"
+        );
+        assert!(
+            project_dir.join("crates/demo-app-cli/src/main.rs").exists(),
+            "<name>-cli crate main.rs should be scaffolded"
+        );
+        assert!(
+            project_dir
+                .join("crates/demo-app-adapter-spin/spin.toml")
+                .exists(),
+            "spin.toml should be scaffolded"
+        );
+    }
 
+    fn assert_scaffold_workspace(project_dir: &Path) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
-        assert!(cargo_toml.contains("crates/demo-app-core"));
-        assert!(cargo_toml.contains("crates/demo-app-adapter-cloudflare"));
-        assert!(cargo_toml.contains("crates/demo-app-adapter-fastly"));
-        assert!(
-            cargo_toml.contains("crates/demo-app-adapter-spin"),
-            "workspace Cargo.toml should include spin adapter"
-        );
+        for member in [
+            "crates/demo-app-core",
+            "crates/demo-app-cli",
+            "crates/demo-app-adapter-cloudflare",
+            "crates/demo-app-adapter-fastly",
+            "crates/demo-app-adapter-spin",
+        ] {
+            assert!(
+                cargo_toml.contains(member),
+                "workspace Cargo.toml should include {member}"
+            );
+        }
+        assert!(cargo_toml.contains("[workspace.lints.clippy]"));
+        assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
 
         let manifest =
             fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
@@ -698,25 +763,18 @@ mod tests {
             manifest.contains("[adapters.spin"),
             "edgezero.toml should include spin adapter section"
         );
-        assert!(
-            project_dir
-                .join("crates/demo-app-adapter-spin/spin.toml")
-                .exists(),
-            "spin.toml should be scaffolded"
-        );
 
         let gitignore =
             fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
         assert!(gitignore.contains("target/"));
-
         let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
         assert!(clippy.contains("allow-expect-in-tests = true"));
+    }
 
-        assert!(cargo_toml.contains("[workspace.lints.clippy]"));
-        assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
-
+    fn assert_scaffold_crate_lints(project_dir: &Path) {
         for crate_dir in [
             "crates/demo-app-core",
+            "crates/demo-app-cli",
             "crates/demo-app-adapter-axum",
             "crates/demo-app-adapter-cloudflare",
             "crates/demo-app-adapter-fastly",
@@ -730,5 +788,26 @@ mod tests {
                 "{crate_dir} must inherit workspace lints",
             );
         }
+    }
+
+    #[test]
+    fn generate_new_scaffolds_workspace_layout() {
+        let temp = TempDir::new().expect("temp dir");
+        let bin_dir = temp.path().join("bin");
+        write_git_stub(&bin_dir);
+        let _path_guard = PathOverride::prepend(&bin_dir);
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+            local_core: false,
+        };
+
+        generate_new(&args).expect("scaffold succeeds");
+
+        let project_dir = temp.path().join("demo-app");
+        assert_scaffold_files(&project_dir);
+        assert_scaffold_workspace(&project_dir);
+        assert_scaffold_crate_lints(&project_dir);
     }
 }
