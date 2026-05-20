@@ -1,32 +1,30 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls:*)",
-      "Bash(cat:*)",
-      "Bash(head:*)",
-      "Bash(tail:*)",
-      "Bash(wc:*)",
-      "Bash(tree:*)",
-      "Bash(which:*)",
-
       "Bash(cargo build:*)",
-      "Bash(cargo test:*)",
       "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
       "Bash(cargo metadata:*)",
       "Bash(cargo run -p edgezero-cli:*)",
-
-      "Bash(cargo fmt:*)",
-      "Bash(cargo clippy:*)",
-
-      "Bash(npm ci:*)",
-      "Bash(npm run:*)",
-
-      "Bash(rustup target:*)",
-
-      "Bash(git status:*)",
+      "Bash(cargo test:*)",
+      "Bash(cat:*)",
+      "Bash(git branch:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
-      "Bash(git branch:*)"
+      "Bash(git status:*)",
+      "Bash(head:*)",
+      "Bash(ls:*)",
+      "Bash(npm ci:*)",
+      "Bash(npm run:*)",
+      "Bash(rustup target:*)",
+      "Bash(tail:*)",
+      "Bash(tree:*)",
+      "Bash(wc:*)",
+      "Bash(which:*)"
     ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
   }
 }
