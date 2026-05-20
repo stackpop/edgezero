@@ -207,9 +207,16 @@ pub struct BoundConfigStore { /* ... */ }
 pub struct BoundSecretStore { /* ... */ }
 impl BoundConfigStore { pub async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>; }
 impl BoundKvStore     { /* async CRUD */ }
-impl BoundSecretStore { pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, SecretStoreError>; }
+// Secret store keeps the existing bytes::Bytes API (no Vec<u8>, no extra alloc).
+impl BoundSecretStore {
+    pub async fn get(&self, key: &str) -> Result<Option<bytes::Bytes>, SecretError>;
+    pub async fn require_str(&self, key: &str) -> Result<String, SecretError>;
+}
 
-// RequestContext store API (rewritten in sub-project #3)
+// RequestContext store API (rewritten in sub-project #3) — returns BOUND,
+// per-request handles. This is the only surface that yields bound handles,
+// because binding needs per-request adapter state (Cloudflare Env, Fastly
+// runtime state, Axum local handles).
 impl RequestContext {
     pub fn kv_store(&self, id: &str) -> Option<BoundKvStore>;
     pub fn kv_store_default(&self) -> Option<BoundKvStore>;
@@ -219,7 +226,12 @@ impl RequestContext {
     pub fn secret_store_default(&self) -> Option<BoundSecretStore>;
 }
 
-// Hooks gains the same id-keyed accessors returning Bound*Store.
+// Hooks does NOT return bound handles. Hooks is static, compile-time app
+// metadata (the app! macro emits it). It exposes store *metadata*
+// registries — logical ids, the resolved default, per-adapter names —
+// keyed by store kind. Adapters consume that metadata at request setup to
+// build the runtime registries that back RequestContext's bound handles.
+// See §6.8 and §9.
 
 // Extractors (refactored in sub-project #3): see §6.8.
 pub struct Kv(/* per-request KV registry */);
@@ -261,7 +273,7 @@ crates/edgezero-cli/
   tests/lib_consumer.rs       # NEW
 
 crates/edgezero-core/src/
-  manifest.rs                 # REWRITTEN store schema (Option<LogicalStoreConfig> + per-adapter map)
+  manifest.rs                 # store schema: compat structs in #2 (legacy + ids), legacy fields dropped in #3
   context.rs                  # REWRITTEN store accessors (id-keyed; return Bound*Store)
   app_config.rs               # NEW: AppConfigMeta + SecretField/Kind + loaders w/ env overlay
   config_store.rs             # ConfigStore trait becomes async
@@ -403,14 +415,38 @@ crate    = "crates/app-demo-adapter-spin"
 manifest = "crates/app-demo-adapter-spin/spin.toml"
 ```
 
-**Old-vs-new discrimination (HIGH #4 fix):** each `[stores.<kind>]`
-deserialises into `Option<LogicalStoreConfig>`. An `edgezero.toml`
-written before this effort has no `[stores.<kind>]` in the new shape →
-`None` → no new-schema validation. A new manifest declaring
-`[stores.<kind>] ids = [...]` → `Some(LogicalStoreConfig)` → fully
-validated. This keeps sub-project #2 genuinely additive: old manifests
-are distinguishable from new-but-incomplete ones, so empty `ids` is a
-real error rather than an accidental old-manifest match.
+**Old-vs-new discrimination — discriminate on the `ids` field, not the
+table.** Pre-existing manifests *already have* `[stores.kv]`,
+`[stores.secrets]`, `[stores.config]` tables (see the current
+[examples/app-demo/edgezero.toml:108](examples/app-demo/edgezero.toml#L108)),
+so "table present or not" cannot tell old from new. Instead, during
+sub-project #2 each `Manifest<Kind>StoreConfig` struct is a
+**compatibility struct carrying both the old and new fields**:
+
+```rust
+#[derive(Deserialize)]
+#[non_exhaustive]
+pub struct ManifestKvStoreConfig {
+    // --- legacy single-store fields (still parsed in #2; removed in #3) ---
+    #[serde(default)] pub name: Option<String>,
+    #[serde(default)] pub adapters: BTreeMap<String, LegacyKvAdapterOverride>,
+    // --- new logical-store fields ---
+    #[serde(default)] pub ids: Option<Vec<String>>,
+    #[serde(default)] pub default: Option<String>,
+}
+```
+
+The discriminator is `ids.is_some()`:
+
+- `ids` absent → legacy shape → legacy validation only; new-schema
+  rules do not fire.
+- `ids` present → new shape → new-schema validation fires (non-empty
+  `ids`, `default` resolution, per-adapter completeness). A new-shape
+  table with `ids = []` is a real error.
+
+This keeps sub-project #2 genuinely additive: every current manifest
+keeps parsing and validating exactly as before. Sub-project #3 deletes
+the legacy fields once the runtime no longer reads them.
 
 **Field reference:**
 
@@ -558,9 +594,14 @@ id      = "abc123def456"
 ```
 
 `config push --adapter cloudflare` writes via `wrangler kv bulk put
-<tempfile.json> --namespace-id=<id>`. No redeploy; values live on the
-next request after KV propagation. The `[vars]` model is removed;
-existing deployed workers migrate once (documented in the guide).
+<tempfile.json> --namespace-id=<id>`. No redeploy is needed. **KV is
+eventually consistent** — pushed values become visible after KV's
+propagation window (typically seconds; Cloudflare documents up to ~60s
+for global propagation). The spec, docs, and tests treat Cloudflare KV
+visibility as eventual: CI does not assert immediate global visibility
+for Cloudflare (CI exercises the axum and mock paths; see §15). The
+`[vars]` model is removed; existing deployed workers migrate once
+(documented in the guide).
 
 ### 6.10 App-config environment-variable resolution
 
@@ -570,16 +611,43 @@ layers, lowest priority first:
 1. The `[config]` table parsed from `<name>.toml`.
 2. Environment-variable overrides.
 
+**Env vars override existing keys only.** An env var overrides a config
+value **only if that key already exists in the parsed `[config]`
+tree**. Keys absent from the file are not created by env vars. This is
+a deliberate constraint:
+
+- With `C: DeserializeOwned` there is no pre-deserialization reflection
+  over `C`'s field types, so the loader cannot know the type of a key
+  supplied *only* via env. By restricting overrides to existing keys,
+  the loader infers the type from the **existing TOML value** at that
+  path and parses the env string accordingly.
+- It also matches the existing `AxumConfigStore::from_env` behaviour,
+  which only reads env vars for keys declared in the manifest.
+- Consequence: to make a key env-overridable, it must appear in
+  `<name>.toml` (with a real value or a stub). The generator template
+  and `app-demo.toml` include every env-overridable key.
+
+This rule applies identically to the typed and raw loaders.
+
 **Env var naming.** `<APP_NAME>__<SECTION>__…__<KEY>`:
 
 - `<APP_NAME>` is `[app].name` from `edgezero.toml`, uppercased, with
   `-` replaced by `_` (so `app-demo` → `APP_DEMO`). Passed to
   `load_app_config` as the `app_name` argument.
 - `__` (double underscore) separates **every** nesting level,
-  including app-name → first key. A single `_` is a literal character
-  within a name; only `__` is a separator.
-- Each segment after the prefix is matched case-insensitively against
-  the config key at that level.
+  including app-name → first key. A single `_` is a literal character;
+  only `__` is a separator.
+
+**Deterministic, ambiguity-rejecting key matching.** TOML keys are
+case-sensitive; env var names are conventionally uppercase. The loader
+matches by transforming each config key at a level to its
+**env segment form** — uppercase the key, leave `_` as-is — and
+comparing against the env var's segment. If two sibling keys at the
+same level transform to the same env segment (e.g. `foo` and `FOO`, or
+`api_key` and `API_KEY`), the loader **errors** with
+`AppConfigError` ("ambiguous env mapping: keys `foo` and `FOO` at
+`config` both map to env segment `FOO`"). Matching is otherwise exact
+on the transformed form — no fuzzy/case-insensitive fallback.
 
 Examples for `app-demo.toml`:
 
@@ -595,18 +663,17 @@ timeout_ms = 1500
 | `APP_DEMO__GREETING` | `config.greeting` |
 | `APP_DEMO__SERVICE__TIMEOUT_MS` | `config.service.timeout_ms` |
 
-**Type coercion.** Env var values are strings. During overlay they are
-parsed against the target field's TOML type (the overlay produces a
-`toml::Value` tree; integers/bools are parsed from the string, parse
-failure is an `AppConfigError`). For the typed loader this happens
-before `serde` deserialization.
+**Type coercion.** The env string is parsed against the type of the
+**existing** TOML value at that path: string → as-is; integer/float/
+bool → parsed from the string (parse failure is an `AppConfigError`).
+The overlay produces a `toml::Value` tree; for the typed loader this
+happens before `serde` deserialization.
 
-**Scope.** Resolution happens inside `load_app_config*`. Therefore
-`config validate` and `config push` both see env-resolved values —
-useful for injecting per-environment values from a deploy pipeline. A
-`--no-env` flag on `validate` and `push` disables the overlay when the
-raw file contents are wanted. The axum dev server also resolves via
-this path, so `APP_DEMO__GREETING=hi cargo run …` overrides locally.
+**Scope.** Resolution happens inside `load_app_config*`. `config
+validate` and `config push` both see env-resolved values — useful for
+injecting per-environment values from a deploy pipeline. A `--no-env`
+flag on `validate` and `push` disables the overlay. The axum dev
+server resolves via the same path.
 
 ### 6.11 `Default` on `*Args`
 
@@ -645,24 +712,29 @@ succeeds.
 
 ## 8. Sub-project 2 — Manifest schema additions (purely additive)
 
-**Goal:** add the new schema as `Option<LogicalStoreConfig>` +
-`Option<AdapterStoresConfig>` so old-shape manifests are
-distinguishable and validation only runs on new-shape declarations.
-No runtime changes; nothing removed; `[stores.config.defaults]`
-stays.
+**Goal:** add the new logical-store fields **alongside** the existing
+single-store fields in the same structs (compatibility structs, §6.6),
+discriminating on `ids` presence. Old-shape manifests keep parsing and
+validating exactly as before. No runtime changes; nothing removed;
+`[stores.config.defaults]` stays.
 
-**Source changes:** `manifest.rs` gains `Option<LogicalStoreConfig>`
-per kind and `ManifestAdapter.stores: Option<AdapterStoresConfig>`;
-validator rules (§6.6) fire only when the new fields are `Some`;
-`STORES_SUPPORTED_ADAPTERS` allowlist drives completeness. Old fields
-remain and keep deserialising.
+**Source changes:** `manifest.rs` — each `Manifest<Kind>StoreConfig`
+becomes a compatibility struct carrying both the legacy fields
+(`name`, legacy `adapters` overrides) and the new logical fields
+(`ids: Option<Vec<String>>`, `default: Option<String>`).
+`ManifestAdapter` gains `stores: Option<AdapterStoresConfig>` (the
+per-adapter logical mapping). New-schema validator rules (§6.6) fire
+only when `ids.is_some()`; `STORES_SUPPORTED_ADAPTERS` drives
+completeness. Legacy fields and legacy validation are untouched.
 
-**Tests:** new-schema round-trip; default resolution (omitted with one
-id; omitted with many → error; explicit not-in-ids → error);
-completeness (supported adapter omitting `stores` → error;
+**Tests:** new-schema round-trip; `ids`-presence discrimination
+(legacy table with `name` only → no new validation; table with
+`ids` → new validation); default resolution (omitted with one id;
+omitted with many → error; explicit not-in-ids → error; `ids = []` →
+error); completeness (supported adapter omitting `stores` → error;
 non-allowlisted adapter → skipped); Cloudflare JS-identifier check →
-error; old-shape manifests parse with `None` and trigger no new
-validation.
+error; the **current** `examples/app-demo/edgezero.toml` (legacy
+shape) parses and validates unchanged.
 
 **Ship gate:** existing app-demo runtime works unchanged; manifest
 tests prove the new schema parses and validates.
@@ -675,16 +747,26 @@ end-to-end on axum and Cloudflare.
 **Scope:**
 
 - `ConfigStore::get` becomes `async` (`#[async_trait(?Send)]`).
-- `BoundKvStore` / `BoundConfigStore` / `BoundSecretStore` introduced;
-  `RequestContext` + `Hooks` accessors return them, id-keyed, with
-  `_default()` helpers resolving the §6.4 default.
-- Each adapter's store setup builds a `StoreRegistry<H>` from
-  `[adapters.<self>.stores.*]`.
+- `BoundKvStore` / `BoundConfigStore` / `BoundSecretStore` introduced.
+  **Only `RequestContext` returns bound handles** — binding needs
+  per-request adapter state. `RequestContext` accessors are id-keyed
+  with `_default()` helpers resolving the §6.4 default.
+- **`Hooks` does not return bound handles.** `Hooks` /
+  `ConfigStoreMetadata` are static, compile-time app metadata (emitted
+  by the `app!` macro). They are rewritten to expose store *metadata*
+  registries — per kind: logical ids, the resolved default, and the
+  per-adapter `name` map. Adapters consume that metadata at request
+  setup to build the runtime `StoreRegistry<H>` that backs
+  `RequestContext`'s bound handles. So the split is: `Hooks`/`app!` =
+  metadata; `RequestContext` = bound runtime handles.
+- Each adapter's store setup reads the `Hooks` metadata + injects a
+  `StoreRegistry<H>` for each kind into the request context.
 - `CloudflareConfigStore` rewritten `[vars]` → KV (§6.9).
 - `Kv` / `Secrets` extractors refactored to `default()` / `named()`
   (§6.8); a `Config` extractor added.
-- `ConfigStoreMetadata` becomes a registry; `app!` macro emits
-  id-keyed metadata from the new manifest schema.
+- `ConfigStoreMetadata` becomes a metadata registry (one entry per
+  logical config id, each with its per-adapter names); `app!` macro
+  emits it from the new manifest schema.
 - Old single-store manifest fields removed; `examples/app-demo/
   edgezero.toml` migrated; `app-demo` handlers updated to the new
   accessors. Spin adapter omits `stores`.
@@ -791,19 +873,55 @@ adapter/kind table (`wrangler kv namespace create <name>`, `fastly
 kv-store create --name=<name>`, etc.). `--dry-run` prints
 `CommandSpec`s without invocation.
 
-**Writeback to native manifests:**
+**Writeback to native manifests — concrete contract.**
 
-- **Cloudflare:** patch `wrangler.toml` `[[kv_namespaces]]` with
-  `binding = "<name>"`, `id = "<extracted>"`.
-- **Fastly:** the exact `fastly.toml` sections to patch are
-  **pinned in the implementation plan** by reading Fastly's current
-  manifest docs (Fastly distinguishes store names, resource-link
-  names/IDs, and `setup` vs `local_server` sections). The spec-level
-  contract: `provision` writes Fastly resource identifiers into
-  whatever `fastly.toml` section the Fastly Compute runtime resolves
-  stores from, and `config push` reads the identifier back from the
-  same section — read and write paths must agree. Sub-project #7's PR
-  ships the exact section names with golden-file tests.
+*Cloudflare* (IDs are stable and persisted):
+
+- After `wrangler kv namespace create <name>`, parse the namespace ID
+  from stdout and patch `wrangler.toml`:
+  ```toml
+  [[kv_namespaces]]
+  binding = "<name>"     # == [adapters.cloudflare.stores.<kind>.<id>].name
+  id      = "<extracted-namespace-id>"
+  ```
+- `config push --adapter cloudflare` reads the `id` back from
+  `wrangler.toml` by matching `binding`.
+
+*Fastly* (resource-link model; IDs resolved on demand):
+
+Fastly's `fastly.toml` declares stores in two sections, both keyed by
+the **resource link name** — which Fastly Compute code uses to access
+the store, and which EdgeZero maps to
+`[adapters.fastly.stores.<kind>.<id>].name`:
+
+- `[setup.kv_stores.<name>]` / `[setup.config_stores.<name>]` /
+  `[setup.secret_stores.<name>]` — consumed by `fastly compute deploy`
+  to create and link resources on first deploy.
+- `[local_server.kv_stores.<name>]` / `[local_server.config_stores.
+  <name>]` / `[local_server.secret_stores.<name>]` — consumed by
+  `fastly compute serve` for local testing.
+
+`provision --adapter fastly` for each logical id:
+
+1. `fastly <kind>-store create --name=<name>` creates the store.
+2. Ensures `fastly.toml` contains both `[setup.<kind>_stores.<name>]`
+   and `[local_server.<kind>_stores.<name>]` table entries (created if
+   absent) so deploy links the store and local serve can find it.
+
+The Fastly store *ID* is **not** persisted in `edgezero.toml` or
+`fastly.toml` — Fastly's manifest has no stable ID slot outside the
+transient `[setup]` section (which is ignored once the service
+exists). Instead, `config push --adapter fastly` resolves the store
+ID on demand: `fastly config-store list --json`, match by `<name>`,
+then `fastly config-store-entry create --store-id=<id> --key=… --value=…`
+(large values via `--stdin`). One extra authenticated CLI call per
+push; no persistence problem.
+
+**Read/write-path agreement:** the runtime Fastly adapter accesses
+each store by its resource link name (`<name>`); `provision` writes
+that same `<name>` into `[setup.*]` / `[local_server.*]`; `config
+push` resolves the ID from `<name>` via the list command. All three
+paths key off `[adapters.fastly.stores.<kind>.<id>].name`.
 
 **Tests:** per-(adapter, kind) mock-runner with scripted stdout;
 golden ID-extraction parsers; temp-fixture writeback verified;
@@ -831,9 +949,11 @@ overlay unless `--no-env`); serialise per §6.4 (skip `SECRET_FIELDS`);
 resolve target id (`--store` or resolved default); look up the
 per-adapter `name`; read the platform resource ID from the native
 manifest (error "did you run `provision` first?" if absent); shell
-out (`wrangler kv bulk put … --namespace-id=…`; `fastly
-config-store-entry create …`; axum writes
-`.edgezero/local-config-<id>.env`; spin errors "not yet supported").
+out (`wrangler kv bulk put … --namespace-id=…`; for Fastly, resolve
+the store id via `fastly config-store list --json` then
+`fastly config-store-entry create --store-id=… …` per §13; axum writes
+the resolved values to `.edgezero/local-config-<id>.json` — the file
+the axum config store reads (§15); spin errors "not yet supported").
 
 **Tests (MEDIUM #9 — push behaviour beyond validate):** typed + raw;
 per-adapter mock-runner with golden payloads; secret fields absent
@@ -883,13 +1003,32 @@ subset. Concretely it exercises:
 - **`auth` / `provision`:** exercised against the `MockCommandRunner`
   in tests; the walkthrough doc shows the real invocations.
 
+**Axum config store backing — push and runtime read the same file.**
+For axum there is no remote store, so the axum config store is backed
+by a single local file: `.edgezero/local-config-<id>.json` (gitignored).
+
+- `config push --adapter axum` loads `<name>.toml` (env overlay
+  applied), serialises the resolved `[config]` values, and writes them
+  to `.edgezero/local-config-<id>.json`.
+- The axum config store reads from `.edgezero/local-config-<id>.json`
+  at request setup — the **same file** `config push` writes. No
+  disagreement: a running dev server observes pushed values.
+- `edgezero dev` regenerates `.edgezero/local-config-<id>.json` at
+  startup (running the same resolve-and-write step as `config push
+  --adapter axum`), so the dev workflow needs no manual push. If the
+  file is absent at request time (e.g. server started without `dev`),
+  the axum config store treats it as an empty store.
+
+This makes axum genuinely push-backed and consistent with the remote
+adapters, and lets the §15 ship gate test a real push→read cycle.
+
 **`[stores.config.defaults]` removal:** drop the `defaults` field from
 `manifest.rs`; drop the axum dev-server seeding at
-[dev_server.rs:349](crates/edgezero-adapter-axum/src/dev_server.rs#L349);
-the axum config store now seeds local-dev values from `app-demo.toml`
-(via `load_app_config_raw`, env overlay included) — the typed struct's
-keys form the allowlist. `examples/app-demo/edgezero.toml` drops
-`[stores.config.defaults]`.
+[dev_server.rs:349](crates/edgezero-adapter-axum/src/dev_server.rs#L349).
+Its role is fully replaced by the file flow above: the source of
+local-dev config values is `<name>.toml` (resolved through `config
+push --adapter axum` / `edgezero dev`), not a manifest section.
+`examples/app-demo/edgezero.toml` drops `[stores.config.defaults]`.
 
 **Docs:** `docs/guide/cli-walkthrough.md` (full `myapp` loop including
 an env-override example); `manifest-store-migration.md` finalised;
