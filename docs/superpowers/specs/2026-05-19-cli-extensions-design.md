@@ -149,34 +149,42 @@ Key contracts:
 
 ## 4. End-state public API surface
 
+The arg structs live in a **`pub mod args`**, not a crate-root
+re-export. A crate-root `pub use args::{...}` would trip
+`clippy::pub_use` (the `restriction` group is `-D`-denied
+workspace-wide), so the supported API is `edgezero_cli::args::BuildArgs`
+etc. The `run_*` functions stay at the crate root. Downstream code
+writes `use edgezero_cli::args::BuildArgs;` and
+`use edgezero_cli::run_build;`.
+
 ```rust
 // crates/edgezero-cli/src/lib.rs  (feature = "cli")
 
-pub use args::{
-    AuthArgs, AuthSub, BuildArgs, ConfigPushArgs, ConfigValidateArgs,
-    DeployArgs, NewArgs, ProvisionArgs, ServeArgs,
-};
+/// CLI argument structs — a `pub mod`, addressed as `edgezero_cli::args::*`.
+pub mod args;
+// args:: { Args, Command, AuthArgs, AuthSub, BuildArgs, ConfigPushArgs,
+//          ConfigValidateArgs, DeployArgs, NewArgs, ProvisionArgs, ServeArgs }
 
 pub fn init_cli_logger();
 
-pub fn run_build(args: &BuildArgs) -> Result<(), String>;
-pub fn run_deploy(args: &DeployArgs) -> Result<(), String>;
-pub fn run_new(args: &NewArgs) -> Result<(), String>;
-pub fn run_serve(args: &ServeArgs) -> Result<(), String>;
+pub fn run_build(args: &args::BuildArgs) -> Result<(), String>;
+pub fn run_deploy(args: &args::DeployArgs) -> Result<(), String>;
+pub fn run_new(args: &args::NewArgs) -> Result<(), String>;
+pub fn run_serve(args: &args::ServeArgs) -> Result<(), String>;
 #[cfg(feature = "edgezero-adapter-axum")]
 pub fn run_demo() -> Result<(), String>;  // `demo` subcommand; Ok on graceful shutdown
 
-pub fn run_auth(args: &AuthArgs) -> Result<(), String>;
-pub fn run_provision(args: &ProvisionArgs) -> Result<(), String>;
+pub fn run_auth(args: &args::AuthArgs) -> Result<(), String>;
+pub fn run_provision(args: &args::ProvisionArgs) -> Result<(), String>;
 
-pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String>;
-pub fn run_config_validate_typed<C>(args: &ConfigValidateArgs) -> Result<(), String>
+pub fn run_config_validate(args: &args::ConfigValidateArgs) -> Result<(), String>;
+pub fn run_config_validate_typed<C>(args: &args::ConfigValidateArgs) -> Result<(), String>
 where
     C: serde::de::DeserializeOwned + validator::Validate
        + ::edgezero_core::app_config::AppConfigMeta;
 
-pub fn run_config_push(args: &ConfigPushArgs) -> Result<(), String>;
-pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String>
+pub fn run_config_push(args: &args::ConfigPushArgs) -> Result<(), String>;
+pub fn run_config_push_typed<C>(args: &args::ConfigPushArgs) -> Result<(), String>
 where
     C: serde::de::DeserializeOwned + validator::Validate + serde::Serialize
        + ::edgezero_core::app_config::AppConfigMeta;
