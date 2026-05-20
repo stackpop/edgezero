@@ -399,9 +399,20 @@ pub struct ManifestAdapterDefinition {
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub crate_path: Option<String>,
+    /// Bind address for the adapter server (e.g. `"0.0.0.0"` or `"127.0.0.1"`).
+    ///
+    /// Stored as a raw string so validation can be deferred until bind-address
+    /// resolution, where environment-variable overrides and fallback behavior
+    /// are applied consistently (see [`crate::addr::resolve_bind_addr`]).
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub host: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub manifest: Option<String>,
+    /// Port for the adapter server.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -1808,5 +1819,35 @@ name = "FASTLY_STORE"
             manifest.manifest().secret_store_binding("cloudflare"),
             DEFAULT_SECRET_STORE_NAME
         );
+    }
+
+    // -- Adapter host/port config ------------------------------------------
+
+    #[test]
+    fn adapter_definition_with_host_and_port() {
+        let manifest = r#"
+[adapters.axum.adapter]
+crate = "crates/axum-adapter"
+host = "0.0.0.0"
+port = 3000
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let manifest_data = loader.manifest();
+        let adapter = &manifest_data.adapters["axum"];
+        assert_eq!(adapter.adapter.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(adapter.adapter.port, Some(3000));
+    }
+
+    #[test]
+    fn adapter_definition_host_and_port_default_to_none() {
+        let manifest = r#"
+[adapters.axum.adapter]
+crate = "crates/axum-adapter"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let manifest_data = loader.manifest();
+        let adapter = &manifest_data.adapters["axum"];
+        assert!(adapter.adapter.host.is_none());
+        assert!(adapter.adapter.port.is_none());
     }
 }
