@@ -411,7 +411,18 @@ Spec §9, §6.7, §6.8, §6.10.
 
 **Files:**
 
-- Create: `crates/edgezero-macros/src/app_config.rs`; Modify: `crates/edgezero-macros/src/lib.rs`
+- Create: `crates/edgezero-macros/src/app_config.rs`; Modify: `crates/edgezero-macros/src/lib.rs`, `crates/edgezero-core/src/lib.rs`
+
+**Macro availability — chosen route: re-export through `edgezero-core`.**
+`edgezero-core` already re-exports the `action` and `app` proc-macros
+from `edgezero-macros` (handlers do `use edgezero_core::action`).
+`AppConfig` follows the *same* route: the derive is defined in
+`edgezero-macros` and **re-exported from `edgezero-core`** so consumers
+write `use edgezero_core::AppConfig`. Consequence: a crate that derives
+`AppConfig` needs **only `edgezero-core`** as a dependency for the
+macro — no direct `edgezero-macros` dependency. (`#[derive(Validate)]`
+and `#[validate(...)]` still need the `validator` crate directly — see
+Task 3.4 / 3.5.)
 
 - [ ] **Step 1a: Add the `trybuild` dev-dependency.** Compile-fail tests need `trybuild`; `crates/edgezero-macros/Cargo.toml` currently has only `tempfile` under `[dev-dependencies]`. Add `trybuild = "1"` to `[dev-dependencies]` there (and to `[workspace.dependencies]` in the root `Cargo.toml` if the workspace pins dev-deps centrally — check first and follow the existing convention).
 
@@ -419,7 +430,7 @@ Spec §9, §6.7, §6.8, §6.10.
 
 - [ ] **Step 2: Run** — FAIL.
 
-- [ ] **Step 3: Implement.** `#[proc_macro_derive(AppConfig, attributes(secret))]` in `lib.rs` delegating to `app_config::derive`. The impl scans fields for `#[secret]` / `#[secret(store_ref)]`, enforces the §6.7 constraints with `compile_error!`, and emits `impl ::edgezero_core::app_config::AppConfigMeta` with the `SECRET_FIELDS` array (Rust field name verbatim).
+- [ ] **Step 3: Implement.** `#[proc_macro_derive(AppConfig, attributes(secret))]` in `edgezero-macros/src/lib.rs` delegating to `app_config::derive`. The impl scans fields for `#[secret]` / `#[secret(store_ref)]`, enforces the §6.7 constraints with `compile_error!`, and emits `impl ::edgezero_core::app_config::AppConfigMeta` with the `SECRET_FIELDS` array (Rust field name verbatim). **Also re-export it from `edgezero-core/src/lib.rs`** — `pub use edgezero_macros::AppConfig;` — next to the existing `action` / `app` re-exports, so downstream code uses `edgezero_core::AppConfig`.
 
 - [ ] **Step 4: Run** — PASS.
 
@@ -442,13 +453,15 @@ Spec §9, §6.7, §6.8, §6.10.
 **Files:**
 
 - Create: `crates/edgezero-cli/src/templates/app/<name>.toml.hbs`, `crates/edgezero-cli/src/templates/core/src/config.rs.hbs`
-- Modify: `crates/edgezero-cli/src/generator.rs`, `scaffold.rs`
+- Modify: `crates/edgezero-cli/src/templates/core/Cargo.toml.hbs`, `crates/edgezero-cli/src/generator.rs`, `scaffold.rs`
 
-- [ ] **Step 1:** `app/<name>.toml.hbs` — a `[config]` table with `greeting` and a nested `[config.service]` section. `core/src/config.rs.hbs` — `<NameUpperCamel>Config` with `#[derive(Deserialize, Serialize, Validate, AppConfig)]` + `#[serde(deny_unknown_fields)]`, a `greeting` field, a nested `service` field, **one plain `#[secret]` field**, and a commented-out `#[secret(store_ref)]` example (§6.8 — the generated template does not include `store_ref` live).
+- [ ] **Step 1:** `app/<name>.toml.hbs` — a `[config]` table with `greeting` and a nested `[config.service]` section. `core/src/config.rs.hbs` — `<NameUpperCamel>Config` with `#[derive(serde::Deserialize, serde::Serialize, validator::Validate, edgezero_core::AppConfig)]` + `#[serde(deny_unknown_fields)]`, a `greeting` field, a nested `service` field, **one plain `#[secret]` field**, and a commented-out `#[secret(store_ref)]` example (§6.8 — the generated template does not include `store_ref` live).
 
-- [ ] **Step 2:** Render both in `generate_new`; register in `scaffold.rs`.
+- [ ] **Step 2: Update `templates/core/Cargo.toml.hbs` deps.** The generated config struct needs `validator` (for `#[derive(Validate)]` / `#[validate(...)]`) and `serde` with the `derive` feature. The `AppConfig` derive comes via the `edgezero-core` re-export (Task 3.2) — the core template already depends on `edgezero-core`, so **no `edgezero-macros` dependency is added**. Add `validator = { ... , features = ["derive"] }` to `templates/core/Cargo.toml.hbs` (it currently lacks it); confirm `serde` has `features = ["derive"]`. Use whatever version/workspace-pin convention the existing template deps use.
 
-- [ ] **Step 3: Write/extend the generator test** to assert `<name>.toml` and `<name>-core/src/config.rs` are produced.
+- [ ] **Step 3:** Render both in `generate_new`; register in `scaffold.rs`.
+
+- [ ] **Step 4: Write/extend the generator test** to assert `<name>.toml` and `<name>-core/src/config.rs` are produced **and** that the generated `<name>-core` builds (the `validator` dep resolves and `edgezero_core::AppConfig` is in scope) — `cargo check -p <name>-core` in the scaffolded project.
 
 - [ ] **Step 4: Run** the generator test — PASS.
 
@@ -457,9 +470,9 @@ Spec §9, §6.7, §6.8, §6.10.
 **Files:**
 
 - Create: `examples/app-demo/app-demo.toml`, `examples/app-demo/crates/app-demo-core/src/config.rs`
-- Modify: `examples/app-demo/crates/app-demo-core/src/lib.rs`, `docs/guide/configuration.md`, `getting-started.md`
+- Modify: `examples/app-demo/crates/app-demo-core/src/lib.rs`, `examples/app-demo/crates/app-demo-core/Cargo.toml` (verify deps), `docs/guide/configuration.md`, `getting-started.md`
 
-- [ ] **Step 1:** Write `app-demo.toml` — `[config]` with `greeting`, `feature_new_checkout`, a `[config.service]` with `timeout_ms`, `api_token` (a `#[secret]` value), `vault` (a `#[secret(store_ref)]` value = the single secrets id). Write `app-demo-core/src/config.rs` — `AppDemoConfig` with the §6.8 shape (nested `ServiceConfig`, one `#[secret]`, one `#[secret(store_ref)]`). Export it from `lib.rs`.
+- [ ] **Step 1:** Write `app-demo.toml` — `[config]` with `greeting`, `feature_new_checkout`, a `[config.service]` with `timeout_ms`, `api_token` (a `#[secret]` value), `vault` (a `#[secret(store_ref)]` value = the single secrets id). Write `app-demo-core/src/config.rs` — `AppDemoConfig` with the §6.8 shape (nested `ServiceConfig`, one `#[secret]`, one `#[secret(store_ref)]`), deriving `serde::{Deserialize, Serialize}`, `validator::Validate`, `edgezero_core::AppConfig`. Export it from `lib.rs`. **Verify `app-demo-core/Cargo.toml` deps:** it must have `edgezero-core` (for the `AppConfig` re-export), `validator`, and `serde` with `derive`. `app-demo-core` already depends on all three today — confirm and add any that are somehow missing. No `edgezero-macros` dependency is needed (macro comes via the `edgezero-core` re-export, Task 3.2).
 
 - [ ] **Step 2: Write a round-trip test** in `app-demo-core`: `load_app_config::<AppDemoConfig>` against `app-demo.toml` succeeds; `AppDemoConfig::SECRET_FIELDS` has the expected two entries; an env var overrides the nested value.
 
@@ -509,13 +522,15 @@ binary has no app-config struct, so it uses the **raw** functions.
 
 **Files:**
 
-- Modify: `examples/app-demo/crates/app-demo-cli/src/main.rs`, `docs/guide/cli-reference.md`
+- Modify: `examples/app-demo/crates/app-demo-cli/Cargo.toml`, `examples/app-demo/crates/app-demo-cli/src/main.rs`, `docs/guide/cli-reference.md`
 
-- [ ] **Step 1:** Add a `Config(ConfigCmd)` arm to `app-demo-cli`'s `Cmd` enum with `ConfigCmd { Validate(ConfigValidateArgs) }` (push added in commit 7). Dispatch `Validate` to `edgezero_cli::run_config_validate_typed::<AppDemoConfig>` — the **typed** validator (`app-demo-cli` knows `AppDemoConfig`).
+- [ ] **Step 1: Add the `app-demo-core` dependency.** `app-demo-cli` is about to reference `AppDemoConfig`, which lives in `app-demo-core` (created in commit 3, Task 3.5). Its `Cargo.toml` so far has only `edgezero-cli` / `clap` / `log` (Task 1.5). Add `app-demo-core = { path = "../app-demo-core" }` to `app-demo-cli/Cargo.toml` (path dep within the `examples/app-demo` workspace).
 
-- [ ] **Step 2:** Document `config validate` in `cli-reference.md` — note the default `edgezero` binary runs the raw validator, downstream CLIs the typed one.
+- [ ] **Step 2:** Add a `Config(ConfigCmd)` arm to `app-demo-cli`'s `Cmd` enum with `ConfigCmd { Validate(ConfigValidateArgs) }` (push added in commit 7). `use app_demo_core::AppDemoConfig;` and dispatch `Validate` to `edgezero_cli::run_config_validate_typed::<AppDemoConfig>` — the **typed** validator (`app-demo-cli` knows `AppDemoConfig`).
 
-- [ ] **Step 3: Run** the full gate; `cd examples/app-demo && cargo run -p app-demo-cli -- config validate --strict` exits 0; `./target/debug/edgezero config validate --strict` (raw path) also exits 0 against a fixture. **Commit:** `git commit -m "config validate command (raw + typed)"`
+- [ ] **Step 3:** Document `config validate` in `cli-reference.md` — note the default `edgezero` binary runs the raw validator, downstream CLIs the typed one.
+
+- [ ] **Step 4: Run** the full gate; `cd examples/app-demo && cargo run -p app-demo-cli -- config validate --strict` exits 0; `./target/debug/edgezero config validate --strict` (raw path) also exits 0 against a fixture. **Commit:** `git commit -m "config validate command (raw + typed)"`
 
 ---
 
@@ -644,7 +659,7 @@ Spec §15, §6.12.
 ### Task 8.2: Upgrade the generated `<name>-cli` template to the full command set
 
 **Files:**
-- Modify: `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`, `crates/edgezero-cli/src/generator.rs` (tests)
+- Modify: `crates/edgezero-cli/src/templates/cli/Cargo.toml.hbs`, `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`, `crates/edgezero-cli/src/generator.rs` (tests)
 
 Commit 1 created the `<name>-cli` template with only the five base
 built-ins (`auth` / `provision` / `config` did not exist yet). Now that
@@ -652,11 +667,13 @@ commits 4–7 have landed them, a freshly-scaffolded project must expose
 the full command surface (spec §1: downstream CLIs reuse the
 post-effort built-ins).
 
-- [ ] **Step 1:** Update `templates/cli/src/main.rs.hbs` so the generated `Cmd` enum lists **all eight** built-ins: `Build`, `Deploy`, `Demo`, `New`, `Serve`, `Auth`, `Provision`, `Config(ConfigCmd { Validate, Push })`. Dispatch `build/deploy/demo/new/serve/auth/provision` to the raw `edgezero_cli::run_*`. Dispatch the `Config` arm to the **typed** `run_config_validate_typed::<{{NameUpperCamel}}Config>` / `run_config_push_typed::<{{NameUpperCamel}}Config>` — a generated project has its own `{{name}}-core` config struct (from the Task 3.4 `config.rs.hbs` template), so the scaffold wires the typed path, matching how `app-demo-cli` does it.
+- [ ] **Step 1: Add the core-crate dependency to the CLI template.** The full-command template references the typed config functions with `{{NameUpperCamel}}Config`, which lives in the generated `{{name}}-core` crate. The `templates/cli/Cargo.toml.hbs` from commit 1 depends only on `edgezero-cli` / `clap` / `log` — add `{{name}}-core = { path = "../{{name}}-core" }` (path dep within the generated workspace). Without this the scaffolded CLI will not compile.
 
-- [ ] **Step 2:** Extend the generator structure test (from Task 1.4 / 3.4): the scaffolded `<name>-cli/src/main.rs` contains `Auth`, `Provision`, and `Config` variants and references the typed config functions with the project's config type.
+- [ ] **Step 2:** Update `templates/cli/src/main.rs.hbs` so the generated `Cmd` enum lists **all eight** built-ins: `Build`, `Deploy`, `Demo`, `New`, `Serve`, `Auth`, `Provision`, `Config(ConfigCmd { Validate, Push })`. Dispatch `build/deploy/demo/new/serve/auth/provision` to the raw `edgezero_cli::run_*`. `use {{name}}_core::{{NameUpperCamel}}Config;` and dispatch the `Config` arm to the **typed** `run_config_validate_typed::<{{NameUpperCamel}}Config>` / `run_config_push_typed::<{{NameUpperCamel}}Config>` — a generated project has its own `{{name}}-core` config struct (from the Task 3.4 `config.rs.hbs` template), so the scaffold wires the typed path, matching how `app-demo-cli` does it.
 
-- [ ] **Step 3: Run** the generator tests, then `cargo run -p edgezero-cli -- new <tmp> --dir …` and `cargo check --workspace` in the generated project — the scaffolded CLI builds with all eight commands.
+- [ ] **Step 3:** Extend the generator structure test (from Task 1.4 / 3.4): the scaffolded `<name>-cli/Cargo.toml` depends on `<name>-core`; `<name>-cli/src/main.rs` contains `Auth`, `Provision`, and `Config` variants and references the typed config functions with the project's config type.
+
+- [ ] **Step 4: Run** the generator tests, then `cargo run -p edgezero-cli -- new <tmp> --dir …` and `cargo check --workspace` in the generated project — the scaffolded CLI builds with all eight commands **and** resolves `{{NameUpperCamel}}Config` from its core crate.
 
 ### Task 8.3: CI wiring for the `app-demo` loop
 
