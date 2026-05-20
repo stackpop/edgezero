@@ -1,6 +1,6 @@
 # Key-Value Store
 
-EdgeZero provides a unified interface for Key-Value (KV) storage, abstracting differences between Fastly KV Store and Cloudflare Workers KV.
+EdgeZero provides a unified interface for Key-Value (KV) storage, abstracting differences between Axum local storage, Fastly KV Store, Cloudflare Workers KV, and Spin KV.
 
 ## End-to-End Example
 
@@ -68,7 +68,7 @@ The `KvHandle` provides typed helpers that automatically serialize/deserialize J
 - `get<T>(key)`: Returns `Option<T>`.
 - `get_or(key, default)`: Returns the value or a fallback.
 - `put<T>(key, value)`: Stores a value.
-- `put_with_ttl(key, value, ttl)`: Stores a value that expires after `ttl`.
+- `put_with_ttl(key, value, ttl)`: Stores a value that expires after `ttl` on adapters that support TTL.
 - `delete(key)`: Removes a value.
 - `exists(key)`: Checks if a key is present.
 - `list_keys_page(prefix, cursor, limit)`: Lists keys in a bounded page. Pass the returned cursor back unchanged with the same prefix to fetch the next page.
@@ -86,7 +86,7 @@ Use it only when approximate values are acceptable (e.g. visit counters, feature
 For strict correctness, use a transactional data store.
 :::
 
-Key listing is paginated by design. This avoids buffering an unbounded number of keys in memory and matches the underlying provider APIs.
+Key listing is paginated by design. This avoids buffering an unbounded number of keys in memory and matches the underlying provider APIs. The Spin adapter returns `KvError::Validation` for key listing because Spin's current `Store::get_keys()` API is unbounded.
 
 ## Platform Specifics
 
@@ -124,13 +124,32 @@ Key listing is paginated by design. This avoids buffering an unbounded number of
 
   The `binding` name MUST match the store name configured in `edgezero.toml` (default: `"EDGEZERO_KV"`).
 
+- **Spin**: Requires a `key_value_stores` label in `spin.toml`.
+
+  ```toml
+  [component.my-app]
+  key_value_stores = ["default"]
+  ```
+
+  The label MUST match the store name configured in `edgezero.toml`, or the Spin-specific override. Spin's local runtime auto-provisions the `"default"` label; custom labels require a Spin runtime config or cloud link.
+
+  ```toml
+  [stores.kv]
+  name = "EDGEZERO_KV"
+
+  [stores.kv.adapters.spin]
+  name = "default"
+  ```
+
+  `edgezero_adapter_spin::run_app` reads `edgezero.toml` and opens the resolved Spin label. Low-level manual dispatch helpers do not read the manifest.
+
 ### Consistency
 
 Both Fastly and Cloudflare KV stores are **eventually consistent**.
 
 - A value written at one edge location may not be immediately visible at another.
 - `read_modify_write()` is **not atomic**. Concurrent updates to the same key may result in lost writes.
-- **TTL**: `put_with_ttl` enforces a minimum of **60 seconds** and a maximum of **1 year** across all adapters.
+- **TTL**: `put_with_ttl` enforces a minimum of **60 seconds** and a maximum of **1 year** before delegating to an adapter. Spin KV does not support TTL, so the Spin adapter returns `KvError::Validation` without writing the value.
 
 ## Limits & Validation
 

@@ -22,7 +22,7 @@ component = "app-demo"
 [component.app-demo]
 source = "../../target/wasm32-wasip1/release/app_demo_adapter_spin.wasm"
 allowed_outbound_hosts = ["https://*:*"]
-# KV store bound to the "default" label; SpinKvStore opens this label by default.
+# KV store label must match [stores.kv.adapters.spin] in edgezero.toml.
 key_value_stores = ["default"]
 
 [component.app-demo.variables]

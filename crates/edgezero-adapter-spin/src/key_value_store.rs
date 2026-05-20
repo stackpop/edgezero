@@ -6,18 +6,10 @@
 //! # Limitations
 //!
 //! - **TTL**: The Spin KV API has no TTL support. Calls to
-//!   `put_bytes_with_ttl` store the value without expiry and emit a
-//!   `log::warn!`.
+//!   `put_bytes_with_ttl` return `KvError::Validation` without writing.
 //! - **Listing**: `spin_sdk::key_value::Store::get_keys()` returns all keys
-//!   with no prefix or cursor support. Every call to `list_keys_page` pays a
-//!   full host round-trip that fetches **all** keys in the store regardless of
-//!   prefix or page size — O(n) I/O per page. Prefix filtering and pagination
-//!   are performed in-process after the fetch. A configurable cap
-//!   (`max_list_keys`, default [`DEFAULT_MAX_LIST_KEYS`]) limits how many keys
-//!   may be processed; when the store contains more keys than the cap,
-//!   `list_keys_page` returns `KvError::Validation` so the caller can detect
-//!   the condition and raise the cap via [`SpinKvStore::with_max_list_keys`]
-//!   rather than silently receiving incomplete results.
+//!   with no prefix or cursor support. `list_keys_page` therefore returns
+//!   `KvError::Validation` instead of materializing the whole store.
 //!
 //! # Note
 //!
@@ -33,12 +25,6 @@ use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use std::time::Duration;
 
-/// Maximum number of keys the Spin KV host may return before
-/// `list_keys_page` returns `KvError::Validation`. Overridable via
-/// [`SpinKvStore::with_max_list_keys`].
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub const DEFAULT_MAX_LIST_KEYS: usize = 10_000;
-
 /// KV store backed by the Spin KV API.
 ///
 /// Wraps a `spin_sdk::key_value::Store` handle obtained via
@@ -46,7 +32,6 @@ pub const DEFAULT_MAX_LIST_KEYS: usize = 10_000;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinKvStore {
     store: spin_sdk::key_value::Store,
-    max_list_keys: usize,
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -58,25 +43,12 @@ impl SpinKvStore {
     pub fn open(label: &str) -> Result<Self, KvError> {
         let store = spin_sdk::key_value::Store::open(label)
             .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?;
-        Ok(Self {
-            store,
-            max_list_keys: DEFAULT_MAX_LIST_KEYS,
-        })
+        Ok(Self { store })
     }
 
-    /// Open the default Spin KV store (label `"default"`).
+    /// Open the default EdgeZero KV store label (`"EDGEZERO_KV"`).
     pub fn open_default() -> Result<Self, KvError> {
-        Self::open("default")
-    }
-
-    /// Override the maximum number of keys allowed during `list_keys_page`.
-    ///
-    /// When the Spin KV store contains more than `limit` keys,
-    /// `list_keys_page` returns `KvError::Validation` instead of returning
-    /// incomplete results. Defaults to [`DEFAULT_MAX_LIST_KEYS`].
-    pub fn with_max_list_keys(mut self, limit: usize) -> Self {
-        self.max_list_keys = limit;
-        self
+        Self::open(edgezero_core::manifest::DEFAULT_KV_STORE_NAME)
     }
 }
 
@@ -98,14 +70,13 @@ impl KvStore for SpinKvStore {
 
     async fn put_bytes_with_ttl(
         &self,
-        key: &str,
-        value: Bytes,
+        _key: &str,
+        _value: Bytes,
         _ttl: Duration,
     ) -> Result<(), KvError> {
-        log::warn!("SpinKvStore: TTL is not supported by the Spin KV API; storing without expiry");
-        self.store
-            .set(key, value.as_ref())
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("set failed: {e}")))
+        Err(KvError::Validation(
+            "Spin KV does not support TTL; use put_bytes for non-expiring values".to_string(),
+        ))
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
@@ -122,53 +93,13 @@ impl KvStore for SpinKvStore {
 
     async fn list_keys_page(
         &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
+        _prefix: &str,
+        _cursor: Option<&str>,
+        _limit: usize,
     ) -> Result<KvPage, KvError> {
-        let all_keys = self
-            .store
-            .get_keys()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("get_keys failed: {e}")))?;
-
-        if all_keys.len() > self.max_list_keys {
-            return Err(KvError::Validation(format!(
-                "SpinKvStore: store contains {} keys, exceeding max_list_keys={}; \
-                 call with_max_list_keys to raise the cap",
-                all_keys.len(),
-                self.max_list_keys,
-            )));
-        }
-
-        let mut keys: Vec<String> = all_keys
-            .into_iter()
-            .filter(|k| k.starts_with(prefix))
-            .collect();
-
-        keys.sort();
-
-        // Advance past all keys <= last_key (the cursor).
-        let start = if let Some(last_key) = cursor {
-            keys.iter()
-                .position(|k| k.as_str() > last_key)
-                .unwrap_or(keys.len())
-        } else {
-            0
-        };
-
-        let tail = &keys[start..];
-        let page_keys: Vec<String> = tail.iter().take(limit).cloned().collect();
-        let has_more = tail.len() > limit;
-        let next_cursor = if has_more {
-            page_keys.last().cloned()
-        } else {
-            None
-        };
-
-        Ok(KvPage {
-            keys: page_keys,
-            cursor: next_cursor,
-        })
+        Err(KvError::Validation(
+            "Spin KV key listing is unsupported because Store::get_keys() is unbounded".to_string(),
+        ))
     }
 }
 

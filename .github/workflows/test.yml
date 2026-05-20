@@ -83,6 +83,7 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+            ~/.wasmtime/bin/
             target/
           key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
@@ -143,10 +144,11 @@ jobs:
         env:
           WASMTIME_VERSION: v44.0.0
         run: |
+          export PATH="$HOME/.wasmtime/bin:$PATH"
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
           if ! command -v wasmtime &>/dev/null \
               || ! wasmtime --version 2>/dev/null | grep -qF "${WASMTIME_VERSION#v}"; then
             curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version "$WASMTIME_VERSION"
-            echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
           fi
 
       - name: Fetch dependencies (locked)

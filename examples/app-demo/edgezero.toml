@@ -113,6 +113,11 @@ description = "Echo an allowlisted smoke-test secret value (smoke-test only — 
 # [stores.kv.adapters.cloudflare]
 # name = "CF_KV_BINDING"
 
+[stores.kv.adapters.spin]
+# Spin's local runtime auto-provisions the "default" label. Custom labels
+# require a Spin runtime config or cloud link.
+name = "default"
+
 [stores.secrets]
 # Uses the default name "EDGEZERO_SECRETS".
 # Axum reads secrets from environment variables of the same name.

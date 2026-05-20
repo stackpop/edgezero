@@ -8,18 +8,18 @@ pub struct SpinConfigStore {
 }
 
 enum SpinConfigBackend {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     Spin,
     #[cfg(test)]
     InMemory(std::collections::HashMap<String, String>),
-    /// Never constructed; keeps the enum inhabited in non-wasm32, non-test builds.
-    #[cfg(not(any(target_arch = "wasm32", test)))]
+    /// Never constructed; keeps the enum inhabited outside production Spin and tests.
+    #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
     _Uninhabited(std::convert::Infallible),
 }
 
 impl SpinConfigStore {
     /// Create a new `SpinConfigStore` using the Spin variables API.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     pub fn new() -> Self {
         Self {
             inner: SpinConfigBackend::Spin,
@@ -34,7 +34,7 @@ impl SpinConfigStore {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl Default for SpinConfigStore {
     fn default() -> Self {
         Self::new()
@@ -44,7 +44,7 @@ impl Default for SpinConfigStore {
 impl ConfigStore for SpinConfigStore {
     fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(all(feature = "spin", target_arch = "wasm32"))]
             SpinConfigBackend::Spin => {
                 use spin_sdk::variables;
                 match variables::get(_key) {
@@ -58,7 +58,7 @@ impl ConfigStore for SpinConfigStore {
             }
             #[cfg(test)]
             SpinConfigBackend::InMemory(data) => Ok(data.get(_key).cloned()),
-            #[cfg(not(any(target_arch = "wasm32", test)))]
+            #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
             SpinConfigBackend::_Uninhabited(never) => match *never {},
         }
     }
