@@ -186,6 +186,8 @@ Expected: `cargo check --workspace` in the generated project succeeds.
 
 - [ ] **Step 1: Write the test:** `use edgezero_cli::{BuildArgs, run_build};` — construct `let mut a = BuildArgs::default(); a.adapter = "fastly".into();`, write a minimal `edgezero.toml` into a `tempfile::TempDir`, set `EDGEZERO_MANIFEST`, call `run_build(&a)`, assert `Ok` (mirror the existing `handle_build_executes_manifest_command` test's manifest fixture).
 
+  **Env-mutation guard (required).** `EDGEZERO_MANIFEST` is process-global; concurrent tests mutating it flake. Two rules: (a) restore the variable with an RAII guard — copy the `EnvOverride` struct from `edgezero-cli`'s existing `main.rs`/`lib.rs` tests (it saves the prior value in `new` and restores it in `Drop`); (b) keep `tests/lib_consumer.rs` to **exactly one** `#[test]`, so there is no in-binary parallelism on the env var. If a second env-touching test is ever added to this file, gate both with a shared `std::sync::Mutex` guard (the same `manifest_guard()` pattern the crate's unit tests use) — do not rely on `--test-threads=1`.
+
 - [ ] **Step 2: Run** `cargo test -p edgezero-cli --test lib_consumer` — expect PASS. This proves the public API is usable from outside the crate.
 
 ### Task 1.7: Commit-1 documentation + commit
@@ -302,7 +304,15 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 
 - [ ] **Step 5:** Update each adapter's contract-test invocations to the id-keyed factory shape; add a Spin TTL→`Unsupported` contract test and a Spin listing-cap→`LimitExceeded` test; add a Cloudflare config-from-KV async round-trip test (wasm-bindgen-test).
 
-- [ ] **Step 6: Run** `cargo test --workspace --all-targets`, then the per-adapter wasm contract tests (`cargo test -p edgezero-adapter-cloudflare --target wasm32-unknown-unknown --test contract`, fastly + spin on `wasm32-wasip1`). All green.
+- [ ] **Step 6: Run** `cargo test --workspace --all-targets`, then the per-adapter wasm contract tests with the **exact** runner / target / feature each adapter's CI job uses (`.github/workflows/test.yml` `adapter-wasm-tests` matrix — match it, do not improvise):
+  - **cloudflare:** target `wasm32-unknown-unknown`, runner `wasm-bindgen-test-runner` —
+    `cargo test -p edgezero-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare --test contract`
+  - **fastly:** target `wasm32-wasip1`, runner Viceroy (version pinned in `.tool-versions`) —
+    `cargo test -p edgezero-adapter-fastly --target wasm32-wasip1 --features fastly --test contract`
+  - **spin:** target `wasm32-wasip1`, runner Wasmtime —
+    `cargo test -p edgezero-adapter-spin --target wasm32-wasip1 --features spin --test contract`
+
+  The runner for each target is configured in the workspace `.cargo/config.toml`. If the exact feature flags or runner config differ from the above, defer to `.github/workflows/test.yml` as the source of truth and update this step to match. All green.
 
 ### Task 2.8: Migrate `app-demo` + write the migration guide
 
@@ -363,7 +373,9 @@ Spec §9, §6.7, §6.8, §6.10.
 **Files:**
 - Create: `crates/edgezero-macros/src/app_config.rs`; Modify: `crates/edgezero-macros/src/lib.rs`
 
-- [ ] **Step 1: Write macro tests** in `crates/edgezero-macros/tests/app_config_derive.rs`: empty `SECRET_FIELDS` with no annotation; one `KeyInDefault` from `#[secret]`; one `StoreRef` from `#[secret(store_ref)]`; both kinds; `trybuild`-style compile-fail for `#[secret]` + `#[serde(flatten)]`, `#[secret]` + `#[serde(rename)]`, `#[secret(bogus)]`, `#[secret]` on a non-scalar field.
+- [ ] **Step 1a: Add the `trybuild` dev-dependency.** Compile-fail tests need `trybuild`; `crates/edgezero-macros/Cargo.toml` currently has only `tempfile` under `[dev-dependencies]`. Add `trybuild = "1"` to `[dev-dependencies]` there (and to `[workspace.dependencies]` in the root `Cargo.toml` if the workspace pins dev-deps centrally — check first and follow the existing convention).
+
+- [ ] **Step 1b: Write macro tests** in `crates/edgezero-macros/tests/app_config_derive.rs`: empty `SECRET_FIELDS` with no annotation; one `KeyInDefault` from `#[secret]`; one `StoreRef` from `#[secret(store_ref)]`; both kinds. Add a `trybuild` compile-fail harness — `let t = trybuild::TestCases::new(); t.compile_fail("tests/ui/*.rs");` — with one `tests/ui/*.rs` fixture per rejected case: `#[secret]` + `#[serde(flatten)]`, `#[secret]` + `#[serde(rename)]`, `#[secret(bogus)]`, `#[secret]` on a non-scalar field. Each fixture has a matching `.stderr` golden file (generate with `TRYBUILD=overwrite` once the `compile_error!` messages are final).
 
 - [ ] **Step 2: Run** — FAIL.
 
@@ -546,6 +558,11 @@ Spec §15, §6.12.
 
 - [ ] **Step 2: Write integration tests** in `app-demo`: `config validate --strict` exits 0; `config push --adapter axum` writes `.edgezero/local-config-app_config.json` and a running demo server returns `greeting` on `/config/greeting`; `config push --adapter spin --dry-run` **prints** the would-be `__`-encoded keys and the would-be content of both `spin.toml` tables — and the test asserts the on-disk `spin.toml` is **unchanged** (dry-run never mutates); an env-override test asserts `APP_DEMO__SERVICE__TIMEOUT_MS` takes effect.
 
+  **Demo-server lifecycle (required, to keep the e2e test non-flaky):**
+  - **Port:** do not hard-code `8787`. Bind an ephemeral port — either bind `127.0.0.1:0` and read back the assigned port, or pick a free port in the test and pass it to the server. Concurrent CI jobs must not collide.
+  - **Readiness:** after spawning the server, poll `GET /` (or a health route) with a short retry loop — e.g. up to ~50 attempts, 100ms apart (~5s budget) — and only proceed once a request succeeds. Never use a bare `sleep`.
+  - **Teardown:** spawn the server as a child process and kill it in an RAII guard (a struct that holds the `Child` and calls `.kill()` + `.wait()` in `Drop`), so it is reaped even when an assertion fails or panics. Also clean up the `.edgezero/local-config-*.json` files the test wrote.
+
 - [ ] **Step 3: Run** `cd examples/app-demo && cargo test` — PASS.
 
 ### Task 8.2: CI wiring for the `app-demo` loop
@@ -553,9 +570,11 @@ Spec §15, §6.12.
 **Files:**
 - Modify: `.github/workflows/test.yml` (or `scripts/run_tests.sh`)
 
-- [ ] **Step 1:** CI does not currently build `app-demo`. Add a job/step that runs `cd examples/app-demo && cargo test` and the end-to-end axum loop (`cargo run -p app-demo-cli -- config validate --strict`, `... config push --adapter axum`, start the demo server, curl `/config/greeting`). Keep it off the wasm matrix — axum only, no live external calls.
+- [ ] **Step 1:** CI does not currently build `app-demo`. Add a job/step that runs `cd examples/app-demo && cargo test`. Prefer expressing the end-to-end axum loop **as a Rust integration test inside `app-demo`** (the Task 8.1 `app-demo` integration test) rather than as raw shell in the workflow — the Rust test already owns ephemeral-port binding, the readiness poll, and RAII teardown (Task 8.1 step 2). The CI job then just needs `cargo test`; it does not hand-roll `start server / curl / kill` in YAML, which is where shell-based e2e steps go flaky. Keep this job off the wasm matrix — axum only, no live external calls.
 
-- [ ] **Step 2: Run** the workflow logic locally to confirm the loop passes.
+- [ ] **Step 2:** If any loop step must stay as a shell step in the workflow (e.g. invoking the built `app-demo-cli` binary), it must still: select a free port (not a hard-coded one), poll readiness before curl-ing, and `kill` the server in a `trap`/`always()` cleanup so a failed assertion never leaves an orphan process. Mirror the Task 8.1 lifecycle rules.
+
+- [ ] **Step 3: Run** the workflow logic locally to confirm the loop passes and leaves no orphan processes or `.edgezero/` artifacts.
 
 ### Task 8.3: Walkthrough doc + documentation audit + commit
 
