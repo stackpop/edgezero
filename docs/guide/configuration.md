@@ -356,10 +356,25 @@ level = "info"
 [adapters.axum.adapter]
 crate = "crates/my-app-adapter-axum"
 manifest = "crates/my-app-adapter-axum/axum.toml"
+host = "127.0.0.1"
+port = 8787
 
 [adapters.axum.commands]
 build = "cargo build --release -p my-app-adapter-axum"
 serve = "cargo run -p my-app-adapter-axum"
+```
+
+Axum bind-address precedence is:
+
+1. `EDGEZERO_HOST` / `EDGEZERO_PORT`
+2. `edgezero.toml` `[adapters.axum.adapter]` `host` / `port`
+3. `axum.toml` `[adapter]` `host` / `port` when launching through the Axum adapter CLI wrapper
+4. default `127.0.0.1:8787`
+
+Example override:
+
+```sh
+EDGEZERO_HOST=0.0.0.0 EDGEZERO_PORT=3000 cargo run -p my-app-adapter-axum
 ```
 
 ## Using the Manifest

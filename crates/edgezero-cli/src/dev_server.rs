@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
 use edgezero_core::router::RouterService;
 
@@ -33,7 +34,7 @@ pub fn run_dev() {
         Err(err) => log::error!("[edgezero] dev manifest error: {err}"),
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+    let addr = resolve_dev_addr();
     log::info!(
         "[edgezero] dev: starting local server on http://{}:{}",
         addr.ip(),
@@ -83,6 +84,18 @@ async fn dev_root() -> Text<&'static str> {
 #[action]
 async fn dev_echo(Path(params): Path<EchoParams>) -> Text<String> {
     Text::new(format!("hello {}", params.name))
+}
+
+/// Resolve the dev server bind address from `EDGEZERO_HOST` / `EDGEZERO_PORT`
+/// environment variables, falling back to `127.0.0.1:8787`.
+fn resolve_dev_addr() -> SocketAddr {
+    let env_host = env::var("EDGEZERO_HOST").ok();
+    let env_port = env::var("EDGEZERO_PORT").ok();
+    let resolution = addr::resolve_bind_addr(env_host.as_deref(), env_port.as_deref(), None, None);
+    for warning in &resolution.warnings {
+        log::warn!("[edgezero] {warning}");
+    }
+    resolution.addr
 }
 
 fn try_run_manifest_axum() -> Result<bool, String> {

@@ -9,6 +9,7 @@
     reason = "proc-macros must be re-exported through the parent crate"
 )]
 
+pub mod addr;
 pub mod app;
 pub mod body;
 pub mod compression;
