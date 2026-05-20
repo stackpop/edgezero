@@ -1,16 +1,9 @@
 #![cfg(feature = "edgezero-adapter-axum")]
 
-use std::env;
-use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
-use edgezero_core::manifest::ManifestLoader;
 use edgezero_core::router::RouterService;
-
-use crate::adapter;
-use crate::adapter::Action;
 
 #[cfg(not(feature = "dev-example"))]
 use edgezero_core::{action, extractor::Path, response::Text};
@@ -26,19 +19,17 @@ struct EchoParams {
     name: String,
 }
 
-/// Run the example app locally on the axum demo server.
+/// Run the bundled example app locally on the axum demo server.
+///
+/// This always runs the built-in example — it does **not** read
+/// `edgezero.toml` or delegate to a project's axum adapter. To run your
+/// own project's axum adapter, use `edgezero serve --adapter axum`.
 ///
 /// Returns `Ok(())` on graceful shutdown, `Err` on startup failure.
 pub fn run_demo() -> Result<(), String> {
-    match try_run_manifest_axum() {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(err) => log::error!("[edgezero] demo manifest error: {err}"),
-    }
-
     let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
     log::info!(
-        "[edgezero] demo: starting local server on http://{}:{}",
+        "[edgezero] demo: starting example server on http://{}:{}",
         addr.ip(),
         addr.port()
     );
@@ -86,29 +77,4 @@ async fn demo_root() -> Text<&'static str> {
 #[action]
 async fn demo_echo(Path(params): Path<EchoParams>) -> Text<String> {
     Text::new(format!("hello {}", params.name))
-}
-
-fn try_run_manifest_axum() -> Result<bool, String> {
-    let Some(manifest) = load_manifest_optional()? else {
-        return Ok(false);
-    };
-
-    if manifest.manifest().adapters.contains_key("axum") {
-        adapter::execute("axum", Action::Serve, Some(&manifest), &[])
-            .map_err(|err| format!("serve command failed: {err}"))?;
-        return Ok(true);
-    }
-
-    Ok(false)
-}
-
-fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
-    let path = env::var("EDGEZERO_MANIFEST")
-        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
-
-    match ManifestLoader::from_path(&path) {
-        Ok(manifest) => Ok(Some(manifest)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(format!("failed to load {}: {err}", path.display())),
-    }
 }
