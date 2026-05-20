@@ -836,8 +836,22 @@ generic loader with env-var overlay (§6.10).
 `AppConfig` derive + `#[proc_macro_derive]` export; generator
 templates for `<name>.toml` (with a nested `[config.service]` section)
 and `<name>-core/src/config.rs` (with `#[serde(deny_unknown_fields)]`);
-`examples/app-demo/app-demo.toml` + `app-demo-core/src/config.rs` with
-a nested section, one `#[secret]`, one `#[secret(store_ref)]`.
+`examples/app-demo/app-demo.toml` + `app-demo-core/src/config.rs`.
+
+**Generated template vs the `app-demo` example — deliberately
+different.** The **generated** `<name>-core/src/config.rs` (what
+`edgezero new` scaffolds) is the *common-case* starting point: a
+`greeting` field, the nested `[config.service]` section (to exercise
+env overlay), and a single plain `#[secret]` field as the common
+secret pattern. It does **not** include `#[secret(store_ref)]` —
+`store_ref` only buys multiple secret stores on a Fastly-only project
+(§6.8), so putting it in every fresh scaffold would teach the edge
+case as the default. A commented line in the template shows how to add
+`#[secret(store_ref)]` if needed. The **`app-demo` example** is the
+opposite: it deliberately exercises *everything*, so its
+`app-demo-core/src/config.rs` includes a nested section, one
+`#[secret]`, **and** one `#[secret(store_ref)]` — `app-demo` is the
+full-capability showcase, not a representative new project.
 
 **Tests:** `load_app_config` (valid, missing file, bad TOML, validator
 failure, missing `[config]`); env-overlay tests (top-level, nested
@@ -1040,12 +1054,20 @@ unsupported compound shape, `skip_serializing_if`, `Option::None`,
 generated `spin.toml` after a Spin `config push` and asserts: every
 written variable name matches `^[a-z][a-z0-9_]*$` (§6.7); the
 generated manifest **parses** (round-trips through the same TOML /
-Spin-manifest parser the runtime uses), so the
-`^[a-z][a-z0-9_]*$` rule cannot silently drift from Spin's actual
-manifest behaviour. If `spin_sdk` exposes a manifest-validation entry
-point, the test calls it; otherwise it parses with `toml` and checks
-the variable-name regex. The golden file is regenerated only on an
-intentional format change.
+Spin-manifest parser the runtime uses), so the `^[a-z][a-z0-9_]*$`
+rule cannot silently drift from Spin's actual manifest behaviour.
+
+**Validation strength, strongest first:** the test uses the strongest
+check available in its environment. (1) If the `spin` CLI is present
+(the wasm32 spin CI job already installs it), the test runs Spin's own
+manifest validation against the generated file — this is authoritative
+and catches semantic errors a plain TOML parse cannot. (2) Else if
+`spin_sdk` exposes a manifest-validation entry point, it calls that.
+(3) Otherwise it falls back to `toml` parsing + the variable-name
+regex. The regex is the **floor**, not the ceiling — the
+implementation prefers real Spin validation wherever it is reachable
+and treats the TOML-only fallback as the weakest acceptable check.
+The golden file is regenerated only on an intentional format change.
 
 **Ship gate:** `app-demo-cli config push --adapter cloudflare
 --dry-run` and `--adapter spin --dry-run` each show the expected
@@ -1160,6 +1182,11 @@ other seven are individually small.
 **Review note.** Because this is one PR, the reviewer sees all eight
 commits together. The PR description should list the eight commits and
 point at this spec. Reviewing commit-by-commit is recommended.
+**Commit 2 is the review hotspot** — the atomic manifest+runtime
+rewrite is intentionally large (the hard cutoff leaves no smaller
+coherent unit), so it warrants the most reviewer attention. Its
+per-adapter contract tests (§8) are the primary mitigation and should
+be reviewed alongside the code.
 
 **Highest-risk:** commit 2 — atomic manifest+runtime rewrite touching the
 schema, `ConfigStore` (async), **all four** adapters' store impls, the
