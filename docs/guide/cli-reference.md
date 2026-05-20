@@ -52,21 +52,17 @@ The scaffolder includes all adapters registered at CLI build time.
 
 ### edgezero demo
 
-Run the example app locally on the axum demo server:
-
-```bash
-edgezero demo
-```
-
-**Example:**
+Run the bundled example app locally on the axum demo server:
 
 ```bash
 edgezero demo
 # Server starts at http://127.0.0.1:8787
 ```
 
-If `edgezero.toml` defines an Axum adapter command, `edgezero demo` delegates to it. Otherwise it
-starts the built-in demo server (default routes).
+`edgezero demo` always runs the built-in example — it does not read `edgezero.toml`
+or delegate to your project's adapters. To run **your project's** axum adapter, use
+`edgezero serve --adapter axum` (which runs `[adapters.axum.commands].serve` from
+`edgezero.toml`).
 
 > The subcommand is named `demo` — the name `dev` is reserved for a future
 > dev-workflow command.
