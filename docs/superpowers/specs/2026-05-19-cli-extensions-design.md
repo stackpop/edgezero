@@ -56,7 +56,7 @@ Alongside the extensibility substrate, ship:
 
 - A **multi-store manifest model**: the app declares logical stores it
   uses (`[stores.kv] ids = ["foo", "bar"]`); for each store kind an
-  adapter is *Multi-capable* for, it maps every logical id to a
+  adapter is _Multi-capable_ for, it maps every logical id to a
   platform-specific `name`, with room for adapter-specific tuning.
   Stores are addressed in code by logical id. Per-adapter, per-kind
   **capability rules** (§6.6) constrain what is valid — some adapters
@@ -535,7 +535,7 @@ The `cli-walkthrough.md` doc shows the required `spin.toml` entries.
 
 **Config/secret variable collision check (replaces an over-strong
 guarantee).** Spin config and secret variables share one flat
-namespace, so their *effective Spin variable names* must not collide.
+namespace, so their _effective Spin variable names_ must not collide.
 The earlier claim that distinct struct fields guarantee this is wrong:
 a `#[secret]` field's **value** (not its Rust field name) is the
 secret key, so a config key `api_token` and a `#[secret]` field whose
@@ -694,22 +694,22 @@ CLI surface, and the `dev`→`demo` subcommand. The VitePress docs site
 under `docs/guide/` has existing pages describing all of these, which
 go stale. **Updating documentation is part of every commit's
 definition-of-done** — a commit that changes user-facing behaviour
-updates the affected `docs/guide/` pages *in the same commit*, so the
+updates the affected `docs/guide/` pages _in the same commit_, so the
 PR never has a docs-lag window. The docs CI (ESLint + Prettier on
 `docs/`) must pass.
 
 Affected existing pages and the commit that owns each update:
 
-| Page | What changes | Commit |
-|------|--------------|--------|
-| `docs/guide/cli-reference.md` | `dev`→`demo` rename; `edgezero-cli` as a library; new `auth` / `provision` / `config` commands | 1, 5, 6, 7 |
-| `docs/guide/configuration.md` | new `[stores]` logical-id schema + per-adapter mapping + capability rules; removal of `[stores.config.defaults]`; the `<name>.toml` app-config file + env overlay | 2, 3 |
-| `docs/guide/kv.md` | multi-store model, `ctx.kv_store(id)` / bound handles, `Kv` extractor `default()`/`named()` | 2 |
-| `docs/guide/handlers.md` | extractor refactor; async `ConfigStore`; reading config/secrets by logical id | 2 |
-| `docs/guide/getting-started.md` | generator now scaffolds `<name>-cli` and `<name>.toml` | 1, 3 |
-| `docs/guide/adapters/cloudflare.md` | config store moves `[vars]` → KV | 2 |
-| `docs/guide/adapters/overview.md` + Spin adapter docs | Spin store semantics (KV labels, flat-variable config/secrets) | 2 |
-| `docs/guide/architecture.md` | light review — store/adapter description | 2 |
+| Page                                                  | What changes                                                                                                                                                      | Commit     |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `docs/guide/cli-reference.md`                         | `dev`→`demo` rename; `edgezero-cli` as a library; new `auth` / `provision` / `config` commands                                                                    | 1, 5, 6, 7 |
+| `docs/guide/configuration.md`                         | new `[stores]` logical-id schema + per-adapter mapping + capability rules; removal of `[stores.config.defaults]`; the `<name>.toml` app-config file + env overlay | 2, 3       |
+| `docs/guide/kv.md`                                    | multi-store model, `ctx.kv_store(id)` / bound handles, `Kv` extractor `default()`/`named()`                                                                       | 2          |
+| `docs/guide/handlers.md`                              | extractor refactor; async `ConfigStore`; reading config/secrets by logical id                                                                                     | 2          |
+| `docs/guide/getting-started.md`                       | generator now scaffolds `<name>-cli` and `<name>.toml`                                                                                                            | 1, 3       |
+| `docs/guide/adapters/cloudflare.md`                   | config store moves `[vars]` → KV                                                                                                                                  | 2          |
+| `docs/guide/adapters/overview.md` + Spin adapter docs | Spin store semantics (KV labels, flat-variable config/secrets)                                                                                                    | 2          |
+| `docs/guide/architecture.md`                          | light review — store/adapter description                                                                                                                          | 2          |
 
 New pages (created in their owning commit):
 
@@ -804,7 +804,7 @@ API are coupled; with a hard cutoff they ship together as one commit
   `Kv` / `Secrets` / `Config` extractors. Commit 2 does **not**
   introduce `AppDemoConfig` or any typed-app-config handler work:
   that type is created in commit 3 (§9), and `examples/app-demo/
-  app-demo.toml` does not exist yet. This keeps commit 2
+app-demo.toml` does not exist yet. This keeps commit 2
   independently buildable — no commit-2 code references a type that
   lands in commit 3.
 - **`docs/guide/manifest-store-migration.md`** published.
@@ -825,12 +825,12 @@ registry test.
 **Bisectability — config seeding before `config push` exists.** Commit
 2 removes `[stores.config.defaults]` and makes the axum config store
 read `.edgezero/local-config-<id>.json`, but `config push` (which
-*writes* that file) does not land until commit 7, and `edgezero demo`'s
+_writes_ that file) does not land until commit 7, and `edgezero demo`'s
 auto-regeneration of the file depends on the commit-3 loader and the
 commit-7 resolve-and-write step. So between commit 2 and commit 7:
 
 - The axum config store's backing-file **contract** is what commit 2
-  establishes; commit 2 does not need anything to *produce* the file.
+  establishes; commit 2 does not need anything to _produce_ the file.
 - Commit 2's axum config-store tests **write the JSON fixture file
   directly** in test setup (a temp-dir fixture) — they exercise the
   read path without depending on `config push`.
@@ -859,7 +859,7 @@ and `<name>-core/src/config.rs` (with `#[serde(deny_unknown_fields)]`);
 
 **Generated template vs the `app-demo` example — deliberately
 different.** The **generated** `<name>-core/src/config.rs` (what
-`edgezero new` scaffolds) is the *common-case* starting point: a
+`edgezero new` scaffolds) is the _common-case_ starting point: a
 `greeting` field, the nested `[config.service]` section (to exercise
 env overlay), and a single plain `#[secret]` field as the common
 secret pattern. It does **not** include `#[secret(store_ref)]` —
@@ -867,7 +867,7 @@ secret pattern. It does **not** include `#[secret(store_ref)]` —
 (§6.8), so putting it in every fresh scaffold would teach the edge
 case as the default. A commented line in the template shows how to add
 `#[secret(store_ref)]` if needed. The **`app-demo` example** is the
-opposite: it deliberately exercises *everything*, so its
+opposite: it deliberately exercises _everything_, so its
 `app-demo-core/src/config.rs` includes a nested section, one
 `#[secret]`, **and** one `#[secret(store_ref)]` — `app-demo` is the
 full-capability showcase, not a representative new project.
@@ -917,7 +917,7 @@ additional Spin checks (all per §6.7):
    only for the typed path, which is the one downstream CLIs wire up;
 3. Spin component discovery resolves (exactly one `[component.*]` in
    `spin.toml`, or an explicit, matching `[adapters.spin.adapter]
-   .component`) — **typed and raw** (manifest-based, no struct
+.component`) — **typed and raw** (manifest-based, no struct
    needed).
 
 Manifest: `ManifestLoader` checks; under `--strict`, capability-aware
@@ -990,10 +990,10 @@ provisioned by the Spin runtime / Fermyon at deploy). `provision
   appears in the resolved component's `key_value_stores` array field
   (`key_value_stores = [...]` under `[component.<component>]`).
 - **Config and secret variables are NOT handled by `provision`.** The
-  manifest only carries store *ids*, not app-config field keys or
+  manifest only carries store _ids_, not app-config field keys or
   secret key names — `provision` cannot know which Spin variables to
   declare. Config-variable declaration is done by `config push
-  --adapter spin` (which loads `<name>.toml` and therefore knows the
+--adapter spin` (which loads `<name>.toml` and therefore knows the
   keys; see §13). Secret-variable declaration is **manual** — the
   developer declares Spin secret variables in `spin.toml` themselves
   (§6.7); the CLI never writes secret variables.
@@ -1037,11 +1037,11 @@ Push is **split by adapter** — there is no single "resource-ID" model:
 | axum       | Write resolved values to `.edgezero/local-config-<id>.json` (the file the axum config store reads, §15). No runner call.                                                                                                  |
 | cloudflare | Read the namespace id from `wrangler.toml` (error "did you run `provision`?" if absent); `wrangler kv bulk put <tempfile.json> --namespace-id=<id>`. Keys in dotted form.                                                 |
 | fastly     | Resolve the store id on demand: `fastly config-store list --json`, match by `<name>`; per key `fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>` (`--stdin` for large values). Keys in dotted form. |
-| spin       | Declare + set each config value as a Spin variable, writing **both** `spin.toml` tables (see below). Keys in `.`→`__` lowercase form (§6.7). No remote call — live Fermyon Cloud variable push is out of scope (§2). |
+| spin       | Declare + set each config value as a Spin variable, writing **both** `spin.toml` tables (see below). Keys in `.`→`__` lowercase form (§6.7). No remote call — live Fermyon Cloud variable push is out of scope (§2).      |
 
 **Spin `config push` writes two `spin.toml` tables.** A Spin variable
-is not readable by a component unless it is both *declared* and
-*bound*. `config push --adapter spin` therefore writes:
+is not readable by a component unless it is both _declared_ and
+_bound_. `config push --adapter spin` therefore writes:
 
 1. `[variables].<key>` — the application-level variable declaration,
    with `default = "<resolved value>"`.
@@ -1052,7 +1052,7 @@ is not readable by a component unless it is both *declared* and
 If the component-bindings table is missing entries for keys this push
 needs and `config push` cannot resolve the component (§6.7), it
 errors rather than writing a half-configured manifest. The component
-is resolved per §6.7's discovery rule. Config-variable *declaration*
+is resolved per §6.7's discovery rule. Config-variable _declaration_
 lives here (not in `provision`) because only `config push` loads
 `<name>.toml` and thus knows the keys. Secret variables remain manual
 (§6.7) — `config push` skips `SECRET_FIELDS` and never writes secret
@@ -1255,7 +1255,7 @@ writeback across four adapters (`wrangler.toml`, `fastly.toml`,
 - **Spin component discovery:** writing `[component.<name>.*]` tables
   needs the component id; single-component `spin.toml` resolves
   implicitly, multi-component requires `[adapters.spin.adapter]
-  .component`. `config validate --strict` surfaces a failure early.
+.component`. `config validate --strict` surfaces a failure early.
 - **Env overlay surprising `config push`:** `--no-env` is the escape
   hatch.
 - **Shell-out + ID-writeback fragility:** current platform syntax

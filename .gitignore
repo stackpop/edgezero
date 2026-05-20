@@ -17,9 +17,6 @@ target/
 # Worktrees
 .worktrees/
 
-# Superpowers plans
-docs/superpowers/
-
 # Editors
 .claude/*
 !.claude/settings.json

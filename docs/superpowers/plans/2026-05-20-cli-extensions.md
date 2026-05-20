@@ -416,7 +416,7 @@ Spec §9, §6.7, §6.8, §6.10.
 **Macro availability — chosen route: re-export through `edgezero-core`.**
 `edgezero-core` already re-exports the `action` and `app` proc-macros
 from `edgezero-macros` (handlers do `use edgezero_core::action`).
-`AppConfig` follows the *same* route: the derive is defined in
+`AppConfig` follows the _same_ route: the derive is defined in
 `edgezero-macros` and **re-exported from `edgezero-core`** so consumers
 write `use edgezero_core::AppConfig`. Consequence: a crate that derives
 `AppConfig` needs **only `edgezero-core`** as a dependency for the
@@ -514,6 +514,7 @@ Spec §10. New: `ConfigValidateArgs`, `run_config_validate`, `run_config_validat
 ### Task 4.2: Wire `config` into the default `edgezero` binary
 
 **Files:**
+
 - Modify: `crates/edgezero-cli/src/args.rs` (`Command` enum), `crates/edgezero-cli/src/main.rs`
 
 The spec (§1, §8) requires the new subcommands to be available on the
@@ -669,6 +670,7 @@ Spec §15, §6.12.
 ### Task 8.2: Upgrade the generated `<name>-cli` template to the full command set
 
 **Files:**
+
 - Modify: `crates/edgezero-cli/src/templates/cli/Cargo.toml.hbs`, `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`, `crates/edgezero-cli/src/generator.rs` (tests)
 
 Commit 1 created the `<name>-cli` template with only the five base
