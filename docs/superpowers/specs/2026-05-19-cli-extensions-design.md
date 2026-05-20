@@ -44,8 +44,11 @@ Let downstream projects (e.g. a future `myapp` from `edgezero new
 myapp`) build their own CLI binary that:
 
 - Reuses any subset of edgezero's built-in commands (`build`, `deploy`,
-  `dev`, `new`, `serve`; after this effort also `auth`, `provision`,
-  `config validate`, `config push`).
+  `demo`, `new`, `serve`; after this effort also `auth`, `provision`,
+  `config validate`, `config push`). The subcommand that runs the
+  example app locally on axum is named `demo` — the name `dev` is
+  **reserved** for a future dev-workflow command and is intentionally
+  not used by this effort.
 - Adds their own subcommands.
 - Owns the binary name, `about` text, and top-level help.
 
@@ -161,7 +164,7 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String>;
 pub fn run_new(args: &NewArgs) -> Result<(), String>;
 pub fn run_serve(args: &ServeArgs) -> Result<(), String>;
 #[cfg(feature = "edgezero-adapter-axum")]
-pub fn run_dev() -> !;
+pub fn run_demo() -> Result<(), String>;  // `demo` subcommand; Ok on graceful shutdown
 
 pub fn run_auth(args: &AuthArgs) -> Result<(), String>;
 pub fn run_provision(args: &ProvisionArgs) -> Result<(), String>;
@@ -237,7 +240,7 @@ pub fn derive_app_config(input: TokenStream) -> TokenStream { /* ... */ }
 crates/edgezero-cli/
   Cargo.toml
   src/
-    lib.rs / main.rs / args.rs / adapter.rs / scaffold.rs / dev_server.rs
+    lib.rs / main.rs / args.rs / adapter.rs / scaffold.rs / demo_server.rs
     generator.rs              # extended: scaffolds <name>-cli + <name>.toml + <name>-core/src/config.rs
     runner.rs                 # NEW: CommandSpec + CommandRunner + Real/Mock
     auth.rs / provision.rs / config.rs   # NEW command impls
@@ -461,20 +464,23 @@ registers it by logical id.
 - **TTL is unsupported.** `spin_sdk::key_value` has no expiry. The
   `BoundKvStore` surface still exposes `put_*_with_ttl` (used by other
   adapters). On Spin, those operations **must return a deterministic
-  error** (`KvError::Unsupported`), never silently store the value
-  without expiry — generic code must not believe an expiry was applied
-  when it was not. The Spin KV contract test asserts this error.
+  error**, never silently store the value without expiry. The current
+  `KvError` enum has **no `Unsupported` variant** — **commit 2 adds
+  `KvError::Unsupported`** and its `EdgeError` mapping. Because an
+  unsupported operation is not a client mistake, it maps to a
+  5xx-class `EdgeError` (the exact constructor — `EdgeError::internal`
+  or a dedicated one — is pinned in commit 2). The Spin KV contract
+  test asserts this error.
 - **Listing is capped.** `SpinKvStore` carries a `max_list_keys` cap
-  and returns an error rather than silently truncating when exceeded.
-  *Open concern inherited from PR #253:* #253 currently uses
-  `KvError::Validation` for this. A store growing beyond a cap is a
-  server/limit condition, not a malformed client request, so
-  `Validation` (which an adapter may map to HTTP 400) is arguably the
-  wrong variant. This spec does not block on it, but flags it: the
-  implementation of commit 2 should reconcile the listing-cap error
-  with PR #253 — prefer a limit/server-side error variant — and test
-  the pagination logic directly. If #253's variant is kept, that is a
-  conscious decision recorded in the commit.
+  and must error rather than silently truncate when exceeded. A store
+  growing beyond a cap is a server/limit condition, not a malformed
+  client request, so PR #253's current `KvError::Validation` (which an
+  adapter may map to HTTP 400) is the wrong variant. **Resolved here,
+  not left open: commit 2 adds `KvError::LimitExceeded`** (5xx-class
+  `EdgeError` mapping, like `Unsupported`) and the Spin KV listing
+  path returns it when `max_list_keys` is exceeded, replacing
+  `Validation` for this case. Commit 2 also tests the pagination logic
+  directly (not only the cap error).
 
 **Config — flat Spin variables, single-store.** `SpinConfigStore` is
 backed by `spin_sdk::variables`. Spin has **one** flat variable
@@ -636,8 +642,8 @@ compared exactly. Two sibling keys mapping to the same segment is an
 value's type; parse failure → `AppConfigError`.
 
 **Scope.** `config validate` and `config push` both see env-resolved
-values; `--no-env` disables the overlay. The axum dev server resolves
-via the same path.
+values; `--no-env` disables the overlay. The axum demo server (the
+`demo` subcommand) resolves via the same path.
 
 Note the deliberate consistency: the env separator (`__`) is the same
 as the Spin config-key separator (§6.4/§6.7).
@@ -648,6 +654,42 @@ Non-subcommand `*Args` derive `Default` (external construction despite
 `#[non_exhaustive]`). Subcommand-wrapping `AuthArgs` does not (a
 defaulted required subcommand could leak into a real auth path);
 external tests construct it via `clap::Parser::try_parse_from`.
+
+### 6.12 Documentation updates (definition-of-done for every commit)
+
+This effort changes the manifest schema, the runtime store API, the
+CLI surface, and the `dev`→`demo` subcommand. The VitePress docs site
+under `docs/guide/` has existing pages describing all of these, which
+go stale. **Updating documentation is part of every commit's
+definition-of-done** — a commit that changes user-facing behaviour
+updates the affected `docs/guide/` pages *in the same commit*, so the
+PR never has a docs-lag window. The docs CI (ESLint + Prettier on
+`docs/`) must pass.
+
+Affected existing pages and the commit that owns each update:
+
+| Page | What changes | Commit |
+|------|--------------|--------|
+| `docs/guide/cli-reference.md` | `dev`→`demo` rename; `edgezero-cli` as a library; new `auth` / `provision` / `config` commands | 1, 5, 6, 7 |
+| `docs/guide/configuration.md` | new `[stores]` logical-id schema + per-adapter mapping + capability rules; removal of `[stores.config.defaults]`; the `<name>.toml` app-config file + env overlay | 2, 3 |
+| `docs/guide/kv.md` | multi-store model, `ctx.kv_store(id)` / bound handles, `Kv` extractor `default()`/`named()` | 2 |
+| `docs/guide/handlers.md` | extractor refactor; async `ConfigStore`; reading config/secrets by logical id | 2 |
+| `docs/guide/getting-started.md` | generator now scaffolds `<name>-cli` and `<name>.toml` | 1, 3 |
+| `docs/guide/adapters/cloudflare.md` | config store moves `[vars]` → KV | 2 |
+| `docs/guide/adapters/overview.md` + Spin adapter docs | Spin store semantics (KV labels, flat-variable config/secrets) | 2 |
+| `docs/guide/architecture.md` | light review — store/adapter description | 2 |
+
+New pages (created in their owning commit):
+
+- `docs/guide/manifest-store-migration.md` — commit 2 (how to migrate a
+  pre-rewrite `edgezero.toml`).
+- `docs/guide/cli-walkthrough.md` — commit 8 (full `myapp` loop).
+
+Commit 8 additionally performs a **documentation audit**: grep the
+`docs/` tree for stale references (old manifest store keys, the `dev`
+subcommand, the old single-store runtime API) and confirm none remain;
+verify every page is listed in the `docs/.vitepress/config.mts`
+sidebar. The audit is a checklist item in commit 8's ship gate.
 
 ---
 
@@ -661,6 +703,19 @@ external tests construct it via `clap::Parser::try_parse_from`.
 existing tests to `lib.rs`; extend the generator to scaffold
 `crates/<name>-cli`; add the handwritten `examples/app-demo/crates/
 app-demo-cli` parallel.
+
+The `dev` subcommand is renamed to **`demo`** — it runs the example
+app locally on axum, which is a demo workflow, not a dev workflow; the
+name `dev` is reserved for a future dev-workflow command. Commit 1
+renames the CLI's `dev_server` module to `demo_server`, the public
+function `run_dev` to `run_demo`, and the `Command::Dev` variant to
+`Command::Demo`. `run_demo` returns `Result<(), String>` (consistent
+with the other `run_*` functions) — `Ok(())` on graceful shutdown,
+`Err(String)` on startup failure (e.g. port bind). It is **not**
+`-> !` — the demo server is allowed to return. The current
+`dev_server::run_dev()` returns `()`; commit 1 adjusts that boundary.
+(The `edgezero-adapter-axum` crate's own internal `dev_server` module
+is not user-facing and is left as-is.)
 
 **Tests:** existing tests pass post-relocation; `tests/lib_consumer.rs`;
 `app-demo-cli/tests/help.rs`; generator structure test.
@@ -682,6 +737,9 @@ API are coupled; with a hard cutoff they ship together as one commit
   load error. Validation includes the §6.6 capability matrix.
 - **`ConfigStore` async:** `get` becomes `async`
   (`#[async_trait(?Send)]`).
+- **New `KvError` variants:** add `KvError::Unsupported` (Spin TTL
+  writes, §6.7) and `KvError::LimitExceeded` (Spin listing past
+  `max_list_keys`, §6.7), each with a 5xx-class `EdgeError` mapping.
 - **Bound handles:** `BoundKvStore` / `BoundConfigStore` /
   `BoundSecretStore`; `RequestContext` accessors id-keyed, with
   `_default()` helpers.
@@ -724,6 +782,26 @@ config-from-KV async round-trip; Spin config `.`→`__` translation test;
 Spin KV listing-cap pagination test (and its error-variant decision,
 §6.7); `Kv`/`Secrets`/`Config` extractor tests; `app!` macro metadata
 registry test.
+
+**Bisectability — config seeding before `config push` exists.** Commit
+2 removes `[stores.config.defaults]` and makes the axum config store
+read `.edgezero/local-config-<id>.json`, but `config push` (which
+*writes* that file) does not land until commit 7, and `edgezero demo`'s
+auto-regeneration of the file depends on the commit-3 loader and the
+commit-7 resolve-and-write step. So between commit 2 and commit 7:
+
+- The axum config store's backing-file **contract** is what commit 2
+  establishes; commit 2 does not need anything to *produce* the file.
+- Commit 2's axum config-store tests **write the JSON fixture file
+  directly** in test setup (a temp-dir fixture) — they exercise the
+  read path without depending on `config push`.
+- `app-demo`'s commit-2 state: if no fixture file is present the axum
+  config store is empty (the documented "absent → empty" behaviour).
+  Any commit-2 `app-demo` test that asserts a config value seeds the
+  fixture file itself. The full `config push` → running-demo-server
+  read-back end-to-end test lands in commit 8.
+
+This keeps commit 2 independently buildable and testable.
 
 **Ship gate:** multi-store handlers work on axum, cloudflare, fastly,
 and spin; async config reads work; all four CI gates green (including
@@ -773,13 +851,21 @@ opts in; `#[secret]` non-empty; `#[secret(store_ref)]` in
 additional Spin checks (all per §6.7):
 
 1. every flattened config key, `.`→`__` translated, matches
-   `^[a-z][a-z0-9_]*$`;
+   `^[a-z][a-z0-9_]*$` — **typed and raw** (both flavours have the
+   config keys);
 2. the effective Spin variable name set — {flattened config keys} ∪
    {`#[secret]` field values}, after `.`→`__` translation — has no
-   duplicate (config/secret namespace collision check);
+   duplicate (config/secret namespace collision check). **Typed
+   only** — `#[secret]` fields are identified via
+   `AppConfigMeta::SECRET_FIELDS`, which the raw flavour does not
+   have. `run_config_validate` (raw) cannot tell which keys are
+   secrets, so it performs check 1 and check 3 but **not** check 2;
+   its diagnostics say so. The collision check is therefore guaranteed
+   only for the typed path, which is the one downstream CLIs wire up;
 3. Spin component discovery resolves (exactly one `[component.*]` in
    `spin.toml`, or an explicit, matching `[adapters.spin.adapter]
-   .component`).
+   .component`) — **typed and raw** (manifest-based, no struct
+   needed).
 
 Manifest: `ManifestLoader` checks; under `--strict`, capability-aware
 completeness and well-formed handler paths.
@@ -970,7 +1056,7 @@ timeout_ms` is read at runtime; the Spin path proves `.`→`__`
 - **`config validate` / `config push`:** CI runs `config validate
 --strict` (exit 0 — including the three Spin checks of §10) then
   `config push --adapter axum` and reads the value back through a
-  running axum dev server on `/config/greeting`. `config push
+  running axum demo server on `/config/greeting`. `config push
   --adapter spin --dry-run` is asserted to produce `__`-encoded keys
   and to write **both** `spin.toml` tables.
 - **`auth` / `provision`:** exercised against `MockCommandRunner` (and,
@@ -981,16 +1067,27 @@ timeout_ms` is read at runtime; the Spin path proves `.`→`__`
 **Axum config store backing.** The axum config store is backed by
 `.edgezero/local-config-<id>.json` (gitignored). `config push
 --adapter axum` writes it from `<name>.toml` (env overlay applied);
-the axum config store reads the same file; `edgezero dev` regenerates
+the axum config store reads the same file; `edgezero demo` regenerates
 it at startup. If absent, the axum config store is empty.
 
-**Docs:** `docs/guide/cli-walkthrough.md` (full `myapp` loop, env
-override, all four adapters); `docs/.vitepress/config.mts` sidebar
-updated.
+**Docs:** create `docs/guide/cli-walkthrough.md` (full `myapp` loop —
+`new`, `auth`, `provision`, `config validate`, `config push`, `deploy`,
+the `demo` subcommand, an env-override example, all four adapters,
+including the manual Spin secret-variable `spin.toml` entries and the
+explicit `[adapters.spin.adapter].component` form). Update
+`docs/.vitepress/config.mts` so the sidebar lists `cli-walkthrough.md`
+and `manifest-store-migration.md`.
+
+**Documentation audit (§6.12).** Commit 8 finishes with a docs audit:
+grep `docs/` for stale references — old `[stores.*]` manifest keys,
+the `dev` subcommand, the pre-rewrite single-store runtime API — and
+confirm none remain; confirm every page in §6.12's table was updated
+by its owning commit; confirm the docs CI (ESLint + Prettier) passes.
 
 **Ship gate:** CI runs the full loop on axum end-to-end; manifest /
 runtime behaviour for cloudflare, fastly, and spin is covered by
-contract + mock tests.
+contract + mock tests; the documentation audit passes with zero stale
+references.
 
 ---
 
@@ -1008,7 +1105,12 @@ one per sub-project, applied in this order:
 | 5      | §11 | `auth` + `CommandRunner`                               | M    |
 | 6      | §12 | `provision`                                            | H    |
 | 7      | §13 | `config push`                                          | M    |
-| 8      | §15 | `app-demo` polish (all four adapters)                  | M    |
+| 8      | §15 | `app-demo` polish (all four adapters) + docs audit     | M    |
+
+Every commit also updates the `docs/guide/` pages it makes stale
+(§6.12) — documentation is part of each commit's definition-of-done,
+not a deferred afterthought. Commit 8 closes with a documentation
+audit.
 
 **CI and bisectability.** CI gates the PR as a whole on its head
 commit; all four gates (`fmt`, `clippy -D warnings`, `cargo test`,
@@ -1058,10 +1160,13 @@ writeback across four adapters (`wrangler.toml`, `fastly.toml`,
   the walkthrough doc covers this. `#[secret(store_ref)]` is the
   awkward case on Spin (single flat secret namespace, code-local
   keys) — supported, but the developer owns the `spin.toml` entries.
-- **Spin KV TTL / listing-cap:** TTL writes return
-  `KvError::Unsupported` on Spin (deterministic, not silent). The
-  listing-cap error variant is an open reconciliation point with
-  PR #253 (§6.7) — resolved in commit 2, not a blocker.
+- **Spin KV TTL / listing-cap:** commit 2 adds two new `KvError`
+  variants — `Unsupported` (Spin TTL writes) and `LimitExceeded`
+  (Spin listing past `max_list_keys`) — both 5xx-class in their
+  `EdgeError` mapping. Spin TTL writes return `Unsupported`
+  deterministically (not silent); the Spin listing path returns
+  `LimitExceeded`, replacing PR #253's `KvError::Validation` for that
+  case. Both are settled in this spec, not left open.
 - **Spin component discovery:** writing `[component.<name>.*]` tables
   needs the component id; single-component `spin.toml` resolves
   implicitly, multi-component requires `[adapters.spin.adapter]
