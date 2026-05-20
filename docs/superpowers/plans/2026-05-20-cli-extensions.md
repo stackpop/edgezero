@@ -53,7 +53,7 @@ crates/edgezero-core/src/
   secret_store.rs               # M (commit 2): bound-handle wrapper
   context.rs                    # M (commit 2): id-keyed Bound*Store accessors
   extractor.rs                  # M (commit 2): Kv/Secrets/Config default()/named()
-  hooks.rs / app.rs             # M (commit 2): id-keyed metadata
+  app.rs                        # M (commit 2): Hooks + id-keyed ConfigStoreMetadata (Hooks lives in app.rs, no separate hooks.rs)
   app_config.rs                 # C (commit 3)
 crates/edgezero-macros/src/
   lib.rs                        # M (commit 3): AppConfig derive export
@@ -149,7 +149,19 @@ fn build_args_default_and_mutate() {
 
 - [ ] **Step 4: Run** the generator test — expect PASS.
 
-- [ ] **Step 5: Manual check:** `cargo run -p edgezero-cli -- new throwaway && cd /tmp/throwaway && cargo check --workspace` succeeds; clean up.
+- [ ] **Step 5: Manual check:** generate into an explicit fresh temp dir and build it — do **not** assume the project lands in CWD. Example:
+
+```bash
+TMP="$(mktemp -d)"
+cargo run -p edgezero-cli -- new throwaway --dir "$TMP"
+# cd into the generated project root (confirm the exact path the generator
+# prints — `--dir` is "the directory to create the app in"):
+cd "$TMP"/* 2>/dev/null || cd "$TMP"
+cargo check --workspace
+cd - && rm -rf "$TMP"
+```
+
+Expected: `cargo check --workspace` in the generated project succeeds.
 
 ### Task 1.5: Add the handwritten `app-demo-cli` crate
 
@@ -209,7 +221,8 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 
 - [ ] **Step 3: Implement** per §6.6. Replace `ManifestStores`, `ManifestConfigStoreConfig`, `ManifestKvConfig`, `ManifestSecretsConfig`, and the `Manifest*AdapterConfig` types with:
   - `ManifestStores { kv: Option<LogicalStore>, config: Option<LogicalStore>, secrets: Option<LogicalStore> }` where `LogicalStore { ids: Vec<String>, default: Option<String> }`.
-  - `ManifestAdapter` gains `stores: Option<AdapterStoresConfig>` and `component: Option<String>` (Spin component, §6.7). `AdapterStoresConfig { kv/config/secrets: BTreeMap<String /*id*/, AdapterStoreMapping> }`, `AdapterStoreMapping { name: String, #[serde(flatten)] extras: BTreeMap<String, toml::Value> }`.
+  - `ManifestAdapter` (the `[adapters.<x>]` struct) gains `stores: Option<AdapterStoresConfig>`. `AdapterStoresConfig { kv/config/secrets: BTreeMap<String /*id*/, AdapterStoreMapping> }`, `AdapterStoreMapping { name: String, #[serde(flatten)] extras: BTreeMap<String, toml::Value> }`.
+  - The Spin `component` field goes on the **`[adapters.<x>.adapter]` definition struct** — the one that already carries `crate` and `manifest` — **not** on the top-level `ManifestAdapter`. Adding it to `ManifestAdapter` would make the accepted TOML `[adapters.spin] component = "..."`, which is wrong; it must be `[adapters.spin.adapter] component = "..."` (§6.7). Confirm the struct name by reading `manifest.rs` (the struct deserialized from `[adapters.<x>.adapter]`); add `component: Option<String>` there.
   - A `Capability { Multi, Single }` and a const fn `capability(adapter: &str, kind: StoreKind) -> Capability` encoding the §6.6 matrix.
   - Validation in `ManifestLoader`: non-empty `ids`; `default` rules; capability check (any `Single` adapter for a kind ⇒ `ids.len() == 1`); per-id mapping required for `Multi` pairs / forbidden for `Single` pairs; Cloudflare `name` JS-identifier check; Spin KV label check.
   - Detect legacy keys (`name`/`enabled`/`defaults`/`adapters` under `[stores.*]`) via a `#[serde(deny_unknown_fields)]` or an explicit reject, emitting an error pointing at `docs/guide/manifest-store-migration.md`.
@@ -255,7 +268,7 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 ### Task 2.5: Id-keyed `Hooks` / `ConfigStoreMetadata` + `app!` macro
 
 **Files:**
-- Modify: `crates/edgezero-core/src/app.rs`, `crates/edgezero-core/src/hooks.rs` (if separate), `crates/edgezero-macros/src/app.rs`, `crates/edgezero-macros/src/manifest_definitions.rs`
+- Modify: `crates/edgezero-core/src/app.rs` (`Hooks` + `ConfigStoreMetadata` both live here — there is no separate `hooks.rs`), `crates/edgezero-macros/src/app.rs`, `crates/edgezero-macros/src/manifest_definitions.rs`
 
 - [ ] **Step 1: Implement.** `ConfigStoreMetadata` becomes a registry: one entry per logical config id, each carrying the per-adapter `name` map. `Hooks` exposes store **metadata** (ids, resolved default, per-adapter names) per kind — **not** bound handles. Update the `app!` macro to emit the id-keyed metadata from the new manifest schema (`manifest_definitions.rs` is where the macro reads the manifest).
 
@@ -279,7 +292,7 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 **Files:**
 - Modify: `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/{config_store,key_value_store,secret_store}.rs` and each adapter's request-setup code.
 
-- [ ] **Step 1: axum.** Build `StoreRegistry` for each kind from `[adapters.axum.stores.*]`. KV stays `PersistentKvStore` (redb), one per id. Config store reads `.edgezero/local-config-<id>.json` (the file commit 7 writes); absent ⇒ empty. Secrets from env vars (Single).
+- [ ] **Step 1: axum.** Build `StoreRegistry` for each kind from `[adapters.axum.stores.*]`. KV stays `PersistentKvStore` (redb) — **one separate redb file per logical id**, file stem from the per-adapter mapping `[adapters.axum.stores.kv.<id>].name`: `.edgezero/kv-<name>.redb`. (Axum KV is `Multi`, so every id has a `name`.) Distinct files prevent multi-store collapsing into one backing file. Config store reads `.edgezero/local-config-<id>.json` (the file commit 7 writes); absent ⇒ empty. Secrets from env vars (Single).
 
 - [ ] **Step 2: cloudflare.** KV registry. **Config rewritten from `[vars]` to KV** (§6.9) — `CloudflareConfigStore` does an async `env.<NAMESPACE>.get(key)`; one namespace per config id. Secrets from worker secrets (Single).
 
@@ -333,7 +346,15 @@ Spec §9, §6.7, §6.8, §6.10.
 
 - [ ] **Step 2: Run** — FAIL.
 
-- [ ] **Step 3: Implement** per §4: `AppConfigMeta` trait with `const SECRET_FIELDS: &'static [SecretField]`; `SecretField { name, kind }`; `SecretKind { KeyInDefault, StoreRef }`; `AppConfigError`; `load_app_config<C>(path, app_name)` and `load_app_config_raw(path, app_name)`. `load_app_config` parses the `[config]` table, applies the env overlay (Task 3.3), then deserializes + `validate()`. `pub mod app_config;` in `lib.rs`.
+- [ ] **Step 3: Implement** per §4. Types: `AppConfigMeta` trait with `const SECRET_FIELDS: &'static [SecretField]`; `SecretField { name, kind }`; `SecretKind { KeyInDefault, StoreRef }`; `AppConfigError`; `AppConfigLoadOptions { env_overlay: bool }` with `Default` = `{ env_overlay: true }`.
+
+  Loader API — **one consistent shape, no hidden bool param.** The simple functions apply the env overlay (the default); the `_with_options` variants take `AppConfigLoadOptions` explicitly:
+  - `load_app_config<C>(path, app_name) -> Result<C, AppConfigError>` — overlay on.
+  - `load_app_config_with_options<C>(path, app_name, opts: &AppConfigLoadOptions) -> Result<C, AppConfigError>`.
+  - `load_app_config_raw(path, app_name) -> Result<toml::Value, AppConfigError>` — overlay on.
+  - `load_app_config_raw_with_options(path, app_name, opts: &AppConfigLoadOptions) -> Result<toml::Value, AppConfigError>`.
+
+  The simple functions delegate to the `_with_options` form with `AppConfigLoadOptions::default()`. `--no-env` (Tasks 4.1 / 7.1) calls the `_with_options` variant with `env_overlay: false`. `load_app_config*` parses the `[config]` table, applies the env overlay when `opts.env_overlay`, then (typed) deserializes + `validate()`. `pub mod app_config;` in `lib.rs`.
 
 - [ ] **Step 4: Run** — PASS.
 
@@ -355,7 +376,7 @@ Spec §9, §6.7, §6.8, §6.10.
 **Files:**
 - Modify: `crates/edgezero-core/src/app_config.rs`
 
-- [ ] **Step 1: Write tests:** `APP_DEMO__GREETING` overrides a top-level key; `APP_DEMO__SERVICE__TIMEOUT_MS` overrides a nested key; type coercion against the existing TOML value; a non-parseable value errors; two sibling keys mapping to the same env segment errors; `--no-env` (a bool param to the loader) bypasses.
+- [ ] **Step 1: Write tests:** `APP_DEMO__GREETING` overrides a top-level key; `APP_DEMO__SERVICE__TIMEOUT_MS` overrides a nested key; type coercion against the existing TOML value; a non-parseable value errors; two sibling keys mapping to the same env segment errors; `load_app_config_with_options` with `AppConfigLoadOptions { env_overlay: false }` skips the overlay entirely.
 
 - [ ] **Step 2: Run** — FAIL.
 
@@ -523,7 +544,7 @@ Spec §15, §6.12.
 
 - [ ] **Step 1:** Confirm `app-demo-cli`'s `Cmd` has all five built-ins + `Auth` + `Provision` + `Config(Validate|Push)`. Ensure handlers exercise: two named KV ids (`sessions`, `cache`) via `Kv::named`; async `config_store_default().get("greeting")`; the nested `service.timeout_ms`; both secret forms. Add the manual Spin secret-variable declarations to `app-demo-adapter-spin/spin.toml` (`secret = true`, bound under `[component.<component>.variables]`).
 
-- [ ] **Step 2: Write integration tests** in `app-demo`: `config validate --strict` exits 0; `config push --adapter axum` writes `.edgezero/local-config-app_config.json` and a running demo server returns `greeting` on `/config/greeting`; `config push --adapter spin --dry-run` produces `__`-encoded keys and writes both `spin.toml` tables; an env-override test asserts `APP_DEMO__SERVICE__TIMEOUT_MS` takes effect.
+- [ ] **Step 2: Write integration tests** in `app-demo`: `config validate --strict` exits 0; `config push --adapter axum` writes `.edgezero/local-config-app_config.json` and a running demo server returns `greeting` on `/config/greeting`; `config push --adapter spin --dry-run` **prints** the would-be `__`-encoded keys and the would-be content of both `spin.toml` tables — and the test asserts the on-disk `spin.toml` is **unchanged** (dry-run never mutates); an env-override test asserts `APP_DEMO__SERVICE__TIMEOUT_MS` takes effect.
 
 - [ ] **Step 3: Run** `cd examples/app-demo && cargo test` — PASS.
 

@@ -190,11 +190,27 @@ pub trait AppConfigMeta { const SECRET_FIELDS: &'static [SecretField]; }
 pub struct SecretField { pub name: &'static str, pub kind: SecretKind }
 pub enum SecretKind { KeyInDefault, StoreRef }
 
+// Loader options. Default = env overlay on.
+pub struct AppConfigLoadOptions { pub env_overlay: bool }
+impl Default for AppConfigLoadOptions { /* env_overlay: true */ }
+
+// Simple forms apply the env overlay (the default).
 pub fn load_app_config<C>(path: &std::path::Path, app_name: &str)
     -> Result<C, AppConfigError>
 where C: serde::de::DeserializeOwned + validator::Validate + AppConfigMeta;
 pub fn load_app_config_raw(path: &std::path::Path, app_name: &str)
     -> Result<toml::Value, AppConfigError>;
+
+// Explicit-options forms — `--no-env` calls these with env_overlay: false.
+pub fn load_app_config_with_options<C>(
+    path: &std::path::Path, app_name: &str, opts: &AppConfigLoadOptions,
+) -> Result<C, AppConfigError>
+where C: serde::de::DeserializeOwned + validator::Validate + AppConfigMeta;
+pub fn load_app_config_raw_with_options(
+    path: &std::path::Path, app_name: &str, opts: &AppConfigLoadOptions,
+) -> Result<toml::Value, AppConfigError>;
+// The simple forms delegate to the *_with_options forms with
+// AppConfigLoadOptions::default().
 
 // async config store trait
 #[async_trait(?Send)]
@@ -655,8 +671,11 @@ compared exactly. Two sibling keys mapping to the same segment is an
 value's type; parse failure → `AppConfigError`.
 
 **Scope.** `config validate` and `config push` both see env-resolved
-values; `--no-env` disables the overlay. The axum demo server (the
-`demo` subcommand) resolves via the same path.
+values; `--no-env` disables the overlay. `--no-env` is implemented by
+calling `load_app_config_with_options` (§4) with
+`AppConfigLoadOptions { env_overlay: false }`; the default (no flag)
+uses the simple `load_app_config` form (overlay on). The axum demo
+server (the `demo` subcommand) resolves via the same path.
 
 Note the deliberate consistency: the env separator (`__`) is the same
 as the Spin config-key separator (§6.4/§6.7).
@@ -1115,8 +1134,11 @@ timeout_ms` is read at runtime; the Spin path proves `.`→`__`
 --strict` (exit 0 — including the three Spin checks of §10) then
   `config push --adapter axum` and reads the value back through a
   running axum demo server on `/config/greeting`. `config push
-  --adapter spin --dry-run` is asserted to produce `__`-encoded keys
-  and to write **both** `spin.toml` tables.
+  --adapter spin --dry-run` is asserted to **print** the would-be
+  `__`-encoded keys and the would-be content of **both** `spin.toml`
+  tables — and the on-disk `spin.toml` is asserted **unchanged**
+  (dry-run never mutates). The non-dry-run Spin push writing both
+  tables is covered by commit 7's tests, not the dry-run assertion.
 - **`auth` / `provision`:** exercised against `MockCommandRunner` (and,
   for spin/axum provision, against temp-fixture manifests) in tests.
   Spin `provision` is asserted to write only the `key_value_stores`
