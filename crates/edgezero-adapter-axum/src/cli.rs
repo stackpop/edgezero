@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -139,11 +140,17 @@ fn deploy(_extra_args: &[String]) -> Result<(), String> {
     Err("Axum adapter does not define a deploy command. Extend your workspace manifest with one if needed.".into())
 }
 
+#[derive(Debug)]
 struct AxumProject {
+    axum_manifest: PathBuf,
     crate_dir: PathBuf,
     cargo_manifest: PathBuf,
     crate_name: String,
-    port: u16,
+    addr: SocketAddr,
+    env_host: Option<String>,
+    env_port: Option<String>,
+    axum_host: Option<String>,
+    axum_port: Option<u16>,
 }
 
 fn locate_project() -> Result<AxumProject, String> {
@@ -153,10 +160,16 @@ fn locate_project() -> Result<AxumProject, String> {
 }
 
 fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
+    let resolution = resolve_subprocess_addr(project)?;
+    for warning in &resolution.warnings {
+        eprintln!("[edgezero] {warning}");
+    }
+
+    let addr = resolution.addr;
     let display = project.crate_dir.display();
     println!(
-        "[edgezero] Axum {subcommand} ({}) in {} (port: {})",
-        project.crate_name, display, project.port
+        "[edgezero] Axum {subcommand} ({}) in {} ({})",
+        project.crate_name, display, addr
     );
     let mut command = Command::new("cargo");
     command.arg(subcommand);
@@ -169,6 +182,8 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     );
     command.args(extra_args);
     command.current_dir(&project.crate_dir);
+    command.env("EDGEZERO_HOST", addr.ip().to_string());
+    command.env("EDGEZERO_PORT", addr.port().to_string());
     let status = command
         .status()
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
@@ -177,6 +192,152 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     } else {
         Err(format!("cargo {subcommand} failed with status {}", status))
     }
+}
+
+fn resolve_subprocess_addr(
+    project: &AxumProject,
+) -> Result<edgezero_core::addr::BindAddrResolution, String> {
+    let axum_only = resolve_subprocess_addr_from_parts(
+        project.env_host.as_deref(),
+        project.env_port.as_deref(),
+        None,
+        None,
+        project.axum_host.as_deref(),
+        project.axum_port,
+    );
+    debug_assert_eq!(project.addr, axum_only.addr);
+
+    let edgezero = load_edgezero_axum_config(&project.axum_manifest)?;
+    Ok(resolve_subprocess_addr_from_parts(
+        project.env_host.as_deref(),
+        project.env_port.as_deref(),
+        edgezero.as_ref().and_then(|cfg| cfg.host.as_deref()),
+        edgezero.as_ref().and_then(|cfg| cfg.port),
+        project.axum_host.as_deref(),
+        project.axum_port,
+    ))
+}
+
+fn resolve_subprocess_addr_from_parts(
+    env_host: Option<&str>,
+    env_port: Option<&str>,
+    edgezero_host: Option<&str>,
+    edgezero_port: Option<u16>,
+    axum_host: Option<&str>,
+    axum_port: Option<u16>,
+) -> edgezero_core::addr::BindAddrResolution {
+    let mut warnings = Vec::new();
+    let host = resolve_subprocess_host(env_host, edgezero_host, axum_host, &mut warnings);
+    let port = resolve_subprocess_port(env_port, edgezero_port, axum_port, &mut warnings);
+
+    edgezero_core::addr::BindAddrResolution {
+        addr: SocketAddr::from((host, port)),
+        warnings,
+    }
+}
+
+fn resolve_subprocess_host(
+    env_host: Option<&str>,
+    edgezero_host: Option<&str>,
+    axum_host: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> IpAddr {
+    if let Some(value) = env_host {
+        match value.parse() {
+            Ok(host) => return host,
+            Err(_) => warnings.push(format!(
+                "EDGEZERO_HOST={value:?} is not a valid IP address (hostnames like \"localhost\" are not supported); falling back"
+            )),
+        }
+    }
+
+    if let Some(value) = edgezero_host {
+        match value.parse() {
+            Ok(host) => return host,
+            Err(_) => warnings.push(format!(
+                "configured host={value:?} in edgezero.toml is not a valid IP address (hostnames like \"localhost\" are not supported); falling back"
+            )),
+        }
+    }
+
+    if let Some(value) = axum_host {
+        match value.parse() {
+            Ok(host) => return host,
+            Err(_) => warnings.push(format!(
+                "configured host={value:?} in axum.toml is not a valid IP address (hostnames like \"localhost\" are not supported); falling back"
+            )),
+        }
+    }
+
+    edgezero_core::addr::DEFAULT_HOST
+}
+
+fn resolve_subprocess_port(
+    env_port: Option<&str>,
+    edgezero_port: Option<u16>,
+    axum_port: Option<u16>,
+    warnings: &mut Vec<String>,
+) -> u16 {
+    if let Some(value) = env_port {
+        match value.parse::<u16>() {
+            Ok(0) => warnings.push(
+                "EDGEZERO_PORT=\"0\" is not supported (would bind to a random OS port); falling back"
+                    .to_string(),
+            ),
+            Ok(port) => return port,
+            Err(_) => warnings.push(format!(
+                "EDGEZERO_PORT={value:?} is not a valid port number; falling back"
+            )),
+        }
+    }
+
+    if let Some(0) = edgezero_port {
+        warnings.push(
+            "configured port=0 in edgezero.toml is not supported (would bind to a random OS port); falling back"
+                .to_string(),
+        );
+    } else if let Some(port) = edgezero_port {
+        return port;
+    }
+
+    if let Some(0) = axum_port {
+        warnings.push(
+            "configured port=0 in axum.toml is not supported (would bind to a random OS port); falling back"
+                .to_string(),
+        );
+    } else if let Some(port) = axum_port {
+        return port;
+    }
+
+    edgezero_core::addr::DEFAULT_PORT
+}
+
+#[derive(Debug, Default)]
+struct EdgezeroAxumConfig {
+    host: Option<String>,
+    port: Option<u16>,
+}
+
+fn load_edgezero_axum_config(axum_manifest: &Path) -> Result<Option<EdgezeroAxumConfig>, String> {
+    let Some(start_dir) = axum_manifest.parent() else {
+        return Ok(None);
+    };
+
+    let Some(manifest_path) = find_manifest_upwards(start_dir, "edgezero.toml") else {
+        return Ok(None);
+    };
+
+    let manifest = edgezero_core::manifest::ManifestLoader::from_path(&manifest_path)
+        .map_err(|err| format!("failed to load {}: {err}", manifest_path.display()))?;
+    let adapter = match manifest.manifest().adapters.get("axum") {
+        Some(adapter) => adapter,
+        None => return Ok(None),
+    };
+
+    Ok(Some(EdgezeroAxumConfig {
+        host: adapter.adapter.host.clone(),
+        port: adapter.adapter.port,
+    }))
 }
 
 fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
@@ -215,6 +376,16 @@ fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
+    let env_host = std::env::var("EDGEZERO_HOST").ok();
+    let env_port = std::env::var("EDGEZERO_PORT").ok();
+    read_axum_project_with_env(manifest, env_host.as_deref(), env_port.as_deref())
+}
+
+fn read_axum_project_with_env(
+    manifest: &Path,
+    env_host: Option<&str>,
+    env_port: Option<&str>,
+) -> Result<AxumProject, String> {
     let contents = fs::read_to_string(manifest)
         .map_err(|err| format!("failed to read {}: {err}", manifest.display()))?;
     let value: Value = toml::from_str(&contents)
@@ -255,24 +426,40 @@ fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
             })
         });
 
-    let port = match adapter.get("port").and_then(Value::as_integer) {
-        Some(value) => {
-            if !(1..=u16::MAX as i64).contains(&value) {
-                return Err(format!(
-                    "adapter.port in {} must be between 1 and 65535",
-                    manifest.display()
-                ));
-            }
-            value as u16
-        }
-        None => 8787,
+    let config_host = adapter
+        .get("host")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let config_port = match adapter.get("port").and_then(Value::as_integer) {
+        Some(value) => Some(u16::try_from(value).map_err(|_| {
+            format!(
+                "adapter.port in {} must be between 0 and 65535",
+                manifest.display()
+            )
+        })?),
+        None => None,
     };
 
+    let resolution = edgezero_core::addr::resolve_bind_addr(
+        env_host,
+        env_port,
+        config_host.as_deref(),
+        config_port,
+    );
+    for warning in &resolution.warnings {
+        eprintln!("[edgezero] {warning} (in {})", manifest.display());
+    }
+
     Ok(AxumProject {
+        axum_manifest: manifest.to_path_buf(),
         crate_dir,
         cargo_manifest,
         crate_name,
-        port,
+        addr: resolution.addr,
+        env_host: env_host.map(str::to_string),
+        env_port: env_port.map(str::to_string),
+        axum_host: config_host,
+        axum_port: config_port,
     })
 }
 
@@ -297,11 +484,13 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.crate_name, "demo");
         assert_eq!(project.crate_dir, root);
         assert_eq!(project.cargo_manifest, root.join("Cargo.toml"));
-        assert_eq!(project.port, 8787);
+        assert_eq!(project.addr.port(), edgezero_core::addr::DEFAULT_PORT);
+        assert_eq!(project.addr.ip(), edgezero_core::addr::DEFAULT_HOST);
     }
 
     #[test]
@@ -336,8 +525,9 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.port, 4001);
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
+        assert_eq!(project.addr.port(), 4001);
     }
 
     #[test]
@@ -355,15 +545,15 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
-            Err(e) => assert!(e.contains("must be between 1 and 65535")),
+            Err(e) => assert!(e.contains("must be between 0 and 65535")),
         }
     }
 
     #[test]
-    fn read_axum_project_rejects_zero_port() {
+    fn read_axum_project_zero_port_falls_back_to_default() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::write(
@@ -377,8 +567,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
-        assert!(result.is_err());
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
+        assert_eq!(project.addr.port(), edgezero_core::addr::DEFAULT_PORT);
     }
 
     #[test]
@@ -396,7 +587,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         assert!(result.is_err());
     }
 
@@ -411,7 +602,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.contains("adapter table missing")),
@@ -429,7 +620,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.contains("crate_dir missing")),
@@ -449,7 +640,7 @@ mod tests {
         .unwrap();
         // No Cargo.toml in subdir
 
-        let result = read_axum_project(&root.join("axum.toml"));
+        let result = read_axum_project_with_env(&root.join("axum.toml"), None, None);
         match result {
             Ok(_) => panic!("expected error"),
             Err(e) => assert!(e.contains("Cargo.toml missing")),
@@ -468,7 +659,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.crate_name, "my-package");
     }
 
@@ -489,7 +681,8 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
         assert_eq!(project.crate_name, "my-adapter");
         assert_eq!(project.crate_dir, adapter_dir);
     }
@@ -509,8 +702,9 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.port, 65535);
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
+        assert_eq!(project.addr.port(), 65535);
     }
 
     #[test]
@@ -528,8 +722,69 @@ mod tests {
         )
         .unwrap();
 
-        let project = read_axum_project(&root.join("axum.toml")).expect("project");
-        assert_eq!(project.port, 1);
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
+        assert_eq!(project.addr.port(), 1);
+    }
+
+    #[test]
+    fn read_axum_project_defaults_host_to_localhost() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
+        assert_eq!(project.addr.ip(), edgezero_core::addr::DEFAULT_HOST);
+    }
+
+    #[test]
+    fn read_axum_project_uses_custom_host() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"0.0.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
+        assert_eq!(project.addr.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn read_axum_project_invalid_host_falls_back_to_default() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"not-an-ip\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let project =
+            read_axum_project_with_env(&root.join("axum.toml"), None, None).expect("project");
+        assert_eq!(project.addr.ip(), edgezero_core::addr::DEFAULT_HOST);
     }
 
     #[test]
@@ -603,6 +858,101 @@ mod tests {
     #[test]
     fn adapter_name_is_axum() {
         assert_eq!(AXUM_ADAPTER.name(), "axum");
+    }
+
+    #[test]
+    fn read_axum_project_env_overrides_config() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("axum.toml"),
+            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"127.0.0.1\"\nport = 3000\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let result =
+            read_axum_project_with_env(&root.join("axum.toml"), Some("0.0.0.0"), Some("9999"));
+
+        let project = result.expect("project");
+        assert_eq!(project.addr.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
+        assert_eq!(project.addr.port(), 9999);
+    }
+
+    #[test]
+    fn resolve_subprocess_addr_prefers_edgezero_manifest_over_axum_manifest() {
+        let resolution = resolve_subprocess_addr_from_parts(
+            None,
+            None,
+            Some("0.0.0.0"),
+            Some(4000),
+            Some("127.0.0.1"),
+            Some(3000),
+        );
+
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
+        assert!(resolution.warnings.is_empty());
+    }
+
+    #[test]
+    fn resolve_subprocess_addr_falls_back_to_axum_manifest_when_edgezero_missing() {
+        let resolution =
+            resolve_subprocess_addr_from_parts(None, None, None, None, Some("0.0.0.0"), Some(3000));
+
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 3000)));
+        assert!(resolution.warnings.is_empty());
+    }
+
+    #[test]
+    fn resolve_subprocess_addr_env_overrides_both_manifests() {
+        let resolution = resolve_subprocess_addr_from_parts(
+            Some("::1"),
+            Some("9000"),
+            Some("0.0.0.0"),
+            Some(4000),
+            Some("127.0.0.1"),
+            Some(3000),
+        );
+
+        assert_eq!(
+            resolution.addr,
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 9000))
+        );
+        assert!(resolution.warnings.is_empty());
+    }
+
+    #[test]
+    fn resolve_subprocess_addr_invalid_edgezero_host_falls_back_to_axum_host() {
+        let resolution = resolve_subprocess_addr_from_parts(
+            None,
+            None,
+            Some("invalid-host"),
+            Some(4000),
+            Some("0.0.0.0"),
+            Some(3000),
+        );
+
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
+        assert_eq!(resolution.warnings.len(), 1);
+    }
+
+    #[test]
+    fn resolve_subprocess_addr_edgezero_zero_port_falls_back_to_axum_port() {
+        let resolution = resolve_subprocess_addr_from_parts(
+            None,
+            None,
+            Some("127.0.0.1"),
+            Some(0),
+            Some("0.0.0.0"),
+            Some(3000),
+        );
+
+        assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 3000)));
+        assert_eq!(resolution.warnings.len(), 1);
     }
 
     #[test]
