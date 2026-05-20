@@ -72,10 +72,7 @@ impl PersistentKvStore {
     /// Entries scanned per read transaction. Lowered under `cfg(test)` so the
     /// scan-cap path is reachable with a small fixture; pagination correctness
     /// does not depend on the batch size.
-    #[cfg(not(test))]
-    const LIST_SCAN_BATCH_SIZE: usize = 256;
-    #[cfg(test)]
-    const LIST_SCAN_BATCH_SIZE: usize = 16;
+    const LIST_SCAN_BATCH_SIZE: usize = if cfg!(test) { 16 } else { 256 };
     /// Maximum number of scan batches before returning a partial page.
     ///
     /// Each batch scans up to `LIST_SCAN_BATCH_SIZE` entries, so this caps
@@ -91,10 +88,7 @@ impl PersistentKvStore {
     ///
     /// Lowered under `cfg(test)` so the scan-cap path is reachable without
     /// inserting tens of thousands of entries.
-    #[cfg(not(test))]
-    const MAX_SCAN_BATCHES: usize = 100;
-    #[cfg(test)]
-    const MAX_SCAN_BATCHES: usize = 2;
+    const MAX_SCAN_BATCHES: usize = if cfg!(test) { 2 } else { 100 };
 
     fn begin_write(&self) -> Result<redb::WriteTransaction, KvError> {
         self.db
@@ -373,7 +367,7 @@ impl KvStore for PersistentKvStore {
         //   unscanned keys past `scan_cursor`; emit it so the caller resumes
         //   instead of stopping on a spurious `cursor: None`.
         // - otherwise: the table (or prefix range) is genuinely exhausted.
-        let cursor = if has_more {
+        let next_cursor = if has_more {
             live_keys.last().cloned()
         } else if hit_scan_cap {
             scan_cursor
@@ -382,7 +376,7 @@ impl KvStore for PersistentKvStore {
         };
 
         Ok(KvPage {
-            cursor,
+            cursor: next_cursor,
             keys: live_keys,
         })
     }
@@ -653,7 +647,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             second.keys,
-            vec!["live-0".to_owned(), "live-1".to_owned(), "live-2".to_owned()],
+            vec![
+                "live-0".to_owned(),
+                "live-1".to_owned(),
+                "live-2".to_owned()
+            ],
         );
         assert_eq!(second.cursor, None);
     }
