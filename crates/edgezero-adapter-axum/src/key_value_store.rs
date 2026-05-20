@@ -69,7 +69,13 @@ pub struct PersistentKvStore {
 }
 
 impl PersistentKvStore {
+    /// Entries scanned per read transaction. Lowered under `cfg(test)` so the
+    /// scan-cap path is reachable with a small fixture; pagination correctness
+    /// does not depend on the batch size.
+    #[cfg(not(test))]
     const LIST_SCAN_BATCH_SIZE: usize = 256;
+    #[cfg(test)]
+    const LIST_SCAN_BATCH_SIZE: usize = 16;
     /// Maximum number of scan batches before returning a partial page.
     ///
     /// Each batch scans up to `LIST_SCAN_BATCH_SIZE` entries, so this caps
@@ -78,10 +84,17 @@ impl PersistentKvStore {
     /// accumulated large numbers of expired entries (common in long-running
     /// dev sessions) can produce unbounded scan latency.
     ///
-    /// When the limit is hit the partial page is returned with the last
-    /// live cursor, so callers can resume pagination normally on the next
-    /// call. A warning is logged once so operators know cleanup is needed.
+    /// When the limit is hit the partial page is returned with a cursor
+    /// positioned at the last scanned key, so callers can resume pagination
+    /// instead of stopping. A warning is logged so operators know cleanup
+    /// is needed.
+    ///
+    /// Lowered under `cfg(test)` so the scan-cap path is reachable without
+    /// inserting tens of thousands of entries.
+    #[cfg(not(test))]
     const MAX_SCAN_BATCHES: usize = 100;
+    #[cfg(test)]
+    const MAX_SCAN_BATCHES: usize = 2;
 
     fn begin_write(&self) -> Result<redb::WriteTransaction, KvError> {
         self.db
@@ -268,6 +281,7 @@ impl KvStore for PersistentKvStore {
         let mut live_keys = Vec::with_capacity(limit.saturating_add(1));
         let mut scan_cursor = cursor.map(str::to_owned);
         let mut reached_end = false;
+        let mut hit_scan_cap = false;
         let mut batch_count: usize = 0;
 
         while live_keys.len() < limit.saturating_add(1) && !reached_end {
@@ -279,6 +293,7 @@ impl KvStore for PersistentKvStore {
                     Self::MAX_SCAN_BATCHES,
                     Self::MAX_SCAN_BATCHES.saturating_mul(Self::LIST_SCAN_BATCH_SIZE),
                 );
+                hit_scan_cap = true;
                 break;
             }
             batch_count = batch_count.saturating_add(1);
@@ -351,8 +366,23 @@ impl KvStore for PersistentKvStore {
             live_keys.truncate(limit);
         }
 
+        // Cursor resolution:
+        // - `has_more`: a full page plus one — resume from the last returned key.
+        // - `hit_scan_cap`: the page is under-filled because the scan cap was
+        //   reached while skipping a long run of expired keys. There are still
+        //   unscanned keys past `scan_cursor`; emit it so the caller resumes
+        //   instead of stopping on a spurious `cursor: None`.
+        // - otherwise: the table (or prefix range) is genuinely exhausted.
+        let cursor = if has_more {
+            live_keys.last().cloned()
+        } else if hit_scan_cap {
+            scan_cursor
+        } else {
+            None
+        };
+
         Ok(KvPage {
-            cursor: has_more.then(|| live_keys.last().cloned()).flatten(),
+            cursor,
             keys: live_keys,
         })
     }
@@ -574,6 +604,58 @@ mod tests {
         let page = kv_store.list_keys_page("app/", None, 10).await.unwrap();
         assert_eq!(page.keys, vec!["app/live".to_owned()]);
         assert_eq!(page.cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_keys_page_returns_resume_cursor_when_scan_cap_is_hit() {
+        // Under `cfg(test)` the scan cap is 2 batches × 16 entries = 32. Insert
+        // 40 expired keys (so the cap is hit before the table is exhausted)
+        // followed by 3 live keys that sort after them.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let kv_store = PersistentKvStore::new(db_path).unwrap();
+
+        for index in 0_i32..40_i32 {
+            kv_store
+                .put_bytes_with_ttl(
+                    &format!("expired-{index:02}"),
+                    Bytes::from("gone"),
+                    Duration::from_millis(1),
+                )
+                .await
+                .unwrap();
+        }
+        for index in 0_i32..3_i32 {
+            kv_store
+                .put_bytes(&format!("live-{index}"), Bytes::from("value"))
+                .await
+                .unwrap();
+        }
+        thread::sleep(Duration::from_millis(200));
+
+        // First page: the cap is hit while skipping the expired run, so no live
+        // keys are collected — but the cursor must be `Some` so the caller
+        // resumes instead of stopping on a spurious `None`.
+        let first = kv_store.list_keys_page("", None, 10).await.unwrap();
+        assert!(
+            first.keys.is_empty(),
+            "expected an under-filled page, got {:?}",
+            first.keys
+        );
+        let resume = first
+            .cursor
+            .expect("scan-cap page must carry a resume cursor");
+
+        // Resuming from the cursor reaches the live keys past the expired run.
+        let second = kv_store
+            .list_keys_page("", Some(&resume), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.keys,
+            vec!["live-0".to_owned(), "live-1".to_owned(), "live-2".to_owned()],
+        );
+        assert_eq!(second.cursor, None);
     }
 
     #[tokio::test]

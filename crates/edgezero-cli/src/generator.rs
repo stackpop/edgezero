@@ -170,14 +170,14 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     deps.insert("log".to_owned(), "log = \"0.4\"".to_owned());
     deps.insert(
         "simple_logger".to_owned(),
-        "simple_logger = \"4\"".to_owned(),
+        "simple_logger = \"5\"".to_owned(),
     );
     deps.insert(
         "worker".to_owned(),
-        "worker = { version = \"0.7\", default-features = false, features = [\"http\"] }"
+        "worker = { version = \"0.8\", default-features = false, features = [\"http\"] }"
             .to_owned(),
     );
-    deps.insert("fastly".to_owned(), "fastly = \"0.11\"".to_owned());
+    deps.insert("fastly".to_owned(), "fastly = \"0.12\"".to_owned());
     deps.insert("once_cell".to_owned(), "once_cell = \"1\"".to_owned());
     deps.insert(
         "tokio".to_owned(),
