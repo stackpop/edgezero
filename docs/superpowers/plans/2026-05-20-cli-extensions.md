@@ -23,7 +23,7 @@
   library + generator + `app-demo-cli`) plus follow-up `06f4b72`
   (`demo` is example-only; `serve --adapter axum` runs the axum
   adapter). §7 below is kept for reference — do **not** re-do it.
-- **Stages 2–8 — pending.** Stage 2 is gated on PR #253.
+- **Stages 2–8 — pending.** Stage 2 is next; its PR #253 precondition is met.
 
 ## Codebase facts this plan relies on
 
@@ -706,7 +706,7 @@ Spec §15, §6.12.
 
 - Modify: `crates/edgezero-cli/src/templates/cli/Cargo.toml.hbs`, `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`, `crates/edgezero-cli/src/generator.rs` (tests)
 
-Stage 1 created the `<name>-cli` template with only the five base
+Stage 1 created the `<name>-cli` template with only the four downstream
 built-ins (`auth` / `provision` / `config` did not exist yet). Now that
 stages 4–7 have landed them, a freshly-scaffolded project must expose
 the full command surface (spec §1: downstream CLIs reuse the
