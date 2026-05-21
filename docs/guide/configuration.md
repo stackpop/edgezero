@@ -175,9 +175,12 @@ name = "MY_FASTLY_SECRETS"
 - Axum reads secrets from process environment variables of the same name.
 - Fastly opens the configured secret store name from `fastly.toml`.
 - Cloudflare reads Worker Secrets individually; the configured `name` is metadata only.
+- Spin reads component variables from `spin.toml` in a single flat namespace. The configured `name`
+  and named secret-store overrides are metadata only for Spin; variable names must be declared in
+  lowercase and are looked up through the Spin variables API.
 
 If `[stores.secrets]` is omitted, the `Secrets` extractor is not attached for
-that adapter.
+that adapter. The Spin `run_app` helper honors this manifest gate.
 
 ## Stores Section
 
@@ -207,10 +210,15 @@ Runtime behavior by adapter:
 - Fastly reads from a Fastly Config Store resource link.
 - Cloudflare reads from a single JSON string binding in `wrangler.toml [vars]`.
 - Axum reads only the env vars declared in `defaults`, then falls back to `defaults`.
+- Spin reads component variables declared in `spin.toml`. Spin variables use a flat namespace with
+  lowercase names; there is no config-store binding name, so `[stores.config.adapters.spin]` is
+  rejected during manifest validation.
 
 When `[stores.config]` is present, the `app!` macro generates config-store metadata on the `App`
 type. The standard adapter `run_app` helpers use that metadata to inject a config-store handle into
-request extensions automatically, so handlers can call `ctx.config_store()`.
+request extensions automatically, so handlers can call `ctx.config_store()`. The Spin `run_app`
+helper also reads the embedded manifest and injects the config store only when `[stores.config]`
+exists or macro-generated config-store metadata is present.
 
 Treat config-store keys like API surface: validate or allowlist any user-controlled lookup before
 calling `ctx.config_store()?.get(...)`.
