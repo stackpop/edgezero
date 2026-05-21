@@ -761,7 +761,7 @@ is not user-facing and is left as-is.)
 `app-demo-cli/tests/help.rs`; generator structure test.
 
 **Ship gate:** existing `edgezero` commands keep the same flags;
-`app-demo-cli --help` shows the five built-ins; `edgezero new
+`app-demo-cli --help` shows the four downstream built-ins (`build`, `deploy`, `new`, `serve`); `edgezero new
 throwaway-app && cargo check --workspace` succeeds.
 
 ## 8. Sub-project 2 — Manifest + runtime rewrite (atomic, all four adapters)
@@ -1107,7 +1107,7 @@ output; secret fields absent; Spin keys `__`-encoded.
 **Goal:** `app-demo` demonstrates the **full** feature set in CI across
 all four adapters.
 
-- **Extensible CLI:** `app-demo-cli` with all five built-ins plus
+- **Extensible CLI:** `app-demo-cli` with the four downstream built-ins plus
   `Auth`, `Provision`, `Config` (`Validate` / `Push`); the `Config`
   arm wired to the **typed** functions with `AppDemoConfig`.
 - **Multi-store manifest + runtime:** `edgezero.toml` declares 2 KV ids

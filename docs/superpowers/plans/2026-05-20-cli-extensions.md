@@ -179,7 +179,7 @@ fn build_args_default_and_mutate() {
 
 - [ ] **Step 2: Run** the test — expect FAIL.
 
-- [ ] **Step 3: Implement.** Add `templates/cli/Cargo.toml.hbs` (package `{{name}}-cli`, depends on `edgezero-cli` with default features, `clap` derive, `log`). Add `templates/cli/src/main.rs.hbs` — the canonical downstream pattern: a `clap::Parser` `Args` with a `Cmd` `Subcommand` enum listing all five built-ins (`Build(BuildArgs)`, `Deploy(DeployArgs)`, `Demo`, `New(NewArgs)`, `Serve(ServeArgs)`), `main` dispatching to `edgezero_cli::run_*`. Register the new templates in `scaffold.rs::register_templates`. In `generator.rs`, render the cli crate and append `crates/{{name}}-cli` to the root `Cargo.toml` members.
+- [ ] **Step 3: Implement.** Add `templates/cli/Cargo.toml.hbs` (package `{{name}}-cli`, depends on `edgezero-cli` with default features, `clap` derive, `log`). Add `templates/cli/src/main.rs.hbs` — the canonical downstream pattern: a `clap::Parser` `Args` with a `Cmd` `Subcommand` enum listing the four downstream built-ins (`Build(BuildArgs)`, `Deploy(DeployArgs)`, `New(NewArgs)`, `Serve(ServeArgs)`), `main` dispatching to `edgezero_cli::run_*`. Register the new templates in `scaffold.rs::register_templates`. In `generator.rs`, render the cli crate and append `crates/{{name}}-cli` to the root `Cargo.toml` members.
 
 - [ ] **Step 4: Run** the generator test — expect PASS.
 
@@ -208,9 +208,9 @@ Expected: `cargo check --workspace` in the generated project succeeds.
 
 - [ ] **Step 2:** Write `app-demo-cli/Cargo.toml` — `name = "app-demo-cli"`, `publish = false`, `[lints] workspace = true`, deps `edgezero-cli = { workspace = true }`, `clap = { version = "4", features = ["derive"] }`, `log = { workspace = true }`.
 
-- [ ] **Step 3:** Write `app-demo-cli/src/main.rs` mirroring the generated `templates/cli/src/main.rs.hbs` pattern — all five built-ins, no custom subcommands yet. `#[command(name = "app-demo-cli", about = "app-demo edge CLI")]`.
+- [ ] **Step 3:** Write `app-demo-cli/src/main.rs` mirroring the generated `templates/cli/src/main.rs.hbs` pattern — the four downstream built-ins, no custom subcommands yet. `#[command(name = "app-demo-cli", about = "app-demo edge CLI")]`.
 
-- [ ] **Step 4:** Write `tests/help.rs`: `Args::try_parse_from(["app-demo-cli", "--help"])` returns the clap help error (not a panic). Since `Args` is private to `main.rs`, instead spawn the built binary: `assert_cmd`-style or `std::process::Command::new(env!("CARGO_BIN_EXE_app-demo-cli")).arg("--help")` exits 0 and stdout contains `build`, `deploy`, `demo`, `new`, `serve`.
+- [ ] **Step 4:** Write `tests/help.rs`: `Args::try_parse_from(["app-demo-cli", "--help"])` returns the clap help error (not a panic). Since `Args` is private to `main.rs`, instead spawn the built binary: `assert_cmd`-style or `std::process::Command::new(env!("CARGO_BIN_EXE_app-demo-cli")).arg("--help")` exits 0 and stdout contains `build`, `deploy`, `new`, `serve`.
 
 - [ ] **Step 5: Run** `cd examples/app-demo && cargo test -p app-demo-cli` — expect PASS.
 
@@ -670,7 +670,7 @@ Spec §15, §6.12.
 
 - Modify: `examples/app-demo/crates/app-demo-cli/src/main.rs`, `examples/app-demo/crates/app-demo-core/src/handlers.rs`, `examples/app-demo/edgezero.toml`, `examples/app-demo/app-demo.toml`, `examples/app-demo/crates/app-demo-adapter-spin/spin.toml`
 
-- [ ] **Step 1:** Confirm `app-demo-cli`'s `Cmd` has all five built-ins + `Auth` + `Provision` + `Config(Validate|Push)`. Ensure handlers exercise: two named KV ids (`sessions`, `cache`) via `Kv::named`; async `config_store_default().get("greeting")`; the nested `service.timeout_ms`; both secret forms. Add the manual Spin secret-variable declarations to `app-demo-adapter-spin/spin.toml` (`secret = true`, bound under `[component.<component>.variables]`).
+- [ ] **Step 1:** Confirm `app-demo-cli`'s `Cmd` has the four downstream built-ins + `Auth` + `Provision` + `Config(Validate|Push)`. Ensure handlers exercise: two named KV ids (`sessions`, `cache`) via `Kv::named`; async `config_store_default().get("greeting")`; the nested `service.timeout_ms`; both secret forms. Add the manual Spin secret-variable declarations to `app-demo-adapter-spin/spin.toml` (`secret = true`, bound under `[component.<component>.variables]`).
 
 - [ ] **Step 2: Write integration tests** in `app-demo`: `config validate --strict` exits 0; `config push --adapter axum` writes `.edgezero/local-config-app_config.json` and a running demo server returns `greeting` on `/config/greeting`; `config push --adapter spin --dry-run` **prints** the would-be `__`-encoded keys and the would-be content of both `spin.toml` tables — and the test asserts the on-disk `spin.toml` is **unchanged** (dry-run never mutates); an env-override test asserts `APP_DEMO__SERVICE__TIMEOUT_MS` takes effect.
 
@@ -695,11 +695,11 @@ post-effort built-ins).
 
 - [ ] **Step 1: Add the core-crate dependency to the CLI template.** The full-command template references the typed config functions with `{{NameUpperCamel}}Config`, which lives in the generated `{{name}}-core` crate. The `templates/cli/Cargo.toml.hbs` from stage 1 depends only on `edgezero-cli` / `clap` / `log` — add `{{name}}-core = { path = "../{{name}}-core" }` (path dep within the generated workspace). Without this the scaffolded CLI will not compile.
 
-- [ ] **Step 2:** Update `templates/cli/src/main.rs.hbs` so the generated `Cmd` enum lists **all eight** built-ins: `Build`, `Deploy`, `Demo`, `New`, `Serve`, `Auth`, `Provision`, `Config(ConfigCmd { Validate, Push })`. Dispatch `build/deploy/demo/new/serve/auth/provision` to the raw `edgezero_cli::run_*`. The `use` statement must reference the core crate's **Rust module name**, not the package name — use `use {{proj_core_mod}}::{{NameUpperCamel}}Config;` (the generator already exposes `proj_core_mod`, the hyphen-to-underscore module form; `{{name}}_core` would render `my-app_core` for `my-app`, which is invalid Rust). Dispatch the `Config` arm to the **typed** `run_config_validate_typed::<{{NameUpperCamel}}Config>` / `run_config_push_typed::<{{NameUpperCamel}}Config>` — a generated project has its own core config struct (from the Task 3.4 `config.rs.hbs` template), so the scaffold wires the typed path, matching how `app-demo-cli` does it.
+- [ ] **Step 2:** Update `templates/cli/src/main.rs.hbs` so the generated `Cmd` enum lists **all seven** commands: `Build`, `Deploy`, `New`, `Serve`, `Auth`, `Provision`, `Config(ConfigCmd { Validate, Push })`. Dispatch `build/deploy/new/serve/auth/provision` to the raw `edgezero_cli::run_*`. The `use` statement must reference the core crate's **Rust module name**, not the package name — use `use {{proj_core_mod}}::{{NameUpperCamel}}Config;` (the generator already exposes `proj_core_mod`, the hyphen-to-underscore module form; `{{name}}_core` would render `my-app_core` for `my-app`, which is invalid Rust). Dispatch the `Config` arm to the **typed** `run_config_validate_typed::<{{NameUpperCamel}}Config>` / `run_config_push_typed::<{{NameUpperCamel}}Config>` — a generated project has its own core config struct (from the Task 3.4 `config.rs.hbs` template), so the scaffold wires the typed path, matching how `app-demo-cli` does it.
 
 - [ ] **Step 3:** Extend the generator structure test (from Task 1.4 / 3.4): the scaffolded `<name>-cli/Cargo.toml` depends on `<name>-core`; `<name>-cli/src/main.rs` contains `Auth`, `Provision`, and `Config` variants and references the typed config functions with the project's config type.
 
-- [ ] **Step 4: Run** the generator tests, then `cargo run -p edgezero-cli -- new <tmp> --dir …` and `cargo check --workspace` in the generated project — the scaffolded CLI builds with all eight commands **and** resolves `{{NameUpperCamel}}Config` from its core crate.
+- [ ] **Step 4: Run** the generator tests, then `cargo run -p edgezero-cli -- new <tmp> --dir …` and `cargo check --workspace` in the generated project — the scaffolded CLI builds with all seven commands **and** resolves `{{NameUpperCamel}}Config` from its core crate.
 
 ### Task 8.3: CI wiring for the `app-demo` loop
 

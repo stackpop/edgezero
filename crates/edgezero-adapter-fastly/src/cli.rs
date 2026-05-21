@@ -45,7 +45,7 @@ static FASTLY_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     readme: ReadmeInfo {
         description: "{display} entrypoint.",
         dev_heading: "{display} (local)",
-        dev_steps: &["`cd {crate_dir}`", "`edgezero-cli serve --adapter fastly`"],
+        dev_steps: &["`cd {crate_dir}`", "`edgezero serve --adapter fastly`"],
     },
     run_module: "edgezero_adapter_fastly",
 };

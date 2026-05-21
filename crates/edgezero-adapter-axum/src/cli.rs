@@ -95,7 +95,7 @@ static AXUM_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         dev_heading: "{display} (local)",
         dev_steps: &[
             "`cd {crate_dir}`",
-            "`cargo run` or `edgezero-cli serve --adapter axum`",
+            "`cargo run` or `edgezero serve --adapter axum`",
         ],
     },
     run_module: "edgezero_adapter_axum",
