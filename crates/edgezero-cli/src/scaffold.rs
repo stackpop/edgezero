@@ -177,21 +177,35 @@ pub fn resolve_dep_line(
     }
 }
 
+/// Normalise an arbitrary project name into a valid Cargo package name.
+///
+/// ASCII letters are lower-cased (so `MyApp` becomes `myapp`, not the
+/// invalid `-y-pp`); `-` and `_` are kept; every other character collapses
+/// to a single `-`. Leading separators are dropped and trailing separators
+/// trimmed, so the result never starts or ends with `-`/`_`. A digit-leading
+/// result is prefixed with `_`, and an empty result falls back to
+/// `edgezero-app`.
 pub fn sanitize_crate_name(input: &str) -> String {
     let mut out = String::new();
-    for (i, ch) in input.chars().enumerate() {
-        let valid = ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_';
-        if valid {
-            if i == 0 && ch.is_ascii_digit() {
-                out.push('_');
-            }
-            out.push(ch);
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
         } else {
-            out.push('-');
+            // `-`, `_`, and every other invalid character collapse to a
+            // single separator; leading and doubled separators are dropped.
+            let separator = if ch == '_' { '_' } else { '-' };
+            if !out.is_empty() && !out.ends_with(['-', '_']) {
+                out.push(separator);
+            }
         }
+    }
+    while out.ends_with(['-', '_']) {
+        out.pop();
     }
     if out.is_empty() {
         "edgezero-app".to_owned()
+    } else if out.starts_with(|ch: char| ch.is_ascii_digit()) {
+        format!("_{out}")
     } else {
         out
     }
@@ -253,5 +267,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitize_crate_name_lowercases_mixed_case() {
+        // Regression: uppercase letters were mangled to `-`, producing the
+        // invalid package name `-y-pp` for `MyApp`.
+        assert_eq!(sanitize_crate_name("MyApp"), "myapp");
+        assert_eq!(sanitize_crate_name("My App"), "my-app");
+    }
+
+    #[test]
+    fn sanitize_crate_name_keeps_valid_separators() {
+        assert_eq!(sanitize_crate_name("my-edge-app"), "my-edge-app");
+        assert_eq!(sanitize_crate_name("my_app"), "my_app");
+    }
+
+    #[test]
+    fn sanitize_crate_name_trims_and_collapses_separators() {
+        assert_eq!(sanitize_crate_name("  spaced  "), "spaced");
+        assert_eq!(sanitize_crate_name("a@@@b"), "a-b");
+        assert_eq!(sanitize_crate_name("-leading-"), "leading");
+    }
+
+    #[test]
+    fn sanitize_crate_name_handles_digit_leading_and_empty() {
+        assert_eq!(sanitize_crate_name("123app"), "_123app");
+        assert_eq!(sanitize_crate_name("!!!"), "edgezero-app");
     }
 }

@@ -14,7 +14,7 @@
 
 ## Preconditions (do before stage 2)
 
-- [ ] **PR #253 (`feat/spin-store-support`) is merged into the working branch.** The current branch has **no** Spin store support — `crates/edgezero-adapter-spin/src/` has no `config_store.rs` / `key_value_store.rs` / `secret_store.rs`, and `lib.rs` explicitly rejects `[stores.*]` for spin. Stage 2 wires `SpinKvStore` / `SpinConfigStore` / `SpinSecretStore` into the multi-store runtime; they must exist first. Stage 1 does **not** need PR #253. Verify with: `ls crates/edgezero-adapter-spin/src/` shows the three store files before starting stage 2.
+- [x] **PR #253 (`feat/spin-store-support`) is merged into the working branch.** Landed via the `chore/strict-clippy` merge — `crates/edgezero-adapter-spin/src/` now has `config_store.rs` / `key_value_store.rs` / `secret_store.rs`. Stage 2 wires `SpinKvStore` / `SpinConfigStore` / `SpinSecretStore` into the multi-store runtime.
 - [ ] Working on branch `feature/extensible-cli` (stacked on `chore/strict-clippy` / PR #257). The spec and plan live in `docs/superpowers/`, which is gitignored — keep using `git add -f` for spec/plan files only.
 
 ## Status
@@ -247,7 +247,26 @@ git commit -m "Extensible edgezero-cli library + generator + app-demo-cli; renam
 
 # Stage 2 — Manifest + runtime rewrite (atomic, all four adapters)
 
-Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest stage and the review hotspot. Hard cutoff — legacy store schema is removed outright.
+Spec §8, §6.6, §6.7, §6.9. This is the largest stage and the review hotspot. Hard cutoff — legacy store schema is removed outright.
+
+## Design inputs added post-review — resolve in the Stage 2 design pass
+
+Two requirements surfaced after Stage 1 review. They revise the manifest
+model and **must be reconciled with the §8 multi-store design before
+implementing** — do not bolt them on piecemeal:
+
+- **A downstream binary must build without an `edgezero.toml` present.**
+  Manifest/store config reaches the runtime through the `App` / `Hooks`
+  type — macro-baked when `app!` is used, programmatic defaults otherwise —
+  never a runtime `include_str!` of a manifest file. `run_app` must not
+  hard-require a manifest file to exist at compile time. (Today every
+  adapter entrypoint does `include_str!("../../../edgezero.toml")`, which
+  breaks any downstream project that builds its `App` without a manifest.)
+- **`edgezero.toml` defines only non-adapter-specific (portable) config.**
+  Routes, app metadata, logical store declarations, and env-var
+  declarations live in `edgezero.toml`; adapter-specific config lives in
+  the adapter layer (per-adapter manifests / adapter crate config), not the
+  shared manifest.
 
 ### Task 2.1: Rewrite the manifest store schema
 
