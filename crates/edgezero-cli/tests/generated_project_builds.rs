@@ -1,11 +1,12 @@
 //! Opt-in integration test: a freshly scaffolded project compiles.
 //!
-//! Ignored by default — it runs `cargo check` on a generated workspace,
-//! which recompiles the edgezero stack and may fetch crates (minutes, not
-//! milliseconds). The fast `generator` unit tests assert that the scaffold
-//! resolves edgezero crates to local path dependencies; this test
-//! additionally proves the generated workspace — including the CLI crate
-//! that imports `edgezero_cli` — compiles end to end.
+//! Ignored by default — it runs `cargo check` on a generated workspace
+//! (host plus each adapter's wasm target), which recompiles the edgezero
+//! stack and may fetch crates (minutes, not milliseconds). The fast
+//! `generator` unit tests assert that the scaffold resolves edgezero crates
+//! to local path dependencies; this test additionally proves the generated
+//! workspace — the CLI crate that imports `edgezero_cli`, and the
+//! target-gated adapter entrypoints — compiles end to end.
 //!
 //! Run it explicitly (and in CI):
 //!
@@ -15,10 +16,28 @@
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::process::Command;
+
+    /// Targets installed for the toolchain that builds `project`. A wasm
+    /// check is skipped when its target is absent (e.g. a local run where
+    /// the project sits outside a checkout that pins the wasm targets); CI
+    /// installs both wasm targets, so the full set always runs there.
+    fn installed_targets(project: &Path) -> String {
+        Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .current_dir(project)
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default()
+    }
 
     #[test]
     #[ignore = "compiles a generated workspace and may fetch crates; run explicitly"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "an opt-in test surfacing a skipped wasm check"
+    )]
     fn generated_workspace_compiles() {
         let temp = tempfile::tempdir().expect("temp dir");
         let new_status = Command::new(env!("CARGO_BIN_EXE_edgezero"))
@@ -31,14 +50,49 @@ mod tests {
         assert!(new_status.success(), "`edgezero new` should succeed");
 
         let project = temp.path().join("scaffold-probe");
-        let check_status = Command::new(env!("CARGO"))
+
+        // Host target: the whole workspace, including the generated CLI
+        // crate that imports `edgezero_cli`.
+        let host = Command::new(env!("CARGO"))
             .args(["check", "--workspace"])
             .current_dir(&project)
             .status()
             .expect("run `cargo check` on the generated workspace");
         assert!(
-            check_status.success(),
-            "generated workspace should compile against the local edgezero crates",
+            host.success(),
+            "generated workspace should compile for the host target",
         );
+
+        // Per-adapter wasm targets: where target-gated template code lives
+        // (entrypoint signatures, macro-generated unsafe exports).
+        let targets = installed_targets(&project);
+        for (adapter, target) in [
+            ("cloudflare", "wasm32-unknown-unknown"),
+            ("fastly", "wasm32-wasip1"),
+            ("spin", "wasm32-wasip1"),
+        ] {
+            if !targets.contains(target) {
+                eprintln!("skipping {adapter} wasm check: target {target} not installed");
+                continue;
+            }
+            let crate_name = format!("scaffold-probe-adapter-{adapter}");
+            let wasm = Command::new(env!("CARGO"))
+                .args([
+                    "check",
+                    "-p",
+                    &crate_name,
+                    "--target",
+                    target,
+                    "--features",
+                    adapter,
+                ])
+                .current_dir(&project)
+                .status()
+                .expect("run `cargo check` for a wasm adapter target");
+            assert!(
+                wasm.success(),
+                "generated {adapter} adapter should compile for {target}",
+            );
+        }
     }
 }
