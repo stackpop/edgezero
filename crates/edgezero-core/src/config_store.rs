@@ -183,6 +183,7 @@ impl ConfigStoreError {
 /// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
 /// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
 /// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare env bindings
+/// - `SpinConfigStore` (spin adapter) — Spin component variables
 pub trait ConfigStore: Send + Sync {
     /// Retrieve a config value by key. Returns `None` if the key does not exist.
     ///

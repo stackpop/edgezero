@@ -9,6 +9,7 @@ set -euo pipefail
 #   ./scripts/smoke_test_kv.sh axum
 #   ./scripts/smoke_test_kv.sh fastly
 #   ./scripts/smoke_test_kv.sh cloudflare
+#   ./scripts/smoke_test_kv.sh spin
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
@@ -58,9 +59,21 @@ case "$ADAPTER" in
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!
     ;;
+  spin)
+    PORT=3000
+    command -v spin >/dev/null 2>&1 || {
+      echo "Spin CLI is required. Install from https://developer.fermyon.com/spin/v3/install" >&2
+      exit 1
+    }
+    echo "==> Building Spin WASM (wasm32-wasip1)..."
+    (cd "$DEMO_DIR" && cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin 2>&1)
+    echo "==> Starting Spin on port $PORT..."
+    (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && spin up --listen "127.0.0.1:$PORT" 2>&1) &
+    SERVER_PID=$!
+    ;;
   *)
     echo "Unknown adapter: $ADAPTER" >&2
-    echo "Usage: $0 [axum|fastly|cloudflare]" >&2
+    echo "Usage: $0 [axum|fastly|cloudflare|spin]" >&2
     exit 1
     ;;
 esac

@@ -9,6 +9,12 @@ set -euo pipefail
 #   ./scripts/smoke_test_secrets.sh axum
 #   ./scripts/smoke_test_secrets.sh fastly
 #   ./scripts/smoke_test_secrets.sh cloudflare
+#   ./scripts/smoke_test_secrets.sh spin
+#
+# Note (spin): Spin variable names are lowercase.  SpinSecretStore normalises
+# the key to lowercase before lookup, so "SMOKE_SECRET" maps to the Spin
+# variable "smoke_secret".  The secret value is passed at startup via
+# SPIN_VARIABLE_SMOKE_SECRET.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
@@ -108,9 +114,25 @@ start_server() {
       (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
       SERVER_PID=$!
       ;;
+    spin)
+      PORT=3000
+      command -v spin >/dev/null 2>&1 || {
+        echo "Spin CLI is required. Install from https://developer.fermyon.com/spin/v3/install" >&2
+        exit 1
+      }
+      echo "==> Building Spin WASM (wasm32-wasip1)..."
+      (cd "$DEMO_DIR" && cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin 2>&1)
+      echo "==> Starting Spin on port $PORT..."
+      # SpinSecretStore normalises the key to lowercase, so SMOKE_SECRET maps to
+      # the Spin variable smoke_secret.  Pass the value via SPIN_VARIABLE_SMOKE_SECRET.
+      (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
+        SPIN_VARIABLE_SMOKE_SECRET="$SMOKE_SECRET_VALUE" \
+        spin up --listen "127.0.0.1:$PORT" 2>&1) &
+      SERVER_PID=$!
+      ;;
     *)
       echo "Unknown adapter: $ADAPTER" >&2
-      echo "Usage: $0 [axum|fastly|cloudflare]" >&2
+      echo "Usage: $0 [axum|fastly|cloudflare|spin]" >&2
       exit 1
       ;;
   esac

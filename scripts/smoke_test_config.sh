@@ -9,6 +9,10 @@ set -euo pipefail
 #   ./scripts/smoke_test_config.sh axum
 #   ./scripts/smoke_test_config.sh fastly
 #   ./scripts/smoke_test_config.sh cloudflare
+#   ./scripts/smoke_test_config.sh spin
+#
+# Note (spin): Spin variable names may not contain dots. Keys with dots
+# (feature.new_checkout, service.timeout_ms) are skipped for the spin adapter.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
@@ -57,9 +61,21 @@ case "$ADAPTER" in
     (cd "$DEMO_DIR" && wrangler dev --cwd crates/app-demo-adapter-cloudflare --port "$PORT" 2>&1) &
     SERVER_PID=$!
     ;;
+  spin)
+    PORT=3000
+    command -v spin >/dev/null 2>&1 || {
+      echo "Spin CLI is required. Install from https://developer.fermyon.com/spin/v3/install" >&2
+      exit 1
+    }
+    echo "==> Building Spin WASM (wasm32-wasip1)..."
+    (cd "$DEMO_DIR" && cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin 2>&1)
+    echo "==> Starting Spin on port $PORT..."
+    (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && spin up --listen "127.0.0.1:$PORT" 2>&1) &
+    SERVER_PID=$!
+    ;;
   *)
     echo "Unknown adapter: $ADAPTER" >&2
-    echo "Usage: $0 [axum|fastly|cloudflare]" >&2
+    echo "Usage: $0 [axum|fastly|cloudflare|spin]" >&2
     exit 1
     ;;
 esac
@@ -115,14 +131,18 @@ check "GET /config/greeting returns 200" "200" "$STATUS"
 BODY=$(curl -s "$BASE/config/greeting")
 check "greeting value" "hello from config store" "$BODY"
 
-STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/feature.new_checkout")
-check "GET /config/feature.new_checkout returns 200" "200" "$STATUS"
+# Spin variable names cannot contain dots; these keys are only tested on
+# adapters whose config stores support arbitrary key names.
+if [ "$ADAPTER" != "spin" ]; then
+  STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/feature.new_checkout")
+  check "GET /config/feature.new_checkout returns 200" "200" "$STATUS"
 
-BODY=$(curl -s "$BASE/config/feature.new_checkout")
-check "feature.new_checkout value" "false" "$BODY"
+  BODY=$(curl -s "$BASE/config/feature.new_checkout")
+  check "feature.new_checkout value" "false" "$BODY"
 
-BODY=$(curl -s "$BASE/config/service.timeout_ms")
-check "service.timeout_ms value" "1500" "$BODY"
+  BODY=$(curl -s "$BASE/config/service.timeout_ms")
+  check "service.timeout_ms value" "1500" "$BODY"
+fi
 
 section "Config: missing key returns 404"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/does.not.exist")
