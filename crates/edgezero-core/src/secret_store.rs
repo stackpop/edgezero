@@ -280,9 +280,13 @@ impl SecretHandle {
 
 /// Access secrets across multiple named stores.
 ///
-/// Platforms with a single flat namespace (env vars, in-memory test stores)
-/// implement this by keying on `"{store_name}/{key}"`.
-/// Platforms with named stores (Fastly, Spin) open a store-specific handle
+/// Platforms with a single flat namespace implement this differently:
+/// - Env vars and in-memory test stores key values on `"{store_name}/{key}"`.
+/// - Cloudflare and Spin ignore `store_name`; each platform exposes one flat
+///   runtime namespace. Spin reads component variables, which must be declared
+///   with lowercase variable names in `spin.toml`.
+///
+/// Platforms with named stores, such as Fastly, open a store-specific handle
 /// per `store_name`.
 #[async_trait(?Send)]
 pub trait SecretStore: Send + Sync {
