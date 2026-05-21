@@ -126,6 +126,7 @@ mod tests {
     use futures::executor::block_on;
     use std::collections::HashMap;
     use std::env;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     struct TestProxyClient;
 
@@ -135,6 +136,39 @@ mod tests {
             let (_method, uri, _headers, _body, _) = request.into_parts();
             assert!(uri.to_string().contains("status/201"));
             Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
+        }
+    }
+
+    /// Serializes every test that reads or writes the `API_BASE_URL`
+    /// process-global env var — concurrent `env::set_var` / `env::var`
+    /// across threads is unsound, so these tests must not overlap.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Restores `API_BASE_URL` to its prior value when dropped, so a
+    /// panicking assertion cannot leak process-global state.
+    struct EnvVarGuard {
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(value: &str) -> Self {
+            let original = env::var("API_BASE_URL").ok();
+            env::set_var("API_BASE_URL", value);
+            Self { original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => env::set_var("API_BASE_URL", value),
+                None => env::remove_var("API_BASE_URL"),
+            }
         }
     }
 
@@ -210,28 +244,27 @@ mod tests {
 
     #[test]
     fn build_proxy_target_merges_segments_and_query() {
-        env::set_var("API_BASE_URL", "https://example.com/api");
+        let _lock = env_lock();
+        let _env = EnvVarGuard::set("https://example.com/api");
         let original = Uri::from_static("/proxy/status?foo=bar");
         let target = build_proxy_target("status/200", &original).expect("target uri");
         assert_eq!(
             target.to_string(),
             "https://example.com/api/status/200?foo=bar"
         );
-        env::remove_var("API_BASE_URL");
     }
 
     #[test]
     fn proxy_demo_without_handle_returns_placeholder() {
-        env::set_var("API_BASE_URL", "https://example.com/api");
+        let _lock = env_lock();
         let ctx = context_with_params("/proxy/status/200", &[("rest", "status/200")]);
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        env::remove_var("API_BASE_URL");
     }
 
     #[test]
     fn proxy_demo_uses_injected_handle() {
-        env::set_var("API_BASE_URL", "https://example.com/api");
+        let _lock = env_lock();
 
         let mut request = request_builder()
             .method(Method::GET)
@@ -248,8 +281,6 @@ mod tests {
 
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::CREATED);
-
-        env::remove_var("API_BASE_URL");
     }
 
     fn empty_context(path: &str) -> RequestContext {

@@ -41,4 +41,4 @@ default = [
     "edgezero-adapter-spin",
 ]
 cli = ["dep:clap"]
-dev-example = ["dep:app-demo-core"]
+demo-example = ["dep:app-demo-core", "edgezero-adapter-axum"]

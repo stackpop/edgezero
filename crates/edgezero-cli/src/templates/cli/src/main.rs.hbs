@@ -1,6 +1,6 @@
 //! {{name}} CLI — built on the `edgezero-cli` library.
 //!
-//! This binary reuses every built-in `edgezero` command via the
+//! This binary reuses the built-in `edgezero` commands via the
 //! `edgezero_cli` library and is the place to add your own subcommands.
 
 use clap::{Parser, Subcommand};
@@ -17,8 +17,6 @@ struct Args {
 enum Cmd {
     /// Build the project for a target edge.
     Build(BuildArgs),
-    /// Run the example app locally on the axum demo server.
-    Demo,
     /// Deploy to a target edge.
     Deploy(DeployArgs),
     /// Create a new `EdgeZero` app skeleton.
@@ -34,7 +32,6 @@ fn main() {
     let result = match Args::parse().cmd {
         Cmd::Build(args) => edgezero_cli::run_build(&args),
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
-        Cmd::Demo => edgezero_cli::run_demo(),
         Cmd::New(args) => edgezero_cli::run_new(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),
     };

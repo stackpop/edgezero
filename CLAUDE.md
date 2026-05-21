@@ -56,7 +56,7 @@ cargo check --workspace --all-targets --features "fastly cloudflare spin"
 cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
 
 # Run the demo server
-cargo run -p edgezero-cli --features dev-example -- demo
+cargo run -p edgezero-cli --features demo-example -- demo
 
 # Docs site
 cd docs && npm ci && npm run dev

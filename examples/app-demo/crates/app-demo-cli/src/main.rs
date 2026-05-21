@@ -1,6 +1,6 @@
 //! `app-demo` CLI — built on the `edgezero-cli` library.
 //!
-//! Reuses every built-in `edgezero` command via the `edgezero_cli`
+//! Reuses the built-in `edgezero` commands via the `edgezero_cli`
 //! library. This is the canonical example of a downstream project
 //! building its own CLI binary on the `EdgeZero` substrate.
 
@@ -18,8 +18,6 @@ struct Args {
 enum Cmd {
     /// Build the project for a target edge.
     Build(BuildArgs),
-    /// Run the example app locally on the axum demo server.
-    Demo,
     /// Deploy to a target edge.
     Deploy(DeployArgs),
     /// Create a new `EdgeZero` app skeleton.
@@ -35,7 +33,6 @@ fn main() {
     let result = match Args::parse().cmd {
         Cmd::Build(args) => edgezero_cli::run_build(&args),
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
-        Cmd::Demo => edgezero_cli::run_demo(),
         Cmd::New(args) => edgezero_cli::run_new(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),
     };

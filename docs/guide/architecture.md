@@ -125,7 +125,7 @@ Adapter crates use feature flags to gate provider SDKs and CLI integration:
 | `fastly`      | edgezero-adapter-fastly     | Fastly SDK integration                 |
 | `cloudflare`  | edgezero-adapter-cloudflare | Workers SDK integration                |
 | `cli`         | adapter crates              | Register adapters and scaffolding data |
-| `dev-example` | edgezero-cli                | Bundled demo app for development       |
+| `demo-example` | edgezero-cli                | Bundled demo app for development       |
 
 ## Next Steps
 

@@ -1,12 +1,12 @@
 //! Smoke test: the `app-demo-cli` binary parses its CLI without panicking
-//! and `--help` lists every built-in command.
+//! and `--help` lists the built-in commands.
 
 #[cfg(test)]
 mod tests {
     use std::process::Command;
 
     #[test]
-    fn help_lists_all_builtin_commands() {
+    fn help_lists_builtin_commands() {
         let output = Command::new(env!("CARGO_BIN_EXE_app-demo-cli"))
             .arg("--help")
             .output()
@@ -18,7 +18,7 @@ mod tests {
         );
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        for command in ["build", "deploy", "demo", "new", "serve"] {
+        for command in ["build", "deploy", "new", "serve"] {
             assert!(
                 stdout.contains(command),
                 "`--help` output should list the `{command}` command"

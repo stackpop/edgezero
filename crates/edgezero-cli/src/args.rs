@@ -11,7 +11,8 @@ pub struct Args {
 pub enum Command {
     /// Build the project for a target edge.
     Build(BuildArgs),
-    /// Run the example app locally on the axum demo server.
+    /// Run the bundled `app-demo` example locally (contributor-only).
+    #[cfg(feature = "demo-example")]
     Demo,
     /// Deploy to a target edge.
     Deploy(DeployArgs),
@@ -46,7 +47,8 @@ pub struct DeployArgs {
 }
 
 /// Arguments for the `new` command.
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
 pub struct NewArgs {
     /// Directory to create the app in (default: current dir).
     #[arg(long)]
@@ -76,6 +78,14 @@ mod tests {
         let args = BuildArgs::default();
         assert!(args.adapter.is_empty());
         assert!(args.adapter_args.is_empty());
+    }
+
+    #[test]
+    fn new_args_derives_default() {
+        let args = NewArgs::default();
+        assert!(args.name.is_empty());
+        assert!(args.dir.is_none());
+        assert!(!args.local_core);
     }
 
     #[test]
