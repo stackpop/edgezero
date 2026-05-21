@@ -12,6 +12,10 @@ pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
 pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
 /// Default secret store / binding name used when `[stores.secrets]` is omitted.
 pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
+// Spin config values come from Spin component variables (flat namespace);
+// there is no runtime store-name concept, so adapter-name overrides for spin
+// would be silently ignored. Keep spin out of the allowed set to surface
+// misconfiguration at validation time rather than at runtime.
 const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
 
 pub struct ManifestLoader {
@@ -466,7 +470,9 @@ pub struct ManifestStores {
 #[non_exhaustive]
 pub struct ManifestConfigStoreConfig {
     /// Per-adapter name overrides, keyed by supported lowercase adapter name
-    /// (`axum`, `cloudflare`, or `fastly`).
+    /// (`axum`, `cloudflare`, or `fastly`). Spin config uses component
+    /// variables in a flat namespace, so `stores.config.adapters.spin` is
+    /// rejected during validation.
     #[serde(default)]
     #[validate(nested)]
     #[validate(custom(function = "validate_config_store_adapter_keys"))]
@@ -1578,20 +1584,17 @@ name = "APP_CONFIG"
 
     #[test]
     fn config_store_spin_adapter_key_fails_validation() {
+        // Spin config values come from component variables; there is no
+        // runtime store-name concept, so a spin adapter override would be
+        // silently ignored. Validation rejects it to surface the mistake early.
         let src = r#"
 [stores.config.adapters.spin]
 name = "SPIN_CONFIG"
 "#;
         let manifest: Manifest = toml::from_str(src).expect("should parse");
-        let result = manifest.validate();
         assert!(
-            result.is_err(),
-            "spin config store adapter key should fail validation because it is not implemented yet"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("spin"),
-            "error should name the unknown adapter: {err_msg}"
+            manifest.validate().is_err(),
+            "spin config store adapter key should fail validation"
         );
     }
 

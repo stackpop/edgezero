@@ -4,6 +4,15 @@ spin_manifest_version = 2
 name = "app-demo-adapter-spin"
 version = "0.1.0"
 
+# Application-level variable declarations.
+# Spin variable names are lowercase; set overrides at runtime via
+# SPIN_VARIABLE_<UPPERCASE_NAME>=value or `spin up --env KEY=value`.
+[variables]
+greeting = { default = "hello from config store" }
+# smoke_secret has an empty default so the server starts without a value set.
+# Pass SPIN_VARIABLE_SMOKE_SECRET=<value> when running smoke_test_secrets.sh.
+smoke_secret = { default = "" }
+
 # Component name is shortened for brevity; scaffolded projects use the full
 # adapter crate name (e.g. "{{proj_spin}}") via the template.
 [[trigger.http]]
@@ -13,6 +22,13 @@ component = "app-demo"
 [component.app-demo]
 source = "../../target/wasm32-wasip1/release/app_demo_adapter_spin.wasm"
 allowed_outbound_hosts = ["https://*:*"]
+# KV store label must match [stores.kv.adapters.spin] in edgezero.toml.
+key_value_stores = ["default"]
+
+[component.app-demo.variables]
+greeting = "{{ greeting }}"
+smoke_secret = "{{ smoke_secret }}"
+
 [component.app-demo.build]
 command = "cargo build --target wasm32-wasip1 --release"
 watch = ["src/**/*.rs", "Cargo.toml"]

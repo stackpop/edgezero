@@ -6,6 +6,7 @@ bin/
 pkg/
 target/
 .wrangler/
+.spin/
 .edgezero/
 
 # env
