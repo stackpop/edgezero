@@ -23,7 +23,6 @@ edgezero new <name> [options]
 **Options:**
 
 - `--dir <path>` - Directory to create the project in (default: current directory)
-- `--local-core` - Use local path dependency for edgezero-core (development only)
 
 **Examples:**
 
