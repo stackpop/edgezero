@@ -16,25 +16,19 @@
 //! This module is only compiled when the `spin` feature is enabled and the
 //! target is `wasm32`.
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use async_trait::async_trait;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use bytes::Bytes;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use std::time::Duration;
 
 /// KV store backed by the Spin KV API.
 ///
 /// Wraps a `spin_sdk::key_value::Store` handle obtained via
 /// `Store::open(label)`.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinKvStore {
     store: spin_sdk::key_value::Store,
 }
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl SpinKvStore {
     /// Open a Spin KV store by label.
     ///
@@ -52,7 +46,6 @@ impl SpinKvStore {
     }
 }
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl KvStore for SpinKvStore {
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
