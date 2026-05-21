@@ -150,7 +150,7 @@ fn build_args_default_and_mutate() {
 
 - [ ] **Step 4: Run** `cargo test -p edgezero-cli` — expect PASS (all relocated tests green).
 
-- [ ] **Step 5: Run** `cargo build -p edgezero-cli` and `./target/debug/edgezero --help` — expect the same five subcommands (with `demo` instead of `dev`).
+- [ ] **Step 5: Run** `cargo build -p edgezero-cli` and `./target/debug/edgezero --help` — expect four subcommands (`build`, `deploy`, `new`, `serve`); `demo` is gated behind the `demo-example` feature.
 
 ### Task 1.3: Rename `dev` → `demo`
 
@@ -165,7 +165,7 @@ fn build_args_default_and_mutate() {
 
 - [ ] **Step 3:** Update `CLAUDE.md`'s `cargo run -p edgezero-cli --features dev-example -- dev` reference is doc-only — leave the `dev-example` feature name as-is (out of scope) but the invocation becomes `-- demo`. (Doc fix happens in Task 1.7.)
 
-- [ ] **Step 4: Run** `cargo test -p edgezero-cli && cargo build -p edgezero-cli` — expect PASS; `./target/debug/edgezero demo --help` works.
+- [ ] **Step 4: Run** `cargo test -p edgezero-cli && cargo build -p edgezero-cli` — expect PASS; with `--features demo-example` built in, `./target/debug/edgezero demo --help` works.
 
 ### Task 1.4: Extend the generator to scaffold `<name>-cli`
 
