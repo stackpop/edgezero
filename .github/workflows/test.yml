@@ -45,9 +45,6 @@ jobs:
       - name: Add wasm targets
         run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
 
-      - name: Setup Viceroy
-        run: cargo install viceroy --locked --force
-
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
@@ -57,12 +54,25 @@ jobs:
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
-      - name: Check Spin wasm32 compilation
-        run: cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
-
-  cloudflare-wasm-tests:
-    name: cloudflare wasm tests
+  adapter-wasm-tests:
+    name: ${{ matrix.adapter }} wasm tests
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - adapter: cloudflare
+            target: wasm32-unknown-unknown
+            runner_env: CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER
+            runner_value: wasm-bindgen-test-runner
+          - adapter: fastly
+            target: wasm32-wasip1
+            runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
+            runner_value: viceroy run
+          - adapter: spin
+            target: wasm32-wasip1
+            runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
+            runner_value: wasmtime run
     steps:
       - uses: actions/checkout@v4
 
@@ -73,25 +83,27 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
+            ~/.wasmtime/bin/
             target/
-          key: ${{ runner.os }}-cargo-cloudflare-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-cloudflare-
+            ${{ runner.os }}-cargo-${{ matrix.adapter }}-
 
       - name: Retrieve Rust version
-        id: rust-version-cloudflare
+        id: rust-version
         run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
         shell: bash
 
       - name: Set up Rust tool chain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: ${{ steps.rust-version-cloudflare.outputs.rust-version }}
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
-      - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Add wasm target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Resolve wasm-bindgen CLI version
+        if: matrix.adapter == 'cloudflare'
         id: wasm-bindgen-version
         shell: bash
         run: |
@@ -109,60 +121,43 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install wasm-bindgen test runner
-        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
-
-      - name: Fetch dependencies (locked)
-        run: cargo fetch --locked
-
-      - name: Run Cloudflare wasm tests
-        env:
-          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
-        run: cargo test -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown --test contract
-
-      - name: Check Cloudflare wasm target
-        run: cargo check -p edgezero-adapter-cloudflare --features cloudflare --target wasm32-unknown-unknown
-
-  fastly-wasm-tests:
-    name: fastly wasm tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-fastly-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-fastly-
-
-      - name: Retrieve Rust version
-        id: rust-version-fastly
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
-      - name: Set up Rust tool chain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: ${{ steps.rust-version-fastly.outputs.rust-version }}
-
-      - name: Add wasm targets
-        run: rustup target add wasm32-wasip1
+        if: matrix.adapter == 'cloudflare'
+        run: |
+          required="${{ steps.wasm-bindgen-version.outputs.version }}"
+          if ! command -v wasm-bindgen-test-runner &>/dev/null \
+              || ! wasm-bindgen --version 2>/dev/null | grep -q "$required"; then
+            cargo install wasm-bindgen-cli --version "$required" --locked --force
+          fi
 
       - name: Setup Viceroy
-        run: cargo install viceroy --locked --force
+        if: matrix.adapter == 'fastly'
+        env:
+          VICEROY_VERSION: 0.16.5
+        run: |
+          if ! command -v viceroy &>/dev/null \
+              || ! viceroy --version 2>/dev/null | grep -qF "$VICEROY_VERSION"; then
+            cargo install viceroy --version "$VICEROY_VERSION" --locked
+          fi
+
+      - name: Setup Wasmtime
+        if: matrix.adapter == 'spin'
+        env:
+          WASMTIME_VERSION: v44.0.0
+        run: |
+          export PATH="$HOME/.wasmtime/bin:$PATH"
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+          if ! command -v wasmtime &>/dev/null \
+              || ! wasmtime --version 2>/dev/null | grep -qF "${WASMTIME_VERSION#v}"; then
+            curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version "$WASMTIME_VERSION"
+          fi
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
-      - name: Run Fastly wasm tests
+      - name: Run ${{ matrix.adapter }} wasm tests
         env:
-          CARGO_TARGET_WASM32_WASIP1_RUNNER: "viceroy run"
-        run: cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract
+          ${{ matrix.runner_env }}: ${{ matrix.runner_value }}
+        run: cargo test -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --test contract
 
-      - name: Check Fastly wasm target
-        run: cargo check -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1
+      - name: Check ${{ matrix.adapter }} wasm target
+        run: cargo check -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }}
