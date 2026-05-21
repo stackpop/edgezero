@@ -1,14 +1,18 @@
 //! `EdgeZero` CLI library.
 //!
 //! Exposes the built-in command handlers (`run_build`, `run_deploy`,
-//! `run_new`, `run_serve`, `run_demo`) and their argument structs so
-//! downstream projects can build their own CLI binary that reuses any
-//! subset of edgezero's built-in commands. The default `edgezero`
-//! binary (`main.rs`) is a thin wrapper over this library.
+//! `run_new`, `run_serve`) and their argument structs so downstream
+//! projects can build their own CLI binary that reuses any subset of
+//! edgezero's built-in commands. The default `edgezero` binary
+//! (`main.rs`) is a thin wrapper over this library.
+//!
+//! `run_demo` is an additional contributor-only handler, available only
+//! under the `demo-example` feature — it runs the in-repo `app-demo`
+//! example and is not meant for downstream CLIs.
 
 #[cfg(feature = "cli")]
 mod adapter;
-#[cfg(all(feature = "cli", feature = "edgezero-adapter-axum"))]
+#[cfg(all(feature = "cli", feature = "demo-example"))]
 mod demo_server;
 #[cfg(feature = "cli")]
 mod generator;
@@ -117,29 +121,18 @@ pub fn run_new(args: &NewArgs) -> Result<(), String> {
     generator::generate_new(args).map_err(|err| err.to_string())
 }
 
-/// Run the example app locally on the axum demo server.
+/// Run the bundled `app-demo` example locally on the axum dev server.
+///
+/// Contributor-only: available only under the `demo-example` feature,
+/// which pulls in the in-repo `examples/app-demo` crate.
 ///
 /// # Errors
 ///
 /// Returns an error if the demo server fails to start.
-#[cfg(all(feature = "cli", feature = "edgezero-adapter-axum"))]
+#[cfg(all(feature = "cli", feature = "demo-example"))]
 #[inline]
 pub fn run_demo() -> Result<(), String> {
     demo_server::run_demo()
-}
-
-/// Run the example app locally on the axum demo server.
-///
-/// # Errors
-///
-/// Always errors: this build was compiled without `edgezero-adapter-axum`.
-#[cfg(all(feature = "cli", not(feature = "edgezero-adapter-axum")))]
-#[inline]
-pub fn run_demo() -> Result<(), String> {
-    Err(
-        "edgezero-cli built without `edgezero-adapter-axum`; rebuild with that feature to use `edgezero demo`."
-            .to_owned(),
-    )
 }
 
 #[cfg(feature = "cli")]

@@ -35,7 +35,7 @@ High-level backlog and decisions to drive the next milestones.
 - [ ] Adapters: assert error-path mapping for Fastly/Cloudflare request conversion and re-enable the ignored Cloudflare response header test.
 - [ ] CLI: add integration tests for `edgezero new` scaffolding, feature-flag builds, and `dev` fallback app.
 - [ ] CLI: cover `dev_server`, generator, and template scaffolding flows with tempdir-based integration tests to guard manual HTTP parsing and shell commands.
-- [ ] CI: verify feature combinations (without `dev-example`, `json`, `form`) compile and run basic smoke tests.
+- [ ] CI: verify feature combinations (without `demo-example`, `json`, `form`) compile and run basic smoke tests.
 - [ ] Macros: add trybuild coverage for `app!` manifest expansion (route/middleware generation and error surfacing).
 - [x] Core: unit-test `App::build_app`/`Hooks` wiring and `PathParams::deserialize` edge cases beyond indirect coverage. _(Added targeted unit tests in `crates/edgezero-core/src/app.rs` and `crates/edgezero-core/src/params.rs`.)_
 - [x] Coverage hygiene: consolidate duplicate router/extractor request-parsing tests and share adapter contract fixtures to reduce redundant maintenance. _(Router duplicates trimmed; extractor suite now owns request parsing checks.)_
@@ -158,7 +158,7 @@ High-level backlog and decisions to drive the next milestones.
 ## Review (2025-09-18 03:08 UTC)
 
 - Implemented `edgezero build|deploy --adapter fastly` by wiring cargo wasm32 builds and Fastly CLI invocation in the CLI.
-- Documented optional `dev-example` dependency in `edgezero-cli/README.md` and added error handling for unsupported adapters.
+- Documented optional `demo-example` dependency in `edgezero-cli/README.md` and added error handling for unsupported adapters.
 - Verified builds with `cargo test -p edgezero-cli`.
 
 ## Review (2025-09-18 03:27 UTC)

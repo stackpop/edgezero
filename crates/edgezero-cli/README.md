@@ -9,7 +9,7 @@ The crate exposes two cargo features:
 | Feature        | Description                                              | Enabled by default |
 |----------------|----------------------------------------------------------|--------------------|
 | `cli`          | Builds the command-line interface (`edgezero` binary).    | ✅                 |
-| `dev-example`  | Pulls in `examples/app-demo/app-demo-core` so `edgezero dev` can boot the bundled demo app. Enable only when you want the sample router available. | ❌ |
+| `demo-example` | Pulls in `examples/app-demo/app-demo-core` so `edgezero demo` can boot the bundled example app. Contributor-only; enable when working on the in-repo example. | ❌ |
 
 When you just need the CLI functionality (e.g. packaging for distribution), build without the demo feature:
 
@@ -17,10 +17,10 @@ When you just need the CLI functionality (e.g. packaging for distribution), buil
 cargo build -p edgezero-cli --no-default-features --features cli
 ```
 
-For contributors working on the demo, enable the extra feature:
+For contributors working on the bundled example, enable the extra feature:
 
 ```bash
-cargo run -p edgezero-cli --features "cli,dev-example" -- dev
+cargo run -p edgezero-cli --features "cli,demo-example" -- demo
 ```
 
 ## Commands
@@ -28,7 +28,8 @@ cargo run -p edgezero-cli --features "cli,dev-example" -- dev
 _(summaries only; see `edgezero --help` for details)_
 
 - `edgezero new <name>` – Scaffold a new EdgeZero project (templates still evolving).
-- `edgezero dev` – Serve the current project locally (add `--features dev-example` to run the bundled demo).
+- `edgezero serve --adapter <name>` – Run the current project locally on the named adapter.
+- `edgezero demo` – Run the bundled `app-demo` example locally (contributor-only; requires `--features demo-example`).
 - `edgezero build --adapter fastly` – Compile the Fastly crate to `wasm32-wasip1` and drop the artifact in `pkg/`.
 - `edgezero deploy --adapter fastly` – Invoke the Fastly CLI (`fastly compute deploy`) from the detected Fastly crate.
 - `edgezero serve --adapter fastly` – Run `fastly compute serve` in the Fastly crate directory for local testing (requires Fastly CLI).

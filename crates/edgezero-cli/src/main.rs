@@ -10,6 +10,7 @@ fn main() {
     let result = match Args::parse().cmd {
         Command::Build(args) => edgezero_cli::run_build(&args),
         Command::Deploy(args) => edgezero_cli::run_deploy(&args),
+        #[cfg(feature = "demo-example")]
         Command::Demo => edgezero_cli::run_demo(),
         Command::New(args) => edgezero_cli::run_new(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),

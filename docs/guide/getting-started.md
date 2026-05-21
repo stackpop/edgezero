@@ -34,12 +34,12 @@ This generates a workspace with:
 - `crates/my-app-adapter-axum` - Native Axum entrypoint
 - `edgezero.toml` - Manifest describing routes, middleware, and adapter config
 
-## Start the Demo Server
+## Run Your App Locally
 
-Run the example app locally on the axum demo server:
+Run your generated app on the native Axum adapter:
 
 ```bash
-edgezero demo
+edgezero serve --adapter axum
 ```
 
 Your app is now running at `http://127.0.0.1:8787`. Try the generated endpoints:

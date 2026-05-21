@@ -27,7 +27,7 @@ cargo check -p edgezero-core --all-features
 cargo check -p edgezero-adapter-fastly --features cli
 cargo check -p edgezero-adapter-cloudflare --features cli
 cargo check -p edgezero-adapter-axum --features axum
-cargo check -p edgezero-cli --features dev-example
+cargo check -p edgezero-cli --features demo-example
 ```
 
 ## Demo apps
