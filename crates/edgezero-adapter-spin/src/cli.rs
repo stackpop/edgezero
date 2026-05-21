@@ -45,7 +45,7 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     readme: ReadmeInfo {
         description: "{display} entrypoint.",
         dev_heading: "{display} (local)",
-        dev_steps: &["`edgezero-cli serve --adapter spin`"],
+        dev_steps: &["`edgezero serve --adapter spin`"],
     },
     run_module: "edgezero_adapter_spin",
 };
