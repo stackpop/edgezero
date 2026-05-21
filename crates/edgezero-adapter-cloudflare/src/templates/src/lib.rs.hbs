@@ -2,11 +2,9 @@
 
 #[cfg(target_arch = "wasm32")]
 use worker::*;
-#[cfg(target_arch = "wasm32")]
-use {{proj_core_mod}}::App;
 
 #[cfg(target_arch = "wasm32")]
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    edgezero_adapter_cloudflare::run_app::<App>(req, env, ctx).await
+    edgezero_adapter_cloudflare::run_app::<{{proj_core_mod}}::App>(req, env, ctx).await
 }

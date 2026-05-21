@@ -144,6 +144,8 @@ name = "app_config"
 [adapters.axum.adapter]
 crate = "crates/app-demo-adapter-axum"
 manifest = "crates/app-demo-adapter-axum/axum.toml"
+host = "127.0.0.1"
+port = 8787
 
 [adapters.axum.build]
 target = "native"
