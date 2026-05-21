@@ -146,6 +146,11 @@ pub fn resolve_dep_line(
         if let Some(rel) = relative_to(workspace_dir, repo_root) {
             let dep_path = Path::new(&rel).join(repo_rel_crate);
             format!("{} = {{ path = \"{}\" }}", crate_name, dep_path.display())
+        } else if let Ok(absolute) = fs::canonicalize(&candidate) {
+            // The output directory is outside the edgezero checkout, so a
+            // relative path cannot be expressed cleanly. Depend on the local
+            // crate by absolute path rather than falling back to Git.
+            format!("{} = {{ path = \"{}\" }}", crate_name, absolute.display())
         } else {
             fallback.to_owned()
         }

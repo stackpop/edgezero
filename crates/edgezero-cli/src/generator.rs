@@ -124,6 +124,21 @@ struct AdapterArtifacts {
     workspace_members: Vec<String>,
 }
 
+/// Locate the edgezero checkout that built this binary.
+///
+/// `CARGO_MANIFEST_DIR` is baked in at compile time and points at
+/// `crates/edgezero-cli`; its grandparent is the workspace root. Returns
+/// `None` when that path no longer holds a checkout (e.g. an installed
+/// binary whose source tree was moved or removed), in which case
+/// dependency resolution falls back to Git.
+fn edgezero_repo_root() -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent()?.parent()?;
+    let is_checkout = root.join("crates/edgezero-cli/src/lib.rs").is_file()
+        && root.join("crates/edgezero-core/src/lib.rs").is_file();
+    is_checkout.then(|| root.to_path_buf())
+}
+
 /// # Errors
 /// Returns [`GeneratorError`] if any filesystem operation, template render,
 /// or layout invariant fails.
@@ -131,11 +146,18 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
     let layout = ProjectLayout::new(args)?;
 
     let mut workspace_dependencies = seed_workspace_dependencies();
-    let cwd = env::current_dir().map_err(|err| GeneratorError::io(".", err))?;
-    let core_crate_line = resolve_core_dependency(&layout, &cwd, &mut workspace_dependencies);
-    let cli_crate_line = resolve_cli_dependency(&layout, &cwd, &mut workspace_dependencies);
+    // Resolve edgezero dependencies against the checkout that built this
+    // binary so generated projects use path dependencies wherever they are
+    // created. Only an installed binary detached from its source tree falls
+    // back to the current directory (and then, typically, to Git).
+    let repo_root = match edgezero_repo_root() {
+        Some(root) => root,
+        None => env::current_dir().map_err(|err| GeneratorError::io(".", err))?,
+    };
+    let core_crate_line = resolve_core_dependency(&layout, &repo_root, &mut workspace_dependencies);
+    let cli_crate_line = resolve_cli_dependency(&layout, &repo_root, &mut workspace_dependencies);
 
-    let adapter_artifacts = collect_adapter_data(&layout, &cwd, &mut workspace_dependencies)?;
+    let adapter_artifacts = collect_adapter_data(&layout, &repo_root, &mut workspace_dependencies)?;
 
     let mut data_map = build_base_data(
         &layout,
@@ -208,7 +230,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
 
 fn resolve_cli_dependency(
     layout: &ProjectLayout,
-    cwd: &Path,
+    repo_root: &Path,
     workspace_dependencies: &mut BTreeMap<String, String>,
 ) -> String {
     const CLI_GIT_FALLBACK: &str = "edgezero-cli = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-cli\" }";
@@ -219,7 +241,7 @@ fn resolve_cli_dependency(
         crate_line,
     } = resolve_dep_line(
         &layout.out_dir,
-        cwd,
+        repo_root,
         "crates/edgezero-cli",
         CLI_GIT_FALLBACK,
         &[],
@@ -237,7 +259,7 @@ fn resolve_cli_dependency(
 
 fn resolve_core_dependency(
     layout: &ProjectLayout,
-    cwd: &Path,
+    repo_root: &Path,
     workspace_dependencies: &mut BTreeMap<String, String>,
 ) -> String {
     let ResolvedDependency {
@@ -246,7 +268,7 @@ fn resolve_core_dependency(
         crate_line,
     } = resolve_dep_line(
         &layout.out_dir,
-        cwd,
+        repo_root,
         "crates/edgezero-core",
         "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
         &[],
@@ -258,7 +280,7 @@ fn resolve_core_dependency(
 
 fn collect_adapter_data(
     layout: &ProjectLayout,
-    cwd: &Path,
+    repo_root: &Path,
     workspace_dependencies: &mut BTreeMap<String, String>,
 ) -> Result<AdapterArtifacts, GeneratorError> {
     let mut contexts = Vec::new();
@@ -280,7 +302,7 @@ fn collect_adapter_data(
         let crate_dir_rel = format!("crates/{crate_name}");
         let data_entries = blueprint_data_entries(
             layout,
-            cwd,
+            repo_root,
             blueprint,
             &crate_name,
             &crate_dir_rel,
@@ -325,7 +347,7 @@ fn collect_adapter_data(
 /// resolving its dependencies and recording them in `workspace_dependencies`.
 fn blueprint_data_entries(
     layout: &ProjectLayout,
-    cwd: &Path,
+    repo_root: &Path,
     blueprint: &'static AdapterBlueprint,
     crate_name: &str,
     crate_dir_rel: &str,
@@ -345,7 +367,7 @@ fn blueprint_data_entries(
             crate_line,
         } = resolve_dep_line(
             &layout.out_dir,
-            cwd,
+            repo_root,
             dep.repo_crate,
             dep.fallback,
             dep.features,
@@ -762,6 +784,18 @@ mod tests {
         }
         assert!(cargo_toml.contains("[workspace.lints.clippy]"));
         assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
+
+        // Generated from a checkout: edgezero crates must resolve to local
+        // path dependencies, not the Git fallback (whose `edgezero-cli` has
+        // no library target until this work is published).
+        assert!(
+            cargo_toml.contains("edgezero-cli = { path ="),
+            "edgezero-cli must resolve to a local path dependency"
+        );
+        assert!(
+            cargo_toml.contains("edgezero-core = { path ="),
+            "edgezero-core must resolve to a local path dependency"
+        );
 
         let manifest =
             fs::read_to_string(project_dir.join("edgezero.toml")).expect("read edgezero.toml");
