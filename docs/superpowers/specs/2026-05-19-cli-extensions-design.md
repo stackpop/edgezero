@@ -1184,16 +1184,16 @@ references.
 The whole effort is **a single pull request containing eight stages**,
 one per sub-project, applied in this order:
 
-| Stage  | §   | Title                                                  | Risk |
-| ------ | --- | ------------------------------------------------------ | ---- |
-| 1      | §7  | Extensible lib + scaffold                              | M    |
-| 2      | §8  | Manifest + runtime rewrite (atomic, all four adapters) | H    |
-| 3      | §9  | App-config schema + derive macro + env-overlay loader  | M    |
-| 4      | §10 | `config validate`                                      | L    |
-| 5      | §11 | `auth` + `CommandRunner`                               | M    |
-| 6      | §12 | `provision`                                            | H    |
-| 7      | §13 | `config push`                                          | M    |
-| 8      | §15 | `app-demo` polish (all four adapters) + docs audit     | M    |
+| Stage | §   | Title                                                  | Risk |
+| ----- | --- | ------------------------------------------------------ | ---- |
+| 1     | §7  | Extensible lib + scaffold                              | M    |
+| 2     | §8  | Manifest + runtime rewrite (atomic, all four adapters) | H    |
+| 3     | §9  | App-config schema + derive macro + env-overlay loader  | M    |
+| 4     | §10 | `config validate`                                      | L    |
+| 5     | §11 | `auth` + `CommandRunner`                               | M    |
+| 6     | §12 | `provision`                                            | H    |
+| 7     | §13 | `config push`                                          | M    |
+| 8     | §15 | `app-demo` polish (all four adapters) + docs audit     | M    |
 
 Every stage also updates the `docs/guide/` pages it makes stale
 (§6.12) — documentation is part of each stage's definition-of-done,
