@@ -1,8 +1,6 @@
-use {{proj_core_mod}}::App;
+use edgezero_adapter_axum::dev_server::run_app;
 
-fn main() {
-    if let Err(err) = edgezero_adapter_axum::dev_server::run_app::<App>(include_str!("../../../edgezero.toml")) {
-        eprintln!("axum adapter failed: {err}");
-        std::process::exit(1);
-    }
+fn main() -> anyhow::Result<()> {
+    run_app::<{{proj_core_mod}}::App>(include_str!("../../../edgezero.toml"))?;
+    Ok(())
 }

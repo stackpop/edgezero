@@ -1,16 +1,25 @@
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(dead_code, reason = "Fastly entrypoint is wasm32-only")
+)]
 
 #[cfg(target_arch = "wasm32")]
 use fastly::{Error, Request, Response};
-#[cfg(target_arch = "wasm32")]
-use {{proj_core_mod}}::App;
+
 #[cfg(target_arch = "wasm32")]
 #[fastly::main]
 pub fn main(req: Request) -> Result<Response, Error> {
-    edgezero_adapter_fastly::run_app::<App>(include_str!("../../../edgezero.toml"), req)
+    edgezero_adapter_fastly::run_app::<{{proj_core_mod}}::App>(
+        include_str!("../../../edgezero.toml"),
+        req,
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[expect(
+    clippy::print_stderr,
+    reason = "host stub; the real binary only runs on wasm32-wasip1"
+)]
 fn main() {
     eprintln!("{{proj_fastly}}: target wasm32-wasip1 to run on Fastly.");
 }

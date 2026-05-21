@@ -185,14 +185,14 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     deps.insert("log".to_owned(), "log = \"0.4\"".to_owned());
     deps.insert(
         "simple_logger".to_owned(),
-        "simple_logger = \"4\"".to_owned(),
+        "simple_logger = \"5\"".to_owned(),
     );
     deps.insert(
         "worker".to_owned(),
-        "worker = { version = \"0.7\", default-features = false, features = [\"http\"] }"
+        "worker = { version = \"0.8\", default-features = false, features = [\"http\"] }"
             .to_owned(),
     );
-    deps.insert("fastly".to_owned(), "fastly = \"0.11\"".to_owned());
+    deps.insert("fastly".to_owned(), "fastly = \"0.12\"".to_owned());
     deps.insert("once_cell".to_owned(), "once_cell = \"1\"".to_owned());
     deps.insert(
         "tokio".to_owned(),
@@ -788,6 +788,46 @@ mod tests {
                 "{crate_dir} must inherit workspace lints",
             );
         }
+
+        assert_generated_sources_are_lint_clean(project_dir);
+    }
+
+    /// Regression guard for the generated sources: a freshly scaffolded
+    /// project must pass its own `restriction`-deny clippy gate. The pre-fix
+    /// templates shipped a production `.expect(...)` in the `stream` handler,
+    /// infallible `IntoResponse` test usage, and adapter host stubs that
+    /// tripped `print_stderr` / `exit`.
+    fn assert_generated_sources_are_lint_clean(project_dir: &Path) {
+        let handlers = fs::read_to_string(project_dir.join("crates/demo-app-core/src/handlers.rs"))
+            .expect("read handlers.rs");
+        assert!(
+            handlers.contains("pub async fn stream() -> Result<Response, EdgeError>"),
+            "stream handler must be fallible, not panic via expect()",
+        );
+        assert!(
+            !handlers.contains("static stream response"),
+            "handler template must not ship a production expect()",
+        );
+        assert!(
+            handlers.contains(".into_response()"),
+            "handler tests must use the fallible IntoResponse pattern",
+        );
+
+        let axum_main =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-axum/src/main.rs"))
+                .expect("read axum main.rs");
+        assert!(
+            !axum_main.contains("process::exit"),
+            "axum host entrypoint must return Result, not call process::exit",
+        );
+
+        let fastly_main =
+            fs::read_to_string(project_dir.join("crates/demo-app-adapter-fastly/src/main.rs"))
+                .expect("read fastly main.rs");
+        assert!(
+            fastly_main.contains("reason ="),
+            "adapter attributes must carry a reason for allow_attributes_without_reason",
+        );
     }
 
     #[test]

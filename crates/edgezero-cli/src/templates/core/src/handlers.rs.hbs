@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
@@ -6,19 +7,19 @@ use edgezero_core::extractor::{Headers, Json, Path};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
-use bytes::Bytes;
-use futures::{stream, StreamExt};
+use futures::{stream, StreamExt as _};
+use std::env;
 
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 
 #[derive(serde::Deserialize)]
-pub(crate) struct EchoParams {
-    pub(crate) name: String,
+pub struct EchoBody {
+    pub name: String,
 }
 
 #[derive(serde::Deserialize)]
-pub(crate) struct EchoBody {
-    pub(crate) name: String,
+pub struct EchoParams {
+    pub name: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -28,45 +29,44 @@ struct ProxyPath {
 }
 
 #[action]
-pub(crate) async fn root() -> Text<&'static str> {
+pub async fn root() -> Text<&'static str> {
     Text::new("{{name}} app")
 }
 
 #[action]
-pub(crate) async fn echo(Path(params): Path<EchoParams>) -> Text<String> {
+pub async fn echo(Path(params): Path<EchoParams>) -> Text<String> {
     Text::new(format!("Hello, {}!", params.name))
 }
 
 #[action]
-pub(crate) async fn headers(Headers(headers): Headers) -> Text<String> {
+pub async fn headers(Headers(headers): Headers) -> Text<String> {
     let ua = headers
         .get("user-agent")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("(unknown)");
-    Text::new(format!("ua={}", ua))
+    Text::new(format!("ua={ua}"))
 }
 
 #[action]
-pub(crate) async fn stream() -> Response {
-    let body = Body::stream(stream::iter(0..3).map(|index| Bytes::from(format!(
-        "chunk {}\n",
-        index
-    ))));
+pub async fn stream() -> Result<Response, EdgeError> {
+    let body = Body::stream(
+        stream::iter(0_i32..3_i32).map(|index| Bytes::from(format!("chunk {index}\n"))),
+    );
 
     http::response_builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; charset=utf-8")
         .body(body)
-        .expect("static stream response")
+        .map_err(EdgeError::internal)
 }
 
 #[action]
-pub(crate) async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
+pub async fn echo_json(Json(body): Json<EchoBody>) -> Text<String> {
     Text::new(format!("Hello, {}!", body.name))
 }
 
 #[action]
-pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
+pub async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Response, EdgeError> {
     let params: ProxyPath = ctx.path()?;
     let proxy_handle = ctx.proxy_handle();
     let request = ctx.into_request();
@@ -81,8 +81,8 @@ pub(crate) async fn proxy_demo(RequestContext(ctx): RequestContext) -> Result<Re
 }
 
 fn build_proxy_target(rest: &str, original_uri: &Uri) -> Result<Uri, EdgeError> {
-    let base = std::env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_string());
-    let mut target = base.trim_end_matches('/').to_string();
+    let base = env::var("API_BASE_URL").unwrap_or_else(|_| DEFAULT_PROXY_BASE.to_owned());
+    let mut target = base.trim_end_matches('/').to_owned();
     let trimmed_rest = rest.trim_start_matches('/');
     if !trimmed_rest.is_empty() {
         target.push('/');
@@ -115,31 +115,48 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use edgezero_core::body::Body;
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::header::{HeaderName, HeaderValue};
     use edgezero_core::http::{request_builder, Method, StatusCode, Uri};
     use edgezero_core::params::PathParams;
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
-    use edgezero_core::response::IntoResponse;
-    use async_trait::async_trait;
-    use futures::{executor::block_on, StreamExt};
+    use edgezero_core::response::IntoResponse as _;
+    use futures::executor::block_on;
     use std::collections::HashMap;
     use std::env;
+
+    struct TestProxyClient;
+
+    #[async_trait(?Send)]
+    impl ProxyClient for TestProxyClient {
+        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
+            let (_method, uri, _headers, _body, _) = request.into_parts();
+            assert!(uri.to_string().contains("status/201"));
+            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
+        }
+    }
 
     #[test]
     fn root_returns_static_body() {
         let ctx = empty_context("/");
-        let response = block_on(root(ctx)).expect("handler ok").into_response();
-        let bytes = response.into_body().into_bytes();
+        let response = block_on(root(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"{{name}} app");
     }
 
     #[test]
     fn echo_formats_name_from_path() {
         let ctx = context_with_params("/echo/alice", &[("name", "alice")]);
-        let response = block_on(echo(ctx)).expect("handler ok").into_response();
-        let bytes = response.into_body().into_bytes();
+        let response = block_on(echo(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"Hello, alice!");
     }
 
@@ -151,8 +168,11 @@ mod tests {
             HeaderValue::from_static("DemoAgent"),
         );
 
-        let response = block_on(headers(ctx)).expect("handler ok").into_response();
-        let bytes = response.into_body().into_bytes();
+        let response = block_on(headers(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"ua=DemoAgent");
     }
 
@@ -165,8 +185,8 @@ mod tests {
         let mut chunks = response.into_body().into_stream().expect("stream body");
         let collected = block_on(async {
             let mut buf = Vec::new();
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk.expect("chunk");
+            while let Some(item) = chunks.next().await {
+                let chunk = item.expect("chunk");
                 buf.extend_from_slice(&chunk);
             }
             buf
@@ -179,12 +199,12 @@ mod tests {
 
     #[test]
     fn echo_json_formats_payload() {
-        let ctx = context_with_json(
-            "/echo",
-            r#"{"name":"Edge"}"#,
-        );
-        let response = block_on(echo_json(ctx)).expect("handler ok").into_response();
-        let bytes = response.into_body().into_bytes();
+        let ctx = context_with_json("/echo", r#"{"name":"Edge"}"#);
+        let response = block_on(echo_json(ctx))
+            .expect("handler ok")
+            .into_response()
+            .expect("response");
+        let bytes = response.into_body().into_bytes().expect("buffered");
         assert_eq!(bytes.as_ref(), b"Hello, Edge!");
     }
 
@@ -193,7 +213,10 @@ mod tests {
         env::set_var("API_BASE_URL", "https://example.com/api");
         let original = Uri::from_static("/proxy/status?foo=bar");
         let target = build_proxy_target("status/200", &original).expect("target uri");
-        assert_eq!(target.to_string(), "https://example.com/api/status/200?foo=bar");
+        assert_eq!(
+            target.to_string(),
+            "https://example.com/api/status/200?foo=bar"
+        );
         env::remove_var("API_BASE_URL");
     }
 
@@ -204,17 +227,6 @@ mod tests {
         let response = block_on(proxy_demo(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         env::remove_var("API_BASE_URL");
-    }
-
-    struct TestProxyClient;
-
-    #[async_trait(?Send)]
-    impl ProxyClient for TestProxyClient {
-        async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
-            let (_method, uri, _headers, _body, _) = request.into_parts();
-            assert!(uri.to_string().contains("status/201"));
-            Ok(ProxyResponse::new(StatusCode::CREATED, Body::empty()))
-        }
     }
 
     #[test]
@@ -231,7 +243,7 @@ mod tests {
             .insert(ProxyHandle::with_client(TestProxyClient));
 
         let mut params = HashMap::new();
-        params.insert("rest".to_string(), "status/201".to_string());
+        params.insert("rest".to_owned(), "status/201".to_owned());
         let ctx = RequestContext::new(request, PathParams::new(params));
 
         let response = block_on(proxy_demo(ctx)).expect("response");
@@ -257,16 +269,12 @@ mod tests {
             .expect("request");
         let map = params
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|&(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<HashMap<_, _>>();
         RequestContext::new(request, PathParams::new(map))
     }
 
-    fn context_with_header(
-        path: &str,
-        header: HeaderName,
-        value: HeaderValue,
-    ) -> RequestContext {
+    fn context_with_header(path: &str, header: HeaderName, value: HeaderValue) -> RequestContext {
         let mut request = request_builder()
             .method(Method::GET)
             .uri(path)

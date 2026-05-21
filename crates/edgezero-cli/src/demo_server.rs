@@ -1,8 +1,10 @@
 #![cfg(feature = "edgezero-adapter-axum")]
 
+use std::env;
 use std::net::SocketAddr;
 
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
+use edgezero_core::addr;
 use edgezero_core::router::RouterService;
 
 #[cfg(not(feature = "dev-example"))]
@@ -27,7 +29,7 @@ struct EchoParams {
 ///
 /// Returns `Ok(())` on graceful shutdown, `Err` on startup failure.
 pub fn run_demo() -> Result<(), String> {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+    let addr = resolve_demo_addr();
     log::info!(
         "[edgezero] demo: starting example server on http://{}:{}",
         addr.ip(),
@@ -44,6 +46,18 @@ pub fn run_demo() -> Result<(), String> {
     server
         .run()
         .map_err(|err| format!("demo server error: {err}"))
+}
+
+/// Resolve the demo server bind address from `EDGEZERO_HOST` /
+/// `EDGEZERO_PORT` environment variables, falling back to `127.0.0.1:8787`.
+fn resolve_demo_addr() -> SocketAddr {
+    let env_host = env::var("EDGEZERO_HOST").ok();
+    let env_port = env::var("EDGEZERO_PORT").ok();
+    let resolution = addr::resolve_bind_addr(env_host.as_deref(), env_port.as_deref(), None, None);
+    for warning in &resolution.warnings {
+        log::warn!("[edgezero] {warning}");
+    }
+    resolution.addr
 }
 
 fn build_demo_router() -> RouterService {
