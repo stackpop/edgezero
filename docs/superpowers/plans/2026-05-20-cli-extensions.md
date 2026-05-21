@@ -52,7 +52,7 @@ cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
 ```
 
 Plus, where the task touches adapter runtime or `app-demo`: the
-per-adapter wasm `--test contract` runs (commands in Task 2.7 step 6),
+per-adapter wasm `--test contract` runs (Task 2.6),
 `cd examples/app-demo && cargo test`, and — for doc changes — the docs
 ESLint/Prettier job. Each stage's final task runs the full gate before
 its `git commit`.
@@ -268,149 +268,119 @@ implementing** — do not bolt them on piecemeal:
   the adapter layer (per-adapter manifests / adapter crate config), not the
   shared manifest.
 
-### Task 2.1: Rewrite the manifest store schema
+### Task 2.1: Portable manifest schema
 
-**Files:**
+**Files:** `crates/edgezero-core/src/manifest.rs` (+ `manifest_definitions.rs`)
 
-- Modify: `crates/edgezero-core/src/manifest.rs`
+Rewrite `ManifestStores` to the §6.6 portable schema: `[stores.<kind>]`
+carries only `ids` (non-empty) and `default` (required when
+`ids.len() > 1`, else `ids[0]`). Remove the `[adapters.*]` store and
+runtime tables from the manifest model. Pre-rewrite fields
+(`[stores.<kind>] name`, `[stores.config.defaults]`,
+`[adapters.*.stores.*]`) → hard load error pointing at
+`docs/guide/manifest-store-migration.md`.
 
-- [ ] **Step 1: Write failing tests** for the new schema in `manifest.rs` tests: a manifest with `[stores.kv] ids = ["a","b"]\ndefault = "a"` plus `[adapters.cloudflare.stores.kv.a] name = "A"` etc. parses; `ids = []` errors; `default` missing with two ids errors; `default` not in `ids` errors; a `Single`-pair per-id block errors; a legacy `[stores.kv] name = "X"` errors with a message containing `manifest-store-migration`.
+- [ ] Tests: round-trip; non-empty ids; default required when >1 id;
+      legacy manifest → hard error with migration message.
+- [ ] Full gate.
 
-- [ ] **Step 2: Run** — expect FAIL.
+### Task 2.2: `EDGEZERO__*` environment-config layer
 
-- [ ] **Step 3: Implement** per §6.6. Replace `ManifestStores`, `ManifestConfigStoreConfig`, `ManifestKvConfig`, `ManifestSecretsConfig`, and the `Manifest*AdapterConfig` types with:
-  - `ManifestStores { kv: Option<LogicalStore>, config: Option<LogicalStore>, secrets: Option<LogicalStore> }` where `LogicalStore { ids: Vec<String>, default: Option<String> }`.
-  - `ManifestAdapter` (the `[adapters.<x>]` struct) gains `stores: Option<AdapterStoresConfig>`. `AdapterStoresConfig { kv/config/secrets: BTreeMap<String /*id*/, AdapterStoreMapping> }`, `AdapterStoreMapping { name: String, #[serde(flatten)] extras: BTreeMap<String, toml::Value> }`.
-  - The Spin `component` field goes on the **`[adapters.<x>.adapter]` definition struct** — the one that already carries `crate` and `manifest` — **not** on the top-level `ManifestAdapter`. Adding it to `ManifestAdapter` would make the accepted TOML `[adapters.spin] component = "..."`, which is wrong; it must be `[adapters.spin.adapter] component = "..."` (§6.7). Confirm the struct name by reading `manifest.rs` (the struct deserialized from `[adapters.<x>.adapter]`); add `component: Option<String>` there.
-  - A `Capability { Multi, Single }` and a const fn `capability(adapter: &str, kind: StoreKind) -> Capability` encoding the §6.6 matrix.
-  - Validation in `ManifestLoader`: non-empty `ids`; `default` rules; capability check (any `Single` adapter for a kind ⇒ `ids.len() == 1`); per-id mapping required for `Multi` pairs / forbidden for `Single` pairs; Cloudflare `name` JS-identifier check; Spin KV label check.
-  - Detect legacy keys (`name`/`enabled`/`defaults`/`adapters` under `[stores.*]`) via a `#[serde(deny_unknown_fields)]` or an explicit reject, emitting an error pointing at `docs/guide/manifest-store-migration.md`.
-  - Add resolver helpers: `resolved_default(kind) -> &str`, `store_name(adapter, kind, id) -> Option<&str>`.
+**Files:** `crates/edgezero-core/src/env_config.rs` (new)
 
-- [ ] **Step 4: Run** `cargo test -p edgezero-core manifest` — expect PASS. Existing manifest tests that used the old schema are rewritten to the new schema (this is a hard cutoff — old-schema tests are replaced, not kept).
+Parse `EDGEZERO__`-prefixed env vars (`__` = key-path separator) into an
+adapter runtime-config value: per-store `NAME` + free-form tuning, bind
+host/port, logging level. Absent vars resolve to the §6.6 defaults (a
+store's platform name defaults to its logical id).
 
-### Task 2.2: New `KvError` variants
+- [ ] Tests: nesting, defaults, store-name resolution; zero-env case.
+- [ ] Full gate.
 
-**Files:**
+### Task 2.3: `app!` macro bakes portable config into `Hooks`
 
-- Modify: `crates/edgezero-core/src/key_value_store.rs`
+**Files:** `crates/edgezero-macros/src/app.rs`, `crates/edgezero-core/src/app.rs`
 
-- [ ] **Step 1: Write failing test:** assert `KvError::Unsupported` and `KvError::LimitExceeded` exist and that their `EdgeError` conversion yields a 5xx status.
+The `app!` macro reads `edgezero.toml` at compile time and codegens the
+logical store registry + id-keyed `ConfigStoreMetadata` into the
+generated `App` / `Hooks` type, alongside routing. `Hooks` exposes the
+portable store config. The macro and manifest stay optional — an `App`
+built without the macro supplies empty defaults, so a downstream binary
+compiles with no `edgezero.toml`.
 
-- [ ] **Step 2: Run** — expect FAIL.
+- [ ] Tests: `app!` macro metadata-registry test.
+- [ ] Full gate.
 
-- [ ] **Step 3: Implement.** Add `Unsupported { message: String }` and `LimitExceeded { message: String }` to `KvError`. Map both to a 5xx-class `EdgeError` in the existing `KvError → EdgeError` conversion (an unsupported op / a store-too-large condition is not a client error).
+### Task 2.4: `run_app::<A>()` drops `manifest_src` (all four adapters)
 
-- [ ] **Step 4: Run** — expect PASS.
+**Files:** `run_app` in each adapter crate; the four entrypoint templates; `edgezero-cli/src/demo_server.rs`
 
-### Task 2.3: Make `ConfigStore` async
+`run_app` takes no manifest string. It reads portable config from `A`
+and layers `EDGEZERO__*` env config (Task 2.2) for adapter-specific
+values. Remove every `include_str!("edgezero.toml")`; update the four
+adapter entrypoint templates and `demo_server.rs`.
 
-**Files:**
+- [ ] Tests: `run_app` builds and runs with no manifest file / zero env.
+- [ ] Full gate.
 
-- Modify: `crates/edgezero-core/src/config_store.rs`, and every `ConfigStore` impl (all four adapters + any in-core test stores)
+### Task 2.5: Async `ConfigStore`, `KvError` variants, bound handles, id-keyed context
 
-- [ ] **Step 1: Implement.** Change the trait to `#[async_trait(?Send)] pub trait ConfigStore: Send + Sync { async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>; }`. Make `ConfigStoreHandle::get` async. Update the `config_store_contract_tests!` macro so generated tests `.await` the calls (they already run under `futures::executor::block_on` per project convention).
+**Files:** `config_store.rs`, `key_value_store.rs`, `secret_store.rs`, `context.rs`, `error.rs`
 
-- [ ] **Step 2:** Update every `ConfigStore` impl in the four adapters to `async fn get` (the bodies stay; only the signature + any awaits change). This is mechanical but compile-driven — `cargo build` will list every site.
+`ConfigStore::get` → `async` (`#[async_trait(?Send)]`). Add
+`KvError::Unsupported` and `KvError::LimitExceeded` with 5xx-class
+`EdgeError` mappings. Add `BoundKvStore` / `BoundConfigStore` /
+`BoundSecretStore` and a `StoreRegistry<H>`; `RequestContext` accessors
+become id-keyed with `_default()` helpers.
 
-- [ ] **Step 3: Run** `cargo build --workspace` — drive to zero errors.
+- [ ] Tests: async config round-trip; new `KvError` mappings; registry.
+- [ ] Full gate.
 
-### Task 2.4: Bound store handles + id-keyed `RequestContext` + `StoreRegistry`
+### Task 2.6: Adapter store registries — all four adapters
 
-**Files:**
+**Files:** `{config_store,key_value_store,secret_store}.rs` in each adapter crate
 
-- Modify: `crates/edgezero-core/src/context.rs`, `config_store.rs`, `key_value_store.rs`, `secret_store.rs`
+Each adapter builds a `StoreRegistry` keyed by logical id, platform
+names from `EDGEZERO__STORES__*`. axum: local KV + local-file config +
+env secrets. cloudflare: KV registry, config `[vars]`→KV async, worker
+secrets. fastly: KV / config / secret registries. spin: `SpinKvStore`
+(labels from env, `max_list_keys`), `SpinConfigStore` (`.`→`__`),
+`SpinSecretStore`.
 
-- [ ] **Step 1: Implement** per §4. Add `BoundKvStore`, `BoundConfigStore`, `BoundSecretStore` — each wraps the provider handle plus the resolved platform name; `BoundConfigStore::get` async; `BoundSecretStore::get -> Result<Option<bytes::Bytes>, SecretError>` + `require_str`. Add `StoreRegistry<H> { by_id: BTreeMap<String, H>, default_id: String }`. Replace `RequestContext::config_store()/kv_handle()/secret_handle()` with `kv_store(id)/kv_store_default()`, `config_store(id)/config_store_default()`, `secret_store(id)/secret_store_default()` returning `Option<Bound*Store>`. The context stores three `StoreRegistry` values in its `Extensions`.
+- [ ] Tests: id-keyed contract factories ×4; cross-adapter named KV;
+      cloudflare config-from-KV; spin `.`→`__`; spin TTL → `Unsupported`;
+      spin listing-cap pagination.
+- [ ] Full gate incl. per-adapter wasm `--test contract`.
 
-- [ ] **Step 2: Write tests** in `context.rs`: a registry with two ids returns `Some` for each, `None` for an unknown id; `*_default()` resolves the `default_id`.
+### Task 2.7: `Kv` / `Secrets` / `Config` extractors
 
-- [ ] **Step 3: Run** `cargo test -p edgezero-core context` — expect PASS.
+**Files:** `crates/edgezero-core/src/extractor.rs`
 
-### Task 2.5: Id-keyed `Hooks` / `ConfigStoreMetadata` + `app!` macro
+Refactor `Kv` / `Secrets` to `default()` / `named()`; add the `Config`
+extractor (§6.9).
 
-**Files:**
+- [ ] Tests: extractor tests for all three.
+- [ ] Full gate.
 
-- Modify: `crates/edgezero-core/src/app.rs` (`Hooks` + `ConfigStoreMetadata` both live here — there is no separate `hooks.rs`), `crates/edgezero-macros/src/app.rs`, `crates/edgezero-macros/src/manifest_definitions.rs`
+### Task 2.8: Migrate `app-demo`, templates, docs
 
-- [ ] **Step 1: Implement.** `ConfigStoreMetadata` becomes a registry: one entry per logical config id, each carrying the per-adapter `name` map. `Hooks` exposes store **metadata** (ids, resolved default, per-adapter names) per kind — **not** bound handles. Update the `app!` macro to emit the id-keyed metadata from the new manifest schema (`manifest_definitions.rs` is where the macro reads the manifest).
+**Files:** `examples/app-demo/edgezero.toml` + handlers + adapter run config; `templates/root/edgezero.toml.hbs`; `docs/guide/manifest-store-migration.md`; affected `docs/guide/` pages
 
-- [ ] **Step 2: Write a macro test:** the generated `ConfigStoreMetadata` registry matches a fixture manifest's `[stores.config].ids`.
+Rewrite `examples/app-demo/edgezero.toml` and
+`templates/root/edgezero.toml.hbs` to the portable schema (≥2 KV ids,
+one config id, one secrets id). Migrate app-demo handlers for the
+store-accessor change only. Publish `manifest-store-migration.md`;
+update affected `docs/guide/` pages.
 
-- [ ] **Step 3: Run** `cargo test -p edgezero-core && cargo test -p edgezero-macros` — expect PASS.
+- [ ] Full gate + `cd examples/app-demo && cargo test` + docs CI.
 
-### Task 2.6: Refactor `Kv` / `Secrets` extractors + add `Config`
+### Task 2.9: Stage-2 ship gate + commit
 
-**Files:**
-
-- Modify: `crates/edgezero-core/src/extractor.rs`
-
-- [ ] **Step 1: Implement** per §6.9. `Kv` / `Secrets` / new `Config` each become a per-request registry handle with `.default() -> Option<Bound*Store>` and `.named(id) -> Option<Bound*Store>`. Update their `FromRequest` impls to extract the corresponding `StoreRegistry` from the context.
-
-- [ ] **Step 2: Write tests:** a handler-style test resolving `kv.default()` and `kv.named("sessions")`.
-
-- [ ] **Step 3: Run** `cargo test -p edgezero-core extractor` — expect PASS.
-
-### Task 2.7: Rewrite all four adapter store impls for multi-store
-
-**Files:**
-
-- Modify: `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/{config_store,key_value_store,secret_store}.rs` and each adapter's request-setup code.
-
-- [ ] **Step 1: axum.** Build `StoreRegistry` for each kind from `[adapters.axum.stores.*]`. KV stays `PersistentKvStore` (redb) — **one separate redb file per logical id**, file stem from the per-adapter mapping `[adapters.axum.stores.kv.<id>].name`: `.edgezero/kv-<name>.redb`. (Axum KV is `Multi`, so every id has a `name`.) Distinct files prevent multi-store collapsing into one backing file. Config store reads `.edgezero/local-config-<id>.json` (the file stage 7 writes); absent ⇒ empty. Secrets from env vars (Single).
-
-- [ ] **Step 2: cloudflare.** KV registry. **Config rewritten from `[vars]` to KV** (§6.9) — `CloudflareConfigStore` does an async `env.<NAMESPACE>.get(key)`; one namespace per config id. Secrets from worker secrets (Single).
-
-- [ ] **Step 3: fastly.** Fastly is `Multi` for **all three** kinds (KV, config, secrets) — the only adapter that is. Build a `StoreRegistry<H>` per kind from `[adapters.fastly.stores.<kind>.*]`:
-  - **KV:** one Fastly KV store per logical id, opened by the per-id `name`. The existing `FastlyKvStore` is constructed once per id; the registry maps `<id>` → handle.
-  - **Config:** one Fastly config store per logical id, opened by the per-id `name`. The existing `FastlyConfigStore` becomes per-id; `get` stays async after the §6.4 trait change.
-  - **Secrets:** one Fastly secret store per logical id, opened by the per-id `name`.
-  - For every kind, an absent per-id `name` mapping is already a manifest-validation error (§6.6); the adapter setup can rely on each declared id having a `name`.
-  - Resolution: at request setup the adapter reads the `Hooks` store metadata, opens each `(kind, id)` Fastly resource by its `name`, and inserts the three `StoreRegistry` values into the context.
-  - **Tests:** the Fastly contract suite must cover **two logical stores of each kind** (e.g. `[stores.kv] ids = ["a", "b"]`) and assert `ctx.kv_store("a")` / `ctx.kv_store("b")` resolve to distinct stores, `ctx.kv_store("missing")` is `None`, and `kv_store_default()` resolves the manifest default — same id-keyed contract-factory shape as the other adapters (Step 5). Run under Viceroy on `wasm32-wasip1`.
-
-- [ ] **Step 4: spin.** Wire `SpinKvStore` (label registry, honor `max_list_keys`, return `KvError::LimitExceeded` past the cap, `KvError::Unsupported` for TTL writes), `SpinConfigStore` (single flat-variable store, `.`→`__` lowercase key translation), `SpinSecretStore` (single flat-variable store, `store_name` ignored). Stop rejecting `[stores.*]` for spin in `lib.rs`. Labels come from `[adapters.spin.stores.kv.*].name`.
-
-- [ ] **Step 5:** Update each adapter's contract-test invocations to the id-keyed factory shape; add a Spin TTL→`Unsupported` contract test and a Spin listing-cap→`LimitExceeded` test; add a Cloudflare config-from-KV async round-trip test (wasm-bindgen-test).
-
-- [ ] **Step 6: Run** `cargo test --workspace --all-targets`, then the per-adapter wasm contract tests with the **exact** runner / target / feature each adapter's CI job uses (`.github/workflows/test.yml` `adapter-wasm-tests` matrix — match it, do not improvise):
-  - **cloudflare:** target `wasm32-unknown-unknown`, runner `wasm-bindgen-test-runner` —
-    `cargo test -p edgezero-adapter-cloudflare --target wasm32-unknown-unknown --features cloudflare --test contract`
-  - **fastly:** target `wasm32-wasip1`, runner Viceroy (version pinned in `.tool-versions`) —
-    `cargo test -p edgezero-adapter-fastly --target wasm32-wasip1 --features fastly --test contract`
-  - **spin:** target `wasm32-wasip1`, runner Wasmtime —
-    `cargo test -p edgezero-adapter-spin --target wasm32-wasip1 --features spin --test contract`
-
-  The runner for each target is configured in the workspace `.cargo/config.toml`. If the exact feature flags or runner config differ from the above, defer to `.github/workflows/test.yml` as the source of truth and update this step to match. All green.
-
-### Task 2.8: Migrate `app-demo` + write the migration guide
-
-**Files:**
-
-- Modify: `examples/app-demo/edgezero.toml`, `examples/app-demo/crates/app-demo-core/src/handlers.rs`, `crates/edgezero-cli/src/templates/root/edgezero.toml.hbs`
-- Create: `docs/guide/manifest-store-migration.md`
-
-- [ ] **Step 1:** Rewrite `examples/app-demo/edgezero.toml` to the new schema: `[stores.kv] ids = ["sessions","cache"]\ndefault = "sessions"`; one config id (`app_config`); one secrets id (`default`); per-adapter `[adapters.<X>.stores.kv.<id>]` blocks for axum/cloudflare/fastly/spin; no Spin per-id blocks for config/secrets (Single). Remove `[stores.config.defaults]`.
-
-- [ ] **Step 2:** Migrate `app-demo` handlers to id-keyed accessors — **store-accessor change only** (`ctx.kv_store("sessions")`, `ctx.config_store_default()`, the refactored `Kv`/`Secrets`/`Config` extractors). Do **not** introduce `AppDemoConfig` here (stage 3).
-
-- [ ] **Step 3:** Rewrite `templates/root/edgezero.toml.hbs` to the new schema so `edgezero new` produces a valid manifest.
-
-- [ ] **Step 4:** Write `docs/guide/manifest-store-migration.md` — old shape → new shape, worked example, the capability matrix.
-
-- [ ] **Step 5: Run** `cd examples/app-demo && cargo test && cargo build --workspace` — green.
-
-### Task 2.9: Stage-2 docs + commit
-
-**Files:**
-
-- Modify: `docs/guide/configuration.md`, `kv.md`, `handlers.md`, `adapters/cloudflare.md`, `adapters/overview.md`, `architecture.md`, `docs/.vitepress/config.mts`
-
-- [ ] **Step 1:** Update each page per §6.12 — new `[stores]` schema + capability rules + the removal of `[stores.config.defaults]` (`configuration.md`); multi-store + bound handles + extractor `default()/named()` (`kv.md`, `handlers.md`); `[vars]`→KV config (`adapters/cloudflare.md`); Spin store semantics (`adapters/overview.md`); light review (`architecture.md`). Add `manifest-store-migration.md` to the sidebar in `config.mts`.
-
-- [ ] **Step 2: Run** the full gate (all of `.github/workflows/test.yml` + `format.yml` commands, including the docs ESLint/Prettier and the wasm gates) — green.
-
-- [ ] **Step 3: Commit:** `git commit -m "Manifest + runtime rewrite: multi-store schema, async ConfigStore, all four adapters"`
+- [ ] Run the full gate (all five CI gates + per-adapter wasm contract
+      tests + `examples/app-demo` + the `generated_project_builds`
+      opt-in test).
+- [ ] Verify an adapter binary builds and runs with no `edgezero.toml`
+      and zero env vars (defaults).
+- [ ] Commit.
 
 ---
 
