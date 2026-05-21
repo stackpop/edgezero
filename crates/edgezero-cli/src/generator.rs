@@ -211,6 +211,8 @@ fn resolve_cli_dependency(
     cwd: &Path,
     workspace_dependencies: &mut BTreeMap<String, String>,
 ) -> String {
+    const CLI_GIT_FALLBACK: &str = "edgezero-cli = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-cli\" }";
+
     let ResolvedDependency {
         name,
         workspace_line,
@@ -219,9 +221,15 @@ fn resolve_cli_dependency(
         &layout.out_dir,
         cwd,
         "crates/edgezero-cli",
-        "edgezero-cli = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-cli\" }",
+        CLI_GIT_FALLBACK,
         &[],
     );
+
+    if workspace_line == CLI_GIT_FALLBACK {
+        log::warn!(
+            "[edgezero] the generated CLI crate depends on `edgezero-cli` via a Git fallback; it will not build until `edgezero-cli` is available as a library on the referenced remote. Run `edgezero new` from inside an edgezero checkout to use a path dependency instead."
+        );
+    }
 
     workspace_dependencies.entry(name).or_insert(workspace_line);
     crate_line
@@ -840,7 +848,6 @@ mod tests {
         let args = NewArgs {
             name: "demo-app".into(),
             dir: Some(temp.path().to_string_lossy().into_owned()),
-            local_core: false,
         };
 
         generate_new(&args).expect("scaffold succeeds");

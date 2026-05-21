@@ -43,12 +43,16 @@ my-app/
 ├── edgezero.toml
 ├── crates/
 │   ├── my-app-core/
+│   ├── my-app-cli/
 │   ├── my-app-adapter-fastly/
 │   ├── my-app-adapter-cloudflare/
-│   └── my-app-adapter-axum/
+│   ├── my-app-adapter-axum/
+│   └── my-app-adapter-spin/
 ```
 
-The scaffolder includes all adapters registered at CLI build time.
+The scaffolder includes all adapters registered at CLI build time, plus a
+`my-app-cli` crate — your project's own CLI binary built on the `edgezero-cli`
+library.
 
 ### edgezero demo
 
@@ -224,11 +228,11 @@ Install the provider CLI:
 
 ## Building Your Own CLI
 
-`edgezero-cli` is published as a library as well as a binary. Every built-in
+`edgezero-cli` is published as a library as well as a binary. Every downstream
 command is exposed as a `(*Args, run_*)` pair (`BuildArgs` / `run_build`,
-`DeployArgs` / `run_deploy`, `NewArgs` / `run_new`, `ServeArgs` / `run_serve`,
-`run_demo`), so a downstream project can build its own CLI binary that reuses
-any subset of the built-ins and adds its own subcommands:
+`DeployArgs` / `run_deploy`, `NewArgs` / `run_new`, `ServeArgs` / `run_serve`),
+so a downstream project can build its own CLI binary that reuses any subset of
+the built-ins and adds its own subcommands:
 
 ```rust
 use clap::{Parser, Subcommand};

@@ -8,6 +8,10 @@ description = "EdgeZero CLI: build and deploy to multiple edge adapters"
 [lints]
 workspace = true
 
+[[bin]]
+name = "edgezero"
+path = "src/main.rs"
+
 [dependencies]
 edgezero-core = { workspace = true }
 edgezero-adapter = { path = "../edgezero-adapter" }

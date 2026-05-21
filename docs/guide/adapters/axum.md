@@ -42,10 +42,10 @@ fn main() {
 
 ## Development Server
 
-The `edgezero dev` command uses the Axum adapter:
+Run your project locally on the Axum adapter:
 
 ```bash
-edgezero dev
+edgezero serve --adapter axum
 ```
 
 This starts a server at `http://127.0.0.1:8787` with standard logging to stdout.
@@ -183,7 +183,7 @@ The runtime currently binds to `127.0.0.1:8787` regardless of the `axum.toml` po
 
 A typical development workflow:
 
-1. **Start dev server**: `edgezero dev`
+1. **Run locally**: `edgezero serve --adapter axum`
 2. **Make changes** to handlers in `my-app-core`
 3. **Test locally** with curl or browser
 4. **Run tests**: `cargo test`

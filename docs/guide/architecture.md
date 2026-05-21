@@ -77,9 +77,8 @@ Adapters translate between provider-specific types and the portable core model:
 `edgezero-cli` provides the `edgezero` binary:
 
 - **`edgezero new`** - Scaffolds a new project with templates
-- **`edgezero dev`** - Runs the local Axum dev server
 - **`edgezero build`** - Builds for a specific adapter target
-- **`edgezero serve`** - Runs provider-specific local servers (Viceroy, wrangler dev)
+- **`edgezero serve`** - Runs a local server for an adapter (`--adapter axum` for the native server, Viceroy for Fastly, `wrangler dev` for Cloudflare)
 - **`edgezero deploy`** - Deploys to production
 
 ## Data Flow
