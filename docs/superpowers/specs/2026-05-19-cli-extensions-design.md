@@ -380,61 +380,78 @@ tree from `[config]`, same rules, no `Validate`, no secret skipping.
 **Unknown fields:** serde ignores them unless `C` has
 `#[serde(deny_unknown_fields)]`. The generator template emits it.
 
-### 6.6 Multi-store manifest schema + capability rules
+### 6.6 Manifest schema, environment config, and capability rules
 
-The `[stores]` and `[adapters.*]` schema is **rewritten outright**.
-There is no legacy shape. Legacy fields (`[stores.<kind>] name`, legacy
-`[stores.<kind>.adapters.*]` overrides, `[stores.config.defaults]`)
-are removed; a manifest still using them is a **hard load error**
-pointing at `docs/guide/manifest-store-migration.md`.
+`edgezero.toml` is **portable, non-adapter-specific, and never compiled
+into the binary**. It declares what the app _is_ — not how any platform
+runs it. Adapter-specific runtime config is supplied at runtime through
+`EDGEZERO__*` environment variables. There is no legacy shape; a
+manifest using the pre-rewrite `[stores.<kind>] name` /
+`[stores.config.defaults]` / `[adapters.*.stores.*]` fields is a **hard
+load error** pointing at `docs/guide/manifest-store-migration.md`.
 
-**App-level declaration:**
+**`edgezero.toml` — portable schema:**
 
 ```toml
+[app]
+name = "my-app"
+
+[[triggers.http]]
+id      = "root"
+path    = "/"
+methods = ["GET"]
+handler = "my_app_core::handlers::root"
+
+[environment]
+# portable env-var / secret declarations
+
 [stores.kv]
 ids     = ["sessions", "cache"]
-default = "sessions"      # REQUIRED when ids.len() > 1
+default = "sessions"          # REQUIRED when ids.len() > 1
 
 [stores.config]
-ids     = ["app_config"]  # default optional: single id
+ids     = ["app_config"]      # default optional when exactly one id
 
 [stores.secrets]
 ids     = ["default"]
 ```
 
-**Per-adapter mapping + tuning:**
+`[stores.<kind>]` declares **logical store ids only** — the portable
+fact that "this app uses a KV store called `sessions`". No platform
+names, no per-adapter tuning, and **no `[adapters.*]` table**.
 
-```toml
-[adapters.cloudflare.stores.kv.sessions]
-name = "SESSIONS_KV"
+| Field                     | Role                                                                          |
+| ------------------------- | ----------------------------------------------------------------------------- |
+| `[stores.<kind>].ids`     | logical ids (`Vec<String>`, non-empty)                                        |
+| `[stores.<kind>].default` | resolved default; **required when `ids.len() > 1`**, else resolves to `ids[0]` |
 
-[adapters.fastly.stores.kv.sessions]
-name      = "sessions_kv"
-max_value = "1MB"          # adapter-specific tuning, free-form
+The `app!` macro consumes `edgezero.toml` at **compile time** and
+codegens routing plus the logical store registry into the `App` /
+`Hooks` type. The manifest text is **not** embedded — `include_str!` is
+gone; only the derived code is. The manifest and the `app!` macro are
+optional: a project may build `App` programmatically, so a downstream
+binary compiles with no `edgezero.toml` present.
 
-[adapters.spin.stores.kv.sessions]
-name = "sessions"          # Spin KV store label
+**Adapter-specific config — `EDGEZERO__*` environment variables.**
+Platform store names, store tuning, bind host/port, and logging are
+resolved at **runtime** from environment variables. `__` (double
+underscore) separates key-path segments:
 
-[adapters.cloudflare.stores.config.app_config]
-name = "APP_CONFIG_KV"
+| Variable                                | Role                                      | Default         |
+| --------------------------------------- | ----------------------------------------- | --------------- |
+| `EDGEZERO__STORES__<KIND>__<ID>__NAME`  | platform name for logical store `<id>`    | the logical id  |
+| `EDGEZERO__STORES__<KIND>__<ID>__<KEY>` | free-form adapter tuning for store `<id>` | —               |
+| `EDGEZERO__ADAPTER__HOST`               | bind host (axum)                          | `127.0.0.1`     |
+| `EDGEZERO__ADAPTER__PORT`               | bind port (axum)                          | `8787`          |
+| `EDGEZERO__LOGGING__LEVEL`              | log level                                 | adapter default |
 
-# NOTE: there is deliberately no [adapters.spin.stores.config.*] block.
-# Spin config is Single-capability (flat variables) — a per-id mapping
-# block for a Single (adapter, kind) pair is a validation error (§6.6).
-```
+`<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-cased
+logical id. Absent variables fall back to the listed defaults — an
+adapter binary runs with **zero env vars set**, using each logical id
+as its own platform name.
 
-**Field reference:**
-
-| Field                                    | Where       | Role                                                                                                                       |
-| ---------------------------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `[stores.<kind>].ids`                    | top level   | logical ids (`Vec<String>`, non-empty)                                                                                     |
-| `[stores.<kind>].default`                | top level   | resolved default; **required when `ids.len() > 1`**, optional (resolves to `ids[0]`) when exactly one id; must be in `ids` |
-| `[adapters.<X>.stores.<kind>.<id>].name` | per-adapter | platform name (see capability rules for whether required)                                                                  |
-| other fields in that block               | per-adapter | free-form `BTreeMap<String, toml::Value>` tuning                                                                           |
-
-**Adapter × kind capability matrix.** A single flat
-`STORES_SUPPORTED_ADAPTERS` list is too coarse. Each (adapter, kind)
-pair has a capability:
+**Adapter × kind capability matrix.** Each (adapter, kind) pair has a
+capability:
 
 | Adapter    | KV               | Config                  | Secrets                 |
 | ---------- | ---------------- | ----------------------- | ----------------------- |
@@ -443,36 +460,23 @@ pair has a capability:
 | fastly     | Multi (KV store) | Multi (config store)    | Multi (secret store)    |
 | spin       | Multi (KV label) | Single (flat variables) | Single (flat variables) |
 
-- **Multi**: the adapter supports multiple named stores of that kind.
-  A per-id `[adapters.<X>.stores.<kind>.<id>]` block with a `name` is
-  **required** for every id.
-- **Single**: the adapter has exactly one flat store of that kind.
-  A per-id `[adapters.<X>.stores.<kind>.<id>]` block is **forbidden** —
-  there is nothing to configure per id, and a vestigial no-op block is
-  misleading. Its presence is a validation error.
+- **Multi**: the adapter supports multiple named stores of that kind;
+  each logical id resolves to its own platform store via
+  `EDGEZERO__STORES__<KIND>__<ID>__NAME` (or the id default).
+- **Single**: the adapter has exactly one flat store of that kind;
+  every logical id maps to that one store, and per-id `NAME` variables
+  are ignored.
 
-**Validation rules (in `ManifestLoader`):**
-
-- `[stores.<kind>].ids` non-empty when present.
-- `default` present iff `ids.len() > 1`; when present, must be in `ids`.
-- **Capability check:** for each declared kind, compute the minimum
-  capability across the adapters declared in `[adapters.*]`. If any
-  declared adapter is `Single` for that kind, `[stores.<kind>].ids`
-  **must have exactly one id** — you cannot declare two config stores
-  in a project that also targets Spin, because Spin config is a single
-  flat namespace. The error names the offending adapter and kind.
-- For each (adapter, kind) that is `Multi`, every id must have a
-  `[adapters.<X>.stores.<kind>.<id>]` block with a `name`. For
-  `Single` (adapter, kind) pairs, **any such block is a validation
-  error** — the runtime ignores per-id naming there.
-- `name` under `[adapters.cloudflare.stores.*]` must be a JavaScript
-  identifier; `name` under `[adapters.spin.stores.kv.*]` must be a
-  valid Spin KV label. Invalid names are errors.
+**Capability validation** — declaring two config ids while targeting an
+adapter that is `Single` for config (Spin) — is performed by `config
+validate` (§10) and `provision` (§12). It is no longer expressible as
+an in-manifest error: the manifest carries no per-adapter blocks.
 
 **Runtime resolution:** each adapter builds a
 `StoreRegistry<H> { by_id: BTreeMap<String, H>, default_id: String }`
-at request setup. For `Single` (adapter, kind) pairs the registry has
-one entry mapped to the adapter's single flat store.
+at request setup, keyed by logical id, platform names resolved from
+`EDGEZERO__STORES__*` (or the id default). For `Single` (adapter, kind)
+pairs every id maps to the one flat store.
 
 ### 6.7 Spin store semantics
 
@@ -766,15 +770,27 @@ throwaway-app && cargo check --workspace` succeeds.
 
 ## 8. Sub-project 2 — Manifest + runtime rewrite (atomic, all four adapters)
 
-**Goal:** the big atomic sub-project. Manifest schema and runtime store
-API are coupled; with a hard cutoff they ship together as one stage
-(stage 2 of the eight-stage PR).
+**Goal:** the big atomic sub-project. The manifest becomes portable and
+non-adapter-specific (§6.6), adapter config moves to `EDGEZERO__*`
+environment variables, and the runtime store API is rewritten. With a
+hard cutoff these ship together as one stage (stage 2 of the
+eight-stage PR).
 
 **Scope:**
 
-- **Manifest:** rewrite `ManifestStores` / `ManifestAdapter` to the
-  §6.6 schema outright. Legacy fields are removed; using them is a hard
-  load error. Validation includes the §6.6 capability matrix.
+- **Manifest → portable schema:** rewrite `ManifestStores` to the §6.6
+  portable schema — `[stores.<kind>]` carries only logical `ids` /
+  `default`. The `[adapters.*]` store/runtime tables are removed.
+  Legacy fields are a hard load error.
+- **`EDGEZERO__*` env-config layer:** a new `edgezero-core` module
+  parses `EDGEZERO__`-prefixed environment variables (`__` nesting)
+  into adapter runtime config — store platform names + tuning, bind
+  host/port, logging. Absent variables fall back to defaults (§6.6).
+- **No compiled-in manifest:** `run_app` drops its `manifest_src`
+  parameter on all four adapters. The `app!` macro bakes the portable
+  config (routes + logical store registry) into the `App` / `Hooks`
+  type; `run_app::<A>()` reads it from `A` and layers `EDGEZERO__*` env
+  config on top. `include_str!("edgezero.toml")` is removed everywhere.
 - **`ConfigStore` async:** `get` becomes `async`
   (`#[async_trait(?Send)]`).
 - **New `KvError` variants:** add `KvError::Unsupported` (Spin TTL
@@ -784,51 +800,46 @@ API are coupled; with a hard cutoff they ship together as one stage
   `BoundSecretStore`; `RequestContext` accessors id-keyed, with
   `_default()` helpers.
 - **Static metadata:** `Hooks` / `ConfigStoreMetadata` rewritten to
-  id-keyed metadata; `app!` macro emits them from the new schema.
-- **Adapter store rewrites — ALL FOUR adapters:**
-  - **axum:** in-memory KV registry; config from
+  id-keyed metadata; `app!` macro emits them from the portable schema.
+- **Adapter store rewrites — ALL FOUR adapters:** each builds a
+  `StoreRegistry` keyed by logical id, platform names resolved from
+  `EDGEZERO__STORES__*` (or the id default):
+  - **axum:** local KV registry; config from
     `.edgezero/local-config-<id>.json` (§15); secrets from env vars.
   - **cloudflare:** KV registry; **config rewritten `[vars]` → KV**
-    (§6.x) with async reads; secrets from worker secrets.
+    with async reads; secrets from worker secrets.
   - **fastly:** KV / config / secret store registries.
   - **spin:** wire `SpinKvStore` (label registry, `max_list_keys`
     respected), `SpinConfigStore` (single flat-variable store, `.`→`__`
-    key translation), `SpinSecretStore` (single flat-variable store,
-    `store_name` ignored) into the multi-store registry; stop relying
-    on hardcoded default labels — labels come from
-    `[adapters.spin.stores.kv.*].name`.
+    key translation), `SpinSecretStore` (single flat-variable store)
+    into the registry; KV labels come from
+    `EDGEZERO__STORES__KV__<ID>__NAME`, not hardcoded defaults.
 - **Extractors:** `Kv` / `Secrets` refactored to `default()` /
   `named()`; `Config` extractor added.
 - **`[stores.config.defaults]` removed** (hard error). Replaced by the
-  axum config-store file flow (§15). The axum dev-server seeding at
-  [dev_server.rs:349](crates/edgezero-adapter-axum/src/dev_server.rs#L349)
+  axum config-store file flow (§15). The axum dev-server config seeding
   is removed.
 - **Migrate in-tree:** `examples/app-demo/edgezero.toml` rewritten to
-  the new schema with all four adapters declaring stores
-  (≥2 KV ids `sessions`+`cache`; exactly one config id and one
-  secrets id, as the Spin capability rule requires). `app-demo`
-  handlers are migrated **only for the store-accessor change** in
-  stage 2 — `ctx.kv_store(id)` / `config_store` / the refactored
-  `Kv` / `Secrets` / `Config` extractors. Stage 2 does **not**
-  introduce `AppDemoConfig` or any typed-app-config handler work:
-  that type is created in stage 3 (§9), and `examples/app-demo/
-app-demo.toml` does not exist yet. This keeps stage 2
-  independently buildable — no stage-2 code references a type that
-  lands in stage 3.
+  the portable schema (≥2 KV ids `sessions`+`cache`; one config id;
+  one secrets id). The app-demo adapter crates' `EDGEZERO__*` env
+  config lives in their run configuration. `app-demo` handlers are
+  migrated **only for the store-accessor change** — `ctx.kv_store(id)`
+  / `config_store` / the refactored `Kv` / `Secrets` / `Config`
+  extractors. Stage 2 does **not** introduce `AppDemoConfig` or any
+  typed-app-config handler work: that lands in stage 3 (§9). This keeps
+  stage 2 independently buildable.
 - **`docs/guide/manifest-store-migration.md`** published.
 
 **Tests:** manifest round-trip + validation (non-empty ids; default
-required when `ids.len() > 1`; capability check — declaring two config
-ids with spin present → error; per-adapter completeness for `Multi`
-pairs; a per-id block on a `Single` (adapter, kind) pair → error;
-Cloudflare JS-identifier + Spin KV-label checks; pre-rewrite manifest →
-hard error with migration message); id-keyed contract-test factories
-across all four adapters; cross-adapter named-KV test; Cloudflare
-config-from-KV async round-trip; Spin config `.`→`__` translation test;
-**Spin TTL write returns `KvError::Unsupported`** (contract test);
-Spin KV listing-cap pagination test (and its error-variant decision,
-§6.7); `Kv`/`Secrets`/`Config` extractor tests; `app!` macro metadata
-registry test.
+required when `ids.len() > 1`; pre-rewrite manifest → hard error with
+migration message); `EDGEZERO__*` env-layer parsing (nesting, defaults,
+store-name resolution); `run_app` builds and runs with no manifest file
+and zero env vars; id-keyed contract-test factories across all four
+adapters; cross-adapter named-KV test; Cloudflare config-from-KV async
+round-trip; Spin config `.`→`__` translation test; **Spin TTL write
+returns `KvError::Unsupported`** (contract test); Spin KV listing-cap
+pagination test; `Kv`/`Secrets`/`Config` extractor tests; `app!` macro
+metadata registry test.
 
 **Bisectability — config seeding before `config push` exists.** Stage
 2 removes `[stores.config.defaults]` and makes the axum config store
@@ -851,8 +862,9 @@ stage-7 resolve-and-write step. So between stage 2 and stage 7:
 This keeps stage 2 independently buildable and testable.
 
 **Ship gate:** multi-store handlers work on axum, cloudflare, fastly,
-and spin; async config reads work; all four CI gates green (including
-the wasm32 spin gate).
+and spin; async config reads work; an adapter binary builds and runs
+with no `edgezero.toml` and zero env vars (falling back to defaults);
+all five CI gates green (including the wasm32 spin gate).
 
 ## 9. Sub-project 3 — App-config schema, derive macro, env-overlay loader
 
