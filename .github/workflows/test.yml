@@ -55,6 +55,9 @@ jobs:
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
+      - name: Verify a generated project compiles
+        run: cargo test -p edgezero-cli --test generated_project_builds -- --ignored
+
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests
     runs-on: ubuntu-latest
