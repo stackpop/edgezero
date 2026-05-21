@@ -4,7 +4,7 @@
 
 **Goal:** Turn `edgezero-cli` into an extensible library, rewrite the manifest store schema and runtime to a multi-store model, add `auth` / `provision` / `config validate` / `config push` commands, and update `app-demo` to exercise it all across axum / cloudflare / fastly / spin.
 
-**Architecture:** One PR, eight sequential commits. Commit 1 extracts the CLI library substrate. Commit 2 is an atomic manifest + runtime rewrite (hard cutoff — no backward compatibility). Commits 3–7 add app-config and the four commands. Commit 8 makes `app-demo` the full-capability showcase and audits docs.
+**Architecture:** One PR, eight sequential stages. Stage 1 extracts the CLI library substrate. Stage 2 is an atomic manifest + runtime rewrite (hard cutoff — no backward compatibility). Stages 3–7 add app-config and the four commands. Stage 8 makes `app-demo` the full-capability showcase and audits docs.
 
 **Tech Stack:** Rust 1.95 (edition 2021), `clap` (derive), `serde` / `toml` / `serde_json`, `validator`, `async-trait` (`?Send`, WASM-safe), `handlebars` (templates), proc-macros (`edgezero-macros`), VitePress docs.
 
@@ -12,18 +12,18 @@
 
 ---
 
-## Preconditions (do before commit 2)
+## Preconditions (do before stage 2)
 
-- [ ] **PR #253 (`feat/spin-store-support`) is merged into the working branch.** The current branch has **no** Spin store support — `crates/edgezero-adapter-spin/src/` has no `config_store.rs` / `key_value_store.rs` / `secret_store.rs`, and `lib.rs` explicitly rejects `[stores.*]` for spin. Commit 2 wires `SpinKvStore` / `SpinConfigStore` / `SpinSecretStore` into the multi-store runtime; they must exist first. Commit 1 does **not** need PR #253. Verify with: `ls crates/edgezero-adapter-spin/src/` shows the three store files before starting commit 2.
+- [ ] **PR #253 (`feat/spin-store-support`) is merged into the working branch.** The current branch has **no** Spin store support — `crates/edgezero-adapter-spin/src/` has no `config_store.rs` / `key_value_store.rs` / `secret_store.rs`, and `lib.rs` explicitly rejects `[stores.*]` for spin. Stage 2 wires `SpinKvStore` / `SpinConfigStore` / `SpinSecretStore` into the multi-store runtime; they must exist first. Stage 1 does **not** need PR #253. Verify with: `ls crates/edgezero-adapter-spin/src/` shows the three store files before starting stage 2.
 - [ ] Working on branch `feature/extensible-cli` (stacked on `chore/strict-clippy` / PR #257). The spec and plan live in `docs/superpowers/`, which is gitignored — keep using `git add -f` for spec/plan files only.
 
 ## Status
 
-- **Commit 1 — DONE.** Landed as `1d582dd` (extensible `edgezero-cli`
+- **Stage 1 — DONE.** Landed as `1d582dd` (extensible `edgezero-cli`
   library + generator + `app-demo-cli`) plus follow-up `06f4b72`
   (`demo` is example-only; `serve --adapter axum` runs the axum
   adapter). §7 below is kept for reference — do **not** re-do it.
-- **Commits 2–8 — pending.** Commit 2 is gated on PR #253.
+- **Stages 2–8 — pending.** Stage 2 is gated on PR #253.
 
 ## Codebase facts this plan relies on
 
@@ -54,59 +54,59 @@ cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
 Plus, where the task touches adapter runtime or `app-demo`: the
 per-adapter wasm `--test contract` runs (commands in Task 2.7 step 6),
 `cd examples/app-demo && cargo test`, and — for doc changes — the docs
-ESLint/Prettier job. Each commit's final task runs the full gate before
+ESLint/Prettier job. Each stage's final task runs the full gate before
 its `git commit`.
 
-## File structure (created / modified across the 8 commits)
+## File structure (created / modified across the 8 stages)
 
 ```
 crates/edgezero-cli/
   Cargo.toml                    # M: lib target implicit via src/lib.rs; new deps
-  src/lib.rs                    # C (commit 1): public API
-  src/main.rs                   # M (commit 1): thin wrapper; M (4-7): dispatch arms for new commands
+  src/lib.rs                    # C (stage 1): public API
+  src/main.rs                   # M (stage 1): thin wrapper; M (4-7): dispatch arms for new commands
   src/args.rs                   # M: standalone *Args structs; M (4-7): new *Args + Command enum variants
-  src/demo_server.rs            # M (commit 1): renamed from dev_server.rs
-  src/runner.rs                 # C (commit 5): CommandSpec + CommandRunner
-  src/auth.rs                   # C (commit 5)
-  src/provision.rs              # C (commit 6)
-  src/config.rs                 # C (commit 7): validate + push
-  src/generator.rs              # M (commits 1, 3): scaffold <name>-cli, <name>.toml
-  src/templates/cli/            # C (commit 1); M (commit 8): full command set
-  src/templates/app/            # C (commit 3)
-  src/templates/root/edgezero.toml.hbs   # M (commit 2): new store schema
-  src/templates/core/src/config.rs.hbs   # C (commit 3)
-  tests/lib_consumer.rs         # C (commit 1)
+  src/demo_server.rs            # M (stage 1): renamed from dev_server.rs
+  src/runner.rs                 # C (stage 5): CommandSpec + CommandRunner
+  src/auth.rs                   # C (stage 5)
+  src/provision.rs              # C (stage 6)
+  src/config.rs                 # C (stage 7): validate + push
+  src/generator.rs              # M (stages 1, 3): scaffold <name>-cli, <name>.toml
+  src/templates/cli/            # C (stage 1); M (stage 8): full command set
+  src/templates/app/            # C (stage 3)
+  src/templates/root/edgezero.toml.hbs   # M (stage 2): new store schema
+  src/templates/core/src/config.rs.hbs   # C (stage 3)
+  tests/lib_consumer.rs         # C (stage 1)
 crates/edgezero-core/src/
-  manifest.rs                   # M (commit 2): store schema rewrite + capability rules
-  config_store.rs               # M (commit 2): async trait
-  key_value_store.rs            # M (commit 2): KvError::Unsupported + LimitExceeded
-  secret_store.rs               # M (commit 2): bound-handle wrapper
-  context.rs                    # M (commit 2): id-keyed Bound*Store accessors
-  extractor.rs                  # M (commit 2): Kv/Secrets/Config default()/named()
-  app.rs                        # M (commit 2): Hooks + id-keyed ConfigStoreMetadata (Hooks lives in app.rs, no separate hooks.rs)
-  app_config.rs                 # C (commit 3)
+  manifest.rs                   # M (stage 2): store schema rewrite + capability rules
+  config_store.rs               # M (stage 2): async trait
+  key_value_store.rs            # M (stage 2): KvError::Unsupported + LimitExceeded
+  secret_store.rs               # M (stage 2): bound-handle wrapper
+  context.rs                    # M (stage 2): id-keyed Bound*Store accessors
+  extractor.rs                  # M (stage 2): Kv/Secrets/Config default()/named()
+  app.rs                        # M (stage 2): Hooks + id-keyed ConfigStoreMetadata (Hooks lives in app.rs, no separate hooks.rs)
+  app_config.rs                 # C (stage 3)
 crates/edgezero-macros/src/
-  lib.rs                        # M (commit 3): AppConfig derive export
-  app_config.rs                 # C (commit 3): derive impl
-  app.rs                        # M (commit 2): emit id-keyed metadata
+  lib.rs                        # M (stage 3): AppConfig derive export
+  app_config.rs                 # C (stage 3): derive impl
+  app.rs                        # M (stage 2): emit id-keyed metadata
 crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/
-  {config_store,key_value_store,secret_store}.rs   # M (commit 2): multi-store registries
+  {config_store,key_value_store,secret_store}.rs   # M (stage 2): multi-store registries
 examples/app-demo/
-  Cargo.toml                    # M (commit 1): add app-demo-cli member
-  edgezero.toml                 # M (commit 2): new schema
-  app-demo.toml                 # C (commit 3)
-  crates/app-demo-cli/          # C (commit 1, extended 4-8)
-  crates/app-demo-core/src/config.rs       # C (commit 3)
-  crates/app-demo-core/src/handlers.rs     # M (commits 2, 8)
+  Cargo.toml                    # M (stage 1): add app-demo-cli member
+  edgezero.toml                 # M (stage 2): new schema
+  app-demo.toml                 # C (stage 3)
+  crates/app-demo-cli/          # C (stage 1, extended 4-8)
+  crates/app-demo-core/src/config.rs       # C (stage 3)
+  crates/app-demo-core/src/handlers.rs     # M (stages 2, 8)
 docs/guide/                     # M: many pages per §6.12
-docs/guide/manifest-store-migration.md   # C (commit 2)
-docs/guide/cli-walkthrough.md            # C (commit 8)
-docs/.vitepress/config.mts      # M (commits 2, 8): sidebar
+docs/guide/manifest-store-migration.md   # C (stage 2)
+docs/guide/cli-walkthrough.md            # C (stage 8)
+docs/.vitepress/config.mts      # M (stages 2, 8): sidebar
 ```
 
 ---
 
-# Commit 1 — Extensible `edgezero-cli` library + generator + `app-demo-cli` skeleton ✅ DONE (`1d582dd`, `06f4b72`)
+# Stage 1 — Extensible `edgezero-cli` library + generator + `app-demo-cli` skeleton ✅ DONE (`1d582dd`, `06f4b72`)
 
 Spec §7. No PR #253 dependency. Goal: `edgezero-cli` becomes lib + bin; the `demo` subcommand replaces `dev`; the generator scaffolds `<name>-cli`; a handwritten `app-demo-cli` exists.
 
@@ -133,7 +133,7 @@ fn build_args_default_and_mutate() {
 
 - [ ] **Step 4: Run** `cargo test -p edgezero-cli args::` — expect PASS. Update the existing `parses_build_command_with_passthrough_args` test to destructure `Command::Build(BuildArgs { adapter, adapter_args })`.
 
-- [ ] **Step 5: Commit** is deferred — commit 1 lands as one commit after Task 1.7. Stage progress only.
+- [ ] **Step 5: Commit** is deferred — stage 1 lands as one commit after Task 1.7. Stage progress only.
 
 ### Task 1.2: Create `lib.rs`, move handlers, rewrite `main.rs`
 
@@ -226,7 +226,7 @@ Expected: `cargo check --workspace` in the generated project succeeds.
 
 - [ ] **Step 2: Run** `cargo test -p edgezero-cli --test lib_consumer` — expect PASS. This proves the public API is usable from outside the crate.
 
-### Task 1.7: Commit-1 documentation + commit
+### Task 1.7: Stage-1 documentation + commit
 
 **Files:**
 
@@ -245,9 +245,9 @@ git commit -m "Extensible edgezero-cli library + generator + app-demo-cli; renam
 
 ---
 
-# Commit 2 — Manifest + runtime rewrite (atomic, all four adapters)
+# Stage 2 — Manifest + runtime rewrite (atomic, all four adapters)
 
-Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit and the review hotspot. Hard cutoff — legacy store schema is removed outright.
+Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest stage and the review hotspot. Hard cutoff — legacy store schema is removed outright.
 
 ### Task 2.1: Rewrite the manifest store schema
 
@@ -338,7 +338,7 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 
 - Modify: `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/{config_store,key_value_store,secret_store}.rs` and each adapter's request-setup code.
 
-- [ ] **Step 1: axum.** Build `StoreRegistry` for each kind from `[adapters.axum.stores.*]`. KV stays `PersistentKvStore` (redb) — **one separate redb file per logical id**, file stem from the per-adapter mapping `[adapters.axum.stores.kv.<id>].name`: `.edgezero/kv-<name>.redb`. (Axum KV is `Multi`, so every id has a `name`.) Distinct files prevent multi-store collapsing into one backing file. Config store reads `.edgezero/local-config-<id>.json` (the file commit 7 writes); absent ⇒ empty. Secrets from env vars (Single).
+- [ ] **Step 1: axum.** Build `StoreRegistry` for each kind from `[adapters.axum.stores.*]`. KV stays `PersistentKvStore` (redb) — **one separate redb file per logical id**, file stem from the per-adapter mapping `[adapters.axum.stores.kv.<id>].name`: `.edgezero/kv-<name>.redb`. (Axum KV is `Multi`, so every id has a `name`.) Distinct files prevent multi-store collapsing into one backing file. Config store reads `.edgezero/local-config-<id>.json` (the file stage 7 writes); absent ⇒ empty. Secrets from env vars (Single).
 
 - [ ] **Step 2: cloudflare.** KV registry. **Config rewritten from `[vars]` to KV** (§6.9) — `CloudflareConfigStore` does an async `env.<NAMESPACE>.get(key)`; one namespace per config id. Secrets from worker secrets (Single).
 
@@ -373,7 +373,7 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 
 - [ ] **Step 1:** Rewrite `examples/app-demo/edgezero.toml` to the new schema: `[stores.kv] ids = ["sessions","cache"]\ndefault = "sessions"`; one config id (`app_config`); one secrets id (`default`); per-adapter `[adapters.<X>.stores.kv.<id>]` blocks for axum/cloudflare/fastly/spin; no Spin per-id blocks for config/secrets (Single). Remove `[stores.config.defaults]`.
 
-- [ ] **Step 2:** Migrate `app-demo` handlers to id-keyed accessors — **store-accessor change only** (`ctx.kv_store("sessions")`, `ctx.config_store_default()`, the refactored `Kv`/`Secrets`/`Config` extractors). Do **not** introduce `AppDemoConfig` here (commit 3).
+- [ ] **Step 2:** Migrate `app-demo` handlers to id-keyed accessors — **store-accessor change only** (`ctx.kv_store("sessions")`, `ctx.config_store_default()`, the refactored `Kv`/`Secrets`/`Config` extractors). Do **not** introduce `AppDemoConfig` here (stage 3).
 
 - [ ] **Step 3:** Rewrite `templates/root/edgezero.toml.hbs` to the new schema so `edgezero new` produces a valid manifest.
 
@@ -381,7 +381,7 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 
 - [ ] **Step 5: Run** `cd examples/app-demo && cargo test && cargo build --workspace` — green.
 
-### Task 2.9: Commit-2 docs + commit
+### Task 2.9: Stage-2 docs + commit
 
 **Files:**
 
@@ -395,7 +395,7 @@ Spec §8, §6.6, §6.7, §6.9. **Requires PR #253.** This is the largest commit 
 
 ---
 
-# Commit 3 — App-config schema, derive macro, env-overlay loader
+# Stage 3 — App-config schema, derive macro, env-overlay loader
 
 Spec §9, §6.7, §6.8, §6.10.
 
@@ -469,7 +469,7 @@ Task 3.4 / 3.5.)
 - Create: `crates/edgezero-cli/src/templates/app/<name>.toml.hbs`, `crates/edgezero-cli/src/templates/core/src/config.rs.hbs`
 - Modify: `crates/edgezero-cli/src/templates/core/Cargo.toml.hbs`, `crates/edgezero-cli/src/generator.rs`, `scaffold.rs`
 
-- [ ] **Step 1: Add a `NameUpperCamel` key to the generator Handlebars context.** The config templates name the struct `{{NameUpperCamel}}Config` (e.g. `my-app` → `MyAppConfig`), and the CLI template in commit 8 reuses the same key. The generator's Handlebars data today exposes only `name`, `proj_core`, `proj_core_mod`, `proj_mod` (`generator.rs`).
+- [ ] **Step 1: Add a `NameUpperCamel` key to the generator Handlebars context.** The config templates name the struct `{{NameUpperCamel}}Config` (e.g. `my-app` → `MyAppConfig`), and the CLI template in stage 8 reuses the same key. The generator's Handlebars data today exposes only `name`, `proj_core`, `proj_core_mod`, `proj_mod` (`generator.rs`).
 
   Derivation — **must yield a valid Rust type identifier** (the result is used as `{{NameUpperCamel}}Config`, a `struct` name):
   1. Start from the **sanitized** crate name (reuse `sanitize_crate_name` from `scaffold.rs`, so it stays consistent with the crate name).
@@ -477,7 +477,7 @@ Task 3.4 / 3.5.)
   3. Upper-case the first character of each segment, lower-case the rest; join.
   4. **If the result is empty, or its first character is not an ASCII letter** (e.g. the project name started with a digit, giving something like `123App`), prefix it with `App`. A Rust type name cannot begin with a digit.
 
-  Insert the result under the context key `NameUpperCamel`. Add a unit test covering: `my-app` → `MyApp`; `foo` → `Foo`; `a_b-c` → `ABC`; `_foo` → `Foo` (empty leading segment dropped); `123-app` → `App123App` (digit-leading → `App` prefix). This key lands here in commit 3 because `config.rs.hbs` is its first consumer; commit 8's `templates/cli/` reuses it.
+  Insert the result under the context key `NameUpperCamel`. Add a unit test covering: `my-app` → `MyApp`; `foo` → `Foo`; `a_b-c` → `ABC`; `_foo` → `Foo` (empty leading segment dropped); `123-app` → `App123App` (digit-leading → `App` prefix). This key lands here in stage 3 because `config.rs.hbs` is its first consumer; stage 8's `templates/cli/` reuses it.
 
 - [ ] **Step 2:** `app/<name>.toml.hbs` — a `[config]` table with `greeting` and a nested `[config.service]` section. `core/src/config.rs.hbs` — `{{NameUpperCamel}}Config` with `#[derive(serde::Deserialize, serde::Serialize, validator::Validate, edgezero_core::AppConfig)]` + `#[serde(deny_unknown_fields)]`, a `greeting` field, a nested `service` field, **one plain `#[secret]` field**, and a commented-out `#[secret(store_ref)]` example (§6.8 — the generated template does not include `store_ref` live).
 
@@ -506,7 +506,7 @@ Task 3.4 / 3.5.)
 
 ---
 
-# Commit 4 — `config validate` command
+# Stage 4 — `config validate` command
 
 Spec §10. New: `ConfigValidateArgs`, `run_config_validate`, `run_config_validate_typed`.
 
@@ -535,7 +535,7 @@ The spec (§1, §8) requires the new subcommands to be available on the
 **default `edgezero` binary**, not only on `app-demo-cli`. The default
 binary has no app-config struct, so it uses the **raw** functions.
 
-- [ ] **Step 1:** Add `Config(ConfigCmd)` to the default `edgezero-cli` `Command` enum in `args.rs` (the same `ConfigCmd` subcommand enum from Task 4.1; `ConfigCmd::Validate(ConfigValidateArgs)` for now, `Push` added in commit 7).
+- [ ] **Step 1:** Add `Config(ConfigCmd)` to the default `edgezero-cli` `Command` enum in `args.rs` (the same `ConfigCmd` subcommand enum from Task 4.1; `ConfigCmd::Validate(ConfigValidateArgs)` for now, `Push` added in stage 7).
 
 - [ ] **Step 2:** Add the dispatch arm in `main.rs`: `Command::Config(ConfigCmd::Validate(a)) => exit_on_err(edgezero_cli::run_config_validate(&a))` — the **raw** validator (the default binary has no `C`).
 
@@ -549,9 +549,9 @@ binary has no app-config struct, so it uses the **raw** functions.
 
 - Modify: `examples/app-demo/crates/app-demo-cli/Cargo.toml`, `examples/app-demo/crates/app-demo-cli/src/main.rs`, `docs/guide/cli-reference.md`
 
-- [ ] **Step 1: Add the `app-demo-core` dependency.** `app-demo-cli` is about to reference `AppDemoConfig`, which lives in `app-demo-core` (created in commit 3, Task 3.5). Its `Cargo.toml` so far has only `edgezero-cli` / `clap` / `log` (Task 1.5). Add `app-demo-core = { path = "../app-demo-core" }` to `app-demo-cli/Cargo.toml` (path dep within the `examples/app-demo` workspace).
+- [ ] **Step 1: Add the `app-demo-core` dependency.** `app-demo-cli` is about to reference `AppDemoConfig`, which lives in `app-demo-core` (created in stage 3, Task 3.5). Its `Cargo.toml` so far has only `edgezero-cli` / `clap` / `log` (Task 1.5). Add `app-demo-core = { path = "../app-demo-core" }` to `app-demo-cli/Cargo.toml` (path dep within the `examples/app-demo` workspace).
 
-- [ ] **Step 2:** Add a `Config(ConfigCmd)` arm to `app-demo-cli`'s `Cmd` enum with `ConfigCmd { Validate(ConfigValidateArgs) }` (push added in commit 7). `use app_demo_core::AppDemoConfig;` and dispatch `Validate` to `edgezero_cli::run_config_validate_typed::<AppDemoConfig>` — the **typed** validator (`app-demo-cli` knows `AppDemoConfig`).
+- [ ] **Step 2:** Add a `Config(ConfigCmd)` arm to `app-demo-cli`'s `Cmd` enum with `ConfigCmd { Validate(ConfigValidateArgs) }` (push added in stage 7). `use app_demo_core::AppDemoConfig;` and dispatch `Validate` to `edgezero_cli::run_config_validate_typed::<AppDemoConfig>` — the **typed** validator (`app-demo-cli` knows `AppDemoConfig`).
 
 - [ ] **Step 3:** Document `config validate` in `cli-reference.md` — note the default `edgezero` binary runs the raw validator, downstream CLIs the typed one.
 
@@ -559,7 +559,7 @@ binary has no app-config struct, so it uses the **raw** functions.
 
 ---
 
-# Commit 5 — `auth` command (+ `CommandRunner`)
+# Stage 5 — `auth` command (+ `CommandRunner`)
 
 Spec §11, §6.1.
 
@@ -599,7 +599,7 @@ Spec §11, §6.1.
 
 ---
 
-# Commit 6 — `provision` command
+# Stage 6 — `provision` command
 
 Spec §12, §13 (Fastly contract).
 
@@ -624,7 +624,7 @@ Spec §12, §13 (Fastly contract).
 
 ---
 
-# Commit 7 — `config push` command
+# Stage 7 — `config push` command
 
 Spec §13, §6.4, §6.5.
 
@@ -660,7 +660,7 @@ Spec §13, §6.4, §6.5.
 
 ---
 
-# Commit 8 — `app-demo` integration polish + docs audit
+# Stage 8 — `app-demo` integration polish + docs audit
 
 Spec §15, §6.12.
 
@@ -687,13 +687,13 @@ Spec §15, §6.12.
 
 - Modify: `crates/edgezero-cli/src/templates/cli/Cargo.toml.hbs`, `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`, `crates/edgezero-cli/src/generator.rs` (tests)
 
-Commit 1 created the `<name>-cli` template with only the five base
+Stage 1 created the `<name>-cli` template with only the five base
 built-ins (`auth` / `provision` / `config` did not exist yet). Now that
-commits 4–7 have landed them, a freshly-scaffolded project must expose
+stages 4–7 have landed them, a freshly-scaffolded project must expose
 the full command surface (spec §1: downstream CLIs reuse the
 post-effort built-ins).
 
-- [ ] **Step 1: Add the core-crate dependency to the CLI template.** The full-command template references the typed config functions with `{{NameUpperCamel}}Config`, which lives in the generated `{{name}}-core` crate. The `templates/cli/Cargo.toml.hbs` from commit 1 depends only on `edgezero-cli` / `clap` / `log` — add `{{name}}-core = { path = "../{{name}}-core" }` (path dep within the generated workspace). Without this the scaffolded CLI will not compile.
+- [ ] **Step 1: Add the core-crate dependency to the CLI template.** The full-command template references the typed config functions with `{{NameUpperCamel}}Config`, which lives in the generated `{{name}}-core` crate. The `templates/cli/Cargo.toml.hbs` from stage 1 depends only on `edgezero-cli` / `clap` / `log` — add `{{name}}-core = { path = "../{{name}}-core" }` (path dep within the generated workspace). Without this the scaffolded CLI will not compile.
 
 - [ ] **Step 2:** Update `templates/cli/src/main.rs.hbs` so the generated `Cmd` enum lists **all eight** built-ins: `Build`, `Deploy`, `Demo`, `New`, `Serve`, `Auth`, `Provision`, `Config(ConfigCmd { Validate, Push })`. Dispatch `build/deploy/demo/new/serve/auth/provision` to the raw `edgezero_cli::run_*`. The `use` statement must reference the core crate's **Rust module name**, not the package name — use `use {{proj_core_mod}}::{{NameUpperCamel}}Config;` (the generator already exposes `proj_core_mod`, the hyphen-to-underscore module form; `{{name}}_core` would render `my-app_core` for `my-app`, which is invalid Rust). Dispatch the `Config` arm to the **typed** `run_config_validate_typed::<{{NameUpperCamel}}Config>` / `run_config_push_typed::<{{NameUpperCamel}}Config>` — a generated project has its own core config struct (from the Task 3.4 `config.rs.hbs` template), so the scaffold wires the typed path, matching how `app-demo-cli` does it.
 
@@ -731,8 +731,8 @@ post-effort built-ins).
 
 ## Self-review notes
 
-- **Spec coverage:** §7→C1, §8/§6.6/§6.7/§6.9→C2, §9/§6.8/§6.10→C3, §10→C4, §11/§6.1→C5, §12→C6, §13/§6.4/§6.5→C7, §15/§6.12→C8. §6.3 (feature gates) is honored throughout. §6.11 (`Default` on `*Args`) is in Tasks 1.1, 4.1, 5.2, 6.1, 7.1. §6.12 docs are in every commit's final task.
-- **Precondition:** PR #253 is a hard precondition for commit 2 — called out at the top and in the commit-2 header.
-- **Bisectability:** each commit ends with a green-gate step before its commit step; commit 1 needs no PR #253; commit 2's axum config tests seed the JSON fixture directly (Task 2.7 step 1 — "absent ⇒ empty"; tests write the file).
-- **Known drift risk:** commits 3–8's exact code depends on the `Bound*Store` / `StoreRegistry` shapes finalized in commit 2. Re-read commit 2's actual output before executing each later commit; adjust signatures to match.
+- **Spec coverage:** §7→C1, §8/§6.6/§6.7/§6.9→C2, §9/§6.8/§6.10→C3, §10→C4, §11/§6.1→C5, §12→C6, §13/§6.4/§6.5→C7, §15/§6.12→C8. §6.3 (feature gates) is honored throughout. §6.11 (`Default` on `*Args`) is in Tasks 1.1, 4.1, 5.2, 6.1, 7.1. §6.12 docs are in every stage's final task.
+- **Precondition:** PR #253 is a hard precondition for stage 2 — called out at the top and in the stage-2 header.
+- **Bisectability:** each stage ends with a green-gate step before its commit step; stage 1 needs no PR #253; stage 2's axum config tests seed the JSON fixture directly (Task 2.7 step 1 — "absent ⇒ empty"; tests write the file).
+- **Known drift risk:** stages 3–8's exact code depends on the `Bound*Store` / `StoreRegistry` shapes finalized in stage 2. Re-read stage 2's actual output before executing each later stage; adjust signatures to match.
 - **`app-demo` in CI:** Task 8.3 adds the missing CI wiring — the spec's §15 ship gate assumed CI exercises `app-demo`, which it does not today.
