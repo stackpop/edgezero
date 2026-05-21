@@ -32,6 +32,7 @@ This generates a workspace with:
 - `crates/my-app-adapter-fastly` - Fastly Compute entrypoint
 - `crates/my-app-adapter-cloudflare` - Cloudflare Workers entrypoint
 - `crates/my-app-adapter-axum` - Native Axum entrypoint
+- `crates/my-app-adapter-spin` - Fermyon Spin entrypoint
 - `edgezero.toml` - Manifest describing routes, middleware, and adapter config
 
 ## Run Your App Locally
@@ -71,6 +72,9 @@ my-app/
 │   │   └── src/
 │   │       ├── lib.rs      # App definition with edgezero_core::app!
 │   │       └── handlers.rs # Your route handlers
+│   ├── my-app-cli/
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs     # Your project's CLI, built on edgezero-cli
 │   ├── my-app-adapter-fastly/
 │   │   ├── Cargo.toml
 │   │   ├── fastly.toml
@@ -79,9 +83,13 @@ my-app/
 │   │   ├── Cargo.toml
 │   │   ├── wrangler.toml
 │   │   └── src/main.rs
-│   └── my-app-adapter-axum/
+│   ├── my-app-adapter-axum/
+│   │   ├── Cargo.toml
+│   │   ├── axum.toml
+│   │   └── src/main.rs
+│   └── my-app-adapter-spin/
 │       ├── Cargo.toml
-│       ├── axum.toml
+│       ├── spin.toml
 │       └── src/main.rs
 ```
 
