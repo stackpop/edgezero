@@ -32,7 +32,7 @@ validation errors immediately. Every in-tree project is migrated as
 part of the work; external projects do a one-time migration following
 the published guide. No compatibility shims, no dual-schema parsing.
 
-The work ships as **one pull request with eight commits** — one commit
+The work ships as **one pull request with eight stages** — one stage
 per sub-project, in the §16 order. The design decisions live here
 together.
 
@@ -489,21 +489,21 @@ registers it by logical id.
   `BoundKvStore` surface still exposes `put_*_with_ttl` (used by other
   adapters). On Spin, those operations **must return a deterministic
   error**, never silently store the value without expiry. The current
-  `KvError` enum has **no `Unsupported` variant** — **commit 2 adds
+  `KvError` enum has **no `Unsupported` variant** — **stage 2 adds
   `KvError::Unsupported`** and its `EdgeError` mapping. Because an
   unsupported operation is not a client mistake, it maps to a
   5xx-class `EdgeError` (the exact constructor — `EdgeError::internal`
-  or a dedicated one — is pinned in commit 2). The Spin KV contract
+  or a dedicated one — is pinned in stage 2). The Spin KV contract
   test asserts this error.
 - **Listing is capped.** `SpinKvStore` carries a `max_list_keys` cap
   and must error rather than silently truncate when exceeded. A store
   growing beyond a cap is a server/limit condition, not a malformed
   client request, so PR #253's current `KvError::Validation` (which an
   adapter may map to HTTP 400) is the wrong variant. **Resolved here,
-  not left open: commit 2 adds `KvError::LimitExceeded`** (5xx-class
+  not left open: stage 2 adds `KvError::LimitExceeded`** (5xx-class
   `EdgeError` mapping, like `Unsupported`) and the Spin KV listing
   path returns it when `max_list_keys` is exceeded, replacing
-  `Validation` for this case. Commit 2 also tests the pagination logic
+  `Validation` for this case. Stage 2 also tests the pagination logic
   directly (not only the cap error).
 
 **Config — flat Spin variables, single-store.** `SpinConfigStore` is
@@ -695,20 +695,20 @@ Non-subcommand `*Args` derive `Default` (external construction despite
 defaulted required subcommand could leak into a real auth path);
 external tests construct it via `clap::Parser::try_parse_from`.
 
-### 6.12 Documentation updates (definition-of-done for every commit)
+### 6.12 Documentation updates (definition-of-done for every stage)
 
 This effort changes the manifest schema, the runtime store API, the
 CLI surface, and the `dev`→`demo` subcommand. The VitePress docs site
 under `docs/guide/` has existing pages describing all of these, which
-go stale. **Updating documentation is part of every commit's
-definition-of-done** — a commit that changes user-facing behaviour
-updates the affected `docs/guide/` pages _in the same commit_, so the
+go stale. **Updating documentation is part of every stage's
+definition-of-done** — a stage that changes user-facing behaviour
+updates the affected `docs/guide/` pages _in the same stage_, so the
 PR never has a docs-lag window. The docs CI (ESLint + Prettier on
 `docs/`) must pass.
 
-Affected existing pages and the commit that owns each update:
+Affected existing pages and the stage that owns each update:
 
-| Page                                                  | What changes                                                                                                                                                      | Commit     |
+| Page                                                  | What changes                                                                                                                                                      | Stage      |
 | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | `docs/guide/cli-reference.md`                         | `dev`→`demo` rename; `edgezero-cli` as a library; new `auth` / `provision` / `config` commands                                                                    | 1, 5, 6, 7 |
 | `docs/guide/configuration.md`                         | new `[stores]` logical-id schema + per-adapter mapping + capability rules; removal of `[stores.config.defaults]`; the `<name>.toml` app-config file + env overlay | 2, 3       |
@@ -719,17 +719,17 @@ Affected existing pages and the commit that owns each update:
 | `docs/guide/adapters/overview.md` + Spin adapter docs | Spin store semantics (KV labels, flat-variable config/secrets)                                                                                                    | 2          |
 | `docs/guide/architecture.md`                          | light review — store/adapter description                                                                                                                          | 2          |
 
-New pages (created in their owning commit):
+New pages (created in their owning stage):
 
-- `docs/guide/manifest-store-migration.md` — commit 2 (how to migrate a
+- `docs/guide/manifest-store-migration.md` — stage 2 (how to migrate a
   pre-rewrite `edgezero.toml`).
-- `docs/guide/cli-walkthrough.md` — commit 8 (full `myapp` loop).
+- `docs/guide/cli-walkthrough.md` — stage 8 (full `myapp` loop).
 
-Commit 8 additionally performs a **documentation audit**: grep the
+Stage 8 additionally performs a **documentation audit**: grep the
 `docs/` tree for stale references (old manifest store keys, the `dev`
 subcommand, the old single-store runtime API) and confirm none remain;
 verify every page is listed in the `docs/.vitepress/config.mts`
-sidebar. The audit is a checklist item in commit 8's ship gate.
+sidebar. The audit is a checklist item in stage 8's ship gate.
 
 ---
 
@@ -746,14 +746,14 @@ app-demo-cli` parallel.
 
 The `dev` subcommand is renamed to **`demo`** — it runs the example
 app locally on axum, which is a demo workflow, not a dev workflow; the
-name `dev` is reserved for a future dev-workflow command. Commit 1
+name `dev` is reserved for a future dev-workflow command. Stage 1
 renames the CLI's `dev_server` module to `demo_server`, the public
 function `run_dev` to `run_demo`, and the `Command::Dev` variant to
 `Command::Demo`. `run_demo` returns `Result<(), String>` (consistent
 with the other `run_*` functions) — `Ok(())` on graceful shutdown,
 `Err(String)` on startup failure (e.g. port bind). It is **not**
 `-> !` — the demo server is allowed to return. The current
-`dev_server::run_dev()` returns `()`; commit 1 adjusts that boundary.
+`dev_server::run_dev()` returns `()`; stage 1 adjusts that boundary.
 (The `edgezero-adapter-axum` crate's own internal `dev_server` module
 is not user-facing and is left as-is.)
 
@@ -767,8 +767,8 @@ throwaway-app && cargo check --workspace` succeeds.
 ## 8. Sub-project 2 — Manifest + runtime rewrite (atomic, all four adapters)
 
 **Goal:** the big atomic sub-project. Manifest schema and runtime store
-API are coupled; with a hard cutoff they ship together as one commit
-(commit 2 of the eight-commit PR).
+API are coupled; with a hard cutoff they ship together as one stage
+(stage 2 of the eight-stage PR).
 
 **Scope:**
 
@@ -808,13 +808,13 @@ API are coupled; with a hard cutoff they ship together as one commit
   (≥2 KV ids `sessions`+`cache`; exactly one config id and one
   secrets id, as the Spin capability rule requires). `app-demo`
   handlers are migrated **only for the store-accessor change** in
-  commit 2 — `ctx.kv_store(id)` / `config_store` / the refactored
-  `Kv` / `Secrets` / `Config` extractors. Commit 2 does **not**
+  stage 2 — `ctx.kv_store(id)` / `config_store` / the refactored
+  `Kv` / `Secrets` / `Config` extractors. Stage 2 does **not**
   introduce `AppDemoConfig` or any typed-app-config handler work:
-  that type is created in commit 3 (§9), and `examples/app-demo/
-app-demo.toml` does not exist yet. This keeps commit 2
-  independently buildable — no commit-2 code references a type that
-  lands in commit 3.
+  that type is created in stage 3 (§9), and `examples/app-demo/
+app-demo.toml` does not exist yet. This keeps stage 2
+  independently buildable — no stage-2 code references a type that
+  lands in stage 3.
 - **`docs/guide/manifest-store-migration.md`** published.
 
 **Tests:** manifest round-trip + validation (non-empty ids; default
@@ -830,25 +830,25 @@ Spin KV listing-cap pagination test (and its error-variant decision,
 §6.7); `Kv`/`Secrets`/`Config` extractor tests; `app!` macro metadata
 registry test.
 
-**Bisectability — config seeding before `config push` exists.** Commit
+**Bisectability — config seeding before `config push` exists.** Stage
 2 removes `[stores.config.defaults]` and makes the axum config store
 read `.edgezero/local-config-<id>.json`, but `config push` (which
-_writes_ that file) does not land until commit 7, and `edgezero demo`'s
-auto-regeneration of the file depends on the commit-3 loader and the
-commit-7 resolve-and-write step. So between commit 2 and commit 7:
+_writes_ that file) does not land until stage 7, and `edgezero demo`'s
+auto-regeneration of the file depends on the stage-3 loader and the
+stage-7 resolve-and-write step. So between stage 2 and stage 7:
 
-- The axum config store's backing-file **contract** is what commit 2
-  establishes; commit 2 does not need anything to _produce_ the file.
-- Commit 2's axum config-store tests **write the JSON fixture file
+- The axum config store's backing-file **contract** is what stage 2
+  establishes; stage 2 does not need anything to _produce_ the file.
+- Stage 2's axum config-store tests **write the JSON fixture file
   directly** in test setup (a temp-dir fixture) — they exercise the
   read path without depending on `config push`.
-- `app-demo`'s commit-2 state: if no fixture file is present the axum
+- `app-demo`'s stage-2 state: if no fixture file is present the axum
   config store is empty (the documented "absent → empty" behaviour).
-  Any commit-2 `app-demo` test that asserts a config value seeds the
+  Any stage-2 `app-demo` test that asserts a config value seeds the
   fixture file itself. The full `config push` → running-demo-server
-  read-back end-to-end test lands in commit 8.
+  read-back end-to-end test lands in stage 8.
 
-This keeps commit 2 independently buildable and testable.
+This keeps stage 2 independently buildable and testable.
 
 **Ship gate:** multi-store handlers work on axum, cloudflare, fastly,
 and spin; async config reads work; all four CI gates green (including
@@ -1146,7 +1146,7 @@ timeout_ms` is read at runtime; the Spin path proves `.`→`__`
   `__`-encoded keys and the would-be content of **both** `spin.toml`
   tables — and the on-disk `spin.toml` is asserted **unchanged**
   (dry-run never mutates). The non-dry-run Spin push writing both
-  tables is covered by commit 7's tests, not the dry-run assertion.
+  tables is covered by stage 7's tests, not the dry-run assertion.
 - **`auth` / `provision`:** exercised against `MockCommandRunner` (and,
   for spin/axum provision, against temp-fixture manifests) in tests.
   Spin `provision` is asserted to write only the `key_value_stores`
@@ -1166,11 +1166,11 @@ explicit `[adapters.spin.adapter].component` form). Update
 `docs/.vitepress/config.mts` so the sidebar lists `cli-walkthrough.md`
 and `manifest-store-migration.md`.
 
-**Documentation audit (§6.12).** Commit 8 finishes with a docs audit:
+**Documentation audit (§6.12).** Stage 8 finishes with a docs audit:
 grep `docs/` for stale references — old `[stores.*]` manifest keys,
 the `dev` subcommand, the pre-rewrite single-store runtime API — and
 confirm none remain; confirm every page in §6.12's table was updated
-by its owning commit; confirm the docs CI (ESLint + Prettier) passes.
+by its owning stage; confirm the docs CI (ESLint + Prettier) passes.
 
 **Ship gate:** CI runs the full loop on axum end-to-end; manifest /
 runtime behaviour for cloudflare, fastly, and spin is covered by
@@ -1181,10 +1181,10 @@ references.
 
 ## 16. Implementation order and milestones
 
-The whole effort is **a single pull request containing eight commits**,
+The whole effort is **a single pull request containing eight stages**,
 one per sub-project, applied in this order:
 
-| Commit | §   | Title                                                  | Risk |
+| Stage  | §   | Title                                                  | Risk |
 | ------ | --- | ------------------------------------------------------ | ---- |
 | 1      | §7  | Extensible lib + scaffold                              | M    |
 | 2      | §8  | Manifest + runtime rewrite (atomic, all four adapters) | H    |
@@ -1195,36 +1195,36 @@ one per sub-project, applied in this order:
 | 7      | §13 | `config push`                                          | M    |
 | 8      | §15 | `app-demo` polish (all four adapters) + docs audit     | M    |
 
-Every commit also updates the `docs/guide/` pages it makes stale
-(§6.12) — documentation is part of each commit's definition-of-done,
-not a deferred afterthought. Commit 8 closes with a documentation
+Every stage also updates the `docs/guide/` pages it makes stale
+(§6.12) — documentation is part of each stage's definition-of-done,
+not a deferred afterthought. Stage 8 closes with a documentation
 audit.
 
 **CI and bisectability.** CI gates the PR as a whole on its head
 commit; all four gates (`fmt`, `clippy -D warnings`, `cargo test`,
 feature `cargo check`) plus the wasm32 spin gate must pass there. Each
-of the eight commits should nonetheless compile and pass tests on its
-own so the history stays bisectable — commit boundaries are chosen so
-that each is a self-contained, buildable increment. Commit 2 is the one
-unavoidably large commit (the atomic manifest+runtime rewrite); the
+of the eight stages should nonetheless compile and pass tests on its
+own so the history stays bisectable — stage boundaries are chosen so
+that each is a self-contained, buildable increment. Stage 2 is the one
+unavoidably large stage (the atomic manifest+runtime rewrite); the
 other seven are individually small.
 
 **Review note.** Because this is one PR, the reviewer sees all eight
-commits together. The PR description should list the eight commits and
-point at this spec. Reviewing commit-by-commit is recommended.
-**Commit 2 is the review hotspot** — the atomic manifest+runtime
+stages together. The PR description should list the eight stages and
+point at this spec. Reviewing stage-by-stage is recommended.
+**Stage 2 is the review hotspot** — the atomic manifest+runtime
 rewrite is intentionally large (the hard cutoff leaves no smaller
 coherent unit), so it warrants the most reviewer attention. Its
 per-adapter contract tests (§8) are the primary mitigation and should
 be reviewed alongside the code.
 
-**Highest-risk:** commit 2 — atomic manifest+runtime rewrite touching the
+**Highest-risk:** stage 2 — atomic manifest+runtime rewrite touching the
 schema, `ConfigStore` (async), **all four** adapters' store impls, the
 Cloudflare `[vars]`→KV swap, Spin store wiring, `Hooks` /
-`ConfigStoreMetadata` / `app!`, and the extractors, in one commit.
+`ConfigStoreMetadata` / `app!`, and the extractors, in one stage.
 Large by necessity under the hard-cutoff decision. Mitigated by
 per-adapter contract tests and `app-demo` as the in-tree canary.
-Commit 6 (`provision`) — shell-out + multi-file native-manifest
+Stage 6 (`provision`) — shell-out + multi-file native-manifest
 writeback across four adapters (`wrangler.toml`, `fastly.toml`,
 `spin.toml`).
 
@@ -1232,10 +1232,10 @@ writeback across four adapters (`wrangler.toml`, `fastly.toml`,
 
 - **Hard manifest cutoff:** a pre-rewrite `edgezero.toml` fails to
   load with a migration-guide error. All in-tree projects migrated in
-  commit 2; external projects migrate once.
-- **Large atomic commit (commit 2):** unavoidable without a
+  stage 2; external projects migrate once.
+- **Large atomic stage (stage 2):** unavoidable without a
   compatibility layer, which the hard-cutoff decision rejects. It is
-  one commit, not one PR — the PR carries all eight.
+  one stage, not one PR — the PR carries all eight.
 - **Async `ConfigStore` cascade:** `get` becomes async across the
   trait and **all four** adapter impls, handlers, and the `Config`
   extractor. `#[async_trait(?Send)]` keeps WASM compatibility.
@@ -1253,7 +1253,7 @@ writeback across four adapters (`wrangler.toml`, `fastly.toml`,
   the walkthrough doc covers this. `#[secret(store_ref)]` is the
   awkward case on Spin (single flat secret namespace, code-local
   keys) — supported, but the developer owns the `spin.toml` entries.
-- **Spin KV TTL / listing-cap:** commit 2 adds two new `KvError`
+- **Spin KV TTL / listing-cap:** stage 2 adds two new `KvError`
   variants — `Unsupported` (Spin TTL writes) and `LimitExceeded`
   (Spin listing past `max_list_keys`) — both 5xx-class in their
   `EdgeError` mapping. Spin TTL writes return `Unsupported`
