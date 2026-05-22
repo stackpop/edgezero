@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -355,9 +356,10 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         if A::config_store().is_some() && manifest_data.stores.config.is_none() {
             log::warn!("A::config_store() is set but [stores.config] is missing in the manifest. This override is ignored on Axum.");
         }
-        let config_store_handle = manifest_data.stores.config.as_ref().map(|cfg| {
-            let defaults = cfg.config_store_defaults().clone();
-            let store = AxumConfigStore::from_env(defaults);
+        let config_store_handle = manifest_data.stores.config.as_ref().map(|_cfg| {
+            // The portable manifest no longer carries `[stores.config.defaults]`;
+            // the axum config store starts empty and reads from the environment.
+            let store = AxumConfigStore::from_env(iter::empty());
             ConfigStoreHandle::new(Arc::new(store))
         });
         let secret = has_secret_store.then(||  { log::info!("Secret store: reading from environment variables"); SecretHandle::new(Arc::new(
@@ -479,7 +481,7 @@ mod tests {
         let manifest = ManifestLoader::load_from_str(
             r#"
 [stores.kv]
-name = "EDGEZERO_KV"
+ids = ["EDGEZERO_KV"]
 "#,
         );
         assert_eq!(
@@ -603,7 +605,6 @@ mod integration_tests {
     use edgezero_core::extractor::Secrets;
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::SecretHandle as CoreSecretHandle;
-    use std::iter;
     use std::time::{Duration, Instant};
     use tokio::task::{spawn_blocking, JoinHandle};
     use tokio::time::sleep;

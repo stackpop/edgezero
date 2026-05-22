@@ -1,22 +1,18 @@
 use log::LevelFilter;
 use serde::de::Error as DeError;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs, io};
 use validator::{Validate, ValidationError};
 
+/// Default config store / binding name used when `[stores.config]` is omitted.
 pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
 /// Default KV store / binding name used when `[stores.kv]` is omitted.
 pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
 /// Default secret store / binding name used when `[stores.secrets]` is omitted.
 pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
-// Spin config values come from Spin component variables (flat namespace);
-// there is no runtime store-name concept, so adapter-name overrides for spin
-// would be silently ignored. Keep spin out of the allowed set to surface
-// misconfiguration at validation time rather than at runtime.
-const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
 
 pub struct ManifestLoader {
     manifest: Arc<Manifest>,
@@ -169,25 +165,16 @@ impl Manifest {
 
     /// Returns the KV store name for a given adapter.
     ///
-    /// Resolution order:
-    /// 1. Per-adapter override (`[stores.kv.adapters.<adapter>]`)
-    /// 2. Global name (`[stores.kv] name = "..."`)
-    /// 3. Default: `"EDGEZERO_KV"`
+    /// In the portable model the manifest carries no platform name; the name
+    /// resolves to the declared default logical id, or `"EDGEZERO_KV"` when
+    /// `[stores.kv]` is omitted.
     #[must_use]
     #[inline]
-    pub fn kv_store_name(&self, adapter: &str) -> &str {
-        let Some(kv) = self.stores.kv.as_ref() else {
-            return DEFAULT_KV_STORE_NAME;
-        };
-        let adapter_lower = adapter.to_ascii_lowercase();
-        if let Some(adapter_cfg) = kv
-            .adapters
-            .iter()
-            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
-        {
-            return &adapter_cfg.1.name;
-        }
-        &kv.name
+    pub fn kv_store_name(&self, _adapter: &str) -> &str {
+        self.stores
+            .kv
+            .as_ref()
+            .map_or(DEFAULT_KV_STORE_NAME, StoreDeclaration::default_id)
     }
 
     #[must_use]
@@ -210,45 +197,25 @@ impl Manifest {
 
     /// Returns the secret store binding identifier for a given adapter.
     ///
-    /// Resolution order:
-    /// 1. Per-adapter override (`[stores.secrets.adapters.<adapter>]`)
-    /// 2. Global name (`[stores.secrets] name = "..."`)
-    /// 3. Default: `"EDGEZERO_SECRETS"`
+    /// In the portable model the manifest carries no platform name; the name
+    /// resolves to the declared default logical id, or `"EDGEZERO_SECRETS"`
+    /// when `[stores.secrets]` is omitted.
     #[must_use]
     #[inline]
-    pub fn secret_store_binding(&self, adapter: &str) -> &str {
-        let Some(secrets) = self.stores.secrets.as_ref() else {
-            return DEFAULT_SECRET_STORE_NAME;
-        };
-        let adapter_lower = adapter.to_ascii_lowercase();
-        if let Some(adapter_cfg) = secrets
-            .adapters
-            .iter()
-            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
-        {
-            if let Some(name) = adapter_cfg.1.name.as_deref() {
-                return name;
-            }
-        }
-        &secrets.name
+    pub fn secret_store_binding(&self, _adapter: &str) -> &str {
+        self.stores
+            .secrets
+            .as_ref()
+            .map_or(DEFAULT_SECRET_STORE_NAME, StoreDeclaration::default_id)
     }
 
     /// Returns whether the secret store should be attached for a given adapter.
+    ///
+    /// True whenever a `[stores.secrets]` section is declared.
     #[must_use]
     #[inline]
-    pub fn secret_store_enabled(&self, adapter: &str) -> bool {
-        let Some(secrets) = self.stores.secrets.as_ref() else {
-            return false;
-        };
-        let adapter_lower = adapter.to_ascii_lowercase();
-        if let Some(adapter_cfg) = secrets
-            .adapters
-            .iter()
-            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
-        {
-            return adapter_cfg.1.enabled;
-        }
-        secrets.enabled
+    pub fn secret_store_enabled(&self, _adapter: &str) -> bool {
+        self.stores.secrets.is_some()
     }
 }
 
@@ -456,66 +423,62 @@ pub struct ManifestAdapterCommands {
 pub struct ManifestStores {
     #[serde(default)]
     #[validate(nested)]
-    pub config: Option<ManifestConfigStoreConfig>,
+    pub config: Option<StoreDeclaration>,
     #[serde(default)]
     #[validate(nested)]
-    pub kv: Option<ManifestKvConfig>,
+    pub kv: Option<StoreDeclaration>,
     #[serde(default)]
     #[validate(nested)]
-    pub secrets: Option<ManifestSecretsConfig>,
+    pub secrets: Option<StoreDeclaration>,
 }
 
-/// `[stores.config]` section — provider-neutral config store.
+/// Portable `[stores.<kind>]` declaration.
+///
+/// Declares logical store ids only — the portable fact that "this app uses a
+/// KV/config/secrets store called `<id>`". No platform names, no per-adapter
+/// tuning. Platform-specific runtime config (store names, tuning) is supplied
+/// out of band; in this interim model a store's name resolves to its logical
+/// [`StoreDeclaration::default_id`].
 #[derive(Debug, Deserialize, Validate)]
 #[non_exhaustive]
-pub struct ManifestConfigStoreConfig {
-    /// Per-adapter name overrides, keyed by supported lowercase adapter name
-    /// (`axum`, `cloudflare`, or `fastly`). Spin config uses component
-    /// variables in a flat namespace, so `stores.config.adapters.spin` is
-    /// rejected during validation.
+#[validate(schema(function = "validate_store_declaration"))]
+pub struct StoreDeclaration {
+    /// Logical default store id. Required when `ids.len() > 1`; when there is
+    /// exactly one id it resolves to `ids[0]`.
     #[serde(default)]
-    #[validate(nested)]
-    #[validate(custom(function = "validate_config_store_adapter_keys"))]
-    pub adapters: BTreeMap<String, ManifestConfigAdapterConfig>,
-    /// Optional default values used for local dev (Axum adapter).
+    pub default: Option<String>,
+    /// Logical store ids — non-empty (enforced in validation, not by serde, so
+    /// a legacy manifest is rejected with the migration-guide message rather
+    /// than a bare "missing field `ids`" parse error).
     #[serde(default)]
-    pub defaults: BTreeMap<String, String>,
-    /// Global store/binding name used when no adapter-specific override is set.
-    #[serde(default)]
-    #[validate(length(min = 1_u64))]
-    pub name: Option<String>,
+    pub ids: Vec<String>,
+    /// Any field other than `ids` / `default` — the pre-rewrite store schema
+    /// (`name`, `enabled`, `adapters`, `defaults`) lands here and is rejected
+    /// with a migration-guide message during validation.
+    #[serde(flatten)]
+    pub legacy: BTreeMap<String, toml::Value>,
 }
 
-/// `[stores.config.adapters.<adapter>]` override.
-#[derive(Debug, Deserialize, Serialize, Validate)]
-#[non_exhaustive]
-pub struct ManifestConfigAdapterConfig {
-    #[validate(length(min = 1_u64))]
-    pub name: String,
-}
-
-impl ManifestConfigStoreConfig {
-    /// Access the default key-value pairs for local dev.
-    #[must_use]
-    #[inline]
-    pub fn config_store_defaults(&self) -> &BTreeMap<String, String> {
-        &self.defaults
-    }
-
+impl StoreDeclaration {
     /// Resolve the config store name for a given adapter.
     ///
-    /// Priority: adapter override → global name → `DEFAULT_CONFIG_STORE_NAME`.
+    /// In the portable model the manifest carries no platform name; the name
+    /// resolves to the logical [`StoreDeclaration::default_id`].
     #[must_use]
     #[inline]
-    pub fn config_store_name(&self, adapter: &str) -> &str {
-        let adapter_lower = adapter.to_ascii_lowercase();
-        if let Some(override_cfg) = self.adapters.get(&adapter_lower) {
-            return &override_cfg.name;
-        }
-        if let Some(name) = self.name.as_deref() {
-            return name;
-        }
-        DEFAULT_CONFIG_STORE_NAME
+    pub fn config_store_name(&self, _adapter: &str) -> &str {
+        self.default_id()
+    }
+
+    /// Resolve the default logical store id (the explicit `default`, else the
+    /// first declared id).
+    #[must_use]
+    #[inline]
+    pub fn default_id(&self) -> &str {
+        self.default
+            .as_deref()
+            .or_else(|| self.ids.first().map(String::as_str))
+            .unwrap_or("")
     }
 }
 
@@ -581,62 +544,6 @@ impl ManifestLoggingConfig {
     fn is_specified(&self) -> bool {
         self.level.is_some() || self.endpoint.is_some() || self.echo_stdout.is_some()
     }
-}
-
-/// Global KV store configuration.
-#[derive(Debug, Deserialize, Validate)]
-#[non_exhaustive]
-pub struct ManifestKvConfig {
-    /// Per-adapter name overrides.
-    #[serde(default)]
-    #[validate(nested)]
-    pub adapters: BTreeMap<String, ManifestKvAdapterConfig>,
-
-    /// Store / binding name (default: `"EDGEZERO_KV"`).
-    #[serde(default = "default_kv_name")]
-    #[validate(length(min = 1_u64))]
-    pub name: String,
-}
-
-/// Per-adapter KV binding / store name override.
-#[derive(Debug, Deserialize, Validate)]
-#[non_exhaustive]
-pub struct ManifestKvAdapterConfig {
-    #[validate(length(min = 1_u64))]
-    pub name: String,
-}
-
-/// Global secret store configuration.
-#[derive(Debug, Deserialize, Validate)]
-#[non_exhaustive]
-pub struct ManifestSecretsConfig {
-    /// Per-adapter name overrides.
-    #[serde(default)]
-    #[validate(nested)]
-    pub adapters: BTreeMap<String, ManifestSecretsAdapterConfig>,
-
-    /// Whether the secret store is enabled for adapters without overrides.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
-    /// Store / binding name (default: `"EDGEZERO_SECRETS"`).
-    #[serde(default = "default_secret_name")]
-    #[validate(length(min = 1_u64))]
-    pub name: String,
-}
-
-/// Per-adapter secret store name override.
-#[derive(Debug, Deserialize, Validate)]
-#[non_exhaustive]
-pub struct ManifestSecretsAdapterConfig {
-    /// Whether the secret store is enabled for this adapter.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
-    /// Optional per-adapter secret store name override.
-    #[serde(default)]
-    #[validate(length(min = 1_u64))]
-    pub name: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -797,18 +704,6 @@ impl<'de> Deserialize<'de> for LogLevel {
     }
 }
 
-fn default_enabled() -> bool {
-    true
-}
-
-fn default_kv_name() -> String {
-    DEFAULT_KV_STORE_NAME.to_owned()
-}
-
-fn default_secret_name() -> String {
-    DEFAULT_SECRET_STORE_NAME.to_owned()
-}
-
 fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
     match path.parent() {
         Some(parent) if parent.as_os_str().is_empty() => cwd.to_path_buf(),
@@ -818,45 +713,56 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
-fn validate_config_store_adapter_keys(
-    adapters: &BTreeMap<String, ManifestConfigAdapterConfig>,
-) -> Result<(), ValidationError> {
-    let mixed_case_keys = adapters
-        .keys()
-        .filter(|key| key.as_str() != key.to_ascii_lowercase())
-        .cloned()
-        .collect::<Vec<_>>();
-    if !mixed_case_keys.is_empty() {
-        let mut error = ValidationError::new("config_store_adapter_keys_lowercase");
+/// Validates a single `[stores.<kind>]` declaration against the portable
+/// schema.
+///
+/// Rejects the pre-rewrite store fields (`name`, `enabled`, `adapters`,
+/// `defaults`) with an error pointing at the migration guide, and enforces the
+/// `ids` / `default` invariants.
+fn validate_store_declaration(declaration: &StoreDeclaration) -> Result<(), ValidationError> {
+    if !declaration.legacy.is_empty() {
+        let mut keys = declaration.legacy.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let mut error = ValidationError::new("legacy_store_schema");
         error.message = Some(
             format!(
-                "config store adapter override keys must be lowercase: {}",
-                mixed_case_keys.join(", ")
+                "the pre-rewrite `[stores.<kind>]` schema is no longer supported \
+                 (offending field(s): {}); migrate to the portable `ids` / `default` \
+                 form -- see docs/guide/manifest-store-migration.md",
+                keys.join(", ")
             )
             .into(),
         );
         return Err(error);
     }
 
-    let unknown_keys = adapters
-        .keys()
-        .filter(|key| !SUPPORTED_CONFIG_STORE_ADAPTERS.contains(&key.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if unknown_keys.is_empty() {
-        return Ok(());
+    if declaration.ids.is_empty() {
+        let mut error = ValidationError::new("store_ids_empty");
+        error.message =
+            Some("`[stores.<kind>].ids` must declare at least one logical store id".into());
+        return Err(error);
     }
 
-    let mut error = ValidationError::new("config_store_adapter_keys_known");
-    error.message = Some(
-        format!(
-            "config store adapter override keys must match supported adapters ({}): {}",
-            SUPPORTED_CONFIG_STORE_ADAPTERS.join(", "),
-            unknown_keys.join(", ")
-        )
-        .into(),
-    );
-    Err(error)
+    if declaration.ids.len() > 1 && declaration.default.is_none() {
+        let mut error = ValidationError::new("store_default_required");
+        error.message = Some(
+            "`default` is required when `[stores.<kind>]` declares more than one id \
+             -- see docs/guide/manifest-store-migration.md"
+                .into(),
+        );
+        return Err(error);
+    }
+
+    if let Some(default) = declaration.default.as_deref() {
+        if !declaration.ids.iter().any(|id| id == default) {
+            let mut error = ValidationError::new("store_default_unknown");
+            error.message =
+                Some(format!("`default` (`{default}`) must be one of the declared `ids`").into());
+            return Err(error);
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -916,15 +822,15 @@ env = "APP_TOKEN"
 
     #[test]
     fn try_load_from_str_rejects_failed_validation() {
-        // `[stores.config]` requires a non-empty `name` when set; an empty
-        // string trips `validator` and surfaces as InvalidData.
+        // `[stores.config]` requires a non-empty `ids` list; an empty list
+        // trips `validator` and surfaces as InvalidData.
         let err = ManifestLoader::try_load_from_str(
             r#"
 [app]
 name = "demo"
 
 [stores.config]
-name = ""
+ids = []
 "#,
         )
         .err()
@@ -1483,159 +1389,105 @@ manifest = "fastly.toml"
         assert_eq!(HttpMethod::Head.as_str(), "HEAD");
     }
 
-    // Config store tests
-    #[test]
-    fn config_store_name_falls_back_to_default_constant() {
-        // [stores.config] present but no name and no adapter overrides:
-        // config_store_name() must return DEFAULT_CONFIG_STORE_NAME.
-        let toml = "[stores.config]\n";
-        let mfest = ManifestLoader::load_from_str(toml);
-        let config = mfest.manifest().stores.config.as_ref().unwrap();
-        assert_eq!(
-            config.config_store_name("fastly"),
-            DEFAULT_CONFIG_STORE_NAME
-        );
-        assert_eq!(
-            config.config_store_name("cloudflare"),
-            DEFAULT_CONFIG_STORE_NAME
-        );
-        assert_eq!(config.config_store_name("axum"), DEFAULT_CONFIG_STORE_NAME);
-    }
+    // -- Portable store declarations ---------------------------------------
 
     #[test]
-    fn config_store_name_defaults_when_omitted() {
-        // No [stores.config] section at all: callers skip the config store entirely.
-        let manifest = ManifestLoader::load_from_str("");
-        assert!(manifest.manifest().stores.config.is_none());
-    }
-
-    #[test]
-    fn config_store_name_uses_global_name() {
+    fn store_declaration_round_trips() {
         let toml = r#"
+[stores.kv]
+ids = ["sessions", "cache"]
+default = "sessions"
+
 [stores.config]
-name = "app_config"
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
 "#;
-        let mfest = ManifestLoader::load_from_str(toml);
-        let config = mfest.manifest().stores.config.as_ref().unwrap();
+        let loader = ManifestLoader::load_from_str(toml);
+        let stores = &loader.manifest().stores;
+
+        let kv = stores.kv.as_ref().expect("kv declared");
+        assert_eq!(kv.ids, ["sessions", "cache"]);
+        assert_eq!(kv.default_id(), "sessions");
+
+        let config = stores.config.as_ref().expect("config declared");
+        assert_eq!(config.ids, ["app_config"]);
+        assert_eq!(config.default_id(), "app_config");
         assert_eq!(config.config_store_name("fastly"), "app_config");
-        assert_eq!(config.config_store_name("cloudflare"), "app_config");
-        assert_eq!(config.config_store_name("axum"), "app_config");
+
+        let secrets = stores.secrets.as_ref().expect("secrets declared");
+        assert_eq!(secrets.default_id(), "default");
     }
 
     #[test]
-    fn config_store_name_adapter_override() {
-        let toml = r#"
-[stores.config]
-name = "global_config"
-
-[stores.config.adapters.fastly]
-name = "my-config-link"
-
-[stores.config.adapters.cloudflare]
-name = "APP_CONFIG_BINDING"
-"#;
-        let mfest = ManifestLoader::load_from_str(toml);
-        let config = mfest.manifest().stores.config.as_ref().unwrap();
-        assert_eq!(config.config_store_name("fastly"), "my-config-link");
-        assert_eq!(config.config_store_name("cloudflare"), "APP_CONFIG_BINDING");
-        assert_eq!(config.config_store_name("axum"), "global_config");
+    fn store_declaration_default_id_falls_back_to_first_id() {
+        let loader = ManifestLoader::load_from_str("[stores.kv]\nids = [\"only\"]\n");
+        let kv = loader.manifest().stores.kv.as_ref().expect("kv declared");
+        assert!(kv.default.is_none());
+        assert_eq!(kv.default_id(), "only");
     }
 
     #[test]
-    fn config_store_name_case_insensitive() {
-        let toml = r#"
-[stores.config.adapters.fastly]
-name = "fastly-store"
-"#;
-        let mfest = ManifestLoader::load_from_str(toml);
-        let config = mfest.manifest().stores.config.as_ref().unwrap();
-        assert_eq!(config.config_store_name("FASTLY"), "fastly-store");
-        assert_eq!(config.config_store_name("Fastly"), "fastly-store");
-        assert_eq!(config.config_store_name("fastly"), "fastly-store");
-    }
-
-    #[test]
-    fn config_store_mixed_case_adapter_key_fails_validation() {
-        let src = r#"
-[stores.config.adapters.Fastly]
-name = "fastly-store"
-"#;
-        let manifest: Manifest = toml::from_str(src).expect("should parse");
-        let result = manifest.validate();
-        assert!(
-            result.is_err(),
-            "mixed-case config store adapter key should fail validation"
-        );
-    }
-
-    #[test]
-    fn config_store_unknown_adapter_key_fails_validation() {
-        let src = r#"
-[stores.config.adapters.clouflare]
-name = "APP_CONFIG"
-"#;
-        let manifest: Manifest = toml::from_str(src).expect("should parse");
-        let result = manifest.validate();
-        assert!(
-            result.is_err(),
-            "unknown config store adapter key should fail validation"
-        );
-    }
-
-    #[test]
-    fn config_store_spin_adapter_key_fails_validation() {
-        // Spin config values come from component variables; there is no
-        // runtime store-name concept, so a spin adapter override would be
-        // silently ignored. Validation rejects it to surface the mistake early.
-        let src = r#"
-[stores.config.adapters.spin]
-name = "SPIN_CONFIG"
-"#;
-        let manifest: Manifest = toml::from_str(src).expect("should parse");
+    fn store_declaration_empty_ids_fails_validation() {
+        let manifest: Manifest = toml::from_str("[stores.kv]\nids = []\n").expect("should parse");
         assert!(
             manifest.validate().is_err(),
-            "spin config store adapter key should fail validation"
+            "empty `ids` list should fail validation"
         );
     }
 
     #[test]
-    fn config_store_defaults_accessible() {
-        let toml = r#"
-[stores.config.defaults]
-"feature.checkout" = "true"
-"service.timeout_ms" = "1500"
-"#;
-        let mfest = ManifestLoader::load_from_str(toml);
-        let config = mfest.manifest().stores.config.as_ref().unwrap();
-        let defaults = config.config_store_defaults();
-        assert_eq!(
-            defaults.get("feature.checkout").map(String::as_str),
-            Some("true")
+    fn store_declaration_requires_default_with_multiple_ids() {
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"a\", \"b\"]\n").expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("missing `default` with >1 id should fail validation");
+        assert!(
+            err.to_string().contains("default"),
+            "error should mention `default`, got: {err}"
         );
-        assert_eq!(
-            defaults.get("service.timeout_ms").map(String::as_str),
-            Some("1500")
+    }
+
+    #[test]
+    fn store_declaration_default_must_be_a_declared_id() {
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"a\", \"b\"]\ndefault = \"c\"\n")
+                .expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("`default` outside `ids` should fail validation");
+        assert!(
+            err.to_string().contains("declared `ids`"),
+            "error should explain the `default` constraint, got: {err}"
         );
+    }
+
+    #[test]
+    fn legacy_store_schema_is_a_hard_load_error() {
+        for legacy in [
+            "[stores.kv]\nname = \"MY_KV\"\n",
+            "[stores.config]\nids = [\"app_config\"]\n\n[stores.config.defaults]\nkey = \"value\"\n",
+            "[stores.kv]\nids = [\"sessions\"]\n\n[stores.kv.adapters.spin]\nname = \"label\"\n",
+            "[stores.secrets]\nids = [\"default\"]\nenabled = false\n",
+        ] {
+            let err = ManifestLoader::try_load_from_str(legacy)
+                .err()
+                .unwrap_or_else(|| panic!("legacy manifest must fail to load: {legacy}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string()
+                    .contains("docs/guide/manifest-store-migration.md"),
+                "legacy-schema error must reference the migration guide, got: {err}"
+            );
+        }
     }
 
     #[test]
     fn empty_manifest_has_no_config_store() {
         let mfest = ManifestLoader::load_from_str("");
         assert!(mfest.manifest().stores.config.is_none());
-    }
-
-    #[test]
-    fn config_store_empty_global_name_fails_validation() {
-        let src = r#"
-[stores.config]
-name = ""
-"#;
-        let manifest: Manifest = toml::from_str(src).expect("should parse");
-        let result = manifest.validate();
-        assert!(
-            result.is_err(),
-            "empty global config store name should fail validation"
-        );
     }
 
     // Multiple triggers test
@@ -1669,65 +1521,20 @@ body-mode = "buffered"
 
     #[test]
     fn kv_store_name_defaults_when_omitted() {
-        let toml_str = r#"
-[app]
-name = "test"
-"#;
-        let loader = ManifestLoader::load_from_str(toml_str);
+        let loader = ManifestLoader::load_from_str("[app]\nname = \"test\"\n");
         let manifest = loader.manifest();
         assert_eq!(manifest.kv_store_name("fastly"), "EDGEZERO_KV");
         assert_eq!(manifest.kv_store_name("cloudflare"), "EDGEZERO_KV");
     }
 
     #[test]
-    fn kv_store_name_uses_global_name() {
-        let toml_str = r#"
-[app]
-name = "test"
-
-[stores.kv]
-name = "MY_KV"
-"#;
-        let loader = ManifestLoader::load_from_str(toml_str);
+    fn kv_store_name_resolves_to_default_id() {
+        let loader = ManifestLoader::load_from_str(
+            "[stores.kv]\nids = [\"sessions\", \"cache\"]\ndefault = \"cache\"\n",
+        );
         let manifest = loader.manifest();
-        assert_eq!(manifest.kv_store_name("fastly"), "MY_KV");
-        assert_eq!(manifest.kv_store_name("cloudflare"), "MY_KV");
-    }
-
-    #[test]
-    fn kv_store_name_adapter_override() {
-        let toml_str = r#"
-[app]
-name = "test"
-
-[stores.kv]
-name = "GLOBAL_KV"
-
-[stores.kv.adapters.cloudflare]
-name = "CF_BINDING"
-"#;
-        let loader = ManifestLoader::load_from_str(toml_str);
-        let manifest = loader.manifest();
-        assert_eq!(manifest.kv_store_name("cloudflare"), "CF_BINDING");
-        assert_eq!(manifest.kv_store_name("fastly"), "GLOBAL_KV");
-    }
-
-    #[test]
-    fn kv_store_name_case_insensitive() {
-        let toml_str = r#"
-[app]
-name = "test"
-
-[stores.kv]
-name = "DEFAULT"
-
-[stores.kv.adapters.Fastly]
-name = "FASTLY_STORE"
-"#;
-        let loader = ManifestLoader::load_from_str(toml_str);
-        let manifest = loader.manifest();
-        assert_eq!(manifest.kv_store_name("fastly"), "FASTLY_STORE");
-        assert_eq!(manifest.kv_store_name("FASTLY"), "FASTLY_STORE");
+        assert_eq!(manifest.kv_store_name("fastly"), "cache");
+        assert_eq!(manifest.kv_store_name("cloudflare"), "cache");
     }
 
     // -- Secret store config -----------------------------------------------
@@ -1742,8 +1549,8 @@ name = "FASTLY_STORE"
     }
 
     #[test]
-    fn secret_store_binding_uses_global_name_when_declared() {
-        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nname = \"MY_SECRETS\"\n");
+    fn secret_store_binding_resolves_to_default_id() {
+        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nids = [\"MY_SECRETS\"]\n");
         assert_eq!(
             manifest.manifest().secret_store_binding("fastly"),
             "MY_SECRETS"
@@ -1752,34 +1559,6 @@ name = "FASTLY_STORE"
             manifest.manifest().secret_store_binding("cloudflare"),
             "MY_SECRETS"
         );
-    }
-
-    #[test]
-    fn secret_store_binding_uses_per_adapter_override() {
-        let manifest = ManifestLoader::load_from_str(
-            "[stores.secrets]\nname = \"MY_SECRETS\"\n\
-             [stores.secrets.adapters.fastly]\nname = \"FASTLY_STORE\"\n",
-        );
-        assert_eq!(
-            manifest.manifest().secret_store_binding("fastly"),
-            "FASTLY_STORE"
-        );
-        assert_eq!(
-            manifest.manifest().secret_store_binding("cloudflare"),
-            "MY_SECRETS"
-        );
-    }
-
-    #[test]
-    fn secrets_required_is_false_when_absent() {
-        let manifest = ManifestLoader::load_from_str("[app]\nname = \"x\"\n");
-        assert!(manifest.manifest().stores.secrets.is_none());
-    }
-
-    #[test]
-    fn secrets_required_is_true_when_declared() {
-        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nname = \"MY_SECRETS\"\n");
-        assert!(manifest.manifest().stores.secrets.is_some());
     }
 
     #[test]
@@ -1791,37 +1570,10 @@ name = "FASTLY_STORE"
 
     #[test]
     fn secret_store_enabled_is_true_when_declared() {
-        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nname = \"MY_SECRETS\"\n");
+        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nids = [\"default\"]\n");
+        assert!(manifest.manifest().stores.secrets.is_some());
         assert!(manifest.manifest().secret_store_enabled("fastly"));
         assert!(manifest.manifest().secret_store_enabled("cloudflare"));
-    }
-
-    #[test]
-    fn secret_store_enabled_can_be_disabled_per_adapter() {
-        let manifest = ManifestLoader::load_from_str(
-            "[stores.secrets]\nname = \"MY_SECRETS\"\n\
-             [stores.secrets.adapters.cloudflare]\nenabled = false\n",
-        );
-        assert!(manifest.manifest().secret_store_enabled("fastly"));
-        assert!(!manifest.manifest().secret_store_enabled("cloudflare"));
-    }
-
-    #[test]
-    fn secret_store_enabled_can_be_enabled_only_for_specific_adapter() {
-        let manifest = ManifestLoader::load_from_str(
-            "[stores.secrets]\nenabled = false\n\
-             [stores.secrets.adapters.fastly]\nenabled = true\nname = \"FASTLY_STORE\"\n",
-        );
-        assert!(manifest.manifest().secret_store_enabled("fastly"));
-        assert!(!manifest.manifest().secret_store_enabled("cloudflare"));
-        assert_eq!(
-            manifest.manifest().secret_store_binding("fastly"),
-            "FASTLY_STORE"
-        );
-        assert_eq!(
-            manifest.manifest().secret_store_binding("cloudflare"),
-            DEFAULT_SECRET_STORE_NAME
-        );
     }
 
     // -- Adapter host/port config ------------------------------------------

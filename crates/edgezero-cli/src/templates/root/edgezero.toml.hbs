@@ -52,6 +52,20 @@ methods = ["GET", "POST"]
 handler = "{{proj_core_mod}}::handlers::proxy_demo"
 adapters = [{{{adapter_list}}}]
 
+# -- Stores ----------------------------------------------------------------
+#
+# `[stores.<kind>]` declares logical store ids only. `default` is required
+# when more than one id is declared; with a single id it resolves to that id.
+
+[stores.kv]
+ids = ["app_kv"]
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+
 # [environment]
 #
 # [[environment.variables]]

@@ -5,14 +5,14 @@ use std::env;
 
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 
-/// Config store for local dev / Axum. Reads from env vars with manifest
+/// Config store for local dev / Axum. Reads from env vars with in-memory
 /// defaults as fallback. Env vars take precedence over defaults.
 ///
 /// # Note on `from_env`
 ///
 /// [`AxumConfigStore::from_env`] only reads environment variables for keys
-/// declared in `[stores.config.defaults]`. Use an empty-string default when a
-/// key should be overrideable from env without carrying a real default value.
+/// present in the supplied defaults map. The portable manifest no longer
+/// carries config-store defaults, so the dev server passes an empty map.
 pub struct AxumConfigStore {
     defaults: HashMap<String, String>,
     env: HashMap<String, String>,

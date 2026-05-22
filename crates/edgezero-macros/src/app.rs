@@ -39,29 +39,20 @@ fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
         };
     };
 
-    let fallback_name = config.name.as_deref().unwrap_or(DEFAULT_CONFIG_STORE_NAME);
-    let fallback_name_lit = LitStr::new(fallback_name, Span::call_site());
-    let override_entries: Vec<_> = config
-        .adapters
-        .iter()
-        .map(|(adapter, cfg)| {
-            let adapter_lit = LitStr::new(adapter, Span::call_site());
-            let name_lit = LitStr::new(&cfg.name, Span::call_site());
-            quote! {
-                edgezero_core::app::ConfigStoreAdapterMetadata::new(#adapter_lit, #name_lit),
-            }
-        })
-        .collect();
+    // The portable manifest carries no platform name — the config store name
+    // resolves to the declared default logical id.
+    let declared_default = config.default_id();
+    let default_name = if declared_default.is_empty() {
+        DEFAULT_CONFIG_STORE_NAME
+    } else {
+        declared_default
+    };
+    let default_name_lit = LitStr::new(default_name, Span::call_site());
 
     quote! {
         fn config_store() -> Option<&'static edgezero_core::app::ConfigStoreMetadata> {
             static CONFIG_STORE: edgezero_core::app::ConfigStoreMetadata =
-                edgezero_core::app::ConfigStoreMetadata::new(
-                    #fallback_name_lit,
-                    &[
-                        #(#override_entries)*
-                    ],
-                );
+                edgezero_core::app::ConfigStoreMetadata::new(#default_name_lit, &[]);
             Some(&CONFIG_STORE)
         }
     }

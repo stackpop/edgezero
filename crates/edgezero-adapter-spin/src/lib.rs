@@ -155,22 +155,18 @@ mod tests {
     }
 
     #[test]
-    fn store_settings_resolve_spin_manifest_overrides() {
+    fn store_settings_resolve_spin_manifest_declarations() {
         let settings = resolve_settings(
             r#"
 [stores.kv]
-name = "GLOBAL_KV"
-
-[stores.kv.adapters.spin]
-name = "SPIN_KV"
+ids = ["SPIN_KV", "cache"]
+default = "SPIN_KV"
 
 [stores.config]
+ids = ["app_config"]
 
 [stores.secrets]
-enabled = false
-
-[stores.secrets.adapters.spin]
-enabled = true
+ids = ["default"]
 "#,
             false,
         );

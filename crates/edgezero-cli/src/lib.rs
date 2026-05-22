@@ -356,7 +356,7 @@ name = "demo-app"
 entry = "crates/demo-core"
 
 [stores.secrets]
-name = "MY_SECRETS"
+ids = ["MY_SECRETS"]
 
 [adapters.fastly.commands]
 build = "echo build"
@@ -376,7 +376,7 @@ serve = "echo serve"
         let loader = ManifestLoader::load_from_str(
             r#"
 [stores.secrets]
-name = "MY_SECRETS"
+ids = ["MY_SECRETS"]
 "#,
         );
 
@@ -391,13 +391,8 @@ name = "MY_SECRETS"
     }
 
     #[test]
-    fn store_bindings_message_respects_secret_store_enabled() {
-        let loader = ManifestLoader::load_from_str(
-            "
-[stores.secrets]
-enabled = false
-",
-        );
+    fn store_bindings_message_is_absent_without_secret_store() {
+        let loader = ManifestLoader::load_from_str("[app]\nname = \"x\"\n");
         assert!(store_bindings_message("fastly", &loader).is_none());
     }
 }
