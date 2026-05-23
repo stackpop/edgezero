@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
 use async_trait::async_trait;
@@ -8,8 +9,10 @@ use validator::Validate;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
 use crate::http::HeaderMap;
-use crate::key_value_store::KvHandle;
-use crate::secret_store::SecretHandle;
+use crate::store_registry::{
+    BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
+    StoreRegistry,
+};
 
 #[async_trait(?Send)]
 pub trait FromRequest: Sized {
@@ -448,110 +451,184 @@ impl<T> ValidatedForm<T> {
     }
 }
 
-/// Extracts the [`KvHandle`] from the request context.
+/// Extractor that yields the per-request [`KvRegistry`] (§6.9).
 ///
-/// Returns `EdgeError::Internal` if no KV store was configured for this request.
+/// Handlers pick a bound store by id at the call site:
 ///
-/// # Example
 /// ```ignore
 /// #[action]
-/// pub async fn handler(Kv(store): Kv) -> Result<String, EdgeError> {
+/// pub async fn handler(kv: Kv) -> Result<String, EdgeError> {
+///     let store = kv.default().ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no default kv")))?;
 ///     let count: i32 = store.get_or("visits", 0).await?;
 ///     store.put("visits", &(count + 1)).await?;
 ///     Ok(format!("visits: {}", count + 1))
 /// }
 /// ```
-#[derive(Debug)]
-pub struct Kv(pub KvHandle);
+///
+/// Or, for a non-default id:
+///
+/// ```ignore
+/// let cache = kv.named("cache").ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no `cache` kv")))?;
+/// ```
+#[derive(Clone, Debug)]
+pub struct Kv(KvRegistry);
 
 #[async_trait(?Send)]
 impl FromRequest for Kv {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.kv_handle().map(Kv).ok_or_else(|| {
-            EdgeError::internal(anyhow::anyhow!(
-                "no kv store configured -- check [stores.kv] in edgezero.toml and platform bindings"
-            ))
-        })
-    }
-}
-
-impl Deref for Kv {
-    type Target = KvHandle;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for Kv {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        if let Some(registry) = ctx.request().extensions().get::<KvRegistry>().cloned() {
+            return Ok(Kv(registry));
+        }
+        // Legacy fallback: synthesize a single-id registry from the lone handle
+        // so adapters that have not yet wired registries keep working.
+        if let Some(handle) = ctx.kv_handle() {
+            return Ok(Kv(single_id_registry(handle)));
+        }
+        Err(EdgeError::internal(anyhow::anyhow!(
+            "no kv store configured -- check [stores.kv] in edgezero.toml and platform bindings"
+        )))
     }
 }
 
 impl Kv {
+    /// Resolve the default [`BoundKvStore`].
     #[must_use]
     #[inline]
-    pub fn into_inner(self) -> KvHandle {
-        self.0
+    pub fn default(&self) -> Option<BoundKvStore> {
+        self.0.default()
+    }
+
+    /// Resolve the [`BoundKvStore`] for `id`. Strict lookup — unknown ids
+    /// yield `None`.
+    #[must_use]
+    #[inline]
+    pub fn named(&self, id: &str) -> Option<BoundKvStore> {
+        self.0.named(id)
+    }
+
+    /// Access the underlying registry directly (rarely needed; most handlers
+    /// should use [`Self::default`] / [`Self::named`]).
+    #[must_use]
+    #[inline]
+    pub fn registry(&self) -> &KvRegistry {
+        &self.0
     }
 }
 
-/// Extracts the [`SecretHandle`] from the request context.
+/// Extractor that yields the per-request [`SecretRegistry`] (§6.9).
 ///
-/// Returns `EdgeError::Internal` if no secret store was configured for this request.
-///
-/// # Example
 /// ```ignore
 /// #[action]
-/// pub async fn handler(Secrets(secrets): Secrets) -> Result<Response, EdgeError> {
-///     let key = secrets.require_str("api-keys", "API_KEY").await.map_err(EdgeError::from)?;
-///     // use key ...
+/// pub async fn handler(secrets: Secrets) -> Result<Response, EdgeError> {
+///     let bound = secrets.default().ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secrets")))?;
+///     let key = bound.require_str("api-keys", "API_KEY").await.map_err(EdgeError::from)?;
+///     // ...
 /// }
 /// ```
-#[derive(Debug)]
-pub struct Secrets(pub SecretHandle);
+#[derive(Clone, Debug)]
+pub struct Secrets(SecretRegistry);
 
 #[async_trait(?Send)]
 impl FromRequest for Secrets {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        // ctx.secret_handle() returns a handle object, not secret bytes.
-        // The error message below contains only store configuration info — no secret values
-        // are included, so this is safe from a cleartext-logging perspective.
-        ctx.secret_handle().map(Secrets).ok_or_else(|| {
-            EdgeError::internal(anyhow::anyhow!(
-                "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
-            ))
-        })
-    }
-}
-
-impl Deref for Secrets {
-    type Target = SecretHandle;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for Secrets {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        if let Some(registry) = ctx.request().extensions().get::<SecretRegistry>().cloned() {
+            return Ok(Secrets(registry));
+        }
+        if let Some(handle) = ctx.secret_handle() {
+            return Ok(Secrets(single_id_registry(handle)));
+        }
+        Err(EdgeError::internal(anyhow::anyhow!(
+            "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
+        )))
     }
 }
 
 impl Secrets {
+    /// Resolve the default [`BoundSecretStore`].
     #[must_use]
     #[inline]
-    pub fn into_inner(self) -> SecretHandle {
-        self.0
+    pub fn default(&self) -> Option<BoundSecretStore> {
+        self.0.default()
     }
+
+    /// Resolve the [`BoundSecretStore`] for `id`. Strict lookup — unknown ids
+    /// yield `None`.
+    #[must_use]
+    #[inline]
+    pub fn named(&self, id: &str) -> Option<BoundSecretStore> {
+        self.0.named(id)
+    }
+
+    /// Access the underlying registry directly.
+    #[must_use]
+    #[inline]
+    pub fn registry(&self) -> &SecretRegistry {
+        &self.0
+    }
+}
+
+/// Extractor that yields the per-request [`ConfigRegistry`] (§6.9).
+///
+/// ```ignore
+/// #[action]
+/// pub async fn handler(config: Config) -> Result<Response, EdgeError> {
+///     let bound = config.default().ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no config")))?;
+///     let greeting = bound.get("greeting").await?.unwrap_or_default();
+///     // ...
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct Config(ConfigRegistry);
+
+#[async_trait(?Send)]
+impl FromRequest for Config {
+    #[inline]
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        if let Some(registry) = ctx.request().extensions().get::<ConfigRegistry>().cloned() {
+            return Ok(Config(registry));
+        }
+        if let Some(handle) = ctx.config_handle() {
+            return Ok(Config(single_id_registry(handle)));
+        }
+        Err(EdgeError::internal(anyhow::anyhow!(
+            "no config store configured -- check [stores.config] in edgezero.toml and platform bindings"
+        )))
+    }
+}
+
+impl Config {
+    /// Resolve the default [`BoundConfigStore`].
+    #[must_use]
+    #[inline]
+    pub fn default(&self) -> Option<BoundConfigStore> {
+        self.0.default()
+    }
+
+    /// Resolve the [`BoundConfigStore`] for `id`. Strict lookup — unknown ids
+    /// yield `None`.
+    #[must_use]
+    #[inline]
+    pub fn named(&self, id: &str) -> Option<BoundConfigStore> {
+        self.0.named(id)
+    }
+
+    /// Access the underlying registry directly.
+    #[must_use]
+    #[inline]
+    pub fn registry(&self) -> &ConfigRegistry {
+        &self.0
+    }
+}
+
+/// Wrap a legacy single handle into a one-id registry under the conventional
+/// `"default"` id. Used by the extractor fallback path while not every adapter
+/// wires a real registry.
+fn single_id_registry<H: Clone>(handle: H) -> StoreRegistry<H> {
+    let mut by_id: BTreeMap<String, H> = BTreeMap::new();
+    by_id.insert("default".to_owned(), handle);
+    StoreRegistry::new(by_id, "default".to_owned())
 }
 
 #[cfg(test)]
@@ -1067,10 +1144,10 @@ mod tests {
         assert_eq!(inner, "example.com");
     }
 
-    // -- Kv extractor -------------------------------------------------------
+    // -- Kv / Secrets / Config extractors (registry-aware) -----------------
 
     #[test]
-    fn kv_extractor_returns_handle_when_configured() {
+    fn kv_extractor_falls_back_to_legacy_handle() {
         use crate::key_value_store::{KvHandle, NoopKvStore};
         use std::sync::Arc;
 
@@ -1084,7 +1161,42 @@ mod tests {
             .insert(KvHandle::new(Arc::new(NoopKvStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
-        block_on(Kv::from_request(&ctx)).expect("Kv extractor when handle present");
+        let kv = block_on(Kv::from_request(&ctx)).expect("Kv extractor when handle present");
+        // No registry wired → synthetic single-id registry under "default".
+        assert!(kv.default().is_some());
+        assert!(kv.named("default").is_some());
+        assert!(kv.named("other").is_none());
+    }
+
+    #[test]
+    fn kv_extractor_prefers_registry_over_legacy_handle() {
+        use crate::key_value_store::{KvHandle, NoopKvStore};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let registry: KvRegistry = StoreRegistry::new(
+            [
+                ("sessions".to_owned(), KvHandle::new(Arc::new(NoopKvStore))),
+                ("cache".to_owned(), KvHandle::new(Arc::new(NoopKvStore))),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "sessions".to_owned(),
+        );
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let kv = block_on(Kv::from_request(&ctx)).expect("Kv extractor when registry present");
+        assert!(kv.named("sessions").is_some());
+        assert!(kv.named("cache").is_some());
+        assert!(kv.named("unknown").is_none());
+        assert_eq!(kv.registry().default_id(), "sessions");
     }
 
     #[test]
@@ -1101,28 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_deref_and_into_inner() {
-        use crate::key_value_store::{KvHandle, NoopKvStore};
-        use std::sync::Arc;
-
-        let handle = KvHandle::new(Arc::new(NoopKvStore));
-        let kv = Kv(handle);
-
-        // Debug works
-        let debug = format!("{kv:?}");
-        assert!(debug.contains("Kv"));
-
-        // Deref works
-        let _: &KvHandle = &kv;
-
-        // into_inner works
-        let _inner = kv.into_inner();
-    }
-
-    // -- Secrets extractor --------------------------------------------------
-
-    #[test]
-    fn secrets_extractor_returns_handle_when_present() {
+    fn secrets_extractor_falls_back_to_legacy_handle() {
         use crate::secret_store::{NoopSecretStore, SecretHandle};
         use std::sync::Arc;
 
@@ -1135,7 +1226,9 @@ mod tests {
             .extensions_mut()
             .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
         let ctx = RequestContext::new(request, PathParams::default());
-        block_on(Secrets::from_request(&ctx)).expect("Secrets extractor when handle present");
+        let secrets =
+            block_on(Secrets::from_request(&ctx)).expect("Secrets extractor when handle present");
+        assert!(secrets.default().is_some());
     }
 
     #[test]
@@ -1148,5 +1241,94 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let err = block_on(Secrets::from_request(&ctx)).unwrap_err();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn config_extractor_resolves_from_registry() {
+        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        struct FixedStore(&'static str);
+        #[async_trait(?Send)]
+        impl ConfigStore for FixedStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(Some(self.0.to_owned()))
+            }
+        }
+
+        let registry: ConfigRegistry = StoreRegistry::new(
+            [
+                (
+                    "primary".to_owned(),
+                    ConfigStoreHandle::new(Arc::new(FixedStore("primary"))),
+                ),
+                (
+                    "analytics".to_owned(),
+                    ConfigStoreHandle::new(Arc::new(FixedStore("analytics"))),
+                ),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "primary".to_owned(),
+        );
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let config =
+            block_on(Config::from_request(&ctx)).expect("Config extractor when registry present");
+        let analytics = config.named("analytics").expect("analytics handle");
+        assert_eq!(
+            block_on(analytics.get("any")).expect("config value"),
+            Some("analytics".to_owned())
+        );
+        assert!(config.named("missing").is_none());
+        assert!(config.default().is_some());
+    }
+
+    #[test]
+    fn config_extractor_falls_back_to_legacy_handle() {
+        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+        use std::sync::Arc;
+
+        struct AnyStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for AnyStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(Some("legacy".to_owned()))
+            }
+        }
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(ConfigStoreHandle::new(Arc::new(AnyStore)));
+        let ctx = RequestContext::new(request, PathParams::default());
+        let config =
+            block_on(Config::from_request(&ctx)).expect("Config extractor when handle present");
+        assert!(config.default().is_some());
+    }
+
+    #[test]
+    fn config_extractor_errors_when_absent() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        let err = block_on(Config::from_request(&ctx)).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message().contains("check [stores.config]"));
     }
 }
