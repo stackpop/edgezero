@@ -3,7 +3,9 @@
 #[cfg(feature = "cli")]
 pub mod cli;
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+// `config_store` compiles on host for its `InMemory` test backend; the
+// production `Kv` backend is feature-gated internally.
+#[cfg(any(test, all(feature = "cloudflare", target_arch = "wasm32")))]
 pub mod config_store;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod context;
@@ -111,23 +113,16 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     init_logger().expect("init cloudflare logger");
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
-    let kv_binding = stores.kv.map_or_else(
-        || crate::request::DEFAULT_KV_BINDING.to_owned(),
-        |meta| env_config.store_name("kv", meta.default),
-    );
-    let config_binding = stores
-        .config
-        .map(|meta| env_config.store_name("config", meta.default));
     let app = A::build_app();
-    crate::request::dispatch_with_bindings(
+    crate::request::dispatch_with_registries(
         &app,
         req,
         env,
         ctx,
-        config_binding.as_deref(),
-        &kv_binding,
-        stores.kv.is_some(),
-        stores.secrets.is_some(),
+        stores.config,
+        stores.kv,
+        stores.secrets,
+        &env_config,
     )
     .await
 }
