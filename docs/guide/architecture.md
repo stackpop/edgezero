@@ -119,11 +119,11 @@ Adapters translate between provider-specific types and the portable core model:
 
 Adapter crates use feature flags to gate provider SDKs and CLI integration:
 
-| Feature       | Crate                       | Purpose                                |
-| ------------- | --------------------------- | -------------------------------------- |
-| `fastly`      | edgezero-adapter-fastly     | Fastly SDK integration                 |
-| `cloudflare`  | edgezero-adapter-cloudflare | Workers SDK integration                |
-| `cli`         | adapter crates              | Register adapters and scaffolding data |
+| Feature        | Crate                       | Purpose                                |
+| -------------- | --------------------------- | -------------------------------------- |
+| `fastly`       | edgezero-adapter-fastly     | Fastly SDK integration                 |
+| `cloudflare`   | edgezero-adapter-cloudflare | Workers SDK integration                |
+| `cli`          | adapter crates              | Register adapters and scaffolding data |
 | `demo-example` | edgezero-cli                | Bundled demo app for development       |
 
 ## Next Steps

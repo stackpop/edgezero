@@ -149,24 +149,30 @@ Access in handlers via the Cloudflare context or environment bindings.
 
 ## Config Store
 
-Cloudflare does not expose a Fastly-style mutable config-store product, so EdgeZero maps
-`[stores.config]` to a single JSON string binding in `wrangler.toml [vars]`:
+Cloudflare does not expose a Fastly-style mutable config-store product, so each
+declared `[stores.config]` id maps to a **KV namespace binding**. Reads are
+asynchronous (`worker::kv::KvStore::get(key).text().await`).
 
 ```toml
 # edgezero.toml
 [stores.config]
-name = "app_config"
+ids     = ["app_config"]
+# default = "app_config"   # required when ids.len() > 1
 ```
 
 ```toml
 # wrangler.toml
-[vars]
-app_config = '{"greeting":"hello from config store","feature.new_checkout":"false"}'
+[[kv_namespaces]]
+binding = "app_config"
+id      = "abc123…"
 ```
 
-At runtime the adapter parses that JSON object and injects it as `ctx.config_store()`. If the
-configured binding is missing or contains invalid JSON, the adapter logs a warning and skips
-config-store injection for that request.
+The binding name comes from `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME`
+(defaulting to the logical id `app_config` when unset). Populate the
+namespace via `wrangler kv:key put`. Missing bindings log a one-time
+warning and the id is dropped from the registry. See
+[the migration guide](../manifest-store-migration.md) if you are coming
+from the pre-rewrite `[vars]`-backed JSON-string form.
 
 ## KV Storage
 

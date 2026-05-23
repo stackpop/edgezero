@@ -420,9 +420,9 @@ ids     = ["default"]
 fact that "this app uses a KV store called `sessions`". No platform
 names, no per-adapter tuning, and **no `[adapters.*]` table**.
 
-| Field                     | Role                                                                          |
-| ------------------------- | ----------------------------------------------------------------------------- |
-| `[stores.<kind>].ids`     | logical ids (`Vec<String>`, non-empty)                                        |
+| Field                     | Role                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------ |
+| `[stores.<kind>].ids`     | logical ids (`Vec<String>`, non-empty)                                         |
 | `[stores.<kind>].default` | resolved default; **required when `ids.len() > 1`**, else resolves to `ids[0]` |
 
 The `app!` macro consumes `edgezero.toml` at **compile time** and
