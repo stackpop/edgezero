@@ -6,10 +6,11 @@
 //! # Limitations
 //!
 //! - **TTL**: The Spin KV API has no TTL support. Calls to
-//!   `put_bytes_with_ttl` return `KvError::Validation` without writing.
+//!   `put_bytes_with_ttl` return [`KvError::Unsupported`] without writing.
 //! - **Listing**: `spin_sdk::key_value::Store::get_keys()` returns all keys
-//!   with no prefix or cursor support. `list_keys_page` therefore returns
-//!   `KvError::Validation` instead of materializing the whole store.
+//!   with no prefix or cursor support. `list_keys_page` currently returns
+//!   [`KvError::LimitExceeded`]; paged listing with a `max_list_keys` cap
+//!   lands when the Spin store registry is wired (Task 2.6 follow-on).
 //!
 //! # Note
 //!
@@ -67,9 +68,9 @@ impl KvStore for SpinKvStore {
         _value: Bytes,
         _ttl: Duration,
     ) -> Result<(), KvError> {
-        Err(KvError::Validation(
-            "Spin KV does not support TTL; use put_bytes for non-expiring values".to_string(),
-        ))
+        Err(KvError::Unsupported {
+            operation: "put_bytes_with_ttl".to_owned(),
+        })
     }
 
     async fn delete(&self, key: &str) -> Result<(), KvError> {
@@ -90,9 +91,10 @@ impl KvStore for SpinKvStore {
         _cursor: Option<&str>,
         _limit: usize,
     ) -> Result<KvPage, KvError> {
-        Err(KvError::Validation(
-            "Spin KV key listing is unsupported because Store::get_keys() is unbounded".to_string(),
-        ))
+        Err(KvError::LimitExceeded {
+            message: "Spin KV key listing is unbounded; max_list_keys cap is not yet wired"
+                .to_owned(),
+        })
     }
 }
 
