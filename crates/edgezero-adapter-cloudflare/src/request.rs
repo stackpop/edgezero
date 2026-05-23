@@ -5,14 +5,17 @@ use crate::config_store::CloudflareConfigStore;
 use crate::context::CloudflareRequestContext;
 use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
-use edgezero_core::app::App;
+use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Method as CoreMethod, Request, Uri};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
+use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
+use std::collections::BTreeMap;
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
 };
@@ -32,8 +35,11 @@ pub const DEFAULT_KV_BINDING: &str = edgezero_core::manifest::DEFAULT_KV_STORE_N
 /// ```
 #[derive(Default)]
 pub(crate) struct Stores {
+    pub(crate) config_registry: Option<ConfigRegistry>,
     pub(crate) config_store: Option<ConfigStoreHandle>,
     pub(crate) kv: Option<KvHandle>,
+    pub(crate) kv_registry: Option<KvRegistry>,
+    pub(crate) secret_registry: Option<SecretRegistry>,
     pub(crate) secrets: Option<SecretHandle>,
 }
 
@@ -153,13 +159,11 @@ pub async fn dispatch_with_config_handle(
     .await
 }
 
-/// Dispatch a request with a Cloudflare JSON config store injected.
+/// Dispatch a request with a Cloudflare KV-backed config store injected.
 ///
-/// Reads `binding_name` from `env` (a `[vars]` string whose value is a JSON object),
-/// parses it into a `CloudflareConfigStore`, and injects the handle before dispatch
-/// when the binding is present and valid.
-///
-/// The KV namespace bound to [`DEFAULT_KV_BINDING`] is also resolved and injected
+/// Opens `binding_name` as a KV namespace and injects a [`CloudflareConfigStore`]
+/// handle whose `get` reads asynchronously from that namespace (§6.6). The KV
+/// namespace bound to [`DEFAULT_KV_BINDING`] is also resolved and injected
 /// (non-required: missing bindings are silently skipped).
 pub async fn dispatch_with_config(
     app: &App,
@@ -168,8 +172,7 @@ pub async fn dispatch_with_config(
     ctx: Context,
     binding_name: &str,
 ) -> Result<CfResponse, WorkerError> {
-    let config_store_handle = CloudflareConfigStore::try_new(&env, binding_name)
-        .map(|store| ConfigStoreHandle::new(Arc::new(store)));
+    let config_store_handle = open_config_or_warn(&env, binding_name);
     let kv = resolve_kv_handle(&env, DEFAULT_KV_BINDING, false)?;
     dispatch_with_handles(
         app,
@@ -195,10 +198,8 @@ pub(crate) async fn dispatch_with_bindings(
     kv_required: bool,
     secrets_required: bool,
 ) -> Result<CfResponse, WorkerError> {
-    let config_store_handle = config_binding.and_then(|binding_name| {
-        CloudflareConfigStore::try_new(&env, binding_name)
-            .map(|store| ConfigStoreHandle::new(Arc::new(store)))
-    });
+    let config_store_handle =
+        config_binding.and_then(|binding_name| open_config_or_warn(&env, binding_name));
     let kv = resolve_kv_handle(&env, kv_binding, kv_required)?;
     let secrets = resolve_secret_handle(&env, secrets_required);
     dispatch_with_handles(
@@ -210,9 +211,20 @@ pub(crate) async fn dispatch_with_bindings(
             config_store: config_store_handle,
             kv,
             secrets,
+            ..Default::default()
         },
     )
     .await
+}
+
+fn open_config_or_warn(env: &Env, binding_name: &str) -> Option<ConfigStoreHandle> {
+    match CloudflareConfigStore::from_env(env, binding_name) {
+        Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
+        Err(err) => {
+            warn_missing_config_binding_once(binding_name, &err.to_string());
+            None
+        }
+    }
 }
 
 /// Dispatch a Cloudflare Worker request with a secret store attached (no KV store).
@@ -297,11 +309,20 @@ async fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<CfResponse, WorkerError> {
+    if let Some(registry) = stores.config_registry {
+        core_request.extensions_mut().insert(registry);
+    }
     if let Some(handle) = stores.config_store {
         core_request.extensions_mut().insert(handle);
     }
+    if let Some(registry) = stores.kv_registry {
+        core_request.extensions_mut().insert(registry);
+    }
     if let Some(handle) = stores.kv {
         core_request.extensions_mut().insert(handle);
+    }
+    if let Some(registry) = stores.secret_registry {
+        core_request.extensions_mut().insert(registry);
     }
     if let Some(handle) = stores.secrets {
         core_request.extensions_mut().insert(handle);
@@ -312,6 +333,99 @@ async fn dispatch_core_request(
         .await
         .map_err(edge_error_to_worker)?;
     from_core_response(response).map_err(edge_error_to_worker)
+}
+
+/// Dispatch with per-id store registries built from baked metadata.
+///
+/// Cloudflare capability map (§6.6):
+/// - KV (Multi): each declared id opens its own KV namespace binding via
+///   `EDGEZERO__STORES__KV__<ID>__NAME` (default = id).
+/// - Config (Multi): each declared id opens its own KV namespace via
+///   `EDGEZERO__STORES__CONFIG__<ID>__NAME`, read asynchronously.
+/// - Secrets (Single): one shared [`crate::secret_store::CloudflareSecretStore`]
+///   is registered under every declared id.
+pub(crate) async fn dispatch_with_registries(
+    app: &App,
+    req: CfRequest,
+    env: Env,
+    ctx: Context,
+    config_meta: Option<StoreMetadata>,
+    kv_meta: Option<StoreMetadata>,
+    secret_meta: Option<StoreMetadata>,
+    env_config: &EnvConfig,
+) -> Result<CfResponse, WorkerError> {
+    let kv_registry = build_kv_registry(&env, kv_meta, env_config)?;
+    let config_registry = build_config_registry(&env, config_meta, env_config);
+    let secret_registry = build_secret_registry(&env, secret_meta);
+    dispatch_with_handles(
+        app,
+        req,
+        env,
+        ctx,
+        Stores {
+            config_registry,
+            kv_registry,
+            secret_registry,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+fn build_kv_registry(
+    env: &Env,
+    kv_meta: Option<StoreMetadata>,
+    env_config: &EnvConfig,
+) -> Result<Option<KvRegistry>, WorkerError> {
+    let Some(meta) = kv_meta else {
+        return Ok(None);
+    };
+    let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let binding = env_config.store_name("kv", id);
+        // Required per-id: `[stores.kv]` is declared, so failure to open is a
+        // runtime error rather than a silent skip.
+        let Some(handle) = resolve_kv_handle(env, &binding, true)? else {
+            continue;
+        };
+        by_id.insert((*id).to_owned(), handle);
+    }
+    if by_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(StoreRegistry::new(by_id, meta.default.to_owned())))
+}
+
+fn build_config_registry(
+    env: &Env,
+    config_meta: Option<StoreMetadata>,
+    env_config: &EnvConfig,
+) -> Option<ConfigRegistry> {
+    let meta = config_meta?;
+    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let binding = env_config.store_name("config", id);
+        if let Some(handle) = open_config_or_warn(env, &binding) {
+            by_id.insert((*id).to_owned(), handle);
+        }
+    }
+    if by_id.is_empty() {
+        return None;
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+}
+
+fn build_secret_registry(env: &Env, secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+    let meta = secret_meta?;
+    // Cloudflare is `Single` for secrets — one shared handle binds every id.
+    let handle = SecretHandle::new(std::sync::Arc::new(
+        crate::secret_store::CloudflareSecretStore::from_env(env.clone()),
+    ));
+    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    for id in meta.ids {
+        by_id.insert((*id).to_owned(), handle.clone());
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
 pub(crate) fn resolve_kv_handle(
@@ -360,6 +474,23 @@ fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl std::fmt::Display
         }
         Err(_) => {
             log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+        }
+    }
+}
+
+fn warn_missing_config_binding_once(binding: &str, error: &impl std::fmt::Display) {
+    static WARNED_BINDINGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let warned_bindings = WARNED_BINDINGS.get_or_init(|| Mutex::new(BTreeSet::new()));
+
+    match warned_bindings.lock() {
+        Ok(mut warned_bindings) => {
+            if !warned_bindings.insert(binding.to_string()) {
+                return;
+            }
+            log::warn!("config KV binding '{}' not available: {}", binding, error);
+        }
+        Err(_) => {
+            log::warn!("config KV binding '{}' not available: {}", binding, error);
         }
     }
 }
