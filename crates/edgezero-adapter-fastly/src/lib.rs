@@ -20,9 +20,11 @@ pub mod response;
 pub mod secret_store;
 
 #[cfg(feature = "fastly")]
-use edgezero_core::app::{App, Hooks, FASTLY_ADAPTER};
+use edgezero_core::app::{App, Hooks};
 #[cfg(feature = "fastly")]
-use edgezero_core::manifest::{ManifestLoader, ResolvedLoggingConfig};
+use edgezero_core::env_config::EnvConfig;
+#[cfg(feature = "fastly")]
+use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 use request::DEFAULT_KV_STORE_NAME;
 
@@ -104,42 +106,49 @@ pub fn init_logger(
     Ok(())
 }
 
+/// Resolve [`FastlyLogging`] from `EDGEZERO__LOGGING__LEVEL`, falling back to
+/// the adapter default when the variable is unset or unparseable.
+#[cfg(feature = "fastly")]
+fn logging_from_env(env: &EnvConfig) -> FastlyLogging {
+    use std::str::FromStr as _;
+
+    let level = env
+        .logging_level()
+        .and_then(|raw| log::LevelFilter::from_str(raw).ok())
+        .unwrap_or(log::LevelFilter::Info);
+    FastlyLogging {
+        echo_stdout: true,
+        endpoint: None,
+        level,
+        use_fastly_logger: true,
+    }
+}
+
 /// Entry point for a Fastly Compute application.
 ///
-/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
+/// Portable store config is baked into `A` by the `app!` macro; adapter-specific
+/// values (platform store names, logging level) are read at runtime from
+/// `EDGEZERO__*` environment variables. No `edgezero.toml` is required.
 ///
 /// # Errors
-/// Returns an error if the manifest is invalid or any required store cannot be opened.
+/// Returns an error if logger setup fails or any required store cannot be opened.
 #[cfg(feature = "fastly")]
 #[inline]
-pub fn run_app<A: Hooks>(
-    manifest_src: &str,
-    req: fastly::Request,
-) -> Result<fastly::Response, fastly::Error> {
-    let manifest_loader = ManifestLoader::try_load_from_str(manifest_src)
-        .map_err(|err| fastly::Error::msg(err.to_string()))?;
-    let manifest = manifest_loader.manifest();
-    let resolved_logging = manifest.logging_or_default(FASTLY_ADAPTER);
-    // Two-path resolution: `A::config_store()` is set at compile time by the
-    // `#[app]` macro and is the common case. The manifest fallback handles
-    // callers that implement `Hooks` manually without the macro — in that case
-    // `A::config_store()` returns `None` while `[stores.config]` in
-    // `edgezero.toml` may still be present.
-    let config_name = A::config_store()
-        .map(|cfg| cfg.name_for_adapter(FASTLY_ADAPTER).to_owned())
-        .or_else(|| {
-            manifest
-                .stores
-                .config
-                .as_ref()
-                .map(|cfg| cfg.config_store_name(FASTLY_ADAPTER).to_owned())
-        });
-    let kv_name = manifest.kv_store_name(FASTLY_ADAPTER).to_owned();
+pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
+    let env = EnvConfig::from_env();
+    let stores = A::stores();
+    let config_name = stores
+        .config
+        .map(|meta| env.store_name("config", meta.default));
+    let kv_name = stores.kv.map_or_else(
+        || DEFAULT_KV_STORE_NAME.to_owned(),
+        |meta| env.store_name("kv", meta.default),
+    );
     let requirements = StoreRequirements {
-        kv_required: manifest.stores.kv.is_some(),
-        secrets_required: manifest.secret_store_enabled("fastly"),
+        kv_required: stores.kv.is_some(),
+        secrets_required: stores.secrets.is_some(),
     };
-    let logging: FastlyLogging = resolved_logging.into();
+    let logging = logging_from_env(&env);
     run_app_with_stores::<A>(
         &logging,
         req,

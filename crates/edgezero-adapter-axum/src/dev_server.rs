@@ -1,8 +1,8 @@
-use std::env;
 use std::fs;
 use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -13,10 +13,11 @@ use tokio::signal;
 use tower::{service_fn, Service as _};
 
 use edgezero_core::addr;
-use edgezero_core::app::{Hooks, AXUM_ADAPTER};
+use edgezero_core::app::{Hooks, StoresMetadata};
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::manifest::{Manifest, ManifestLoader, DEFAULT_KV_STORE_NAME};
+use edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use log::LevelFilter;
@@ -164,8 +165,8 @@ impl AxumDevServer {
     }
 }
 
-fn kv_init_requirement(manifest: &Manifest) -> KvInitRequirement {
-    if manifest.stores.kv.is_some() {
+fn kv_init_requirement(stores: StoresMetadata) -> KvInitRequirement {
+    if stores.kv.is_some() {
         KvInitRequirement::Required
     } else {
         KvInitRequirement::Optional
@@ -281,28 +282,36 @@ async fn serve_with_stores(
     Ok(())
 }
 
+/// Entry point for an Axum dev-server application.
+///
+/// Portable store config is baked into `A` by the `app!` macro; adapter-specific
+/// values (platform store names, bind host/port, logging level) are read at
+/// runtime from `EDGEZERO__*` environment variables. No `edgezero.toml` is
+/// required.
+///
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 #[inline]
-pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
-    let manifest = ManifestLoader::try_load_from_str(manifest_src)?;
-    let manifest_data = manifest.manifest();
-    let logging = manifest_data.logging_or_default(AXUM_ADAPTER);
-    let kv_init_requirement = kv_init_requirement(manifest_data);
-    let kv_store_name = manifest_data.kv_store_name(AXUM_ADAPTER).to_owned();
+pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
+    let env = EnvConfig::from_env();
+    let stores = A::stores();
+    let kv_init_requirement = kv_init_requirement(stores);
+    let kv_store_name = stores.kv.map_or_else(
+        || DEFAULT_KV_STORE_NAME.to_owned(),
+        |meta| env.store_name("kv", meta.default),
+    );
     let kv_path = kv_store_path(&kv_store_name);
-    let has_secret_store = manifest_data.secret_store_enabled("axum");
+    let has_secret_store = stores.secrets.is_some();
+    let config_store_id = stores.config.map(|meta| meta.default);
 
-    let configured_level: LevelFilter = logging.level.into();
-    let level = if logging.echo_stdout.unwrap_or(true) {
-        configured_level
-    } else {
-        LevelFilter::Off
-    };
+    let level = env
+        .logging_level()
+        .and_then(|raw| LevelFilter::from_str(raw).ok())
+        .unwrap_or(LevelFilter::Info);
 
     let _logger_init = SimpleLogger::new().with_level(level).init();
 
-    let resolution = resolve_addr(manifest_data);
+    let resolution = resolve_addr(&env);
     for warning in &resolution.warnings {
         log::warn!("{warning}");
     }
@@ -349,52 +358,32 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
                 }
             }
         };
-        // Axum always resolves the config store from the manifest only.
-        // Unlike Fastly and Cloudflare, it does not check A::config_store() first.
-        // If a user implements Hooks::config_store() without a [stores.config] section
-        // in edgezero.toml, the override is silently ignored on Axum.
-        if A::config_store().is_some() && manifest_data.stores.config.is_none() {
-            log::warn!("A::config_store() is set but [stores.config] is missing in the manifest. This override is ignored on Axum.");
-        }
-        let config_store_handle = manifest_data.stores.config.as_ref().map(|_cfg| {
-            // The portable manifest no longer carries `[stores.config.defaults]`;
-            // the axum config store starts empty and reads from the environment.
+        // The config store is attached whenever `[stores.config]` was declared.
+        // It starts empty and reads from the environment; the portable manifest
+        // no longer carries `[stores.config.defaults]`.
+        let config_store_handle = config_store_id.map(|_id| {
             let store = AxumConfigStore::from_env(iter::empty());
             ConfigStoreHandle::new(Arc::new(store))
         });
         let secret = has_secret_store.then(||  { log::info!("Secret store: reading from environment variables"); SecretHandle::new(Arc::new(
                 EnvSecretStore::new(),
             )) });
-        let stores = Stores {
+        let request_stores = Stores {
             config_store: config_store_handle,
             kv: kv_handle,
             secrets: secret,
         };
-        serve_with_stores(router, listener, true, stores).await
+        serve_with_stores(router, listener, true, request_stores).await
     })
 }
 
-/// Resolve the bind address from environment variables and manifest config.
+/// Resolve the bind address from `EDGEZERO__ADAPTER__*` environment config.
 ///
 /// Precedence (highest wins):
-/// 1. `EDGEZERO_HOST` / `EDGEZERO_PORT` environment variables
-/// 2. `[adapters.axum.adapter]` host/port in the manifest
-/// 3. Default: `127.0.0.1:8787`
-pub(crate) fn resolve_addr(manifest: &Manifest) -> addr::BindAddrResolution {
-    let env_host = env::var("EDGEZERO_HOST").ok();
-    let env_port = env::var("EDGEZERO_PORT").ok();
-    resolve_addr_from_parts(manifest, env_host.as_deref(), env_port.as_deref())
-}
-
-fn resolve_addr_from_parts(
-    manifest: &Manifest,
-    env_host: Option<&str>,
-    env_port: Option<&str>,
-) -> addr::BindAddrResolution {
-    let adapter = manifest.adapters.get("axum");
-    let config_host = adapter.and_then(|entry| entry.adapter.host.as_deref());
-    let config_port = adapter.and_then(|entry| entry.adapter.port);
-    addr::resolve_bind_addr(env_host, env_port, config_host, config_port)
+/// 1. `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`
+/// 2. Default: `127.0.0.1:8787`
+pub(crate) fn resolve_addr(env: &EnvConfig) -> addr::BindAddrResolution {
+    addr::resolve_bind_addr(env.adapter_host(), env.adapter_port(), None, None)
 }
 
 #[cfg(test)]
@@ -469,25 +458,24 @@ mod tests {
 
     #[test]
     fn implicit_default_kv_is_optional() {
-        let manifest = ManifestLoader::load_from_str("");
         assert_eq!(
-            kv_init_requirement(manifest.manifest()),
+            kv_init_requirement(StoresMetadata::default()),
             KvInitRequirement::Optional
         );
     }
 
     #[test]
     fn explicit_kv_config_is_required() {
-        let manifest = ManifestLoader::load_from_str(
-            r#"
-[stores.kv]
-ids = ["EDGEZERO_KV"]
-"#,
-        );
-        assert_eq!(
-            kv_init_requirement(manifest.manifest()),
-            KvInitRequirement::Required
-        );
+        use edgezero_core::app::StoreMetadata;
+
+        let stores = StoresMetadata {
+            kv: Some(StoreMetadata {
+                default: "edgezero_kv",
+                ids: &["edgezero_kv"],
+            }),
+            ..StoresMetadata::default()
+        };
+        assert_eq!(kv_init_requirement(stores), KvInitRequirement::Required);
     }
 
     #[test]
@@ -523,74 +511,39 @@ ids = ["EDGEZERO_KV"]
     }
 
     #[test]
-    fn resolve_addr_defaults_without_manifest_config() {
-        // Note: env var tests use resolve_addr_from_parts to avoid races.
-        let loader = ManifestLoader::load_from_str("");
-        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+    fn resolve_addr_defaults_without_env_config() {
+        let empty: [(&str, &str); 0] = [];
+        let resolution = resolve_addr(&EnvConfig::from_vars(empty));
         assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
         assert!(resolution.warnings.is_empty());
     }
 
     #[test]
-    fn resolve_addr_reads_manifest_host_and_port() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "0.0.0.0"
-port = 3000
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+    fn resolve_addr_reads_env_host_and_port() {
+        let env = EnvConfig::from_vars([
+            ("EDGEZERO__ADAPTER__HOST", "0.0.0.0"),
+            ("EDGEZERO__ADAPTER__PORT", "3000"),
+        ]);
+        let resolution = resolve_addr(&env);
         assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 3000)));
         assert!(resolution.warnings.is_empty());
     }
 
     #[test]
-    fn resolve_addr_env_overrides_manifest() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "127.0.0.1"
-port = 3000
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), Some("4000"));
-        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
-        assert!(resolution.warnings.is_empty());
-    }
-
-    #[test]
     fn resolve_addr_partial_env_override() {
-        let manifest = "
-[adapters.axum.adapter]
-port = 5000
-";
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), None);
-        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
+        let env = EnvConfig::from_vars([("EDGEZERO__ADAPTER__HOST", "0.0.0.0")]);
+        let resolution = resolve_addr(&env);
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 8787)));
         assert!(resolution.warnings.is_empty());
     }
 
     #[test]
-    fn resolve_addr_invalid_env_falls_back_to_manifest() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "0.0.0.0"
-port = 5000
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), Some("not-an-ip"), Some("abc"));
-        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
-        assert_eq!(resolution.warnings.len(), 2);
-    }
-
-    #[test]
-    fn resolve_addr_invalid_manifest_falls_back_to_default() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "localhost"
-port = 0
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+    fn resolve_addr_invalid_env_falls_back_to_default() {
+        let env = EnvConfig::from_vars([
+            ("EDGEZERO__ADAPTER__HOST", "not-an-ip"),
+            ("EDGEZERO__ADAPTER__PORT", "abc"),
+        ]);
+        let resolution = resolve_addr(&env);
         assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
         assert_eq!(resolution.warnings.len(), 2);
     }

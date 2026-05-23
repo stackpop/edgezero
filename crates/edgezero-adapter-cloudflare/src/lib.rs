@@ -62,61 +62,72 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
+/// Build an [`EnvConfig`](edgezero_core::env_config::EnvConfig) from a
+/// Cloudflare `Env`. Workers have no `std::env`, and the `Env` binding object
+/// cannot be enumerated, so the exact `EDGEZERO__STORES__<KIND>__<ID>__NAME`
+/// keys are derived from the baked store metadata and queried individually,
+/// alongside the fixed `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*` keys.
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+fn env_config_from_worker(
+    env: &worker::Env,
+    stores: edgezero_core::app::StoresMetadata,
+) -> edgezero_core::env_config::EnvConfig {
+    let mut keys: Vec<String> = vec![
+        "EDGEZERO__ADAPTER__HOST".to_owned(),
+        "EDGEZERO__ADAPTER__PORT".to_owned(),
+        "EDGEZERO__LOGGING__LEVEL".to_owned(),
+    ];
+    for (kind, meta) in [
+        ("CONFIG", stores.config),
+        ("KV", stores.kv),
+        ("SECRETS", stores.secrets),
+    ] {
+        if let Some(meta) = meta {
+            for id in meta.ids {
+                keys.push(format!(
+                    "EDGEZERO__STORES__{kind}__{}__NAME",
+                    id.to_ascii_uppercase()
+                ));
+            }
+        }
+    }
+    let vars = keys
+        .into_iter()
+        .filter_map(|key| env.var(&key).ok().map(|value| (key, value.to_string())));
+    edgezero_core::env_config::EnvConfig::from_vars(vars)
+}
+
 /// Entry point for a Cloudflare Workers application.
 ///
-/// **Breaking change (pre-1.0):** `manifest_src` is now a required parameter.
-/// Callers previously using `run_app_with_manifest` can rename to `run_app` —
-/// the signatures are identical.
+/// Portable store config is baked into `A` by the `app!` macro; adapter-specific
+/// values (platform store names) are read at runtime from `EDGEZERO__*`
+/// variables on the worker `Env`. No `edgezero.toml` is required.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub async fn run_app<A: edgezero_core::app::Hooks>(
-    manifest_src: &str,
     req: worker::Request,
     env: worker::Env,
     ctx: worker::Context,
 ) -> Result<worker::Response, worker::Error> {
     init_logger().expect("init cloudflare logger");
-    let manifest_loader = edgezero_core::manifest::ManifestLoader::try_load_from_str(manifest_src)
-        .map_err(|err| worker::Error::RustError(err.to_string()))?;
-    let manifest = manifest_loader.manifest();
-    let kv_binding = manifest.kv_store_name(edgezero_core::app::CLOUDFLARE_ADAPTER);
-    let kv_required = manifest.stores.kv.is_some();
-    // Two-path resolution: `A::config_store()` is set at compile time by the
-    // `#[app]` macro and is the common case. The manifest fallback handles
-    // callers that implement `Hooks` manually without the macro — in that case
-    // `A::config_store()` returns `None` while `[stores.config]` in
-    // `edgezero.toml` may still be present.
-    let config_binding = A::config_store()
-        .map(|cfg| cfg.name_for_adapter(edgezero_core::app::CLOUDFLARE_ADAPTER))
-        .or_else(|| {
-            manifest
-                .stores
-                .config
-                .as_ref()
-                .map(|cfg| cfg.config_store_name(edgezero_core::app::CLOUDFLARE_ADAPTER))
-        });
-    let secrets_required = manifest.secret_store_enabled("cloudflare");
+    let stores = A::stores();
+    let env_config = env_config_from_worker(&env, stores);
+    let kv_binding = stores.kv.map_or_else(
+        || crate::request::DEFAULT_KV_BINDING.to_owned(),
+        |meta| env_config.store_name("kv", meta.default),
+    );
+    let config_binding = stores
+        .config
+        .map(|meta| env_config.store_name("config", meta.default));
     let app = A::build_app();
     crate::request::dispatch_with_bindings(
         &app,
         req,
         env,
         ctx,
-        config_binding,
-        kv_binding,
-        kv_required,
-        secrets_required,
+        config_binding.as_deref(),
+        &kv_binding,
+        stores.kv.is_some(),
+        stores.secrets.is_some(),
     )
     .await
-}
-
-/// Deprecated: use [`run_app`] which now takes `manifest_src` directly.
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-#[deprecated(note = "use run_app instead, which now takes manifest_src")]
-pub async fn run_app_with_manifest<A: edgezero_core::app::Hooks>(
-    manifest_src: &str,
-    req: worker::Request,
-    env: worker::Env,
-    ctx: worker::Context,
-) -> Result<worker::Response, worker::Error> {
-    run_app::<A>(manifest_src, req, env, ctx).await
 }
