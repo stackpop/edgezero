@@ -365,4 +365,131 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&*body, b"has_kv=false");
     }
+
+    /// Two-id KV registry: `ctx.kv_store("sessions")` and
+    /// `ctx.kv_store("cache")` must each resolve to their own backing store.
+    /// `ctx.kv_store_default()` must resolve to the registered default id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_kv_registry_resolves_named_and_default() {
+        use crate::key_value_store::PersistentKvStore;
+        use edgezero_core::store_registry::{KvRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let sessions_store: Arc<dyn KvStore> =
+            Arc::new(PersistentKvStore::new(temp_dir.path().join("sessions.redb")).unwrap());
+        let sessions_handle = KvHandle::new(Arc::clone(&sessions_store));
+        sessions_handle
+            .put("greeting", &"hello-from-sessions")
+            .await
+            .unwrap();
+
+        let cache_store: Arc<dyn KvStore> =
+            Arc::new(PersistentKvStore::new(temp_dir.path().join("cache.redb")).unwrap());
+        let cache_handle = KvHandle::new(Arc::clone(&cache_store));
+        cache_handle
+            .put("greeting", &"hello-from-cache")
+            .await
+            .unwrap();
+
+        let by_id: BTreeMap<String, KvHandle> = [
+            ("sessions".to_owned(), sessions_handle),
+            ("cache".to_owned(), cache_handle),
+        ]
+        .into_iter()
+        .collect();
+        let registry: KvRegistry = StoreRegistry::new(by_id, "sessions".to_owned());
+
+        let router = RouterService::builder()
+            .get("/named/{id}", |ctx: RequestContext| async move {
+                let id = ctx
+                    .path_params()
+                    .get("id")
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                let store = ctx
+                    .kv_store(&id)
+                    .ok_or_else(|| EdgeError::not_found(format!("kv id `{id}` not registered")))?;
+                let value: String = store.get_or("greeting", String::new()).await.unwrap();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(value))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .get("/default", |ctx: RequestContext| async move {
+                let store = ctx
+                    .kv_store_default()
+                    .expect("default kv store is registered");
+                let value: String = store.get_or("greeting", String::new()).await.unwrap();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(value))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let service = EdgeZeroAxumService::new(router).with_kv_registry(registry);
+
+        assert_eq!(
+            body_at(&service, "/named/sessions").await,
+            "hello-from-sessions"
+        );
+        assert_eq!(body_at(&service, "/named/cache").await, "hello-from-cache");
+        assert_eq!(body_at(&service, "/default").await, "hello-from-sessions");
+    }
+
+    /// Unknown ids on a wired registry yield `None` — strict lookup, no
+    /// fallback to the default. The handler returns 404 in that case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kv_registry_lookup_is_strict_for_unknown_ids() {
+        use crate::key_value_store::PersistentKvStore;
+        use edgezero_core::store_registry::{KvRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let only_store: Arc<dyn KvStore> =
+            Arc::new(PersistentKvStore::new(temp_dir.path().join("only.redb")).unwrap());
+        let only_handle = KvHandle::new(Arc::clone(&only_store));
+
+        let by_id: BTreeMap<String, KvHandle> =
+            [("only".to_owned(), only_handle)].into_iter().collect();
+        let registry: KvRegistry = StoreRegistry::new(by_id, "only".to_owned());
+
+        let router = RouterService::builder()
+            .get("/lookup/{id}", |ctx: RequestContext| async move {
+                let id = ctx
+                    .path_params()
+                    .get("id")
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                let present = ctx.kv_store(&id).is_some();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(format!("present={present}")))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let service = EdgeZeroAxumService::new(router).with_kv_registry(registry);
+
+        assert_eq!(body_at(&service, "/lookup/only").await, "present=true");
+        assert_eq!(body_at(&service, "/lookup/missing").await, "present=false");
+    }
+
+    /// Send a GET request through `service` and return the response body as a UTF-8 string.
+    /// Lifted out of the registry-aware tests so each can stay flat (clippy
+    /// `items_after_statements` rejects nested `async fn` definitions).
+    async fn body_at(service: &EdgeZeroAxumService, path: &str) -> String {
+        let request = Request::builder()
+            .uri(path)
+            .body(AxumBody::empty())
+            .unwrap();
+        let mut svc = service.clone();
+        let response = svc.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
 }
