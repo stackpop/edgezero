@@ -138,15 +138,17 @@ Fastly logging is wired when you call `init_logger` (or `run_app`); otherwise no
 
 ## Config Store
 
-Fastly uses a native Config Store resource link for runtime configuration. Declare the logical store
-name in `edgezero.toml`:
+Fastly uses a native Config Store resource link for runtime configuration. Declare logical config
+ids in `edgezero.toml`; each id opens its own platform store via
+`EDGEZERO__STORES__CONFIG__<ID>__NAME` (default = the logical id):
 
 ```toml
 [stores.config]
-name = "app_config"
+ids     = ["app_config"]
+# default = "app_config"   # required when ids.len() > 1
 ```
 
-For local Viceroy testing, mirror that binding in `fastly.toml`:
+For local Viceroy testing, mirror the platform name in `fastly.toml`:
 
 ```toml
 [local_server.config_stores.app_config]
@@ -156,8 +158,19 @@ format = "inline-toml"
 greeting = "hello from config store"
 ```
 
-Handlers can then read values through `ctx.config_store()`. If the configured store link is missing,
-the adapter logs a warning and continues without injecting a config-store handle.
+Handlers read values through the `Config` extractor or `ctx.config_store(id)`:
+
+```rust
+async fn handler(config: Config) -> Result<Response, EdgeError> {
+    let store = config.named("app_config").ok_or_else(|| EdgeError::service_unavailable("no `app_config`"))?;
+    let greeting = store.get("greeting").await?.unwrap_or_default();
+    // …
+}
+```
+
+If a configured store link is missing, the adapter logs a one-time warning
+and drops that id from the registry. Migrating from `name`/`adapters.*`?
+See [the migration guide](../manifest-store-migration.md).
 
 ## Context Access
 

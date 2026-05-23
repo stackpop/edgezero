@@ -41,9 +41,16 @@ Adapters surface a `dispatch` function that bridges from the provider event loop
 
 This helper is what demo entrypoints and adapters call when wiring their platform-specific main functions.
 
-## Config Store Resolution
+## Store Registry Resolution
 
-When wiring adapters, Fastly and Cloudflare check `Hooks::config_store()` first to allow custom overrides, and then fall back to the manifest. However, the Axum adapter resolves the config store exclusively from `edgezero.toml` defaults (`[stores.config.defaults]`) and currently ignores custom `Hooks::config_store()` implementations.
+All four adapters resolve KV, config, and secret stores from the portable
+`Hooks::stores()` metadata baked by the `app!` macro plus `EDGEZERO__*`
+environment variables (see [the migration guide](../manifest-store-migration.md)
+for the schema change). Each adapter builds a per-request
+`StoreRegistry<H>` keyed by logical id; handlers reach a bound store via
+the id-keyed `Kv` / `Secrets` / `Config` extractors or the matching
+`ctx.kv_store(id)` / `ctx.config_store(id)` / `ctx.secret_store(id)`
+accessors. The pre-rewrite `Hooks::config_store()` hook is gone.
 
 ## Proxy Integration
 

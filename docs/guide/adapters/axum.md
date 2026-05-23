@@ -137,23 +137,41 @@ cargo test -p my-app-adapter-axum
 
 ## Config Store
 
-For local development, the Axum adapter only reads environment variables for keys declared in
-`[stores.config.defaults]`, then falls back to those defaults in `edgezero.toml`:
+For local development, each declared `[stores.config]` id resolves to a
+local-file config store backed by `.edgezero/local-config-<id>.json`.
+The portable manifest carries no inline defaults — the
+pre-rewrite `[stores.config.defaults]` table is gone (see
+[the migration guide](../manifest-store-migration.md)).
 
 ```toml
 [stores.config]
-name = "app_config"
-
-[stores.config.defaults]
-"greeting" = "hello from config store"
-"feature.new_checkout" = "false"
-"service.timeout_ms" = ""
+ids     = ["app_config"]
+# default = "app_config"   # required when ids.len() > 1
 ```
 
-Handlers access the injected store through `ctx.config_store()`. Environment variables take
-precedence over manifest defaults. If a key should be overrideable from env without carrying a real
-default value, declare it with an empty-string placeholder. Do not pass raw user input straight to
-`ctx.config_store()?.get(...)` in production handlers; validate or allowlist keys first.
+```jsonc
+// .edgezero/local-config-app_config.json
+{
+  "greeting": "hello from config store",
+  "feature.new_checkout": "false",
+  "service.timeout_ms": "1500",
+}
+```
+
+Handlers access stores via the `Config` extractor or `ctx.config_store(id)`:
+
+```rust
+async fn handler(config: Config) -> Result<Response, EdgeError> {
+    let store = config.default().ok_or_else(|| EdgeError::service_unavailable("no default config"))?;
+    let greeting = store.get("greeting").await?.unwrap_or_default();
+    // …
+}
+```
+
+Do not pass raw user input straight to `store.get(…)` in production
+handlers; validate or allowlist keys first. (`config push` will write
+`.edgezero/local-config-<id>.json` from a typed app-config in Stage 7;
+until then, populate it directly.)
 
 ## Container Deployment
 

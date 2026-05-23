@@ -150,37 +150,28 @@ the `Secrets` extractor. This is separate from `[[environment.secrets]]`:
 
 ```toml
 [stores.secrets]
-name = "EDGEZERO_SECRETS"
-
-[stores.secrets.adapters.fastly]
-name = "MY_FASTLY_SECRETS"
+ids     = ["default"]            # one id per logical secret store
+# default = "default"            # required when ids.len() > 1
 ```
 
-### Global Fields
-
-| Field     | Required | Description                                                                                                 |
-| --------- | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `enabled` | No       | Whether secrets are enabled for adapters without overrides (defaults to `true` when the section is present) |
-| `name`    | No       | Store or binding name (defaults to `EDGEZERO_SECRETS`)                                                      |
-
-### Per-Adapter Overrides
-
-| Field                        | Required | Description                                   |
-| ---------------------------- | -------- | --------------------------------------------- |
-| `adapters.<adapter>.enabled` | No       | Override whether that adapter exposes secrets |
-| `adapters.<adapter>.name`    | No       | Override the adapter-specific store name      |
+The portable `[stores.<kind>]` schema declares **logical ids only**.
+Platform names are resolved at runtime from
+`EDGEZERO__STORES__SECRETS__<ID>__NAME` (defaulting to the logical id
+when unset). Migrating from the pre-rewrite `name` /
+`[stores.secrets.adapters.*]` form? See
+[the migration guide](./manifest-store-migration.md).
 
 ### Adapter Behavior
 
-- Axum reads secrets from process environment variables of the same name.
-- Fastly opens the configured secret store name from `fastly.toml`.
-- Cloudflare reads Worker Secrets individually; the configured `name` is metadata only.
-- Spin reads component variables from `spin.toml` in a single flat namespace. The configured `name`
-  and named secret-store overrides are metadata only for Spin; variable names must be declared in
-  lowercase and are looked up through the Spin variables API.
+| Adapter    | Capability                       | Notes                                                                            |
+| ---------- | -------------------------------- | -------------------------------------------------------------------------------- |
+| axum       | Single (env vars)                | Every declared id maps to the same env-backed store                              |
+| cloudflare | Single (Worker Secrets)          | Per-id `NAME` variables are ignored                                              |
+| fastly     | Multi (Fastly Secret Store)      | Each id opens its own platform store via `EDGEZERO__STORES__SECRETS__<ID>__NAME` |
+| spin       | Single (flat Spin `[variables]`) | Per-id `NAME` variables are ignored                                              |
 
-If `[stores.secrets]` is omitted, the `Secrets` extractor is not attached for
-that adapter. The Spin `run_app` helper honors this manifest gate.
+If `[stores.secrets]` is omitted, the `Secrets` extractor is not attached and
+the runtime `secret_store` accessors on `RequestContext` return `None`.
 
 ## Stores Section
 
@@ -189,39 +180,37 @@ or service settings:
 
 ```toml
 [stores.config]
-name = "app_config"
-
-[stores.config.defaults]
-"greeting" = "hello from config store"
-"service.timeout_ms" = "1500"
-
-[stores.config.adapters.cloudflare]
-name = "app_config"
+ids     = ["app_config"]         # one id per logical config store
+# default = "app_config"         # required when ids.len() > 1
 ```
 
-| Field      | Required | Description                                                                                                       |
-| ---------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
-| `name`     | No       | Global store or binding name; if omitted but the section is present, adapters fall back to `EDGEZERO_CONFIG`      |
-| `adapters` | No       | Per-adapter name overrides, keyed by supported lowercase adapter name (`axum`, `cloudflare`, `fastly`)            |
-| `defaults` | No       | Local default values used by the Axum adapter when env vars are absent; this key set is also Axum's env allowlist |
+The portable schema is symmetric across `[stores.kv]`, `[stores.config]`,
+and `[stores.secrets]`: declare logical `ids` only; resolve platform
+names at runtime via `EDGEZERO__STORES__<KIND>__<ID>__NAME`. The
+pre-rewrite `name`, `enabled`, `[stores.config.defaults]`, and
+`[stores.config.adapters.*]` fields are a hard load error — see
+[the migration guide](./manifest-store-migration.md).
 
 Runtime behavior by adapter:
 
-- Fastly reads from a Fastly Config Store resource link.
-- Cloudflare reads from a single JSON string binding in `wrangler.toml [vars]`.
-- Axum reads only the env vars declared in `defaults`, then falls back to `defaults`.
-- Spin reads component variables declared in `spin.toml`. Spin variables use a flat namespace with
-  lowercase names; there is no config-store binding name, so `[stores.config.adapters.spin]` is
-  rejected during manifest validation.
+- Fastly reads from a Fastly Config Store resource link, one per id.
+- Cloudflare reads from a KV namespace, one per id, asynchronously.
+- Axum reads from `.edgezero/local-config-<id>.json` per logical id
+  (one file per declared config id). The `config push` command will
+  write that file in Stage 7; until then, populate it directly.
+- Spin reads component variables declared in `spin.toml`. Spin's
+  variable namespace is flat (single-store), so declaring `ids.len() > 1`
+  for `[stores.config]` while targeting Spin is caught by
+  `config validate`.
 
-When `[stores.config]` is present, the `app!` macro generates config-store metadata on the `App`
-type. The standard adapter `run_app` helpers use that metadata to inject a config-store handle into
-request extensions automatically, so handlers can call `ctx.config_store()`. The Spin `run_app`
-helper also reads the embedded manifest and injects the config store only when `[stores.config]`
-exists or macro-generated config-store metadata is present.
+When `[stores.config]` is present, the `app!` macro bakes the portable
+store registry into `Hooks::stores()`. Adapter `run_app` helpers build
+a per-request `ConfigRegistry` and inject it into request extensions so
+handlers can call `ctx.config_store("app_config")` (or
+`ctx.config_store_default()`).
 
 Treat config-store keys like API surface: validate or allowlist any user-controlled lookup before
-calling `ctx.config_store()?.get(...)`.
+calling `ctx.config_store_default()?.get(...)`.
 
 ## Adapters Section
 
@@ -325,7 +314,7 @@ value = "https://api.example.com"
 name = "API_KEY"
 
 [stores.secrets]
-name = "EDGEZERO_SECRETS"
+ids = ["default"]
 
 [adapters.fastly.adapter]
 crate = "crates/my-app-adapter-fastly"
@@ -403,7 +392,7 @@ The macro:
 - Parses HTTP triggers
 - Generates route registration
 - Wires middleware from the manifest
-- Generates config-store metadata from `[stores.config]` when present
+- Bakes portable store metadata (`Hooks::stores()`) from `[stores.kv]`, `[stores.config]`, and `[stores.secrets]` when present
 - Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
 
 ### ManifestLoader
