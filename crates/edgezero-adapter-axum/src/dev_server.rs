@@ -1034,7 +1034,10 @@ mod integration_tests {
     }
 
     #[action]
-    async fn secret_value_handler(Secrets(store): Secrets) -> Result<String, EdgeError> {
+    async fn secret_value_handler(secrets: Secrets) -> Result<String, EdgeError> {
+        let store = secrets
+            .default()
+            .ok_or_else(|| EdgeError::service_unavailable("no default secret store registered"))?;
         store
             .require_str("test-store", "API_KEY")
             .await

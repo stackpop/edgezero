@@ -172,7 +172,10 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
 
 /// Increment and return a visit counter stored in KV.
 #[action]
-pub async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
+pub async fn kv_counter(kv: Kv) -> Result<Response, EdgeError> {
+    let store = kv
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
     let count: i64 = store
         .read_modify_write("demo:counter", 0_i64, |n| n.wrapping_add(1))
         .await?;
@@ -187,10 +190,13 @@ pub async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
 /// Store a note by id (body = note text).
 #[action]
 pub async fn kv_note_put(
-    Kv(store): Kv,
+    kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
     RequestContext(ctx): RequestContext,
 ) -> Result<Response, EdgeError> {
+    let store = kv
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
     let body = ctx.into_request().into_body();
     let body_bytes = body.into_bytes_bounded(MAX_BODY_SIZE).await?;
     store
@@ -205,9 +211,12 @@ pub async fn kv_note_put(
 /// Read a note by id.
 #[action]
 pub async fn kv_note_get(
-    Kv(store): Kv,
+    kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
+    let store = kv
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
     match store.get_bytes(&format!("note:{}", path.id)).await? {
         Some(data) => http::response_builder()
             .status(StatusCode::OK)
@@ -221,9 +230,12 @@ pub async fn kv_note_get(
 /// Delete a note by id.
 #[action]
 pub async fn kv_note_delete(
-    Kv(store): Kv,
+    kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
+    let store = kv
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
     store.delete(&format!("note:{}", path.id)).await?;
     http::response_builder()
         .status(StatusCode::NO_CONTENT)
@@ -243,7 +255,7 @@ pub async fn kv_note_delete(
 /// Usage: `GET /secrets/echo?name=SMOKE_SECRET`
 #[action]
 pub async fn secrets_echo(
-    Secrets(store): Secrets,
+    secrets: Secrets,
     Query(params): Query<EchoParams>,
 ) -> Result<Text<String>, EdgeError> {
     match params.name.as_str() {
@@ -255,6 +267,9 @@ pub async fn secrets_echo(
         }
     }
 
+    let store = secrets
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default secret store registered"))?;
     let value = store
         .require_str(SECRET_STORE_NAME, &params.name)
         .await
