@@ -29,5 +29,6 @@ pub mod responder;
 pub mod response;
 pub mod router;
 pub mod secret_store;
+pub mod store_registry;
 
 pub use edgezero_macros::{action, app};

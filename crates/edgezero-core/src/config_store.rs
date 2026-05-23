@@ -1,12 +1,14 @@
 //! Provider-neutral read-only configuration store abstraction.
 //!
-//! All platforms expose config reads as synchronous operations, so no
-//! `async_trait` is needed here.
+//! `ConfigStore::get` is `async` because the Cloudflare config store reads
+//! from a KV namespace whose `get` is JS-interop and asynchronous. Other
+//! backends complete synchronously and resolve immediately.
 
 use std::fmt;
 use std::sync::Arc;
 
 use anyhow::Error as AnyError;
+use async_trait::async_trait;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -43,52 +45,72 @@ macro_rules! config_store_contract_tests {
             use super::*;
             use $crate::config_store::ConfigStore;
 
+            fn run<Fut: ::std::future::Future>(future: Fut) -> Fut::Output {
+                ::futures::executor::block_on(future)
+            }
+
             #[$test_attr]
             fn contract_get_returns_value_for_existing_key() {
                 let store = $factory;
-                assert_eq!(
-                    store.get("contract.key.a").expect("config value"),
-                    Some("value_a".to_owned())
-                );
+                run(async {
+                    assert_eq!(
+                        store.get("contract.key.a").await.expect("config value"),
+                        Some("value_a".to_owned())
+                    );
+                });
             }
 
             #[$test_attr]
             fn contract_get_returns_none_for_missing_key() {
                 let store = $factory;
-                assert_eq!(store.get("contract.key.missing").expect("config miss"), None);
+                run(async {
+                    assert_eq!(
+                        store.get("contract.key.missing").await.expect("config miss"),
+                        None
+                    );
+                });
             }
 
             #[$test_attr]
             fn contract_multiple_keys_are_independent() {
                 let store = $factory;
-                assert_eq!(
-                    store.get("contract.key.a").expect("first config value"),
-                    Some("value_a".to_owned())
-                );
-                assert_eq!(
-                    store.get("contract.key.b").expect("second config value"),
-                    Some("value_b".to_owned())
-                );
+                run(async {
+                    assert_eq!(
+                        store.get("contract.key.a").await.expect("first config value"),
+                        Some("value_a".to_owned())
+                    );
+                    assert_eq!(
+                        store.get("contract.key.b").await.expect("second config value"),
+                        Some("value_b".to_owned())
+                    );
+                });
             }
 
             #[$test_attr]
             fn contract_key_lookup_is_case_sensitive() {
                 let store = $factory;
-                // lowercase "contract.key.a" exists; uppercase must not match
-                assert_eq!(store.get("CONTRACT.KEY.A").expect("case-sensitive miss"), None);
+                run(async {
+                    // lowercase "contract.key.a" exists; uppercase must not match
+                    assert_eq!(
+                        store.get("CONTRACT.KEY.A").await.expect("case-sensitive miss"),
+                        None
+                    );
+                });
             }
 
             #[$test_attr]
             fn contract_empty_key_returns_none_or_invalid_key() {
                 let store = $factory;
-                // Backends may either return Ok(None) or Err(InvalidKey) for an empty key.
-                // Fastly's Config Store SDK may reject empty keys rather than returning None.
-                match store.get("") {
-                    Ok(None) => {}
-                    Ok(Some(_)) => panic!("empty key should not return a value"),
-                    Err($crate::config_store::ConfigStoreError::InvalidKey { .. }) => {}
-                    Err(err) => panic!("unexpected error for empty key: {}", err),
-                }
+                run(async {
+                    // Backends may either return Ok(None) or Err(InvalidKey) for an empty key.
+                    // Fastly's Config Store SDK may reject empty keys rather than returning None.
+                    match store.get("").await {
+                        Ok(None) => {}
+                        Ok(Some(_)) => panic!("empty key should not return a value"),
+                        Err($crate::config_store::ConfigStoreError::InvalidKey { .. }) => {}
+                        Err(err) => panic!("unexpected error for empty key: {}", err),
+                    }
+                });
             }
 
             #[$test_attr]
@@ -97,11 +119,16 @@ macro_rules! config_store_contract_tests {
                 use $crate::config_store::ConfigStoreHandle;
 
                 let handle = ConfigStoreHandle::new(Arc::new($factory));
-                assert_eq!(
-                    handle.get("contract.key.a").expect("handle value"),
-                    Some("value_a".to_owned())
-                );
-                assert_eq!(handle.get("contract.key.missing").expect("handle miss"), None);
+                run(async {
+                    assert_eq!(
+                        handle.get("contract.key.a").await.expect("handle value"),
+                        Some("value_a".to_owned())
+                    );
+                    assert_eq!(
+                        handle.get("contract.key.missing").await.expect("handle miss"),
+                        None
+                    );
+                });
             }
 
             #[$test_attr]
@@ -111,14 +138,16 @@ macro_rules! config_store_contract_tests {
 
                 let h1 = ConfigStoreHandle::new(Arc::new($factory));
                 let h2 = h1.clone();
-                assert_eq!(
-                    h1.get("contract.key.a").expect("first handle value"),
-                    h2.get("contract.key.a").expect("second handle value")
-                );
-                assert_eq!(
-                    h1.get("contract.key.missing").expect("first handle miss"),
-                    h2.get("contract.key.missing").expect("second handle miss")
-                );
+                run(async {
+                    assert_eq!(
+                        h1.get("contract.key.a").await.expect("first handle value"),
+                        h2.get("contract.key.a").await.expect("second handle value")
+                    );
+                    assert_eq!(
+                        h1.get("contract.key.missing").await.expect("first handle miss"),
+                        h2.get("contract.key.missing").await.expect("second handle miss")
+                    );
+                });
             }
         }
     };
@@ -182,14 +211,15 @@ impl ConfigStoreError {
 /// Implementations exist per adapter:
 /// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
 /// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
-/// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare env bindings
+/// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare KV namespace
 /// - `SpinConfigStore` (spin adapter) — Spin component variables
+#[async_trait(?Send)]
 pub trait ConfigStore: Send + Sync {
     /// Retrieve a config value by key. Returns `None` if the key does not exist.
     ///
     /// # Errors
     /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,8 +245,8 @@ impl ConfigStoreHandle {
     /// # Errors
     /// Returns [`ConfigStoreError`] if `key` is invalid or the backend is unavailable.
     #[inline]
-    pub fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-        self.store.get(key)
+    pub async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        self.store.get(key).await
     }
 
     /// Create a new handle wrapping a config store implementation.
@@ -239,6 +269,7 @@ mod tests {
     );
 
     use super::*;
+    use futures::executor::block_on;
     use std::collections::HashMap;
 
     struct FailingConfigStore;
@@ -247,14 +278,16 @@ mod tests {
         data: HashMap<String, String>,
     }
 
+    #[async_trait(?Send)]
     impl ConfigStore for FailingConfigStore {
-        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
     }
 
+    #[async_trait(?Send)]
     impl ConfigStore for TestConfigStore {
-        fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.data.get(key).cloned())
         }
     }
@@ -278,7 +311,7 @@ mod tests {
     fn config_store_get_returns_none_for_missing_key() {
         let store_handle = handle(&[]);
         assert_eq!(
-            store_handle.get("nonexistent").expect("missing config"),
+            block_on(store_handle.get("nonexistent")).expect("missing config"),
             None
         );
     }
@@ -287,7 +320,7 @@ mod tests {
     fn config_store_get_returns_value_for_existing_key() {
         let store_handle = handle(&[("feature.checkout", "true")]);
         assert_eq!(
-            store_handle.get("feature.checkout").expect("config value"),
+            block_on(store_handle.get("feature.checkout")).expect("config value"),
             Some("true".to_owned())
         );
     }
@@ -304,8 +337,8 @@ mod tests {
         let h1 = handle(&[("key", "val")]);
         let h2 = h1.clone();
         assert_eq!(
-            h1.get("key").expect("first handle value"),
-            h2.get("key").expect("second handle value")
+            block_on(h1.get("key")).expect("first handle value"),
+            block_on(h2.get("key")).expect("second handle value")
         );
     }
 
@@ -314,7 +347,7 @@ mod tests {
         let store = Arc::new(TestConfigStore::new(&[("a", "1")]));
         let store_handle = ConfigStoreHandle::new(store);
         assert_eq!(
-            store_handle.get("a").expect("arc-backed config"),
+            block_on(store_handle.get("a")).expect("arc-backed config"),
             Some("1".to_owned())
         );
     }
@@ -322,9 +355,7 @@ mod tests {
     #[test]
     fn config_store_handle_propagates_backend_errors() {
         let handle = ConfigStoreHandle::new(Arc::new(FailingConfigStore));
-        let err = handle
-            .get("feature.checkout")
-            .expect_err("expected backend error");
+        let err = block_on(handle.get("feature.checkout")).expect_err("expected backend error");
         assert!(matches!(err, ConfigStoreError::Unavailable { .. }));
     }
 
@@ -332,9 +363,12 @@ mod tests {
     fn config_store_handle_wraps_and_delegates() {
         let store_handle = handle(&[("timeout_ms", "1500")]);
         assert_eq!(
-            store_handle.get("timeout_ms").expect("config value"),
+            block_on(store_handle.get("timeout_ms")).expect("config value"),
             Some("1500".to_owned())
         );
-        assert_eq!(store_handle.get("missing").expect("missing config"), None);
+        assert_eq!(
+            block_on(store_handle.get("missing")).expect("missing config"),
+            None
+        );
     }
 }

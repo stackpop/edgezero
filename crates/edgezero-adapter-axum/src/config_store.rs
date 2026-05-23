@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 
+use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 
 /// Config store for local dev / Axum. Reads from env vars with in-memory
@@ -58,9 +59,10 @@ impl AxumConfigStore {
     }
 }
 
+#[async_trait(?Send)]
 impl ConfigStore for AxumConfigStore {
     #[inline]
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         Ok(self
             .env
             .get(key)
@@ -94,6 +96,7 @@ mod tests {
     });
 
     use super::*;
+    use futures::executor::block_on;
 
     fn store(env: &[(&str, &str)], defaults: &[(&str, &str)]) -> AxumConfigStore {
         AxumConfigStore::new(
@@ -109,7 +112,7 @@ mod tests {
     fn axum_config_store_env_overrides_defaults() {
         let cs = store(&[("KEY", "from_env")], &[("KEY", "from_default")]);
         assert_eq!(
-            cs.get("KEY").expect("config value"),
+            block_on(cs.get("KEY")).expect("config value"),
             Some("from_env".to_owned())
         );
     }
@@ -118,7 +121,7 @@ mod tests {
     fn axum_config_store_falls_back_to_defaults() {
         let cs = store(&[], &[("KEY", "default_val")]);
         assert_eq!(
-            cs.get("KEY").expect("default config"),
+            block_on(cs.get("KEY")).expect("default config"),
             Some("default_val".to_owned())
         );
     }
@@ -138,17 +141,15 @@ mod tests {
         );
 
         assert_eq!(
-            cs.get("feature.new_checkout")
-                .expect("allowed env override"),
+            block_on(cs.get("feature.new_checkout")).expect("allowed env override"),
             Some("true".to_owned())
         );
         assert_eq!(
-            cs.get("service.timeout_ms").expect("default fallback"),
+            block_on(cs.get("service.timeout_ms")).expect("default fallback"),
             Some("1500".to_owned())
         );
         assert_eq!(
-            cs.get("DATABASE_URL")
-                .expect("undeclared key should stay hidden"),
+            block_on(cs.get("DATABASE_URL")).expect("undeclared key should stay hidden"),
             None
         );
     }
@@ -156,14 +157,14 @@ mod tests {
     #[test]
     fn axum_config_store_returns_none_for_missing() {
         let cs = store(&[], &[]);
-        assert_eq!(cs.get("NOPE").expect("missing config"), None);
+        assert_eq!(block_on(cs.get("NOPE")).expect("missing config"), None);
     }
 
     #[test]
     fn axum_config_store_returns_values() {
         let cs = store(&[("MY_KEY", "my_val")], &[]);
         assert_eq!(
-            cs.get("MY_KEY").expect("config value"),
+            block_on(cs.get("MY_KEY")).expect("config value"),
             Some("my_val".to_owned())
         );
     }

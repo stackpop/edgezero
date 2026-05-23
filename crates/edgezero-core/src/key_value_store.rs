@@ -299,6 +299,11 @@ pub enum KvError {
     #[error("kv store error: {0}")]
     Internal(#[from] anyhow::Error),
 
+    /// A backend listing or paging limit was exceeded (e.g. Spin's
+    /// `max_list_keys` cap on `get_keys`).
+    #[error("kv backend limit exceeded: {message}")]
+    LimitExceeded { message: String },
+
     /// The requested key was not found (used by `delete` when strict).
     #[error("key not found: {key}")]
     NotFound { key: String },
@@ -310,6 +315,11 @@ pub enum KvError {
     /// The KV store backend is temporarily unavailable.
     #[error("kv store unavailable")]
     Unavailable,
+
+    /// The operation is not supported by the active backend (e.g. TTL writes
+    /// on Spin, where `key_value::Store::set` accepts no expiry).
+    #[error("kv operation not supported by backend: {operation}")]
+    Unsupported { operation: String },
 
     /// A validation error (e.g., invalid key or value).
     #[error("validation error: {0}")]
@@ -682,6 +692,12 @@ impl From<KvError> for EdgeError {
                 EdgeError::internal(anyhow::anyhow!("kv serialization error: {msg}"))
             }
             KvError::Internal(source) => EdgeError::internal(source),
+            KvError::Unsupported { operation } => EdgeError::not_implemented(format!(
+                "kv operation not supported by backend: {operation}"
+            )),
+            KvError::LimitExceeded { message } => {
+                EdgeError::service_unavailable(format!("kv backend limit exceeded: {message}"))
+            }
         }
     }
 }
@@ -1042,6 +1058,26 @@ mod tests {
         let kv_err = KvError::Unavailable;
         let edge_err: EdgeError = kv_err.into();
         assert_eq!(edge_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn kv_error_unsupported_converts_to_not_implemented() {
+        let kv_err = KvError::Unsupported {
+            operation: "put_bytes_with_ttl".to_owned(),
+        };
+        let edge_err: EdgeError = kv_err.into();
+        assert_eq!(edge_err.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(edge_err.message().contains("put_bytes_with_ttl"));
+    }
+
+    #[test]
+    fn kv_error_limit_exceeded_converts_to_service_unavailable() {
+        let kv_err = KvError::LimitExceeded {
+            message: "max_list_keys=1000 exceeded".to_owned(),
+        };
+        let edge_err: EdgeError = kv_err.into();
+        assert_eq!(edge_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(edge_err.message().contains("max_list_keys"));
     }
 
     #[test]

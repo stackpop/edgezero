@@ -23,6 +23,8 @@ pub enum EdgeError {
     MethodNotAllowed { method: Method, allowed: String },
     #[error("no route matched path: {path}")]
     NotFound { path: String },
+    #[error("not implemented: {message}")]
+    NotImplemented { message: String },
     #[error("service unavailable: {message}")]
     ServiceUnavailable { message: String },
     #[error("validation error: {message}")]
@@ -53,6 +55,7 @@ impl EdgeError {
         match self {
             EdgeError::BadRequest { message }
             | EdgeError::Validation { message }
+            | EdgeError::NotImplemented { message }
             | EdgeError::ServiceUnavailable { message } => message.clone(),
             EdgeError::NotFound { path } => format!("no route matched path: {path}"),
             EdgeError::MethodNotAllowed { method, allowed } => {
@@ -87,6 +90,13 @@ impl EdgeError {
     }
 
     #[inline]
+    pub fn not_implemented<S: Into<String>>(message: S) -> Self {
+        EdgeError::NotImplemented {
+            message: message.into(),
+        }
+    }
+
+    #[inline]
     pub fn service_unavailable<S: Into<String>>(message: S) -> Self {
         EdgeError::ServiceUnavailable {
             message: message.into(),
@@ -108,6 +118,7 @@ impl EdgeError {
             EdgeError::Internal { source } => Some(source),
             EdgeError::BadRequest { .. }
             | EdgeError::NotFound { .. }
+            | EdgeError::NotImplemented { .. }
             | EdgeError::MethodNotAllowed { .. }
             | EdgeError::Validation { .. }
             | EdgeError::ServiceUnavailable { .. } => None,
@@ -122,6 +133,7 @@ impl EdgeError {
             EdgeError::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             EdgeError::NotFound { .. } => StatusCode::NOT_FOUND,
             EdgeError::MethodNotAllowed { .. } => StatusCode::METHOD_NOT_ALLOWED,
+            EdgeError::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             EdgeError::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             EdgeError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }

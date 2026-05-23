@@ -40,7 +40,7 @@ impl EdgeZeroAxumService {
     /// Attach a shared config store to this service.
     ///
     /// The handle is cloned into every request's extensions, making
-    /// `ctx.config_store()` available in handlers.
+    /// `ctx.config_handle()` available in handlers.
     #[must_use]
     #[inline]
     pub fn with_config_store_handle(mut self, handle: ConfigStoreHandle) -> Self {
@@ -142,8 +142,9 @@ mod tests {
 
     struct FixedConfigStore(String);
 
+    #[async_trait::async_trait(?Send)]
     impl ConfigStore for FixedConfigStore {
-        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(Some(self.0.clone()))
         }
     }
@@ -172,9 +173,10 @@ mod tests {
 
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {
-                let store = ctx.config_store().expect("config store should be present");
+                let store = ctx.config_handle().expect("config store should be present");
                 let val = store
                     .get("any_key")
+                    .await
                     .expect("config lookup should succeed")
                     .unwrap_or_default();
                 let response = response_builder()
@@ -235,7 +237,7 @@ mod tests {
     async fn service_without_config_store_handle_still_works() {
         let router = RouterService::builder()
             .get("/no-config", |ctx: RequestContext| async move {
-                let has_config = ctx.config_store().is_some();
+                let has_config = ctx.config_handle().is_some();
                 let response = response_builder()
                     .status(StatusCode::OK)
                     .body(Body::from(format!("has_config={has_config}")))
