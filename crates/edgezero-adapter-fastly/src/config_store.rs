@@ -3,6 +3,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
+use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use fastly::config_store::{LookupError, OpenError};
 use fastly::ConfigStore as FastlyConfigStoreInner;
@@ -40,9 +41,10 @@ impl FastlyConfigStore {
     }
 }
 
+#[async_trait(?Send)]
 impl ConfigStore for FastlyConfigStore {
     #[inline]
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
             FastlyConfigStoreBackend::Fastly(inner) => {
                 inner.try_get(key).map_err(|err| map_lookup_error(&err))

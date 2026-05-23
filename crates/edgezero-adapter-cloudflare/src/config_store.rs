@@ -14,6 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use worker::Env;
 
@@ -71,8 +72,9 @@ impl CloudflareConfigStore {
     }
 }
 
+#[async_trait(?Send)]
 impl ConfigStore for CloudflareConfigStore {
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         Ok(self.data.get(key).cloned())
     }
 }

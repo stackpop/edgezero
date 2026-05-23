@@ -24,8 +24,9 @@ struct FixedConfigStore {
     value: &'static str,
 }
 
+#[async_trait::async_trait(?Send)]
 impl ConfigStore for FixedConfigStore {
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         if key == self.key {
             Ok(Some(self.value.to_string()))
         } else {
@@ -134,10 +135,15 @@ fn build_test_app() -> App {
     }
 
     async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = ctx
-            .config_store()
-            .and_then(|store| store.get("greeting").ok().flatten())
-            .unwrap_or_else(|| "missing".to_string());
+        let value = match ctx.config_handle() {
+            Some(store) => store
+                .get("greeting")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "missing".to_string()),
+            None => "missing".to_string(),
+        };
         let response = response_builder()
             .status(StatusCode::OK)
             .body(Body::text(value))

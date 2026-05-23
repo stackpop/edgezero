@@ -1,5 +1,6 @@
 //! Spin adapter config store: wraps `spin_sdk::variables`.
 
+use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 #[cfg(test)]
 use std::collections::HashMap;
@@ -43,8 +44,9 @@ impl Default for SpinConfigStore {
     }
 }
 
+#[async_trait(?Send)]
 impl ConfigStore for SpinConfigStore {
-    fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
             #[cfg(all(feature = "spin", target_arch = "wasm32"))]
             SpinConfigBackend::Spin => {

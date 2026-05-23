@@ -154,14 +154,14 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
         );
     }
 
-    let Some(store) = ctx.config_store() else {
+    let Some(store) = ctx.config_handle() else {
         return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "config store is unavailable for this adapter",
         );
     };
 
-    match store.get(&params.name)? {
+    match store.get(&params.name).await? {
         Some(value) => text_response(StatusCode::OK, value),
         None => text_response(
             StatusCode::NOT_FOUND,
@@ -291,8 +291,9 @@ mod tests {
 
     struct UnavailableConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl ConfigStore for MapConfigStore {
-        fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.0.get(key).cloned())
         }
     }
@@ -368,8 +369,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl ConfigStore for UnavailableConfigStore {
-        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
     }

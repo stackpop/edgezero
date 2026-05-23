@@ -27,8 +27,9 @@ wasm_bindgen_test_configure!(run_in_browser);
 
 struct FixedConfigStore(&'static str);
 
+#[async_trait::async_trait(?Send)]
 impl ConfigStore for FixedConfigStore {
-    fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+    async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
         Ok(Some(self.0.to_string()))
     }
 }
@@ -53,7 +54,7 @@ fn build_test_app() -> App {
     }
 
     async fn config_presence(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let present = if ctx.config_store().is_some() {
+        let present = if ctx.config_handle().is_some() {
             "yes"
         } else {
             "no"
@@ -79,10 +80,15 @@ fn build_test_app() -> App {
     }
 
     async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = ctx
-            .config_store()
-            .and_then(|store| store.get("greeting").ok().flatten())
-            .unwrap_or_else(|| "missing".to_string());
+        let value = match ctx.config_handle() {
+            Some(store) => store
+                .get("greeting")
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "missing".to_string()),
+            None => "missing".to_string(),
+        };
         let response = response_builder()
             .status(StatusCode::OK)
             .body(Body::text(value))
@@ -219,7 +225,7 @@ async fn dispatch_passes_request_body_to_handlers() {
 async fn dispatch_with_config_missing_binding_skips_injection() {
     // The test env is an empty JS object; any env.var() call returns None.
     // dispatch_with_config should log a warning and dispatch without injecting
-    // a config-store handle, so the handler receives ctx.config_store() == None.
+    // a config-store handle, so the handler receives ctx.config_handle() == None.
     let app = build_test_app();
     let req = cf_request(CfMethod::Get, "/has-config", None);
     let (env, ctx) = test_env_ctx();
