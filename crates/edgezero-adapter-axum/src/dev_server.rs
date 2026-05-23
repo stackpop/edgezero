@@ -13,15 +13,17 @@ use tokio::signal;
 use tower::{service_fn, Service as _};
 
 use edgezero_core::addr;
-use edgezero_core::app::{Hooks, StoresMetadata};
+use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
+use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
+use std::collections::BTreeMap;
 
 use crate::config_store::AxumConfigStore;
 use crate::key_value_store::PersistentKvStore;
@@ -53,15 +55,15 @@ impl Default for AxumDevServerConfig {
 
 /// Optional store handles attached to every request processed by the dev server.
 ///
-/// Build with struct init and `..Default::default()` for the fields you do not need:
-///
-/// ```rust,ignore
-/// let stores = Stores { kv: Some(kv_handle), ..Default::default() };
-/// ```
+/// Both single-handle fields and registry fields can be set; the service inserts
+/// whichever are present. Registries take precedence in `RequestContext`.
 #[derive(Default)]
 struct Stores {
+    config_registry: Option<ConfigRegistry>,
     config_store: Option<ConfigStoreHandle>,
     kv: Option<KvHandle>,
+    kv_registry: Option<KvRegistry>,
+    secret_registry: Option<SecretRegistry>,
     secrets: Option<SecretHandle>,
 }
 
@@ -137,6 +139,13 @@ impl AxumDevServer {
 
     #[must_use]
     #[inline]
+    pub fn with_config_registry(mut self, registry: ConfigRegistry) -> Self {
+        self.stores.config_registry = Some(registry);
+        self
+    }
+
+    #[must_use]
+    #[inline]
     pub fn with_config_store(mut self, handle: ConfigStoreHandle) -> Self {
         self.stores.config_store = Some(handle);
         self
@@ -153,6 +162,14 @@ impl AxumDevServer {
         self
     }
 
+    /// Attach an id-keyed KV registry to the dev server.
+    #[must_use]
+    #[inline]
+    pub fn with_kv_registry(mut self, registry: KvRegistry) -> Self {
+        self.stores.kv_registry = Some(registry);
+        self
+    }
+
     /// Attach a secret store to the dev server.
     ///
     /// The handle is shared across all requests, making the `Secrets` extractor
@@ -161,6 +178,14 @@ impl AxumDevServer {
     #[inline]
     pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
         self.stores.secrets = Some(handle);
+        self
+    }
+
+    /// Attach an id-keyed secret registry to the dev server.
+    #[must_use]
+    #[inline]
+    pub fn with_secret_registry(mut self, registry: SecretRegistry) -> Self {
+        self.stores.secret_registry = Some(registry);
         self
     }
 }
@@ -250,11 +275,20 @@ async fn serve_with_stores(
 ) -> anyhow::Result<()> {
     let service = {
         let mut service = EdgeZeroAxumService::new(router);
+        if let Some(registry) = stores.config_registry {
+            service = service.with_config_registry(registry);
+        }
         if let Some(handle) = stores.config_store {
             service = service.with_config_store_handle(handle);
         }
+        if let Some(registry) = stores.kv_registry {
+            service = service.with_kv_registry(registry);
+        }
         if let Some(handle) = stores.kv {
             service = service.with_kv_handle(handle);
+        }
+        if let Some(registry) = stores.secret_registry {
+            service = service.with_secret_registry(registry);
         }
         if let Some(handle) = stores.secrets {
             service = service.with_secret_handle(handle);
@@ -296,13 +330,6 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
     let env = EnvConfig::from_env();
     let stores = A::stores();
     let kv_init_requirement = kv_init_requirement(stores);
-    let kv_store_name = stores.kv.map_or_else(
-        || DEFAULT_KV_STORE_NAME.to_owned(),
-        |meta| env.store_name("kv", meta.default),
-    );
-    let kv_path = kv_store_path(&kv_store_name);
-    let has_secret_store = stores.secrets.is_some();
-    let config_store_id = stores.config.map(|meta| meta.default);
 
     let level = env
         .logging_level()
@@ -335,46 +362,100 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
         let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
 
-        let kv_handle = match kv_handle_from_path(&kv_path) {
-            Ok(handle) => Some(handle),
-            Err(err) => {
-                match kv_init_requirement {
-                    KvInitRequirement::Optional => {
-                        log::warn!(
-                            "KV store '{}' could not be initialized at {}: {}",
-                            kv_store_name,
-                            kv_path.display(),
-                            err
-                        );
-                        None
-                    }
-                    KvInitRequirement::Required => {
-                        return Err(err.context(format!(
-                            "KV store '{}' is explicitly configured for axum but could not be initialized at {}",
-                            kv_store_name,
-                            kv_path.display()
-                        )));
-                    }
-                }
-            }
-        };
-        // The config store is attached whenever `[stores.config]` was declared.
-        // It starts empty and reads from the environment; the portable manifest
-        // no longer carries `[stores.config.defaults]`.
-        let config_store_handle = config_store_id.map(|_id| {
-            let store = AxumConfigStore::from_env(iter::empty());
-            ConfigStoreHandle::new(Arc::new(store))
-        });
-        let secret = has_secret_store.then(||  { log::info!("Secret store: reading from environment variables"); SecretHandle::new(Arc::new(
-                EnvSecretStore::new(),
-            )) });
+        let kv_registry = build_kv_registry(stores.kv, &env, kv_init_requirement)?;
+        let config_registry = build_config_registry(stores.config);
+        let secret_registry = build_secret_registry(stores.secrets);
+
         let request_stores = Stores {
-            config_store: config_store_handle,
-            kv: kv_handle,
-            secrets: secret,
+            config_registry,
+            kv_registry,
+            secret_registry,
+            ..Stores::default()
         };
         serve_with_stores(router, listener, true, request_stores).await
     })
+}
+
+/// Build the per-request KV registry from baked store metadata.
+///
+/// Each declared id resolves to a [`PersistentKvStore`] at
+/// `.edgezero/kv-<slug>-<hash>.redb`, where the file name is derived from the
+/// platform store name (`EDGEZERO__STORES__KV__<ID>__NAME` or the id default).
+fn build_kv_registry(
+    kv_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+    init: KvInitRequirement,
+) -> anyhow::Result<Option<KvRegistry>> {
+    let Some(meta) = kv_meta else {
+        return Ok(None);
+    };
+
+    let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let store_name = env.store_name("kv", id);
+        let kv_path = kv_store_path(&store_name);
+        let handle = match kv_handle_from_path(&kv_path) {
+            Ok(handle) => handle,
+            Err(err) => match init {
+                KvInitRequirement::Optional => {
+                    log::warn!(
+                        "KV store '{}' (id `{}`) could not be initialized at {}: {}",
+                        store_name,
+                        id,
+                        kv_path.display(),
+                        err
+                    );
+                    continue;
+                }
+                KvInitRequirement::Required => {
+                    return Err(err.context(format!(
+                        "KV store '{}' (id `{}`) is explicitly configured for axum but could not be initialized at {}",
+                        store_name,
+                        id,
+                        kv_path.display()
+                    )));
+                }
+            },
+        };
+        by_id.insert((*id).to_owned(), handle);
+    }
+
+    if by_id.is_empty() {
+        return Ok(None);
+    }
+
+    let default_id = if by_id.contains_key(meta.default) {
+        meta.default.to_owned()
+    } else {
+        by_id.keys().next().cloned().unwrap_or_default()
+    };
+    Ok(Some(StoreRegistry::new(by_id, default_id)))
+}
+
+/// Build the per-request config registry. The axum config store starts empty;
+/// values are read from `.edgezero/local-config-<id>.json` (wired in Task 2.6
+/// once `config push` lands in Stage 7).
+fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
+    let meta = config_meta?;
+    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let store = AxumConfigStore::from_env(iter::empty());
+        by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+}
+
+/// Build the per-request secret registry. Axum is `Single` for secrets — every
+/// declared id maps to the same env-backed [`EnvSecretStore`].
+fn build_secret_registry(secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+    let meta = secret_meta?;
+    log::info!("Secret store: reading from environment variables");
+    let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
+    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    for id in meta.ids {
+        by_id.insert((*id).to_owned(), handle.clone());
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
 /// Resolve the bind address from `EDGEZERO__ADAPTER__*` environment config.

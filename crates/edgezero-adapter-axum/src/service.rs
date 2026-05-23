@@ -10,6 +10,7 @@ use edgezero_core::http::StatusCode;
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
+use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
@@ -19,10 +20,13 @@ use crate::response::into_axum_response;
 /// Tower service that adapts `EdgeZero` router requests to Axum/Hyper compatible responses.
 #[derive(Clone)]
 pub struct EdgeZeroAxumService {
+    config_registry: Option<ConfigRegistry>,
     config_store_handle: Option<ConfigStoreHandle>,
     kv_handle: Option<KvHandle>,
+    kv_registry: Option<KvRegistry>,
     router: RouterService,
     secret_handle: Option<SecretHandle>,
+    secret_registry: Option<SecretRegistry>,
 }
 
 impl EdgeZeroAxumService {
@@ -30,17 +34,28 @@ impl EdgeZeroAxumService {
     #[inline]
     pub fn new(router: RouterService) -> Self {
         Self {
+            config_registry: None,
             config_store_handle: None,
             kv_handle: None,
+            kv_registry: None,
             router,
             secret_handle: None,
+            secret_registry: None,
         }
+    }
+
+    /// Attach an id-keyed config-store registry to this service.
+    #[must_use]
+    #[inline]
+    pub fn with_config_registry(mut self, registry: ConfigRegistry) -> Self {
+        self.config_registry = Some(registry);
+        self
     }
 
     /// Attach a shared config store to this service.
     ///
-    /// The handle is cloned into every request's extensions, making
-    /// `ctx.config_handle()` available in handlers.
+    /// Legacy single-handle setter; the handle is exposed via
+    /// `ctx.config_handle()`. New code should use [`Self::with_config_registry`].
     #[must_use]
     #[inline]
     pub fn with_config_store_handle(mut self, handle: ConfigStoreHandle) -> Self {
@@ -50,8 +65,8 @@ impl EdgeZeroAxumService {
 
     /// Attach a shared KV store to this service.
     ///
-    /// The handle is cloned into every request's extensions, making
-    /// the `Kv` extractor available in handlers.
+    /// Legacy single-handle setter; the handle is exposed via
+    /// `ctx.kv_handle()`. New code should use [`Self::with_kv_registry`].
     #[must_use]
     #[inline]
     pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
@@ -59,14 +74,30 @@ impl EdgeZeroAxumService {
         self
     }
 
+    /// Attach an id-keyed KV registry to this service.
+    #[must_use]
+    #[inline]
+    pub fn with_kv_registry(mut self, registry: KvRegistry) -> Self {
+        self.kv_registry = Some(registry);
+        self
+    }
+
     /// Attach a shared secret store to this service.
     ///
-    /// The handle is cloned into every request's extensions, making
-    /// the `Secrets` extractor available in handlers.
+    /// Legacy single-handle setter; the handle is exposed via
+    /// `ctx.secret_handle()`. New code should use [`Self::with_secret_registry`].
     #[must_use]
     #[inline]
     pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {
         self.secret_handle = Some(handle);
+        self
+    }
+
+    /// Attach an id-keyed secret-store registry to this service.
+    #[must_use]
+    #[inline]
+    pub fn with_secret_registry(mut self, registry: SecretRegistry) -> Self {
+        self.secret_registry = Some(registry);
         self
     }
 }
@@ -79,9 +110,12 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
+        let config_registry = self.config_registry.clone();
         let config_store_handle = self.config_store_handle.clone();
         let kv_handle = self.kv_handle.clone();
+        let kv_registry = self.kv_registry.clone();
         let secret_handle = self.secret_handle.clone();
+        let secret_registry = self.secret_registry.clone();
         Box::pin(async move {
             let mut core_request = match into_core_request(req).await {
                 Ok(converted) => converted,
@@ -93,14 +127,23 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
                 }
             };
 
+            if let Some(registry) = config_registry {
+                core_request.extensions_mut().insert(registry);
+            }
             if let Some(handle) = config_store_handle {
                 core_request.extensions_mut().insert(handle);
             }
 
+            if let Some(registry) = kv_registry {
+                core_request.extensions_mut().insert(registry);
+            }
             if let Some(handle) = kv_handle {
                 core_request.extensions_mut().insert(handle);
             }
 
+            if let Some(registry) = secret_registry {
+                core_request.extensions_mut().insert(registry);
+            }
             if let Some(handle) = secret_handle {
                 core_request.extensions_mut().insert(handle);
             }
