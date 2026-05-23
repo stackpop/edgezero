@@ -137,25 +137,13 @@ fn logging_from_env(env: &EnvConfig) -> FastlyLogging {
 pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
     let env = EnvConfig::from_env();
     let stores = A::stores();
-    let config_name = stores
-        .config
-        .map(|meta| env.store_name("config", meta.default));
-    let kv_name = stores.kv.map_or_else(
-        || DEFAULT_KV_STORE_NAME.to_owned(),
-        |meta| env.store_name("kv", meta.default),
-    );
-    let requirements = StoreRequirements {
-        kv_required: stores.kv.is_some(),
-        secrets_required: stores.secrets.is_some(),
-    };
     let logging = logging_from_env(&env);
-    run_app_with_stores::<A>(
-        &logging,
-        req,
-        config_name.as_deref(),
-        &kv_name,
-        &requirements,
-    )
+    if logging.use_fastly_logger {
+        let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
+        init_logger(endpoint, logging.level, logging.echo_stdout)?;
+    }
+    let app = A::build_app();
+    request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
 }
 
 /// Dispatch with a config store. Prefer this over `run_app_with_logging` for new code.
