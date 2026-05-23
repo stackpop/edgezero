@@ -3,17 +3,20 @@ use std::fmt::Display;
 use std::io::Read as _;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use edgezero_core::app::App;
+use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::manifest::DEFAULT_KV_STORE_NAME as CORE_DEFAULT_KV_STORE_NAME;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
+use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
+use std::collections::BTreeMap;
 
 use crate::config_store::FastlyConfigStore;
 use crate::context::FastlyRequestContext;
@@ -61,8 +64,11 @@ impl RecentStringSet {
 /// ```
 #[derive(Default)]
 struct Stores {
+    config_registry: Option<ConfigRegistry>,
     config_store: Option<ConfigStoreHandle>,
     kv: Option<KvHandle>,
+    kv_registry: Option<KvRegistry>,
+    secret_registry: Option<SecretRegistry>,
     secrets: Option<SecretHandle>,
 }
 
@@ -87,11 +93,20 @@ fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<FastlyResponse, FastlyError> {
+    if let Some(registry) = stores.config_registry {
+        core_request.extensions_mut().insert(registry);
+    }
     if let Some(handle) = stores.config_store {
         core_request.extensions_mut().insert(handle);
     }
+    if let Some(registry) = stores.kv_registry {
+        core_request.extensions_mut().insert(registry);
+    }
     if let Some(handle) = stores.kv {
         core_request.extensions_mut().insert(handle);
+    }
+    if let Some(registry) = stores.secret_registry {
+        core_request.extensions_mut().insert(registry);
     }
     if let Some(handle) = stores.secrets {
         core_request.extensions_mut().insert(handle);
@@ -284,8 +299,95 @@ pub(crate) fn dispatch_with_store_names(
             config_store: config_store_handle,
             kv,
             secrets,
+            ..Default::default()
         },
     )
+}
+
+/// Dispatch with per-id store registries built from baked metadata.
+///
+/// Fastly is `Multi` for all three kinds, so each declared id resolves to
+/// its own platform store via `EDGEZERO__STORES__<KIND>__<ID>__NAME` (or the
+/// id default). KV failures escalate when `kv_required` is set; missing
+/// config / secret stores degrade silently with a one-time warning.
+pub(crate) fn dispatch_with_registries(
+    app: &App,
+    req: FastlyRequest,
+    config_meta: Option<StoreMetadata>,
+    kv_meta: Option<StoreMetadata>,
+    secret_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Result<FastlyResponse, FastlyError> {
+    let kv_registry = build_kv_registry(kv_meta, env)?;
+    let config_registry = build_config_registry(config_meta, env);
+    let secret_registry = build_secret_registry(secret_meta);
+    dispatch_with_handles(
+        app,
+        req,
+        Stores {
+            config_registry,
+            kv_registry,
+            secret_registry,
+            ..Default::default()
+        },
+    )
+}
+
+fn build_kv_registry(
+    kv_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Result<Option<KvRegistry>, FastlyError> {
+    let Some(meta) = kv_meta else {
+        return Ok(None);
+    };
+    let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let store_name = env.store_name("kv", id);
+        // KV is required: if `[stores.kv]` is declared, an id failing to open
+        // is a runtime error rather than a silent degradation.
+        let Some(handle) = resolve_kv_handle(&store_name, true)? else {
+            continue;
+        };
+        by_id.insert((*id).to_owned(), handle);
+    }
+    if by_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(StoreRegistry::new(by_id, meta.default.to_owned())))
+}
+
+fn build_config_registry(
+    config_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Option<ConfigRegistry> {
+    let meta = config_meta?;
+    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let store_name = env.store_name("config", id);
+        match FastlyConfigStore::try_open(&store_name) {
+            Ok(store) => {
+                by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+            }
+            Err(err) => warn_missing_store_once(&store_name, &err.to_string()),
+        }
+    }
+    if by_id.is_empty() {
+        return None;
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+}
+
+fn build_secret_registry(secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+    let meta = secret_meta?;
+    // `FastlySecretStore` is stateless — it opens the named store per call. One
+    // shared handle is registered under every declared id; the per-id platform
+    // name binding lands when Task 2.7 reshapes `BoundSecretStore`.
+    let handle = SecretHandle::new(Arc::new(FastlySecretStore));
+    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    for id in meta.ids {
+        by_id.insert((*id).to_owned(), handle.clone());
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
 /// # Errors
