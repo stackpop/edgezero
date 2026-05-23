@@ -21,17 +21,17 @@ mod response;
 // require `all(feature = "spin", target_arch = "wasm32")`.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod key_value_store;
+// `kv_pagination` is the pure paging logic for `SpinKvStore::list_keys_page`.
+// It is host-compilable so its tests run under `cargo test`, while the wasm32
+// `SpinKvStore` is the production consumer.
+mod kv_pagination;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod secret_store;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use config_store::SpinConfigStore;
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-use edgezero_core::app::StoresMetadata;
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-use edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub use key_value_store::SpinKvStore;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -65,15 +65,6 @@ impl AppExt for edgezero_core::app::App {
     }
 }
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SpinStoreSettings {
-    pub config_enabled: bool,
-    pub kv_label: String,
-    pub kv_required: bool,
-    pub secrets_enabled: bool,
-}
-
 /// Initialize the logger for Spin.
 ///
 /// Currently a no-op — Spin manages its own logging internally.
@@ -86,26 +77,6 @@ pub(crate) struct SpinStoreSettings {
 #[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
-}
-
-/// Resolve Spin store settings from baked store metadata plus `EDGEZERO__*`
-/// environment config. The KV label resolves to the platform name for the
-/// declared default logical id, or [`DEFAULT_KV_STORE_NAME`] when no
-/// `[stores.kv]` was declared.
-///
-/// [`DEFAULT_KV_STORE_NAME`]: edgezero_core::manifest::DEFAULT_KV_STORE_NAME
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-pub(crate) fn resolve_store_settings(stores: StoresMetadata, env: &EnvConfig) -> SpinStoreSettings {
-    let kv_label = stores.kv.map_or_else(
-        || DEFAULT_KV_STORE_NAME.to_owned(),
-        |meta| env.store_name("kv", meta.default),
-    );
-    SpinStoreSettings {
-        config_enabled: stores.config.is_some(),
-        kv_label,
-        kv_required: stores.kv.is_some(),
-        secrets_enabled: stores.secrets.is_some(),
-    }
 }
 
 /// Convenience entry point: build the app from `Hooks`, dispatch the
@@ -136,67 +107,9 @@ pub async fn run_app<A: edgezero_core::app::Hooks>(
     // `log::set_logger` returns Err on the second call — `.expect()`
     // would panic on every subsequent request.
     let _ = init_logger();
-    let settings = resolve_store_settings(A::stores(), &EnvConfig::from_env());
+    let env = EnvConfig::from_env();
+    let stores = A::stores();
     let app = A::build_app();
-    request::dispatch_with_store_settings(&app, req, &settings).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use edgezero_core::app::StoreMetadata;
-
-    #[test]
-    fn store_settings_default_to_optional_kv_without_config_or_secrets() {
-        let empty: [(&str, &str); 0] = [];
-        let settings =
-            resolve_store_settings(StoresMetadata::default(), &EnvConfig::from_vars(empty));
-
-        assert_eq!(settings.kv_label, DEFAULT_KV_STORE_NAME);
-        assert!(!settings.kv_required);
-        assert!(!settings.config_enabled);
-        assert!(!settings.secrets_enabled);
-    }
-
-    #[test]
-    fn store_settings_resolve_baked_metadata() {
-        let stores = StoresMetadata {
-            config: Some(StoreMetadata {
-                default: "app_config",
-                ids: &["app_config"],
-            }),
-            kv: Some(StoreMetadata {
-                default: "sessions",
-                ids: &["sessions", "cache"],
-            }),
-            secrets: Some(StoreMetadata {
-                default: "default",
-                ids: &["default"],
-            }),
-        };
-        let empty: [(&str, &str); 0] = [];
-        let settings = resolve_store_settings(stores, &EnvConfig::from_vars(empty));
-
-        // No env override: the KV label resolves to the default logical id.
-        assert_eq!(settings.kv_label, "sessions");
-        assert!(settings.kv_required);
-        assert!(settings.config_enabled);
-        assert!(settings.secrets_enabled);
-    }
-
-    #[test]
-    fn store_settings_kv_label_from_env() {
-        let stores = StoresMetadata {
-            config: None,
-            kv: Some(StoreMetadata {
-                default: "sessions",
-                ids: &["sessions"],
-            }),
-            secrets: None,
-        };
-        let env = EnvConfig::from_vars([("EDGEZERO__STORES__KV__SESSIONS__NAME", "prod-label")]);
-        let settings = resolve_store_settings(stores, &env);
-
-        assert_eq!(settings.kv_label, "prod-label");
-    }
+    request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
+        .await
 }

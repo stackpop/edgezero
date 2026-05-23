@@ -1,26 +1,31 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::config_store::SpinConfigStore;
 use crate::context::SpinRequestContext;
-use crate::key_value_store::SpinKvStore;
+use crate::key_value_store::{SpinKvStore, DEFAULT_MAX_LIST_KEYS};
 use crate::proxy::SpinProxyClient;
 use crate::response::from_core_response;
 use crate::secret_store::SpinSecretStore;
-use crate::SpinStoreSettings;
-use edgezero_core::app::App;
+use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request, Uri};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
+use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
 use spin_sdk::http::IncomingRequest;
 
 #[derive(Default)]
 pub(crate) struct Stores {
+    pub(crate) config_registry: Option<ConfigRegistry>,
     pub(crate) config_store: Option<ConfigStoreHandle>,
     pub(crate) kv: Option<KvHandle>,
+    pub(crate) kv_registry: Option<KvRegistry>,
+    pub(crate) secret_registry: Option<SecretRegistry>,
     pub(crate) secrets: Option<SecretHandle>,
 }
 
@@ -108,19 +113,6 @@ pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sd
     dispatch_with_kv_label(app, req, "default").await
 }
 
-pub(crate) async fn dispatch_with_store_settings(
-    app: &App,
-    req: IncomingRequest,
-    settings: &SpinStoreSettings,
-) -> anyhow::Result<spin_sdk::http::Response> {
-    let stores = Stores {
-        config_store: resolve_config_handle(settings.config_enabled),
-        kv: resolve_kv_handle(&settings.kv_label, settings.kv_required)?,
-        secrets: resolve_secret_handle(settings.secrets_enabled),
-    };
-    dispatch_with_handles(app, req, stores).await
-}
-
 /// Dispatch a Spin request through the EdgeZero router and return
 /// a Spin-compatible response, opening the KV store under `kv_label`.
 ///
@@ -141,6 +133,7 @@ pub async fn dispatch_with_kv_label(
         config_store: resolve_config_handle(true),
         kv: resolve_kv_handle(kv_label, false)?,
         secrets: resolve_secret_handle(true),
+        ..Default::default()
     };
     dispatch_with_handles(app, req, stores).await
 }
@@ -151,17 +144,115 @@ pub(crate) async fn dispatch_with_handles(
     stores: Stores,
 ) -> anyhow::Result<spin_sdk::http::Response> {
     let mut core_request = into_core_request(req).await?;
+    if let Some(registry) = stores.config_registry {
+        core_request.extensions_mut().insert(registry);
+    }
     if let Some(handle) = stores.config_store {
         core_request.extensions_mut().insert(handle);
     }
+    if let Some(registry) = stores.kv_registry {
+        core_request.extensions_mut().insert(registry);
+    }
     if let Some(handle) = stores.kv {
         core_request.extensions_mut().insert(handle);
+    }
+    if let Some(registry) = stores.secret_registry {
+        core_request.extensions_mut().insert(registry);
     }
     if let Some(handle) = stores.secrets {
         core_request.extensions_mut().insert(handle);
     }
     let response = app.router().oneshot(core_request).await?;
     Ok(from_core_response(response).await?)
+}
+
+/// Dispatch with per-id store registries built from baked metadata.
+///
+/// Spin capability map (§6.6):
+/// - KV: **Multi** — each declared id opens its own [`SpinKvStore`] under the
+///   label resolved from `EDGEZERO__STORES__KV__<ID>__NAME`. Optional
+///   `EDGEZERO__STORES__KV__<ID>__MAX_LIST_KEYS` overrides the paging cap.
+/// - Config: **Single** — every declared id maps to the one shared
+///   [`SpinConfigStore`] (flat variable namespace).
+/// - Secrets: **Single** — every declared id maps to the one shared
+///   [`SpinSecretStore`] (same flat namespace).
+pub(crate) async fn dispatch_with_registries(
+    app: &App,
+    req: IncomingRequest,
+    config_meta: Option<StoreMetadata>,
+    kv_meta: Option<StoreMetadata>,
+    secret_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> anyhow::Result<spin_sdk::http::Response> {
+    let kv_registry = build_kv_registry(kv_meta, env)?;
+    let config_registry = build_config_registry(config_meta);
+    let secret_registry = build_secret_registry(secret_meta);
+    dispatch_with_handles(
+        app,
+        req,
+        Stores {
+            config_registry,
+            kv_registry,
+            secret_registry,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+fn build_kv_registry(
+    kv_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> anyhow::Result<Option<KvRegistry>> {
+    let Some(meta) = kv_meta else {
+        return Ok(None);
+    };
+    let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let label = env.store_name("kv", id);
+        let max_list_keys = env
+            .store_setting("kv", id, "MAX_LIST_KEYS")
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_LIST_KEYS);
+        match SpinKvStore::open_with_max_list_keys(&label, max_list_keys) {
+            Ok(store) => {
+                by_id.insert((*id).to_owned(), KvHandle::new(Arc::new(store)));
+            }
+            Err(err) => {
+                // Required: `[stores.kv]` is declared, so a missing label is a
+                // configuration error rather than a silent degradation.
+                return Err(anyhow::anyhow!(
+                    "Spin KV store '{label}' (id `{id}`) is explicitly configured but could not be opened: {err}"
+                ));
+            }
+        }
+    }
+    if by_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(StoreRegistry::new(by_id, meta.default.to_owned())))
+}
+
+fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
+    let meta = config_meta?;
+    // Spin is `Single` for config: every id resolves to the same flat variable store.
+    let handle = ConfigStoreHandle::new(Arc::new(SpinConfigStore::new()));
+    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    for id in meta.ids {
+        by_id.insert((*id).to_owned(), handle.clone());
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+}
+
+fn build_secret_registry(secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+    let meta = secret_meta?;
+    // Spin is `Single` for secrets: every id resolves to the same flat variable store.
+    let handle = SecretHandle::new(Arc::new(SpinSecretStore::new()));
+    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    for id in meta.ids {
+        by_id.insert((*id).to_owned(), handle.clone());
+    }
+    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
 fn resolve_config_handle(config_enabled: bool) -> Option<ConfigStoreHandle> {
