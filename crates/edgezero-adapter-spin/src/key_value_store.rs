@@ -8,9 +8,11 @@
 //! - **TTL**: The Spin KV API has no TTL support. Calls to
 //!   `put_bytes_with_ttl` return [`KvError::Unsupported`] without writing.
 //! - **Listing**: `spin_sdk::key_value::Store::get_keys()` returns all keys
-//!   with no prefix or cursor support. `list_keys_page` currently returns
-//!   [`KvError::LimitExceeded`]; paged listing with a `max_list_keys` cap
-//!   lands when the Spin store registry is wired (Task 2.6 follow-on).
+//!   with no prefix, cursor, or limit support. `list_keys_page` materialises
+//!   the full key list, filters by prefix, sorts, and pages client-side via
+//!   [`crate::kv_pagination::paginate_keys`]. A `max_list_keys` cap guards
+//!   against runaway materialisation; exceeding it yields
+//!   [`KvError::LimitExceeded`].
 //!
 //! # Note
 //!
@@ -22,23 +24,41 @@ use bytes::Bytes;
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 use std::time::Duration;
 
+use crate::kv_pagination::paginate_keys;
+
+/// Default `max_list_keys` cap. Matches the Cloudflare KV page size ceiling
+/// (`KvHandle::MAX_LIST_PAGE_SIZE`) and stays well below the soft per-isolate
+/// memory budgets a Spin component is given. Overridable via
+/// `EDGEZERO__STORES__KV__<ID>__MAX_LIST_KEYS`.
+pub const DEFAULT_MAX_LIST_KEYS: usize = 1_000;
+
 /// KV store backed by the Spin KV API.
 ///
 /// Wraps a `spin_sdk::key_value::Store` handle obtained via
-/// `Store::open(label)`.
+/// `Store::open(label)` plus a `max_list_keys` paging cap.
 pub struct SpinKvStore {
     store: spin_sdk::key_value::Store,
+    max_list_keys: usize,
 }
 
 impl SpinKvStore {
-    /// Open a Spin KV store by label.
+    /// Open a Spin KV store by label, using the default `max_list_keys` cap.
     ///
     /// The `label` must match a `key_value_stores` entry in `spin.toml`.
     /// Returns `KvError::Internal` if the store cannot be opened.
     pub fn open(label: &str) -> Result<Self, KvError> {
+        Self::open_with_max_list_keys(label, DEFAULT_MAX_LIST_KEYS)
+    }
+
+    /// Open a Spin KV store by label with a custom `max_list_keys` cap.
+    /// Pass `0` to disable the cap (not recommended in production).
+    pub fn open_with_max_list_keys(label: &str, max_list_keys: usize) -> Result<Self, KvError> {
         let store = spin_sdk::key_value::Store::open(label)
             .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?;
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            max_list_keys,
+        })
     }
 
     /// Open the default EdgeZero KV store label (`"EDGEZERO_KV"`).
@@ -87,14 +107,15 @@ impl KvStore for SpinKvStore {
 
     async fn list_keys_page(
         &self,
-        _prefix: &str,
-        _cursor: Option<&str>,
-        _limit: usize,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
     ) -> Result<KvPage, KvError> {
-        Err(KvError::LimitExceeded {
-            message: "Spin KV key listing is unbounded; max_list_keys cap is not yet wired"
-                .to_owned(),
-        })
+        let all_keys = self
+            .store
+            .get_keys()
+            .map_err(|e| KvError::Internal(anyhow::anyhow!("get_keys failed: {e}")))?;
+        paginate_keys(all_keys, prefix, cursor, limit, self.max_list_keys)
     }
 }
 
