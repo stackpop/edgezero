@@ -4,9 +4,10 @@
 //!
 //! `demo` runs the bundled `app-demo` example locally — the **same way**
 //! `app-demo`'s own axum adapter runs it: via
-//! [`edgezero_adapter_axum::dev_server::run_app`], which loads
-//! `app-demo`'s `edgezero.toml` and wires the full setup (routing, KV /
-//! config / secret stores, logging, host/port).
+//! [`edgezero_adapter_axum::dev_server::run_app`], which reads the store
+//! config baked into `App` plus `EDGEZERO__*` environment variables and
+//! wires the full setup (routing, KV / config / secret stores, logging,
+//! host/port).
 //!
 //! This is a contributor-only convenience: it depends on the in-repo
 //! `examples/app-demo` crate, so it is compiled only under the
@@ -24,6 +25,5 @@ pub fn run_demo() -> Result<(), String> {
     use app_demo_core::App;
     use edgezero_adapter_axum::dev_server::run_app;
 
-    run_app::<App>(include_str!("../../../examples/app-demo/edgezero.toml"))
-        .map_err(|err| format!("demo server error: {err}"))
+    run_app::<App>().map_err(|err| format!("demo server error: {err}"))
 }

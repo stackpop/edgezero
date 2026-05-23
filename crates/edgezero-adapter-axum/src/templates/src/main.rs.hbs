@@ -1,6 +1,6 @@
 use edgezero_adapter_axum::dev_server::run_app;
 
 fn main() -> anyhow::Result<()> {
-    run_app::<{{proj_core_mod}}::App>(include_str!("../../../edgezero.toml"))?;
+    run_app::<{{proj_core_mod}}::App>()?;
     Ok(())
 }
