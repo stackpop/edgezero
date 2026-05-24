@@ -56,15 +56,21 @@ adapters = [{{{adapter_list}}}]
 #
 # `[stores.<kind>]` declares logical store ids only. `default` is required
 # when more than one id is declared; with a single id it resolves to that id.
-
-[stores.kv]
-ids = ["app_kv"]
-
-[stores.config]
-ids = ["app_config"]
-
-[stores.secrets]
-ids = ["default"]
+#
+# The default scaffold ships with no stores so `edgezero serve --adapter
+# <name>` starts cleanly without per-platform KV / config / secret bindings.
+# Uncomment the kinds your handlers use and provision the matching platform
+# bindings (see docs/guide/manifest-store-migration.md and the per-adapter
+# guides for the wrangler.toml / spin.toml / fastly.toml entries).
+#
+# [stores.kv]
+# ids = ["app_kv"]
+#
+# [stores.config]
+# ids = ["app_config"]
+#
+# [stores.secrets]
+# ids = ["default"]
 
 # [environment]
 #

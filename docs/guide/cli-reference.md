@@ -116,7 +116,7 @@ edgezero serve --adapter <name>
 
 **Arguments:**
 
-- `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `axum`)
+- `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`, `axum`)
 
 **Examples:**
 
@@ -127,6 +127,9 @@ edgezero serve --adapter fastly
 # Run Wrangler dev server
 edgezero serve --adapter cloudflare
 
+# Run Spin dev server
+edgezero serve --adapter spin
+
 # Run native Axum server
 edgezero serve --adapter axum
 ```
@@ -135,6 +138,7 @@ edgezero serve --adapter axum
 
 - **Fastly**: Runs `fastly compute serve`
 - **Cloudflare**: Runs `wrangler dev`
+- **Spin**: Runs `spin up`
 - **Axum**: Runs `cargo run -p <adapter-crate>`
 
 ### edgezero deploy
@@ -147,7 +151,7 @@ edgezero deploy --adapter <name>
 
 **Arguments:**
 
-- `--adapter <name>` - Target adapter (`fastly`, `cloudflare`)
+- `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`)
 
 **Examples:**
 
@@ -157,12 +161,16 @@ edgezero deploy --adapter fastly
 
 # Deploy to Cloudflare
 edgezero deploy --adapter cloudflare
+
+# Deploy to a Spin runtime
+edgezero deploy --adapter spin
 ```
 
 **Provider behavior:**
 
 - **Fastly**: Runs `fastly compute deploy`
 - **Cloudflare**: Runs `wrangler deploy`
+- **Spin**: Runs `spin deploy`
 
 ::: warning
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.
@@ -191,6 +199,7 @@ Built-in adapters (default CLI build):
 
 - `fastly` - Fastly Compute@Edge
 - `cloudflare` - Cloudflare Workers
+- `spin` - Fermyon Spin
 - `axum` - Native Axum/Tokio
 
 ## Troubleshooting

@@ -22,8 +22,10 @@ component = "app-demo"
 [component.app-demo]
 source = "../../target/wasm32-wasip1/release/app_demo_adapter_spin.wasm"
 allowed_outbound_hosts = ["https://*:*"]
-# KV store label must match [stores.kv.adapters.spin] in edgezero.toml.
-key_value_stores = ["default"]
+# Spin labels match the logical KV ids declared in edgezero.toml
+# (`[stores.kv].ids = ["sessions", "cache"]`). Override per-id via
+# `EDGEZERO__STORES__KV__SESSIONS__NAME=<label>` if you need to remap.
+key_value_stores = ["sessions", "cache"]
 
 [component.app-demo.variables]
 greeting = "{{ greeting }}"
