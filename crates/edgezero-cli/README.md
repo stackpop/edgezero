@@ -13,16 +13,32 @@ contributor concerns.
 
 ## Feature Flags
 
-| Feature        | Description                                                                                                                                                          | Enabled by default |
-| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `cli`          | Builds the command-line interface (`edgezero` binary).                                                                                                               | ✅                 |
-| `demo-example` | Pulls in `examples/app-demo/app-demo-core` so `edgezero demo` can boot the bundled example app. Contributor-only; enable when working on the in-repo example.        | ❌                 |
+| Feature                       | Description                                                                                                                                                   | Enabled by default |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `cli`                         | Builds the command-line interface (`edgezero` binary).                                                                                                        | ✅                 |
+| `edgezero-adapter-axum`       | Links the Axum adapter into the binary and registers its blueprint with the scaffolder.                                                                       | ✅                 |
+| `edgezero-adapter-fastly`     | Links the Fastly adapter and registers its blueprint.                                                                                                         | ✅                 |
+| `edgezero-adapter-cloudflare` | Links the Cloudflare adapter and registers its blueprint.                                                                                                     | ✅                 |
+| `edgezero-adapter-spin`       | Links the Spin adapter and registers its blueprint.                                                                                                           | ✅                 |
+| `demo-example`                | Pulls in `examples/app-demo/app-demo-core` so `edgezero demo` can boot the bundled example app. Contributor-only; enable when working on the in-repo example. | ❌                 |
 
-Distributable build (no demo dependency):
+Distributable build (default — includes all four adapters):
 
 ```bash
-cargo build -p edgezero-cli --no-default-features --features cli
+cargo build -p edgezero-cli --release
 ```
+
+Slim build with only a specific adapter (e.g. axum-only):
+
+```bash
+cargo build -p edgezero-cli --release --no-default-features \
+    --features "cli edgezero-adapter-axum"
+```
+
+Note: `--no-default-features --features cli` alone drops every
+`edgezero-adapter-*` dep, so the resulting binary has **no** built-in
+adapter helpers and `edgezero new` will scaffold nothing. Enable each
+adapter feature you want to ship explicitly.
 
 Contributor build with the bundled example:
 
@@ -60,13 +76,24 @@ for the canonical pattern; the generated `crates/<name>-cli` from `edgezero
 new` is a working starting point.
 
 ```rust
-use edgezero_cli::{BuildArgs, DeployArgs, NewArgs, ServeArgs, run_build, run_deploy, run_new, run_serve};
+use edgezero_cli::{run_build, run_deploy, run_new, run_serve};
+use edgezero_cli::args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
 // …compose into your own clap subcommand enum.
 ```
 
-Argument structs derive `clap::Args`, `Default`, and are `#[non_exhaustive]`
-so callers can build them programmatically and still tolerate new fields in
-a future minor release (`BuildArgs { adapter: "fastly".into(), ..Default::default() }`).
+Argument structs derive `clap::Args` + `Default` and are
+`#[non_exhaustive]`, so callers tolerate new fields in a future minor
+release. Build them programmatically by starting from `Default::default()`
+and assigning the fields you need — struct-literal expressions are not
+allowed across crates for `#[non_exhaustive]` types, so the
+`StructName { … ..Default::default() }` shorthand does not compile from
+downstream code:
+
+```rust
+let mut args = BuildArgs::default();
+args.adapter = "fastly".into();
+edgezero_cli::run_build(&args)?;
+```
 
 ## Adapter discovery
 
