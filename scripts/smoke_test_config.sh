@@ -11,8 +11,10 @@ set -euo pipefail
 #   ./scripts/smoke_test_config.sh cloudflare
 #   ./scripts/smoke_test_config.sh spin
 #
-# Note (spin): Spin variable names may not contain dots. Keys with dots
-# (feature.new_checkout, service.timeout_ms) are skipped for the spin adapter.
+# Note (spin): handler-facing dotted keys (`feature.new_checkout`,
+# `service.timeout_ms`) are supported on Spin too; `SpinConfigStore`
+# translates them to the flat variable form (`feature__new_checkout`,
+# `service__timeout_ms`) before lookup.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
@@ -131,18 +133,14 @@ check "GET /config/greeting returns 200" "200" "$STATUS"
 BODY=$(curl -s "$BASE/config/greeting")
 check "greeting value" "hello from config store" "$BODY"
 
-# Spin variable names cannot contain dots; these keys are only tested on
-# adapters whose config stores support arbitrary key names.
-if [ "$ADAPTER" != "spin" ]; then
-  STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/feature.new_checkout")
-  check "GET /config/feature.new_checkout returns 200" "200" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/feature.new_checkout")
+check "GET /config/feature.new_checkout returns 200" "200" "$STATUS"
 
-  BODY=$(curl -s "$BASE/config/feature.new_checkout")
-  check "feature.new_checkout value" "false" "$BODY"
+BODY=$(curl -s "$BASE/config/feature.new_checkout")
+check "feature.new_checkout value" "false" "$BODY"
 
-  BODY=$(curl -s "$BASE/config/service.timeout_ms")
-  check "service.timeout_ms value" "1500" "$BODY"
-fi
+BODY=$(curl -s "$BASE/config/service.timeout_ms")
+check "service.timeout_ms value" "1500" "$BODY"
 
 section "Config: missing key returns 404"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/does.not.exist")
