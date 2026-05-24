@@ -5,6 +5,12 @@ export default defineConfig({
   title: 'EdgeZero',
   description: 'Production-ready toolkit for portable edge HTTP workloads',
   base: '/edgezero/',
+  // `superpowers/` holds internal design docs (specs + plans) that are not
+  // part of the published site. They sit in `docs/` so the doc tooling
+  // (prettier, eslint) covers them, but VitePress should skip them: the
+  // raw spec text contains literal `{{ … }}` interpolations inside inline
+  // code that Vue's compiler would otherwise try to evaluate.
+  srcExclude: ['superpowers/**'],
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
     nav: [
