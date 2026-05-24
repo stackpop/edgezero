@@ -191,12 +191,18 @@ fn ensure_adapter_defined(
 
 #[cfg(feature = "cli")]
 fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
-    let path = env::var("EDGEZERO_MANIFEST")
-        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
+    let (path, explicit) = env::var("EDGEZERO_MANIFEST").map_or_else(
+        |_| (PathBuf::from("edgezero.toml"), false),
+        |raw| (PathBuf::from(raw), true),
+    );
 
     match ManifestLoader::from_path(&path) {
         Ok(loader) => Ok(Some(loader)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        // A missing default `edgezero.toml` is permissive — built-in adapters
+        // can still serve the request. An explicitly set `EDGEZERO_MANIFEST`
+        // that points at a missing file is a hard error so typos surface
+        // instead of silently falling back.
+        Err(err) if err.kind() == ErrorKind::NotFound && !explicit => Ok(None),
         Err(err) => Err(format!("failed to load {}: {err}", path.display())),
     }
 }
@@ -258,14 +264,44 @@ serve = "echo serve"
     }
 
     #[test]
-    fn load_manifest_optional_returns_none_when_missing() {
+    fn load_manifest_optional_hard_errors_when_explicit_env_path_missing() {
+        // An explicit `EDGEZERO_MANIFEST` pointing at a missing file must
+        // fail loudly so typos surface instead of silently falling back to
+        // the built-in adapters.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("missing.toml");
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
-        let result = load_manifest_optional().expect("load result");
-        assert!(result.is_none());
+        match load_manifest_optional() {
+            Err(err) => assert!(
+                err.contains("missing.toml"),
+                "error should name the bad path: {err}"
+            ),
+            Ok(_) => panic!("expected hard error for missing explicit EDGEZERO_MANIFEST"),
+        }
+    }
+
+    #[test]
+    fn load_manifest_optional_returns_none_when_default_missing() {
+        // Default `edgezero.toml` missing is the no-manifest case — built-in
+        // adapters can still serve the request, so this remains permissive.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let _env = EnvOverride {
+            key: "EDGEZERO_MANIFEST",
+            original: env::var("EDGEZERO_MANIFEST").ok(),
+        };
+        env::remove_var("EDGEZERO_MANIFEST");
+        let original_cwd = env::current_dir().expect("cwd");
+        env::set_current_dir(temp.path()).expect("cd temp");
+        let result = load_manifest_optional();
+        env::set_current_dir(original_cwd).expect("restore cwd");
+        match result {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("expected no manifest in a temp dir"),
+            Err(err) => panic!("default missing edgezero.toml should be permissive: {err}"),
+        }
     }
 
     #[test]
