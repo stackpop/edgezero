@@ -126,7 +126,7 @@ struct CloudflareCliAdapter;
 impl Adapter for CloudflareCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
-            AdapterAction::Build => build().map(|artifact| {
+            AdapterAction::Build => build(args).map(|artifact| {
                 log::info!(
                     "[edgezero] Cloudflare build artifact -> {}",
                     artifact.display()
@@ -146,7 +146,7 @@ impl Adapter for CloudflareCliAdapter {
 /// # Errors
 /// Returns an error if the Cloudflare wrangler build command fails.
 #[inline]
-pub fn build() -> Result<PathBuf, String> {
+pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest =
         find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
     let manifest_dir = manifest
@@ -166,6 +166,7 @@ pub fn build() -> Result<PathBuf, String> {
                 .to_str()
                 .ok_or("invalid Cargo manifest path")?,
         ])
+        .args(extra_args)
         .status()
         .map_err(|err| format!("failed to run cargo build: {err}"))?;
     if !status.success() {

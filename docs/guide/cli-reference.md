@@ -83,7 +83,7 @@ edgezero build --adapter <name>
 
 **Arguments:**
 
-- `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `axum`)
+- `--adapter <name>` - Target adapter (`fastly`, `cloudflare`, `spin`, `axum`)
 
 **Examples:**
 
@@ -93,6 +93,9 @@ edgezero build --adapter fastly
 
 # Build for Cloudflare
 edgezero build --adapter cloudflare
+
+# Build for Spin
+edgezero build --adapter spin
 
 # Build native binary
 edgezero build --adapter axum
@@ -213,8 +216,8 @@ error: target may not be installed
 Install the required target:
 
 ```bash
-rustup target add wasm32-wasip1      # For Fastly
-rustup target add wasm32-unknown-unknown  # For Cloudflare
+rustup target add wasm32-wasip1            # For Fastly or Spin
+rustup target add wasm32-unknown-unknown   # For Cloudflare
 ```
 
 ### Manifest Not Found
@@ -233,6 +236,7 @@ Install the provider CLI:
 
 - Fastly: https://developer.fastly.com/learning/compute/
 - Cloudflare: `npm install -g wrangler`
+- Spin: https://spinframework.dev/
 
 ## Building Your Own CLI
 
