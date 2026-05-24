@@ -188,35 +188,6 @@ pub async fn dispatch_with_config(
     .await
 }
 
-pub(crate) async fn dispatch_with_bindings(
-    app: &App,
-    req: CfRequest,
-    env: Env,
-    ctx: Context,
-    config_binding: Option<&str>,
-    kv_binding: &str,
-    kv_required: bool,
-    secrets_required: bool,
-) -> Result<CfResponse, WorkerError> {
-    let config_store_handle =
-        config_binding.and_then(|binding_name| open_config_or_warn(&env, binding_name));
-    let kv = resolve_kv_handle(&env, kv_binding, kv_required)?;
-    let secrets = resolve_secret_handle(&env, secrets_required);
-    dispatch_with_handles(
-        app,
-        req,
-        env,
-        ctx,
-        Stores {
-            config_store: config_store_handle,
-            kv,
-            secrets,
-            ..Default::default()
-        },
-    )
-    .await
-}
-
 fn open_config_or_warn(env: &Env, binding_name: &str) -> Option<ConfigStoreHandle> {
     match CloudflareConfigStore::from_env(env, binding_name) {
         Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),

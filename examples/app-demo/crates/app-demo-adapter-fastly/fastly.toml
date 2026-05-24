@@ -8,7 +8,9 @@ service_id = ""
 [local_server]
 
 # Config store entries for local Viceroy testing.
-# Mirrors [stores.config.defaults] in edgezero.toml so smoke tests pass on all adapters.
+# The platform name matches the logical id from edgezero.toml
+# (`[stores.config].ids = ["app_config"]`); override at runtime with
+# `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=<store>` if you need to remap.
 [local_server.config_stores.app_config]
 format = "inline-toml"
 
@@ -17,15 +19,26 @@ greeting = "hello from config store"
 "feature.new_checkout" = "false"
 "service.timeout_ms" = "1500"
 
+# KV stores, one per logical id from `[stores.kv].ids = ["sessions", "cache"]`.
+# The platform store names match the logical ids by default; override per-id
+# via `EDGEZERO__STORES__KV__<ID>__NAME` (e.g. `…__SESSIONS__NAME=prod-store`).
 [local_server.kv_stores]
 
-[[local_server.kv_stores.EDGEZERO_KV]]
-# We use a dummy key to initialize the store.
-# 'data' provides inline content (empty string here).
-# 'path' would load content from a file (e.g. path="./README.md"), but we don't need that.
+[[local_server.kv_stores.sessions]]
+# Dummy `__init__` key keeps the store materialised under Viceroy without seeding data.
 key = "__init__"
 data = ""
 
+[[local_server.kv_stores.cache]]
+key = "__init__"
+data = ""
+
+# Secret store. The handler still passes a hardcoded `store_name` ("EDGEZERO_SECRETS")
+# to `SecretHandle::get_bytes(store_name, key)` — `BoundSecretStore` does not yet
+# capture the per-id platform name (that lands when 2.7's extractor refactor is
+# extended). The logical id from `[stores.secrets].ids = ["default"]` is what
+# the registry indexes by; the platform store name below is what the handler
+# actually queries.
 [local_server.secret_stores]
 
 [[local_server.secret_stores.EDGEZERO_SECRETS]]
@@ -34,8 +47,10 @@ env = "SMOKE_SECRET"
 
 [setup]
 [setup.kv_stores]
-[setup.kv_stores.EDGEZERO_KV]
-description = "KV store for EdgeZero demo"
+[setup.kv_stores.sessions]
+description = "KV store for EdgeZero demo (sessions)"
+[setup.kv_stores.cache]
+description = "KV store for EdgeZero demo (cache)"
 
 [setup.secret_stores]
 [setup.secret_stores.EDGEZERO_SECRETS]
