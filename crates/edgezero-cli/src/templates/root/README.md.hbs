@@ -3,6 +3,7 @@
 This workspace demonstrates a multi-target EdgeZero app.
 
 - `crates/{{proj_core}}`: reusable application logic built with `edgezero-core`.
+- `crates/{{proj_cli}}`: your project's CLI binary, built on the reusable `edgezero-cli` library. Extend it with your own subcommands here — `edgezero` itself stays generic.
 {{{readme_adapter_crates}}}
 
 ## Routes
