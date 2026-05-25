@@ -193,8 +193,12 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     );
     command.args(extra_args);
     command.current_dir(&project.crate_dir);
-    command.env("EDGEZERO_HOST", bind_addr.ip().to_string());
-    command.env("EDGEZERO_PORT", bind_addr.port().to_string());
+    // Stage 2 canonical env vars. The runtime's `EnvConfig` reads only the
+    // `EDGEZERO__*` form (see `crates/edgezero-core/src/env_config.rs`);
+    // setting the legacy `EDGEZERO_HOST`/`EDGEZERO_PORT` here would be a
+    // no-op for the child process.
+    command.env("EDGEZERO__ADAPTER__HOST", bind_addr.ip().to_string());
+    command.env("EDGEZERO__ADAPTER__PORT", bind_addr.port().to_string());
     let status = command
         .status()
         .map_err(|err| format!("failed to run cargo {subcommand}: {err}"))?;
@@ -258,7 +262,7 @@ fn resolve_subprocess_host(
         match value.parse() {
             Ok(host) => return host,
             Err(_) => warnings.push(format!(
-                "EDGEZERO_HOST={value:?} is not a valid IP address (hostnames like \"localhost\" are not supported); falling back"
+                "EDGEZERO__ADAPTER__HOST={value:?} is not a valid IP address (hostnames like \"localhost\" are not supported); falling back"
             )),
         }
     }
@@ -293,11 +297,11 @@ fn resolve_subprocess_port(
     if let Some(value) = env_port {
         match value.parse::<u16>() {
             Ok(0) => warnings.push(
-                "EDGEZERO_PORT=\"0\" is not supported (would bind to a random OS port); falling back".to_owned(),
+                "EDGEZERO__ADAPTER__PORT=\"0\" is not supported (would bind to a random OS port); falling back".to_owned(),
             ),
             Ok(port) => return port,
             Err(_) => warnings.push(format!(
-                "EDGEZERO_PORT={value:?} is not a valid port number; falling back"
+                "EDGEZERO__ADAPTER__PORT={value:?} is not a valid port number; falling back"
             )),
         }
     }
@@ -375,8 +379,17 @@ fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
-    let env_host = env::var("EDGEZERO_HOST").ok();
-    let env_port = env::var("EDGEZERO_PORT").ok();
+    // Canonical Stage 2 env vars take precedence. Fall back to the
+    // pre-Stage-2 `EDGEZERO_HOST`/`EDGEZERO_PORT` for back-compat so a user
+    // who set the old names in CI scripts still gets a working address
+    // override; they'll be re-emitted to the subprocess under the canonical
+    // `EDGEZERO__ADAPTER__*` names that the runtime actually reads.
+    let env_host = env::var("EDGEZERO__ADAPTER__HOST")
+        .ok()
+        .or_else(|| env::var("EDGEZERO_HOST").ok());
+    let env_port = env::var("EDGEZERO__ADAPTER__PORT")
+        .ok()
+        .or_else(|| env::var("EDGEZERO_PORT").ok());
     read_axum_project_with_env(manifest, env_host.as_deref(), env_port.as_deref())
 }
 

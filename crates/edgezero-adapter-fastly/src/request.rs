@@ -352,10 +352,13 @@ fn build_kv_registry(
         };
         by_id.insert((*id).to_owned(), handle);
     }
-    if by_id.is_empty() {
-        return Ok(None);
+    let default_id = meta.default.to_owned();
+    if !by_id.contains_key(&default_id) {
+        log::warn!(
+            "KV registry default id `{default_id}` could not be opened; dropping the KV registry"
+        );
     }
-    Ok(Some(StoreRegistry::new(by_id, meta.default.to_owned())))
+    Ok(StoreRegistry::from_parts(by_id, default_id))
 }
 
 fn build_config_registry(
@@ -373,10 +376,13 @@ fn build_config_registry(
             Err(err) => warn_missing_store_once(&store_name, &err.to_string()),
         }
     }
-    if by_id.is_empty() {
-        return None;
+    let default_id = meta.default.to_owned();
+    if !by_id.contains_key(&default_id) {
+        log::warn!(
+            "config registry default id `{default_id}` could not be opened; dropping the config registry"
+        );
     }
-    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+    StoreRegistry::from_parts(by_id, default_id)
 }
 
 fn build_secret_registry(
@@ -399,7 +405,9 @@ fn build_secret_registry(
             BoundSecretStore::new(handle.clone(), store_name),
         );
     }
-    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+    // Fastly's secret-store handle wrappers are infallible to construct;
+    // `from_parts` keeps the API symmetric with the KV / config builders.
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
 /// # Errors

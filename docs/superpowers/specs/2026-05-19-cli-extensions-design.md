@@ -418,7 +418,18 @@ ids     = ["default"]
 
 `[stores.<kind>]` declares **logical store ids only** — the portable
 fact that "this app uses a KV store called `sessions`". No platform
-names, no per-adapter tuning, and **no `[adapters.*]` table**.
+names, no per-adapter tuning, and **no per-adapter store / runtime
+tables**.
+
+The top-level `[adapters.<name>]` table is retained for adapter
+discovery and shell-command wiring (`crate`, `build`, `commands`,
+`logging`); what the hard-cutoff removes is the per-adapter
+**store** subtable (`[adapters.<name>.stores.*]`) and the per-adapter
+**runtime** tuning subtable (anything other than the four blocks
+listed). `[adapters.<name>.adapter] host`/`port` survives as a hint
+the CLI translates into `EDGEZERO__ADAPTER__HOST`/`PORT` env vars
+when spawning a child process; the runtime itself reads only the env
+vars (§6.6 below).
 
 | Field                     | Role                                                                           |
 | ------------------------- | ------------------------------------------------------------------------------ |

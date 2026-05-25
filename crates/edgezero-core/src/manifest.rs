@@ -359,14 +359,15 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub commands: ManifestAdapterCommands,
-    #[serde(default)]
-    #[validate(nested)]
-    pub logging: ManifestLoggingConfig,
-    /// Catch-all for any sub-table other than the four above. The pre-rewrite
+    /// Catch-all for any sub-table other than the four canonical ones
+    /// (`adapter`, `build`, `commands`, `logging`). The pre-rewrite
     /// `[adapters.<name>.stores.*]` tables land here and are rejected by
     /// [`validate_manifest_adapter`] with the migration-guide message.
     #[serde(flatten)]
     pub legacy: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub logging: ManifestLoggingConfig,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]

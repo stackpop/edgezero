@@ -39,6 +39,20 @@ case "$ADAPTER" in
     PORT=8787
     echo "==> Building app-demo (axum)..."
     (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
+    # Stage 2 Axum config is read from `.edgezero/local-config-<id>.json`
+    # per logical id (see `AxumConfigStore::from_local_file`). `config push`
+    # writes that file in Stage 7; until then the smoke script seeds it
+    # directly with the same demo values Fastly's `[local_server.config_stores.app_config.contents]`
+    # and Spin's `[variables]` defaults carry.
+    echo "==> Seeding .edgezero/local-config-app_config.json..."
+    mkdir -p "$DEMO_DIR/.edgezero"
+    cat > "$DEMO_DIR/.edgezero/local-config-app_config.json" <<'JSON'
+{
+  "greeting": "hello from config store",
+  "feature.new_checkout": "false",
+  "service.timeout_ms": "1500"
+}
+JSON
     echo "==> Starting Axum adapter on port $PORT..."
     (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
     SERVER_PID=$!

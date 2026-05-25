@@ -76,7 +76,16 @@ pub fn execute(
         if let Some(command) = manifest_command(loader.manifest(), adapter_name, action) {
             let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
             let env = loader.manifest().environment_for(adapter_name);
-            return run_shell(command, root, adapter_name, action, Some(env), adapter_args);
+            let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
+            return run_shell(
+                command,
+                root,
+                adapter_name,
+                action,
+                Some(env),
+                adapter_bind,
+                adapter_args,
+            );
         }
     }
 
@@ -117,12 +126,27 @@ fn manifest_command<'manifest>(
     }
 }
 
+/// `(host, port)` from `[adapters.<name>.adapter]`. Translated into
+/// `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT` on the
+/// subprocess env so the runtime (which reads only the canonical Stage 2
+/// names) actually sees the values declared in the manifest.
+fn adapter_bind_from_manifest(
+    manifest: &Manifest,
+    adapter_name: &str,
+) -> (Option<String>, Option<u16>) {
+    let Some(cfg) = manifest.adapters.get(adapter_name) else {
+        return (None, None);
+    };
+    (cfg.adapter.host.clone(), cfg.adapter.port)
+}
+
 fn run_shell(
     command: &str,
     cwd: &Path,
     adapter_name: &str,
     action: Action,
     environment: Option<ResolvedEnvironment>,
+    adapter_bind: (Option<String>, Option<u16>),
     adapter_args: &[String],
 ) -> Result<(), String> {
     let full_command = if adapter_args.is_empty() {
@@ -142,6 +166,23 @@ fn run_shell(
 
     if let Some(env) = environment {
         apply_environment(adapter_name, &env, &mut cmd)?;
+    }
+
+    // Propagate manifest `[adapters.<name>.adapter] host`/`port` to the
+    // subprocess as `EDGEZERO__ADAPTER__HOST/PORT` so the runtime — which
+    // reads only the Stage 2 canonical names — actually sees them.
+    // Parent-env overrides win: if the user already set the canonical
+    // variable, leave it alone.
+    let (manifest_host, manifest_port) = adapter_bind;
+    if let Some(host) = manifest_host {
+        if env::var_os("EDGEZERO__ADAPTER__HOST").is_none() {
+            cmd.env("EDGEZERO__ADAPTER__HOST", host);
+        }
+    }
+    if let Some(port) = manifest_port {
+        if env::var_os("EDGEZERO__ADAPTER__PORT").is_none() {
+            cmd.env("EDGEZERO__ADAPTER__PORT", port.to_string());
+        }
     }
 
     let status = cmd

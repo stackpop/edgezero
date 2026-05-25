@@ -47,13 +47,6 @@ pub struct BoundSecretStore {
 }
 
 impl BoundSecretStore {
-    /// Bind `handle` to the platform store name `store_name`.
-    #[inline]
-    #[must_use]
-    pub fn new(handle: SecretHandle, store_name: String) -> Self {
-        Self { handle, store_name }
-    }
-
     /// Retrieve a secret by key against the bound platform store.
     ///
     /// # Errors
@@ -61,6 +54,21 @@ impl BoundSecretStore {
     #[inline]
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, SecretError> {
         self.handle.get_bytes(&self.store_name, key).await
+    }
+
+    /// Underlying [`SecretHandle`] (escape hatch for callers that need the
+    /// store-name argument explicitly).
+    #[inline]
+    #[must_use]
+    pub fn handle(&self) -> &SecretHandle {
+        &self.handle
+    }
+
+    /// Bind `handle` to the platform store name `store_name`.
+    #[inline]
+    #[must_use]
+    pub fn new(handle: SecretHandle, store_name: String) -> Self {
+        Self { handle, store_name }
     }
 
     /// Retrieve a secret as raw bytes, error on absent.
@@ -79,14 +87,6 @@ impl BoundSecretStore {
     #[inline]
     pub async fn require_str(&self, key: &str) -> Result<String, SecretError> {
         self.handle.require_str(&self.store_name, key).await
-    }
-
-    /// Underlying [`SecretHandle`] (escape hatch for callers that need the
-    /// store-name argument explicitly).
-    #[inline]
-    #[must_use]
-    pub fn handle(&self) -> &SecretHandle {
-        &self.handle
     }
 
     /// Platform store name this binding resolves to.
@@ -108,7 +108,11 @@ pub struct StoreRegistry<H: Clone> {
 }
 
 impl<H: Clone> StoreRegistry<H> {
-    /// Return the default handle, if the registry is non-empty.
+    /// Return the default handle.
+    ///
+    /// Always `Some` for a registry constructed via [`Self::new`] — the
+    /// invariant is enforced at construction time. `Option` is kept on the
+    /// signature for API symmetry with [`Self::named`].
     #[must_use]
     #[inline]
     pub fn default(&self) -> Option<H> {
@@ -120,6 +124,23 @@ impl<H: Clone> StoreRegistry<H> {
     #[inline]
     pub fn default_id(&self) -> &str {
         &self.default_id
+    }
+
+    /// Try to build a registry from a pre-built id → handle map and the
+    /// declared default id, dropping it entirely when the default id is
+    /// not registered. Adapters that skip a failed-to-open backend per id
+    /// (logging a warning) call this instead of [`Self::new`] so the
+    /// registry isn't constructed with a default that has nowhere to
+    /// resolve to. Returning `None` in that case bubbles up as "no
+    /// registry wired", which surfaces as a clear 503 at the handler
+    /// rather than a silent `None` from [`Self::default`].
+    #[must_use]
+    #[inline]
+    pub fn from_parts(by_id: BTreeMap<String, H>, default_id: String) -> Option<Self> {
+        if by_id.is_empty() || !by_id.contains_key(&default_id) {
+            return None;
+        }
+        Some(Self { by_id, default_id })
     }
 
     /// Iterate over the registered logical ids.
@@ -136,13 +157,23 @@ impl<H: Clone> StoreRegistry<H> {
     }
 
     /// Create a registry from a pre-built id → handle map and the resolved
-    /// default id. The default id must be present in `by_id`.
+    /// default id.
+    ///
+    /// # Panics
+    /// Panics (in both debug and release) if `default_id` is not a key in
+    /// `by_id`. Adapter builders that drop a failed-to-open id must ensure
+    /// they don't construct a registry whose declared default is missing —
+    /// either skip the whole registry, or fail the request loudly.
+    /// Surfacing this as a panic enforces the [`Self::default`] invariant
+    /// at construction time, matching the spec's intent that a declared
+    /// default always resolves.
     #[must_use]
     #[inline]
     pub fn new(by_id: BTreeMap<String, H>, default_id: String) -> Self {
-        debug_assert!(
+        assert!(
             by_id.contains_key(&default_id),
-            "StoreRegistry default id `{default_id}` is not present in the map"
+            "StoreRegistry default id `{default_id}` is not present among the registered ids: {ids:?}",
+            ids = by_id.keys().collect::<Vec<_>>()
         );
         Self { by_id, default_id }
     }
@@ -203,5 +234,15 @@ mod tests {
         let r1 = build_registry(&[("a", "1")], "a");
         let r2 = r1.clone();
         assert_eq!(r1.named("a"), r2.named("a"));
+    }
+
+    #[test]
+    #[should_panic(expected = "is not present among the registered ids")]
+    fn new_panics_when_default_is_not_among_registered_ids() {
+        // The invariant is enforced in both debug and release builds — a
+        // builder that drops a failed-to-open default id must not still
+        // call `new(by_id, missing_default)`. Catching this loudly avoids
+        // silent registries whose `default()` returns `None`.
+        let _registry: StoreRegistry<String> = build_registry(&[("sessions", "a")], "cache");
     }
 }

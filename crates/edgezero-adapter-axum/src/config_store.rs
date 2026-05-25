@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -26,15 +27,9 @@ pub struct AxumConfigStore {
 }
 
 impl AxumConfigStore {
-    /// Build a store from an explicit `{key -> value}` map. Intended for
-    /// tests and for callers that already have parsed config in memory.
-    #[inline]
-    pub fn from_map<E>(entries: E) -> Self
-    where
-        E: IntoIterator<Item = (String, String)>,
-    {
+    fn empty() -> Self {
         Self {
-            data: entries.into_iter().collect(),
+            data: HashMap::new(),
         }
     }
 
@@ -54,17 +49,22 @@ impl AxumConfigStore {
         Self::from_path(&Self::local_path(id))
     }
 
-    /// Resolve the on-disk path for the given logical config id.
-    #[must_use]
+    /// Build a store from an explicit `{key -> value}` map. Intended for
+    /// tests and for callers that already have parsed config in memory.
     #[inline]
-    pub fn local_path(id: &str) -> PathBuf {
-        PathBuf::from(".edgezero").join(format!("local-config-{id}.json"))
+    pub fn from_map<E>(entries: E) -> Self
+    where
+        E: IntoIterator<Item = (String, String)>,
+    {
+        Self {
+            data: entries.into_iter().collect(),
+        }
     }
 
     fn from_path(path: &Path) -> Result<Self, ConfigStoreError> {
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(err) if err.kind() == ErrorKind::NotFound => {
                 return Ok(Self::empty());
             }
             Err(err) => {
@@ -83,10 +83,11 @@ impl AxumConfigStore {
         Ok(Self { data })
     }
 
-    fn empty() -> Self {
-        Self {
-            data: HashMap::new(),
-        }
+    /// Resolve the on-disk path for the given logical config id.
+    #[must_use]
+    #[inline]
+    pub fn local_path(id: &str) -> PathBuf {
+        PathBuf::from(".edgezero").join(format!("local-config-{id}.json"))
     }
 }
 
@@ -134,7 +135,7 @@ mod tests {
     fn axum_config_store_from_path_reads_flat_json() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("local-config-app_config.json");
-        std::fs::write(
+        fs::write(
             &path,
             r#"{"greeting":"hello from file","feature.new_checkout":"false"}"#,
         )
@@ -156,7 +157,7 @@ mod tests {
     fn axum_config_store_from_path_rejects_malformed_json() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("local-config-bad.json");
-        std::fs::write(&path, "{not json}").expect("write");
+        fs::write(&path, "{not json}").expect("write");
 
         match AxumConfigStore::from_path(&path) {
             Err(ConfigStoreError::Unavailable { .. }) => {}
@@ -169,7 +170,7 @@ mod tests {
     fn axum_config_store_from_path_rejects_non_string_values() {
         let temp = tempdir().expect("tempdir");
         let path = temp.path().join("local-config-numeric.json");
-        std::fs::write(&path, r#"{"greeting":42}"#).expect("write");
+        fs::write(&path, r#"{"greeting":42}"#).expect("write");
 
         match AxumConfigStore::from_path(&path) {
             Err(ConfigStoreError::Unavailable { .. }) => {}
