@@ -42,6 +42,7 @@ http = { workspace = true }
 log = { workspace = true }
 redb = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true }
 simple_logger = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }

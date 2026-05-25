@@ -14,7 +14,9 @@ use edgezero_core::http::{request_builder, Method as CoreMethod, Request, Uri};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
-use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
+use edgezero_core::store_registry::{
+    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+};
 use std::collections::BTreeMap;
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
@@ -327,7 +329,7 @@ pub(crate) async fn dispatch_with_registries(
 ) -> Result<CfResponse, WorkerError> {
     let kv_registry = build_kv_registry(&env, kv_meta, env_config)?;
     let config_registry = build_config_registry(&env, config_meta, env_config);
-    let secret_registry = build_secret_registry(&env, secret_meta);
+    let secret_registry = build_secret_registry(&env, secret_meta, env_config);
     dispatch_with_handles(
         app,
         req,
@@ -386,15 +388,26 @@ fn build_config_registry(
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
-fn build_secret_registry(env: &Env, secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+fn build_secret_registry(
+    env: &Env,
+    secret_meta: Option<StoreMetadata>,
+    env_config: &EnvConfig,
+) -> Option<SecretRegistry> {
     let meta = secret_meta?;
     // Cloudflare is `Single` for secrets — one shared handle binds every id.
+    // `CloudflareSecretStore::get_bytes` ignores `store_name` (worker
+    // secrets are a flat namespace), so the per-id bound name is
+    // observable only via [`BoundSecretStore::store_name`].
     let handle = SecretHandle::new(std::sync::Arc::new(
         crate::secret_store::CloudflareSecretStore::from_env(env.clone()),
     ));
-    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
     for id in meta.ids {
-        by_id.insert((*id).to_owned(), handle.clone());
+        let store_name = env_config.store_name("secrets", id);
+        by_id.insert(
+            (*id).to_owned(),
+            BoundSecretStore::new(handle.clone(), store_name),
+        );
     }
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }

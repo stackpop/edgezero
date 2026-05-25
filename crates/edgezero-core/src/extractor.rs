@@ -518,11 +518,15 @@ impl Kv {
 
 /// Extractor that yields the per-request [`SecretRegistry`] (§6.9).
 ///
+/// The returned [`BoundSecretStore`] is pre-bound to a platform store name
+/// (resolved per id from `EDGEZERO__STORES__SECRETS__<ID>__NAME`), so
+/// handler code passes only the key:
+///
 /// ```ignore
 /// #[action]
 /// pub async fn handler(secrets: Secrets) -> Result<Response, EdgeError> {
 ///     let bound = secrets.default().ok_or_else(|| EdgeError::internal(anyhow::anyhow!("no secrets")))?;
-///     let key = bound.require_str("api-keys", "API_KEY").await.map_err(EdgeError::from)?;
+///     let key = bound.require_str("API_KEY").await.map_err(EdgeError::from)?;
 ///     // ...
 /// }
 /// ```
@@ -537,7 +541,12 @@ impl FromRequest for Secrets {
             return Ok(Secrets(registry));
         }
         if let Some(handle) = ctx.secret_handle() {
-            return Ok(Secrets(single_id_registry(handle)));
+            // Legacy fallback: wrap the lone `SecretHandle` into a one-id
+            // registry under the conventional `"default"` platform name.
+            // Adapters that haven't yet wired a real `SecretRegistry` keep
+            // working through this path.
+            let bound = BoundSecretStore::new(handle, "default".to_owned());
+            return Ok(Secrets(single_id_registry(bound)));
         }
         Err(EdgeError::internal(anyhow::anyhow!(
             "no secret store configured -- check [stores.secrets] in edgezero.toml and platform bindings"
@@ -1228,7 +1237,58 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let secrets =
             block_on(Secrets::from_request(&ctx)).expect("Secrets extractor when handle present");
-        assert!(secrets.default().is_some());
+        let bound = secrets
+            .default()
+            .expect("legacy fallback yields a bound store");
+        assert_eq!(bound.store_name(), "default");
+    }
+
+    #[test]
+    fn secrets_extractor_preserves_registry_per_id_platform_name() {
+        use crate::secret_store::{NoopSecretStore, SecretHandle};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let handle = SecretHandle::new(Arc::new(NoopSecretStore));
+        let by_id: BTreeMap<String, BoundSecretStore> = [
+            (
+                "primary".to_owned(),
+                BoundSecretStore::new(handle.clone(), "primary-vault".to_owned()),
+            ),
+            (
+                "analytics".to_owned(),
+                BoundSecretStore::new(handle, "analytics-vault".to_owned()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let registry: SecretRegistry = StoreRegistry::new(by_id, "primary".to_owned());
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/secrets")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+        let ctx = RequestContext::new(request, PathParams::default());
+
+        let secrets =
+            block_on(Secrets::from_request(&ctx)).expect("Secrets extractor when registry present");
+        // The per-id binding survives the extractor — each named store
+        // resolves to its own platform name.
+        assert_eq!(
+            secrets.named("primary").expect("primary").store_name(),
+            "primary-vault"
+        );
+        assert_eq!(
+            secrets.named("analytics").expect("analytics").store_name(),
+            "analytics-vault"
+        );
+        assert_eq!(
+            secrets.default().expect("default").store_name(),
+            "primary-vault"
+        );
+        assert!(secrets.named("missing").is_none());
     }
 
     #[test]

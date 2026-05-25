@@ -16,7 +16,9 @@ use edgezero_core::http::{request_builder, Request, Uri};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
-use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
+use edgezero_core::store_registry::{
+    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+};
 use spin_sdk::http::IncomingRequest;
 
 #[derive(Default)]
@@ -186,7 +188,7 @@ pub(crate) async fn dispatch_with_registries(
 ) -> anyhow::Result<spin_sdk::http::Response> {
     let kv_registry = build_kv_registry(kv_meta, env)?;
     let config_registry = build_config_registry(config_meta);
-    let secret_registry = build_secret_registry(secret_meta);
+    let secret_registry = build_secret_registry(secret_meta, env);
     dispatch_with_handles(
         app,
         req,
@@ -244,13 +246,23 @@ fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigReg
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
-fn build_secret_registry(secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+fn build_secret_registry(
+    secret_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Option<SecretRegistry> {
     let meta = secret_meta?;
-    // Spin is `Single` for secrets: every id resolves to the same flat variable store.
+    // Spin is `Single` for secrets: every id resolves to the same flat
+    // variable store. `SpinSecretStore::get_bytes` ignores `store_name`
+    // (logs a debug if non-empty per §6.7), so the per-id bound name is
+    // observable only via [`BoundSecretStore::store_name`].
     let handle = SecretHandle::new(Arc::new(SpinSecretStore::new()));
-    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
     for id in meta.ids {
-        by_id.insert((*id).to_owned(), handle.clone());
+        let store_name = env.store_name("secrets", id);
+        by_id.insert(
+            (*id).to_owned(),
+            BoundSecretStore::new(handle.clone(), store_name),
+        );
     }
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }

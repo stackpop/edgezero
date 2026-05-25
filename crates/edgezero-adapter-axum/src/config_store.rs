@@ -1,60 +1,91 @@
-//! Axum adapter config store: env vars with in-memory defaults fallback.
+//! Axum adapter config store: reads from a per-id local JSON file.
+//!
+//! Each declared `[stores.config].ids` id maps to a file at
+//! `.edgezero/local-config-<id>.json` (§15 of the design spec). The file
+//! holds a flat object of `string -> string` pairs — the same shape
+//! `config push --adapter axum` will write when Stage 7 lands.
+//!
+//! If the file is absent the store is empty (`get` returns `Ok(None)` for
+//! every key). This keeps `edgezero serve --adapter axum` permissive when
+//! the project hasn't seeded any local config yet.
 
 use std::collections::HashMap;
-use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 
-/// Config store for local dev / Axum. Reads from env vars with in-memory
-/// defaults as fallback. Env vars take precedence over defaults.
+/// Local-file config store used by the Axum dev server.
 ///
-/// # Note on `from_env`
-///
-/// [`AxumConfigStore::from_env`] only reads environment variables for keys
-/// present in the supplied defaults map. The portable manifest no longer
-/// carries config-store defaults, so the dev server passes an empty map.
+/// Construction is fallible only when the backing file is present but
+/// malformed JSON — a missing file is a documented "no values seeded yet"
+/// state, not an error.
 pub struct AxumConfigStore {
-    defaults: HashMap<String, String>,
-    env: HashMap<String, String>,
+    data: HashMap<String, String>,
 }
 
 impl AxumConfigStore {
-    /// Create from the current process environment and manifest defaults.
+    /// Build a store from an explicit `{key -> value}` map. Intended for
+    /// tests and for callers that already have parsed config in memory.
     #[inline]
-    pub fn from_env<D>(defaults: D) -> Self
+    pub fn from_map<E>(entries: E) -> Self
     where
-        D: IntoIterator<Item = (String, String)>,
+        E: IntoIterator<Item = (String, String)>,
     {
-        Self::from_lookup(defaults, |key| env::var(key).ok())
-    }
-
-    fn from_lookup<D, F>(defaults: D, mut lookup: F) -> Self
-    where
-        D: IntoIterator<Item = (String, String)>,
-        F: FnMut(&str) -> Option<String>,
-    {
-        let collected: HashMap<String, String> = defaults.into_iter().collect();
-        let env = collected
-            .keys()
-            .filter_map(|key| lookup(key).map(|value| (key.clone(), value)))
-            .collect();
         Self {
-            defaults: collected,
-            env,
+            data: entries.into_iter().collect(),
         }
     }
 
-    /// Create from env vars and optional manifest defaults.
+    /// Open the local-file config store for a given logical id.
+    ///
+    /// Reads `.edgezero/local-config-<id>.json` if present and parses it
+    /// as a flat `string -> string` JSON object. A missing file yields an
+    /// empty store. A malformed file yields
+    /// [`ConfigStoreError::Unavailable`] so the dev-server log surfaces
+    /// the problem at startup rather than at first request.
+    ///
+    /// # Errors
+    /// Returns [`ConfigStoreError::Unavailable`] when the backing file
+    /// exists but cannot be read or parsed.
     #[inline]
-    pub fn new<E, D>(env: E, defaults: D) -> Self
-    where
-        E: IntoIterator<Item = (String, String)>,
-        D: IntoIterator<Item = (String, String)>,
-    {
+    pub fn from_local_file(id: &str) -> Result<Self, ConfigStoreError> {
+        Self::from_path(&Self::local_path(id))
+    }
+
+    /// Resolve the on-disk path for the given logical config id.
+    #[must_use]
+    #[inline]
+    pub fn local_path(id: &str) -> PathBuf {
+        PathBuf::from(".edgezero").join(format!("local-config-{id}.json"))
+    }
+
+    fn from_path(path: &Path) -> Result<Self, ConfigStoreError> {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::empty());
+            }
+            Err(err) => {
+                return Err(ConfigStoreError::unavailable(format!(
+                    "failed to read {}: {err}",
+                    path.display()
+                )));
+            }
+        };
+        let data: HashMap<String, String> = serde_json::from_str(&raw).map_err(|err| {
+            ConfigStoreError::unavailable(format!(
+                "{} is not a flat string -> string JSON object: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(Self { data })
+    }
+
+    fn empty() -> Self {
         Self {
-            defaults: defaults.into_iter().collect(),
-            env: env.into_iter().collect(),
+            data: HashMap::new(),
         }
     }
 }
@@ -63,109 +94,96 @@ impl AxumConfigStore {
 impl ConfigStore for AxumConfigStore {
     #[inline]
     async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(self
-            .env
-            .get(key)
-            .or_else(|| self.defaults.get(key))
-            .cloned())
+        Ok(self.data.get(key).cloned())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Run the shared contract tests against AxumConfigStore (defaults path).
-    edgezero_core::config_store_contract_tests!(axum_config_store_defaults_contract, {
-        AxumConfigStore::new(
-            [],
-            [
-                ("contract.key.a".to_owned(), "value_a".to_owned()),
-                ("contract.key.b".to_owned(), "value_b".to_owned()),
-            ],
-        )
-    });
-
-    // Run the shared contract tests against AxumConfigStore (env path).
-    edgezero_core::config_store_contract_tests!(axum_config_store_env_contract, {
-        AxumConfigStore::new(
-            [
-                ("contract.key.a".to_owned(), "value_a".to_owned()),
-                ("contract.key.b".to_owned(), "value_b".to_owned()),
-            ],
-            [],
-        )
+    // Run the shared contract tests against AxumConfigStore.
+    edgezero_core::config_store_contract_tests!(axum_config_store_contract, {
+        AxumConfigStore::from_map([
+            ("contract.key.a".to_owned(), "value_a".to_owned()),
+            ("contract.key.b".to_owned(), "value_b".to_owned()),
+        ])
     });
 
     use super::*;
     use futures::executor::block_on;
+    use tempfile::tempdir;
 
-    fn store(env: &[(&str, &str)], defaults: &[(&str, &str)]) -> AxumConfigStore {
-        AxumConfigStore::new(
-            env.iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
-            defaults
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    #[test]
+    fn axum_config_store_from_map_returns_values() {
+        let cs = AxumConfigStore::from_map([("greeting".to_owned(), "hello".to_owned())]);
+        assert_eq!(
+            block_on(cs.get("greeting")).expect("config value"),
+            Some("hello".to_owned())
+        );
+        assert_eq!(block_on(cs.get("missing")).expect("missing config"), None);
+    }
+
+    #[test]
+    fn axum_config_store_from_path_returns_empty_for_missing_file() {
+        let temp = tempdir().expect("tempdir");
+        let cs = AxumConfigStore::from_path(&temp.path().join("nope.json"))
+            .expect("missing file is permissive");
+        assert_eq!(block_on(cs.get("anything")).expect("empty store"), None);
+    }
+
+    #[test]
+    fn axum_config_store_from_path_reads_flat_json() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("local-config-app_config.json");
+        std::fs::write(
+            &path,
+            r#"{"greeting":"hello from file","feature.new_checkout":"false"}"#,
         )
+        .expect("write json");
+
+        let cs = AxumConfigStore::from_path(&path).expect("parse json");
+        assert_eq!(
+            block_on(cs.get("greeting")).expect("value"),
+            Some("hello from file".to_owned())
+        );
+        assert_eq!(
+            block_on(cs.get("feature.new_checkout")).expect("dotted value"),
+            Some("false".to_owned())
+        );
+        assert_eq!(block_on(cs.get("missing")).expect("missing"), None);
     }
 
     #[test]
-    fn axum_config_store_env_overrides_defaults() {
-        let cs = store(&[("KEY", "from_env")], &[("KEY", "from_default")]);
-        assert_eq!(
-            block_on(cs.get("KEY")).expect("config value"),
-            Some("from_env".to_owned())
-        );
+    fn axum_config_store_from_path_rejects_malformed_json() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("local-config-bad.json");
+        std::fs::write(&path, "{not json}").expect("write");
+
+        match AxumConfigStore::from_path(&path) {
+            Err(ConfigStoreError::Unavailable { .. }) => {}
+            Err(other) => panic!("expected Unavailable, got {other:?}"),
+            Ok(_) => panic!("malformed JSON must surface as error"),
+        }
     }
 
     #[test]
-    fn axum_config_store_falls_back_to_defaults() {
-        let cs = store(&[], &[("KEY", "default_val")]);
-        assert_eq!(
-            block_on(cs.get("KEY")).expect("default config"),
-            Some("default_val".to_owned())
-        );
+    fn axum_config_store_from_path_rejects_non_string_values() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("local-config-numeric.json");
+        std::fs::write(&path, r#"{"greeting":42}"#).expect("write");
+
+        match AxumConfigStore::from_path(&path) {
+            Err(ConfigStoreError::Unavailable { .. }) => {}
+            Err(other) => panic!("expected Unavailable, got {other:?}"),
+            Ok(_) => panic!("non-string values must surface as error"),
+        }
     }
 
     #[test]
-    fn axum_config_store_from_env_reads_only_declared_keys() {
-        let cs = AxumConfigStore::from_lookup(
-            [
-                ("feature.new_checkout".to_owned(), "false".to_owned()),
-                ("service.timeout_ms".to_owned(), "1500".to_owned()),
-            ],
-            |key| match key {
-                "feature.new_checkout" => Some("true".to_owned()),
-                "DATABASE_URL" => Some("postgres://secret".to_owned()),
-                _ => None,
-            },
-        );
-
+    fn local_path_is_keyed_by_logical_id() {
+        let path = AxumConfigStore::local_path("app_config");
         assert_eq!(
-            block_on(cs.get("feature.new_checkout")).expect("allowed env override"),
-            Some("true".to_owned())
-        );
-        assert_eq!(
-            block_on(cs.get("service.timeout_ms")).expect("default fallback"),
-            Some("1500".to_owned())
-        );
-        assert_eq!(
-            block_on(cs.get("DATABASE_URL")).expect("undeclared key should stay hidden"),
-            None
-        );
-    }
-
-    #[test]
-    fn axum_config_store_returns_none_for_missing() {
-        let cs = store(&[], &[]);
-        assert_eq!(block_on(cs.get("NOPE")).expect("missing config"), None);
-    }
-
-    #[test]
-    fn axum_config_store_returns_values() {
-        let cs = store(&[("MY_KEY", "my_val")], &[]);
-        assert_eq!(
-            block_on(cs.get("MY_KEY")).expect("config value"),
-            Some("my_val".to_owned())
+            path,
+            PathBuf::from(".edgezero/local-config-app_config.json")
         );
     }
 }

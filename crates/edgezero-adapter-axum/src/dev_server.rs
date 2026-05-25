@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(test)]
 use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
@@ -20,7 +21,9 @@ use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
-use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
+use edgezero_core::store_registry::{
+    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+};
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 use std::collections::BTreeMap;
@@ -364,7 +367,7 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
 
         let kv_registry = build_kv_registry(stores.kv, &env, kv_init_requirement)?;
         let config_registry = build_config_registry(stores.config);
-        let secret_registry = build_secret_registry(stores.secrets);
+        let secret_registry = build_secret_registry(stores.secrets, &env);
 
         let request_stores = Stores {
             config_registry,
@@ -432,28 +435,58 @@ fn build_kv_registry(
     Ok(Some(StoreRegistry::new(by_id, default_id)))
 }
 
-/// Build the per-request config registry. The axum config store starts empty;
-/// values are read from `.edgezero/local-config-<id>.json` (wired in Task 2.6
-/// once `config push` lands in Stage 7).
+/// Build the per-request config registry from the per-id local-file stores.
+///
+/// Each declared id reads `.edgezero/local-config-<id>.json` (§15). A missing
+/// file yields an empty store for that id — the dev server stays usable
+/// before any `config push` has populated the file. A malformed file logs a
+/// warning and the id is dropped from the registry rather than failing
+/// startup, matching the cloudflare config-binding behaviour.
 fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
     let meta = config_meta?;
     let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
     for id in meta.ids {
-        let store = AxumConfigStore::from_env(iter::empty());
+        let store = match AxumConfigStore::from_local_file(id) {
+            Ok(store) => store,
+            Err(err) => {
+                log::warn!(
+                    "config store for id `{}` could not be loaded from {}: {}; \
+                     dropping this id from the registry",
+                    id,
+                    AxumConfigStore::local_path(id).display(),
+                    err
+                );
+                continue;
+            }
+        };
         by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+    }
+    if by_id.is_empty() {
+        return None;
     }
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
 /// Build the per-request secret registry. Axum is `Single` for secrets — every
-/// declared id maps to the same env-backed [`EnvSecretStore`].
-fn build_secret_registry(secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+/// declared id maps to the same env-backed [`EnvSecretStore`]. Each binding
+/// captures the platform store name resolved from
+/// `EDGEZERO__STORES__SECRETS__<ID>__NAME` (defaulting to the logical id);
+/// the axum env-secret backend ignores the name on lookup, so the binding
+/// is observable only via [`BoundSecretStore::store_name`].
+fn build_secret_registry(
+    secret_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Option<SecretRegistry> {
     let meta = secret_meta?;
     log::info!("Secret store: reading from environment variables");
     let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
-    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
     for id in meta.ids {
-        by_id.insert((*id).to_owned(), handle.clone());
+        let store_name = env.store_name("secrets", id);
+        by_id.insert(
+            (*id).to_owned(),
+            BoundSecretStore::new(handle.clone(), store_name),
+        );
     }
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
@@ -1038,10 +1071,7 @@ mod integration_tests {
         let store = secrets
             .default()
             .ok_or_else(|| EdgeError::service_unavailable("no default secret store registered"))?;
-        store
-            .require_str("test-store", "API_KEY")
-            .await
-            .map_err(EdgeError::from)
+        store.require_str("API_KEY").await.map_err(EdgeError::from)
     }
 
     // -----------------------------------------------------------------------
@@ -1056,8 +1086,10 @@ mod integration_tests {
         let router = RouterService::builder()
             .get("/secret", secret_value_handler)
             .build();
-        let store =
-            InMemorySecretStore::new([("test-store/API_KEY", bytes::Bytes::from("s3cr3t"))]);
+        // The legacy single-handle wiring binds under `"default"` (see
+        // `Secrets::from_request` fallback), so the in-memory store is
+        // keyed under that prefix.
+        let store = InMemorySecretStore::new([("default/API_KEY", bytes::Bytes::from("s3cr3t"))]);
         let handle = SecretHandle::new(Arc::new(store));
         let server = start_test_server_with_store_handle(router, Some(handle)).await;
 
