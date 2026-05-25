@@ -348,6 +348,7 @@ pub struct ResolvedEnvironment {
 
 #[derive(Debug, Default, Deserialize, Validate)]
 #[non_exhaustive]
+#[validate(schema(function = "validate_manifest_adapter"))]
 pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
@@ -361,6 +362,11 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub logging: ManifestLoggingConfig,
+    /// Catch-all for any sub-table other than the four above. The pre-rewrite
+    /// `[adapters.<name>.stores.*]` tables land here and are rejected by
+    /// [`validate_manifest_adapter`] with the migration-guide message.
+    #[serde(flatten)]
+    pub legacy: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -711,6 +717,33 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
         Some(parent) => parent.to_path_buf(),
         None => cwd.to_path_buf(),
     }
+}
+
+/// Validates a single `[adapters.<name>]` block. The portable manifest model
+/// has no per-adapter store / runtime tuning surface — all of that moved to
+/// `EDGEZERO__*` env vars in Stage 2. The pre-rewrite
+/// `[adapters.<name>.stores.<kind>]` tables and the legacy
+/// `[adapters.<name>.adapter] runtime` block were silently ignored by the
+/// deserializer before this hard-cutoff, so projects could carry over
+/// stale entries without noticing.
+fn validate_manifest_adapter(adapter: &ManifestAdapter) -> Result<(), ValidationError> {
+    if !adapter.legacy.is_empty() {
+        let mut keys = adapter.legacy.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let mut error = ValidationError::new("legacy_adapter_schema");
+        error.message = Some(
+            format!(
+                "the pre-rewrite `[adapters.<name>.<key>]` subtables are no longer \
+                 supported (offending field(s): {}); per-adapter store / runtime \
+                 tuning moved to `EDGEZERO__*` env vars in Stage 2 -- see \
+                 docs/guide/manifest-store-migration.md",
+                keys.join(", ")
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Validates a single `[stores.<kind>]` declaration against the portable
@@ -1480,6 +1513,33 @@ ids = ["default"]
                 err.to_string()
                     .contains("docs/guide/manifest-store-migration.md"),
                 "legacy-schema error must reference the migration guide, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_adapter_subtables_are_a_hard_load_error() {
+        // Pre-rewrite manifests carried per-adapter store / runtime tuning
+        // under `[adapters.<name>.<sub>]`. The portable model moved all of
+        // that to `EDGEZERO__*` env vars; stale subtables left in a
+        // migrated manifest must surface as a hard load error rather than
+        // be silently ignored.
+        for legacy in [
+            // legacy per-adapter KV-store override (old [stores.kv.adapters.spin] hoisted)
+            "[adapters.spin.stores.kv.default]\nname = \"EDGEZERO_KV\"\n",
+            "[adapters.fastly.stores.config]\nname = \"app_config\"\n",
+            "[adapters.cloudflare.stores.secrets.default]\nname = \"WORKER_SECRETS\"\n",
+            // legacy runtime-tuning subtable under [adapters.axum]
+            "[adapters.axum.runtime]\nthreads = 4\n",
+        ] {
+            let err = ManifestLoader::try_load_from_str(legacy)
+                .err()
+                .unwrap_or_else(|| panic!("legacy adapter subtable must fail to load: {legacy}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                err.to_string()
+                    .contains("docs/guide/manifest-store-migration.md"),
+                "legacy adapter-subtable error must reference the migration guide, got: {err}"
             );
         }
     }

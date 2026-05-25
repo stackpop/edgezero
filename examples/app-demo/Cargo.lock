@@ -708,6 +708,7 @@ dependencies = [
  "log",
  "redb",
  "reqwest",
+ "serde_json",
  "simple_logger 5.1.0",
  "thiserror 2.0.18",
  "tokio",

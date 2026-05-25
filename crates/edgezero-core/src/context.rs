@@ -183,23 +183,29 @@ impl RequestContext {
     }
 
     /// Resolve the [`BoundSecretStore`] for `id`. Registry-aware (strict
-    /// lookup when a [`SecretRegistry`] is wired); falls back to the legacy
-    /// single handle otherwise.
+    /// lookup when a [`SecretRegistry`] is wired); falls back to wrapping
+    /// the legacy single [`SecretHandle`] under the conventional `"default"`
+    /// platform name otherwise.
     #[inline]
     pub fn secret_store(&self, id: &str) -> Option<BoundSecretStore> {
         match self.request.extensions().get::<SecretRegistry>() {
             Some(registry) => registry.named(id),
-            None => self.secret_handle(),
+            None => self
+                .secret_handle()
+                .map(|handle| BoundSecretStore::new(handle, "default".to_owned())),
         }
     }
 
     /// Resolve the default [`BoundSecretStore`] — the registry's declared
-    /// default id, or the legacy single handle if no registry has been wired.
+    /// default id, or the legacy single handle (bound to `"default"`)
+    /// if no registry has been wired.
     #[inline]
     pub fn secret_store_default(&self) -> Option<BoundSecretStore> {
         match self.request.extensions().get::<SecretRegistry>() {
             Some(registry) => registry.default(),
-            None => self.secret_handle(),
+            None => self
+                .secret_handle()
+                .map(|handle| BoundSecretStore::new(handle, "default".to_owned())),
         }
     }
 }
@@ -629,13 +635,17 @@ mod tests {
     #[test]
     fn secret_store_resolves_named_handle_from_registry() {
         use crate::secret_store::{NoopSecretStore, SecretHandle};
-        use crate::store_registry::{SecretRegistry, StoreRegistry};
+        use crate::store_registry::{BoundSecretStore, SecretRegistry, StoreRegistry};
         use std::collections::BTreeMap;
         use std::sync::Arc;
 
-        let by_id: BTreeMap<String, SecretHandle> = [(
+        let handle = SecretHandle::new(Arc::new(NoopSecretStore));
+        let by_id: BTreeMap<String, BoundSecretStore> = [(
             "default".to_owned(),
-            SecretHandle::new(Arc::new(NoopSecretStore)),
+            // The registry binds the logical id to the platform store name —
+            // in production that's `EDGEZERO__STORES__SECRETS__DEFAULT__NAME`
+            // resolved against the env (falling back to the logical id).
+            BoundSecretStore::new(handle, "platform-secret-store".to_owned()),
         )]
         .into_iter()
         .collect();
@@ -649,8 +659,34 @@ mod tests {
         request.extensions_mut().insert(registry);
 
         let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.secret_store("default").is_some());
+        let bound = ctx.secret_store("default").expect("default bound store");
+        assert_eq!(bound.store_name(), "platform-secret-store");
         assert!(ctx.secret_store("unknown").is_none());
         assert!(ctx.secret_store_default().is_some());
+    }
+
+    #[test]
+    fn secret_store_default_falls_back_to_legacy_handle_under_default_name() {
+        use crate::secret_store::{NoopSecretStore, SecretHandle};
+        use std::sync::Arc;
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/secrets")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let bound = ctx
+            .secret_store_default()
+            .expect("legacy fallback yields a bound store");
+        assert_eq!(
+            bound.store_name(),
+            "default",
+            "legacy fallback binds the conventional `default` platform name"
+        );
     }
 }

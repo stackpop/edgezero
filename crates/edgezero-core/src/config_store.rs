@@ -29,13 +29,10 @@ use thiserror::Error;
 ///
 /// ```rust,ignore
 /// edgezero_core::config_store_contract_tests!(axum_config_store_contract, {
-///     AxumConfigStore::new(
-///         [
-///             ("contract.key.a".to_owned(), "value_a".to_owned()),
-///             ("contract.key.b".to_owned(), "value_b".to_owned()),
-///         ],
-///         [],
-///     )
+///     AxumConfigStore::from_map([
+///         ("contract.key.a".to_owned(), "value_a".to_owned()),
+///         ("contract.key.b".to_owned(), "value_b".to_owned()),
+///     ])
 /// });
 /// ```
 #[macro_export]

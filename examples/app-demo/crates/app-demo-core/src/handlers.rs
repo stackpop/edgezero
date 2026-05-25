@@ -17,7 +17,6 @@ const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
 // 512 (KV key limit) - 5 (len of "note:") = 507
 const MAX_NOTE_ID_LEN: u64 = 507;
-const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
 const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
 const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
 
@@ -154,7 +153,12 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
         );
     }
 
-    let Some(store) = ctx.config_handle() else {
+    // The registry-aware accessor reads the wired `ConfigRegistry` and falls
+    // back to the legacy `ConfigStoreHandle` when no registry has been
+    // attached (e.g. an adapter that has not yet moved to Task 2.6's
+    // registry wiring). The pre-rewrite `ctx.config_handle()` was
+    // registry-blind, so it 503'd on every registry-backed adapter.
+    let Some(store) = ctx.config_store_default() else {
         return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "config store is unavailable for this adapter",
@@ -267,11 +271,14 @@ pub async fn secrets_echo(
         }
     }
 
+    // `BoundSecretStore` is pre-bound to a platform store name by the
+    // adapter (`EDGEZERO__STORES__SECRETS__<ID>__NAME` or the logical id);
+    // the handler passes only the key.
     let store = secrets
         .default()
         .ok_or_else(|| EdgeError::service_unavailable("no default secret store registered"))?;
     let value = store
-        .require_str(SECRET_STORE_NAME, &params.name)
+        .require_str(&params.name)
         .await
         .map_err(EdgeError::from)?;
     Ok(Text::new(value))
@@ -452,6 +459,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_get_resolves_through_registry_when_wired() {
+        // Adapters wire `ConfigRegistry` into request extensions; the
+        // handler must read it via `ctx.config_store_default()` instead of
+        // the legacy single-handle accessor (which would 503).
+        use edgezero_core::store_registry::{ConfigRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+
+        let store = MapConfigStore(
+            [("greeting".to_owned(), "hello from registry".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        let by_id: BTreeMap<String, ConfigStoreHandle> = [(
+            "app_config".to_owned(),
+            ConfigStoreHandle::new(Arc::new(store)),
+        )]
+        .into_iter()
+        .collect();
+        let registry: ConfigRegistry = StoreRegistry::new(by_id, "app_config".to_owned());
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config/greeting")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+        let mut params = HashMap::new();
+        params.insert("name".to_owned(), "greeting".to_owned());
+        let ctx = RequestContext::new(request, PathParams::new(params));
+
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .as_ref(),
+            b"hello from registry"
+        );
+    }
+
     fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
         let mut request = request_builder()
             .method(Method::GET)
@@ -526,20 +576,34 @@ mod tests {
     }
 
     fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
+        // Exercise the production registry path: build a one-id
+        // `SecretRegistry` whose bound platform store name matches the
+        // prefix the `InMemorySecretStore` is keyed under. The handler
+        // uses `secrets.default()?.require_str(key)` against the bound
+        // `default` store; the `InMemorySecretStore` looks up
+        // `"default/<key>"`.
+        use edgezero_core::store_registry::{BoundSecretStore, SecretRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+
+        const PLATFORM_NAME: &str = "default";
         let provider = InMemorySecretStore::new(entries.iter().map(|&(name, value)| {
             (
-                format!("{SECRET_STORE_NAME}/{name}"),
+                format!("{PLATFORM_NAME}/{name}"),
                 bytes::Bytes::from(value.to_owned()),
             )
         }));
         let handle = SecretHandle::new(Arc::new(provider));
+        let bound = BoundSecretStore::new(handle, PLATFORM_NAME.to_owned());
+        let by_id: BTreeMap<String, BoundSecretStore> =
+            [("default".to_owned(), bound)].into_iter().collect();
+        let registry: SecretRegistry = StoreRegistry::new(by_id, "default".to_owned());
         let uri = format!("{path}?{query}");
         let mut request = request_builder()
             .method(Method::GET)
             .uri(uri.as_str())
             .body(Body::empty())
             .expect("request");
-        request.extensions_mut().insert(handle);
+        request.extensions_mut().insert(registry);
         RequestContext::new(request, PathParams::default())
     }
 

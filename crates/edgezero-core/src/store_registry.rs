@@ -11,18 +11,21 @@
 //! - [`ConfigRegistry`] = `StoreRegistry<BoundConfigStore>`
 //! - [`SecretRegistry`] = `StoreRegistry<BoundSecretStore>`
 //!
-//! The `Bound*` aliases are the per-id resolved handles — currently identical
-//! to [`crate::key_value_store::KvHandle`] /
-//! [`crate::config_store::ConfigStoreHandle`] /
-//! [`crate::secret_store::SecretHandle`]. They exist so handler code and
-//! extractors can be expressed in registry-aware terms without coupling to
-//! the legacy single-handle names.
+//! KV and config handles are already bound to a single backing store by
+//! construction, so the `Bound*` aliases for those are just the existing
+//! handle types. [`BoundSecretStore`] is a real wrapper because the
+//! underlying [`SecretHandle::get_bytes`] takes a `store_name` argument —
+//! the registry captures the per-id platform name (resolved from
+//! `EDGEZERO__STORES__SECRETS__<ID>__NAME`) so handlers can call
+//! [`BoundSecretStore::get_bytes`] with just the key.
 
 use std::collections::BTreeMap;
 
+use bytes::Bytes;
+
 use crate::config_store::ConfigStoreHandle;
 use crate::key_value_store::KvHandle;
-use crate::secret_store::SecretHandle;
+use crate::secret_store::{SecretError, SecretHandle};
 
 /// A per-bind KV handle, returned by [`KvRegistry::named`] / [`KvRegistry::default`].
 pub type BoundKvStore = KvHandle;
@@ -31,9 +34,68 @@ pub type BoundKvStore = KvHandle;
 /// [`ConfigRegistry::named`] / [`ConfigRegistry::default`].
 pub type BoundConfigStore = ConfigStoreHandle;
 
-/// A per-bind secret handle, returned by
-/// [`SecretRegistry::named`] / [`SecretRegistry::default`].
-pub type BoundSecretStore = SecretHandle;
+/// A per-bind secret handle: a [`SecretHandle`] pre-bound to a platform
+/// store name. The registry resolves the name per logical id at request
+/// setup from `EDGEZERO__STORES__SECRETS__<ID>__NAME` (defaulting to the
+/// logical id), so handler code reads
+/// `secrets.named(id)?.require_str(key)` without re-passing the platform
+/// name on every call.
+#[derive(Clone, Debug)]
+pub struct BoundSecretStore {
+    handle: SecretHandle,
+    store_name: String,
+}
+
+impl BoundSecretStore {
+    /// Bind `handle` to the platform store name `store_name`.
+    #[inline]
+    #[must_use]
+    pub fn new(handle: SecretHandle, store_name: String) -> Self {
+        Self { handle, store_name }
+    }
+
+    /// Retrieve a secret by key against the bound platform store.
+    ///
+    /// # Errors
+    /// See [`SecretHandle::get_bytes`].
+    #[inline]
+    pub async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, SecretError> {
+        self.handle.get_bytes(&self.store_name, key).await
+    }
+
+    /// Retrieve a secret as raw bytes, error on absent.
+    ///
+    /// # Errors
+    /// See [`SecretHandle::require_bytes`].
+    #[inline]
+    pub async fn require_bytes(&self, key: &str) -> Result<Bytes, SecretError> {
+        self.handle.require_bytes(&self.store_name, key).await
+    }
+
+    /// Retrieve a secret as a UTF-8 string, error on absent.
+    ///
+    /// # Errors
+    /// See [`SecretHandle::require_str`].
+    #[inline]
+    pub async fn require_str(&self, key: &str) -> Result<String, SecretError> {
+        self.handle.require_str(&self.store_name, key).await
+    }
+
+    /// Underlying [`SecretHandle`] (escape hatch for callers that need the
+    /// store-name argument explicitly).
+    #[inline]
+    #[must_use]
+    pub fn handle(&self) -> &SecretHandle {
+        &self.handle
+    }
+
+    /// Platform store name this binding resolves to.
+    #[inline]
+    #[must_use]
+    pub fn store_name(&self) -> &str {
+        &self.store_name
+    }
+}
 
 /// Registry of per-id store handles, with a declared default.
 ///

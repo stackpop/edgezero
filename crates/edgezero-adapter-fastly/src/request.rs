@@ -13,7 +13,9 @@ use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::manifest::DEFAULT_KV_STORE_NAME as CORE_DEFAULT_KV_STORE_NAME;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
-use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry};
+use edgezero_core::store_registry::{
+    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+};
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
 use std::collections::BTreeMap;
@@ -320,7 +322,7 @@ pub(crate) fn dispatch_with_registries(
 ) -> Result<FastlyResponse, FastlyError> {
     let kv_registry = build_kv_registry(kv_meta, env)?;
     let config_registry = build_config_registry(config_meta, env);
-    let secret_registry = build_secret_registry(secret_meta);
+    let secret_registry = build_secret_registry(secret_meta, env);
     dispatch_with_handles(
         app,
         req,
@@ -377,15 +379,25 @@ fn build_config_registry(
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
 
-fn build_secret_registry(secret_meta: Option<StoreMetadata>) -> Option<SecretRegistry> {
+fn build_secret_registry(
+    secret_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Option<SecretRegistry> {
     let meta = secret_meta?;
-    // `FastlySecretStore` is stateless — it opens the named store per call. One
-    // shared handle is registered under every declared id; the per-id platform
-    // name binding lands when Task 2.7 reshapes `BoundSecretStore`.
+    // Fastly is `Multi` for secrets (§6.6). The provider trait is stateless —
+    // `FastlySecretStore::get_bytes(store_name, key)` opens the named Fastly
+    // Secret Store per call — so we share one provider handle across all
+    // bindings, then capture the per-id platform store name in the bound
+    // wrapper. `EDGEZERO__STORES__SECRETS__<ID>__NAME` (default = the logical
+    // id) decides which Fastly store each id resolves to at runtime.
     let handle = SecretHandle::new(Arc::new(FastlySecretStore));
-    let mut by_id: BTreeMap<String, SecretHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
     for id in meta.ids {
-        by_id.insert((*id).to_owned(), handle.clone());
+        let store_name = env.store_name("secrets", id);
+        by_id.insert(
+            (*id).to_owned(),
+            BoundSecretStore::new(handle.clone(), store_name),
+        );
     }
     Some(StoreRegistry::new(by_id, meta.default.to_owned()))
 }
