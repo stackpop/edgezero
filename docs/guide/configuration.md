@@ -363,15 +363,23 @@ serve = "cargo run -p my-app-adapter-axum"
 
 Axum bind-address precedence is:
 
-1. `EDGEZERO_HOST` / `EDGEZERO_PORT`
-2. `edgezero.toml` `[adapters.axum.adapter]` `host` / `port`
-3. `axum.toml` `[adapter]` `host` / `port` when launching through the Axum adapter CLI wrapper
+1. `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT` (Stage 2 canonical;
+   read directly by the runtime; the pre-Stage-2 `EDGEZERO_HOST` /
+   `EDGEZERO_PORT` is still accepted by the Axum CLI wrapper for
+   back-compat and translated to the canonical names on the subprocess)
+2. `edgezero.toml` `[adapters.axum.adapter]` `host` / `port` (the CLI
+   translates these into `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`
+   when spawning the subprocess; if a canonical env var is already set,
+   it wins)
+3. `axum.toml` `[adapter]` `host` / `port` when launching through the
+   Axum adapter CLI wrapper
 4. default `127.0.0.1:8787`
 
 Example override:
 
 ```sh
-EDGEZERO_HOST=0.0.0.0 EDGEZERO_PORT=3000 cargo run -p my-app-adapter-axum
+EDGEZERO__ADAPTER__HOST=0.0.0.0 EDGEZERO__ADAPTER__PORT=3000 \
+    cargo run -p my-app-adapter-axum
 ```
 
 ## Using the Manifest

@@ -423,16 +423,14 @@ fn build_kv_registry(
         by_id.insert((*id).to_owned(), handle);
     }
 
-    if by_id.is_empty() {
-        return Ok(None);
+    let default_id = meta.default.to_owned();
+    if !by_id.contains_key(&default_id) {
+        log::warn!(
+            "KV registry default id `{default_id}` failed to initialize; dropping the KV registry — \
+             handlers will see no KV store"
+        );
     }
-
-    let default_id = if by_id.contains_key(meta.default) {
-        meta.default.to_owned()
-    } else {
-        by_id.keys().next().cloned().unwrap_or_default()
-    };
-    Ok(Some(StoreRegistry::new(by_id, default_id)))
+    Ok(StoreRegistry::from_parts(by_id, default_id))
 }
 
 /// Build the per-request config registry from the per-id local-file stores.
@@ -461,10 +459,14 @@ fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigReg
         };
         by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
     }
-    if by_id.is_empty() {
-        return None;
+    let default_id = meta.default.to_owned();
+    if !by_id.contains_key(&default_id) {
+        log::warn!(
+            "config registry default id `{default_id}` failed to load; dropping the config registry — \
+             handlers will see no config store"
+        );
     }
-    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+    StoreRegistry::from_parts(by_id, default_id)
 }
 
 /// Build the per-request secret registry. Axum is `Single` for secrets — every
@@ -488,7 +490,10 @@ fn build_secret_registry(
             BoundSecretStore::new(handle.clone(), store_name),
         );
     }
-    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+    // Secret backends are infallible here, so the default id is always
+    // present in `by_id`; `from_parts` keeps the API symmetric with the
+    // KV / config builders without changing observable behaviour.
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
 /// Resolve the bind address from `EDGEZERO__ADAPTER__*` environment config.

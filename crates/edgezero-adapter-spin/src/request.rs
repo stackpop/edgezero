@@ -229,21 +229,23 @@ fn build_kv_registry(
             }
         }
     }
-    if by_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(StoreRegistry::new(by_id, meta.default.to_owned())))
+    // For Spin, KV open is required — any failure already returns Err
+    // above, so the default id is guaranteed to be in `by_id` here.
+    // `from_parts` keeps the API symmetric with the other adapters.
+    Ok(StoreRegistry::from_parts(by_id, meta.default.to_owned()))
 }
 
 fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
     let meta = config_meta?;
-    // Spin is `Single` for config: every id resolves to the same flat variable store.
+    // Spin is `Single` for config: every id resolves to the same flat
+    // variable store. Construction is infallible, so the default id is
+    // always present in `by_id`.
     let handle = ConfigStoreHandle::new(Arc::new(SpinConfigStore::new()));
     let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
     for id in meta.ids {
         by_id.insert((*id).to_owned(), handle.clone());
     }
-    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
 fn build_secret_registry(
@@ -254,7 +256,8 @@ fn build_secret_registry(
     // Spin is `Single` for secrets: every id resolves to the same flat
     // variable store. `SpinSecretStore::get_bytes` ignores `store_name`
     // (logs a debug if non-empty per §6.7), so the per-id bound name is
-    // observable only via [`BoundSecretStore::store_name`].
+    // observable only via [`BoundSecretStore::store_name`]. Construction
+    // is infallible.
     let handle = SecretHandle::new(Arc::new(SpinSecretStore::new()));
     let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
     for id in meta.ids {
@@ -264,7 +267,7 @@ fn build_secret_registry(
             BoundSecretStore::new(handle.clone(), store_name),
         );
     }
-    Some(StoreRegistry::new(by_id, meta.default.to_owned()))
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
 fn resolve_config_handle(config_enabled: bool) -> Option<ConfigStoreHandle> {

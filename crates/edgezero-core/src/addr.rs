@@ -20,7 +20,7 @@ pub struct BindAddrResolution {
 /// Resolve a bind address from optional environment and config values.
 ///
 /// Precedence (highest wins):
-/// 1. `env_host` / `env_port` (typically `EDGEZERO_HOST` / `EDGEZERO_PORT`)
+/// 1. `env_host` / `env_port` (typically `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`)
 /// 2. `config_host` / `config_port` (from manifest or adapter config)
 /// 3. Defaults: `127.0.0.1:8787`
 ///
@@ -52,7 +52,7 @@ fn resolve_host(
         match value.parse() {
             Ok(host) => return host,
             Err(_) => warnings.push(format!(
-                "EDGEZERO_HOST={value:?} is not a valid IP address (hostnames like \"localhost\" are not supported); falling back"
+                "EDGEZERO__ADAPTER__HOST={value:?} is not a valid IP address (hostnames like \"localhost\" are not supported); falling back"
             )),
         }
     }
@@ -77,12 +77,12 @@ fn resolve_port(
     if let Some(value) = env_port {
         match value.parse::<u16>() {
             Ok(0) => warnings.push(
-                "EDGEZERO_PORT=\"0\" is not supported (would bind to a random OS port); falling back"
+                "EDGEZERO__ADAPTER__PORT=\"0\" is not supported (would bind to a random OS port); falling back"
                     .to_owned(),
             ),
             Ok(port) => return port,
             Err(_) => warnings.push(format!(
-                "EDGEZERO_PORT={value:?} is not a valid port number; falling back"
+                "EDGEZERO__ADAPTER__PORT={value:?} is not a valid port number; falling back"
             )),
         }
     }
@@ -147,7 +147,7 @@ mod tests {
         let resolution = resolve_bind_addr(Some("not-an-ip"), None, Some("0.0.0.0"), None);
         assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(resolution.warnings.len(), 1);
-        assert!(resolution.warnings[0].contains("EDGEZERO_HOST"));
+        assert!(resolution.warnings[0].contains("EDGEZERO__ADAPTER__HOST"));
         assert!(resolution.warnings[0].contains("not a valid IP address"));
     }
 
@@ -156,7 +156,7 @@ mod tests {
         let resolution = resolve_bind_addr(None, Some("abc"), None, Some(3000));
         assert_eq!(resolution.addr.port(), 3000);
         assert_eq!(resolution.warnings.len(), 1);
-        assert!(resolution.warnings[0].contains("EDGEZERO_PORT"));
+        assert!(resolution.warnings[0].contains("EDGEZERO__ADAPTER__PORT"));
         assert!(resolution.warnings[0].contains("not a valid port number"));
     }
 
