@@ -1,0 +1,21 @@
+# `{{name}}.toml` — typed application config.
+#
+# Mirrors the `{{NameUpperCamel}}Config` struct in
+# `crates/{{proj_core}}/src/config.rs`. The loader reads only the
+# `[config]` table; sibling tables (e.g. `[metadata]`) are ignored.
+#
+# Env-var overlay: every key here can be overridden at runtime by
+# `{{name}}__<SECTION>__…__<KEY>` (uppercase, `-`→`_`, `__` separator)
+# as long as the key already exists below. The loader infers the type
+# from the parsed value and coerces the env string accordingly.
+
+[config]
+# `api_token` is the *key* into the default secret store (declared in
+# `edgezero.toml` under `[stores.secrets]`). The store resolves it to
+# the real secret bytes at request time via
+# `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
+api_token = "demo_api_token"
+greeting = "hello from {{name}}"
+
+[config.service]
+timeout_ms = 1500

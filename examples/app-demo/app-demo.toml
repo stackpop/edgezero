@@ -1,0 +1,24 @@
+# `app-demo.toml` — typed application config for the `app-demo` example.
+#
+# Mirrors the `AppDemoConfig` struct in
+# `crates/app-demo-core/src/config.rs`. The loader reads only the
+# `[config]` table; sibling tables are ignored.
+#
+# Env-var overlay: every key here can be overridden at runtime by
+# `app_demo__<SECTION>__…__<KEY>` (uppercase, `-`→`_`, `__` separator)
+# as long as the key already exists below.
+
+[config]
+greeting = "hello from app-demo"
+feature_new_checkout = false
+# `api_token` is the *key* inside the resolved default secret store
+# (see `[stores.secrets]` in `edgezero.toml`). The handler resolves it
+# via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
+api_token = "demo_api_token"
+# `vault` is a `#[secret(store_ref)]` value — the logical id of a
+# secret store declared in `[stores.secrets].ids`. The app-demo
+# manifest declares a single id, `"default"`.
+vault = "default"
+
+[config.service]
+timeout_ms = 1500

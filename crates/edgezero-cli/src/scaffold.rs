@@ -95,6 +95,14 @@ pub fn register_templates(hbs: &mut Handlebars) {
         include_str!("templates/core/src/handlers.rs.hbs"),
     )
     .expect("compiled-in template is valid");
+    hbs.register_template_string(
+        "core_src_config_rs",
+        include_str!("templates/core/src/config.rs.hbs"),
+    )
+    .expect("compiled-in template is valid");
+    // App-config (`<name>.toml`)
+    hbs.register_template_string("app_name_toml", include_str!("templates/app/name.toml.hbs"))
+        .expect("compiled-in template is valid");
     // CLI
     hbs.register_template_string(
         "cli_Cargo_toml",
@@ -252,8 +260,10 @@ mod tests {
             "core_Cargo_toml",
             "core_src_lib_rs",
             "core_src_handlers_rs",
+            "core_src_config_rs",
             "cli_Cargo_toml",
             "cli_src_main_rs",
+            "app_name_toml",
         ] {
             assert!(hbs.has_template(name), "missing template {name}");
         }

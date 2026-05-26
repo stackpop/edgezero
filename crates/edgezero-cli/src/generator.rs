@@ -72,6 +72,12 @@ struct ProjectLayout {
     name: String,
     out_dir: PathBuf,
     project_mod: String,
+    /// `NameUpperCamel` Handlebars key — the project name converted to
+    /// upper-camel-case (`my-app` → `MyApp`) and guaranteed to be a
+    /// valid Rust type identifier (Task 3.4). Used by the `<Name>Config`
+    /// struct in the generated `config.rs` and reused by the stage-8
+    /// `*-cli` template.
+    upper_camel: String,
 }
 
 impl ProjectLayout {
@@ -101,6 +107,7 @@ impl ProjectLayout {
 
         let project_mod = name.replace('-', "_");
         let core_mod = core_name.replace('-', "_");
+        let upper_camel = upper_camel_from_sanitized(&name);
         Ok(ProjectLayout {
             cli_dir,
             cli_name,
@@ -111,6 +118,7 @@ impl ProjectLayout {
             name,
             out_dir,
             project_mod,
+            upper_camel,
         })
     }
 }
@@ -122,6 +130,36 @@ struct AdapterArtifacts {
     readme_adapter_crates: String,
     readme_adapter_dev: String,
     workspace_members: Vec<String>,
+}
+
+/// Convert a sanitised crate name to upper-camel-case, guaranteed to be
+/// a valid Rust type identifier.
+///
+/// Splits on `-` and `_`, drops empty segments (this naturally absorbs
+/// a leading `_` that `sanitize_crate_name` may have inserted), then
+/// upper-cases the first character of each segment. If the result
+/// would be empty or start with a non-letter, it is prefixed with
+/// `App` so the output is always a valid `struct` name (Task 3.4 step
+/// 1 derivation rule).
+fn upper_camel_from_sanitized(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for segment in name.split(['-', '_']).filter(|seg| !seg.is_empty()) {
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            for ch in chars {
+                out.extend(ch.to_lowercase());
+            }
+        }
+    }
+    if out.is_empty() || !out.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+        let mut prefixed = String::with_capacity(out.len().saturating_add(3));
+        prefixed.push_str("App");
+        prefixed.push_str(&out);
+        prefixed
+    } else {
+        out
+    }
 }
 
 /// Locate the edgezero checkout that built this binary.
@@ -224,6 +262,14 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     deps.insert(
         "spin-sdk".to_owned(),
         "spin-sdk = { version = \"5.2\", default-features = false }".to_owned(),
+    );
+    // Core depends on `validator` for `#[derive(Validate)]` on the
+    // generated `<Name>Config` struct (Task 3.4). Pinned to the same
+    // major as the edgezero workspace so a `workspace = true` dep in
+    // the generated core crate resolves cleanly.
+    deps.insert(
+        "validator".to_owned(),
+        "validator = { version = \"0.20\", features = [\"derive\"] }".to_owned(),
     );
     deps
 }
@@ -509,6 +555,10 @@ fn build_base_data(
     );
     data.insert("proj_mod".into(), Value::String(layout.project_mod.clone()));
     data.insert(
+        "NameUpperCamel".into(),
+        Value::String(layout.upper_camel.clone()),
+    );
+    data.insert(
         "dep_edgezero_core".into(),
         Value::String(core_crate_line.to_owned()),
     );
@@ -613,6 +663,18 @@ fn render_templates(
         data_value,
         &layout.core_dir.join("src/handlers.rs"),
     )?;
+    write_tmpl(
+        &hbs,
+        "core_src_config_rs",
+        data_value,
+        &layout.core_dir.join("src/config.rs"),
+    )?;
+    write_tmpl(
+        &hbs,
+        "app_name_toml",
+        data_value,
+        &layout.out_dir.join(format!("{}.toml", layout.name)),
+    )?;
 
     log::info!("[edgezero] writing cli crate {}", layout.cli_name);
     write_tmpl(
@@ -711,6 +773,22 @@ mod tests {
     }
 
     #[test]
+    fn upper_camel_from_sanitized_covers_derivation_rules() {
+        // Hyphen and underscore both split into PascalCase segments.
+        assert_eq!(upper_camel_from_sanitized("my-app"), "MyApp");
+        // Single segment is just capitalised.
+        assert_eq!(upper_camel_from_sanitized("foo"), "Foo");
+        // Mixed separators: each non-empty segment contributes one capital.
+        assert_eq!(upper_camel_from_sanitized("a_b-c"), "ABC");
+        // `sanitize_crate_name` may emit a leading `_` for digit-leading
+        // input; the empty leading segment from the split is dropped.
+        assert_eq!(upper_camel_from_sanitized("_foo"), "Foo");
+        // Digit-leading produces a digit-leading PascalCase result, which
+        // would be an invalid Rust ident, so we prefix `App`.
+        assert_eq!(upper_camel_from_sanitized("123-app"), "App123App");
+    }
+
+    #[test]
     fn generator_error_format_displays_underlying_fmt_error() {
         // `writeln!`-to-`String` cannot actually fail in production, but the
         // variant is part of the public error surface and `From<fmt::Error>`
@@ -764,6 +842,58 @@ mod tests {
                 .join("crates/demo-app-adapter-spin/spin.toml")
                 .exists(),
             "spin.toml should be scaffolded"
+        );
+    }
+
+    fn assert_scaffold_app_config(project_dir: &Path) {
+        // Task 3.4: `<name>.toml` and `<name>-core/src/config.rs` must be
+        // produced, with the `<NameUpperCamel>Config` struct named after
+        // the project (`demo-app` → `DemoAppConfig`).
+        let app_toml_path = project_dir.join("demo-app.toml");
+        assert!(
+            app_toml_path.exists(),
+            "<name>.toml should be scaffolded at the project root"
+        );
+        let app_toml = fs::read_to_string(&app_toml_path).expect("read demo-app.toml");
+        assert!(
+            app_toml.contains("[config]"),
+            "<name>.toml must contain a [config] table"
+        );
+
+        let config_rs_path = project_dir.join("crates/demo-app-core/src/config.rs");
+        assert!(
+            config_rs_path.exists(),
+            "<name>-core/src/config.rs should be scaffolded"
+        );
+        let config_rs = fs::read_to_string(&config_rs_path).expect("read config.rs");
+        assert!(
+            config_rs.contains("pub struct DemoAppConfig"),
+            "config.rs must declare the DemoAppConfig struct"
+        );
+        assert!(
+            config_rs.contains("edgezero_core::AppConfig"),
+            "config.rs must derive edgezero_core::AppConfig"
+        );
+
+        let core_cargo = fs::read_to_string(project_dir.join("crates/demo-app-core/Cargo.toml"))
+            .expect("read core Cargo.toml");
+        assert!(
+            core_cargo.contains("validator = { workspace = true }"),
+            "<name>-core Cargo.toml must pull validator from the workspace"
+        );
+
+        let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
+            .expect("read core lib.rs");
+        assert!(
+            core_lib.contains("pub mod config"),
+            "<name>-core lib.rs must expose the config module so consumers can reach DemoAppConfig"
+        );
+
+        let workspace_cargo =
+            fs::read_to_string(project_dir.join("Cargo.toml")).expect("read workspace Cargo.toml");
+        assert!(
+            workspace_cargo.contains("validator = { version ="),
+            "workspace Cargo.toml must seed the validator dependency"
         );
     }
 
@@ -889,6 +1019,7 @@ mod tests {
         let project_dir = temp.path().join("demo-app");
         assert_scaffold_files(&project_dir);
         assert_scaffold_workspace(&project_dir);
+        assert_scaffold_app_config(&project_dir);
         assert_scaffold_crate_lints(&project_dir);
     }
 }

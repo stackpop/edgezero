@@ -28,13 +28,14 @@ cd my-app
 
 This generates a workspace with:
 
-- `crates/my-app-core` - Your shared handlers and routing logic
+- `crates/my-app-core` - Your shared handlers, routing logic, and the typed `MyAppConfig` struct in `src/config.rs`
 - `crates/my-app-cli` - Your project's own CLI binary, built on the `edgezero-cli` library
 - `crates/my-app-adapter-fastly` - Fastly Compute entrypoint
 - `crates/my-app-adapter-cloudflare` - Cloudflare Workers entrypoint
 - `crates/my-app-adapter-axum` - Native Axum entrypoint
 - `crates/my-app-adapter-spin` - Fermyon Spin entrypoint
 - `edgezero.toml` - Manifest describing routes, middleware, and adapter config
+- `my-app.toml` - Typed application config matching the `MyAppConfig` struct (see [Application config](/guide/configuration#application-config))
 
 ## Run Your App Locally
 
@@ -67,11 +68,13 @@ A scaffolded project looks like this:
 my-app/
 ├── Cargo.toml              # Workspace manifest
 ├── edgezero.toml           # EdgeZero configuration
+├── my-app.toml             # Typed application config (loaded into MyAppConfig)
 ├── crates/
 │   ├── my-app-core/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs      # App definition with edgezero_core::app!
+│   │       ├── config.rs   # MyAppConfig with #[derive(AppConfig)]
 │   │       └── handlers.rs # Your route handlers
 │   ├── my-app-cli/
 │   │   ├── Cargo.toml

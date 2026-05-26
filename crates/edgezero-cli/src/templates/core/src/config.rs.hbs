@@ -1,0 +1,47 @@
+//! Typed application config, loaded from `{{name}}.toml` via
+//! `edgezero_core::app_config::load_app_config::<{{NameUpperCamel}}Config>`.
+//!
+//! Add fields here and mirror them in `{{name}}.toml`. The
+//! `{{name}}__<SECTION>__…__<KEY>` env-var overlay (uppercase,
+//! `-`→`_`) overrides any key already present in the file.
+
+#![expect(
+    clippy::module_name_repetitions,
+    reason = "`<Name>Config` is the canonical struct name the generator emits; the duplication with the `config` module is intentional"
+)]
+
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+#[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+#[serde(deny_unknown_fields)]
+pub struct {{NameUpperCamel}}Config {
+    /// Resolved at runtime via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
+    /// The value here is the *key* in the default secret store, not the secret bytes.
+    #[secret]
+    pub api_token: String,
+
+    /// Free-form greeting surfaced by example handlers. Replace or
+    /// remove as the app grows.
+    pub greeting: String,
+
+    /// Nested section — exercises the env-var overlay
+    /// (`{{name}}__SERVICE__TIMEOUT_MS=…` at runtime).
+    pub service: ServiceConfig,
+    // `#[secret(store_ref)]` — uncomment when the project declares
+    // more than one secret store id under `[stores.secrets].ids` in
+    // `edgezero.toml`. The value is then the logical id of the
+    // secret store to resolve at runtime via
+    // `ctx.secret_store(&cfg.vault)?`. Single-secret-store projects
+    // (the default scaffold) don't need this.
+    //
+    // #[secret(store_ref)]
+    // pub vault: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfig {
+    #[validate(range(min = 100_u32, max = 60_000_u32))]
+    pub timeout_ms: u32,
+}

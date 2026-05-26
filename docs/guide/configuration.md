@@ -212,6 +212,114 @@ handlers can call `ctx.config_store("app_config")` (or
 Treat config-store keys like API surface: validate or allowlist any user-controlled lookup before
 calling `ctx.config_store_default()?.get(...)`.
 
+## Application config
+
+`edgezero.toml` describes the *shape* of the app — routes, adapters,
+stores. A separate `<name>.toml` file (e.g. `my-app.toml`, sitting
+alongside `edgezero.toml`) carries the *typed values* the app reads at
+request time: feature flags, timeouts, the keys it uses to look up
+secrets. `edgezero new` generates both, plus a `<Name>Config` struct
+in `crates/<name>-core/src/config.rs` that the file deserialises into.
+
+```rust
+// crates/my-app-core/src/config.rs
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+#[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+#[serde(deny_unknown_fields)]
+pub struct MyAppConfig {
+    pub greeting: String,
+    pub service: ServiceConfig,
+
+    #[secret]
+    pub api_token: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfig {
+    #[validate(range(min = 100, max = 60_000))]
+    pub timeout_ms: u32,
+}
+```
+
+```toml
+# my-app.toml — loaded into MyAppConfig
+[config]
+greeting = "hello from my-app"
+api_token = "demo_api_token"   # key into the default secret store
+
+[config.service]
+timeout_ms = 1500
+```
+
+The loader reads only the `[config]` table; sibling tables are
+ignored. `deny_unknown_fields` makes typos in the TOML a hard load
+error rather than a silent drop.
+
+### Loading the config
+
+```rust
+use edgezero_core::app_config::load_app_config;
+
+let cfg: MyAppConfig =
+    load_app_config(std::path::Path::new("my-app.toml"), "my-app")?;
+```
+
+The function deserialises, runs the `validator` rules (e.g.
+`#[validate(range(...))]`), and returns the typed struct.
+
+### Secret annotations
+
+| Attribute              | Meaning                                                                                          |
+| ---------------------- | ------------------------------------------------------------------------------------------------ |
+| `#[secret]`            | The field's value is a **key inside the default secret store** declared by `[stores.secrets]`.   |
+| `#[secret(store_ref)]` | The field's value is a **logical store id** that must appear in `[stores.secrets].ids`.          |
+
+Only bare `String` fields can carry a `#[secret]` annotation;
+combining it with `#[serde(flatten)]`, `#[serde(rename)]`, or
+`#[serde(skip)]` is a compile error. The `config validate` command
+(see [CLI reference](/guide/cli-reference)) checks that every
+`#[secret(store_ref)]` value matches a declared id.
+
+Resolve secrets at request time from the secret store:
+
+```rust
+// #[secret] field — key in the default store
+let token = ctx
+    .secret_store_default()?
+    .require_str(&cfg.api_token)
+    .await?;
+
+// #[secret(store_ref)] field — value names the store itself
+let value = ctx
+    .secret_store(&cfg.vault)?
+    .require_str("active")
+    .await?;
+```
+
+### Environment-variable overlay
+
+Every key in `[config]` can be overridden at runtime by an env var
+named `<APP_NAME>__<SECTION>__…__<KEY>` (uppercase, with `-` in the
+app name replaced by `_`, segments joined by a double-underscore).
+The overlay only applies to keys **already present in the file** — it
+can't introduce new ones — and the existing TOML value's type drives
+how the env string is coerced (`"true"` / `"false"` for `bool`,
+parsed integers for numeric fields, etc.).
+
+```sh
+# Override the nested service.timeout_ms key:
+MY_APP__SERVICE__TIMEOUT_MS=2500 \
+    cargo run -p my-app-adapter-axum
+```
+
+Two sibling keys collapsing to the same env segment (e.g. `foo-bar`
+and `foo_bar`) is rejected as an `EnvOverlay` error before any
+override is applied, so a misconfiguration leaves the file values
+intact.
+
 ## Adapters Section
 
 Each adapter has its own configuration block:
