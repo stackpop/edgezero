@@ -214,9 +214,9 @@ calling `ctx.config_store_default()?.get(...)`.
 
 ## Application config
 
-`edgezero.toml` describes the *shape* of the app — routes, adapters,
+`edgezero.toml` describes the _shape_ of the app — routes, adapters,
 stores. A separate `<name>.toml` file (e.g. `my-app.toml`, sitting
-alongside `edgezero.toml`) carries the *typed values* the app reads at
+alongside `edgezero.toml`) carries the _typed values_ the app reads at
 request time: feature flags, timeouts, the keys it uses to look up
 secrets. `edgezero new` generates both, plus a `<Name>Config` struct
 in `crates/<name>-core/src/config.rs` that the file deserialises into.
@@ -272,10 +272,10 @@ The function deserialises, runs the `validator` rules (e.g.
 
 ### Secret annotations
 
-| Attribute              | Meaning                                                                                          |
-| ---------------------- | ------------------------------------------------------------------------------------------------ |
-| `#[secret]`            | The field's value is a **key inside the default secret store** declared by `[stores.secrets]`.   |
-| `#[secret(store_ref)]` | The field's value is a **logical store id** that must appear in `[stores.secrets].ids`.          |
+| Attribute              | Meaning                                                                                        |
+| ---------------------- | ---------------------------------------------------------------------------------------------- |
+| `#[secret]`            | The field's value is a **key inside the default secret store** declared by `[stores.secrets]`. |
+| `#[secret(store_ref)]` | The field's value is a **logical store id** that must appear in `[stores.secrets].ids`.        |
 
 Only bare `String` fields can carry a `#[secret]` annotation;
 combining it with `#[serde(flatten)]`, `#[serde(rename)]`, or
