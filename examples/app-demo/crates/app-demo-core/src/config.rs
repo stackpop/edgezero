@@ -27,13 +27,20 @@ pub struct AppDemoConfig {
     /// `feature__new_checkout` on Spin) — matching the existing
     /// handler that reads `feature.new_checkout` from the config
     /// store and the per-adapter seeds in `fastly.toml`/`spin.toml`.
+    /// `#[validate(nested)]` makes the outer `validate()` call
+    /// recurse into `FeatureConfig`'s rules.
+    #[validate(nested)]
     pub feature: FeatureConfig,
 
     /// Free-form greeting surfaced by example handlers.
     pub greeting: String,
 
     /// Nested section — exercises the env-var overlay on a sub-table
-    /// (`app_demo__SERVICE__TIMEOUT_MS=…`).
+    /// (`app_demo__SERVICE__TIMEOUT_MS=…`). `#[validate(nested)]`
+    /// propagates the inner `range` rule on `timeout_ms` up to the
+    /// outer `AppDemoConfig::validate()` — without it the inner
+    /// validator silently no-ops.
+    #[validate(nested)]
     pub service: ServiceConfig,
 
     /// Logical id of a secret store declared in `[stores.secrets].ids`
@@ -123,6 +130,52 @@ mod tests {
                 ("api_token", SecretKind::KeyInDefault),
                 ("vault", SecretKind::StoreRef),
             ],
+        );
+    }
+
+    #[test]
+    fn nested_validator_rules_propagate_to_outer_validate() {
+        // Regression: without `#[validate(nested)]` on the
+        // `AppDemoConfig::service` field, the inner
+        // `#[validate(range(min = 100, ...))]` on
+        // `ServiceConfig::timeout_ms` silently no-ops. Write a
+        // tempfile fixture with `timeout_ms = 50` so we don't race
+        // the sibling env-overlay test over the shared process env
+        // var, and load with the overlay disabled so the file
+        // values are decisive.
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().expect("tempfile");
+        file.write_all(
+            br#"
+[config]
+api_token = "x"
+greeting = "hi"
+vault = "default"
+
+[config.feature]
+new_checkout = false
+
+[config.service]
+timeout_ms = 50
+"#,
+        )
+        .expect("write fixture");
+
+        let mut opts = AppConfigLoadOptions::default();
+        opts.env_overlay = false;
+        let result = load_app_config_with_options::<AppDemoConfig>(file.path(), "app-demo", &opts);
+
+        let err = result.expect_err("out-of-range nested field must error");
+        let message = err.to_string();
+        assert!(
+            message.to_lowercase().contains("validation"),
+            "error mentions validation: {message}"
+        );
+        assert!(
+            message.contains("timeout_ms"),
+            "error names the failing nested field: {message}"
         );
     }
 

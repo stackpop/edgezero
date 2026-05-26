@@ -600,7 +600,9 @@ snake_case. This is consistent with idiomatic serde field naming.
 #[serde(deny_unknown_fields)]
 pub struct AppDemoConfig {
     pub greeting: String,
-    pub feature_new_checkout: bool,
+    #[validate(nested)]
+    pub feature: FeatureConfig,          // nested — flattens to `feature.new_checkout`
+    #[validate(nested)]
     pub service: ServiceConfig,          // nested section (env-overridable, §6.10)
 
     #[secret]                            // key inside the resolved default secret store
@@ -612,11 +614,22 @@ pub struct AppDemoConfig {
 
 #[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
+pub struct FeatureConfig {
+    pub new_checkout: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     #[validate(range(min = 100, max = 60000))]
     pub timeout_ms: u32,
 }
 ```
+
+`#[validate(nested)]` is required for the outer `validate()` to
+recurse into the inner structs — without it the inner `range` /
+`length` rules silently no-op. Stage 4's `app-demo-cli config
+validate` would otherwise accept any nested value.
 
 The derive emits `impl AppConfigMeta` with a `SECRET_FIELDS` array.
 

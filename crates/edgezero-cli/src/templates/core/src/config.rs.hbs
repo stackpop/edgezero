@@ -27,6 +27,10 @@ pub struct {{NameUpperCamel}}Config {
 
     /// Nested section — exercises the env-var overlay
     /// (`{{name}}__SERVICE__TIMEOUT_MS=…` at runtime).
+    /// `#[validate(nested)]` makes the outer `validate()` recurse
+    /// into `ServiceConfig`; without it the inner `range` rule on
+    /// `timeout_ms` silently no-ops.
+    #[validate(nested)]
     pub service: ServiceConfig,
     // `#[secret(store_ref)]` — uncomment when the project declares
     // more than one secret store id under `[stores.secrets].ids` in
