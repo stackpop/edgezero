@@ -45,15 +45,19 @@ use my_app_core::App;
 
 #[fastly::main]
 fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    edgezero_adapter_fastly::run_app::<App>(include_str!("../../../edgezero.toml"), req)
+    edgezero_adapter_fastly::run_app::<App>(req)
 }
 ```
 
-`run_app` reads logging and config-store settings from `edgezero.toml`, builds the app, and injects
-the configured Fastly Config Store into request extensions automatically.
+`run_app` reads logging and store config at runtime from `EDGEZERO__*`
+environment variables (see
+[the migration guide](../manifest-store-migration.md)) and builds
+per-id `KV` / `Config` / `Secret` registries from the portable store
+metadata baked into `App` by the `app!` macro. No `edgezero.toml` is
+loaded by the runtime.
 
 The low-level `dispatch()` helper remains available only for fully manual wiring and does not inject
-config-store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
+store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
 `dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
 `ConfigStoreHandle`.
 

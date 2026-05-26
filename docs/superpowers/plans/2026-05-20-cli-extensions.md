@@ -23,7 +23,29 @@
   library + generator + `app-demo-cli`) plus follow-up `06f4b72`
   (`demo` is example-only; `serve --adapter axum` runs the axum
   adapter). §7 below is kept for reference — do **not** re-do it.
-- **Stages 2–8 — pending.** Stage 2 is next; its PR #253 precondition is met.
+- **Stage 2 — DONE on `feature/extensible-cli`.** Landed across the
+  commit chain rooted at `f5bd432` (Task 2.1, portable store schema)
+  through the post-review fixes at `8942ec2` (Spin component field,
+  bind-vs-environment precedence, axum doc API drift). Substrate
+  shipped: portable `[stores.<kind>]` schema + hard-cutoff for the
+  legacy `[stores.<kind>] name` / `[adapters.<name>.stores.*]` /
+  `[adapters.<name>.adapter] <unknown>` fields (§§ 8.1, 8.3, plus
+  follow-ups); `EDGEZERO__*` env-config layer; `app!` macro bakes
+  portable store metadata into `Hooks::stores()`; `run_app` drops
+  `manifest_src` on all four adapters; async `ConfigStore`; `KvError`
+  gains `Unsupported` / `LimitExceeded` with `EdgeError` mappings;
+  per-id `KvRegistry` / `ConfigRegistry` / `SecretRegistry`; `Kv` /
+  `Secrets` / `Config` extractors reshape to `default()` / `named()`;
+  `BoundSecretStore` captures the per-id platform store name (Fastly
+  multi-secret wired end-to-end); axum config store reads
+  `.edgezero/local-config-<id>.json` per id; Spin KV pagination and
+  dotted-key translation; cloudflare config-store rewrite from `[vars]`
+  JSON-string to KV namespace; `app-demo` and the generator template
+  ship matching manifests + per-platform bindings; manifest-store
+  migration guide published; all five CI gates + the opt-in
+  generated-project compile check + docs lint/format/build green.
+- **Stages 3–8 — pending.** Stage 3 is next; Stage 2 is the
+  precondition and it is met.
 
 ## Codebase facts this plan relies on
 
