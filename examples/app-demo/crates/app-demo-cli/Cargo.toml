@@ -9,6 +9,7 @@ publish = false
 workspace = true
 
 [dependencies]
+app-demo-core = { path = "../app-demo-core" }
 clap = { workspace = true }
 edgezero-cli = { workspace = true }
 log = { workspace = true }

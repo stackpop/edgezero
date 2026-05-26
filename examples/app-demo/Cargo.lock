@@ -149,6 +149,7 @@ dependencies = [
 name = "app-demo-cli"
 version = "0.1.0"
 dependencies = [
+ "app-demo-core",
  "clap",
  "edgezero-cli",
  "log",
@@ -800,6 +801,7 @@ dependencies = [
  "simple_logger 5.1.0",
  "thiserror 2.0.18",
  "toml",
+ "validator",
 ]
 
 [[package]]

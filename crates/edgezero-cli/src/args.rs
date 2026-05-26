@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "edgezero", about = "EdgeZero CLI")]
@@ -11,6 +12,9 @@ pub struct Args {
 pub enum Command {
     /// Build the project for a target edge.
     Build(BuildArgs),
+    /// Inspect or mutate the typed `<name>.toml` app config.
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// Run the bundled `app-demo` example locally (contributor-only).
     #[cfg(feature = "demo-example")]
     Demo,
@@ -20,6 +24,15 @@ pub enum Command {
     New(NewArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
+}
+
+/// Subcommands under `edgezero config …` (spec §10). Stage 4 ships
+/// `validate`; Stage 7 will add `push`.
+#[derive(Subcommand, Debug)]
+pub enum ConfigCmd {
+    /// Validate `edgezero.toml` and the typed `<name>.toml` against the
+    /// manifest / app-config / Spin-key contract.
+    Validate(ConfigValidateArgs),
 }
 
 /// Arguments for the `build` command.
@@ -64,6 +77,28 @@ pub struct ServeArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
+}
+
+/// Arguments for the `config validate` command (spec §10).
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct ConfigValidateArgs {
+    /// Path to the typed app-config file (default: `<app_name>.toml`
+    /// resolved from the manifest's `[app].name`, next to the manifest).
+    #[arg(long)]
+    pub app_config: Option<PathBuf>,
+    /// Path to the manifest (default: `edgezero.toml`).
+    #[arg(long, default_value = "edgezero.toml")]
+    pub manifest: PathBuf,
+    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
+    /// typed app-config. The default loads the overlay so validation
+    /// sees the same values the runtime would.
+    #[arg(long)]
+    pub no_env: bool,
+    /// Strict mode: additionally check capability-aware completeness
+    /// for the declared adapter set and well-formed handler paths.
+    #[arg(long)]
+    pub strict: bool,
 }
 
 #[cfg(test)]
@@ -120,5 +155,52 @@ mod tests {
         };
         assert_eq!(new_args.name, "demo-app");
         assert!(new_args.dir.is_none());
+    }
+
+    #[test]
+    fn config_validate_parses_with_strict() {
+        let args = Args::try_parse_from(["edgezero", "config", "validate", "--strict"])
+            .expect("parse config validate --strict");
+        let Command::Config(ConfigCmd::Validate(validate)) = args.cmd else {
+            panic!("expected Command::Config(ConfigCmd::Validate)");
+        };
+        assert!(validate.strict);
+        assert!(!validate.no_env);
+        assert_eq!(validate.manifest, PathBuf::from("edgezero.toml"));
+        assert!(validate.app_config.is_none());
+    }
+
+    #[test]
+    fn config_validate_parses_explicit_paths_and_no_env() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "config",
+            "validate",
+            "--manifest",
+            "custom/edgezero.toml",
+            "--app-config",
+            "custom/my-app.toml",
+            "--no-env",
+        ])
+        .expect("parse config validate with overrides");
+        let Command::Config(ConfigCmd::Validate(validate)) = args.cmd else {
+            panic!("expected Command::Config(ConfigCmd::Validate)");
+        };
+        assert_eq!(validate.manifest, PathBuf::from("custom/edgezero.toml"));
+        assert_eq!(
+            validate.app_config,
+            Some(PathBuf::from("custom/my-app.toml"))
+        );
+        assert!(validate.no_env);
+        assert!(!validate.strict);
+    }
+
+    #[test]
+    fn config_validate_args_defaults() {
+        let args = ConfigValidateArgs::default();
+        assert_eq!(args.manifest, PathBuf::new());
+        assert!(args.app_config.is_none());
+        assert!(!args.strict);
+        assert!(!args.no_env);
     }
 }
