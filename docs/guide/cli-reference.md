@@ -179,6 +179,40 @@ edgezero deploy --adapter spin
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.
 :::
 
+### edgezero config validate
+
+Validate `edgezero.toml` together with the typed `<name>.toml` app
+config (see [Application config](/guide/configuration#application-config)).
+
+```bash
+edgezero config validate [--manifest <path>] [--app-config <path>] [--strict] [--no-env]
+```
+
+**Arguments:**
+
+- `--manifest <path>` — manifest path (default: `edgezero.toml`).
+- `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
+- `--strict` — additionally check capability-aware completeness for the declared adapter set (spec §6.6) and well-formed Rust handler paths.
+- `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config. By default the validator reads the overlay so it sees the same values the runtime would.
+
+**Two flavours:**
+
+- The default `edgezero` binary runs the **raw** validator — manifest + app-config TOML/schema + the two Spin checks that don't need the typed struct (key syntax, component discovery).
+- A downstream CLI built on `edgezero-cli` that owns its app-config struct (e.g. `app-demo-cli`) runs the **typed** validator: everything the raw flow does, plus the typed deserialise, `validator` rules, the `#[secret]` / `#[secret(store_ref)]` checks, and the Spin config / secret namespace collision check.
+
+**Examples:**
+
+```bash
+# Raw flow on the default binary — manifest + Spin key syntax.
+edgezero config validate
+
+# Strict mode on a downstream CLI — typed deserialise + secrets +
+# capability completeness for the declared adapter set.
+app-demo-cli config validate --strict
+```
+
+**Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure (the loader / validator returns early at the first mismatch).
+
 ## Environment Variables
 
 The CLI respects these environment variables:

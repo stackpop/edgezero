@@ -1,17 +1,28 @@
 //! `EdgeZero` CLI library.
 //!
 //! Exposes the built-in command handlers (`run_build`, `run_deploy`,
-//! `run_new`, `run_serve`) and their argument structs so downstream
-//! projects can build their own CLI binary that reuses any subset of
-//! edgezero's built-in commands. The default `edgezero` binary
-//! (`main.rs`) is a thin wrapper over this library.
+//! `run_new`, `run_serve`, `run_config_validate*`) and their argument
+//! structs so downstream projects can build their own CLI binary that
+//! reuses any subset of edgezero's built-in commands. The default
+//! `edgezero` binary (`main.rs`) is a thin wrapper over this library.
 //!
 //! `run_demo` is an additional contributor-only handler, available only
 //! under the `demo-example` feature — it runs the in-repo `app-demo`
 //! example and is not meant for downstream CLIs.
 
+// `pub use config::*` re-exports `run_config_validate*` at the crate
+// root. The lint is module-scoped (cannot be `#[expect]`-ed per-item);
+// downstream CLIs already call `edgezero_cli::run_build` / `run_serve`
+// at the crate root, so the new validators follow the same convention.
+#![expect(
+    clippy::pub_use,
+    reason = "config-validate entry points re-export at the crate root to match the existing run_* surface downstream CLIs already use"
+)]
+
 #[cfg(feature = "cli")]
 mod adapter;
+#[cfg(feature = "cli")]
+mod config;
 #[cfg(all(feature = "cli", feature = "demo-example"))]
 mod demo_server;
 #[cfg(feature = "cli")]
@@ -24,6 +35,9 @@ mod scaffold;
 /// command argument types — e.g. `edgezero_cli::args::BuildArgs`.
 #[cfg(feature = "cli")]
 pub mod args;
+
+#[cfg(feature = "cli")]
+pub use config::{run_config_validate, run_config_validate_typed};
 
 #[cfg(feature = "cli")]
 use args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
