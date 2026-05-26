@@ -1,8 +1,9 @@
 //! Typed application config for `app-demo`, loaded from `app-demo.toml`
 //! via `edgezero_core::app_config::load_app_config::<AppDemoConfig>`.
 //!
-//! The `app_demo__<SECTION>__…__<KEY>` env-var overlay (uppercase,
-//! `-`→`_`) overrides any key already present in the file.
+//! The TOML file maps directly onto `AppDemoConfig` — no `[config]`
+//! wrapper. The `app_demo__<SECTION>__…__<KEY>` env-var overlay
+//! (uppercase, `-`→`_`) overrides any key already present.
 
 #![expect(
     clippy::module_name_repetitions,
@@ -149,15 +150,14 @@ mod tests {
         let mut file = NamedTempFile::new().expect("tempfile");
         file.write_all(
             br#"
-[config]
 api_token = "x"
 greeting = "hi"
 vault = "default"
 
-[config.feature]
+[feature]
 new_checkout = false
 
-[config.service]
+[service]
 timeout_ms = 50
 "#,
         )

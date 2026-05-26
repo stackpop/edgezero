@@ -1,14 +1,13 @@
 # `app-demo.toml` — typed application config for the `app-demo` example.
 #
-# Mirrors the `AppDemoConfig` struct in
-# `crates/app-demo-core/src/config.rs`. The loader reads only the
-# `[config]` table; sibling tables are ignored.
+# The file's top-level table maps 1:1 to the `AppDemoConfig` struct in
+# `crates/app-demo-core/src/config.rs`. There is no `[config]`
+# wrapper.
 #
 # Env-var overlay: every key here can be overridden at runtime by
 # `app_demo__<SECTION>__…__<KEY>` (uppercase, `-`→`_`, `__` separator)
 # as long as the key already exists below.
 
-[config]
 # `api_token` is the *key* inside the resolved default secret store
 # (see `[stores.secrets]` in `edgezero.toml`). The handler resolves it
 # via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
@@ -24,8 +23,8 @@ vault = "default"
 # `feature.new_checkout` from the config store and the per-adapter
 # seeds in `fastly.toml`/`spin.toml` (translated to
 # `feature__new_checkout` on Spin's flat namespace).
-[config.feature]
+[feature]
 new_checkout = false
 
-[config.service]
+[service]
 timeout_ms = 1500

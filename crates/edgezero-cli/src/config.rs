@@ -4,10 +4,10 @@
 //! app-config file, and (when `spin` is in the adapter set) the Spin
 //! key-syntax / component-discovery rules:
 //!
-//! - [`run_config_validate`] — raw flow. Loads the `[config]` table as
-//!   a [`toml::Value`] only; the typed deserialise / `validator` /
-//!   secret checks are skipped because no `C` is in scope. The
-//!   default `edgezero` binary uses this.
+//! - [`run_config_validate`] — raw flow. Loads the file's root
+//!   table as a [`toml::Value`] only; the typed deserialise /
+//!   `validator` / secret checks are skipped because no `C` is in
+//!   scope. The default `edgezero` binary uses this.
 //! - [`run_config_validate_typed`] — typed flow. Adds typed
 //!   deserialisation, `validator::Validate::validate()`, the
 //!   `#[secret]` / `#[secret(store_ref)]` checks, and the Spin
@@ -48,17 +48,13 @@ struct ValidationContext {
     /// Path the manifest was loaded from — kept so error messages
     /// can name the user-visible file.
     manifest_path: PathBuf,
-    /// Raw `[config]` table — loaded with the same overlay setting
-    /// the typed flow will use, so the raw Spin key-syntax check
-    /// sees the same values.
+    /// Raw root table of `<name>.toml` — loaded with the same
+    /// overlay setting the typed flow will use, so the raw Spin
+    /// key-syntax check sees the same values.
     raw_config: Value,
 }
 
 impl ValidationContext {
-    fn has_spin_adapter(&self) -> bool {
-        self.manifest().adapters.contains_key("spin")
-    }
-
     fn manifest(&self) -> &Manifest {
         self.manifest_loader.manifest()
     }
@@ -100,10 +96,11 @@ where
             .map_err(|err| format_app_config_error(&err))?;
 
     typed_secret_checks(&typed, &ctx)?;
-
-    if ctx.has_spin_adapter() {
-        spin_config_secret_collision(&ctx, C::SECRET_FIELDS)?;
-    }
+    // Spin's flat variable namespace can collide with a secret value
+    // resolved via `#[secret]` — see §6.7 check 2. The collision check
+    // self-gates: it returns `Ok` when Spin isn't in the adapter set,
+    // so the context stays adapter-agnostic.
+    spin_config_secret_collision(&ctx, C::SECRET_FIELDS)?;
 
     Ok(())
 }
@@ -124,10 +121,10 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
 
     let app_config_path = resolve_app_config_path(args, &args.manifest, &app_name);
 
-    // Load the raw `[config]` table once. The typed flow will re-load
-    // it via `load_app_config_with_options::<C>` to drive deserialise +
-    // validator; we keep this copy for shared checks (Spin key syntax,
-    // component discovery) that don't need `C`.
+    // Load the raw root table once. The typed flow will re-load it
+    // via `load_app_config_with_options::<C>` to drive deserialise +
+    // validator; we keep this copy for shared checks (Spin key
+    // syntax, component discovery) that don't need `C`.
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let raw_config =
@@ -163,10 +160,11 @@ fn resolve_app_config_path(
 }
 
 fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
-    if ctx.has_spin_adapter() {
-        spin_key_syntax_check(&ctx.raw_config)?;
-        spin_component_discovery(ctx.manifest(), &ctx.manifest_path)?;
-    }
+    // Each Spin check self-gates on `manifest.adapters.contains_key("spin")`,
+    // so the context stays adapter-agnostic and the call site reads as a
+    // flat list of contract checks.
+    spin_key_syntax_check(ctx.manifest(), &ctx.raw_config)?;
+    spin_component_discovery(ctx.manifest(), &ctx.manifest_path)?;
     if ctx.args_strict {
         strict_capability_completeness(ctx.manifest())?;
         strict_handler_paths(ctx.manifest())?;
@@ -185,7 +183,7 @@ fn typed_secret_checks<C: AppConfigMeta>(
     let raw_table = ctx
         .raw_config
         .as_table()
-        .ok_or_else(|| "raw `[config]` was not a table after load".to_owned())?;
+        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
 
     for field in C::SECRET_FIELDS {
         let value = raw_table
@@ -193,7 +191,7 @@ fn typed_secret_checks<C: AppConfigMeta>(
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 format!(
-                    "{}: `#[secret]` field `{}` is missing or not a string in [config]",
+                    "{}: `#[secret]` field `{}` is missing or not a string at the top level",
                     ctx.app_config_path.display(),
                     field.name
                 )
@@ -244,10 +242,13 @@ fn typed_secret_checks<C: AppConfigMeta>(
 // Spin checks (spec §6.7)
 // -------------------------------------------------------------------
 
-fn spin_key_syntax_check(raw_config: &Value) -> Result<(), String> {
+fn spin_key_syntax_check(manifest: &Manifest, raw_config: &Value) -> Result<(), String> {
+    if !manifest.adapters.contains_key("spin") {
+        return Ok(());
+    }
     let table = raw_config
         .as_table()
-        .ok_or_else(|| "raw `[config]` was not a table after load".to_owned())?;
+        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
     for key in flatten_keys(table) {
         let spin_var = key.replace('.', "__");
         if !is_valid_spin_key(&spin_var) {
@@ -274,10 +275,13 @@ fn spin_config_secret_collision(
     ctx: &ValidationContext,
     secret_fields: &[SecretField],
 ) -> Result<(), String> {
+    if !ctx.manifest().adapters.contains_key("spin") {
+        return Ok(());
+    }
     let raw_table = ctx
         .raw_config
         .as_table()
-        .ok_or_else(|| "raw `[config]` was not a table after load".to_owned())?;
+        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
 
     let mut seen: HashSet<String> = HashSet::new();
     for key in flatten_keys(raw_table) {
@@ -507,17 +511,15 @@ mod tests {
     // ---------- shared fixtures ----------
 
     const FIXTURE_APP_CONFIG: &str = r#"
-[config]
 api_token = "demo_api_token"
 greeting = "hello"
 vault = "default"
 
-[config.service]
+[service]
 timeout_ms = 1500
 "#;
 
     const VALID_APP_CONFIG: &str = r#"
-[config]
 api_token = "demo_api_token"
 greeting = "hello"
 "#;
@@ -637,17 +639,6 @@ source = "target/wasm32-wasip1/release/demo.wasm"
     }
 
     #[test]
-    fn raw_errors_on_missing_config_table() {
-        let (_dir, manifest, _) = setup_project(VALID_MANIFEST, "[other]\nkey = \"v\"\n");
-        let err =
-            run_config_validate(&args_for(&manifest)).expect_err("missing [config] must error");
-        assert!(
-            err.contains("`[config]` table"),
-            "error explains the missing table: {err}"
-        );
-    }
-
-    #[test]
     fn raw_errors_when_manifest_app_name_missing() {
         let manifest = r#"
 [adapters.axum.adapter]
@@ -678,13 +669,12 @@ serve = "echo"
     #[test]
     fn typed_errors_on_unknown_field() {
         let app_config = r#"
-[config]
 api_token = "x"
 greeting = "hi"
 vault = "default"
 extra_unknown = "rejected"
 
-[config.service]
+[service]
 timeout_ms = 1500
 "#;
         let (_dir, manifest, _) = setup_project(VALID_MANIFEST, app_config);
@@ -699,12 +689,11 @@ timeout_ms = 1500
     #[test]
     fn typed_errors_on_validator_rule_failure() {
         let app_config = r#"
-[config]
 api_token = "x"
 greeting = "hi"
 vault = "default"
 
-[config.service]
+[service]
 timeout_ms = 50
 "#;
         let (_dir, manifest, _) = setup_project(VALID_MANIFEST, app_config);
@@ -719,12 +708,11 @@ timeout_ms = 50
     #[test]
     fn typed_errors_on_empty_secret_field() {
         let app_config = r#"
-[config]
 api_token = ""
 greeting = "hi"
 vault = "default"
 
-[config.service]
+[service]
 timeout_ms = 1500
 "#;
         let (_dir, manifest, _) = setup_project(VALID_MANIFEST, app_config);
@@ -739,12 +727,11 @@ timeout_ms = 1500
     #[test]
     fn typed_errors_when_store_ref_value_not_in_ids() {
         let app_config = r#"
-[config]
 api_token = "x"
 greeting = "hi"
 vault = "missing-id"
 
-[config.service]
+[service]
 timeout_ms = 1500
 "#;
         let (_dir, manifest, _) = setup_project(VALID_MANIFEST, app_config);
@@ -809,7 +796,6 @@ ids = ["default"]
     #[test]
     fn spin_key_syntax_rejects_uppercase_top_level_key() {
         let app_config = r#"
-[config]
 api_token = "x"
 GREETING = "hi"
 "#;
@@ -825,7 +811,6 @@ GREETING = "hi"
     #[test]
     fn spin_key_syntax_rejects_dash_in_key() {
         let app_config = r#"
-[config]
 api-token = "x"
 "#;
         let (dir, manifest, _) = setup_project(&spin_manifest(""), app_config);
@@ -1012,13 +997,12 @@ serve = "echo"
 ids = ["default"]
 "#;
         let app_config = r#"
-[config]
 api_token = "demo_api_token"
 default = "shared-name"
 greeting = "hi"
 vault = "default"
 
-[config.service]
+[service]
 timeout_ms = 1500
 "#;
         let (dir, manifest_path, _) = setup_project(manifest, app_config);
@@ -1034,12 +1018,11 @@ timeout_ms = 1500
         // `api_token`'s value translate to the same Spin variable
         // `greeting`. Typed flow must reject; raw flow can't see it.
         let app_config = r#"
-[config]
 api_token = "greeting"
 greeting = "hi"
 vault = "default"
 
-[config.service]
+[service]
 timeout_ms = 1500
 "#;
         let (dir, manifest, _) = setup_project(&spin_manifest(""), app_config);

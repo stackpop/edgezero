@@ -1,17 +1,18 @@
 //! Typed app-config loading (spec §4, §6.10).
 //!
 //! Stage 3 surface for downstream `<name>.toml` files (e.g.
-//! `app-demo.toml`). The loader reads the `[config]` table, optionally
-//! applies the `<APP_NAME>__<SECTION>__…<KEY>` env-var overlay (§6.10),
-//! and either:
+//! `app-demo.toml`). The loader reads the file's top-level table
+//! verbatim — there is no `[config]` wrapper — optionally applies the
+//! `<APP_NAME>__<SECTION>__…<KEY>` env-var overlay (§6.10), and
+//! either:
 //!
 //! - Deserialises into a downstream `C: DeserializeOwned + Validate`
 //!   and runs `validator::Validate::validate()` —
 //!   [`load_app_config`] / [`load_app_config_with_options`].
-//! - Returns the parsed `[config]` table as raw `toml::Value` for
-//!   tools that don't have access to the typed struct (`config push`
-//!   shell mode, Stage 7) —
-//!   [`load_app_config_raw`] / [`load_app_config_raw_with_options`].
+//! - Returns the parsed root table as raw `toml::Value` for tools
+//!   that don't have access to the typed struct (`config push` shell
+//!   mode, Stage 7) — [`load_app_config_raw`] /
+//!   [`load_app_config_raw_with_options`].
 
 use std::any;
 use std::collections::HashMap;
@@ -68,7 +69,7 @@ pub enum SecretKind {
 #[non_exhaustive]
 pub struct AppConfigLoadOptions {
     /// When `true`, apply the `<APP_NAME>__…__<KEY>` env-var overlay
-    /// after parsing the `[config]` table; when `false`, the parsed
+    /// after parsing the file's root table; when `false`, the parsed
     /// values are used as-is.
     pub env_overlay: bool,
 }
@@ -88,16 +89,11 @@ impl Default for AppConfigLoadOptions {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppConfigError {
-    /// The file parsed and contained a top-level `config` key, but the
-    /// value was a scalar / array instead of a table — e.g. `config =
-    /// "..."`. Stage 4's raw validation depends on `load_app_config_raw`
-    /// returning an actual table, so reject the mismatch here.
-    #[error("`config` in {} must be a table, got {actual}", path.display())]
-    ConfigNotATable { path: PathBuf, actual: &'static str },
-    /// Deserialising the `[config]` table into the typed `C` failed —
-    /// missing required fields, wrong types, unknown fields (when the
-    /// struct opts in to `#[serde(deny_unknown_fields)]`), etc.
-    #[error("failed to deserialise `[config]` in {} into {target_type}: {source}", path.display())]
+    /// Deserialising the file's top-level table into the typed `C`
+    /// failed — missing required fields, wrong types, unknown fields
+    /// (when the struct opts in to `#[serde(deny_unknown_fields)]`),
+    /// etc.
+    #[error("failed to deserialise {} into {target_type}: {source}", path.display())]
     Deserialize {
         path: PathBuf,
         target_type: &'static str,
@@ -110,18 +106,13 @@ pub enum AppConfigError {
     #[error("env overlay failed for {}: {message}", path.display())]
     EnvOverlay { path: PathBuf, message: String },
     /// Failed to read the on-disk file (missing, permission denied,
-    /// etc.). The `[config]`-table absence error is distinct
-    /// ([`AppConfigError::MissingConfigTable`]) so callers can
-    /// distinguish a no-file project from a malformed one.
+    /// etc.).
     #[error("failed to read {}: {source}", path.display())]
     Io {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    /// The file parsed as TOML but has no top-level `[config]` table.
-    #[error("no `[config]` table in {}", path.display())]
-    MissingConfigTable { path: PathBuf },
     /// The file exists but is not valid TOML.
     #[error("failed to parse {} as TOML: {source}", path.display())]
     Parse {
@@ -131,7 +122,7 @@ pub enum AppConfigError {
     },
     /// `validator::Validate::validate()` rejected the parsed values
     /// (range / length / regex / custom validators).
-    #[error("validation failed for `[config]` in {}: {source}", path.display())]
+    #[error("validation failed for {}: {source}", path.display())]
     Validation {
         path: PathBuf,
         #[source]
@@ -224,7 +215,7 @@ where
     Ok(typed)
 }
 
-/// Read the `[config]` table as a raw `toml::Value`, with the env
+/// Read the file's root table as a raw `toml::Value`, with the env
 /// overlay applied (when on). Used by `config push` (Stage 7) and
 /// other tools that don't have access to the typed struct.
 ///
@@ -249,31 +240,18 @@ pub fn load_app_config_raw_with_options(
         path: path.to_path_buf(),
         source,
     })?;
-    let document: Value = toml::from_str(&raw).map_err(|source| AppConfigError::Parse {
+    let mut document: Value = toml::from_str(&raw).map_err(|source| AppConfigError::Parse {
         path: path.to_path_buf(),
         source: Box::new(source),
     })?;
-    let mut config_table = document
-        .as_table()
-        .and_then(|table| table.get("config"))
-        .cloned()
-        .ok_or_else(|| AppConfigError::MissingConfigTable {
-            path: path.to_path_buf(),
-        })?;
-    if !config_table.is_table() {
-        return Err(AppConfigError::ConfigNotATable {
-            path: path.to_path_buf(),
-            actual: config_table.type_str(),
-        });
-    }
     if opts.env_overlay {
-        apply_env_overlay(&mut config_table, app_name, path)?;
+        apply_env_overlay(&mut document, app_name, path)?;
     }
-    Ok(config_table)
+    Ok(document)
 }
 
 /// Apply the `<APP_NAME>__<SECTION>__…__<KEY>` env-var overlay
-/// against the parsed `[config]` table (§6.10).
+/// against the parsed root table (§6.10).
 ///
 /// The overlay only overrides keys that already exist in the parsed
 /// tree (the existing TOML value's type drives coercion of the env
@@ -460,7 +438,6 @@ mod tests {
     fn load_app_config_round_trips_a_valid_file() {
         let file = write_fixture(
             r#"
-[config]
 greeting = "hello"
 timeout_ms = 1500
 "#,
@@ -498,40 +475,9 @@ timeout_ms = 1500
     }
 
     #[test]
-    fn load_app_config_errors_with_missing_config_table_variant() {
-        let file = write_fixture("[other]\nkey = \"value\"\n");
-        let err = load_app_config::<FixtureConfig>(file.path(), "fixture")
-            .expect_err("no [config] table must error");
-        assert!(
-            matches!(err, AppConfigError::MissingConfigTable { .. }),
-            "expected MissingConfigTable variant, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn load_app_config_raw_rejects_non_table_config_value() {
-        // `config = "..."` is a scalar — Stage 4's raw flow assumes a
-        // table, so the loader must reject the mismatch up front rather
-        // than handing back something `as_table()` will silently coerce.
-        let file = write_fixture("config = \"not-a-table\"\n");
-        let err =
-            load_app_config_raw(file.path(), "fixture").expect_err("non-table `config` must error");
-        match err {
-            AppConfigError::ConfigNotATable { actual, .. } => {
-                assert_eq!(
-                    actual, "string",
-                    "error names the actual TOML type (got {actual})"
-                );
-            }
-            other => panic!("expected ConfigNotATable variant, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn load_app_config_errors_with_deserialize_variant_for_unknown_fields() {
         let file = write_fixture(
             r#"
-[config]
 greeting = "hello"
 timeout_ms = 1500
 extra_unknown = "rejected by deny_unknown_fields"
@@ -550,7 +496,6 @@ extra_unknown = "rejected by deny_unknown_fields"
         // `timeout_ms = 99` violates `range(min = 100, ..)`.
         let file = write_fixture(
             r#"
-[config]
 greeting = "hello"
 timeout_ms = 99
 "#,
@@ -564,13 +509,12 @@ timeout_ms = 99
     }
 
     #[test]
-    fn load_app_config_raw_returns_the_config_table() {
+    fn load_app_config_raw_returns_the_root_table() {
         let file = write_fixture(
             r#"
-[config]
 greeting = "hello"
 
-[config.service]
+[service]
 timeout_ms = 1500
 "#,
         );
@@ -579,7 +523,7 @@ timeout_ms = 1500
         assert_eq!(table.get("greeting").and_then(Value::as_str), Some("hello"),);
         assert!(
             table.get("service").and_then(Value::as_table).is_some(),
-            "nested [config.service] survives raw load"
+            "nested [service] survives raw load"
         );
     }
 
@@ -593,13 +537,8 @@ timeout_ms = 1500
 
     // -- Env overlay (§6.10) ------------------------------------------------
 
-    fn parse_config_table(contents: &str) -> Value {
-        let document: Value = toml::from_str(contents).expect("parse fixture");
-        document
-            .as_table()
-            .and_then(|table| table.get("config"))
-            .cloned()
-            .expect("fixture has [config] table")
+    fn parse_root_table(contents: &str) -> Value {
+        toml::from_str(contents).expect("parse fixture")
     }
 
     fn overlay_with_lookup(
@@ -614,9 +553,8 @@ timeout_ms = 1500
 
     #[test]
     fn env_overlay_overrides_top_level_string() {
-        let mut table = parse_config_table(
+        let mut table = parse_root_table(
             r#"
-[config]
 greeting = "hello"
 "#,
         );
@@ -627,11 +565,9 @@ greeting = "hello"
 
     #[test]
     fn env_overlay_overrides_nested_integer_with_coercion() {
-        let mut table = parse_config_table(
+        let mut table = parse_root_table(
             "
-[config]
-
-[config.service]
+[service]
 timeout_ms = 1500
 ",
         );
@@ -654,9 +590,8 @@ timeout_ms = 1500
     #[test]
     fn env_overlay_coerces_boolean_from_true_false_or_numeric() {
         for (raw, expected) in [("true", true), ("false", false), ("1", true), ("0", false)] {
-            let mut table = parse_config_table(
+            let mut table = parse_root_table(
                 "
-[config]
 feature_new_checkout = false
 ",
             );
@@ -676,11 +611,9 @@ feature_new_checkout = false
 
     #[test]
     fn env_overlay_errors_when_value_cannot_be_coerced_to_existing_type() {
-        let mut table = parse_config_table(
+        let mut table = parse_root_table(
             "
-[config]
-
-[config.service]
+[service]
 timeout_ms = 1500
 ",
         );
@@ -710,9 +643,8 @@ timeout_ms = 1500
         // `greeting_a` and `GREETING_A` would both translate to env
         // segment `GREETING_A` (uppercase). Since TOML keys are
         // case-sensitive but env segments aren't, we need a guard.
-        let mut table = parse_config_table(
+        let mut table = parse_root_table(
             r#"
-[config]
 greeting_a = "lower"
 GREETING_A = "upper"
 "#,
@@ -743,7 +675,6 @@ GREETING_A = "upper"
         // process env between threads).
         let file = write_fixture(
             r#"
-[config]
 greeting = "hello"
 timeout_ms = 1500
 "#,
@@ -766,9 +697,8 @@ timeout_ms = 1500
         // An env var for a key that is not already present in the
         // parsed table is silently ignored (the overlay never adds
         // new keys — §6.10 "env vars override existing keys only").
-        let mut table = parse_config_table(
+        let mut table = parse_root_table(
             r#"
-[config]
 greeting = "hello"
 "#,
         );

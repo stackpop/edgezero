@@ -93,8 +93,9 @@ flags; new subcommands are added.
   `fastly` / `spin`.
 - No direct REST API calls; everything goes through the platform's
   native CLI.
-- No environment-sectioned app-config (`[config.production]` etc.).
-  Single `[config]` table per file. (Env-var _override_ is in scope;
+- No environment-sectioned app-config. The file is a flat typed
+  struct — top-level keys are struct fields, no `[config]` /
+  `[config.production]` wrapper. (Env-var _override_ is in scope;
   per-environment _files_ are not.)
 - No live-platform CI smoke tests. Mock `CommandRunner` only.
 - **No backward compatibility** with the old manifest schema or runtime
@@ -360,8 +361,8 @@ for the target adapter.
 
 ### 6.5 Typed vs raw config serialization
 
-**Validate (both flavours):** TOML syntax OK; `[config]` table present;
-structure parses. Typed additionally: deserialises into `C`; runs
+**Validate (both flavours):** TOML syntax OK; the file's top-level
+table parses. Typed additionally: deserialises into `C`; runs
 `C::validate()`; for each `SecretField`, value is a non-empty string,
 and `StoreRef` values appear in `[stores.secrets].ids`. Validate does
 not require `Serialize` and performs no `to_value` check.
@@ -374,8 +375,9 @@ nested structs flattened into dotted keys (§6.4). `SECRET_FIELDS`
 skipped (typed only). Typed additionally: asserts
 `serde_json::to_value(&c)` is `Value::Object` (else error before any
 runner call); honors `#[serde(rename)]`, `#[serde(skip_serializing*)]`;
-supports `#[serde(flatten)]` on non-secret fields. Raw: `toml::Value`
-tree from `[config]`, same rules, no `Validate`, no secret skipping.
+supports `#[serde(flatten)]` on non-secret fields. Raw: the parsed
+root `toml::Value` tree, same rules, no `Validate`, no secret
+skipping.
 
 **Unknown fields:** serde ignores them unless `C` has
 `#[serde(deny_unknown_fields)]`. The generator template emits it.
@@ -686,13 +688,15 @@ The only in-tree consumers of the old single-store extractors are the
 ### 6.10 App-config environment-variable resolution
 
 `load_app_config` / `load_app_config_raw` resolve in two layers:
-(1) the `[config]` table from `<name>.toml`; (2) env-var overrides.
+(1) the file's top-level table from `<name>.toml` (no `[config]`
+wrapper — the file is the typed struct directly); (2) env-var
+overrides.
 
 **Env vars override existing keys only.** An env var overrides a value
-only if that key already exists in the parsed `[config]` tree (the
-loader infers the type from the existing TOML value and parses the env
-string accordingly — there is no pre-deserialization reflection over
-`C`). To make a key env-overridable it must appear in `<name>.toml`.
+only if that key already exists in the parsed tree (the loader infers
+the type from the existing TOML value and parses the env string
+accordingly — there is no pre-deserialization reflection over `C`).
+To make a key env-overridable it must appear in `<name>.toml`.
 
 **Env var naming.** `<APP_NAME>__<SECTION>__…__<KEY>`. `<APP_NAME>` is
 `[app].name` uppercased with `-`→`_`. `__` separates every nesting
@@ -916,11 +920,11 @@ opposite: it deliberately exercises _everything_, so its
 `#[secret]`, **and** one `#[secret(store_ref)]` — `app-demo` is the
 full-capability showcase, not a representative new project.
 
-**Tests:** `load_app_config` (valid, missing file, bad TOML, validator
-failure, missing `[config]`); env-overlay tests (top-level, nested
-`__`, type coercion, parse failure, ambiguous key → error, `--no-env`);
-round-trip for `AppDemoConfig`; macro tests for all §6.8 compile-error
-constraints.
+**Tests:** `load_app_config` (valid, missing file, bad TOML,
+validator failure); env-overlay tests (top-level, nested `__`, type
+coercion, parse failure, ambiguous key → error, `--no-env`);
+round-trip for `AppDemoConfig`; macro tests for all §6.8
+compile-error constraints.
 
 **Ship gate:** `AppDemoConfig::SECRET_FIELDS` matches; `load_app_config`
 succeeds; `APP_DEMO__SERVICE__TIMEOUT_MS` overrides the nested value
@@ -941,9 +945,9 @@ pub struct ConfigValidateArgs {
 
 Bound: `DeserializeOwned + Validate + AppConfigMeta` (no `Serialize`).
 
-App-config validation: TOML syntax; `[config]` present; deserialises
-into `C`; types; `validator` rules; unknown fields rejected when `C`
-opts in; `#[secret]` non-empty; `#[secret(store_ref)]` in
+App-config validation: TOML syntax; deserialises into `C`; types;
+`validator` rules; unknown fields rejected when `C` opts in;
+`#[secret]` non-empty; `#[secret(store_ref)]` in
 `[stores.secrets].ids`. **When `spin` is in the adapter set**, three
 additional Spin checks (all per §6.7):
 
