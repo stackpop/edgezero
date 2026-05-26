@@ -52,6 +52,17 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
         }
     }
 
+    // SECRET_FIELDS emits the Rust field name verbatim. A container-
+    // level `#[serde(rename_all = ...)]` would desync that metadata
+    // from what Stage 4's `config validate` (and the Spin collision
+    // check) sees on the wire — silently — so reject it whenever any
+    // secret field is present. Structs with no secret fields are
+    // unaffected: SECRET_FIELDS is empty and the validator never
+    // compares names.
+    if !annotations.is_empty() {
+        enforce_no_container_rename_all(&input.attrs)?;
+    }
+
     let entries = annotations.iter().map(|annotation| {
         let name_lit = annotation.name.to_string();
         let kind_tokens = match annotation.kind {
@@ -183,6 +194,35 @@ fn is_scalar_string_type(ty: &Type) -> bool {
         }
     }
     false
+}
+
+/// Container-level guard: a struct that carries any `#[secret]` field
+/// must not also carry `#[serde(rename_all = ...)]`. The derive emits
+/// `SECRET_FIELDS` with Rust field names verbatim, but `rename_all`
+/// would translate the on-the-wire key name (e.g. `kebab-case` →
+/// `api-token`), silently desyncing the typed Stage 4 secret checks
+/// from what the deserialiser actually accepts. Reject this at compile
+/// time so the desync can't ship.
+fn enforce_no_container_rename_all(attrs: &[Attribute]) -> Result<(), syn::Error> {
+    for attr in attrs {
+        if !attr.path().is_ident("serde") {
+            continue;
+        }
+        let mut offending = false;
+        let _parse_result: syn::Result<()> = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                offending = true;
+            }
+            Ok(())
+        });
+        if offending {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "`#[derive(AppConfig)]` rejects `#[serde(rename_all = ...)]` on structs with `#[secret]` fields: SECRET_FIELDS uses Rust field names verbatim, so a container rename would silently desync `config validate` from runtime deserialisation",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `#[secret]` cannot coexist with `#[serde(flatten)]` /

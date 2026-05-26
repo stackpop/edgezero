@@ -88,6 +88,12 @@ impl Default for AppConfigLoadOptions {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AppConfigError {
+    /// The file parsed and contained a top-level `config` key, but the
+    /// value was a scalar / array instead of a table — e.g. `config =
+    /// "..."`. Stage 4's raw validation depends on `load_app_config_raw`
+    /// returning an actual table, so reject the mismatch here.
+    #[error("`config` in {} must be a table, got {actual}", path.display())]
+    ConfigNotATable { path: PathBuf, actual: &'static str },
     /// Deserialising the `[config]` table into the typed `C` failed —
     /// missing required fields, wrong types, unknown fields (when the
     /// struct opts in to `#[serde(deny_unknown_fields)]`), etc.
@@ -182,7 +188,7 @@ impl EnvLookup {
 #[inline]
 pub fn load_app_config<C>(path: &Path, app_name: &str) -> Result<C, AppConfigError>
 where
-    C: DeserializeOwned + Validate,
+    C: DeserializeOwned + Validate + AppConfigMeta,
 {
     load_app_config_with_options(path, app_name, &AppConfigLoadOptions::default())
 }
@@ -198,7 +204,7 @@ pub fn load_app_config_with_options<C>(
     opts: &AppConfigLoadOptions,
 ) -> Result<C, AppConfigError>
 where
-    C: DeserializeOwned + Validate,
+    C: DeserializeOwned + Validate + AppConfigMeta,
 {
     let config_table = load_app_config_raw_with_options(path, app_name, opts)?;
     let typed: C =
@@ -254,6 +260,12 @@ pub fn load_app_config_raw_with_options(
         .ok_or_else(|| AppConfigError::MissingConfigTable {
             path: path.to_path_buf(),
         })?;
+    if !config_table.is_table() {
+        return Err(AppConfigError::ConfigNotATable {
+            path: path.to_path_buf(),
+            actual: config_table.type_str(),
+        });
+    }
     if opts.env_overlay {
         apply_env_overlay(&mut config_table, app_name, path)?;
     }
@@ -419,12 +431,23 @@ mod tests {
     use std::io::Write as _;
     use tempfile::NamedTempFile;
 
+    // `AppConfigMeta` is hand-impl'd here rather than derived: the
+    // `#[derive(AppConfig)]` proc macro emits absolute paths
+    // (`::edgezero_core::…`) that don't resolve inside the defining
+    // crate's own modules. The downstream integration test in
+    // `edgezero-macros/tests/app_config_derive.rs` exercises the derive
+    // itself; this fixture only needs the trait bound to satisfy
+    // `load_app_config<C>`.
     #[derive(Debug, Deserialize, Validate, PartialEq)]
     #[serde(deny_unknown_fields)]
     struct FixtureConfig {
         greeting: String,
         #[validate(range(min = 100, max = 60_000))]
         timeout_ms: u32,
+    }
+
+    impl AppConfigMeta for FixtureConfig {
+        const SECRET_FIELDS: &'static [SecretField] = &[];
     }
 
     fn write_fixture(contents: &str) -> NamedTempFile {
@@ -483,6 +506,25 @@ timeout_ms = 1500
             matches!(err, AppConfigError::MissingConfigTable { .. }),
             "expected MissingConfigTable variant, got {err:?}"
         );
+    }
+
+    #[test]
+    fn load_app_config_raw_rejects_non_table_config_value() {
+        // `config = "..."` is a scalar — Stage 4's raw flow assumes a
+        // table, so the loader must reject the mismatch up front rather
+        // than handing back something `as_table()` will silently coerce.
+        let file = write_fixture("config = \"not-a-table\"\n");
+        let err =
+            load_app_config_raw(file.path(), "fixture").expect_err("non-table `config` must error");
+        match err {
+            AppConfigError::ConfigNotATable { actual, .. } => {
+                assert_eq!(
+                    actual, "string",
+                    "error names the actual TOML type (got {actual})"
+                );
+            }
+            other => panic!("expected ConfigNotATable variant, got {other:?}"),
+        }
     }
 
     #[test]
