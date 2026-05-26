@@ -29,16 +29,17 @@ The Axum entrypoint wires the adapter:
 ```rust
 use my_app_core::App;
 
-fn main() {
-    if let Err(err) = edgezero_adapter_axum::run_app::<App>(include_str!("../../../edgezero.toml")) {
-        eprintln!("axum adapter failed: {err}");
-        std::process::exit(1);
-    }
+fn main() -> anyhow::Result<()> {
+    edgezero_adapter_axum::run_app::<App>()
 }
 ```
 
-`run_app` installs `simple_logger`, builds the app, and wires the local config store from
-`[stores.config]` automatically.
+`run_app` installs `simple_logger`, builds the app, and reads bind /
+store / logging config at runtime from `EDGEZERO__*` environment
+variables (see [the migration guide](../manifest-store-migration.md)).
+The portable store metadata baked into `App` by the `app!` macro
+drives which logical stores are exposed; no `edgezero.toml` needs to
+be loaded by the runtime.
 
 ## Development Server
 
