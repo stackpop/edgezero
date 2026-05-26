@@ -38,21 +38,29 @@ impl ManifestLoader {
         })
     }
 
-    /// Loads a manifest from a static, compile-time-embedded TOML string
-    /// (typically `include_str!("edgezero.toml")` inside an adapter binary).
+    /// Loads a manifest from a static, in-process TOML string —
+    /// fixture data in tests, build-time compile-checks, and the
+    /// `app!` macro's compile-time consumption are the in-tree callers
+    /// post Stage 2. The Stage 2 rewrite removed the per-adapter
+    /// `run_app(include_str!("edgezero.toml"), …)` shape, so an adapter
+    /// binary no longer carries the manifest at runtime; the portable
+    /// store registry it would have extracted is baked into
+    /// `Hooks::stores()` by the macro instead.
     ///
     /// # Panics
-    /// Panics if `contents` is not valid TOML or fails validation. Because
-    /// `contents` is baked into the binary at build time, a parse/validation
-    /// failure means the binary itself is malformed — there is no runtime
-    /// recovery path, and surfacing the error as a panic with a clear
-    /// message is the correct behavior. Callers with a fallible input
-    /// source (file paths, network, user input) should use
-    /// [`ManifestLoader::try_load_from_str`] or [`ManifestLoader::from_path`].
+    /// Panics if `contents` is not valid TOML or fails validation.
+    /// Because `contents` is statically known to the caller (a
+    /// compile-time literal in the macro / tests), a parse failure
+    /// indicates corruption that can't be recovered at runtime, and
+    /// surfacing it as a clear panic is the right behaviour. Callers
+    /// with a fallible input source (file paths, network, user input)
+    /// should use [`ManifestLoader::try_load_from_str`] or
+    /// [`ManifestLoader::from_path`].
     #[expect(
         clippy::panic,
-        reason = "load_from_str only consumes binary-embedded manifests; \
-                  a parse error means the binary is corrupt and cannot recover"
+        reason = "load_from_str only consumes statically-known manifest \
+                  literals (macro/tests); a parse error means the caller's \
+                  static input is corrupt and cannot recover"
     )]
     #[must_use]
     #[inline]
