@@ -21,4 +21,10 @@ toml = { workspace = true }
 validator = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+# `edgezero-core` re-exports `AppConfig`; the derive tests assert
+# against the trait/types over the re-export path the way downstream
+# users will. Cargo allows dev-dep cycles (only the main dep edge
+# matters for build ordering).
+edgezero-core = { workspace = true }
 tempfile = { workspace = true }
+trybuild = { workspace = true }

@@ -11,6 +11,7 @@
 
 pub mod addr;
 pub mod app;
+pub mod app_config;
 pub mod body;
 pub mod compression;
 pub mod config_store;
@@ -31,4 +32,4 @@ pub mod router;
 pub mod secret_store;
 pub mod store_registry;
 
-pub use edgezero_macros::{action, app};
+pub use edgezero_macros::{action, app, AppConfig};
