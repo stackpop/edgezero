@@ -49,13 +49,108 @@
 
 ## Codebase facts this plan relies on
 
-- `edgezero-cli` is a binary-only crate today; `main.rs` holds private `handle_*` fns; `cli` feature gates `clap`.
-- `ConfigStore::get` is **synchronous** today (`config_store.rs`). `KvStore` is already async. `SecretStore` (`get_bytes`) is async, uses `bytes::Bytes`.
-- The KV handle type is `KvHandle`; config is `ConfigStoreHandle`; secrets is `SecretHandle`.
-- `RequestContext` exposes `config_store() -> Option<ConfigStoreHandle>`, `kv_handle() -> Option<KvHandle>`, `secret_handle() -> Option<SecretHandle>` — all singular.
-- Axum KV is `PersistentKvStore` (redb-backed, `.edgezero/kv.redb`).
-- `examples/app-demo` is a **separate workspace**, excluded from the root workspace; CI does not currently build or test it.
-- CI: `.github/workflows/test.yml` and `format.yml` plus the docs ESLint/Prettier job. The exact gate commands are the five below.
+(Reflects branch state after Stage 2 shipped on
+`feature/extensible-cli`. The pre-Stage-1 / pre-Stage-2 shape that
+earlier revisions of this plan referenced is gone — code below is the
+substrate Stage 3 builds on.)
+
+- `edgezero-cli` is a **library + binary**:
+  - `crates/edgezero-cli/src/lib.rs` is the public API; downstream
+    binaries depend on it. Each command is exposed as a
+    `(<Cmd>Args, run_<cmd>)` pair (`BuildArgs` / `run_build`, etc.).
+  - `*Args` structs derive `clap::Args` + `Default` and are
+    `#[non_exhaustive]`; live under `edgezero_cli::args`.
+  - The `edgezero` binary is a thin wrapper that delegates to those
+    `run_*` functions; the `cli` feature gates the binary build (deps
+    on `clap`).
+  - Adapter discovery is link-time via the `edgezero-adapter` registry;
+    `build.rs` reads `Cargo.toml` to figure out which optional
+    `edgezero-adapter-*` deps are enabled and emits
+    `linked_adapters.rs`.
+- `ConfigStore::get` is **async** (`#[async_trait(?Send)]`), with all
+  four adapter impls — `AxumConfigStore` (local-file backed),
+  `FastlyConfigStore`, `CloudflareConfigStore` (KV-namespace backed,
+  was `[vars]` JSON-string), `SpinConfigStore`. `KvStore` and
+  `SecretStore` are already async.
+- `KvError` carries `Unsupported { operation }` and
+  `LimitExceeded { message }` variants in addition to the legacy
+  `Internal` / `NotFound` / `Serialization` / `Unavailable` /
+  `Validation`. Both new variants map to 5xx-class `EdgeError`s.
+- Handle types remain `KvHandle` / `ConfigStoreHandle` / `SecretHandle`.
+  Stage 2 added `BoundKvStore = KvHandle` and
+  `BoundConfigStore = ConfigStoreHandle` aliases, plus a real
+  `BoundSecretStore { handle: SecretHandle, store_name: String }`
+  that captures the per-id platform store name (so the registry's
+  `EDGEZERO__STORES__SECRETS__<ID>__NAME` binding actually flows
+  through to lookups).
+- `StoreRegistry<H> { by_id: BTreeMap<String, H>, default_id: String }`
+  lives at `crates/edgezero-core/src/store_registry.rs` with
+  `KvRegistry` / `ConfigRegistry` / `SecretRegistry` aliases. `new`
+  panics in both debug and release when `default_id` is missing;
+  builders that skip failed-to-open backends use the safe
+  `from_parts(by_id, default_id) -> Option<Self>`.
+- `RequestContext` accessors are **id-keyed**:
+  `kv_store(id)` / `kv_store_default()`,
+  `config_store(id)` / `config_store_default()`,
+  `secret_store(id)` / `secret_store_default()`. The legacy singular
+  accessors stay around as fallbacks (`kv_handle()` / `config_handle()` /
+  `secret_handle()`) for code paths that don't wire a registry; the
+  id-keyed accessors prefer a wired registry and fall back to the
+  legacy handle wrapped under the conventional `"default"` id.
+- `Kv` / `Secrets` / `Config` extractors expose `.default()` /
+  `.named(id)` returning the matching `Bound*Store`. The legacy
+  destructure pattern (`Kv(store): Kv`) is gone.
+- The portable manifest model (`crates/edgezero-core/src/manifest.rs`):
+  - `[stores.<kind>]` carries only `ids` + `default`; pre-rewrite
+    fields (`name`, `enabled`, `[stores.<kind>.adapters.*]`,
+    `[stores.config.defaults]`) are a hard load error pointing at
+    `docs/guide/manifest-store-migration.md`.
+  - `[adapters.<name>]` retains `adapter` / `build` / `commands` /
+    `logging`; any other sub-table is a hard load error.
+    `[adapters.<name>.adapter]` declares `component` / `crate` / `host` /
+    `manifest` / `port`; any other field is a hard load error.
+  - `app!` macro bakes the portable store registry into
+    `Hooks::stores()` at compile time (no runtime manifest load).
+- `run_app::<A>()` takes **no `manifest_src`** on any adapter
+  (axum / fastly / cloudflare / spin). Adapter-specific runtime
+  config — bind host/port, store platform names, store tuning, log
+  level — comes from `EDGEZERO__*` env vars
+  (`crates/edgezero-core/src/env_config.rs`). The Stage 2 CLI
+  translates `[adapters.<name>.adapter] host`/`port` into
+  `EDGEZERO__ADAPTER__HOST/PORT` on the subprocess env (with the
+  documented precedence parent env > manifest `[environment.variables]`
+  > `[adapters.<name>.adapter]` bind hint).
+- Axum KV is `PersistentKvStore` (redb-backed). Each declared
+  `[stores.kv]` id resolves to its own file: the default id keeps
+  `.edgezero/kv.redb`; other ids get `.edgezero/kv-<slug>-<hash>.redb`
+  where the file name is derived from the platform name from
+  `EDGEZERO__STORES__KV__<ID>__NAME` (or the id default).
+- Axum config is `AxumConfigStore::from_local_file(id)` reading
+  `.edgezero/local-config-<id>.json` per declared id (a flat
+  `string -> string` JSON object). Missing file → empty store
+  (permissive); malformed → `ConfigStoreError::Unavailable` and the
+  id is dropped from the registry with a warn log. `config push`
+  (Stage 7) will write that file; Stage 3 / typed app config feed
+  into the same path.
+- Axum secrets is `EnvSecretStore` (env-var lookup). `Single` for
+  secrets, so every declared id maps to the same env-backed store.
+- Spin KV is `SpinKvStore` (`max_list_keys` cap honored;
+  `put_bytes_with_ttl` returns `KvError::Unsupported`; listing past
+  the cap returns `KvError::LimitExceeded`). Spin config is
+  `SpinConfigStore` (single flat-variable store; `.`→`__` key
+  translation). Spin secrets is `SpinSecretStore` (single flat-
+  variable store).
+- Cloudflare config is **KV-namespace backed**, not `[vars]`
+  JSON-string — `CloudflareConfigStore::from_env(&worker::Env, binding_name)`
+  opens a KV namespace and `get(key)` is async.
+- `examples/app-demo` is a **separate workspace**, excluded from the
+  root workspace; CI does not currently build or test it. The opt-in
+  `cargo test -p edgezero-cli --test generated_project_builds -- --ignored`
+  scaffolds a new workspace from the templates and runs `cargo check`
+  on it — Stage 3's generator-template changes must keep that test
+  green.
+- CI: `.github/workflows/test.yml` and `format.yml` plus the docs
+  ESLint/Prettier job. The exact gate commands are the five below.
 
 ## The full gate
 
