@@ -511,7 +511,7 @@ Spec §9, §6.7, §6.8, §6.10.
 
 - Create: `crates/edgezero-core/src/app_config.rs`; Modify: `crates/edgezero-core/src/lib.rs`
 
-- [ ] **Step 1: Write failing tests:** valid `<name>.toml` loads; missing file, bad TOML, missing `[config]` table, validator failure each produce a distinct `AppConfigError`.
+- [ ] **Step 1: Write failing tests:** valid `<name>.toml` loads; missing file, bad TOML, validator failure each produce a distinct `AppConfigError`.
 
 - [ ] **Step 2: Run** — FAIL.
 
@@ -523,7 +523,7 @@ Spec §9, §6.7, §6.8, §6.10.
   - `load_app_config_raw(path, app_name) -> Result<toml::Value, AppConfigError>` — overlay on.
   - `load_app_config_raw_with_options(path, app_name, opts: &AppConfigLoadOptions) -> Result<toml::Value, AppConfigError>`.
 
-  The simple functions delegate to the `_with_options` form with `AppConfigLoadOptions::default()`. `--no-env` (Tasks 4.1 / 7.1) calls the `_with_options` variant with `env_overlay: false`. `load_app_config*` parses the `[config]` table, applies the env overlay when `opts.env_overlay`, then (typed) deserializes + `validate()`. `pub mod app_config;` in `lib.rs`.
+  The simple functions delegate to the `_with_options` form with `AppConfigLoadOptions::default()`. `--no-env` (Tasks 4.1 / 7.1) calls the `_with_options` variant with `env_overlay: false`. `load_app_config*` parses the file's top-level table, applies the env overlay when `opts.env_overlay`, then (typed) deserializes + `validate()`. `pub mod app_config;` in `lib.rs`.
 
 - [ ] **Step 4: Run** — PASS.
 
@@ -564,7 +564,7 @@ Task 3.4 / 3.5.)
 
 - [ ] **Step 2: Run** — FAIL.
 
-- [ ] **Step 3: Implement** per §6.10: walk the parsed `[config]` tree; for each existing key compute `<APP_NAME>__<SECTION>__…__<KEY>` (uppercase, `-`→`_`, `__` separators); look up the env var; coerce to the existing value's type; reject ambiguous sibling mappings.
+- [ ] **Step 3: Implement** per §6.10: walk the parsed root table; for each existing key compute `<APP_NAME>__<SECTION>__…__<KEY>` (uppercase, `-`→`_`, `__` separators); look up the env var; coerce to the existing value's type; reject ambiguous sibling mappings.
 
 - [ ] **Step 4: Run** — PASS.
 
@@ -585,7 +585,7 @@ Task 3.4 / 3.5.)
 
   Insert the result under the context key `NameUpperCamel`. Add a unit test covering: `my-app` → `MyApp`; `foo` → `Foo`; `a_b-c` → `ABC`; `_foo` → `Foo` (empty leading segment dropped); `123-app` → `App123App` (digit-leading → `App` prefix). This key lands here in stage 3 because `config.rs.hbs` is its first consumer; stage 8's `templates/cli/` reuses it.
 
-- [ ] **Step 2:** `app/<name>.toml.hbs` — a `[config]` table with `greeting` and a nested `[config.service]` section. `core/src/config.rs.hbs` — `{{NameUpperCamel}}Config` with `#[derive(serde::Deserialize, serde::Serialize, validator::Validate, edgezero_core::AppConfig)]` + `#[serde(deny_unknown_fields)]`, a `greeting` field, a nested `service` field, **one plain `#[secret]` field**, and a commented-out `#[secret(store_ref)]` example (§6.8 — the generated template does not include `store_ref` live).
+- [ ] **Step 2:** `app/<name>.toml.hbs` — top-level keys (`greeting`, `api_token`, etc.) and a nested `[service]` table; no `[config]` wrapper. `core/src/config.rs.hbs` — `{{NameUpperCamel}}Config` with `#[derive(serde::Deserialize, serde::Serialize, validator::Validate, edgezero_core::AppConfig)]` + `#[serde(deny_unknown_fields)]`, a `greeting` field, a nested `service: ServiceConfig` field carrying `#[validate(nested)]`, **one plain `#[secret]` field**, and a commented-out `#[secret(store_ref)]` example (§6.8 — the generated template does not include `store_ref` live).
 
 - [ ] **Step 3: Update `templates/core/Cargo.toml.hbs` deps + the workspace-dep seed.** The generated config struct needs `validator` (for `#[derive(Validate)]` / `#[validate(...)]`) and `serde` with the `derive` feature. The `AppConfig` derive comes via the `edgezero-core` re-export (Task 3.2) — the core template already depends on `edgezero-core`, so **no `edgezero-macros` dependency is added**. Add `validator = { workspace = true }` to `templates/core/Cargo.toml.hbs` (it currently lacks it); confirm `serde` is present with `features = ["derive"]`. Because the generated project is itself a workspace, a `workspace = true` dep only resolves if the generated **root** `Cargo.toml` lists it: add `validator` to the generator's workspace-dependency seed (the `seed_workspace_dependencies` function / data in `generator.rs` — confirm the exact name by reading the file; it seeds the generated root `[workspace.dependencies]` and does **not** include `validator` today). Match whatever version-pin the seed already uses for `serde` etc.
 
@@ -602,7 +602,7 @@ Task 3.4 / 3.5.)
 - Create: `examples/app-demo/app-demo.toml`, `examples/app-demo/crates/app-demo-core/src/config.rs`
 - Modify: `examples/app-demo/crates/app-demo-core/src/lib.rs`, `examples/app-demo/crates/app-demo-core/Cargo.toml` (verify deps), `docs/guide/configuration.md`, `getting-started.md`
 
-- [ ] **Step 1:** Write `app-demo.toml` — `[config]` with `greeting`, a `[config.feature]` sub-table containing `new_checkout` (mirrors the dotted config-store key `feature.new_checkout` the handler reads, and the per-adapter `feature__new_checkout` Spin seed), a `[config.service]` with `timeout_ms`, `api_token` (a `#[secret]` value), `vault` (a `#[secret(store_ref)]` value = the single secrets id). Write `app-demo-core/src/config.rs` — `AppDemoConfig` with the §6.8 shape (nested `FeatureConfig` + `ServiceConfig` carrying `#[validate(nested)]`, one `#[secret]`, one `#[secret(store_ref)]`), deriving `serde::{Deserialize, Serialize}`, `validator::Validate`, `edgezero_core::AppConfig`. Export it from `lib.rs`. **Verify `app-demo-core/Cargo.toml` deps:** it must have `edgezero-core` (for the `AppConfig` re-export), `validator`, and `serde` with `derive`. `app-demo-core` already depends on all three today — confirm and add any that are somehow missing. No `edgezero-macros` dependency is needed (macro comes via the `edgezero-core` re-export, Task 3.2).
+- [ ] **Step 1:** Write `app-demo.toml` — top-level `greeting`, `api_token` (a `#[secret]` value), `vault` (a `#[secret(store_ref)]` value = the single secrets id); a `[feature]` sub-table containing `new_checkout` (mirrors the dotted config-store key `feature.new_checkout` the handler reads, and the per-adapter `feature__new_checkout` Spin seed); a `[service]` table with `timeout_ms`. No `[config]` wrapper. Write `app-demo-core/src/config.rs` — `AppDemoConfig` with the §6.8 shape (nested `FeatureConfig` + `ServiceConfig` carrying `#[validate(nested)]`, one `#[secret]`, one `#[secret(store_ref)]`), deriving `serde::{Deserialize, Serialize}`, `validator::Validate`, `edgezero_core::AppConfig`. Export it from `lib.rs`. **Verify `app-demo-core/Cargo.toml` deps:** it must have `edgezero-core` (for the `AppConfig` re-export), `validator`, and `serde` with `derive`. `app-demo-core` already depends on all three today — confirm and add any that are somehow missing. No `edgezero-macros` dependency is needed (macro comes via the `edgezero-core` re-export, Task 3.2).
 
 - [ ] **Step 2: Write a round-trip test** in `app-demo-core`: `load_app_config::<AppDemoConfig>` against `app-demo.toml` succeeds; `AppDemoConfig::SECRET_FIELDS` has the expected two entries; an env var overrides the nested value.
 
@@ -623,7 +623,7 @@ Spec §10. New: `ConfigValidateArgs`, `run_config_validate`, `run_config_validat
 - Modify: `crates/edgezero-cli/src/args.rs` (add `ConfigValidateArgs` + a `ConfigCmd` subcommand enum), `crates/edgezero-cli/src/lib.rs`
 - Create: `crates/edgezero-cli/src/config.rs`
 
-- [ ] **Step 1: Write failing tests** with fixtures for each failure mode (§10): valid passes; bad TOML; missing `[config]`; unknown field (struct with `deny_unknown_fields`); type mismatch; validator-rule failure; empty `#[secret]`; `#[secret(store_ref)]` value not in `[stores.secrets].ids`; missing per-adapter mapping; the three Spin checks (key syntax, collision — typed-only, component discovery).
+- [ ] **Step 1: Write failing tests** with fixtures for each failure mode (§10): valid passes; bad TOML; unknown field (struct with `deny_unknown_fields`); type mismatch; validator-rule failure; empty `#[secret]`; `#[secret(store_ref)]` value not in `[stores.secrets].ids`; missing per-adapter mapping; the three Spin checks (key syntax, collision — typed-only, component discovery).
 
 - [ ] **Step 2: Run** — FAIL.
 

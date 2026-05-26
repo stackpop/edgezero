@@ -1,9 +1,10 @@
 //! Typed application config, loaded from `{{name}}.toml` via
 //! `edgezero_core::app_config::load_app_config::<{{NameUpperCamel}}Config>`.
 //!
-//! Add fields here and mirror them in `{{name}}.toml`. The
-//! `{{name}}__<SECTION>__…__<KEY>` env-var overlay (uppercase,
-//! `-`→`_`) overrides any key already present in the file.
+//! The TOML file maps directly onto this struct — there is no
+//! `[config]` wrapper; top-level keys correspond to top-level
+//! fields. The `{{name}}__<SECTION>__…__<KEY>` env-var overlay
+//! (uppercase, `-`→`_`) overrides any key already present.
 
 #![expect(
     clippy::module_name_repetitions,

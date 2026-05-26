@@ -246,16 +246,15 @@ pub struct ServiceConfig {
 
 ```toml
 # my-app.toml — loaded into MyAppConfig
-[config]
 greeting = "hello from my-app"
 api_token = "demo_api_token"   # key into the default secret store
 
-[config.service]
+[service]
 timeout_ms = 1500
 ```
 
-The loader reads only the `[config]` table; sibling tables are
-ignored. `deny_unknown_fields` makes typos in the TOML a hard load
+The file's top-level table maps 1:1 to the struct — no `[config]`
+wrapper. `deny_unknown_fields` makes typos in the TOML a hard load
 error rather than a silent drop.
 
 ### Loading the config
@@ -301,13 +300,13 @@ let value = ctx
 
 ### Environment-variable overlay
 
-Every key in `[config]` can be overridden at runtime by an env var
-named `<APP_NAME>__<SECTION>__…__<KEY>` (uppercase, with `-` in the
-app name replaced by `_`, segments joined by a double-underscore).
-The overlay only applies to keys **already present in the file** — it
-can't introduce new ones — and the existing TOML value's type drives
-how the env string is coerced (`"true"` / `"false"` for `bool`,
-parsed integers for numeric fields, etc.).
+Every key in `<name>.toml` can be overridden at runtime by an env
+var named `<APP_NAME>__<SECTION>__…__<KEY>` (uppercase, with `-` in
+the app name replaced by `_`, segments joined by a double-underscore).
+The overlay only applies to keys **already present in the file** —
+it can't introduce new ones — and the existing TOML value's type
+drives how the env string is coerced (`"true"` / `"false"` for
+`bool`, parsed integers for numeric fields, etc.).
 
 ```sh
 # Override the nested service.timeout_ms key:
