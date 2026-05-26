@@ -57,6 +57,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use web_time::Instant;
 
 use crate::error::EdgeError;
 
@@ -415,7 +416,12 @@ impl KvHandle {
     #[inline]
     pub async fn delete(&self, key: &str) -> Result<(), KvError> {
         Self::validate_key(key)?;
-        self.store.delete(key).await
+        let started_at = Self::kv_timing_start();
+        let result = self.store.delete(key).await;
+        Self::kv_timing_log(started_at, "delete", &result, || {
+            format!("key_len={}", key.len())
+        });
+        result
     }
 
     fn encode_list_cursor(prefix: &str, cursor: Option<String>) -> Result<Option<String>, KvError> {
@@ -437,7 +443,16 @@ impl KvHandle {
     #[inline]
     pub async fn exists(&self, key: &str) -> Result<bool, KvError> {
         Self::validate_key(key)?;
-        self.store.exists(key).await
+        let started_at = Self::kv_timing_start();
+        let result = self.store.exists(key).await;
+        Self::kv_timing_log(started_at, "exists", &result, || {
+            let exists = result
+                .as_ref()
+                .map(bool::to_string)
+                .unwrap_or_else(|_err| "unknown".to_owned());
+            format!("key_len={} exists={exists}", key.len())
+        });
+        result
     }
 
     /// Get a value by key, deserializing from JSON.
@@ -449,7 +464,13 @@ impl KvHandle {
     #[inline]
     pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, KvError> {
         Self::validate_key(key)?;
-        match self.store.get_bytes(key).await? {
+        let started_at = Self::kv_timing_start();
+        let result = self.store.get_bytes(key).await;
+        Self::kv_timing_log(started_at, "get", &result, || {
+            format!("key_len={} {}", key.len(), Self::kv_hit_metadata(&result))
+        });
+
+        match result? {
             Some(bytes) => {
                 let val = serde_json::from_slice(&bytes)?;
                 Ok(Some(val))
@@ -465,7 +486,12 @@ impl KvHandle {
     #[inline]
     pub async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         Self::validate_key(key)?;
-        self.store.get_bytes(key).await
+        let started_at = Self::kv_timing_start();
+        let result = self.store.get_bytes(key).await;
+        Self::kv_timing_log(started_at, "get_bytes", &result, || {
+            format!("key_len={} {}", key.len(), Self::kv_hit_metadata(&result))
+        });
+        result
     }
 
     /// Get a value by key, returning `default` if the key does not exist.
@@ -475,6 +501,46 @@ impl KvHandle {
     #[inline]
     pub async fn get_or<T: DeserializeOwned>(&self, key: &str, default: T) -> Result<T, KvError> {
         Ok(self.get(key).await?.unwrap_or(default))
+    }
+
+    fn kv_hit_metadata(result: &Result<Option<Bytes>, KvError>) -> String {
+        match result.as_ref() {
+            Ok(Some(bytes)) => format!("hit=true bytes={}", bytes.len()),
+            Ok(None) => "hit=false bytes=0".to_owned(),
+            Err(_err) => "hit=unknown bytes=unknown".to_owned(),
+        }
+    }
+
+    fn kv_timing_log<ResultValue, Metadata>(
+        started_at: Option<Instant>,
+        operation: &str,
+        result: &Result<ResultValue, KvError>,
+        metadata: Metadata,
+    ) where
+        Metadata: FnOnce() -> String,
+    {
+        if let Some(started_at) = started_at {
+            let status = if result.is_ok() { "ok" } else { "error" };
+            log::debug!(
+                "kv operation={operation} elapsed_ms={} status={status} {}",
+                started_at.elapsed().as_millis(),
+                metadata()
+            );
+        }
+    }
+
+    fn kv_timing_start() -> Option<Instant> {
+        log::log_enabled!(log::Level::Debug).then(Instant::now)
+    }
+
+    fn kv_write_metadata(key_len: usize, bytes_len: usize, ttl: Option<Duration>) -> String {
+        match ttl {
+            Some(ttl) => format!(
+                "key_len={key_len} bytes={bytes_len} ttl_secs={}",
+                ttl.as_secs()
+            ),
+            None => format!("key_len={key_len} bytes={bytes_len}"),
+        }
     }
 
     /// List keys in a bounded, paginated fashion.
@@ -496,10 +562,28 @@ impl KvHandle {
         Self::validate_prefix(prefix)?;
         Self::validate_list_limit(limit)?;
         let decoded_cursor = Self::decode_list_cursor(prefix, cursor)?;
-        let page = self
+        let started_at = Self::kv_timing_start();
+        let result = self
             .store
             .list_keys_page(prefix, decoded_cursor.as_deref(), limit)
-            .await?;
+            .await;
+        Self::kv_timing_log(started_at, "list_keys_page", &result, || {
+            let (count, next_cursor) = result
+                .as_ref()
+                .map(|page| {
+                    (
+                        page.keys.len().to_string(),
+                        page.cursor.is_some().to_string(),
+                    )
+                })
+                .unwrap_or_else(|_err| ("unknown".to_owned(), "unknown".to_owned()));
+            format!(
+                "prefix_len={} cursor_present={} limit={limit} count={count} next_cursor_present={next_cursor}",
+                prefix.len(),
+                cursor.is_some()
+            )
+        });
+        let page = result?;
 
         Ok(KvPage {
             cursor: Self::encode_list_cursor(prefix, page.cursor)?,
@@ -522,7 +606,13 @@ impl KvHandle {
         Self::validate_key(key)?;
         let bytes = serde_json::to_vec(value)?;
         Self::validate_value(&bytes)?;
-        self.store.put_bytes(key, Bytes::from(bytes)).await
+        let bytes_len = bytes.len();
+        let started_at = Self::kv_timing_start();
+        let result = self.store.put_bytes(key, Bytes::from(bytes)).await;
+        Self::kv_timing_log(started_at, "put", &result, || {
+            Self::kv_write_metadata(key.len(), bytes_len, None)
+        });
+        result
     }
 
     /// Put raw bytes for a key.
@@ -533,7 +623,13 @@ impl KvHandle {
     pub async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         Self::validate_key(key)?;
         Self::validate_value(&value)?;
-        self.store.put_bytes(key, value).await
+        let bytes_len = value.len();
+        let started_at = Self::kv_timing_start();
+        let result = self.store.put_bytes(key, value).await;
+        Self::kv_timing_log(started_at, "put_bytes", &result, || {
+            Self::kv_write_metadata(key.len(), bytes_len, None)
+        });
+        result
     }
 
     /// Put raw bytes with a TTL.
@@ -550,7 +646,13 @@ impl KvHandle {
         Self::validate_key(key)?;
         Self::validate_ttl(ttl)?;
         Self::validate_value(&value)?;
-        self.store.put_bytes_with_ttl(key, value, ttl).await
+        let bytes_len = value.len();
+        let started_at = Self::kv_timing_start();
+        let result = self.store.put_bytes_with_ttl(key, value, ttl).await;
+        Self::kv_timing_log(started_at, "put_bytes_with_ttl", &result, || {
+            Self::kv_write_metadata(key.len(), bytes_len, Some(ttl))
+        });
+        result
     }
 
     /// Put a value with a TTL, serializing it to JSON.
@@ -568,9 +670,16 @@ impl KvHandle {
         Self::validate_ttl(ttl)?;
         let bytes = serde_json::to_vec(value)?;
         Self::validate_value(&bytes)?;
-        self.store
+        let bytes_len = bytes.len();
+        let started_at = Self::kv_timing_start();
+        let result = self
+            .store
             .put_bytes_with_ttl(key, Bytes::from(bytes), ttl)
-            .await
+            .await;
+        Self::kv_timing_log(started_at, "put_with_ttl", &result, || {
+            Self::kv_write_metadata(key.len(), bytes_len, Some(ttl))
+        });
+        result
     }
 
     /// Read-modify-write: get the current value (or `default`),
