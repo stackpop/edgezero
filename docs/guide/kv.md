@@ -88,6 +88,12 @@ For strict correctness, use a transactional data store.
 
 Key listing is paginated by design. This avoids buffering an unbounded number of keys in memory and matches the underlying provider APIs. The Spin adapter returns `KvError::Validation` for key listing because Spin's current `Store::get_keys()` API is unbounded.
 
+## Operation Timing / Observability
+
+`KvHandle` emits debug-level timing logs for backend KV operations across all adapters. Logs include safe metadata such as operation name, elapsed milliseconds, success/error status, key or prefix length, hit/miss, byte counts, TTL seconds, and list page counts.
+
+Raw keys, prefixes, cursors, and values are never logged. Typed helper timings measure only the backend call after validation/serialization and before JSON deserialization. `read_modify_write` performs separate read and write calls, so it emits separate operation logs.
+
 ## Platform Specifics
 
 ### Local Development
