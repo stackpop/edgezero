@@ -248,6 +248,12 @@ fn enforce_no_disallowed_serde_attrs(field: &Field) -> Result<(), syn::Error> {
                     "skip" => Some("skip"),
                     "skip_deserializing" => Some("skip_deserializing"),
                     "skip_serializing" => Some("skip_serializing"),
+                    // `skip_serializing_if = "..."` also omits the
+                    // field from round-trips (config push reads
+                    // SECRET_FIELDS, then serialises the typed
+                    // struct), so reject it alongside the
+                    // unconditional skip family.
+                    "skip_serializing_if" => Some("skip_serializing_if"),
                     _ => offending,
                 };
             }
