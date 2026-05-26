@@ -38,6 +38,7 @@ edgezero-adapter-cloudflare = { path = "crates/edgezero-adapter-cloudflare", def
 edgezero-adapter-fastly = { path = "crates/edgezero-adapter-fastly", default-features = false }
 edgezero-adapter-spin = { path = "crates/edgezero-adapter-spin", default-features = false }
 edgezero-core = { path = "crates/edgezero-core", default-features = false }
+edgezero-cli = { path = "crates/edgezero-cli", default-features = false }
 fastly = "0.12"
 fern = "0.7"
 flate2 = { version = "1", features = ["rust_backend"] }
