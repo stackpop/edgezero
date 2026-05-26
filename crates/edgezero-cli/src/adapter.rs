@@ -164,15 +164,18 @@ fn run_shell(
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(&full_command).current_dir(cwd);
 
-    if let Some(env) = environment {
-        apply_environment(adapter_name, &env, &mut cmd)?;
-    }
-
-    // Propagate manifest `[adapters.<name>.adapter] host`/`port` to the
-    // subprocess as `EDGEZERO__ADAPTER__HOST/PORT` so the runtime — which
-    // reads only the Stage 2 canonical names — actually sees them.
-    // Parent-env overrides win: if the user already set the canonical
-    // variable, leave it alone.
+    // Precedence (high to low) for `EDGEZERO__ADAPTER__HOST/PORT` on the
+    // subprocess:
+    //   1. Parent env — propagated through std::process::Command's default
+    //      inheritance unless we explicitly `cmd.env()` over it.
+    //   2. Manifest `[environment.variables].<EDGEZERO__ADAPTER__...>` —
+    //      `apply_environment` writes the explicit per-adapter value.
+    //   3. Manifest `[adapters.<name>.adapter] host`/`port` — adapter-
+    //      specific bind hint.
+    // We inject the bind hint FIRST so `apply_environment` (manifest
+    // variable) can overwrite it, then skip the bind injection entirely
+    // when the parent env already has the canonical variable so the
+    // user's CLI-invocation override wins over everything.
     let (manifest_host, manifest_port) = adapter_bind;
     if let Some(host) = manifest_host {
         if env::var_os("EDGEZERO__ADAPTER__HOST").is_none() {
@@ -183,6 +186,10 @@ fn run_shell(
         if env::var_os("EDGEZERO__ADAPTER__PORT").is_none() {
             cmd.env("EDGEZERO__ADAPTER__PORT", port.to_string());
         }
+    }
+
+    if let Some(env) = environment {
+        apply_environment(adapter_name, &env, &mut cmd)?;
     }
 
     let status = cmd

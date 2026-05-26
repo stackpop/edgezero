@@ -372,7 +372,15 @@ pub struct ManifestAdapter {
 
 #[derive(Debug, Default, Deserialize, Validate)]
 #[non_exhaustive]
+#[validate(schema(function = "validate_manifest_adapter_definition"))]
 pub struct ManifestAdapterDefinition {
+    /// Spin component id, when the adapter's `manifest` (`spin.toml`) declares
+    /// more than one `[component.*]`. Read by `provision` (Stage 6) and
+    /// `config push` (Stage 7); ignored at runtime. `config validate --strict`
+    /// requires it when `spin.toml` declares multiple components.
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub component: Option<String>,
     #[serde(rename = "crate")]
     #[serde(default)]
     #[validate(length(min = 1_u64))]
@@ -385,6 +393,12 @@ pub struct ManifestAdapterDefinition {
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub host: Option<String>,
+    /// Catch-all for any field other than the declared ones above. The
+    /// portable manifest has no per-adapter runtime tuning surface, so an
+    /// unknown key under `[adapters.<name>.adapter]` is rejected at load
+    /// time rather than silently ignored.
+    #[serde(flatten)]
+    pub legacy: BTreeMap<String, toml::Value>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub manifest: Option<String>,
@@ -718,6 +732,33 @@ fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
         Some(parent) => parent.to_path_buf(),
         None => cwd.to_path_buf(),
     }
+}
+
+/// Validates a single `[adapters.<name>.adapter]` block. The portable
+/// manifest model lists the declared fields explicitly; an unknown key
+/// would otherwise be silently dropped by serde, so we surface it as a
+/// hard load error with the migration-guide pointer (consistent with the
+/// hard-cutoff on `[stores.<kind>]` and `[adapters.<name>.<sub>]`).
+fn validate_manifest_adapter_definition(
+    definition: &ManifestAdapterDefinition,
+) -> Result<(), ValidationError> {
+    if !definition.legacy.is_empty() {
+        let mut keys = definition.legacy.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let mut error = ValidationError::new("legacy_adapter_definition_schema");
+        error.message = Some(
+            format!(
+                "unknown field(s) under `[adapters.<name>.adapter]`: {}. The portable \
+                 manifest has no per-adapter runtime tuning surface beyond \
+                 `component`, `crate`, `host`, `manifest`, `port` -- see \
+                 docs/guide/manifest-store-migration.md",
+                keys.join(", ")
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Validates a single `[adapters.<name>]` block. The portable manifest model
@@ -1665,5 +1706,50 @@ crate = "crates/axum-adapter"
         let adapter = &manifest_data.adapters["axum"];
         assert!(adapter.adapter.host.is_none());
         assert!(adapter.adapter.port.is_none());
+    }
+
+    #[test]
+    fn adapter_definition_accepts_spin_component_field() {
+        // `component` is the Spin component id used by `provision` (Stage 6)
+        // and `config push` (Stage 7) when `spin.toml` declares multiple
+        // `[component.*]`. Documented in docs/guide/adapters/spin.md and
+        // must round-trip through the manifest model now even though the
+        // runtime ignores it.
+        let manifest = r#"
+[adapters.spin.adapter]
+crate = "crates/my-app-adapter-spin"
+manifest = "crates/my-app-adapter-spin/spin.toml"
+component = "my-app"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let manifest_data = loader.manifest();
+        let adapter = &manifest_data.adapters["spin"];
+        assert_eq!(adapter.adapter.component.as_deref(), Some("my-app"));
+    }
+
+    #[test]
+    fn adapter_definition_rejects_unknown_field_with_migration_pointer() {
+        // Hard cutoff: the portable manifest enumerates the per-adapter
+        // tuning surface explicitly. Anything else (e.g. a stale
+        // pre-rewrite `runtime` knob, or a typo'd `compnent`) is a load
+        // error rather than a silent drop.
+        let manifest = r#"
+[adapters.axum.adapter]
+crate = "crates/axum-adapter"
+runtime_threads = 4
+"#;
+        let err = ManifestLoader::try_load_from_str(manifest)
+            .err()
+            .expect("unknown adapter-definition field must fail to load");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("runtime_threads"),
+            "error should name the offending field, got: {msg}"
+        );
+        assert!(
+            msg.contains("docs/guide/manifest-store-migration.md"),
+            "error should reference the migration guide, got: {msg}"
+        );
     }
 }
