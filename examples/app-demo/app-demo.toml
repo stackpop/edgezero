@@ -9,16 +9,23 @@
 # as long as the key already exists below.
 
 [config]
-greeting = "hello from app-demo"
-feature_new_checkout = false
 # `api_token` is the *key* inside the resolved default secret store
 # (see `[stores.secrets]` in `edgezero.toml`). The handler resolves it
 # via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
 api_token = "demo_api_token"
+greeting = "hello from app-demo"
 # `vault` is a `#[secret(store_ref)]` value — the logical id of a
 # secret store declared in `[stores.secrets].ids`. The app-demo
 # manifest declares a single id, `"default"`.
 vault = "default"
+
+# Nested so `config push` writes the dotted key
+# `feature.new_checkout` — matching the handler that reads
+# `feature.new_checkout` from the config store and the per-adapter
+# seeds in `fastly.toml`/`spin.toml` (translated to
+# `feature__new_checkout` on Spin's flat namespace).
+[config.feature]
+new_checkout = false
 
 [config.service]
 timeout_ms = 1500

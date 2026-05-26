@@ -22,10 +22,12 @@ pub struct AppDemoConfig {
     #[secret]
     pub api_token: String,
 
-    /// Toggles the (hypothetical) new-checkout code path. Exercises a
-    /// non-string scalar through the env-var overlay
-    /// (`app_demo__FEATURE_NEW_CHECKOUT=true`).
-    pub feature_new_checkout: bool,
+    /// Feature-flag sub-table. Nested so `config push` writes the
+    /// dotted key `feature.new_checkout` (translated to
+    /// `feature__new_checkout` on Spin) — matching the existing
+    /// handler that reads `feature.new_checkout` from the config
+    /// store and the per-adapter seeds in `fastly.toml`/`spin.toml`.
+    pub feature: FeatureConfig,
 
     /// Free-form greeting surfaced by example handlers.
     pub greeting: String,
@@ -41,6 +43,15 @@ pub struct AppDemoConfig {
     /// value here — `config validate` enforces this.
     #[secret(store_ref)]
     pub vault: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct FeatureConfig {
+    /// Toggles the (hypothetical) new-checkout code path. Exercises a
+    /// non-string scalar through the env-var overlay
+    /// (`app_demo__FEATURE__NEW_CHECKOUT=true`).
+    pub new_checkout: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate)]
@@ -93,7 +104,7 @@ mod tests {
             .expect("load AppDemoConfig from app-demo.toml");
 
         assert_eq!(cfg.greeting, "hello from app-demo");
-        assert!(!cfg.feature_new_checkout);
+        assert!(!cfg.feature.new_checkout);
         assert_eq!(cfg.api_token, "demo_api_token");
         assert_eq!(cfg.vault, "default");
         assert_eq!(cfg.service.timeout_ms, 1500);
