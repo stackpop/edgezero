@@ -289,6 +289,14 @@ fn spin_config_secret_collision(
         }
     }
     for field in secret_fields {
+        // Spec §6.7 check 2: the collision set is {flattened config
+        // keys} ∪ {plain `#[secret]` values}. `#[secret(store_ref)]`
+        // values are *logical store ids* resolved at runtime — they
+        // never enter Spin's flat variable namespace and so cannot
+        // collide. Skip them.
+        if !matches!(field.kind, SecretKind::KeyInDefault) {
+            continue;
+        }
         let Some(value) = raw_table.get(field.name).and_then(Value::as_str) else {
             continue; // typed_secret_checks would have surfaced the absence already
         };
@@ -361,21 +369,13 @@ fn spin_component_discovery(manifest: &Manifest, manifest_path: &Path) -> Result
         ));
     }
 
-    if component_ids.len() == 1 {
-        return Ok(());
-    }
-
-    // Multiple components — require an explicit selector and that it
-    // matches one of them.
-    let Some(selector) = &spin.adapter.component else {
-        return Err(format!(
-            "{} declares {} components ({}) but [adapters.spin.adapter].component is unset; set one explicitly",
-            spin_path.display(),
-            component_ids.len(),
-            component_ids.join(", ")
-        ));
-    };
-    if !component_ids.iter().any(|id| id == selector) {
+    // An explicit selector must always name a declared component, even
+    // when there is exactly one — a typo would otherwise silently pass
+    // here and only blow up later in `config push` / `provision`.
+    if let Some(selector) = &spin.adapter.component {
+        if component_ids.iter().any(|id| id == selector) {
+            return Ok(());
+        }
         return Err(format!(
             "[adapters.spin.adapter].component = {:?} is not declared in {} (available: {})",
             selector,
@@ -383,7 +383,18 @@ fn spin_component_discovery(manifest: &Manifest, manifest_path: &Path) -> Result
             component_ids.join(", ")
         ));
     }
-    Ok(())
+
+    // No selector — auto-select only when there is exactly one
+    // component; otherwise force the user to pick.
+    if component_ids.len() == 1 {
+        return Ok(());
+    }
+    Err(format!(
+        "{} declares {} components ({}) but [adapters.spin.adapter].component is unset; set one explicitly",
+        spin_path.display(),
+        component_ids.len(),
+        component_ids.join(", ")
+    ))
 }
 
 fn collect_spin_component_ids(parsed: &Value) -> Vec<String> {
@@ -865,6 +876,48 @@ source = "b.wasm"
     }
 
     #[test]
+    fn spin_component_discovery_rejects_bad_selector_against_single_component() {
+        // Regression: a typo in `[adapters.spin.adapter].component`
+        // used to pass when `spin.toml` declared exactly one
+        // component because the auto-select path returned early
+        // before checking the selector. A wrong id must fail here so
+        // it doesn't blow up later in `config push` / `provision`.
+        let spin_toml = r#"
+spin_manifest_version = 2
+[application]
+name = "demo-app"
+version = "0.1.0"
+[component.actual]
+source = "a.wasm"
+"#;
+        let manifest_str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+component = "typo"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
+        write_spin_toml(dir.path(), spin_toml);
+        let err = run_config_validate(&args_for(&manifest))
+            .expect_err("typo'd selector against single component must error");
+        assert!(
+            err.contains("typo") && err.contains("actual"),
+            "error names both the bad selector and the available id: {err}"
+        );
+    }
+
+    #[test]
     fn spin_component_discovery_accepts_explicit_selector() {
         let spin_toml = r#"
 spin_manifest_version = 2
@@ -897,6 +950,81 @@ ids = ["default"]
         write_spin_toml(dir.path(), spin_toml);
         run_config_validate(&args_for(&manifest))
             .expect("explicit selector matching a declared component passes");
+    }
+
+    #[test]
+    fn spin_config_secret_collision_ignores_store_ref_values() {
+        // Regression: `#[secret(store_ref)]` values are logical
+        // store ids (resolved at runtime), not Spin variable names —
+        // they must not enter the Spin collision set. Earlier the
+        // walker treated every SECRET_FIELDS entry as a potential
+        // Spin var, so a perfectly valid `vault = "default"` plus a
+        // config key whose flattened name happened to be `default`
+        // would falsely trip a collision.
+        //
+        // We exercise the path the typed flow takes when a
+        // `store_ref` value coincides with a real config key. The
+        // raw flow already tolerated it; the typed flow used to
+        // reject and should now pass.
+
+        // Reuse the FixtureConfig shape but allow the extra `default`
+        // key via a dedicated struct — the regression is about the
+        // Spin walker, not about deserialisation. Items must precede
+        // the test-local `let` bindings (clippy::items_after_statements).
+        #[derive(Debug, Deserialize, Validate)]
+        #[expect(dead_code, reason = "fields are read by serde/validator only")]
+        struct StoreRefRegressionConfig {
+            api_token: String,
+            default: String,
+            #[validate(length(min = 1_u64))]
+            greeting: String,
+            #[validate(nested)]
+            service: FixtureServiceConfig,
+            vault: String,
+        }
+        impl AppConfigMeta for StoreRefRegressionConfig {
+            const SECRET_FIELDS: &'static [SecretField] = &[
+                SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    name: "api_token",
+                },
+                SecretField {
+                    kind: SecretKind::StoreRef,
+                    name: "vault",
+                },
+            ];
+        }
+
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let app_config = r#"
+[config]
+api_token = "demo_api_token"
+default = "shared-name"
+greeting = "hi"
+vault = "default"
+
+[config.service]
+timeout_ms = 1500
+"#;
+        let (dir, manifest_path, _) = setup_project(manifest, app_config);
+        write_spin_toml(dir.path(), VALID_SPIN_TOML);
+        run_config_validate_typed::<StoreRefRegressionConfig>(&args_for(&manifest_path))
+            .expect("store_ref value coinciding with a config key must not collide");
     }
 
     #[test]
