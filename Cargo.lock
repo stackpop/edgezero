@@ -733,6 +733,7 @@ dependencies = [
  "spin-sdk",
  "tempfile",
  "toml",
+ "toml_edit",
  "walkdir",
 ]
 

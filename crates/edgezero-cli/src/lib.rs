@@ -576,29 +576,33 @@ auth-status = "echo whoami"
     }
 
     #[test]
-    fn run_provision_spin_stub_reports_not_yet_implemented() {
-        // spin lands in a follow-up commit. Until then it
-        // explicitly Errs — better than silently pretending to
-        // provision. cloudflare's real impl ships in 6.2 and
-        // fastly's in 6.3 (each covered by its own dry-run
-        // dispatch test below).
+    fn run_provision_spin_dry_run_dispatches_to_adapter() {
+        // Real impl shipped in 6.4 — dry-run path doesn't edit
+        // spin.toml, so CI can exercise dispatch by writing a
+        // single-component spin.toml the resolver can locate.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        // spin's provision resolves spin.toml relative to the
+        // manifest root and walks `[component.*]` for the
+        // component selector — write a single-component manifest
+        // so resolution succeeds even though dry-run won't edit
+        // anything.
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
-        let err = run_provision(&args::ProvisionArgs {
+        run_provision(&args::ProvisionArgs {
             adapter: "spin".to_owned(),
-            dry_run: false,
+            dry_run: true,
             manifest: manifest_path.clone(),
         })
-        .expect_err("stub adapter must err");
-        assert!(
-            err.contains("not yet implemented"),
-            "spin stub should say `not yet implemented`: {err}"
-        );
+        .expect("spin dry-run dispatches cleanly");
     }
 
     #[test]

@@ -231,13 +231,13 @@ edgezero provision --adapter <name> [--manifest <path>] [--dry-run]
 | `axum`       | Local-only — prints one note per declared store id and exits 0 (KV in-memory; config in `.edgezero/local-config-<id>.json`).                                                                                            |
 | `cloudflare` | For each KV id + config id: shells out to `wrangler kv namespace create <id>`, parses the namespace id from stdout, appends `[[kv_namespaces]] binding = "<id>", id = "<extracted>"` to `wrangler.toml` (idempotent on the binding name; preserves existing entries and comments). Secrets are runtime-managed via `wrangler secret put` — no-op. |
 | `fastly`     | For each KV / config / secret id: shells out to `fastly <kind>-store create --name=<id>`, then appends `[setup.<kind>_stores.<id>]` and `[local_server.<kind>_stores.<id>]` tables to `fastly.toml`. Idempotent: if the setup table is already present the id is skipped (no shell-out, no edit). Store IDs are not persisted — `config push` resolves them on demand. |
-| `spin`       | _Coming soon._ Pure `spin.toml` editing — appends each KV label to the resolved component's `key_value_stores = [...]` array.                                                                                            |
+| `spin`       | Pure `spin.toml` editing — no shell-out (Spin KV stores are runtime-resolved). For each declared KV id, appends the label to the resolved `[component.<component>].key_value_stores = [...]` array (idempotent on the label). Config and secret ids are intentionally not handled here: `config push --adapter spin` declares config variables, and secret variables are manually declared by the developer in `spin.toml`. |
 
 **`--dry-run`** prints what each adapter _would_ do without
 performing it. For `axum` the output is identical to a real run
-(there's nothing to actually perform). For `cloudflare` and
-`fastly`, dry-run does not invoke the native CLI and does not edit
-the adapter manifest.
+(there's nothing to actually perform). For `cloudflare`,
+`fastly`, and `spin`, dry-run does not invoke any native CLI and
+does not edit the adapter manifest.
 
 The `cloudflare` flow requires `wrangler` on `PATH` and
 `[adapters.cloudflare.adapter].manifest` pointing at the project's
@@ -248,6 +248,13 @@ The `fastly` flow requires `fastly` on `PATH` and
 `[adapters.fastly.adapter].manifest` pointing at the project's
 `fastly.toml`. Re-running is safe: provision skips any id whose
 `[setup.<kind>_stores.<id>]` block already exists in the manifest.
+
+The `spin` flow needs no native CLI but does require
+`[adapters.spin.adapter].manifest` pointing at the project's
+`spin.toml`. If `spin.toml` declares more than one `[component.*]`,
+`[adapters.spin.adapter].component = "<id>"` selects which one
+receives the KV labels (single-component manifests resolve
+implicitly).
 
 ### edgezero auth
 
