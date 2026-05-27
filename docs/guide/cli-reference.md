@@ -226,16 +226,22 @@ edgezero provision --adapter <name> [--manifest <path>] [--dry-run]
 
 **Per-adapter behaviour:**
 
-| `--adapter`  | Behaviour                                                                                                                           |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `axum`       | Local-only — prints one note per declared store id and exits 0 (KV in-memory; config in `.edgezero/local-config-<id>.json`).        |
-| `cloudflare` | _Coming soon._ Will shell out to `wrangler kv namespace create` and patch `wrangler.toml` `[[kv_namespaces]]` per id.               |
-| `fastly`     | _Coming soon._ Will shell out to `fastly <kind>-store create` and ensure `[setup.*]` / `[local_server.*]` entries in `fastly.toml`. |
-| `spin`       | _Coming soon._ Pure `spin.toml` editing — appends each KV label to the resolved component's `key_value_stores = [...]` array.       |
+| `--adapter`  | Behaviour                                                                                                                                                                                                              |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `axum`       | Local-only — prints one note per declared store id and exits 0 (KV in-memory; config in `.edgezero/local-config-<id>.json`).                                                                                            |
+| `cloudflare` | For each KV id + config id: shells out to `wrangler kv namespace create <id>`, parses the namespace id from stdout, appends `[[kv_namespaces]] binding = "<id>", id = "<extracted>"` to `wrangler.toml` (idempotent on the binding name; preserves existing entries and comments). Secrets are runtime-managed via `wrangler secret put` — no-op. |
+| `fastly`     | _Coming soon._ Will shell out to `fastly <kind>-store create` and ensure `[setup.*]` / `[local_server.*]` entries in `fastly.toml`.                                                                                     |
+| `spin`       | _Coming soon._ Pure `spin.toml` editing — appends each KV label to the resolved component's `key_value_stores = [...]` array.                                                                                            |
 
 **`--dry-run`** prints what each adapter _would_ do without
 performing it. For `axum` the output is identical to a real run
-(there's nothing to actually perform).
+(there's nothing to actually perform). For `cloudflare`, dry-run
+does not invoke `wrangler` and does not edit `wrangler.toml`.
+
+The `cloudflare` flow requires `wrangler` on `PATH` and
+`[adapters.cloudflare.adapter].manifest` pointing at the project's
+`wrangler.toml`. Re-running after a successful provision is safe:
+existing `binding`s are detected and skipped.
 
 ### edgezero auth
 
