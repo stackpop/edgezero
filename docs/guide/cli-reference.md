@@ -213,6 +213,30 @@ app-demo-cli config validate --strict
 
 **Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure (the loader / validator returns early at the first mismatch).
 
+### edgezero provision
+
+Create the platform resources backing the `[stores.<kind>].ids` the
+manifest declares — KV namespaces, config stores, secret stores
+(spec §12). Same dispatch shape as the other commands: each adapter
+crate owns its own implementation, the CLI is a thin delegate.
+
+```bash
+edgezero provision --adapter <name> [--manifest <path>] [--dry-run]
+```
+
+**Per-adapter behaviour:**
+
+| `--adapter`  | Behaviour                                                                                                                           |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `axum`       | Local-only — prints one note per declared store id and exits 0 (KV in-memory; config in `.edgezero/local-config-<id>.json`).        |
+| `cloudflare` | _Coming soon._ Will shell out to `wrangler kv namespace create` and patch `wrangler.toml` `[[kv_namespaces]]` per id.               |
+| `fastly`     | _Coming soon._ Will shell out to `fastly <kind>-store create` and ensure `[setup.*]` / `[local_server.*]` entries in `fastly.toml`. |
+| `spin`       | _Coming soon._ Pure `spin.toml` editing — appends each KV label to the resolved component's `key_value_stores = [...]` array.       |
+
+**`--dry-run`** prints what each adapter _would_ do without
+performing it. For `axum` the output is identical to a real run
+(there's nothing to actually perform).
+
 ### edgezero auth
 
 Sign in, sign out, or check session against the adapter's native

@@ -26,6 +26,11 @@ pub enum Command {
     Deploy(DeployArgs),
     /// Create a new `EdgeZero` app skeleton (multi-crate workspace).
     New(NewArgs),
+    /// Create the platform resources backing the declared
+    /// `[stores.<kind>].ids` (spec §12). Each adapter owns its
+    /// own dispatch: cloudflare shells out to `wrangler`, fastly to
+    /// `fastly`, spin edits `spin.toml` in-place, axum is a no-op.
+    Provision(ProvisionArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
 }
@@ -109,6 +114,22 @@ pub struct NewArgs {
     pub dir: Option<String>,
     /// App name (e.g., my-edge-app).
     pub name: String,
+}
+
+/// Arguments for the `provision` command (spec §12).
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct ProvisionArgs {
+    /// Target adapter name.
+    #[arg(long, required = true)]
+    pub adapter: String,
+    /// Print the would-be commands and would-be manifest edits
+    /// without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Path to the manifest (default: `edgezero.toml`).
+    #[arg(long, default_value = "edgezero.toml")]
+    pub manifest: PathBuf,
 }
 
 /// Arguments for the `serve` command.
@@ -288,5 +309,29 @@ mod tests {
     fn auth_requires_adapter() {
         Args::try_parse_from(["edgezero", "auth", "login"])
             .expect_err("`auth login` without --adapter must error");
+    }
+
+    #[test]
+    fn provision_parses_with_adapter_and_dry_run() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "provision",
+            "--adapter",
+            "cloudflare",
+            "--dry-run",
+        ])
+        .expect("parse provision --adapter cloudflare --dry-run");
+        let Command::Provision(provision) = args.cmd else {
+            panic!("expected Command::Provision");
+        };
+        assert_eq!(provision.adapter, "cloudflare");
+        assert!(provision.dry_run);
+        assert_eq!(provision.manifest, PathBuf::from("edgezero.toml"));
+    }
+
+    #[test]
+    fn provision_requires_adapter() {
+        Args::try_parse_from(["edgezero", "provision"])
+            .expect_err("`provision` without --adapter must error");
     }
 }

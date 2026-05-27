@@ -22,6 +22,17 @@ pub enum AdapterAction {
     Serve,
 }
 
+/// Per-kind store ids extracted from `[stores.<kind>].ids` in the
+/// manifest, handed to [`Adapter::provision`] so the adapter knows
+/// what to create. Empty slices mean the user didn't declare that
+/// store kind.
+#[derive(Clone, Copy, Debug)]
+pub struct ProvisionStores<'stores> {
+    pub config: &'stores [String],
+    pub kv: &'stores [String],
+    pub secrets: &'stores [String],
+}
+
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 ///
 /// The non-`execute` methods carry the adapter's `config validate`
@@ -38,6 +49,37 @@ pub trait Adapter: Sync + Send {
 
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
+
+    /// Provision the platform resources backing each store id the
+    /// user declared (spec §12). Returns a list of human-readable
+    /// status lines the CLI logs verbatim — one line per resource
+    /// created, skipped, or that would be created under `dry_run`.
+    ///
+    /// `manifest_root` is the directory containing the user's
+    /// `edgezero.toml`. `adapter_manifest_path` and
+    /// `component_selector` come from `[adapters.<name>.adapter]`
+    /// — the adapter resolves its own per-platform manifest
+    /// (`wrangler.toml`, `fastly.toml`, `spin.toml`) relative to
+    /// the root. `stores` carries the declared ids per kind.
+    ///
+    /// Default: no-op (returns an empty `Vec`) so adapters that
+    /// don't own any platform resources don't need to override.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if any platform
+    /// invocation or manifest edit fails. `dry_run` impls should
+    /// describe what they *would* do without performing it.
+    #[inline]
+    fn provision(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _stores: &ProvisionStores<'_>,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
 
     /// Store kinds for which this adapter is Single-capable per
     /// spec §6.6 — `--strict` rejects `[stores.<kind>].ids.len() > 1`

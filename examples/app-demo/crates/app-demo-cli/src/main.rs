@@ -6,7 +6,9 @@
 
 use app_demo_core::config::AppDemoConfig;
 use clap::{Parser, Subcommand};
-use edgezero_cli::args::{AuthArgs, BuildArgs, ConfigValidateArgs, DeployArgs, NewArgs, ServeArgs};
+use edgezero_cli::args::{
+    AuthArgs, BuildArgs, ConfigValidateArgs, DeployArgs, NewArgs, ProvisionArgs, ServeArgs,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "app-demo-cli", about = "app-demo edge CLI")]
@@ -29,6 +31,9 @@ enum Cmd {
     Deploy(DeployArgs),
     /// Create a new `EdgeZero` app skeleton.
     New(NewArgs),
+    /// Create the platform resources backing the declared
+    /// `[stores.<kind>].ids` (spec §12).
+    Provision(ProvisionArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
 }
@@ -58,6 +63,7 @@ fn main() {
         }
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
         Cmd::New(args) => edgezero_cli::run_new(&args),
+        Cmd::Provision(args) => edgezero_cli::run_provision(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),
     };
     if let Err(err) = result {

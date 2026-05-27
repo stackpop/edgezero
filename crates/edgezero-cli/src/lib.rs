@@ -30,6 +30,8 @@ mod demo_server;
 #[cfg(feature = "cli")]
 mod generator;
 #[cfg(feature = "cli")]
+mod provision;
+#[cfg(feature = "cli")]
 mod scaffold;
 
 /// CLI argument structs (`Args`, `Command`, and the per-command `*Args`
@@ -42,6 +44,8 @@ pub mod args;
 pub use auth::run_auth;
 #[cfg(feature = "cli")]
 pub use config::{run_config_validate, run_config_validate_typed};
+#[cfg(feature = "cli")]
+pub use provision::run_provision;
 
 #[cfg(feature = "cli")]
 use args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
@@ -233,6 +237,55 @@ mod tests {
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    /// `provision` dispatch fixture: declares axum + fastly +
+    /// cloudflare + spin (every adapter the build registers), with
+    /// store ids per kind so axum has something to print and the
+    /// not-yet-implemented adapters' stubs are exercised against a
+    /// non-empty input.
+    const PROVISION_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.cloudflare.adapter]
+crate = "crates/demo-cf"
+[adapters.cloudflare.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-fastly"
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.kv]
+ids = ["sessions", "cache"]
+default = "sessions"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
 
     const BASIC_MANIFEST: &str = r#"
 [app]
@@ -461,6 +514,87 @@ auth-status = "echo whoami"
             err.contains("wat"),
             "error should name the unknown adapter: {err}"
         );
+    }
+
+    #[test]
+    fn run_provision_axum_prints_local_only_notes_for_each_store() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&args::ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: false,
+            manifest: manifest_path.clone(),
+        })
+        .expect("axum provision exits 0 (no remote resources)");
+    }
+
+    #[test]
+    fn run_provision_axum_dry_run_is_also_a_no_op() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&args::ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("axum dry-run also exits 0");
+    }
+
+    #[test]
+    fn run_provision_errors_on_unknown_adapter() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&args::ProvisionArgs {
+            adapter: "wat".to_owned(),
+            dry_run: false,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("unknown adapter must error");
+        assert!(
+            err.contains("wat"),
+            "error should name the unknown adapter: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_stubbed_adapters_report_not_yet_implemented() {
+        // cloudflare/fastly/spin land in follow-up commits.
+        // Until then they explicitly Err — better than silently
+        // pretending to provision.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        for adapter in ["cloudflare", "fastly", "spin"] {
+            let err = run_provision(&args::ProvisionArgs {
+                adapter: adapter.to_owned(),
+                dry_run: false,
+                manifest: manifest_path.clone(),
+            })
+            .expect_err("stub adapter must err");
+            assert!(
+                err.contains("not yet implemented"),
+                "{adapter} stub should say `not yet implemented`: {err}"
+            );
+        }
     }
 
     #[test]

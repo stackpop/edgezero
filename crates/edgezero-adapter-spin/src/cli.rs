@@ -8,7 +8,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
-use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
+use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction, ProvisionStores};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -138,6 +138,20 @@ impl Adapter for SpinCliAdapter {
 
     fn name(&self) -> &'static str {
         "spin"
+    }
+
+    fn provision(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _stores: &ProvisionStores<'_>,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Stage 6.4 will edit spin.toml's `key_value_stores`
+        // array on the resolved `[component.<component>]`. No
+        // shell-out — Spin KV labels are runtime-resolved.
+        Err("spin provision is not yet implemented; landing in a follow-up commit".to_owned())
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
