@@ -153,6 +153,8 @@ dependencies = [
  "clap",
  "edgezero-cli",
  "log",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
