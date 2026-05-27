@@ -676,19 +676,25 @@ binary has no app-config struct, so it uses the **raw** functions.
 
 Spec §11, §6.1.
 
-### Task 5.1: `CommandRunner` infrastructure
+### Task 5.1: Extend `AdapterAction` with the auth variants
+
+The original sketch placed a `CommandRunner` indirection inside
+`edgezero-cli`. That duplicated the adapter-name knowledge `build` /
+`deploy` / `serve` deliberately keep out of the CLI — they read
+commands from the manifest first, then fall back to the adapter
+crate's `Adapter::execute`. Auth follows the same path.
 
 **Files:**
 
-- Create: `crates/edgezero-cli/src/runner.rs`; Modify: `lib.rs`
+- Modify: `crates/edgezero-adapter/src/registry.rs` (`AdapterAction` enum)
+- Modify: each `crates/edgezero-adapter-*/src/cli.rs` (`Adapter::execute` match)
+- Modify: `crates/edgezero-core/src/manifest.rs` (`ManifestAdapterCommands` fields)
+- Modify: `crates/edgezero-cli/src/adapter.rs` (`Action` enum + `manifest_command` lookup)
 
-- [ ] **Step 1: Write a test** using `MockCommandRunner` — assert a recorded `CommandSpec` matches `{ program: "echo", args: ["hi"], cwd: None, ... }`.
-
-- [ ] **Step 2: Run** — FAIL.
-
-- [ ] **Step 3: Implement** per §6.1: private `CommandSpec<'a>`, `CommandRunner` trait, `CommandOutput`, `RealCommandRunner` (`std::process::Command`), `#[cfg(test)] MockCommandRunner`.
-
-- [ ] **Step 4: Run** — PASS.
+- [ ] **Step 1:** Extend `AdapterAction` with `AuthLogin` / `AuthLogout` / `AuthStatus`.
+- [ ] **Step 2:** Each `edgezero-adapter-*/src/cli.rs` adds match arms for the new variants and implements its own dispatch (cloudflare shells to `wrangler login/logout/whoami`, fastly to `fastly profile create/delete/list`, spin to `spin cloud login/logout/info`, axum no-ops).
+- [ ] **Step 3:** Extend `ManifestAdapterCommands` with `auth_login` / `auth_logout` / `auth_status` (serde-renamed to `auth-login` / `auth-logout` / `auth-status` on disk), and `edgezero-cli/src/adapter.rs::manifest_command` to look them up.
+- [ ] **Step 4: Run** — workspace compiles, no auth dispatch yet.
 
 ### Task 5.2: `auth` command + docs + commit
 
@@ -698,17 +704,17 @@ Spec §11, §6.1.
 - Create: `crates/edgezero-cli/src/auth.rs`
 - Modify: `examples/app-demo/crates/app-demo-cli/src/main.rs`, `docs/guide/cli-reference.md`
 
-- [ ] **Step 1: Write tests:** for each (adapter, sub) pair a `MockCommandRunner` expectation asserting the exact `CommandSpec` (per the §11 table); tool-not-found and non-zero-exit cases.
+- [ ] **Step 1: Write tests** mirroring the existing `run_build_executes_manifest_command` pattern: configure `[adapters.fastly.commands].auth-login = "echo logged in"` (etc.) in a fixture manifest, call `run_auth(&AuthArgs { sub: AuthSub::Login { adapter: "fastly" } })`, assert success. Add an "unknown adapter errors" case.
 
-- [ ] **Step 2: Run** — FAIL.
+- [ ] **Step 2: Run** — FAIL (no `run_auth` yet).
 
-- [ ] **Step 3: Implement.** `AuthArgs { sub: AuthSub }` — `#[derive(clap::Args, Debug)] #[non_exhaustive]`, **no `Default`** (§6.11). `AuthSub { Login{adapter}, Logout{adapter}, Status{adapter} }`. `run_auth` → `run_auth_with(&RealCommandRunner, args)` dispatching per the §11 table.
+- [ ] **Step 3: Implement.** `AuthArgs { sub: AuthSub }` — `#[derive(clap::Args, Debug)] #[non_exhaustive]`, **no `Default`** (§6.11). `AuthSub { Login{adapter}, Logout{adapter}, Status{adapter} }`. `crates/edgezero-cli/src/auth.rs::run_auth` is a five-line delegate to `adapter::execute(name, Action::Auth{Login,Logout,Status}, manifest, &[])`. No `CommandRunner`; no `MockCommandRunner`; no hard-coded `(adapter, sub) → (program, args)` table in the CLI crate.
 
-- [ ] **Step 4: Run** — PASS. Document `auth` in `cli-reference.md`.
+- [ ] **Step 4: Run** — PASS. Document `auth` in `cli-reference.md` (built-ins + per-project override via `[adapters.<name>.commands].auth-{login,logout,status}`).
 
 - [ ] **Step 5: Wire both binaries.** Add `Auth(AuthArgs)` to the **default `edgezero-cli` `Command` enum** (`args.rs`) and a dispatch arm in `main.rs`: `Command::Auth(a) => exit_on_err(edgezero_cli::run_auth(&a))`. Also add `Auth(AuthArgs)` to `app-demo-cli`'s `Cmd` enum and dispatch it to `run_auth`. Write a test that `Args::try_parse_from(["edgezero", "auth", "login", "--adapter", "cloudflare"])` parses and that `edgezero --help` lists `auth`.
 
-- [ ] **Step 6: Run** the full gate; `./target/debug/edgezero auth --help` shows the `login`/`logout`/`status` subcommands. **Commit:** `git commit -m "auth command + CommandRunner infrastructure"`
+- [ ] **Step 6: Run** the full gate; `./target/debug/edgezero auth --help` shows the `login`/`logout`/`status` subcommands. **Commit:** `git commit -m "auth command (adapter-trait dispatch, no hardcoded table)"`
 
 ---
 

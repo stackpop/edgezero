@@ -6,7 +6,7 @@
 
 use app_demo_core::config::AppDemoConfig;
 use clap::{Parser, Subcommand};
-use edgezero_cli::args::{BuildArgs, ConfigValidateArgs, DeployArgs, NewArgs, ServeArgs};
+use edgezero_cli::args::{AuthArgs, BuildArgs, ConfigValidateArgs, DeployArgs, NewArgs, ServeArgs};
 
 #[derive(Parser, Debug)]
 #[command(name = "app-demo-cli", about = "app-demo edge CLI")]
@@ -17,6 +17,9 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Sign in / out / status against the adapter's native CLI
+    /// (`wrangler` / `fastly` / `spin`). See spec §11.
+    Auth(AuthArgs),
     /// Build the project for a target edge.
     Build(BuildArgs),
     /// Inspect or mutate the typed `app-demo.toml` app config.
@@ -48,6 +51,7 @@ fn main() {
 
     edgezero_cli::init_cli_logger();
     let result = match Args::parse().cmd {
+        Cmd::Auth(args) => edgezero_cli::run_auth(&args),
         Cmd::Build(args) => edgezero_cli::run_build(&args),
         Cmd::Config(AppDemoConfigCmd::Validate(args)) => {
             edgezero_cli::run_config_validate_typed::<AppDemoConfig>(&args)

@@ -306,22 +306,41 @@ docs/.vitepress/config.mts    # UPDATED sidebar (note: .mts, not .ts)
 
 ## 6. Cross-cutting designs
 
-### 6.1 `CommandSpec` + `CommandRunner` (sub-project #5)
+### 6.1 Command spawning — sub-project #5 (revised)
+
+The original sketch placed a `CommandSpec` / `CommandRunner` trait
+in `crates/edgezero-cli/src/runner.rs` for CLI-side dispatch
+testability. Sub-project #5 (`auth`) demonstrated the wrong split:
+hard-coding `("cloudflare", AuthAction::Login) => ("wrangler",
+&["login"])` inside the CLI duplicated the adapter-name knowledge
+that `build` / `deploy` / `serve` deliberately keep out of
+`edgezero-cli` (they read commands from the manifest first, then
+fall back to the adapter crate's `Adapter::execute`).
+
+`auth` follows the same path. `AdapterAction` in
+`edgezero-adapter::registry` extends to:
 
 ```rust
-// crates/edgezero-cli/src/runner.rs (private)
-pub(crate) struct CommandSpec<'a> {
-    pub program: &'a str, pub args: &'a [&'a str],
-    pub cwd: Option<&'a std::path::Path>, pub stdin: Option<&'a [u8]>,
-    pub env: &'a [(&'a str, &'a str)],
+#[non_exhaustive]
+pub enum AdapterAction {
+    AuthLogin, AuthLogout, AuthStatus,
+    Build, Deploy, Serve,
 }
-pub(crate) trait CommandRunner: Send + Sync {
-    fn run(&self, spec: &CommandSpec<'_>) -> std::io::Result<CommandOutput>;
-}
-pub(crate) struct CommandOutput { pub status: i32, pub stdout: String, pub stderr: String }
-pub(crate) struct RealCommandRunner;
-#[cfg(test)] pub(crate) struct MockCommandRunner { /* recorded expectations */ }
 ```
+
+Each `edgezero-adapter-*` crate implements the new variants in its
+own `Adapter::execute` impl (cloudflare shells out to `wrangler`,
+axum no-ops, …). The CLI dispatches via the existing
+`adapter::execute(adapter, action, manifest, args)` machinery; the
+manifest's `[adapters.<name>.commands].auth-{login,logout,status}`
+keys are per-project overrides at the same precedence as `build` /
+`deploy` / `serve`.
+
+The standalone `CommandRunner` / `MockCommandRunner` types are not
+built. Each adapter crate is responsible for its own implementation
+mechanism (shell, HTTP, SDK) and its own testability. The CLI
+orchestration is covered by the same manifest-override fixture
+pattern `build` / `deploy` / `serve` already use.
 
 ### 6.2 Error model
 
@@ -995,12 +1014,32 @@ pub enum AuthSub {
 }
 ```
 
-UX: `auth login --adapter cloudflare`. Per-adapter: axum no-ops;
-cloudflare `wrangler login/logout/whoami`; fastly `fastly profile
-create/delete/list`; spin `spin cloud login/logout/info`. All via
-`CommandRunner` (the `runner` module lands here).
+UX: `auth login --adapter cloudflare`. Dispatch follows the same
+path as `build` / `deploy` / `serve`: `AdapterAction::AuthLogin` /
+`AuthLogout` / `AuthStatus` extend the existing
+`edgezero_adapter::registry::AdapterAction` enum, and each
+`edgezero-adapter-*` crate implements the variants in its own
+`Adapter::execute` impl (shell out, HTTP call, or no-op — the CLI
+doesn't care). Per-project override via
+`[adapters.<name>.commands].auth-{login,logout,status}` in
+`edgezero.toml`, same precedence as `build` / `deploy` / `serve`.
 
-**Tests:** mock-runner matrix; ENOENT + non-zero-exit cases.
+Built-ins (each in its adapter crate):
+
+- axum: no-op (no remote auth surface).
+- cloudflare: `wrangler login/logout/whoami`.
+- fastly: `fastly profile create/delete/list`.
+- spin: `spin cloud login/logout/info`.
+
+The standalone `CommandRunner` indirection originally sketched here
+was dropped: each adapter chooses its own implementation mechanism
+and is responsible for its own testability. The CLI's `auth.rs` is
+a five-line args-to-action delegate to `adapter::execute`.
+
+**Tests:** the orchestration test mirrors `build`/`deploy`/`serve` —
+configure `[adapters.<name>.commands].auth-login = "echo logged in"`
+in a fixture manifest and assert dispatch succeeds. The real native
+CLIs are not exercised in CI (§13).
 
 ## 12. Sub-project 6 — `provision` command
 

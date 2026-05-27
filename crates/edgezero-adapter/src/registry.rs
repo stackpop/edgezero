@@ -5,9 +5,17 @@ static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Actions the `EdgeZero` CLI can request from an adapter implementation.
+///
+/// `AuthLogin` / `AuthLogout` / `AuthStatus` dispatch the platform's
+/// native sign-in flow (`wrangler login`, `fastly profile create`,
+/// `spin cloud login`, …). The adapter chooses whether to shell out
+/// to a CLI, call an HTTP API, or no-op — the CLI doesn't care.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AdapterAction {
+    AuthLogin,
+    AuthLogout,
+    AuthStatus,
     Build,
     Deploy,
     Serve,
