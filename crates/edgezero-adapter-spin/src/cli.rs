@@ -1,12 +1,11 @@
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
+    find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
 use edgezero_adapter::scaffold::{
@@ -106,6 +105,8 @@ static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
 
 const TARGET_TRIPLE: &str = "wasm32-wasip1";
 
+const SPIN_INSTALL_HINT: &str = "install the Spin CLI (https://spinframework.dev/) and try again";
+
 struct SpinCliAdapter;
 
 impl Adapter for SpinCliAdapter {
@@ -114,9 +115,15 @@ impl Adapter for SpinCliAdapter {
             // `spin cloud {login|logout|info}` is the native sign-in
             // surface for Fermyon Cloud. EdgeZero stores no
             // credentials — this is a thin shell-out (spec §11).
-            AdapterAction::AuthLogin => run_native("spin", &["cloud", "login"]),
-            AdapterAction::AuthLogout => run_native("spin", &["cloud", "logout"]),
-            AdapterAction::AuthStatus => run_native("spin", &["cloud", "info"]),
+            AdapterAction::AuthLogin => {
+                run_native_cli("spin", &["cloud", "login"], SPIN_INSTALL_HINT)
+            }
+            AdapterAction::AuthLogout => {
+                run_native_cli("spin", &["cloud", "logout"], SPIN_INSTALL_HINT)
+            }
+            AdapterAction::AuthStatus => {
+                run_native_cli("spin", &["cloud", "info"], SPIN_INSTALL_HINT)
+            }
             AdapterAction::Build => {
                 let artifact = build(args)?;
                 log::info!("[edgezero] Spin build complete -> {}", artifact.display());
@@ -130,29 +137,6 @@ impl Adapter for SpinCliAdapter {
 
     fn name(&self) -> &'static str {
         "spin"
-    }
-}
-
-/// Spawn `program args…` inheriting parent stdio, returning a
-/// human-readable error if the binary is missing from `PATH` or the
-/// child exits non-zero.
-fn run_native(program: &str, args: &[&str]) -> Result<(), String> {
-    let status = Command::new(program).args(args).status().map_err(|err| {
-        if err.kind() == ErrorKind::NotFound {
-            format!(
-                "`{program}` not found on PATH; install the Spin CLI (https://spinframework.dev/) and try again"
-            )
-        } else {
-            format!("failed to spawn `{program}`: {err}")
-        }
-    })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "`{program} {}` exited with status {status}",
-            args.join(" ")
-        ))
     }
 }
 

@@ -4,7 +4,9 @@
 )]
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Walks up the directory tree looking for `manifest_name` alongside a `Cargo.toml`.
 #[inline]
@@ -62,6 +64,37 @@ pub fn path_distance(left: &Path, right: &Path) -> usize {
         .len()
         .saturating_sub(common)
         .saturating_add(right_components.len().saturating_sub(common))
+}
+
+/// Spawn `program args…` inheriting parent stdio, returning a
+/// human-readable error message.
+///
+/// Used by every adapter's auth dispatch (`wrangler login`,
+/// `fastly profile create`, `spin cloud login`, …). The
+/// `install_hint` is appended to the not-found message so the
+/// adapter can point operators at the right install instructions
+/// (`npm install -g wrangler`, the Fastly CLI download page, etc.).
+///
+/// # Errors
+/// Returns an error string if the binary is missing from `PATH`,
+/// the child fails to spawn, or it exits non-zero.
+#[inline]
+pub fn run_native_cli(program: &str, args: &[&str], install_hint: &str) -> Result<(), String> {
+    let status = Command::new(program).args(args).status().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!("`{program}` not found on PATH; {install_hint}")
+        } else {
+            format!("failed to spawn `{program}`: {err}")
+        }
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{program} {}` exited with status {status}",
+            args.join(" ")
+        ))
+    }
 }
 
 /// Reads the crate name from a `Cargo.toml`, supporting both the inline and `[package]` forms.

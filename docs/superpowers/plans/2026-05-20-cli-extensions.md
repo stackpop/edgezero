@@ -51,8 +51,14 @@
   reference `app-demo-cli config validate --strict` and raw
   `edgezero config validate --strict` both exit 0 against the
   in-tree fixture.
-- **Stages 5–8 — pending.** Stage 5 (`auth` command + `CommandRunner`
-  infrastructure) is next.
+- **Stage 5 — shipped.** `auth login/logout/status --adapter <name>`
+  dispatches via `AdapterAction::Auth{Login,Logout,Status}`; each
+  adapter crate owns its implementation in `Adapter::execute`.
+  Per-project overrides via
+  `[adapters.<name>.commands].auth-{login,logout,status}` in
+  `edgezero.toml`. Earlier `CommandRunner`/`MockCommandRunner`
+  sketch retired (see Stage 5 below).
+- **Stages 6–8 — pending.** Stage 6 (`provision` command) is next.
 
 ## Codebase facts this plan relies on
 
@@ -190,7 +196,8 @@ crates/edgezero-cli/
   src/main.rs                   # M (stage 1): thin wrapper; M (4-7): dispatch arms for new commands
   src/args.rs                   # M: standalone *Args structs; M (4-7): new *Args + Command enum variants
   src/demo_server.rs            # M (stage 1): renamed from dev_server.rs
-  src/runner.rs                 # C (stage 5): CommandSpec + CommandRunner
+  # (stage 5 originally planned a `src/runner.rs` — retired in
+  #  favour of per-adapter `Adapter::execute` dispatch.)
   src/auth.rs                   # C (stage 5)
   src/provision.rs              # C (stage 6)
   src/config.rs                 # C (stage 7): validate + push
@@ -672,7 +679,7 @@ binary has no app-config struct, so it uses the **raw** functions.
 
 ---
 
-# Stage 5 — `auth` command (+ `CommandRunner`)
+# Stage 5 — `auth` command (adapter-trait dispatch)
 
 Spec §11, §6.1.
 
@@ -729,11 +736,11 @@ Spec §12, §13 (Fastly contract).
 - Modify: `crates/edgezero-cli/src/args.rs` (`ProvisionArgs`), `lib.rs`
 - Create: `crates/edgezero-cli/src/provision.rs`
 
-- [ ] **Step 1: Write tests:** per-(adapter, kind) `MockCommandRunner` expectations with scripted stdout; golden ID-extraction parsers; temp-fixture writeback verified for `wrangler.toml`, `fastly.toml`, and the Spin `key_value_stores` array in `spin.toml`; axum no-op output asserted; `--dry-run` invokes nothing.
+- [ ] **Step 1: Write tests** following Stage 5's pattern: each adapter crate's tests own the per-(adapter, kind) writeback assertions (temp-fixture writeback for `wrangler.toml`, `fastly.toml`, and the Spin `key_value_stores` array in `spin.toml`; axum no-op). The CLI test asserts `run_provision` dispatches to the right adapter and that `--dry-run` short-circuits without spawning.
 
 - [ ] **Step 2: Run** — FAIL.
 
-- [ ] **Step 3: Implement** `ProvisionArgs { manifest, adapter, dry_run }`. `run_provision` per the §12 per-adapter table: axum no-op; cloudflare `wrangler kv namespace create` + `wrangler.toml` `[[kv_namespaces]]` writeback; fastly `fastly <kind>-store create` + `[setup.*]`/`[local_server.*]` `fastly.toml` writeback; spin KV-label `spin.toml` writeback only (component resolved per §6.7).
+- [ ] **Step 3: Implement** `ProvisionArgs { manifest, adapter, dry_run }`. Extend `AdapterAction` with a `Provision` variant (or a small `ProvisionKind` payload if per-store-kind dispatch is needed). Each adapter crate's `Adapter::execute` implements its own §12 behaviour: axum no-op; cloudflare `wrangler kv namespace create` + `wrangler.toml` `[[kv_namespaces]]` writeback; fastly `fastly <kind>-store create` + `[setup.*]`/`[local_server.*]` `fastly.toml` writeback; spin KV-label `spin.toml` writeback only (component resolved per §6.7). CLI's `provision.rs` is a thin args→action delegate to `adapter::execute`, same shape as `auth.rs`.
 
 - [ ] **Step 4: Run** — PASS. Document `provision` in `cli-reference.md`.
 
