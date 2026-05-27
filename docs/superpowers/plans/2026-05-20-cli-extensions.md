@@ -58,7 +58,55 @@
   `[adapters.<name>.commands].auth-{login,logout,status}` in
   `edgezero.toml`. Earlier `CommandRunner`/`MockCommandRunner`
   sketch retired (see Stage 5 below).
-- **Stages 6–8 — pending.** Stage 6 (`provision` command) is next.
+- **Stage 6 — shipped.** `provision --adapter <name>` dispatches
+  via a new `Adapter::provision` trait method (NOT
+  `AdapterAction` — the surface needs typed `ProvisionStores` and
+  a paths/dry-run signature that doesn't fit `AdapterAction`'s
+  `&[String]` shape). Landed as one-adapter-per-commit:
+  `9a0369b` (trait + axum no-op + CLI delegate + stubs for the
+  other three), `d905e42` (cloudflare `wrangler kv namespace
+  create` + `wrangler.toml` `[[kv_namespaces]]` writeback),
+  `79a54b6` (fastly `fastly <kind>-store create` +
+  `[setup.*]`/`[local_server.*]` `fastly.toml` writeback),
+  `0933440` (spin pure `spin.toml` editing — appends KV labels
+  to the resolved `[component.<c>].key_value_stores` array).
+- **Stage 7 — shipped.** `config push` adds the symmetric
+  write-side counterpart to `config validate`, also dispatched
+  via a new `Adapter::push_config_entries` trait method (same
+  rationale as `provision`). Landed as one-adapter-per-commit:
+  `bc0a705` (trait + axum impl + CLI raw + typed entry points +
+  stubs), `74d596a` (cloudflare `wrangler kv bulk put` against
+  the namespace id read from `wrangler.toml`), `d852f3f` (fastly
+  `fastly config-store list --json` then
+  `fastly config-store-entry create` per entry), `57c7eb3` (spin
+  pure `spin.toml` editing — writes both `[variables].<key>` and
+  `[component.<c>.variables].<key>` with `.→__` lowercase key
+  translation). The typed flow strips both `#[secret]` and
+  `#[secret(store_ref)]` top-level fields before pushing (spec
+  §13).
+- **Stage 8 — partially shipped.** Task 8.1's plan-listed
+  sub-items split across three commits: `3d3f87c` (manual Spin
+  secret-variable declarations in
+  `app-demo-adapter-spin/spin.toml` — `api_token` with
+  `required = true, secret = true` and `vault` with a default,
+  both bound under `[component.app-demo.variables]`), `9fdd1f4`
+  (three `app-demo-cli` integration tests covering typed
+  `config validate --strict`, typed `config push --adapter
+  axum` with secret-stripping assertions, and typed
+  `config push --adapter spin --dry-run` with manifest-
+  preservation assertion — env-overlay path is already covered
+  by `app-demo-core/src/config.rs::env_overlay_overrides_
+  nested_value`), `26fddcc` (handlers rewired to use
+  `Kv::named("sessions")` for the counter and `Kv::named("cache")`
+  for the notes endpoints, with `context_with_kv` rebuilt
+  around a real `KvRegistry`). **Remaining Stage 8 work:**
+  Task 8.1 step 2's e2e demo-server test (needs an
+  ephemeral-port + readiness + RAII-teardown lifecycle helper
+  — see "Demo-server lifecycle" in the task body); Task 8.2
+  (upgrade the `<name>-cli` generator template to emit the full
+  seven-command Cmd enum); Task 8.3 (CI wiring for `cd
+  examples/app-demo && cargo test`); Task 8.4
+  (`cli-walkthrough.md` + doc audit).
 
 ## Codebase facts this plan relies on
 
