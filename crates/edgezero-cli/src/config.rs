@@ -32,6 +32,22 @@ use toml::value::Table;
 use toml::Value;
 use validator::Validate;
 
+const ADAPTER_CHECKS: &[&dyn AdapterCheck] = &[&Axum, &Cloudflare, &Spin];
+
+/// Axum (native dev server): env-var-backed secret store is flat.
+/// Multi for KV (local file dirs) and Config (local JSON files);
+/// only Secrets is Single.
+struct Axum;
+
+/// Cloudflare Workers: Worker Secrets is a single flat bag.
+/// Multi for KV (KV namespaces) and Config (KV namespaces); only
+/// Secrets is Single.
+struct Cloudflare;
+
+/// Spin: flat config/secret variable namespace, single-component
+/// `spin.toml`, Single-capable for Config and Secrets.
+struct Spin;
+
 /// Pre-loaded state shared by the raw and typed flows.
 struct ValidationContext {
     /// Resolved app-config TOML path. Either the explicit
@@ -58,6 +74,118 @@ impl ValidationContext {
     fn manifest(&self) -> &Manifest {
         self.manifest_loader.manifest()
     }
+}
+
+/// Per-adapter validation hooks.
+///
+/// Every adapter that has special validation rules (Spin's flat
+/// variable namespace, Axum/Cloudflare's single-secrets capability)
+/// implements this trait. The orchestrator iterates over
+/// [`ADAPTER_CHECKS`] and only invokes the methods of adapters that
+/// appear in the manifest — call sites read as a flat list of
+/// contract checks with no `if adapter == "spin"` branches.
+///
+/// Fastly is intentionally absent: it has no special validation rules
+/// (Multi across all store kinds, no flat-namespace constraints), and
+/// the default no-op implementations would just add registry noise.
+trait AdapterCheck: Sync {
+    /// Manifest key that identifies this adapter under
+    /// `[adapters.<id>.*]`.
+    fn adapter_id(&self) -> &'static str;
+
+    /// App-config check called from both the raw and typed flows.
+    /// Default: no-op.
+    fn check_app_config(&self, _ctx: &ValidationContext) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Manifest-only check (e.g. Spin's `spin.toml` component
+    /// discovery). Default: no-op.
+    fn check_manifest(&self, _ctx: &ValidationContext) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Typed-only check that needs `SECRET_FIELDS` (e.g. Spin's
+    /// config/secret namespace collision). Default: no-op.
+    fn check_typed(
+        &self,
+        _ctx: &ValidationContext,
+        _secret_fields: &[SecretField],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Store kinds for which this adapter is Single-capable per
+    /// spec §6.6 — `--strict` rejects `[stores.<kind>].ids.len() > 1`
+    /// when any listed kind matches.
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+}
+
+// -------------------------------------------------------------------
+// Concrete adapter checks (spec §6.6, §6.7)
+// -------------------------------------------------------------------
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "Axum has no app-config / manifest / typed-only checks beyond the capability matrix; the trait defaults already model that"
+)]
+impl AdapterCheck for Axum {
+    fn adapter_id(&self) -> &'static str {
+        "axum"
+    }
+
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        &["secrets"]
+    }
+}
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "Cloudflare has no app-config / manifest / typed-only checks beyond the capability matrix; the trait defaults already model that"
+)]
+impl AdapterCheck for Cloudflare {
+    fn adapter_id(&self) -> &'static str {
+        "cloudflare"
+    }
+
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        &["secrets"]
+    }
+}
+
+impl AdapterCheck for Spin {
+    fn adapter_id(&self) -> &'static str {
+        "spin"
+    }
+
+    fn check_app_config(&self, ctx: &ValidationContext) -> Result<(), String> {
+        spin_key_syntax_check(&ctx.raw_config)
+    }
+
+    fn check_manifest(&self, ctx: &ValidationContext) -> Result<(), String> {
+        spin_component_discovery(ctx.manifest(), &ctx.manifest_path)
+    }
+
+    fn check_typed(
+        &self,
+        ctx: &ValidationContext,
+        secret_fields: &[SecretField],
+    ) -> Result<(), String> {
+        spin_config_secret_collision(ctx, secret_fields)
+    }
+
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        &["config", "secrets"]
+    }
+}
+
+fn adapter_checks_for(manifest: &Manifest) -> impl Iterator<Item = &'static dyn AdapterCheck> + '_ {
+    ADAPTER_CHECKS
+        .iter()
+        .copied()
+        .filter(|check| manifest.adapters.contains_key(check.adapter_id()))
 }
 
 /// Raw flow — no typed `C`. Runs every check the typed flow runs
@@ -96,11 +224,9 @@ where
             .map_err(|err| format_app_config_error(&err))?;
 
     typed_secret_checks(&typed, &ctx)?;
-    // Spin's flat variable namespace can collide with a secret value
-    // resolved via `#[secret]` — see §6.7 check 2. The collision check
-    // self-gates: it returns `Ok` when Spin isn't in the adapter set,
-    // so the context stays adapter-agnostic.
-    spin_config_secret_collision(&ctx, C::SECRET_FIELDS)?;
+    for check in adapter_checks_for(ctx.manifest()) {
+        check.check_typed(&ctx, C::SECRET_FIELDS)?;
+    }
 
     Ok(())
 }
@@ -160,11 +286,10 @@ fn resolve_app_config_path(
 }
 
 fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
-    // Each Spin check self-gates on `manifest.adapters.contains_key("spin")`,
-    // so the context stays adapter-agnostic and the call site reads as a
-    // flat list of contract checks.
-    spin_key_syntax_check(ctx.manifest(), &ctx.raw_config)?;
-    spin_component_discovery(ctx.manifest(), &ctx.manifest_path)?;
+    for check in adapter_checks_for(ctx.manifest()) {
+        check.check_app_config(ctx)?;
+        check.check_manifest(ctx)?;
+    }
     if ctx.args_strict {
         strict_capability_completeness(ctx.manifest())?;
         strict_handler_paths(ctx.manifest())?;
@@ -242,10 +367,7 @@ fn typed_secret_checks<C: AppConfigMeta>(
 // Spin checks (spec §6.7)
 // -------------------------------------------------------------------
 
-fn spin_key_syntax_check(manifest: &Manifest, raw_config: &Value) -> Result<(), String> {
-    if !manifest.adapters.contains_key("spin") {
-        return Ok(());
-    }
+fn spin_key_syntax_check(raw_config: &Value) -> Result<(), String> {
     let table = raw_config
         .as_table()
         .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
@@ -275,9 +397,6 @@ fn spin_config_secret_collision(
     ctx: &ValidationContext,
     secret_fields: &[SecretField],
 ) -> Result<(), String> {
-    if !ctx.manifest().adapters.contains_key("spin") {
-        return Ok(());
-    }
     let raw_table = ctx
         .raw_config
         .as_table()
@@ -337,8 +456,9 @@ fn flatten_keys_into(table: &Table, prefix: &str, out: &mut Vec<String>) {
 }
 
 fn spin_component_discovery(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
-    // Caller guarantees `has_spin_adapter()`; the `else` branch covers
-    // the (impossible) case so we don't lean on `.expect()`.
+    // Reached only via the Spin AdapterCheck impl, which the registry
+    // filters by manifest presence; the `else` branch covers the
+    // (impossible) case so we don't lean on `.expect()`.
     let Some(spin) = manifest.adapters.get("spin") else {
         return Ok(());
     };
@@ -415,10 +535,10 @@ fn collect_spin_component_ids(parsed: &Value) -> Vec<String> {
 // -------------------------------------------------------------------
 
 fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
-    // Spec §6.6 capability matrix. Hard-coded here rather than threaded
-    // through the adapter registry because the registry is feature-gated
-    // per platform and the validator must run regardless of build
-    // features.
+    // Spec §6.6 capability matrix, driven by each adapter's
+    // `single_store_kinds()`. The registry is independent of the
+    // platform feature gates so this validator runs against every
+    // build.
     for (kind, maybe_decl) in [
         ("kv", manifest.stores.kv.as_ref()),
         ("config", manifest.stores.config.as_ref()),
@@ -430,29 +550,17 @@ fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
         if declaration.ids.len() <= 1 {
             continue;
         }
-        for adapter in manifest.adapters.keys() {
-            if is_single_store_adapter(adapter, kind) {
+        for check in adapter_checks_for(manifest) {
+            if check.single_store_kinds().contains(&kind) {
                 return Err(format!(
-                    "adapter `{adapter}` is Single-capable for {kind} stores (spec §6.6) but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
+                    "adapter `{}` is Single-capable for {kind} stores (spec §6.6) but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
+                    check.adapter_id(),
                     declaration.ids.len()
                 ));
             }
         }
     }
     Ok(())
-}
-
-fn is_single_store_adapter(adapter: &str, kind: &str) -> bool {
-    // Spec §6.6 capability matrix:
-    // - axum/cloudflare are Single only for `secrets` (env vars /
-    //   worker secrets); both are Multi for KV and Config.
-    // - fastly is Multi across the board.
-    // - spin is Multi for KV (label-backed) but Single for Config and
-    //   Secrets (flat-variable namespace).
-    matches!(
-        (adapter, kind),
-        ("axum" | "cloudflare", "secrets") | ("spin", "config" | "secrets")
-    )
 }
 
 fn strict_handler_paths(manifest: &Manifest) -> Result<(), String> {
