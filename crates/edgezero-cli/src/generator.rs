@@ -855,9 +855,20 @@ mod tests {
             "<name>.toml should be scaffolded at the project root"
         );
         let app_toml = fs::read_to_string(&app_toml_path).expect("read demo-app.toml");
+        // Parse the file rather than substring-matching on a comment.
+        // The shape contract is "the root table IS the typed struct; no
+        // `[config]` wrapper". A regression that re-introduces `[config
+        // = ...]` or `[config.service]` would otherwise pass a
+        // comment-only check.
+        let parsed: toml::Value = toml::from_str(&app_toml).expect("parse demo-app.toml");
+        let root = parsed.as_table().expect("root is a TOML table");
         assert!(
-            app_toml.contains("[config]"),
-            "<name>.toml must contain a [config] table"
+            root.get("config").is_none(),
+            "<name>.toml must not have a top-level `config` key: the file is the typed struct"
+        );
+        assert!(
+            root.get("service").is_some_and(toml::Value::is_table),
+            "<name>.toml must declare `[service]` at the root, not nested under `[config]`"
         );
 
         let config_rs_path = project_dir.join("crates/demo-app-core/src/config.rs");

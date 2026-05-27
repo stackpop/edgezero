@@ -44,8 +44,15 @@
   ship matching manifests + per-platform bindings; manifest-store
   migration guide published; all five CI gates + the opt-in
   generated-project compile check + docs lint/format/build green.
-- **Stages 3–8 — pending.** Stage 3 is next; Stage 2 is the
-  precondition and it is met.
+- **Stages 3 + 4 — shipped** on `feature/extensible-cli`. Typed
+  `<name>.toml` app-config + `#[derive(AppConfig)]` + env-var
+  overlay land in Stage 3; `config validate` (raw + typed flavours
+  dispatched via an `AdapterCheck` trait) lands in Stage 4. The
+  reference `app-demo-cli config validate --strict` and raw
+  `edgezero config validate --strict` both exit 0 against the
+  in-tree fixture.
+- **Stages 5–8 — pending.** Stage 5 (`auth` command + `CommandRunner`
+  infrastructure) is next.
 
 ## Codebase facts this plan relies on
 
