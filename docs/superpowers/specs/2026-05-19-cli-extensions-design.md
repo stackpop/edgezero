@@ -74,8 +74,10 @@ Alongside the extensibility substrate, ship:
 - **Refactored `Kv` / `Secrets` / `Config` extractors** resolving the
   default store or a named one (§6.8).
 - Platform credential and resource management (`auth`, `provision`)
-  shelling out to each platform's native CLI, wrapped in a mockable
-  `CommandRunner` so CI stays hermetic.
+  delegated to each adapter crate's `Adapter::execute` impl — the
+  CLI carries no adapter-name strings, and CI stays hermetic
+  because the adapter crates choose their own implementation
+  (shell-out, HTTP, SDK) and own their tests.
 - A generator that scaffolds a new project complete with `<name>-cli`,
   `<name>.toml`, `<name>-core/src/config.rs`, and an `edgezero.toml`
   using the new schema.
@@ -97,7 +99,9 @@ flags; new subcommands are added.
   struct — top-level keys are struct fields, no `[config]` /
   `[config.production]` wrapper. (Env-var _override_ is in scope;
   per-environment _files_ are not.)
-- No live-platform CI smoke tests. Mock `CommandRunner` only.
+- No live-platform CI smoke tests. Each adapter crate ships its own
+  per-adapter unit tests; the CLI's orchestration tests use fixture
+  manifests (`auth-login = "echo logged in"` and the like).
 - **No backward compatibility** with the old manifest schema or runtime
   store API. A pre-rewrite `edgezero.toml` is a hard load error.
 - No dynamic Spin variable provider integration (Vault, Fermyon Cloud
@@ -108,7 +112,7 @@ flags; new subcommands are added.
 
 ```mermaid
 graph TB
-    Lib["<b>edgezero-cli (lib)</b><br/>pub *Args + pub run_*<br/>internal: CommandRunner / adapter / generator"]
+    Lib["<b>edgezero-cli (lib)</b><br/>pub *Args + pub run_*<br/>internal: adapter dispatch (registry) / generator"]
 
     Macros["<b>edgezero-macros</b><br/>#[derive(AppConfig)]<br/>#[secret] / #[secret(store_ref)]"]
 
@@ -146,7 +150,13 @@ Key contracts:
   variables** (§6.7).
 - **Extractors**: `Kv` / `Secrets` / `Config` resolve default or named.
 - **Typed app-config + secrets**: §6.8. **Env-var override**: §6.10.
-- **Shell-out isolation**: private `CommandRunner` + `CommandSpec`.
+- **Shell-out isolation**: each adapter crate owns its native CLI
+  invocation in its `Adapter::execute` impl (build/deploy/serve plus
+  auth login/logout/status). The CLI carries zero adapter-name
+  strings. Adapters that shell out share the
+  `edgezero_adapter::cli_support::run_native_cli(program, args,
+install_hint)` helper so the "missing binary on PATH /
+  non-zero-exit" handling is uniform.
 
 ## 4. End-state public API surface
 
@@ -267,8 +277,7 @@ crates/edgezero-cli/
   src/
     lib.rs / main.rs / args.rs / adapter.rs / scaffold.rs / demo_server.rs
     generator.rs              # extended: scaffolds <name>-cli + <name>.toml + <name>-core/src/config.rs
-    runner.rs                 # NEW: CommandSpec + CommandRunner + Real/Mock
-    auth.rs / provision.rs / config.rs   # NEW command impls
+    auth.rs / provision.rs / config.rs   # NEW command impls (thin delegates to adapter::execute)
     templates/{core,root,cli,app}/       # cli/ + app/ new; root edgezero.toml.hbs rewritten
 
 crates/edgezero-core/src/
@@ -999,7 +1008,7 @@ on/off.
 **Ship gate:** `app-demo-cli config validate --strict` exits 0;
 corrupted fixtures fail with expected messages.
 
-## 11. Sub-project 5 — `auth` command (+ `CommandRunner`)
+## 11. Sub-project 5 — `auth` command (adapter-trait dispatch)
 
 ```rust
 #[derive(clap::Args, Debug)]      // NO Default — §6.11
@@ -1088,15 +1097,16 @@ provisioned by the Spin runtime / Fermyon at deploy). `provision
   (§6.7); the CLI never writes secret variables.
 
 Component resolution for the KV writeback follows §6.7's rule. No
-`CommandRunner` calls for Spin — it is pure manifest editing.
+shell-out for Spin — it is pure manifest editing.
 
-`--dry-run` prints the would-be `CommandSpec`s and would-be manifest
+`--dry-run` prints the would-be commands and would-be manifest
 edits without performing them.
 
-**Tests:** per-(adapter, kind) mock-runner for cloudflare/fastly with
-scripted stdout; golden ID-extraction parsers; temp-fixture writeback
-verified for `wrangler.toml`, `fastly.toml`, and the Spin
-`key_value_stores` array in `spin.toml`; axum no-op output asserted;
+**Tests:** each adapter crate owns its per-(adapter, kind) writeback
+tests (temp-fixture writeback for `wrangler.toml`, `fastly.toml`,
+and the Spin `key_value_stores` array in `spin.toml`; axum no-op
+output asserted). The CLI's orchestration test asserts dispatch
+and `--dry-run` short-circuits without invoking the adapter;
 `--dry-run` performs nothing.
 
 ## 13. Sub-project 7 — `config push` command
@@ -1228,10 +1238,15 @@ timeout_ms` is read at runtime; the Spin path proves `.`→`__`
   tables — and the on-disk `spin.toml` is asserted **unchanged**
   (dry-run never mutates). The non-dry-run Spin push writing both
   tables is covered by stage 7's tests, not the dry-run assertion.
-- **`auth` / `provision`:** exercised against `MockCommandRunner` (and,
-  for spin/axum provision, against temp-fixture manifests) in tests.
-  Spin `provision` is asserted to write only the `key_value_stores`
-  array, not variables.
+- **`auth` / `provision`:** dispatch tests in `edgezero-cli` use
+  fixture manifests with `auth-login = "echo logged in"` (etc.) and
+  assert that `adapter::execute` is reached for the right
+  `AdapterAction`. The actual native-CLI invocation and any manifest
+  writeback live in each adapter crate's own tests (temp-fixture
+  writeback for `wrangler.toml`, `fastly.toml`, and the Spin
+  `key_value_stores` array in `spin.toml`). Spin `provision` is
+  asserted to write only the `key_value_stores` array, not
+  variables.
 
 **Axum config store backing.** The axum config store is backed by
 `.edgezero/local-config-<id>.json` (gitignored). `config push
@@ -1271,7 +1286,7 @@ one per sub-project, applied in this order:
 | 2     | §8  | Manifest + runtime rewrite (atomic, all four adapters) | H    |
 | 3     | §9  | App-config schema + derive macro + env-overlay loader  | M    |
 | 4     | §10 | `config validate`                                      | L    |
-| 5     | §11 | `auth` + `CommandRunner`                               | M    |
+| 5     | §11 | `auth` (adapter-trait dispatch)                        | M    |
 | 6     | §12 | `provision`                                            | H    |
 | 7     | §13 | `config push`                                          | M    |
 | 8     | §15 | `app-demo` polish (all four adapters) + docs audit     | M    |
