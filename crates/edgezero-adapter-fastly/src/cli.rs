@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -152,17 +153,157 @@ impl Adapter for FastlyCliAdapter {
 
     fn provision(
         &self,
-        _manifest_root: &Path,
-        _adapter_manifest_path: Option<&str>,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _stores: &ProvisionStores<'_>,
-        _dry_run: bool,
+        stores: &ProvisionStores<'_>,
+        dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Stage 6.3 will shell out to `fastly <kind>-store create`
-        // and append [setup.*]/[local_server.*] entries to
-        // fastly.toml.
-        Err("fastly provision is not yet implemented; landing in a follow-up commit".to_owned())
+        // §12: fastly is Multi for every store kind. Each id maps
+        // 1:1 to a Fastly resource (kv-store / config-store /
+        // secret-store) created via the Fastly CLI; the manifest
+        // writeback declares the resource link for `fastly compute
+        // deploy` and the local viceroy server.
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.fastly.adapter].manifest must point at fastly.toml for provision"
+                    .to_owned(),
+            );
+        };
+        let fastly_path = manifest_root.join(rel);
+
+        let mut out = Vec::new();
+        for (kind, ids) in [
+            ("kv", stores.kv),
+            ("config", stores.config),
+            ("secret", stores.secrets),
+        ] {
+            for id in ids {
+                if dry_run {
+                    out.push(format!(
+                        "would run `fastly {kind}-store create --name={id}` and append [setup.{kind}_stores.{id}] / [local_server.{kind}_stores.{id}] to {}",
+                        fastly_path.display()
+                    ));
+                    continue;
+                }
+                if setup_block_present(&fastly_path, kind, id)? {
+                    out.push(format!(
+                        "fastly {kind}-store `{id}` already declared in {}; skipping",
+                        fastly_path.display()
+                    ));
+                    continue;
+                }
+                create_fastly_store(kind, id)?;
+                append_fastly_setup(&fastly_path, kind, id)?;
+                out.push(format!(
+                    "created fastly {kind}-store `{id}`; appended setup tables to {}",
+                    fastly_path.display()
+                ));
+            }
+        }
+        if out.is_empty() {
+            out.push("fastly has no declared stores to provision".to_owned());
+        }
+        Ok(out)
     }
+}
+
+/// Shell out to `fastly <kind>-store create --name=<id>`. Returns
+/// `Ok(())` on success; surfaces the CLI's stderr verbatim on
+/// failure (including the "already exists" error, which is the
+/// caller's signal to fix the toml or use a different name).
+///
+/// # Errors
+/// Returns an error if `fastly` isn't on `PATH`, the child fails to
+/// spawn, or the exit status is non-zero.
+fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
+    let subcommand = format!("{kind}-store");
+    let name_arg = format!("--name={name}");
+    let output = Command::new("fastly")
+        .args([subcommand.as_str(), "create", name_arg.as_str()])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "`fastly {subcommand} create --name={name}` exited with status {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// Probe `fastly.toml` for the existence of
+/// `[setup.<kind>_stores.<id>]`. Treats a missing file as
+/// "not present" so the first provision call can create it.
+fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let plural = format!("{kind}_stores");
+    let exists = doc
+        .get("setup")
+        .and_then(|setup| setup.get(plural.as_str()))
+        .and_then(|kind_tbl| kind_tbl.get(id))
+        .is_some();
+    Ok(exists)
+}
+
+/// Append `[setup.<kind>_stores.<id>]` and
+/// `[local_server.<kind>_stores.<id>]` to `fastly.toml`. Creates
+/// the file (and the parent `[setup]` / `[local_server]` tables)
+/// if absent. Both new blocks are written as empty tables — the
+/// resource-link declaration is enough for `fastly compute deploy`
+/// to honour, and `config push` fills in entries later (§13).
+fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
+    use toml_edit::{table, DocumentMut, Item};
+
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let mut doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+
+    let plural = format!("{kind}_stores");
+    for parent in ["setup", "local_server"] {
+        let parent_entry = doc.entry(parent).or_insert_with(table);
+        let parent_tbl = parent_entry.as_table_mut().ok_or_else(|| {
+            format!(
+                "{}: `{parent}` exists but is not a table; refusing to edit in place",
+                path.display()
+            )
+        })?;
+        let kind_entry = parent_tbl
+            .entry(plural.as_str())
+            .or_insert_with(|| Item::Table(toml_edit::Table::new()));
+        let kind_tbl = kind_entry.as_table_mut().ok_or_else(|| {
+            format!(
+                "{}: `{parent}.{plural}` exists but is not a table; refusing to edit in place",
+                path.display()
+            )
+        })?;
+        if !kind_tbl.contains_key(id) {
+            kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
+        }
+    }
+
+    fs::write(path, doc.to_string())
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(())
 }
 
 /// # Errors
@@ -405,5 +546,212 @@ mod tests {
         fs::write(&manifest, "[package]\nname = \"demo\"\n").unwrap();
         let name = read_package_name(&manifest).unwrap();
         assert_eq!(name, "demo");
+    }
+
+    // ---------- setup_block_present ----------
+
+    #[test]
+    fn setup_block_present_true_when_table_exists() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "name = \"demo\"\n[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
+        )
+        .expect("write");
+        assert!(setup_block_present(&path, "kv", "sessions").expect("probe"));
+    }
+
+    #[test]
+    fn setup_block_present_false_when_id_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n[setup.kv_stores.other]\n").expect("write");
+        assert!(!setup_block_present(&path, "kv", "sessions").expect("probe"));
+    }
+
+    #[test]
+    fn setup_block_present_false_for_missing_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.toml");
+        assert!(!setup_block_present(&path, "kv", "sessions").expect("probe"));
+    }
+
+    // ---------- append_fastly_setup ----------
+
+    #[test]
+    fn append_fastly_setup_creates_both_tables_in_minimal_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        append_fastly_setup(&path, "kv", "sessions").expect("append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("[setup.kv_stores.sessions]"),
+            "setup table added: {after}"
+        );
+        assert!(
+            after.contains("[local_server.kv_stores.sessions]"),
+            "local_server table added: {after}"
+        );
+        assert!(
+            after.contains("name = \"demo\""),
+            "preserved original keys: {after}"
+        );
+    }
+
+    #[test]
+    fn append_fastly_setup_appends_alongside_existing_kind_tables() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "[setup.kv_stores.cache]\n[local_server.kv_stores.cache]\n",
+        )
+        .expect("write");
+        append_fastly_setup(&path, "kv", "sessions").expect("append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("[setup.kv_stores.cache]"),
+            "existing entry kept: {after}"
+        );
+        assert!(
+            after.contains("[setup.kv_stores.sessions]"),
+            "new entry added: {after}"
+        );
+    }
+
+    #[test]
+    fn append_fastly_setup_is_idempotent_on_duplicate_id() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "[setup.kv_stores.sessions]\nfoo = \"keep\"\n[local_server.kv_stores.sessions]\n",
+        )
+        .expect("write");
+        append_fastly_setup(&path, "kv", "sessions").expect("idempotent append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("foo = \"keep\""),
+            "did not stomp existing key: {after}"
+        );
+    }
+
+    #[test]
+    fn append_fastly_setup_creates_file_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Note: no fs::write — file starts absent.
+        append_fastly_setup(&path, "config", "app_config").expect("create");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(after.contains("[setup.config_stores.app_config]"));
+        assert!(after.contains("[local_server.config_stores.app_config]"));
+    }
+
+    #[test]
+    fn append_fastly_setup_preserves_top_comments() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "# managed by hand -- please keep this line\nname = \"demo\"\n",
+        )
+        .expect("write");
+        append_fastly_setup(&path, "secret", "default").expect("append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("# managed by hand"),
+            "preserved comment: {after}"
+        );
+    }
+
+    // ---------- provision (dry-run + error path) ----------
+
+    #[test]
+    fn provision_dry_run_does_not_invoke_fastly() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let kv_ids = vec!["sessions".to_owned()];
+        let config_ids = vec!["app_config".to_owned()];
+        let secret_ids = vec!["default".to_owned()];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        let out = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+        // 1 KV + 1 config + 1 secret = 3 status lines.
+        assert_eq!(out.len(), 3);
+        assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
+        assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
+        assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
+        // Manifest untouched.
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
+    }
+
+    #[test]
+    fn provision_errors_when_adapter_manifest_path_missing() {
+        let dir = tempdir().expect("tempdir");
+        let kv_ids = vec!["sessions".to_owned()];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = FastlyCliAdapter
+            .provision(dir.path(), None, None, &stores, true)
+            .expect_err("missing adapter manifest path must error");
+        assert!(
+            err.contains("fastly.toml"),
+            "error names what's missing: {err}"
+        );
+    }
+
+    #[test]
+    fn provision_with_no_declared_stores_says_so() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        let out = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect("no-store provision is fine");
+        assert_eq!(out, vec!["fastly has no declared stores to provision"]);
+    }
+
+    #[test]
+    fn provision_skips_id_when_setup_block_already_present() {
+        // setup_block_present's role in the flow: re-running
+        // provision after the user already declared a store in
+        // fastly.toml must be a no-op (no shell-out to fastly).
+        // We can verify this in a real (non-dry-run) call because
+        // the skip path bypasses create_fastly_store entirely.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
+        )
+        .expect("write");
+        let kv_ids = vec!["sessions".to_owned()];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = FastlyCliAdapter
+            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .expect("skip path succeeds without invoking fastly");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("already declared"), "got: {out:?}");
     }
 }
