@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -163,15 +164,48 @@ impl Adapter for CloudflareCliAdapter {
 
     fn provision(
         &self,
-        _manifest_root: &Path,
-        _adapter_manifest_path: Option<&str>,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _stores: &ProvisionStores<'_>,
-        _dry_run: bool,
+        stores: &ProvisionStores<'_>,
+        dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Stage 6.2 will shell out to `wrangler kv namespace create`,
-        // parse the namespace id from stdout, and patch wrangler.toml.
-        Err("cloudflare provision is not yet implemented; landing in a follow-up commit".to_owned())
+        // §12: KV ids and config ids both back to Cloudflare KV
+        // namespaces. Secrets are runtime-managed via
+        // `wrangler secret put` — provision is a no-op for them.
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.cloudflare.adapter].manifest must point at wrangler.toml for provision"
+                    .to_owned(),
+            );
+        };
+        let wrangler_path = manifest_root.join(rel);
+
+        let mut out = Vec::new();
+        for id in stores.kv.iter().chain(stores.config.iter()) {
+            if dry_run {
+                out.push(format!(
+                    "would run `wrangler kv namespace create {id}` and append [[kv_namespaces]] binding = \"{id}\" to {}",
+                    wrangler_path.display()
+                ));
+                continue;
+            }
+            let namespace_id = create_kv_namespace(id)?;
+            append_kv_namespace(&wrangler_path, id, &namespace_id)?;
+            out.push(format!(
+                "created KV namespace `{id}` (id={namespace_id}); appended to {}",
+                wrangler_path.display()
+            ));
+        }
+        for id in stores.secrets {
+            out.push(format!(
+                "cloudflare secret `{id}` is runtime-managed via `wrangler secret put`; nothing to provision"
+            ));
+        }
+        if out.is_empty() {
+            out.push("cloudflare has no declared stores to provision".to_owned());
+        }
+        Ok(out)
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -180,6 +214,129 @@ impl Adapter for CloudflareCliAdapter {
         // Secrets is a single flat bag).
         &["secrets"]
     }
+}
+
+/// Shell out to `wrangler kv namespace create <binding>`, capture
+/// stdout, and parse the resulting namespace id. The CLI's
+/// `provision` command resolves this against the user's
+/// `wrangler.toml` and writes the `[[kv_namespaces]]` entry.
+///
+/// # Errors
+/// Returns an error if `wrangler` isn't on `PATH`, the child fails
+/// to spawn, the exit status is non-zero, or stdout doesn't
+/// include a parseable `id = "..."` line.
+fn create_kv_namespace(binding: &str) -> Result<String, String> {
+    let output = Command::new("wrangler")
+        .args(["kv", "namespace", "create", binding])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`wrangler` not found on PATH; {WRANGLER_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `wrangler`: {err}")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "`wrangler kv namespace create {binding}` exited with status {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    extract_namespace_id(&stdout).ok_or_else(|| {
+        format!(
+            "wrangler created `{binding}` but stdout did not include a parseable `id = \"...\"` line; raw output:\n{stdout}"
+        )
+    })
+}
+
+/// Pull the namespace id out of `wrangler kv namespace create`
+/// stdout. Wrangler 3+ prints (something like):
+///
+/// ```text
+/// 🌀 Creating namespace with title "..."
+/// ✨ Success!
+/// Add the following to your configuration file in your kv_namespaces array:
+/// [[kv_namespaces]]
+/// binding = "my-kv"
+/// id = "abc123..."
+/// ```
+///
+/// We tolerate leading whitespace + surrounding decoration; the
+/// only contract is a line containing `id` `=` `"<value>"`.
+fn extract_namespace_id(stdout: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        let Some(after_id_kw) = trimmed.strip_prefix("id") else {
+            continue;
+        };
+        let Some(after_eq) = after_id_kw.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let Some(quoted) = after_eq.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some((id, _)) = quoted.split_once('"') else {
+            continue;
+        };
+        if !id.is_empty() {
+            return Some(id.to_owned());
+        }
+    }
+    None
+}
+
+/// Append a `[[kv_namespaces]]` block to the user's `wrangler.toml`
+/// (creating the array if absent). Existing entries are preserved;
+/// if a binding with the same name is already present this is a
+/// no-op (idempotent across re-runs).
+fn append_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), String> {
+    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table, Value};
+
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let mut doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+
+    // Accept both representations for the idempotency check so a
+    // re-run silently skips even if the user happens to use the
+    // inline-array form. We only force array-of-tables on insert.
+    let already_present = match doc.get("kv_namespaces") {
+        Some(Item::ArrayOfTables(arr)) => arr
+            .iter()
+            .any(|table| table.get("binding").and_then(Item::as_str) == Some(binding)),
+        Some(Item::Value(Value::Array(arr))) => arr.iter().any(|item| {
+            item.as_inline_table()
+                .and_then(|table| table.get("binding"))
+                .and_then(Value::as_str)
+                == Some(binding)
+        }),
+        Some(_) | None => false,
+    };
+    if already_present {
+        return Ok(());
+    }
+
+    let entry = doc
+        .entry("kv_namespaces")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    let arr_of_tables = entry.as_array_of_tables_mut().ok_or_else(|| {
+        format!(
+            "{}: `kv_namespaces` exists but is not an array-of-tables (`[[kv_namespaces]]`); convert it manually before re-running provision",
+            path.display()
+        )
+    })?;
+
+    let mut new_table = Table::new();
+    new_table.insert("binding", value(binding));
+    new_table.insert("id", value(id));
+    arr_of_tables.push(new_table);
+
+    fs::write(path, doc.to_string())
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(())
 }
 
 /// # Errors
@@ -357,4 +514,203 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // ---------- extract_namespace_id ----------
+
+    #[test]
+    fn extract_namespace_id_parses_wrangler_3_output() {
+        // wrangler decorates these lines with unicode glyphs in real
+        // output; we drop them from the fixture to keep the source
+        // file ASCII-only (clippy::non_ascii_literal). The parser
+        // only cares about the literal `id = "..."` line.
+        let stdout = r#"Creating namespace with title "my-kv"
+Success!
+Add the following to your configuration file in your kv_namespaces array:
+[[kv_namespaces]]
+binding = "my-kv"
+id = "abc123def456"
+"#;
+        assert_eq!(
+            extract_namespace_id(stdout).as_deref(),
+            Some("abc123def456")
+        );
+    }
+
+    #[test]
+    fn extract_namespace_id_tolerates_extra_whitespace() {
+        let stdout = "   id   =   \"xyz789\"   \n";
+        assert_eq!(extract_namespace_id(stdout).as_deref(), Some("xyz789"));
+    }
+
+    #[test]
+    fn extract_namespace_id_returns_none_on_missing_id_line() {
+        assert!(extract_namespace_id("nothing to see here").is_none());
+        assert!(extract_namespace_id("").is_none());
+        assert!(
+            extract_namespace_id("id = \"\"").is_none(),
+            "empty value not a real id"
+        );
+    }
+
+    #[test]
+    fn extract_namespace_id_ignores_unrelated_lines_starting_with_id() {
+        // A line like `identifier = "..."` shouldn't match — we
+        // strip exactly the prefix `id` then require `=`.
+        assert!(extract_namespace_id("identifier = \"x\"").is_none());
+    }
+
+    // ---------- append_kv_namespace ----------
+
+    fn write_wrangler(dir: &Path, contents: &str) -> PathBuf {
+        let path = dir.join("wrangler.toml");
+        fs::write(&path, contents).expect("write wrangler.toml");
+        path
+    }
+
+    #[test]
+    fn append_kv_namespace_adds_block_to_minimal_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(dir.path(), "name = \"my-worker\"\n");
+        append_kv_namespace(&path, "sessions", "abc123").expect("append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("[[kv_namespaces]]"),
+            "added array entry: {after}"
+        );
+        assert!(
+            after.contains("binding = \"sessions\""),
+            "binding present: {after}"
+        );
+        assert!(after.contains("id = \"abc123\""), "id present: {after}");
+        assert!(
+            after.contains("name = \"my-worker\""),
+            "preserved original keys: {after}"
+        );
+    }
+
+    #[test]
+    fn append_kv_namespace_appends_to_existing_array_of_tables() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "[[kv_namespaces]]\nbinding = \"cache\"\nid = \"old\"\n",
+        );
+        append_kv_namespace(&path, "sessions", "abc123").expect("append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("binding = \"cache\""),
+            "existing entry kept: {after}"
+        );
+        assert!(
+            after.contains("binding = \"sessions\""),
+            "new entry added: {after}"
+        );
+        assert_eq!(
+            after.matches("[[kv_namespaces]]").count(),
+            2,
+            "two entries: {after}"
+        );
+    }
+
+    #[test]
+    fn append_kv_namespace_is_idempotent_on_duplicate_binding() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"existing\"\n",
+        );
+        append_kv_namespace(&path, "sessions", "new-id").expect("idempotent append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("id = \"existing\""),
+            "did not overwrite existing id: {after}"
+        );
+        assert_eq!(
+            after.matches("binding = \"sessions\"").count(),
+            1,
+            "no duplicate binding: {after}"
+        );
+    }
+
+    #[test]
+    fn append_kv_namespace_preserves_top_comments() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "# managed by hand -- please keep this line\nname = \"my-worker\"\n",
+        );
+        append_kv_namespace(&path, "sessions", "abc123").expect("append");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("# managed by hand"),
+            "preserved comment: {after}"
+        );
+    }
+
+    // ---------- provision (dry-run + error path) ----------
+
+    #[test]
+    fn provision_dry_run_does_not_invoke_wrangler() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let kv_ids = vec!["sessions".to_owned(), "cache".to_owned()];
+        let config_ids = vec!["app_config".to_owned()];
+        let secret_ids = vec!["default".to_owned()];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        let out = CloudflareCliAdapter
+            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+        // 2 KV + 1 config + 1 secret = 4 status lines.
+        assert_eq!(out.len(), 4);
+        assert!(out[0].contains("would run `wrangler kv namespace create sessions`"));
+        assert!(out[1].contains("would run `wrangler kv namespace create cache`"));
+        assert!(out[2].contains("would run `wrangler kv namespace create app_config`"));
+        assert!(out[3].contains("runtime-managed via `wrangler secret put`"));
+        // Manifest untouched.
+        let after = fs::read_to_string(dir.path().join("wrangler.toml")).expect("read");
+        assert_eq!(after, "name = \"demo\"\n", "dry-run mutated wrangler.toml");
+    }
+
+    #[test]
+    fn provision_errors_when_adapter_manifest_path_missing() {
+        let dir = tempdir().expect("tempdir");
+        let kv_ids = vec!["sessions".to_owned()];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = CloudflareCliAdapter
+            .provision(dir.path(), None, None, &stores, true)
+            .expect_err("missing adapter manifest path must error");
+        assert!(
+            err.contains("wrangler.toml"),
+            "error names what's missing: {err}"
+        );
+    }
+
+    #[test]
+    fn provision_with_no_declared_stores_says_so() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        let out = CloudflareCliAdapter
+            .provision(dir.path(), Some("wrangler.toml"), None, &stores, false)
+            .expect("no-store provision is fine");
+        assert_eq!(out, vec!["cloudflare has no declared stores to provision"]);
+    }
 }

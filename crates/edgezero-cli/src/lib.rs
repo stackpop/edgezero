@@ -256,6 +256,7 @@ serve = "echo"
 
 [adapters.cloudflare.adapter]
 crate = "crates/demo-cf"
+manifest = "wrangler.toml"
 [adapters.cloudflare.commands]
 build = "echo"
 deploy = "echo"
@@ -573,9 +574,10 @@ auth-status = "echo whoami"
 
     #[test]
     fn run_provision_stubbed_adapters_report_not_yet_implemented() {
-        // cloudflare/fastly/spin land in follow-up commits.
-        // Until then they explicitly Err — better than silently
-        // pretending to provision.
+        // fastly + spin land in follow-up commits. Until then
+        // they explicitly Err — better than silently pretending
+        // to provision. cloudflare's real impl ships in 6.2 and
+        // is covered by `run_provision_cloudflare_dry_run_dispatches`.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -583,7 +585,7 @@ auth-status = "echo whoami"
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
-        for adapter in ["cloudflare", "fastly", "spin"] {
+        for adapter in ["fastly", "spin"] {
             let err = run_provision(&args::ProvisionArgs {
                 adapter: adapter.to_owned(),
                 dry_run: false,
@@ -595,6 +597,32 @@ auth-status = "echo whoami"
                 "{adapter} stub should say `not yet implemented`: {err}"
             );
         }
+    }
+
+    #[test]
+    fn run_provision_cloudflare_dry_run_dispatches_to_adapter() {
+        // Real impl shipped in 6.2 — dry-run path doesn't shell
+        // out to wrangler, so CI can exercise dispatch without
+        // wrangler installed. Non-dry-run is an operator workflow
+        // and isn't exercised here (spec §13).
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        // cloudflare's provision resolves wrangler.toml relative
+        // to the manifest root — write one so the resolver finds
+        // a file even though dry-run won't read it.
+        fs::write(temp.path().join("wrangler.toml"), "name = \"demo\"\n")
+            .expect("write wrangler.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&args::ProvisionArgs {
+            adapter: "cloudflare".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("cloudflare dry-run dispatches cleanly");
     }
 
     #[test]
