@@ -8,7 +8,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
-use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
+use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction, ProvisionStores};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -149,6 +149,46 @@ impl Adapter for AxumCliAdapter {
 
     fn name(&self) -> &'static str {
         "axum"
+    }
+
+    fn provision(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        stores: &ProvisionStores<'_>,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // §12: axum has no remote resources. Print one note per
+        // declared store id so the operator sees the CLI heard
+        // them — same shape `dry_run` would have, since there is
+        // nothing to actually perform.
+        let mut out = Vec::with_capacity(
+            stores
+                .kv
+                .len()
+                .saturating_add(stores.config.len())
+                .saturating_add(stores.secrets.len()),
+        );
+        for id in stores.kv {
+            out.push(format!(
+                "axum KV store `{id}` is in-memory; nothing to provision"
+            ));
+        }
+        for id in stores.config {
+            out.push(format!(
+                "axum config store `{id}` reads `.edgezero/local-config-{id}.json`; nothing to provision"
+            ));
+        }
+        for id in stores.secrets {
+            out.push(format!(
+                "axum secret store `{id}` reads env vars; nothing to provision"
+            ));
+        }
+        if out.is_empty() {
+            out.push("axum has no declared stores to provision".to_owned());
+        }
+        Ok(out)
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {

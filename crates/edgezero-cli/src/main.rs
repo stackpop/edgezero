@@ -19,6 +19,7 @@ fn main() {
         #[cfg(feature = "demo-example")]
         Command::Demo => edgezero_cli::run_demo(),
         Command::New(args) => edgezero_cli::run_new(&args),
+        Command::Provision(args) => edgezero_cli::run_provision(&args),
         Command::Serve(args) => edgezero_cli::run_serve(&args),
     };
     if let Err(err) = result {

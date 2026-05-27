@@ -7,7 +7,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
-use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
+use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction, ProvisionStores};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -148,6 +148,20 @@ impl Adapter for FastlyCliAdapter {
 
     fn name(&self) -> &'static str {
         "fastly"
+    }
+
+    fn provision(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _stores: &ProvisionStores<'_>,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Stage 6.3 will shell out to `fastly <kind>-store create`
+        // and append [setup.*]/[local_server.*] entries to
+        // fastly.toml.
+        Err("fastly provision is not yet implemented; landing in a follow-up commit".to_owned())
     }
 }
 
