@@ -15,6 +15,8 @@ cli = [
     "dep:edgezero-adapter",
     "edgezero-adapter/cli",
     "dep:ctor",
+    "dep:serde_json",
+    "dep:tempfile",
     "dep:toml_edit",
     "dep:walkdir",
 ]
@@ -34,6 +36,7 @@ futures-util = { workspace = true }
 log = { workspace = true }
 ctor = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 toml_edit = { workspace = true, optional = true }
 worker = { version = "0.8", default-features = false, features = ["http"], optional = true }
 walkdir = { workspace = true, optional = true }

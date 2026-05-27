@@ -1499,10 +1499,13 @@ timeout_ms = 1500
         assert_eq!(parsed["tags"], "[\"a\",\"b\",\"c\"]");
     }
 
-    // ---------- stub adapters (Stage 7.2/7.3/7.4 land impls) ----------
+    // ---------- stub adapters (Stage 7.3/7.4 land impls) ----------
 
     #[test]
-    fn raw_push_cloudflare_stub_reports_not_yet_implemented() {
+    fn raw_push_cloudflare_dry_run_dispatches_to_adapter() {
+        // Real impl shipped in 7.2 — dry-run resolves the namespace
+        // id from wrangler.toml but doesn't shell out, so CI can
+        // exercise dispatch without wrangler installed.
         let manifest_cf = r#"
 [app]
 name = "demo-app"
@@ -1522,13 +1525,18 @@ ids = ["app_config"]
 [stores.secrets]
 ids = ["default"]
 "#;
-        let (_dir, manifest, _) = setup_project(manifest_cf, VALID_APP_CONFIG);
-        let err = run_config_push(&push_args(&manifest, "cloudflare"))
-            .expect_err("cloudflare stub must err");
-        assert!(
-            err.contains("not yet implemented"),
-            "stub error mentions not-yet-implemented: {err}"
-        );
+        let (dir, manifest, _) = setup_project(manifest_cf, VALID_APP_CONFIG);
+        // The adapter resolves wrangler.toml relative to the
+        // manifest root and reads the namespace id by binding —
+        // write one so dispatch reaches the dry-run branch.
+        fs::write(
+            dir.path().join("wrangler.toml"),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"abc123\"\n",
+        )
+        .expect("write wrangler.toml");
+        let mut args = push_args(&manifest, "cloudflare");
+        args.dry_run = true;
+        run_config_push(&args).expect("cloudflare dry-run dispatches cleanly");
     }
 
     // ---------- typed push ----------
