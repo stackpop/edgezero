@@ -314,10 +314,13 @@ MY_APP__SERVICE__TIMEOUT_MS=2500 \
     cargo run -p my-app-adapter-axum
 ```
 
-Two sibling keys collapsing to the same env segment (e.g. `foo-bar`
-and `foo_bar`) is rejected as an `EnvOverlay` error before any
-override is applied, so a misconfiguration leaves the file values
-intact.
+The env-segment translation is uppercase-only — it does **not**
+substitute `-` for `_`, so dashed and underscored TOML keys remain
+distinct env segments. The only way two siblings collapse is when
+they differ only in letter case (e.g. `greeting_a` and `GREETING_A`,
+both uppercasing to `GREETING_A`). That case is rejected as an
+`EnvOverlay` error before any override is applied, so a
+misconfiguration leaves the file values intact.
 
 ## Adapters Section
 

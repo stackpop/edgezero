@@ -901,15 +901,17 @@ generic loader with env-var overlay (§6.10).
 
 **Source changes:** `edgezero-core::app_config`; `edgezero-macros`
 `AppConfig` derive + `#[proc_macro_derive]` export; generator
-templates for `<name>.toml` (with a nested `[config.service]` section)
-and `<name>-core/src/config.rs` (with `#[serde(deny_unknown_fields)]`);
-`examples/app-demo/app-demo.toml` + `app-demo-core/src/config.rs`.
+templates for `<name>.toml` (with a nested `[service]` table at the
+root — no `[config]` wrapper) and `<name>-core/src/config.rs` (with
+`#[serde(deny_unknown_fields)]`); `examples/app-demo/app-demo.toml`
+
+- `app-demo-core/src/config.rs`.
 
 **Generated template vs the `app-demo` example — deliberately
 different.** The **generated** `<name>-core/src/config.rs` (what
 `edgezero new` scaffolds) is the _common-case_ starting point: a
-`greeting` field, the nested `[config.service]` section (to exercise
-env overlay), and a single plain `#[secret]` field as the common
+`greeting` field, a nested `[service]` table (to exercise the env
+overlay), and a single plain `#[secret]` field as the common
 secret pattern. It does **not** include `#[secret(store_ref)]` —
 `store_ref` only buys multiple secret stores on a Fastly-only project
 (§6.8), so putting it in every fresh scaffold would teach the edge

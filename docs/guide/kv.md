@@ -18,7 +18,11 @@ struct VisitData {
 }
 
 #[action]
-async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
+async fn visit_counter(kv: Kv) -> Result<String, EdgeError> {
+    let store = kv
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default kv configured"))?;
+
     // Read-modify-write helper (Note: not atomic!)
     let data = store
         .read_modify_write("visits", VisitData::default(), |mut d| {

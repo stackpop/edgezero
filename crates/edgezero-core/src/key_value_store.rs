@@ -37,7 +37,10 @@
 //!
 //! ```rust,ignore
 //! #[action]
-//! async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
+//! async fn visit_counter(kv: Kv) -> Result<String, EdgeError> {
+//!     let store = kv
+//!         .default()
+//!         .ok_or_else(|| EdgeError::service_unavailable("no default kv"))?;
 //!     let count: i32 = store.read_modify_write("visits", 0, |n| n + 1).await?;
 //!     Ok(format!("Visit #{count}"))
 //! }
