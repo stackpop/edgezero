@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -22,6 +23,12 @@ pub enum AdapterAction {
 }
 
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
+///
+/// The non-`execute` methods carry the adapter's `config validate`
+/// rules (spec §10). They take primitive parameters (no `Manifest` /
+/// `SecretField` from `edgezero-core`) so this crate stays dep-free
+/// of `edgezero-core`. Defaults are no-ops; adapters override what
+/// they actually need.
 pub trait Adapter: Sync + Send {
     /// Execute the requested action with optional adapter-specific args.
     ///
@@ -31,6 +38,73 @@ pub trait Adapter: Sync + Send {
 
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
+
+    /// Store kinds for which this adapter is Single-capable per
+    /// spec §6.6 — `--strict` rejects `[stores.<kind>].ids.len() > 1`
+    /// when any listed kind matches. Default: `&[]` (Multi for
+    /// every store kind).
+    #[inline]
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Adapter-specific manifest check — e.g. Spin's
+    /// `[component.*]` discovery in `spin.toml`. The adapter
+    /// resolves its own per-adapter manifest path relative to
+    /// `manifest_root` (the directory containing the user's
+    /// `edgezero.toml`). `adapter_manifest_path` and
+    /// `component_selector` come from
+    /// `[adapters.<name>.adapter].manifest` and `.component`
+    /// respectively. Default: no-op.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string on any manifest
+    /// inconsistency the adapter can detect.
+    #[inline]
+    fn validate_adapter_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Reject the user's `<name>.toml` if it violates an
+    /// adapter-specific naming constraint — Spin's
+    /// `^[a-z][a-z0-9_]*$` after `.→__` translation, for example.
+    /// `keys` are the flattened dotted paths into the typed
+    /// app-config (e.g. `["greeting", "service.timeout_ms"]`).
+    /// Default: no-op.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if any key violates
+    /// the adapter's contract.
+    #[inline]
+    fn validate_app_config_keys(&self, _keys: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Typed-only check that needs `#[secret]` field values — the
+    /// CLI calls this only from the typed validation flow.
+    /// `plain_secrets` carries only `#[secret]` (`KeyInDefault`)
+    /// entries as `(field_name, value)`; `#[secret(store_ref)]`
+    /// values are runtime store ids and never enter the adapter's
+    /// flat variable namespace, so they are excluded by the CLI
+    /// before calling. Default: no-op.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string on any conflict
+    /// between config keys and secret values (e.g. a Spin variable
+    /// collision).
+    #[inline]
+    fn validate_typed_secrets(
+        &self,
+        _config_keys: &[&str],
+        _plain_secrets: &[(&str, &str)],
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Registers an adapter so it can be discovered by the CLI.
@@ -82,6 +156,10 @@ mod tests {
         name: &'static str,
     }
 
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "TestAdapter only exercises register / get / execute; the validation methods inherit the trait defaults (no-ops)"
+    )]
     impl Adapter for TestAdapter {
         fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
             HIT.store(self.hit_value, Ordering::SeqCst);

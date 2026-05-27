@@ -126,6 +126,10 @@ const WRANGLER_INSTALL_HINT: &str =
 
 struct CloudflareCliAdapter;
 
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; the trait defaults already model that"
+)]
 impl Adapter for CloudflareCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
@@ -155,6 +159,13 @@ impl Adapter for CloudflareCliAdapter {
 
     fn name(&self) -> &'static str {
         "cloudflare"
+    }
+
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        // §6.6: cloudflare is Multi for KV (KV namespaces) and
+        // Config (KV namespaces), Single for Secrets (Worker
+        // Secrets is a single flat bag).
+        &["secrets"]
     }
 }
 
