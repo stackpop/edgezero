@@ -22,6 +22,8 @@
 #[cfg(feature = "cli")]
 mod adapter;
 #[cfg(feature = "cli")]
+mod auth;
+#[cfg(feature = "cli")]
 mod config;
 #[cfg(all(feature = "cli", feature = "demo-example"))]
 mod demo_server;
@@ -36,6 +38,8 @@ mod scaffold;
 #[cfg(feature = "cli")]
 pub mod args;
 
+#[cfg(feature = "cli")]
+pub use auth::run_auth;
 #[cfg(feature = "cli")]
 pub use config::{run_config_validate, run_config_validate_typed};
 
@@ -247,6 +251,9 @@ profile = "release"
 build = "echo build"
 deploy = "echo deploy"
 serve = "echo serve"
+auth-login = "echo logged in"
+auth-logout = "echo logged out"
+auth-status = "echo whoami"
 "#;
 
     struct EnvOverride {
@@ -396,6 +403,64 @@ serve = "echo serve"
             adapter: "fastly".to_owned(),
         };
         run_serve(&args).expect("serve command runs");
+    }
+
+    /// Auth dispatches through the same `adapter::execute` path as
+    /// `build` / `deploy` / `serve`, so the orchestration test
+    /// follows the same shape — configure the manifest's
+    /// `auth-{login,logout,status}` override to a harmless `echo`
+    /// command and assert each subcommand runs cleanly. The real
+    /// per-adapter implementations (`wrangler login`, etc.) live in
+    /// the adapter crates and are not exercised in CI per spec §13.
+    #[cfg(not(windows))]
+    #[test]
+    fn run_auth_dispatches_each_subcommand_via_manifest_override() {
+        use args::{AuthArgs, AuthSub};
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, BASIC_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        for sub in [
+            AuthSub::Login {
+                adapter: "fastly".to_owned(),
+            },
+            AuthSub::Logout {
+                adapter: "fastly".to_owned(),
+            },
+            AuthSub::Status {
+                adapter: "fastly".to_owned(),
+            },
+        ] {
+            run_auth(&AuthArgs { sub }).expect("auth subcommand runs");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_auth_rejects_unknown_adapter() {
+        use args::{AuthArgs, AuthSub};
+
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, BASIC_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_auth(&AuthArgs {
+            sub: AuthSub::Login {
+                adapter: "wat".to_owned(),
+            },
+        })
+        .expect_err("unknown adapter must error");
+        assert!(
+            err.contains("wat"),
+            "error should name the unknown adapter: {err}"
+        );
     }
 
     #[test]

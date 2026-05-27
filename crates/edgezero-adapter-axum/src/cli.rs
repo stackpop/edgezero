@@ -127,6 +127,15 @@ struct EdgezeroAxumConfig {
 impl Adapter for AxumCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
+            // The axum adapter is the in-process native dev server —
+            // there is no remote auth provider to sign in/out of.
+            // Per spec §11 this is an explicit no-op.
+            AdapterAction::AuthLogin | AdapterAction::AuthLogout | AdapterAction::AuthStatus => {
+                log::info!(
+                    "[edgezero] axum has no remote auth surface; `auth` is a no-op for this adapter"
+                );
+                Ok(())
+            }
             AdapterAction::Build => build(args),
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),

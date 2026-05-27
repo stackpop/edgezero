@@ -213,6 +213,52 @@ app-demo-cli config validate --strict
 
 **Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure (the loader / validator returns early at the first mismatch).
 
+### edgezero auth
+
+Sign in, sign out, or check session against the adapter's native
+auth surface. `EdgeZero` stores no credentials of its own — `auth`
+delegates to the adapter, which decides whether to shell out to the
+platform CLI, hit an HTTP API, or no-op (spec §11).
+
+```bash
+edgezero auth login  --adapter <name>
+edgezero auth logout --adapter <name>
+edgezero auth status --adapter <name>
+```
+
+Dispatch follows the same path as `build` / `deploy` / `serve`:
+the CLI looks up `[adapters.<name>.commands].auth-login` (or
+`auth-logout` / `auth-status`) in `edgezero.toml` first; if absent,
+it delegates to the adapter crate's built-in implementation.
+
+**Adapter built-ins:**
+
+| `--adapter`  | `login`                 | `logout`                | `status`              |
+| ------------ | ----------------------- | ----------------------- | --------------------- |
+| `axum`       | no-op (no remote auth)  | no-op                   | no-op                 |
+| `cloudflare` | `wrangler login`        | `wrangler logout`       | `wrangler whoami`     |
+| `fastly`     | `fastly profile create` | `fastly profile delete` | `fastly profile list` |
+| `spin`       | `spin cloud login`      | `spin cloud logout`     | `spin cloud info`     |
+
+**Per-project override** — pin to a script or a different binary in
+`edgezero.toml` (same precedence as `build` / `deploy` / `serve`
+overrides):
+
+```toml
+[adapters.cloudflare.commands]
+auth-login  = "./scripts/cf-login.sh"
+auth-status = "wrangler whoami --json"
+```
+
+The native CLI must be on `PATH`; a missing binary surfaces with an
+install hint. A non-zero exit propagates with its stderr verbatim.
+
+::: tip Axum is local-only
+`auth --adapter axum` is intentionally a no-op — the native dev
+server reads secrets from process env vars (`EDGEZERO__STORES__SECRETS__<ID>__…`),
+not from a remote auth provider.
+:::
+
 ## Environment Variables
 
 The CLI respects these environment variables:

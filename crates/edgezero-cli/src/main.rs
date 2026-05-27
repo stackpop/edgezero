@@ -8,6 +8,7 @@ fn main() {
 
     edgezero_cli::init_cli_logger();
     let result = match Args::parse().cmd {
+        Command::Auth(args) => edgezero_cli::run_auth(&args),
         Command::Build(args) => edgezero_cli::run_build(&args),
         // Default `edgezero` binary has no app-config struct, so it
         // runs the **raw** validator. Downstream CLIs that own a

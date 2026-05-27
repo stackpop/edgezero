@@ -23,17 +23,9 @@
 //!
 //! # Usage
 //!
-//! Access the KV store in a handler via [`crate::context::RequestContext::kv_handle`]:
-//!
-//! ```rust,ignore
-//! async fn visit_counter(ctx: RequestContext) -> Result<String, EdgeError> {
-//!     let kv = ctx.kv_handle().expect("kv store configured");
-//!     let count: i32 = kv.read_modify_write("visits", 0, |n| n + 1).await?;
-//!     Ok(format!("Visit #{count}"))
-//! }
-//! ```
-//!
-//! Or use the [`crate::extractor::Kv`] extractor with the `#[action]` macro:
+//! Use the [`crate::extractor::Kv`] extractor with the `#[action]`
+//! macro and pick a store by id at the call site (Stage 2 portable
+//! store API):
 //!
 //! ```rust,ignore
 //! #[action]
@@ -42,6 +34,17 @@
 //!         .default()
 //!         .ok_or_else(|| EdgeError::service_unavailable("no default kv"))?;
 //!     let count: i32 = store.read_modify_write("visits", 0, |n| n + 1).await?;
+//!     Ok(format!("Visit #{count}"))
+//! }
+//! ```
+//!
+//! Or reach the store through [`crate::context::RequestContext`]
+//! when you have a context instead of an extractor:
+//!
+//! ```rust,ignore
+//! async fn visit_counter(ctx: RequestContext) -> Result<String, EdgeError> {
+//!     let kv = ctx.kv_store_default().expect("default kv configured");
+//!     let count: i32 = kv.read_modify_write("visits", 0, |n| n + 1).await?;
 //!     Ok(format!("Visit #{count}"))
 //! }
 //! ```
@@ -338,7 +341,10 @@ pub enum KvError {
 ///
 /// ```ignore
 /// #[action]
-/// async fn handler(Kv(store): Kv) -> Result<String, EdgeError> {
+/// async fn handler(kv: Kv) -> Result<String, EdgeError> {
+///     let store = kv
+///         .default()
+///         .ok_or_else(|| EdgeError::service_unavailable("no default kv"))?;
 ///     let count: i32 = store.get_or("visits", 0).await?;
 ///     store.put("visits", &(count + 1)).await?;
 ///     Ok(format!("visits: {}", count + 1))

@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -126,6 +127,12 @@ struct CloudflareCliAdapter;
 impl Adapter for CloudflareCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
+            // `wrangler` is the native sign-in surface for Cloudflare
+            // Workers. EdgeZero stores no credentials — this is a thin
+            // shell-out (spec §11).
+            AdapterAction::AuthLogin => run_native("wrangler", &["login"]),
+            AdapterAction::AuthLogout => run_native("wrangler", &["logout"]),
+            AdapterAction::AuthStatus => run_native("wrangler", &["whoami"]),
             AdapterAction::Build => build(args).map(|artifact| {
                 log::info!(
                     "[edgezero] Cloudflare build artifact -> {}",
@@ -140,6 +147,31 @@ impl Adapter for CloudflareCliAdapter {
 
     fn name(&self) -> &'static str {
         "cloudflare"
+    }
+}
+
+/// Spawn `program args…` inheriting parent stdio, returning a
+/// human-readable error if the binary is missing from `PATH` or the
+/// child exits non-zero. Used by the auth dispatch — kept here rather
+/// than in a shared crate because each adapter shells out at most
+/// once per action and the helper is six lines.
+fn run_native(program: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(program).args(args).status().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!(
+                "`{program}` not found on PATH; install the Cloudflare CLI (`npm install -g wrangler`) and try again"
+            )
+        } else {
+            format!("failed to spawn `{program}`: {err}")
+        }
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{program} {}` exited with status {status}",
+            args.join(" ")
+        ))
     }
 }
 

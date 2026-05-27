@@ -431,6 +431,20 @@ pub struct ManifestAdapterBuild {
 #[derive(Debug, Default, Deserialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestAdapterCommands {
+    /// Per-project override for `edgezero auth login --adapter <name>`.
+    /// `None` (the default) means "use the adapter's built-in
+    /// command" — `wrangler login`, `fastly profile create`, etc.
+    #[serde(default, rename = "auth-login")]
+    #[validate(length(min = 1_u64))]
+    pub auth_login: Option<String>,
+    /// Per-project override for `edgezero auth logout --adapter <name>`.
+    #[serde(default, rename = "auth-logout")]
+    #[validate(length(min = 1_u64))]
+    pub auth_logout: Option<String>,
+    /// Per-project override for `edgezero auth status --adapter <name>`.
+    #[serde(default, rename = "auth-status")]
+    #[validate(length(min = 1_u64))]
+    pub auth_status: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub build: Option<String>,

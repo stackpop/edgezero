@@ -10,6 +10,10 @@ pub struct Args {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Sign in / out / status against the adapter's native CLI
+    /// (`wrangler` / `fastly` / `spin`). `EdgeZero` stores no
+    /// credentials itself — `auth` just delegates (spec §11).
+    Auth(AuthArgs),
     /// Build the project for a target edge.
     Build(BuildArgs),
     /// Inspect or mutate the typed `<name>.toml` app config.
@@ -33,6 +37,43 @@ pub enum ConfigCmd {
     /// Validate `edgezero.toml` and the typed `<name>.toml` against the
     /// manifest / app-config / Spin-key contract.
     Validate(ConfigValidateArgs),
+}
+
+/// Arguments for the `auth` command (spec §11).
+///
+/// Intentionally has no `Default` impl (§6.11) — every invocation
+/// must name a subcommand, so an empty `AuthArgs` is meaningless.
+#[derive(clap::Args, Debug)]
+#[non_exhaustive]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub sub: AuthSub,
+}
+
+/// Subcommands under `edgezero auth …`. Each carries the adapter the
+/// session belongs to; the runtime dispatches to the matching native
+/// CLI (`wrangler` / `fastly` / `spin`). `axum` is a no-op (no
+/// remote auth).
+#[derive(Subcommand, Debug)]
+pub enum AuthSub {
+    /// Sign in (`wrangler login` / `fastly profile create` / `spin
+    /// cloud login`).
+    Login {
+        #[arg(long)]
+        adapter: String,
+    },
+    /// Sign out (`wrangler logout` / `fastly profile delete` / `spin
+    /// cloud logout`).
+    Logout {
+        #[arg(long)]
+        adapter: String,
+    },
+    /// Show the current session (`wrangler whoami` / `fastly profile
+    /// list` / `spin cloud info`).
+    Status {
+        #[arg(long)]
+        adapter: String,
+    },
 }
 
 /// Arguments for the `build` command.
@@ -202,5 +243,50 @@ mod tests {
         assert!(args.app_config.is_none());
         assert!(!args.strict);
         assert!(!args.no_env);
+    }
+
+    #[test]
+    fn auth_login_parses_with_adapter() {
+        let args = Args::try_parse_from(["edgezero", "auth", "login", "--adapter", "cloudflare"])
+            .expect("parse auth login --adapter cloudflare");
+        let Command::Auth(AuthArgs {
+            sub: AuthSub::Login { adapter },
+        }) = args.cmd
+        else {
+            panic!("expected Command::Auth(AuthSub::Login)");
+        };
+        assert_eq!(adapter, "cloudflare");
+    }
+
+    #[test]
+    fn auth_logout_parses_with_adapter() {
+        let args = Args::try_parse_from(["edgezero", "auth", "logout", "--adapter", "fastly"])
+            .expect("parse `auth logout --adapter fastly`");
+        let Command::Auth(AuthArgs {
+            sub: AuthSub::Logout { adapter },
+        }) = args.cmd
+        else {
+            panic!("expected Command::Auth(AuthSub::Logout)");
+        };
+        assert_eq!(adapter, "fastly");
+    }
+
+    #[test]
+    fn auth_status_parses_with_adapter() {
+        let args = Args::try_parse_from(["edgezero", "auth", "status", "--adapter", "spin"])
+            .expect("parse `auth status --adapter spin`");
+        let Command::Auth(AuthArgs {
+            sub: AuthSub::Status { adapter },
+        }) = args.cmd
+        else {
+            panic!("expected Command::Auth(AuthSub::Status)");
+        };
+        assert_eq!(adapter, "spin");
+    }
+
+    #[test]
+    fn auth_requires_adapter() {
+        Args::try_parse_from(["edgezero", "auth", "login"])
+            .expect_err("`auth login` without --adapter must error");
     }
 }

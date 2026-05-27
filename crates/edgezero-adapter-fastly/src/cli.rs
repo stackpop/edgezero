@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -116,6 +117,12 @@ struct FastlyCliAdapter;
 impl Adapter for FastlyCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
+            // `fastly profile {create|delete|list}` is the native
+            // sign-in surface for Fastly Compute. EdgeZero stores no
+            // credentials — this is a thin shell-out (spec §11).
+            AdapterAction::AuthLogin => run_native("fastly", &["profile", "create"]),
+            AdapterAction::AuthLogout => run_native("fastly", &["profile", "delete"]),
+            AdapterAction::AuthStatus => run_native("fastly", &["profile", "list"]),
             AdapterAction::Build => {
                 let artifact = build(args)?;
                 log::info!("[edgezero] Fastly build complete -> {}", artifact.display());
@@ -129,6 +136,29 @@ impl Adapter for FastlyCliAdapter {
 
     fn name(&self) -> &'static str {
         "fastly"
+    }
+}
+
+/// Spawn `program args…` inheriting parent stdio, returning a
+/// human-readable error if the binary is missing from `PATH` or the
+/// child exits non-zero.
+fn run_native(program: &str, args: &[&str]) -> Result<(), String> {
+    let status = Command::new(program).args(args).status().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            format!(
+                "`{program}` not found on PATH; install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again"
+            )
+        } else {
+            format!("failed to spawn `{program}`: {err}")
+        }
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{program} {}` exited with status {status}",
+            args.join(" ")
+        ))
     }
 }
 

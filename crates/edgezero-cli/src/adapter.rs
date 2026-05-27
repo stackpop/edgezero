@@ -10,6 +10,9 @@ include!(concat!(env!("OUT_DIR"), "/linked_adapters.rs"));
 
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
+    AuthLogin,
+    AuthLogout,
+    AuthStatus,
     Build,
     Deploy,
     Serve,
@@ -18,6 +21,9 @@ pub enum Action {
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
+            Action::AuthLogin => "auth login",
+            Action::AuthLogout => "auth logout",
+            Action::AuthStatus => "auth status",
             Action::Build => "build",
             Action::Deploy => "deploy",
             Action::Serve => "serve",
@@ -30,6 +36,9 @@ impl From<Action> for AdapterAction {
     #[inline]
     fn from(value: Action) -> Self {
         match value {
+            Action::AuthLogin => AdapterAction::AuthLogin,
+            Action::AuthLogout => AdapterAction::AuthLogout,
+            Action::AuthStatus => AdapterAction::AuthStatus,
             Action::Build => AdapterAction::Build,
             Action::Deploy => AdapterAction::Deploy,
             Action::Serve => AdapterAction::Serve,
@@ -120,6 +129,9 @@ fn manifest_command<'manifest>(
 ) -> Option<&'manifest str> {
     let cfg = manifest.adapters.get(adapter_name)?;
     match action {
+        Action::AuthLogin => cfg.commands.auth_login.as_deref(),
+        Action::AuthLogout => cfg.commands.auth_logout.as_deref(),
+        Action::AuthStatus => cfg.commands.auth_status.as_deref(),
         Action::Build => cfg.commands.build.as_deref(),
         Action::Deploy => cfg.commands.deploy.as_deref(),
         Action::Serve => cfg.commands.serve.as_deref(),
