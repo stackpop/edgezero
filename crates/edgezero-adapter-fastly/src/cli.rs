@@ -116,6 +116,10 @@ const FASTLY_INSTALL_HINT: &str =
 
 struct FastlyCliAdapter;
 
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "fastly is Multi for every store kind (§6.6) and has no additional validation hooks; the trait defaults already model that"
+)]
 impl Adapter for FastlyCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {

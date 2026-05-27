@@ -124,6 +124,10 @@ struct EdgezeroAxumConfig {
     port: Option<u16>,
 }
 
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; the trait defaults already model that"
+)]
 impl Adapter for AxumCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
@@ -145,6 +149,12 @@ impl Adapter for AxumCliAdapter {
 
     fn name(&self) -> &'static str {
         "axum"
+    }
+
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        // §6.6: axum is Multi for KV (local file dirs) and Config
+        // (local JSON files), Single for Secrets (env vars).
+        &["secrets"]
     }
 }
 

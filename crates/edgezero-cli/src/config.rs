@@ -20,33 +20,16 @@
 //! the values the runtime would.
 
 use crate::args::ConfigValidateArgs;
+use edgezero_adapter::registry as adapter_registry;
 use edgezero_core::app_config::{
-    self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretField, SecretKind,
+    self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind,
 };
 use edgezero_core::manifest::{Manifest, ManifestLoader};
 use serde::de::DeserializeOwned;
-use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use toml::value::Table;
 use toml::Value;
 use validator::Validate;
-
-const ADAPTER_CHECKS: &[&dyn AdapterCheck] = &[&Axum, &Cloudflare, &Spin];
-
-/// Axum (native dev server): env-var-backed secret store is flat.
-/// Multi for KV (local file dirs) and Config (local JSON files);
-/// only Secrets is Single.
-struct Axum;
-
-/// Cloudflare Workers: Worker Secrets is a single flat bag.
-/// Multi for KV (KV namespaces) and Config (KV namespaces); only
-/// Secrets is Single.
-struct Cloudflare;
-
-/// Spin: flat config/secret variable namespace, single-component
-/// `spin.toml`, Single-capable for Config and Secrets.
-struct Spin;
 
 /// Pre-loaded state shared by the raw and typed flows.
 struct ValidationContext {
@@ -65,8 +48,8 @@ struct ValidationContext {
     /// can name the user-visible file.
     manifest_path: PathBuf,
     /// Raw root table of `<name>.toml` — loaded with the same
-    /// overlay setting the typed flow will use, so the raw Spin
-    /// key-syntax check sees the same values.
+    /// overlay setting the typed flow will use, so the same
+    /// flattened key set drives every adapter's `validate_*` call.
     raw_config: Value,
 }
 
@@ -74,118 +57,6 @@ impl ValidationContext {
     fn manifest(&self) -> &Manifest {
         self.manifest_loader.manifest()
     }
-}
-
-/// Per-adapter validation hooks.
-///
-/// Every adapter that has special validation rules (Spin's flat
-/// variable namespace, Axum/Cloudflare's single-secrets capability)
-/// implements this trait. The orchestrator iterates over
-/// [`ADAPTER_CHECKS`] and only invokes the methods of adapters that
-/// appear in the manifest — call sites read as a flat list of
-/// contract checks with no `if adapter == "spin"` branches.
-///
-/// Fastly is intentionally absent: it has no special validation rules
-/// (Multi across all store kinds, no flat-namespace constraints), and
-/// the default no-op implementations would just add registry noise.
-trait AdapterCheck: Sync {
-    /// Manifest key that identifies this adapter under
-    /// `[adapters.<id>.*]`.
-    fn adapter_id(&self) -> &'static str;
-
-    /// App-config check called from both the raw and typed flows.
-    /// Default: no-op.
-    fn check_app_config(&self, _ctx: &ValidationContext) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Manifest-only check (e.g. Spin's `spin.toml` component
-    /// discovery). Default: no-op.
-    fn check_manifest(&self, _ctx: &ValidationContext) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Typed-only check that needs `SECRET_FIELDS` (e.g. Spin's
-    /// config/secret namespace collision). Default: no-op.
-    fn check_typed(
-        &self,
-        _ctx: &ValidationContext,
-        _secret_fields: &[SecretField],
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Store kinds for which this adapter is Single-capable per
-    /// spec §6.6 — `--strict` rejects `[stores.<kind>].ids.len() > 1`
-    /// when any listed kind matches.
-    fn single_store_kinds(&self) -> &'static [&'static str] {
-        &[]
-    }
-}
-
-// -------------------------------------------------------------------
-// Concrete adapter checks (spec §6.6, §6.7)
-// -------------------------------------------------------------------
-
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "Axum has no app-config / manifest / typed-only checks beyond the capability matrix; the trait defaults already model that"
-)]
-impl AdapterCheck for Axum {
-    fn adapter_id(&self) -> &'static str {
-        "axum"
-    }
-
-    fn single_store_kinds(&self) -> &'static [&'static str] {
-        &["secrets"]
-    }
-}
-
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "Cloudflare has no app-config / manifest / typed-only checks beyond the capability matrix; the trait defaults already model that"
-)]
-impl AdapterCheck for Cloudflare {
-    fn adapter_id(&self) -> &'static str {
-        "cloudflare"
-    }
-
-    fn single_store_kinds(&self) -> &'static [&'static str] {
-        &["secrets"]
-    }
-}
-
-impl AdapterCheck for Spin {
-    fn adapter_id(&self) -> &'static str {
-        "spin"
-    }
-
-    fn check_app_config(&self, ctx: &ValidationContext) -> Result<(), String> {
-        spin_key_syntax_check(&ctx.raw_config)
-    }
-
-    fn check_manifest(&self, ctx: &ValidationContext) -> Result<(), String> {
-        spin_component_discovery(ctx.manifest(), &ctx.manifest_path)
-    }
-
-    fn check_typed(
-        &self,
-        ctx: &ValidationContext,
-        secret_fields: &[SecretField],
-    ) -> Result<(), String> {
-        spin_config_secret_collision(ctx, secret_fields)
-    }
-
-    fn single_store_kinds(&self) -> &'static [&'static str] {
-        &["config", "secrets"]
-    }
-}
-
-fn adapter_checks_for(manifest: &Manifest) -> impl Iterator<Item = &'static dyn AdapterCheck> + '_ {
-    ADAPTER_CHECKS
-        .iter()
-        .copied()
-        .filter(|check| manifest.adapters.contains_key(check.adapter_id()))
 }
 
 /// Raw flow — no typed `C`. Runs every check the typed flow runs
@@ -224,9 +95,7 @@ where
             .map_err(|err| format_app_config_error(&err))?;
 
     typed_secret_checks(&typed, &ctx)?;
-    for check in adapter_checks_for(ctx.manifest()) {
-        check.check_typed(&ctx, C::SECRET_FIELDS)?;
-    }
+    run_adapter_typed_checks::<C>(&ctx)?;
 
     Ok(())
 }
@@ -286,13 +155,74 @@ fn resolve_app_config_path(
 }
 
 fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
-    for check in adapter_checks_for(ctx.manifest()) {
-        check.check_app_config(ctx)?;
-        check.check_manifest(ctx)?;
-    }
+    run_adapter_shared_checks(ctx)?;
     if ctx.args_strict {
         strict_capability_completeness(ctx.manifest())?;
         strict_handler_paths(ctx.manifest())?;
+    }
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// Adapter dispatch — defer per-adapter rules to each adapter crate's
+// `Adapter` trait impl. No `if adapter == "spin"` branches here.
+// -------------------------------------------------------------------
+
+/// Run the adapter-agnostic shared checks: for every adapter
+/// declared in the manifest, look up its `Adapter` impl in the
+/// registry and invoke `validate_app_config_keys` +
+/// `validate_adapter_manifest`. Adapters not in the registry (e.g.
+/// a feature-gated build that omitted some) are silently skipped —
+/// they can't validate what they don't link.
+fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
+    let raw_table = ctx
+        .raw_config
+        .as_table()
+        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
+    let flattened = flatten_keys(raw_table);
+    let key_refs: Vec<&str> = flattened.iter().map(String::as_str).collect();
+    let manifest_root = ctx.manifest_path.parent().unwrap_or_else(|| Path::new("."));
+
+    for (name, adapter_cfg) in &ctx.manifest().adapters {
+        let Some(adapter) = adapter_registry::get_adapter(name) else {
+            continue;
+        };
+        adapter.validate_app_config_keys(&key_refs)?;
+        adapter.validate_adapter_manifest(
+            manifest_root,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.component.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Typed-only adapter dispatch: feed each adapter the flattened
+/// config keys and the `#[secret]` (`KeyInDefault` only —
+/// `#[secret(store_ref)]` values are runtime store ids, not
+/// flat-namespace candidates).
+fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+    let raw_table = ctx
+        .raw_config
+        .as_table()
+        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
+    let flattened = flatten_keys(raw_table);
+    let key_refs: Vec<&str> = flattened.iter().map(String::as_str).collect();
+
+    let mut plain_secrets: Vec<(&str, &str)> = Vec::new();
+    for field in C::SECRET_FIELDS {
+        if !matches!(field.kind, SecretKind::KeyInDefault) {
+            continue;
+        }
+        if let Some(value) = raw_table.get(field.name).and_then(Value::as_str) {
+            plain_secrets.push((field.name, value));
+        }
+    }
+
+    for name in ctx.manifest().adapters.keys() {
+        if let Some(adapter) = adapter_registry::get_adapter(name) {
+            adapter.validate_typed_secrets(&key_refs, &plain_secrets)?;
+        }
     }
     Ok(())
 }
@@ -364,75 +294,11 @@ fn typed_secret_checks<C: AppConfigMeta>(
 }
 
 // -------------------------------------------------------------------
-// Spin checks (spec §6.7)
+// flatten_keys — produces the dotted-path inventory each adapter
+// trait method consumes. Lives here because it's the CLI's
+// responsibility to walk the parsed TOML; adapters work with the
+// already-flattened slice.
 // -------------------------------------------------------------------
-
-fn spin_key_syntax_check(raw_config: &Value) -> Result<(), String> {
-    let table = raw_config
-        .as_table()
-        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
-    for key in flatten_keys(table) {
-        let spin_var = key.replace('.', "__");
-        if !is_valid_spin_key(&spin_var) {
-            return Err(format!(
-                "config key `{key}` translates to Spin variable `{spin_var}`, which does not match `^[a-z][a-z0-9_]*$`"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn is_valid_spin_key(key: &str) -> bool {
-    let mut chars = key.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_lowercase() {
-        return false;
-    }
-    chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-}
-
-fn spin_config_secret_collision(
-    ctx: &ValidationContext,
-    secret_fields: &[SecretField],
-) -> Result<(), String> {
-    let raw_table = ctx
-        .raw_config
-        .as_table()
-        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
-
-    let mut seen: HashSet<String> = HashSet::new();
-    for key in flatten_keys(raw_table) {
-        let spin_var = key.replace('.', "__");
-        if !seen.insert(spin_var.clone()) {
-            return Err(format!(
-                "duplicate Spin variable `{spin_var}` derived from config key `{key}`"
-            ));
-        }
-    }
-    for field in secret_fields {
-        // Spec §6.7 check 2: the collision set is {flattened config
-        // keys} ∪ {plain `#[secret]` values}. `#[secret(store_ref)]`
-        // values are *logical store ids* resolved at runtime — they
-        // never enter Spin's flat variable namespace and so cannot
-        // collide. Skip them.
-        if !matches!(field.kind, SecretKind::KeyInDefault) {
-            continue;
-        }
-        let Some(value) = raw_table.get(field.name).and_then(Value::as_str) else {
-            continue; // typed_secret_checks would have surfaced the absence already
-        };
-        let spin_var = value.replace('.', "__");
-        if !seen.insert(spin_var.clone()) {
-            return Err(format!(
-                "Spin variable `{spin_var}` (from `#[secret]` field `{}`) collides with a config key under the same name; Spin's flat variable namespace cannot disambiguate them",
-                field.name
-            ));
-        }
-    }
-    Ok(())
-}
 
 fn flatten_keys(table: &Table) -> Vec<String> {
     let mut out = Vec::new();
@@ -455,90 +321,15 @@ fn flatten_keys_into(table: &Table, prefix: &str, out: &mut Vec<String>) {
     }
 }
 
-fn spin_component_discovery(manifest: &Manifest, manifest_path: &Path) -> Result<(), String> {
-    // Reached only via the Spin AdapterCheck impl, which the registry
-    // filters by manifest presence; the `else` branch covers the
-    // (impossible) case so we don't lean on `.expect()`.
-    let Some(spin) = manifest.adapters.get("spin") else {
-        return Ok(());
-    };
-    let Some(rel_spin_toml) = &spin.adapter.manifest else {
-        return Err(format!(
-            "{}: [adapters.spin.adapter].manifest must point at spin.toml for Spin component discovery",
-            manifest_path.display()
-        ));
-    };
-    let manifest_dir = manifest_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let spin_path = manifest_dir.map_or_else(
-        || PathBuf::from(rel_spin_toml),
-        |dir| dir.join(rel_spin_toml),
-    );
-
-    let raw = fs::read_to_string(&spin_path).map_err(|err| {
-        format!(
-            "failed to read spin manifest at {}: {err}",
-            spin_path.display()
-        )
-    })?;
-    let parsed: Value = toml::from_str(&raw)
-        .map_err(|err| format!("failed to parse {} as TOML: {err}", spin_path.display()))?;
-    let component_ids = collect_spin_component_ids(&parsed);
-
-    if component_ids.is_empty() {
-        return Err(format!(
-            "{}: no [component.*] declarations found",
-            spin_path.display()
-        ));
-    }
-
-    // An explicit selector must always name a declared component, even
-    // when there is exactly one — a typo would otherwise silently pass
-    // here and only blow up later in `config push` / `provision`.
-    if let Some(selector) = &spin.adapter.component {
-        if component_ids.iter().any(|id| id == selector) {
-            return Ok(());
-        }
-        return Err(format!(
-            "[adapters.spin.adapter].component = {:?} is not declared in {} (available: {})",
-            selector,
-            spin_path.display(),
-            component_ids.join(", ")
-        ));
-    }
-
-    // No selector — auto-select only when there is exactly one
-    // component; otherwise force the user to pick.
-    if component_ids.len() == 1 {
-        return Ok(());
-    }
-    Err(format!(
-        "{} declares {} components ({}) but [adapters.spin.adapter].component is unset; set one explicitly",
-        spin_path.display(),
-        component_ids.len(),
-        component_ids.join(", ")
-    ))
-}
-
-fn collect_spin_component_ids(parsed: &Value) -> Vec<String> {
-    parsed
-        .as_table()
-        .and_then(|root| root.get("component"))
-        .and_then(Value::as_table)
-        .map(|components| components.keys().cloned().collect())
-        .unwrap_or_default()
-}
-
 // -------------------------------------------------------------------
 // --strict checks (spec §10)
 // -------------------------------------------------------------------
 
 fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
-    // Spec §6.6 capability matrix, driven by each adapter's
-    // `single_store_kinds()`. The registry is independent of the
-    // platform feature gates so this validator runs against every
-    // build.
+    // Spec §6.6 capability matrix, driven by each adapter crate's
+    // `Adapter::single_store_kinds()` impl. Adapters not in the
+    // registry (e.g. a feature-gated build that omitted some) are
+    // skipped — we can't speak for what isn't linked.
     for (kind, maybe_decl) in [
         ("kv", manifest.stores.kv.as_ref()),
         ("config", manifest.stores.config.as_ref()),
@@ -550,11 +341,13 @@ fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
         if declaration.ids.len() <= 1 {
             continue;
         }
-        for check in adapter_checks_for(manifest) {
-            if check.single_store_kinds().contains(&kind) {
+        for adapter_name in manifest.adapters.keys() {
+            let Some(adapter) = adapter_registry::get_adapter(adapter_name) else {
+                continue;
+            };
+            if adapter.single_store_kinds().contains(&kind) {
                 return Err(format!(
-                    "adapter `{}` is Single-capable for {kind} stores (spec §6.6) but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
-                    check.adapter_id(),
+                    "adapter `{adapter_name}` is Single-capable for {kind} stores (spec §6.6) but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
                     declaration.ids.len()
                 ));
             }
@@ -614,6 +407,7 @@ mod tests {
     use super::*;
     use edgezero_core::app_config::SecretField;
     use serde::Deserialize;
+    use std::fs;
     use tempfile::TempDir;
 
     // ---------- shared fixtures ----------
@@ -1217,23 +1011,6 @@ ids = ["default"]
     }
 
     // ---------- helpers ----------
-
-    #[test]
-    fn is_valid_spin_key_accepts_lowercase_with_digits_and_underscores() {
-        assert!(is_valid_spin_key("foo"));
-        assert!(is_valid_spin_key("foo_bar"));
-        assert!(is_valid_spin_key("foo__bar"));
-        assert!(is_valid_spin_key("a1b2"));
-    }
-
-    #[test]
-    fn is_valid_spin_key_rejects_bad_starts_and_chars() {
-        assert!(!is_valid_spin_key(""));
-        assert!(!is_valid_spin_key("FOO"));
-        assert!(!is_valid_spin_key("1foo"));
-        assert!(!is_valid_spin_key("foo-bar"));
-        assert!(!is_valid_spin_key("_foo"));
-    }
 
     #[test]
     fn flatten_keys_walks_nested_tables_in_dotted_form() {

@@ -780,6 +780,7 @@ dependencies = [
  "futures-util",
  "log",
  "spin-sdk",
+ "toml",
  "walkdir",
 ]
 
