@@ -209,17 +209,77 @@ impl Adapter for SpinCliAdapter {
 
     fn push_config_entries(
         &self,
-        _manifest_root: &Path,
-        _adapter_manifest_path: Option<&str>,
-        _component_selector: Option<&str>,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
         _store_id: &str,
-        _entries: &[(String, String)],
-        _dry_run: bool,
+        entries: &[(String, String)],
+        dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Stage 7.4 will write both [variables].<key> and
-        // [component.<component>.variables].<key> tables in
-        // spin.toml, with `.→__` key translation (spec §13).
-        Err("spin config push is not yet implemented; landing in a follow-up commit".to_owned())
+        // §13: pure spin.toml editing — no shell-out. Spec §6.7
+        // says Spin variables must match `^[a-z][a-z0-9_]*$`, and
+        // dotted CLI keys translate `.→__` (lowercase). A Spin
+        // variable is only readable by a component when it is both
+        // declared in `[variables]` AND bound in
+        // `[component.<component>.variables]`, so push writes
+        // both tables. Secret variables are intentionally NOT
+        // touched — the typed CLI flow already stripped
+        // `SECRET_FIELDS`, and the raw flow leaves declaration to
+        // the developer (manual `[variables].* secret = true`).
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.spin.adapter].manifest must point at spin.toml for config push"
+                    .to_owned(),
+            );
+        };
+        let spin_path = manifest_root.join(rel);
+        let component_id = resolve_spin_component(&spin_path, component_selector)?;
+
+        // Translate `.→__` lowercase up front so both the
+        // dry-run preview and the writeback see the exact key
+        // form that will land in spin.toml. Reject any key whose
+        // translation fails `^[a-z][a-z0-9_]*$` — `config
+        // validate` should already have caught it, but a
+        // belt-and-braces check keeps spin.toml well-formed.
+        let mut translated: Vec<(String, String)> = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let spin_key = translate_key_for_spin(key);
+            if !is_valid_spin_key(&spin_key) {
+                return Err(format!(
+                    "config key `{key}` translates to Spin variable `{spin_key}`, which does not match `^[a-z][a-z0-9_]*$` (run `edgezero config validate --strict` to surface this earlier)"
+                ));
+            }
+            translated.push((spin_key, value.clone()));
+        }
+
+        if translated.is_empty() {
+            return Ok(vec![format!(
+                "no config entries to push to [component.{component_id}.variables] in {}",
+                spin_path.display()
+            )]);
+        }
+
+        if dry_run {
+            let mut out = Vec::with_capacity(translated.len().saturating_add(1));
+            out.push(format!(
+                "would write {} Spin variable(s) to {} (both [variables] and [component.{component_id}.variables]):",
+                translated.len(),
+                spin_path.display()
+            ));
+            for (spin_key, value) in &translated {
+                out.push(format!(
+                    "  [variables.{spin_key}] default = {value:?}; [component.{component_id}.variables].{spin_key} = {{{{ {spin_key} }}}}"
+                ));
+            }
+            return Ok(out);
+        }
+
+        write_spin_variables(&spin_path, &component_id, &translated)?;
+        Ok(vec![format!(
+            "pushed {} Spin variable(s) to {} ([variables] + [component.{component_id}.variables])",
+            translated.len(),
+            spin_path.display()
+        )])
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -459,6 +519,88 @@ fn ensure_kv_label_in_component(
     fs::write(spin_path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
     Ok(true)
+}
+
+/// Translate a dotted CLI config key into a Spin variable name
+/// (§6.7). Spin's flat variable namespace has no concept of
+/// nested paths, so we encode the dotted path as `__`-separated
+/// segments and lowercase the result.
+fn translate_key_for_spin(dotted_key: &str) -> String {
+    dotted_key.replace('.', "__").to_ascii_lowercase()
+}
+
+/// Declare + bind each Spin variable so the component can read
+/// it. Writes both:
+/// 1. `[variables].<key>` with `default = "<value>"` — the
+///    application-level declaration.
+/// 2. `[component.<component>.variables].<key>` = `"{{ <key> }}"`
+///    — the component binding (without it the variable is
+///    invisible to the wasm component).
+///
+/// Idempotent: re-running updates the `default` value in place
+/// and overwrites the component binding. Preserves the rest of
+/// the spin manifest (formatting, comments, sibling tables).
+fn write_spin_variables(
+    spin_path: &Path,
+    component_id: &str,
+    entries: &[(String, String)],
+) -> Result<(), String> {
+    use toml_edit::{table, value, DocumentMut, Item};
+
+    let raw = fs::read_to_string(spin_path)
+        .map_err(|err| format!("failed to read {}: {err}", spin_path.display()))?;
+    let mut doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", spin_path.display()))?;
+
+    // (1) Application-level declarations under [variables].
+    let variables_entry = doc.entry("variables").or_insert_with(table);
+    let variables_tbl = variables_entry
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: `variables` is not a table", spin_path.display()))?;
+    for (spin_key, val) in entries {
+        let var_entry = variables_tbl
+            .entry(spin_key.as_str())
+            .or_insert_with(|| Item::Table(toml_edit::Table::new()));
+        let var_tbl = var_entry.as_table_mut().ok_or_else(|| {
+            format!(
+                "{}: [variables.{spin_key}] is not a table",
+                spin_path.display()
+            )
+        })?;
+        var_tbl.insert("default", value(val.as_str()));
+    }
+
+    // (2) Component-level bindings under
+    // [component.<component>.variables]. Surfaces the
+    // application variable into the wasm component via spin's
+    // `{{ <key> }}` template syntax.
+    let component_root = doc.entry("component").or_insert_with(table);
+    let component_tbl = component_root
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: `component` is not a table", spin_path.display()))?;
+    let target = component_tbl.entry(component_id).or_insert_with(table);
+    let target_tbl = target.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: [component.{component_id}] is not a table",
+            spin_path.display()
+        )
+    })?;
+    let bindings_entry = target_tbl.entry("variables").or_insert_with(table);
+    let bindings_tbl = bindings_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: [component.{component_id}.variables] is not a table",
+            spin_path.display()
+        )
+    })?;
+    for (spin_key, _) in entries {
+        let template = format!("{{{{ {spin_key} }}}}");
+        bindings_tbl.insert(spin_key.as_str(), value(template));
+    }
+
+    fs::write(spin_path, doc.to_string())
+        .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
+    Ok(())
 }
 
 /// # Errors
@@ -1042,5 +1184,297 @@ mod tests {
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
             .expect("no-store provision is fine");
         assert_eq!(out, vec!["spin has no declared stores to provision"]);
+    }
+
+    // ---------- translate_key_for_spin ----------
+
+    #[test]
+    fn translate_key_for_spin_replaces_dots_with_double_underscores() {
+        assert_eq!(
+            translate_key_for_spin("service.timeout_ms"),
+            "service__timeout_ms"
+        );
+    }
+
+    #[test]
+    fn translate_key_for_spin_passes_through_unsegmented_keys() {
+        assert_eq!(translate_key_for_spin("greeting"), "greeting");
+    }
+
+    #[test]
+    fn translate_key_for_spin_lowercases() {
+        // Spin's `^[a-z][a-z0-9_]*$` rule rejects uppercase; the
+        // translator normalises so the validator in §6.7 sees the
+        // canonical form before push.
+        assert_eq!(translate_key_for_spin("GREETING"), "greeting");
+        assert_eq!(
+            translate_key_for_spin("Service.TimeoutMs"),
+            "service__timeoutms"
+        );
+    }
+
+    // ---------- write_spin_variables ----------
+
+    #[test]
+    fn write_spin_variables_writes_both_tables() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let entries = vec![
+            ("greeting".to_owned(), "hi".to_owned()),
+            ("service__timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        write_spin_variables(&path, "demo", &entries).expect("write");
+        let after = fs::read_to_string(&path).expect("read back");
+        // The generated manifest must round-trip through a TOML
+        // parser (spec §13 "validation strength" — regex + parse
+        // is the floor when neither the spin CLI nor spin_sdk is
+        // reachable from the test harness).
+        let parsed: toml::Value = toml::from_str(&after).expect("parses as TOML");
+        let variables = parsed
+            .get("variables")
+            .and_then(toml::Value::as_table)
+            .expect("[variables] present");
+        assert_eq!(
+            variables["greeting"]["default"].as_str(),
+            Some("hi"),
+            "greeting default landed: {after}"
+        );
+        assert_eq!(
+            variables["service__timeout_ms"]["default"].as_str(),
+            Some("1500")
+        );
+        let bindings = parsed["component"]["demo"]["variables"]
+            .as_table()
+            .expect("[component.demo.variables] present");
+        assert_eq!(
+            bindings["greeting"].as_str(),
+            Some("{{ greeting }}"),
+            "binding uses spin template: {after}"
+        );
+        assert_eq!(
+            bindings["service__timeout_ms"].as_str(),
+            Some("{{ service__timeout_ms }}")
+        );
+    }
+
+    #[test]
+    fn write_spin_variables_is_idempotent_and_updates_in_place() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let first = vec![("greeting".to_owned(), "hi".to_owned())];
+        write_spin_variables(&path, "demo", &first).expect("first write");
+        // Re-push with a new value — should overwrite, not error.
+        let second = vec![("greeting".to_owned(), "hello".to_owned())];
+        write_spin_variables(&path, "demo", &second).expect("second write");
+        let after = fs::read_to_string(&path).expect("read back");
+        let parsed: toml::Value = toml::from_str(&after).expect("parses");
+        assert_eq!(
+            parsed["variables"]["greeting"]["default"].as_str(),
+            Some("hello"),
+            "default updated: {after}"
+        );
+        // Component binding stays a single entry (not duplicated).
+        let bindings = parsed["component"]["demo"]["variables"]
+            .as_table()
+            .expect("bindings present");
+        assert_eq!(bindings.len(), 1, "no duplicate bindings: {after}");
+    }
+
+    #[test]
+    fn write_spin_variables_preserves_other_component_fields() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\nallowed_outbound_hosts = []\n",
+        );
+        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
+        write_spin_variables(&path, "demo", &entries).expect("write");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("allowed_outbound_hosts = []"),
+            "preserved sibling field: {after}"
+        );
+        assert!(
+            after.contains("source = \"demo.wasm\""),
+            "preserved source: {after}"
+        );
+    }
+
+    #[test]
+    fn write_spin_variables_golden_round_trips_and_passes_spin_key_regex() {
+        // §13 golden test — floor of the validation ladder when
+        // neither the spin CLI nor spin_sdk validation is
+        // reachable: every variable name matches the Spin
+        // `^[a-z][a-z0-9_]*$` rule, and the generated manifest
+        // parses as TOML.
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service__timeout_ms".to_owned(), "1500".to_owned()),
+            ("api__base_url".to_owned(), "https://example.com".to_owned()),
+        ];
+        write_spin_variables(&path, "demo", &entries).expect("write");
+        let after = fs::read_to_string(&path).expect("read back");
+        let parsed: toml::Value = toml::from_str(&after).expect("parses as TOML");
+
+        let variables = parsed["variables"].as_table().expect("[variables] present");
+        for key in variables.keys() {
+            assert!(
+                is_valid_spin_key(key),
+                "variable name `{key}` violates Spin's `^[a-z][a-z0-9_]*$` rule"
+            );
+        }
+        let bindings = parsed["component"]["demo"]["variables"]
+            .as_table()
+            .expect("[component.demo.variables] present");
+        for key in bindings.keys() {
+            assert!(
+                is_valid_spin_key(key),
+                "binding name `{key}` violates Spin's `^[a-z][a-z0-9_]*$` rule"
+            );
+            let template = bindings[key].as_str().expect("binding is a string");
+            assert_eq!(template, format!("{{{{ {key} }}}}"));
+        }
+    }
+
+    // ---------- push_config_entries (dry-run + error paths) ----------
+
+    #[test]
+    fn push_dry_run_does_not_edit_spin_toml() {
+        let dir = tempdir().expect("tempdir");
+        let original = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
+        let path = write_spin(dir.path(), original);
+        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
+        let out = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                "app_config",
+                &entries,
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert!(
+            out.iter()
+                .any(|line| line.contains("would write 1 Spin variable")),
+            "dry-run summary present: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("greeting")),
+            "dry-run names the variable: {out:?}"
+        );
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, original, "dry-run mutated spin.toml");
+    }
+
+    #[test]
+    fn push_writes_variables_into_resolved_component() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let entries = vec![
+            ("greeting".to_owned(), "hi".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        let out = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                "app_config",
+                &entries,
+                false,
+            )
+            .expect("real push succeeds");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("pushed 2 Spin variable"), "got: {out:?}");
+        // Re-parse and assert both the dot-translated key and the
+        // pristine binding are present (`service.timeout_ms` →
+        // `service__timeout_ms`).
+        let after = fs::read_to_string(&path).expect("read back");
+        let parsed: toml::Value = toml::from_str(&after).expect("parses");
+        assert_eq!(
+            parsed["variables"]["service__timeout_ms"]["default"].as_str(),
+            Some("1500"),
+            "`.` translated to `__`: {after}"
+        );
+        assert_eq!(
+            parsed["component"]["demo"]["variables"]["service__timeout_ms"].as_str(),
+            Some("{{ service__timeout_ms }}")
+        );
+    }
+
+    #[test]
+    fn push_errors_when_adapter_manifest_path_missing() {
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
+        let err = SpinCliAdapter
+            .push_config_entries(dir.path(), None, None, "app_config", &entries, true)
+            .expect_err("missing adapter manifest path must error");
+        assert!(
+            err.contains("spin.toml"),
+            "error names what's missing: {err}"
+        );
+    }
+
+    #[test]
+    fn push_rejects_keys_that_violate_spin_variable_rule() {
+        // `config validate` should already have caught this, but
+        // the adapter belt-and-braces check keeps spin.toml
+        // well-formed if a raw push slips an invalid key through.
+        let dir = tempdir().expect("tempdir");
+        write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let entries = vec![("api-token".to_owned(), "x".to_owned())];
+        let err = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                "app_config",
+                &entries,
+                false,
+            )
+            .expect_err("dashed key must error");
+        assert!(
+            err.contains("api-token") && err.contains("Spin"),
+            "error names the bad key + Spin: {err}"
+        );
+    }
+
+    #[test]
+    fn push_with_no_entries_reports_no_op_without_writing() {
+        let dir = tempdir().expect("tempdir");
+        let original = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
+        let path = write_spin(dir.path(), original);
+        let out = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                "app_config",
+                &[],
+                false,
+            )
+            .expect("zero-entry push is fine");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("no config entries"), "got: {out:?}");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert_eq!(after, original, "zero-entry push must not edit spin.toml");
     }
 }
