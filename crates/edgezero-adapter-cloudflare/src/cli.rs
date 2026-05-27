@@ -208,6 +208,23 @@ impl Adapter for CloudflareCliAdapter {
         Ok(out)
     }
 
+    fn push_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store_id: &str,
+        _entries: &[(String, String)],
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Stage 7.2 will shell out to `wrangler kv bulk put` against
+        // the namespace id resolved from wrangler.toml.
+        Err(
+            "cloudflare config push is not yet implemented; landing in a follow-up commit"
+                .to_owned(),
+        )
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         // §6.6: cloudflare is Multi for KV (KV namespaces) and
         // Config (KV namespaces), Single for Secrets (Worker

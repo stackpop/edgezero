@@ -213,6 +213,53 @@ app-demo-cli config validate --strict
 
 **Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure (the loader / validator returns early at the first mismatch).
 
+### edgezero config push
+
+Push the resolved `<name>.toml` app-config into the target adapter's
+config store (spec §13). Same dispatch shape as the other commands:
+each adapter crate owns its own implementation, the CLI is a thin
+delegate.
+
+```bash
+edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] [--store <id>] [--no-env] [--dry-run]
+```
+
+**Arguments:**
+
+- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`).
+- `--manifest <path>` — manifest path (default: `edgezero.toml`).
+- `--app-config <path>` — typed app-config path (default: `<app_name>.toml` next to the manifest).
+- `--store <id>` — logical config-store id to push to. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
+- `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the app config. By default the loader reads the overlay so the push sends the same values the runtime would.
+- `--dry-run` — print the would-be operations without performing them. No file writes, no shell-outs.
+
+**Two flavours (same split as `config validate`):**
+
+- The default `edgezero` binary runs the **raw** push — flattens the on-disk TOML tree, JSON-encodes arrays into single values, and pushes every leaf as `(dotted_key, string_value)`. **No secret filtering** — the raw flow has no `AppConfigMeta` to read `SECRET_FIELDS` from, so anything in `<name>.toml` is pushed verbatim.
+- A downstream CLI built on `edgezero-cli` that owns its app-config struct (e.g. `app-demo-cli`) runs the **typed** push: runs strict pre-flight validation (`validator::Validate`, secret presence, store-ref membership, adapter checks), serialises the struct via `serde_json`, and **strips every `#[secret]` and `#[secret(store_ref)]` top-level field** before flattening — runtime store ids and secret values both stay out of the config payload.
+
+**Per-adapter behaviour:**
+
+| `--adapter`  | Behaviour                                                                                                                                                                                                              |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `axum`       | Writes the flattened payload to `.edgezero/local-config-<id>.json` (the file `AxumConfigStore` reads back). Creates `.edgezero/` on first use. No shell-out.                                                            |
+| `cloudflare` | _Coming soon (Stage 7.2)._ Will read the namespace id from `wrangler.toml` and shell out to `wrangler kv bulk put`.                                                                                                     |
+| `fastly`     | _Coming soon (Stage 7.3)._ Will resolve the config-store id via `fastly config-store list --json` and shell out to `fastly config-store-entry create` per key.                                                          |
+| `spin`       | _Coming soon (Stage 7.4)._ Pure `spin.toml` editing — writes both `[variables].<key>` and `[component.<component>.variables].<key>` tables with `.` → `__` lowercase key translation.                                   |
+
+**Examples:**
+
+```bash
+# Raw push to the axum local-file store (no secret filtering).
+edgezero config push --adapter axum
+
+# Typed push from a downstream CLI — runs strict validation, strips
+# #[secret] and #[secret(store_ref)] fields before writing.
+app-demo-cli config push --adapter axum --dry-run
+```
+
+**Exit codes:** `0` on success, non-zero with a one-line diagnostic on the first failure.
+
 ### edgezero provision
 
 Create the platform resources backing the `[stores.<kind>].ids` the

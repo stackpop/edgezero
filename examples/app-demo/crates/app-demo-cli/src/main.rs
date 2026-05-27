@@ -7,7 +7,8 @@
 use app_demo_core::config::AppDemoConfig;
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigValidateArgs, DeployArgs, NewArgs, ProvisionArgs, ServeArgs,
+    AuthArgs, BuildArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs, ProvisionArgs,
+    ServeArgs,
 };
 
 #[derive(Parser, Debug)]
@@ -38,14 +39,17 @@ enum Cmd {
     Serve(ServeArgs),
 }
 
-/// Mirrors `edgezero_cli::args::ConfigCmd` but dispatches `validate`
-/// to the **typed** validator parameterised over `AppDemoConfig` —
-/// the downstream project owns the struct, so it can enforce the
-/// typed deserialise, `validator` rules, and `#[secret]` /
-/// `#[secret(store_ref)]` checks the raw default-binary path skips
-/// (spec §10).
+/// Mirrors `edgezero_cli::args::ConfigCmd` but dispatches both
+/// `validate` and `push` to the **typed** entry points
+/// parameterised over `AppDemoConfig` — the downstream project owns
+/// the struct, so it can enforce the typed deserialise, `validator`
+/// rules, and `#[secret]` / `#[secret(store_ref)]` checks the raw
+/// default-binary path skips (spec §10, §13).
 #[derive(Subcommand, Debug)]
 enum AppDemoConfigCmd {
+    /// Push `app-demo.toml` (flattened, secret-stripped) to the
+    /// adapter's config store.
+    Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and `app-demo.toml` against the
     /// typed `AppDemoConfig` contract.
     Validate(ConfigValidateArgs),
@@ -58,6 +62,9 @@ fn main() {
     let result = match Args::parse().cmd {
         Cmd::Auth(args) => edgezero_cli::run_auth(&args),
         Cmd::Build(args) => edgezero_cli::run_build(&args),
+        Cmd::Config(AppDemoConfigCmd::Push(args)) => {
+            edgezero_cli::run_config_push_typed::<AppDemoConfig>(&args)
+        }
         Cmd::Config(AppDemoConfigCmd::Validate(args)) => {
             edgezero_cli::run_config_validate_typed::<AppDemoConfig>(&args)
         }

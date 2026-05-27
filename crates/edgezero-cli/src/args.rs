@@ -35,10 +35,13 @@ pub enum Command {
     Serve(ServeArgs),
 }
 
-/// Subcommands under `edgezero config …` (spec §10). Stage 4 ships
-/// `validate`; Stage 7 will add `push`.
+/// Subcommands under `edgezero config …` (spec §10, §13). Stage 4
+/// shipped `validate`; Stage 7 adds `push`.
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
+    /// Push the typed `<name>.toml` (flattened, secret-stripped) to
+    /// the adapter's config store (spec §13).
+    Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed `<name>.toml` against the
     /// manifest / app-config / Spin-key contract.
     Validate(ConfigValidateArgs),
@@ -139,6 +142,35 @@ pub struct ServeArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
+}
+
+/// Arguments for the `config push` command (spec §13).
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct ConfigPushArgs {
+    /// Target adapter name.
+    #[arg(long, required = true)]
+    pub adapter: String,
+    /// Path to the typed app-config file (default: `<app_name>.toml`
+    /// resolved from the manifest's `[app].name`, next to the manifest).
+    #[arg(long)]
+    pub app_config: Option<PathBuf>,
+    /// Print the would-be operations without performing them.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Path to the manifest (default: `edgezero.toml`).
+    #[arg(long, default_value = "edgezero.toml")]
+    pub manifest: PathBuf,
+    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
+    /// typed app-config. The default loads the overlay so the runtime
+    /// and the push see the same resolved values.
+    #[arg(long)]
+    pub no_env: bool,
+    /// Logical config store id to push to. Defaults to the
+    /// `[stores.config].default` (or the only declared id when
+    /// `[stores.config].ids` has length 1).
+    #[arg(long)]
+    pub store: Option<String>,
 }
 
 /// Arguments for the `config validate` command (spec §10).
@@ -333,5 +365,55 @@ mod tests {
     fn provision_requires_adapter() {
         Args::try_parse_from(["edgezero", "provision"])
             .expect_err("`provision` without --adapter must error");
+    }
+
+    #[test]
+    fn config_push_parses_with_adapter_and_defaults() {
+        let args = Args::try_parse_from(["edgezero", "config", "push", "--adapter", "axum"])
+            .expect("parse config push --adapter axum");
+        let Command::Config(ConfigCmd::Push(push)) = args.cmd else {
+            panic!("expected Command::Config(ConfigCmd::Push)");
+        };
+        assert_eq!(push.adapter, "axum");
+        assert!(!push.dry_run);
+        assert!(!push.no_env);
+        assert!(push.store.is_none());
+        assert!(push.app_config.is_none());
+        assert_eq!(push.manifest, PathBuf::from("edgezero.toml"));
+    }
+
+    #[test]
+    fn config_push_parses_explicit_paths_store_and_flags() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "config",
+            "push",
+            "--adapter",
+            "cloudflare",
+            "--manifest",
+            "custom/edgezero.toml",
+            "--app-config",
+            "custom/my-app.toml",
+            "--store",
+            "app_config",
+            "--no-env",
+            "--dry-run",
+        ])
+        .expect("parse config push with overrides");
+        let Command::Config(ConfigCmd::Push(push)) = args.cmd else {
+            panic!("expected Command::Config(ConfigCmd::Push)");
+        };
+        assert_eq!(push.adapter, "cloudflare");
+        assert_eq!(push.manifest, PathBuf::from("custom/edgezero.toml"));
+        assert_eq!(push.app_config, Some(PathBuf::from("custom/my-app.toml")));
+        assert_eq!(push.store.as_deref(), Some("app_config"));
+        assert!(push.no_env);
+        assert!(push.dry_run);
+    }
+
+    #[test]
+    fn config_push_requires_adapter() {
+        Args::try_parse_from(["edgezero", "config", "push"])
+            .expect_err("`config push` without --adapter must error");
     }
 }

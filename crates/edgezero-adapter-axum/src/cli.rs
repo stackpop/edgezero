@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
@@ -189,6 +190,44 @@ impl Adapter for AxumCliAdapter {
             out.push("axum has no declared stores to provision".to_owned());
         }
         Ok(out)
+    }
+
+    fn push_config_entries(
+        &self,
+        manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store_id: &str,
+        entries: &[(String, String)],
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // §13: axum is local-only. Push writes the same flat
+        // `string -> string` JSON object `AxumConfigStore` reads
+        // back from `.edgezero/local-config-<id>.json`.
+        let local_dir = manifest_root.join(".edgezero");
+        let target = local_dir.join(format!("local-config-{store_id}.json"));
+        if dry_run {
+            return Ok(vec![format!(
+                "would write {} entries to {}",
+                entries.len(),
+                target.display()
+            )]);
+        }
+        fs::create_dir_all(&local_dir)
+            .map_err(|err| format!("failed to create {}: {err}", local_dir.display()))?;
+        let map: BTreeMap<&str, &str> = entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let json = serde_json::to_string_pretty(&map)
+            .map_err(|err| format!("failed to serialize config to JSON: {err}"))?;
+        fs::write(&target, json)
+            .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
+        Ok(vec![format!(
+            "wrote {} entries to {}",
+            entries.len(),
+            target.display()
+        )])
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -1026,5 +1065,68 @@ mod tests {
     fn blueprint_has_correct_id() {
         assert_eq!(AXUM_BLUEPRINT.id, "axum");
         assert_eq!(AXUM_BLUEPRINT.display_name, "Axum");
+    }
+
+    // ---------- push_config_entries ----------
+
+    #[test]
+    fn push_writes_flat_json_to_local_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        let lines = AxumCliAdapter
+            .push_config_entries(dir.path(), None, None, "app_config", &entries, false)
+            .expect("push succeeds");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("wrote 2 entries"),
+            "status line names count: {lines:?}"
+        );
+        let json_path = dir.path().join(".edgezero/local-config-app_config.json");
+        let raw = fs::read_to_string(&json_path).expect("read written file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["greeting"], "hello");
+        assert_eq!(parsed["service.timeout_ms"], "1500");
+    }
+
+    #[test]
+    fn push_dry_run_does_not_create_local_dir_or_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let lines = AxumCliAdapter
+            .push_config_entries(dir.path(), None, None, "app_config", &entries, true)
+            .expect("dry-run succeeds");
+        assert!(
+            lines[0].contains("would write 1 entries"),
+            "dry-run line: {lines:?}"
+        );
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            ".edgezero must not exist after dry-run"
+        );
+    }
+
+    #[test]
+    fn push_creates_dot_edgezero_directory_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entries = vec![("key".to_owned(), "value".to_owned())];
+        AxumCliAdapter
+            .push_config_entries(dir.path(), None, None, "x", &entries, false)
+            .expect("push succeeds");
+        assert!(dir.path().join(".edgezero").is_dir(), ".edgezero created");
+    }
+
+    #[test]
+    fn push_with_empty_entries_writes_empty_json_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        AxumCliAdapter
+            .push_config_entries(dir.path(), None, None, "empty", &[], false)
+            .expect("push succeeds even with no entries");
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-empty.json"))
+            .expect("read written file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!({}));
     }
 }

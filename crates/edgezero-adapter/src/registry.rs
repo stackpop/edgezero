@@ -81,6 +81,45 @@ pub trait Adapter: Sync + Send {
         Ok(Vec::new())
     }
 
+    /// Push resolved config entries into the platform's config
+    /// store backing `store_id` (spec §13). Returns a list of
+    /// human-readable status lines the CLI logs verbatim.
+    ///
+    /// `entries` are pre-flattened and pre-stringified by the CLI:
+    /// dotted keys (`service.timeout_ms`) and string values
+    /// (numbers via `to_string`, arrays/maps via `serde_json`,
+    /// `Option::None` already skipped). The CLI also skips
+    /// `SECRET_FIELDS` on the typed path before calling. Adapter-
+    /// specific key translation (`.` → `__` for spin, §6.7) and
+    /// per-platform value encoding happen here.
+    ///
+    /// `manifest_root`, `adapter_manifest_path`, and
+    /// `component_selector` mirror `provision` — each adapter
+    /// resolves its own per-platform manifest as needed.
+    ///
+    /// Default: returns an error. Adapters opt in by overriding.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if the platform
+    /// invocation or manifest edit fails, or the adapter has no
+    /// `push` impl. `dry_run` impls describe what they *would* do
+    /// without performing it.
+    #[inline]
+    fn push_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store_id: &str,
+        _entries: &[(String, String)],
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "adapter `{}` does not implement `config push`",
+            self.name()
+        ))
+    }
+
     /// Store kinds for which this adapter is Single-capable per
     /// spec §6.6 — `--strict` rejects `[stores.<kind>].ids.len() > 1`
     /// when any listed kind matches. Default: `&[]` (Multi for

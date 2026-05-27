@@ -43,7 +43,9 @@ pub mod args;
 #[cfg(feature = "cli")]
 pub use auth::run_auth;
 #[cfg(feature = "cli")]
-pub use config::{run_config_validate, run_config_validate_typed};
+pub use config::{
+    run_config_push, run_config_push_typed, run_config_validate, run_config_validate_typed,
+};
 #[cfg(feature = "cli")]
 pub use provision::run_provision;
 

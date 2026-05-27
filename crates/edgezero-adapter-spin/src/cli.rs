@@ -207,6 +207,21 @@ impl Adapter for SpinCliAdapter {
         Ok(out)
     }
 
+    fn push_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store_id: &str,
+        _entries: &[(String, String)],
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Stage 7.4 will write both [variables].<key> and
+        // [component.<component>.variables].<key> tables in
+        // spin.toml, with `.→__` key translation (spec §13).
+        Err("spin config push is not yet implemented; landing in a follow-up commit".to_owned())
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         // §6.7: Multi for KV (label-backed); Single for Config and
         // Secrets (flat-variable namespace).
