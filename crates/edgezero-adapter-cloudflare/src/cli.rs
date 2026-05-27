@@ -210,19 +210,72 @@ impl Adapter for CloudflareCliAdapter {
 
     fn push_config_entries(
         &self,
-        _manifest_root: &Path,
-        _adapter_manifest_path: Option<&str>,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _store_id: &str,
-        _entries: &[(String, String)],
-        _dry_run: bool,
+        store_id: &str,
+        entries: &[(String, String)],
+        dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Stage 7.2 will shell out to `wrangler kv bulk put` against
-        // the namespace id resolved from wrangler.toml.
-        Err(
-            "cloudflare config push is not yet implemented; landing in a follow-up commit"
-                .to_owned(),
-        )
+        // §13: read namespace id from wrangler.toml (matched by
+        // `binding = <store_id>`), then `wrangler kv bulk put
+        // <tempfile.json> --namespace-id=<id>`. Keys in dotted
+        // form — the CLI already flattened them.
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.cloudflare.adapter].manifest must point at wrangler.toml for config push"
+                    .to_owned(),
+            );
+        };
+        let wrangler_path = manifest_root.join(rel);
+        let namespace_id = find_namespace_id(&wrangler_path, store_id)?;
+        if entries.is_empty() {
+            return Ok(vec![format!(
+                "no config entries to push to KV namespace `{store_id}` (id={namespace_id})"
+            )]);
+        }
+        if dry_run {
+            return Ok(vec![format!(
+                "would run `wrangler kv bulk put <tempfile.json> --namespace-id={namespace_id}` with {} entries for binding `{store_id}`",
+                entries.len()
+            )]);
+        }
+        let payload = bulk_payload(entries)?;
+        let temp = tempfile::Builder::new()
+            .prefix("edgezero-cf-push-")
+            .suffix(".json")
+            .tempfile()
+            .map_err(|err| {
+                format!("failed to create temp file for wrangler bulk payload: {err}")
+            })?;
+        fs::write(temp.path(), payload.as_bytes())
+            .map_err(|err| format!("failed to write {}: {err}", temp.path().display()))?;
+        let temp_arg = temp
+            .path()
+            .to_str()
+            .ok_or_else(|| format!("temp file path {} is not UTF-8", temp.path().display()))?;
+        let namespace_arg = format!("--namespace-id={namespace_id}");
+        let output = Command::new("wrangler")
+            .args(["kv", "bulk", "put", temp_arg, namespace_arg.as_str()])
+            .output()
+            .map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    format!("`wrangler` not found on PATH; {WRANGLER_INSTALL_HINT}")
+                } else {
+                    format!("failed to spawn `wrangler`: {err}")
+                }
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "`wrangler kv bulk put` exited with status {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(vec![format!(
+            "pushed {} entries to KV namespace `{store_id}` (id={namespace_id})",
+            entries.len()
+        )])
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -356,6 +409,18 @@ fn append_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Render the entries as the `[{"key": "...", "value": "..."}, …]`
+/// JSON wrangler expects for `kv bulk put`. Keys arrive pre-flattened
+/// from the CLI (dotted form, §6.4); cloudflare passes them through.
+fn bulk_payload(entries: &[(String, String)]) -> Result<String, String> {
+    let payload: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
+        .collect();
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize wrangler bulk payload: {err}"))
+}
+
 /// # Errors
 /// Returns an error if the Cloudflare wrangler build command fails.
 #[inline]
@@ -422,6 +487,50 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Look up the namespace id wrangler.toml has bound to `binding`.
+/// Accepts both `[[kv_namespaces]]` (array-of-tables, what
+/// `provision` writes and wrangler's own post-create hint prints)
+/// and the inline-array form. Returns Err with a "did you run
+/// provision?" hint if the binding is absent — the most common
+/// cause of this error is forgetting to provision first.
+fn find_namespace_id(wrangler_path: &Path, binding: &str) -> Result<String, String> {
+    use toml_edit::{DocumentMut, Item, Value};
+
+    let raw = fs::read_to_string(wrangler_path).map_err(|err| {
+        format!(
+            "failed to read {}: {err} (did you run `edgezero provision --adapter cloudflare`?)",
+            wrangler_path.display()
+        )
+    })?;
+    let doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", wrangler_path.display()))?;
+    let id = match doc.get("kv_namespaces") {
+        Some(Item::ArrayOfTables(arr)) => arr.iter().find_map(|table| {
+            if table.get("binding").and_then(Item::as_str) == Some(binding) {
+                table.get("id").and_then(Item::as_str).map(str::to_owned)
+            } else {
+                None
+            }
+        }),
+        Some(Item::Value(Value::Array(arr))) => arr.iter().find_map(|item| {
+            let table = item.as_inline_table()?;
+            if table.get("binding").and_then(Value::as_str) == Some(binding) {
+                table.get("id").and_then(Value::as_str).map(str::to_owned)
+            } else {
+                None
+            }
+        }),
+        Some(_) | None => None,
+    };
+    id.ok_or_else(|| {
+        format!(
+            "{}: no [[kv_namespaces]] entry with binding = {binding:?} (did you run `edgezero provision --adapter cloudflare`?)",
+            wrangler_path.display()
+        )
+    })
 }
 
 fn find_wrangler_manifest(start: &Path) -> Result<PathBuf, String> {
@@ -729,5 +838,167 @@ id = "abc123def456"
             .provision(dir.path(), Some("wrangler.toml"), None, &stores, false)
             .expect("no-store provision is fine");
         assert_eq!(out, vec!["cloudflare has no declared stores to provision"]);
+    }
+
+    // ---------- find_namespace_id ----------
+
+    #[test]
+    fn find_namespace_id_reads_array_of_tables() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"abc123\"\n",
+        );
+        let id = find_namespace_id(&path, "app_config").expect("found");
+        assert_eq!(id, "abc123");
+    }
+
+    #[test]
+    fn find_namespace_id_reads_inline_array() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "name = \"demo\"\nkv_namespaces = [{ binding = \"app_config\", id = \"xyz789\" }]\n",
+        );
+        let id = find_namespace_id(&path, "app_config").expect("found");
+        assert_eq!(id, "xyz789");
+    }
+
+    #[test]
+    fn find_namespace_id_errors_with_provision_hint_when_binding_absent() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"other\"\nid = \"abc\"\n",
+        );
+        let err = find_namespace_id(&path, "app_config").expect_err("missing must error");
+        assert!(
+            err.contains("app_config") && err.contains("provision"),
+            "error names the binding and points at provision: {err}"
+        );
+    }
+
+    #[test]
+    fn find_namespace_id_errors_with_provision_hint_when_file_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.toml");
+        let err =
+            find_namespace_id(&path, "app_config").expect_err("missing wrangler.toml must error");
+        assert!(
+            err.contains("provision"),
+            "error points at provision: {err}"
+        );
+    }
+
+    // ---------- bulk_payload ----------
+
+    #[test]
+    fn bulk_payload_emits_wrangler_array_of_key_value_objects() {
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        let raw = bulk_payload(&entries).expect("payload");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        let array = parsed.as_array().expect("array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0]["key"], "greeting");
+        assert_eq!(array[0]["value"], "hello");
+        assert_eq!(array[1]["key"], "service.timeout_ms");
+        assert_eq!(array[1]["value"], "1500");
+    }
+
+    #[test]
+    fn bulk_payload_with_no_entries_is_empty_array() {
+        let raw = bulk_payload(&[]).expect("empty payload");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed, serde_json::json!([]));
+    }
+
+    // ---------- push_config_entries (dry-run + error paths) ----------
+
+    #[test]
+    fn push_dry_run_resolves_namespace_id_and_does_not_invoke_wrangler() {
+        let dir = tempdir().expect("tempdir");
+        let original =
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"abc123\"\n";
+        let path = write_wrangler(dir.path(), original);
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                "app_config",
+                &entries,
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("would run `wrangler kv bulk put")
+                && out[0].contains("--namespace-id=abc123"),
+            "dry-run line names namespace id: {out:?}"
+        );
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(after, original, "dry-run must not mutate wrangler.toml");
+    }
+
+    #[test]
+    fn push_errors_when_adapter_manifest_path_missing() {
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![("k".to_owned(), "v".to_owned())];
+        let err = CloudflareCliAdapter
+            .push_config_entries(dir.path(), None, None, "app_config", &entries, true)
+            .expect_err("missing adapter manifest path must error");
+        assert!(
+            err.contains("wrangler.toml") && err.contains("config push"),
+            "error explains the missing manifest pointer: {err}"
+        );
+    }
+
+    #[test]
+    fn push_errors_with_provision_hint_when_binding_absent() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let err = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                "app_config",
+                &entries,
+                true,
+            )
+            .expect_err("missing binding must error");
+        assert!(
+            err.contains("provision") && err.contains("app_config"),
+            "error points at provision: {err}"
+        );
+    }
+
+    #[test]
+    fn push_with_no_entries_reports_no_op_after_resolving_namespace() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"abc123\"\n",
+        );
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                "app_config",
+                &[],
+                false,
+            )
+            .expect("zero-entry push is fine");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("no config entries") && out[0].contains("abc123"),
+            "status line names empty + namespace id: {out:?}"
+        );
     }
 }
