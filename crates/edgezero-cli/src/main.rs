@@ -11,9 +11,11 @@ fn main() {
         Command::Auth(args) => edgezero_cli::run_auth(&args),
         Command::Build(args) => edgezero_cli::run_build(&args),
         // Default `edgezero` binary has no app-config struct, so it
-        // runs the **raw** validator. Downstream CLIs that own a
-        // typed config wire `run_config_validate_typed::<C>` instead
-        // (spec §1, §8).
+        // runs the **raw** validator and the **raw** push. Downstream
+        // CLIs that own a typed config wire
+        // `run_config_validate_typed::<C>` / `run_config_push_typed::<C>`
+        // instead (spec §1, §8, §13).
+        Command::Config(ConfigCmd::Push(args)) => edgezero_cli::run_config_push(&args),
         Command::Config(ConfigCmd::Validate(args)) => edgezero_cli::run_config_validate(&args),
         Command::Deploy(args) => edgezero_cli::run_deploy(&args),
         #[cfg(feature = "demo-example")]

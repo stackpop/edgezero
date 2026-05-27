@@ -19,17 +19,33 @@
 //! env-overlay unless `--no-env` is passed, so the validation sees
 //! the values the runtime would.
 
-use crate::args::ConfigValidateArgs;
+use crate::args::{ConfigPushArgs, ConfigValidateArgs};
+use crate::ensure_adapter_defined;
 use edgezero_adapter::registry as adapter_registry;
 use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind,
 };
-use edgezero_core::manifest::{Manifest, ManifestLoader};
+use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use toml::value::Table;
 use toml::Value;
 use validator::Validate;
+
+/// Pre-loaded state for either push flow. Shares
+/// [`ValidationContext`] with the validate flows (manifest, raw
+/// config, env-overlay-aware app-config path) and adds the resolved
+/// target adapter + store id.
+struct PushContext {
+    adapter: &'static dyn adapter_registry::Adapter,
+    /// Resolved logical config store id (`--store` or the manifest
+    /// default).
+    store_id: String,
+    /// Validate-shaped pre-loaded state (manifest + raw config).
+    validation: ValidationContext,
+}
 
 /// Pre-loaded state shared by the raw and typed flows.
 struct ValidationContext {
@@ -98,6 +114,231 @@ where
     run_adapter_typed_checks::<C>(&ctx)?;
 
     Ok(())
+}
+
+/// Raw flow — push the on-disk `<name>.toml` as a parsed TOML tree.
+/// Skips no fields (no `SECRET_FIELDS` knowledge); the operator is
+/// responsible for keeping sensitive material out of a raw push.
+///
+/// # Errors
+/// Returns a human-readable error string on any load / resolution /
+/// adapter-push failure.
+#[inline]
+pub fn run_config_push(args: &ConfigPushArgs) -> Result<(), String> {
+    let ctx = load_push_context(args)?;
+    let entries = flatten_raw_for_push(&ctx.validation.raw_config)?;
+    dispatch_push(&ctx, &entries, args.dry_run)
+}
+
+/// Typed flow — push the user's `C` struct. Runs the same strict
+/// pre-flight validation `config validate --strict` does (typed
+/// deserialise, `validator::Validate`, secret checks), then
+/// serialises `C` and feeds the adapter the flattened, dotted-key
+/// entries with `SECRET_FIELDS` (any kind) stripped.
+///
+/// # Errors
+/// Returns a human-readable error string on any validation or push
+/// failure.
+#[inline]
+pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String>
+where
+    C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
+{
+    let ctx = load_push_context(args)?;
+
+    let mut opts = AppConfigLoadOptions::default();
+    opts.env_overlay = !args.no_env;
+    let typed: C = app_config::load_app_config_with_options::<C>(
+        &ctx.validation.app_config_path,
+        &ctx.validation.app_name,
+        &opts,
+    )
+    .map_err(|err| format_app_config_error(&err))?;
+
+    typed
+        .validate()
+        .map_err(|err| format!("typed app-config failed validation: {err}"))?;
+    typed_secret_checks(&typed, &ctx.validation)?;
+    run_adapter_typed_checks::<C>(&ctx.validation)?;
+
+    let entries = flatten_typed_for_push::<C>(&typed)?;
+    dispatch_push(&ctx, &entries, args.dry_run)
+}
+
+// -------------------------------------------------------------------
+// Push context + dispatch
+// -------------------------------------------------------------------
+
+fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
+    let validate_args = ConfigValidateArgs {
+        app_config: args.app_config.clone(),
+        manifest: args.manifest.clone(),
+        no_env: args.no_env,
+        strict: false,
+    };
+    let validation = load_validation_context(&validate_args)?;
+    ensure_adapter_defined(&args.adapter, Some(&validation.manifest_loader))?;
+    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
+        format!(
+            "adapter `{}` is declared in {} but not registered in this build (rebuild `edgezero-cli` with its feature enabled)",
+            args.adapter,
+            args.manifest.display()
+        )
+    })?;
+    let store_id = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
+    Ok(PushContext {
+        adapter,
+        store_id,
+        validation,
+    })
+}
+
+fn dispatch_push(
+    ctx: &PushContext,
+    entries: &[(String, String)],
+    dry_run: bool,
+) -> Result<(), String> {
+    let manifest = ctx.validation.manifest();
+    let adapter_cfg = manifest.adapters.get(ctx.adapter.name()).ok_or_else(|| {
+        format!(
+            "adapter `{}` vanished from the manifest after lookup",
+            ctx.adapter.name()
+        )
+    })?;
+    let manifest_root = ctx
+        .validation
+        .manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let lines = ctx.adapter.push_config_entries(
+        manifest_root,
+        adapter_cfg.adapter.manifest.as_deref(),
+        adapter_cfg.adapter.component.as_deref(),
+        &ctx.store_id,
+        entries,
+        dry_run,
+    )?;
+    if dry_run {
+        log::info!(
+            "[edgezero] config push --dry-run for `{}` -> store `{}`:",
+            ctx.adapter.name(),
+            ctx.store_id
+        );
+    }
+    for line in lines {
+        log::info!("{line}");
+    }
+    Ok(())
+}
+
+fn resolve_config_store_id(requested: Option<&str>, manifest: &Manifest) -> Result<String, String> {
+    let Some(declaration) = manifest.stores.config.as_ref() else {
+        return Err(
+            "manifest has no `[stores.config]` section; declare it before pushing config"
+                .to_owned(),
+        );
+    };
+    if declaration.ids.is_empty() {
+        return Err("[stores.config].ids is empty; declare at least one id".to_owned());
+    }
+    if let Some(name) = requested {
+        if declaration.ids.iter().any(|id| id == name) {
+            return Ok(name.to_owned());
+        }
+        return Err(format!(
+            "--store={name:?} is not in [stores.config].ids ({:?})",
+            declaration.ids
+        ));
+    }
+    Ok(resolved_default(declaration))
+}
+
+fn resolved_default(declaration: &StoreDeclaration) -> String {
+    declaration.default_id().to_owned()
+}
+
+// -------------------------------------------------------------------
+// Flattening — raw (toml::Value) and typed (Serialize -> JSON)
+// -------------------------------------------------------------------
+
+fn flatten_raw_for_push(raw: &Value) -> Result<Vec<(String, String)>, String> {
+    let json: serde_json::Value = serde_json::to_value(raw)
+        .map_err(|err| format!("failed to convert raw TOML to JSON for flattening: {err}"))?;
+    let mut out = Vec::new();
+    flatten_json_into(&json, "", &BTreeSet::new(), &mut out)?;
+    Ok(out)
+}
+
+fn flatten_typed_for_push<C>(typed: &C) -> Result<Vec<(String, String)>, String>
+where
+    C: Serialize + AppConfigMeta,
+{
+    let json = serde_json::to_value(typed)
+        .map_err(|err| format!("failed to serialize typed app-config: {err}"))?;
+    if !json.is_object() {
+        return Err(
+            "typed app-config did not serialize to a JSON object; only struct-shaped configs are supported"
+                .to_owned(),
+        );
+    }
+    // Skip every `#[secret]` AND `#[secret(store_ref)]` top-level
+    // field — runtime store ids and secret values both belong out
+    // of the config-store payload (§13).
+    let secret_field_names: BTreeSet<String> = C::SECRET_FIELDS
+        .iter()
+        .map(|field| field.name.to_owned())
+        .collect();
+    let mut out = Vec::new();
+    flatten_json_into(&json, "", &secret_field_names, &mut out)?;
+    Ok(out)
+}
+
+fn flatten_json_into(
+    value: &serde_json::Value,
+    prefix: &str,
+    skip_top_level: &BTreeSet<String>,
+    out: &mut Vec<(String, String)>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::Bool(boolean) => {
+            out.push((prefix.to_owned(), boolean.to_string()));
+            Ok(())
+        }
+        serde_json::Value::Number(number) => {
+            out.push((prefix.to_owned(), number.to_string()));
+            Ok(())
+        }
+        serde_json::Value::String(text) => {
+            out.push((prefix.to_owned(), text.clone()));
+            Ok(())
+        }
+        serde_json::Value::Array(_) => {
+            // §6.5: arrays are JSON-encoded into a single value.
+            let encoded = serde_json::to_string(value)
+                .map_err(|err| format!("failed to JSON-encode array at key `{prefix}`: {err}"))?;
+            out.push((prefix.to_owned(), encoded));
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if prefix.is_empty() && skip_top_level.contains(key) {
+                    continue;
+                }
+                let full = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                // Only the top-level skip-set applies; nested keys
+                // can never be secrets (SECRET_FIELDS is top-level).
+                flatten_json_into(child, &full, &BTreeSet::new(), out)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContext, String> {
@@ -406,7 +647,7 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 mod tests {
     use super::*;
     use edgezero_core::app_config::SecretField;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use std::fs;
     use tempfile::TempDir;
 
@@ -443,6 +684,29 @@ serve = "cargo run"
 ids = ["default"]
 "#;
 
+    /// `[stores.config]` is required for push; the validate
+    /// fixtures don't declare it. This fixture is push-shaped: axum
+    /// adapter + a single config store id + a secrets section so
+    /// the typed flow's `#[secret]` checks pass.
+    const PUSH_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-app-adapter-axum"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+
     const VALID_SPIN_TOML: &str = r#"
 spin_manifest_version = 2
 
@@ -460,13 +724,11 @@ source = "target/wasm32-wasip1/release/demo.wasm"
 
     /// `AppDemoConfig`-shaped fixture: `greeting` + `api_token` (a
     /// `#[secret]`) + `vault` (a `#[secret(store_ref)]`) + nested
-    /// `service`.
-    #[derive(Debug, Deserialize, Validate)]
+    /// `service`. Fields are read through Serialize (typed-push
+    /// tests) and validator (`#[validate(...)]`), which is why this
+    /// no longer needs a `dead_code` allow.
+    #[derive(Debug, Deserialize, Serialize, Validate)]
     #[serde(deny_unknown_fields)]
-    #[expect(
-        dead_code,
-        reason = "fields are read by serde's deserialize and validator's validate; Rust's dead-code analysis can't see those paths"
-    )]
     struct FixtureConfig {
         api_token: String,
         #[validate(length(min = 1_u64))]
@@ -476,7 +738,7 @@ source = "target/wasm32-wasip1/release/demo.wasm"
         vault: String,
     }
 
-    #[derive(Debug, Deserialize, Validate)]
+    #[derive(Debug, Deserialize, Serialize, Validate)]
     #[serde(deny_unknown_fields)]
     struct FixtureServiceConfig {
         #[validate(range(min = 100, max = 60_000))]
@@ -511,6 +773,17 @@ source = "target/wasm32-wasip1/release/demo.wasm"
             manifest: manifest.to_path_buf(),
             no_env: true, // tests don't want env leakage
             strict: false,
+        }
+    }
+
+    fn push_args(manifest: &Path, adapter: &str) -> ConfigPushArgs {
+        ConfigPushArgs {
+            adapter: adapter.to_owned(),
+            app_config: None,
+            dry_run: false,
+            manifest: manifest.to_path_buf(),
+            no_env: true,
+            store: None,
         }
     }
 
@@ -1045,5 +1318,273 @@ deep = true
         assert!(!is_valid_handler_path("not_a_path"));
         assert!(!is_valid_handler_path(""));
         assert!(!is_valid_handler_path("foo::1bar"));
+    }
+
+    // -------------------------------------------------------------------
+    // config push (raw + typed) — spec §13
+    // -------------------------------------------------------------------
+
+    // ---------- raw push ----------
+
+    #[test]
+    fn raw_push_axum_writes_local_config_json() {
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
+        run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
+        let written = dir.path().join(".edgezero/local-config-app_config.json");
+        let raw = fs::read_to_string(&written).expect("wrote local-config file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        // The raw flow doesn't strip anything — `api_token` from
+        // VALID_APP_CONFIG appears in the payload.
+        assert_eq!(parsed["api_token"], "demo_api_token");
+        assert_eq!(parsed["greeting"], "hello");
+    }
+
+    #[test]
+    fn raw_push_dry_run_does_not_write() {
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.dry_run = true;
+        run_config_push(&args).expect("dry-run succeeds");
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            ".edgezero must not be created in dry-run"
+        );
+    }
+
+    #[test]
+    fn raw_push_errors_when_stores_config_missing() {
+        let manifest_no_config = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_no_config, VALID_APP_CONFIG);
+        let err = run_config_push(&push_args(&manifest, "axum"))
+            .expect_err("missing [stores.config] must error");
+        assert!(
+            err.contains("[stores.config]"),
+            "error names the missing section: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_push_errors_when_adapter_not_declared() {
+        let (_dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
+        let err = run_config_push(&push_args(&manifest, "not-an-adapter"))
+            .expect_err("undeclared adapter must error");
+        assert!(
+            err.contains("not-an-adapter"),
+            "error names the undeclared adapter: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_push_respects_explicit_store_selection() {
+        // Two declared ids — push to the non-default one via --store.
+        let manifest_two_ids = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config", "alt_config"]
+default = "app_config"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_two_ids, VALID_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.store = Some("alt_config".to_owned());
+        run_config_push(&args).expect("explicit --store=alt_config succeeds");
+        assert!(
+            dir.path()
+                .join(".edgezero/local-config-alt_config.json")
+                .exists(),
+            "push targeted alt_config"
+        );
+        assert!(
+            !dir.path()
+                .join(".edgezero/local-config-app_config.json")
+                .exists(),
+            "default store untouched"
+        );
+    }
+
+    #[test]
+    fn raw_push_rejects_unknown_store_id() {
+        let (_dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.store = Some("does-not-exist".to_owned());
+        let err = run_config_push(&args).expect_err("bad --store must error");
+        assert!(
+            err.contains("does-not-exist"),
+            "error names the bad store id: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_push_resolves_default_from_multi_id_store() {
+        // [stores.config].ids = ["one", "two"], default = "two".
+        let manifest_with_default = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["one", "two"]
+default = "two"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_with_default, VALID_APP_CONFIG);
+        run_config_push(&push_args(&manifest, "axum")).expect("default resolves to `two`");
+        assert!(
+            dir.path().join(".edgezero/local-config-two.json").exists(),
+            "push targeted the `default` id"
+        );
+    }
+
+    #[test]
+    fn raw_push_flattens_nested_tables_into_dotted_keys() {
+        let app_config = r#"
+greeting = "hi"
+
+[service]
+timeout_ms = 1500
+"#;
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, app_config);
+        run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("read written file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["greeting"], "hi");
+        assert_eq!(
+            parsed["service.timeout_ms"], "1500",
+            "nested field flattened to dotted key + stringified: {parsed}"
+        );
+    }
+
+    #[test]
+    fn raw_push_json_encodes_arrays() {
+        // §6.5: arrays become a single JSON-encoded string value.
+        let app_config = "tags = [\"a\", \"b\", \"c\"]\n";
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, app_config);
+        run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("read written file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["tags"], "[\"a\",\"b\",\"c\"]");
+    }
+
+    // ---------- stub adapters (Stage 7.2/7.3/7.4 land impls) ----------
+
+    #[test]
+    fn raw_push_cloudflare_stub_reports_not_yet_implemented() {
+        let manifest_cf = r#"
+[app]
+name = "demo-app"
+
+[adapters.cloudflare.adapter]
+crate = "crates/demo-cf"
+manifest = "wrangler.toml"
+
+[adapters.cloudflare.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_cf, VALID_APP_CONFIG);
+        let err = run_config_push(&push_args(&manifest, "cloudflare"))
+            .expect_err("cloudflare stub must err");
+        assert!(
+            err.contains("not yet implemented"),
+            "stub error mentions not-yet-implemented: {err}"
+        );
+    }
+
+    // ---------- typed push ----------
+
+    #[test]
+    fn typed_push_strips_secret_fields_from_payload() {
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        // FixtureConfig requires `api_token` (#[secret]) and `vault`
+        // (#[secret(store_ref)]) — both should be absent from the
+        // pushed payload (§13).
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        run_config_push_typed::<FixtureConfig>(&args).expect("typed push succeeds");
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("read written file");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert!(
+            parsed.get("api_token").is_none(),
+            "#[secret] field must be stripped: {parsed}"
+        );
+        assert!(
+            parsed.get("vault").is_none(),
+            "#[secret(store_ref)] field must be stripped: {parsed}"
+        );
+        assert_eq!(parsed["greeting"], "hello");
+        assert_eq!(parsed["service.timeout_ms"], "1500");
+    }
+
+    #[test]
+    fn typed_push_runs_validator_and_errors_on_bad_config() {
+        let bad_config = r#"
+api_token = "demo"
+greeting = "hi"
+vault = "default"
+
+[service]
+timeout_ms = 50
+"#;
+        let (_dir, manifest, _) = setup_project(PUSH_MANIFEST, bad_config);
+        let err = run_config_push_typed::<FixtureConfig>(&push_args(&manifest, "axum"))
+            .expect_err("validator failure must abort push");
+        assert!(
+            err.to_lowercase().contains("validation"),
+            "error names validation: {err}"
+        );
+    }
+
+    #[test]
+    fn typed_push_dry_run_does_not_write() {
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.dry_run = true;
+        run_config_push_typed::<FixtureConfig>(&args).expect("dry-run succeeds");
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            ".edgezero must not be created in dry-run"
+        );
     }
 }

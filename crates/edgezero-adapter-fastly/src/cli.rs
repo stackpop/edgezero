@@ -206,6 +206,21 @@ impl Adapter for FastlyCliAdapter {
         }
         Ok(out)
     }
+
+    fn push_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store_id: &str,
+        _entries: &[(String, String)],
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Stage 7.3 will resolve the config-store id via `fastly
+        // config-store list --json` and shell out to `fastly
+        // config-store-entry create` per key.
+        Err("fastly config push is not yet implemented; landing in a follow-up commit".to_owned())
+    }
 }
 
 /// Shell out to `fastly <kind>-store create --name=<id>`. Returns
