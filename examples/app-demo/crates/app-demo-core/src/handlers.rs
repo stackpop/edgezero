@@ -174,12 +174,17 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
     }
 }
 
-/// Increment and return a visit counter stored in KV.
+/// Increment and return a visit counter stored in the `sessions`
+/// KV store. The `[stores.kv]` manifest declares both `sessions`
+/// and `cache` ids; the counter lives in `sessions` because it
+/// tracks per-deployment session-flavoured state — the demo
+/// exercises [`Kv::named`] (not `.default()`) so the multi-store
+/// surface is visible end-to-end.
 #[action]
 pub async fn kv_counter(kv: Kv) -> Result<Response, EdgeError> {
     let store = kv
-        .default()
-        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
+        .named("sessions")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `sessions` is not registered"))?;
     let count: i64 = store
         .read_modify_write("demo:counter", 0_i64, |n| n.wrapping_add(1))
         .await?;
@@ -191,7 +196,10 @@ pub async fn kv_counter(kv: Kv) -> Result<Response, EdgeError> {
         .map_err(EdgeError::internal)
 }
 
-/// Store a note by id (body = note text).
+/// Store a note by id (body = note text) in the `cache` KV store.
+/// Notes are short-lived, cache-flavoured payloads — separate
+/// from the `sessions` store the counter writes to, so the demo
+/// exercises both named ids declared in `[stores.kv]`.
 #[action]
 pub async fn kv_note_put(
     kv: Kv,
@@ -199,8 +207,8 @@ pub async fn kv_note_put(
     RequestContext(ctx): RequestContext,
 ) -> Result<Response, EdgeError> {
     let store = kv
-        .default()
-        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
+        .named("cache")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
     let body = ctx.into_request().into_body();
     let body_bytes = body.into_bytes_bounded(MAX_BODY_SIZE).await?;
     store
@@ -212,15 +220,15 @@ pub async fn kv_note_put(
         .map_err(EdgeError::internal)
 }
 
-/// Read a note by id.
+/// Read a note by id from the `cache` KV store.
 #[action]
 pub async fn kv_note_get(
     kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
     let store = kv
-        .default()
-        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
+        .named("cache")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
     match store.get_bytes(&format!("note:{}", path.id)).await? {
         Some(data) => http::response_builder()
             .status(StatusCode::OK)
@@ -231,15 +239,15 @@ pub async fn kv_note_get(
     }
 }
 
-/// Delete a note by id.
+/// Delete a note by id from the `cache` KV store.
 #[action]
 pub async fn kv_note_delete(
     kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
     let store = kv
-        .default()
-        .ok_or_else(|| EdgeError::service_unavailable("no default KV store registered"))?;
+        .named("cache")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
     store.delete(&format!("note:{}", path.id)).await?;
     http::response_builder()
         .status(StatusCode::NO_CONTENT)
@@ -298,6 +306,7 @@ mod tests {
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+    use edgezero_core::store_registry::KvRegistry;
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -541,25 +550,40 @@ mod tests {
         RequestContext::new(request, PathParams::default())
     }
 
+    /// Build a `KvRegistry` with the two named stores
+    /// (`sessions` + `cache`) the manifest declares, each backed
+    /// by its own `MockKv`. The registry's `Clone` is cheap (each
+    /// `KvHandle` is `Arc`-backed), so a test can share the same
+    /// registry across two contexts to verify cross-request
+    /// persistence — which is what the put-then-get and put-then-
+    /// delete tests need.
     fn context_with_kv(
         path: &str,
         method: Method,
         body: Body,
         params: &[(&str, &str)],
-    ) -> (RequestContext, KvHandle) {
-        let kv = Arc::new(MockKv::new());
-        let handle = KvHandle::new(kv);
+    ) -> (RequestContext, KvRegistry) {
+        use edgezero_core::store_registry::StoreRegistry;
+        let sessions = KvHandle::new(Arc::new(MockKv::new()));
+        let cache = KvHandle::new(Arc::new(MockKv::new()));
+        let by_id: BTreeMap<String, KvHandle> = [
+            ("sessions".to_owned(), sessions),
+            ("cache".to_owned(), cache),
+        ]
+        .into_iter()
+        .collect();
+        let registry: KvRegistry = StoreRegistry::new(by_id, "sessions".to_owned());
         let mut request = request_builder()
             .method(method)
             .uri(path)
             .body(body)
             .expect("request");
-        request.extensions_mut().insert(handle.clone());
+        request.extensions_mut().insert(registry.clone());
         let map = params
             .iter()
             .map(|&(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<HashMap<_, _>>();
-        (RequestContext::new(request, PathParams::new(map)), handle)
+        (RequestContext::new(request, PathParams::new(map)), registry)
     }
 
     fn context_with_params(path: &str, params: &[(&str, &str)]) -> RequestContext {
@@ -680,7 +704,7 @@ mod tests {
 
     #[test]
     fn kv_note_delete_returns_no_content() {
-        let (ctx, handle) = context_with_kv(
+        let (ctx, registry) = context_with_kv(
             "/kv/notes/del",
             Method::POST,
             Body::from("to-delete"),
@@ -688,16 +712,19 @@ mod tests {
         );
         block_on(kv_note_put(ctx)).unwrap();
 
-        let (ctx2, _) = {
+        // Reuse the same registry so the delete sees the put's
+        // write — KvHandle is Arc-backed, so cloning the registry
+        // shares the underlying `cache` store across both ctxs.
+        let ctx2 = {
             let mut request = request_builder()
                 .method(Method::DELETE)
                 .uri("/kv/notes/del")
                 .body(Body::empty())
                 .expect("request");
-            request.extensions_mut().insert(handle.clone());
+            request.extensions_mut().insert(registry);
             let mut map = HashMap::new();
             map.insert("id".to_owned(), "del".to_owned());
-            (RequestContext::new(request, PathParams::new(map)), handle)
+            RequestContext::new(request, PathParams::new(map))
         };
         let resp = block_on(kv_note_delete(ctx2)).expect("response");
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -717,7 +744,7 @@ mod tests {
 
     #[test]
     fn kv_note_put_and_get() {
-        let (ctx, handle) = context_with_kv(
+        let (ctx, registry) = context_with_kv(
             "/kv/notes/abc",
             Method::POST,
             Body::from("hello world"),
@@ -726,19 +753,18 @@ mod tests {
         let put_resp = block_on(kv_note_put(ctx)).expect("response");
         assert_eq!(put_resp.status(), StatusCode::CREATED);
 
-        let (ctx2, _) = {
+        // Same registry → same `cache` store, so the get reads
+        // the value the put just wrote.
+        let ctx2 = {
             let mut request = request_builder()
                 .method(Method::GET)
                 .uri("/kv/notes/abc")
                 .body(Body::empty())
                 .expect("request");
-            request.extensions_mut().insert(handle.clone());
+            request.extensions_mut().insert(registry);
             let mut map = HashMap::new();
             map.insert("id".to_owned(), "abc".to_owned());
-            (
-                RequestContext::new(request, PathParams::new(map)),
-                handle.clone(),
-            )
+            RequestContext::new(request, PathParams::new(map))
         };
         let get_resp = block_on(kv_note_get(ctx2)).expect("response");
         assert_eq!(get_resp.status(), StatusCode::OK);
