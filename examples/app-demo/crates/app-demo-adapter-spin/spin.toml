@@ -11,10 +11,21 @@ version = "0.1.0"
 # names (`feature__new_checkout`, `service__timeout_ms`) before lookup,
 # matching the spec §6.7 rule. Override at runtime via
 # SPIN_VARIABLE_<UPPERCASE_NAME>=value or `spin up --env KEY=value`.
+#
+# Spec §15 + §6.7 also says secret variables must be declared MANUALLY
+# by the developer (config push never writes them). `api_token` is the
+# `#[secret]` field from AppDemoConfig — its value resolves through
+# the Spin secret store, but the variable must still be declared here
+# with `secret = true` so the wasm component is allowed to read it.
+# `vault` is `#[secret(store_ref)]` — the value is a runtime store id,
+# not material to keep secret, but bound the same way for consistency
+# with the AppDemoConfig surface.
 [variables]
 greeting = { default = "hello from config store" }
 feature__new_checkout = { default = "false" }
 service__timeout_ms = { default = "1500" }
+api_token = { required = true, secret = true }
+vault = { default = "default" }
 # smoke_secret has an empty default so the server starts without a value set.
 # Pass SPIN_VARIABLE_SMOKE_SECRET=<value> when running smoke_test_secrets.sh.
 smoke_secret = { default = "" }
@@ -37,6 +48,8 @@ key_value_stores = ["sessions", "cache"]
 greeting = "{{ greeting }}"
 feature__new_checkout = "{{ feature__new_checkout }}"
 service__timeout_ms = "{{ service__timeout_ms }}"
+api_token = "{{ api_token }}"
+vault = "{{ vault }}"
 smoke_secret = "{{ smoke_secret }}"
 
 [component.app-demo.build]
