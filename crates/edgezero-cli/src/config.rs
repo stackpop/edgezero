@@ -1570,6 +1570,44 @@ ids = ["default"]
         run_config_push(&args).expect("fastly dry-run dispatches cleanly");
     }
 
+    #[test]
+    fn raw_push_spin_dry_run_dispatches_to_adapter() {
+        // Real impl shipped in 7.4 — dry-run resolves the
+        // component but skips the spin.toml writeback, so CI
+        // exercises dispatch without leaving artifacts.
+        let manifest_spin = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_spin, VALID_APP_CONFIG);
+        // spin's push needs a single-component spin.toml the
+        // resolver can locate — write one even though dry-run
+        // won't edit it.
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let mut args = push_args(&manifest, "spin");
+        args.dry_run = true;
+        run_config_push(&args).expect("spin dry-run dispatches cleanly");
+    }
+
     // ---------- typed push ----------
 
     #[test]
