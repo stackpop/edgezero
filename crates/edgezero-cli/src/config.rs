@@ -1499,7 +1499,7 @@ timeout_ms = 1500
         assert_eq!(parsed["tags"], "[\"a\",\"b\",\"c\"]");
     }
 
-    // ---------- stub adapters (Stage 7.3/7.4 land impls) ----------
+    // ---------- non-axum adapters (dry-run dispatch tests) ----------
 
     #[test]
     fn raw_push_cloudflare_dry_run_dispatches_to_adapter() {
@@ -1537,6 +1537,37 @@ ids = ["default"]
         let mut args = push_args(&manifest, "cloudflare");
         args.dry_run = true;
         run_config_push(&args).expect("cloudflare dry-run dispatches cleanly");
+    }
+
+    #[test]
+    fn raw_push_fastly_dry_run_dispatches_to_adapter() {
+        // Real impl shipped in 7.3 — dry-run skips the `fastly
+        // config-store list --json` resolver and the per-entry
+        // create shell-out, so CI exercises dispatch without
+        // fastly on PATH.
+        let manifest_fastly = r#"
+[app]
+name = "demo-app"
+
+[adapters.fastly.adapter]
+crate = "crates/demo-fastly"
+manifest = "fastly.toml"
+
+[adapters.fastly.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_fastly, VALID_APP_CONFIG);
+        let mut args = push_args(&manifest, "fastly");
+        args.dry_run = true;
+        run_config_push(&args).expect("fastly dry-run dispatches cleanly");
     }
 
     // ---------- typed push ----------

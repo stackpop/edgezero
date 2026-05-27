@@ -212,14 +212,34 @@ impl Adapter for FastlyCliAdapter {
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _store_id: &str,
-        _entries: &[(String, String)],
-        _dry_run: bool,
+        store_id: &str,
+        entries: &[(String, String)],
+        dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Stage 7.3 will resolve the config-store id via `fastly
-        // config-store list --json` and shell out to `fastly
-        // config-store-entry create` per key.
-        Err("fastly config push is not yet implemented; landing in a follow-up commit".to_owned())
+        // §13: resolve the platform config-store id on demand via
+        // `fastly config-store list --json` (matched by name =
+        // `store_id`), then `fastly config-store-entry create
+        // --store-id=<id> --key=<k> --value=<v>` per key. Keys
+        // arrive pre-flattened from the CLI (dotted form).
+        if entries.is_empty() {
+            return Ok(vec![format!(
+                "no config entries to push to fastly config-store `{store_id}`"
+            )]);
+        }
+        if dry_run {
+            return Ok(vec![format!(
+                "would resolve fastly config-store `{store_id}` via `fastly config-store list --json` and run `fastly config-store-entry create` for {} entries",
+                entries.len()
+            )]);
+        }
+        let resolved_id = resolve_remote_config_store_id(store_id)?;
+        for (key, value) in entries {
+            create_config_store_entry(&resolved_id, key, value)?;
+        }
+        Ok(vec![format!(
+            "pushed {} entries to fastly config-store `{store_id}` (id={resolved_id})",
+            entries.len()
+        )])
     }
 }
 
@@ -319,6 +339,97 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     Ok(())
+}
+
+// -------------------------------------------------------------------
+// `config push` helpers (spec §13)
+// -------------------------------------------------------------------
+
+/// Shell out to `fastly config-store-entry create --store-id=<id>
+/// --key=<k> --value=<v>` for a single entry. Surfaces fastly's
+/// stderr verbatim on failure — including the "entry already
+/// exists" error, which is the operator's signal to delete the
+/// entry (or use `config-store-entry update` manually) before
+/// re-running push.
+fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(), String> {
+    let store_arg = format!("--store-id={store_id}");
+    let key_arg = format!("--key={key}");
+    let value_arg = format!("--value={value}");
+    let output = Command::new("fastly")
+        .args([
+            "config-store-entry",
+            "create",
+            store_arg.as_str(),
+            key_arg.as_str(),
+            value_arg.as_str(),
+        ])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "`fastly config-store-entry create --store-id={store_id} --key={key} ...` exited with status {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// Parse `fastly config-store list --json` output and return the
+/// platform `id` of the store whose `name` matches `name`. Accepts
+/// both a bare array (`[ {"id": "...", "name": "..."}, ... ]`)
+/// and an `{"items": [...]}` envelope so this stays compatible
+/// across fastly CLI versions.
+fn find_config_store_id(stdout: &str, name: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let array = parsed
+        .as_array()
+        .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))?;
+    for entry in array {
+        if entry.get("name").and_then(serde_json::Value::as_str) == Some(name) {
+            return entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
+/// Resolve the platform config-store id on demand: shell out to
+/// `fastly config-store list --json`, parse the JSON, match by
+/// `name`. The provision flow doesn't persist this id (spec §12),
+/// so push has to re-fetch every time.
+fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
+    let output = Command::new("fastly")
+        .args(["config-store", "list", "--json"])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "`fastly config-store list --json` exited with status {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    find_config_store_id(&stdout, name).ok_or_else(|| {
+        format!(
+            "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
+        )
+    })
 }
 
 /// # Errors
@@ -768,5 +879,86 @@ mod tests {
             .expect("skip path succeeds without invoking fastly");
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("already declared"), "got: {out:?}");
+    }
+
+    // ---------- find_config_store_id ----------
+
+    #[test]
+    fn find_config_store_id_matches_bare_array_by_name() {
+        let stdout = r#"[
+            {"id": "abc123", "name": "app_config"},
+            {"id": "def456", "name": "other_store"}
+        ]"#;
+        assert_eq!(
+            find_config_store_id(stdout, "app_config").as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_tolerates_items_envelope() {
+        let stdout = r#"{"items": [
+            {"id": "xyz789", "name": "app_config"}
+        ]}"#;
+        assert_eq!(
+            find_config_store_id(stdout, "app_config").as_deref(),
+            Some("xyz789")
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_returns_none_on_mismatch() {
+        let stdout = r#"[{"id": "abc", "name": "other"}]"#;
+        assert!(find_config_store_id(stdout, "missing").is_none());
+    }
+
+    #[test]
+    fn find_config_store_id_returns_none_on_malformed_json() {
+        assert!(find_config_store_id("not json", "anything").is_none());
+        assert!(find_config_store_id("", "anything").is_none());
+    }
+
+    // ---------- push_config_entries (dry-run + error paths) ----------
+
+    #[test]
+    fn push_dry_run_does_not_invoke_fastly() {
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                "app_config",
+                &entries,
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("would resolve fastly config-store `app_config`")
+                && out[0].contains("config-store-entry create"),
+            "dry-run line describes the would-be flow: {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_with_no_entries_reports_no_op_without_invoking_fastly() {
+        let dir = tempdir().expect("tempdir");
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                "app_config",
+                &[],
+                false,
+            )
+            .expect("zero-entry push is fine");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("no config entries"),
+            "status line names the no-op: {out:?}"
+        );
     }
 }
