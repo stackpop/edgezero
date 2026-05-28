@@ -1,3 +1,11 @@
 .vitepress/cache
 .vitepress/dist
 node_modules
+
+# Internal design docs (specs + plans) — mirror VitePress's srcExclude.
+# Prettier's continuation-line indent rules mangle the wrapped prose in
+# these handwritten documents (e.g. lines starting with `[[...]]` get
+# treated as link references), so leave them un-reformatted. They sit
+# under `docs/` only because the path is convenient for note-taking;
+# they're gitignored and not part of the published site.
+superpowers

@@ -8,7 +8,9 @@ shift as the roadmap evolves.
 - Tooling parity: extend `edgezero-cli` with template/plugin style commands (similar to Spin
   templates) to streamline new app scaffolds and provider-specific wiring.
 - CLI parity backlog: add `edgezero --list-adapters`, standardize exit codes, search up for
-  `edgezero.toml`, respect `RUST_LOG` for dev output, and bake in hot reload for `edgezero dev`.
+  `edgezero.toml`, respect `RUST_LOG` for dev output, and bake in hot reload for
+  `edgezero serve --adapter axum` (the local dev path; the standalone `dev` subcommand was
+  reserved for a future dev-workflow command, see [CLI reference](./cli-reference#edgezero-demo)).
 - Adapter behavior matrix: document which adapters buffer bodies, which preserve streaming, and
   where proxy headers/automatic decompression apply so expectations match runtime behavior.
 - Example coverage: add focused guides for `axum.toml`, manifest `description` fields, logging
