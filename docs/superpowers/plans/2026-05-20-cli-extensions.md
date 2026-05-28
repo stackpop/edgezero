@@ -193,11 +193,13 @@ substrate Stage 3 builds on.)
 - `RequestContext` accessors are **id-keyed**:
   `kv_store(id)` / `kv_store_default()`,
   `config_store(id)` / `config_store_default()`,
-  `secret_store(id)` / `secret_store_default()`. The legacy singular
-  accessors stay around as fallbacks (`kv_handle()` / `config_handle()` /
-  `secret_handle()`) for code paths that don't wire a registry; the
-  id-keyed accessors prefer a wired registry and fall back to the
-  legacy handle wrapped under the conventional `"default"` id.
+  `secret_store(id)` / `secret_store_default()`. The pre-rewrite
+  singular accessors (`kv_handle()` / `config_handle()` /
+  `secret_handle()`) are GONE (Stage 10.1 hard-cutoff). The
+  setup APIs (`with_kv_handle`, etc.) still accept a single
+  handle but synthesise a one-id `StoreRegistry` keyed under
+  `"default"` at the dispatch boundary -- the id-keyed accessors
+  only consult registries, never a bare handle in extensions.
 - `Kv` / `Secrets` / `Config` extractors expose `.default()` /
   `.named(id)` returning the matching `Bound*Store`. The legacy
   destructure pattern (`Kv(store): Kv`) is gone.

@@ -54,8 +54,14 @@ impl EdgeZeroAxumService {
 
     /// Attach a shared config store to this service.
     ///
-    /// Legacy single-handle setter; the handle is exposed via
-    /// `ctx.config_handle()`. New code should use [`Self::with_config_registry`].
+    /// Single-handle setter; the dispatcher synthesises a one-id
+    /// `ConfigRegistry` keyed under `"default"`. Handlers read it
+    /// via `ctx.config_store_default()` or the `Config` extractor
+    /// (the pre-rewrite `ctx.config_handle()` accessor is gone --
+    /// see the runtime-store-API hard-cutoff in
+    /// docs/guide/manifest-store-migration.md). New code that
+    /// declares multiple ids should use [`Self::with_config_registry`]
+    /// directly.
     #[must_use]
     #[inline]
     pub fn with_config_store_handle(mut self, handle: ConfigStoreHandle) -> Self {
@@ -65,8 +71,14 @@ impl EdgeZeroAxumService {
 
     /// Attach a shared KV store to this service.
     ///
-    /// Legacy single-handle setter; the handle is exposed via
-    /// `ctx.kv_handle()`. New code should use [`Self::with_kv_registry`].
+    /// Single-handle setter; the dispatcher synthesises a one-id
+    /// `KvRegistry` keyed under `"default"`. Handlers read it via
+    /// `ctx.kv_store_default()` or the `Kv` extractor (the
+    /// pre-rewrite `ctx.kv_handle()` accessor is gone -- see the
+    /// runtime-store-API hard-cutoff in
+    /// docs/guide/manifest-store-migration.md). New code that
+    /// declares multiple ids should use [`Self::with_kv_registry`]
+    /// directly.
     #[must_use]
     #[inline]
     pub fn with_kv_handle(mut self, handle: KvHandle) -> Self {
@@ -84,8 +96,15 @@ impl EdgeZeroAxumService {
 
     /// Attach a shared secret store to this service.
     ///
-    /// Legacy single-handle setter; the handle is exposed via
-    /// `ctx.secret_handle()`. New code should use [`Self::with_secret_registry`].
+    /// Single-handle setter; the dispatcher synthesises a one-id
+    /// `SecretRegistry` keyed under `"default"` (the handle is
+    /// bound to the platform store name `"default"`). Handlers
+    /// read it via `ctx.secret_store_default()` or the `Secrets`
+    /// extractor (the pre-rewrite `ctx.secret_handle()` accessor
+    /// is gone -- see the runtime-store-API hard-cutoff in
+    /// docs/guide/manifest-store-migration.md). New code that
+    /// declares multiple ids should use
+    /// [`Self::with_secret_registry`] directly.
     #[must_use]
     #[inline]
     pub fn with_secret_handle(mut self, handle: SecretHandle) -> Self {

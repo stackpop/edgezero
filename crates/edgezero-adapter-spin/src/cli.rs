@@ -629,6 +629,12 @@ fn write_spin_variables(
         .map_err(|err| format!("failed to parse {}: {err}", spin_path.display()))?;
 
     // (1) Application-level declarations under [variables].
+    // Existing entries may be either a `[variables.<key>]` block
+    // table OR an inline-table value (`<key> = { default = "..." }`).
+    // Real-world spin.toml files hand-edited by developers very often
+    // use the inline form; preserve whichever shape the user chose
+    // and update the `default` field in place. New entries (no prior
+    // declaration) get the block form by default.
     let variables_entry = doc.entry("variables").or_insert_with(table);
     let variables_tbl = variables_entry
         .as_table_mut()
@@ -637,10 +643,29 @@ fn write_spin_variables(
         let var_entry = variables_tbl
             .entry(spin_key.as_str())
             .or_insert_with(|| Item::Table(toml_edit::Table::new()));
-        let var_tbl = var_entry
-            .as_table_mut()
-            .ok_or_else(|| not_a_table_error(spin_path, &format!("variables.{spin_key}")))?;
-        var_tbl.insert("default", value(val.as_str()));
+        match var_entry {
+            Item::Table(tbl) => {
+                tbl.insert("default", value(val.as_str()));
+            }
+            Item::Value(toml_edit::Value::InlineTable(inline)) => {
+                inline.insert("default", toml_edit::Value::from(val.as_str()));
+            }
+            Item::Value(
+                toml_edit::Value::String(_)
+                | toml_edit::Value::Integer(_)
+                | toml_edit::Value::Float(_)
+                | toml_edit::Value::Boolean(_)
+                | toml_edit::Value::Datetime(_)
+                | toml_edit::Value::Array(_),
+            )
+            | Item::None
+            | Item::ArrayOfTables(_) => {
+                return Err(not_a_table_error(
+                    spin_path,
+                    &format!("variables.{spin_key}"),
+                ));
+            }
+        }
     }
 
     // (2) Component-level bindings under
@@ -1425,6 +1450,50 @@ mod tests {
             .as_table()
             .expect("bindings present");
         assert_eq!(bindings.len(), 1, "no duplicate bindings: {after}");
+    }
+
+    #[test]
+    fn write_spin_variables_updates_existing_inline_table_entry_in_place() {
+        // Hand-edited spin.toml files often declare variables in
+        // inline-table form: `greeting = { default = "hello" }`. The
+        // writeback path must update such entries in place (matching
+        // the user's chosen shape) instead of erring "is not a
+        // table". app-demo's spin.toml is exactly this shape.
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n\
+             [application]\nname = \"x\"\nversion = \"0\"\n\
+             [variables]\n\
+             greeting = { default = \"old\" }\n\
+             feature__new_checkout = { default = \"false\" }\n\
+             [component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let entries = vec![
+            ("greeting".to_owned(), "updated".to_owned()),
+            ("feature__new_checkout".to_owned(), "true".to_owned()),
+        ];
+        write_spin_variables(&path, "demo", &entries).expect("inline-table writeback succeeds");
+
+        let after = fs::read_to_string(&path).expect("read back");
+        let parsed: toml::Value = toml::from_str(&after).expect("parses");
+        assert_eq!(
+            parsed["variables"]["greeting"]["default"].as_str(),
+            Some("updated"),
+            "inline-table entry updated: {after}"
+        );
+        assert_eq!(
+            parsed["variables"]["feature__new_checkout"]["default"].as_str(),
+            Some("true"),
+            "second inline-table entry updated: {after}"
+        );
+        // The original inline-table shape is preserved (not
+        // converted to a block table), so the user's formatting
+        // stays intact.
+        assert!(
+            after.contains("greeting = {") || after.contains("greeting= {"),
+            "preserved inline-table shape: {after}"
+        );
     }
 
     #[test]

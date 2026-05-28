@@ -57,9 +57,11 @@ adapters = [{{{adapter_list}}}]
 # `[stores.<kind>]` declares logical store ids only. `default` is required
 # when more than one id is declared; with a single id it resolves to that id.
 #
-# The default scaffold ships with no stores so `edgezero serve --adapter
-# <name>` starts cleanly without per-platform KV / config / secret bindings.
-# Uncomment the kinds your handlers use and provision the matching platform
+# `[stores.secrets]` is uncommented out of the box because the scaffolded
+# `<name>::AppConfig` declares a `#[secret] api_token` field, which
+# `edgezero config validate` rejects unless the manifest declares a secret
+# store to resolve the key against. Uncomment KV / config blocks once your
+# handlers use those store kinds, and provision the matching platform
 # bindings (see docs/guide/manifest-store-migration.md and the per-adapter
 # guides for the wrangler.toml / spin.toml / fastly.toml entries).
 #
@@ -68,9 +70,9 @@ adapters = [{{{adapter_list}}}]
 #
 # [stores.config]
 # ids = ["app_config"]
-#
-# [stores.secrets]
-# ids = ["default"]
+
+[stores.secrets]
+ids = ["default"]
 
 # [environment]
 #
