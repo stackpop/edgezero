@@ -84,29 +84,69 @@
   translation). The typed flow strips both `#[secret]` and
   `#[secret(store_ref)]` top-level fields before pushing (spec
   §13).
-- **Stage 8 — partially shipped.** Task 8.1's plan-listed
-  sub-items split across three commits: `3d3f87c` (manual Spin
+- **Stage 8 — shipped.** Plan task 8.1 split across three
+  commits (`3d3f87c`, `9fdd1f4`, `26fddcc`) — manual Spin
   secret-variable declarations in
-  `app-demo-adapter-spin/spin.toml` — `api_token` with
-  `required = true, secret = true` and `vault` with a default,
-  both bound under `[component.app-demo.variables]`), `9fdd1f4`
-  (three `app-demo-cli` integration tests covering typed
-  `config validate --strict`, typed `config push --adapter
-  axum` with secret-stripping assertions, and typed
-  `config push --adapter spin --dry-run` with manifest-
-  preservation assertion — env-overlay path is already covered
-  by `app-demo-core/src/config.rs::env_overlay_overrides_
-  nested_value`), `26fddcc` (handlers rewired to use
-  `Kv::named("sessions")` for the counter and `Kv::named("cache")`
-  for the notes endpoints, with `context_with_kv` rebuilt
-  around a real `KvRegistry`). **Remaining Stage 8 work:**
-  Task 8.1 step 2's e2e demo-server test (needs an
-  ephemeral-port + readiness + RAII-teardown lifecycle helper
-  — see "Demo-server lifecycle" in the task body); Task 8.2
-  (upgrade the `<name>-cli` generator template to emit the full
-  seven-command Cmd enum); Task 8.3 (CI wiring for `cd
-  examples/app-demo && cargo test`); Task 8.4
-  (`cli-walkthrough.md` + doc audit).
+  `app-demo-adapter-spin/spin.toml`, three typed-CLI
+  integration tests in `app-demo-cli/tests/config_flow.rs`,
+  and the handler rewiring to `Kv::named("sessions")` /
+  `Kv::named("cache")` with a registry-aware
+  `context_with_kv` test helper. Plan task 8.2 (generator
+  CLI template emits the full seven-command Cmd enum) shipped
+  as `a4f7c81`. The e2e roundtrip
+  (push → `AxumConfigStore::from_path` → handler) shipped as
+  `45aef3d`; full HTTP-subprocess lifecycle is intentionally
+  deferred — the data-contract roundtrip covers what app-demo
+  needs without the subprocess machinery. Plan task 8.3 (CI
+  wiring for `cd examples/app-demo && cargo test` plus
+  fmt/clippy gates) shipped as `7d01061`. Plan task 8.4
+  (`cli-walkthrough.md` + doc audit + sidebar update + a
+  silent-broken VitePress build fix for the `{{ <key> }}`
+  interpolation in cli-reference.md) shipped as `a3b7a89`.
+- **Stage 9 — shipped (review followups).** A staff-engineer
+  review of the post-Stage-8 branch found five gaps; each
+  landed as its own commit so review traceability stays
+  linear. `55fe91b` (Stage 9.1) wired `run_shared_checks` into
+  both raw and typed `config push` with `strict: true`
+  synthesised on the validate args — the typed push had been
+  loading config, running typed secret checks, and dispatching
+  without running the shared adapter / capability-completeness
+  / handler-path checks the spec promised. `b531f5a` (Stage
+  9.2) fixed Spin secret-value validation: the runtime
+  `SpinSecretStore::get_bytes` lowercases keys before
+  `variables::get`, but the validator was case-preserving, so
+  `#[secret]` value `"GREETING"` against config key `greeting`
+  silently passed and dashed values like `"api-token"` were
+  caught only at runtime — `validate_typed_secrets` now mirrors
+  the runtime canonicalisation exactly and also runs
+  `is_valid_spin_key` on each secret value. `2cc85d1` (Stage
+  9.3) introduced the runtime store-API hard-cutoff at the
+  fallback layer: `StoreRegistry::single_id` helper + dispatch-
+  boundary synthesis in all four adapters + extractor and
+  `RequestContext::*_store*` fallback removal. `6592918`
+  (Stage 9.4) hardened Spin dry-run assertions to verify the
+  translated keys, both spin.toml tables, and that
+  `SECRET_FIELDS` stripping reaches the adapter preview.
+  `8ad9040` (Stage 9.5) refreshed the PR template, run_tests.sh,
+  and the migration guide for the new gates and the shipped
+  `config push` command.
+- **Stage 10 — shipped (second-review followups).** A second
+  pass flagged that Stage 9.3 had only closed the
+  silent-masking fallback; the public legacy
+  `RequestContext::config_handle()` / `kv_handle()` /
+  `secret_handle()` accessors plus the bare-handle insertion
+  into request extensions still existed, contradicting the
+  spec's "no backward compatibility" promise.
+  `b1b5dca` (Stage 10.1) removed those three methods, stopped
+  inserting bare handles into request extensions in all four
+  dispatchers, and migrated 9 dev-server callers + 3 axum
+  service tests + 4 contract-test handlers (cloudflare /
+  fastly / spin) to the registry-aware accessors. The
+  `with_*_handle` / `dispatch_with_*_handle` convenience
+  constructors stay public but route through the
+  one-id-registry synthesis path internally, so pre-rewrite
+  setup code keeps compiling while pre-rewrite handler code
+  fails to compile (exactly the spec contract).
 
 ## Codebase facts this plan relies on
 
