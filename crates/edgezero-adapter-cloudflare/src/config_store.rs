@@ -2,8 +2,7 @@
 //!
 //! Each declared config id maps to its own Cloudflare KV namespace binding,
 //! resolved at request time from `EDGEZERO__STORES__CONFIG__<ID>__NAME`.
-//! Reads are async (`worker::kv::KvStore::get(key).text().await`) — see
-//! `§6.6` of the `EdgeZero` design doc.
+//! Reads are async (`worker::kv::KvStore::get(key).text().await`).
 //!
 //! ```toml
 //! # wrangler.toml

@@ -36,7 +36,7 @@ pub struct ProvisionStores<'stores> {
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 ///
 /// The non-`execute` methods carry the adapter's `config validate`
-/// rules (spec §10). They take primitive parameters (no `Manifest` /
+/// rules. They take primitive parameters (no `Manifest` /
 /// `SecretField` from `edgezero-core`) so this crate stays dep-free
 /// of `edgezero-core`. Defaults are no-ops; adapters override what
 /// they actually need.
@@ -51,7 +51,7 @@ pub trait Adapter: Sync + Send {
     fn name(&self) -> &'static str;
 
     /// Provision the platform resources backing each store id the
-    /// user declared (spec §12). Returns a list of human-readable
+    /// user declared. Returns a list of human-readable
     /// status lines the CLI logs verbatim — one line per resource
     /// created, skipped, or that would be created under `dry_run`.
     ///
@@ -82,7 +82,7 @@ pub trait Adapter: Sync + Send {
     }
 
     /// Push resolved config entries into the platform's config
-    /// store backing `store_id` (spec §13). Returns a list of
+    /// store backing `store_id`. Returns a list of
     /// human-readable status lines the CLI logs verbatim.
     ///
     /// `entries` are pre-flattened and pre-stringified by the CLI:
@@ -90,7 +90,7 @@ pub trait Adapter: Sync + Send {
     /// (numbers via `to_string`, arrays/maps via `serde_json`,
     /// `Option::None` already skipped). The CLI also skips
     /// `SECRET_FIELDS` on the typed path before calling. Adapter-
-    /// specific key translation (`.` → `__` for spin, §6.7) and
+    /// specific key translation (`.` → `__` for spin,) and
     /// per-platform value encoding happen here.
     ///
     /// `manifest_root`, `adapter_manifest_path`, and
@@ -121,7 +121,7 @@ pub trait Adapter: Sync + Send {
     }
 
     /// Store kinds for which this adapter is Single-capable per
-    /// spec §6.6 — `--strict` rejects `[stores.<kind>].ids.len() > 1`
+    /// spec — `--strict` rejects `[stores.<kind>].ids.len() > 1`
     /// when any listed kind matches. Default: `&[]` (Multi for
     /// every store kind).
     #[inline]

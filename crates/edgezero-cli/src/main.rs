@@ -14,7 +14,7 @@ fn main() {
         // runs the **raw** validator and the **raw** push. Downstream
         // CLIs that own a typed config wire
         // `run_config_validate_typed::<C>` / `run_config_push_typed::<C>`
-        // instead (spec §1, §8, §13).
+        // instead.
         Command::Config(ConfigCmd::Push(args)) => edgezero_cli::run_config_push(&args),
         Command::Config(ConfigCmd::Validate(args)) => edgezero_cli::run_config_validate(&args),
         Command::Deploy(args) => edgezero_cli::run_deploy(&args),

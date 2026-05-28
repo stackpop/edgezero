@@ -115,7 +115,7 @@ impl Adapter for SpinCliAdapter {
         match action {
             // `spin cloud {login|logout|info}` is the native sign-in
             // surface for Fermyon Cloud. EdgeZero stores no
-            // credentials — this is a thin shell-out (spec §11).
+            // credentials — this is a thin shell-out.
             AdapterAction::AuthLogin => {
                 run_native_cli("spin", &["cloud", "login"], SPIN_INSTALL_HINT)
             }
@@ -148,7 +148,7 @@ impl Adapter for SpinCliAdapter {
         stores: &ProvisionStores<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §12: spin provision is pure spin.toml editing — no
+        //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
         // runtime / Fermyon at deploy). For each declared KV id,
         // append the label to the resolved component's
@@ -158,7 +158,7 @@ impl Adapter for SpinCliAdapter {
         // `config push --adapter spin` declares config variables
         // (it loads the typed `<name>.toml`), and secret
         // variables are manually declared by the developer in
-        // spin.toml (spec §6.7).
+        // spin.toml.
         let Some(rel) = adapter_manifest_path else {
             return Err(
                 "[adapters.spin.adapter].manifest must point at spin.toml for provision".to_owned(),
@@ -198,7 +198,7 @@ impl Adapter for SpinCliAdapter {
         }
         for id in stores.secrets {
             out.push(format!(
-                "spin secret id `{id}` requires manual `[variables].* secret = true` + `[component.*.variables].*` declarations in spin.toml (spec §6.7); nothing to do here"
+                "spin secret id `{id}` requires manual `[variables].* secret = true` + `[component.*.variables].*` declarations in spin.toml; nothing to do here"
             ));
         }
         if out.is_empty() {
@@ -216,7 +216,7 @@ impl Adapter for SpinCliAdapter {
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §13: pure spin.toml editing — no shell-out. Spec §6.7
+        //: pure spin.toml editing — no shell-out. Spec
         // says Spin variables must match `^[a-z][a-z0-9_]*$`, and
         // dotted CLI keys translate `.→__` (lowercase). A Spin
         // variable is only readable by a component when it is both
@@ -283,7 +283,7 @@ impl Adapter for SpinCliAdapter {
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
-        // §6.7: Multi for KV (label-backed); Single for Config and
+        //: Multi for KV (label-backed); Single for Config and
         // Secrets (flat-variable namespace).
         &["config", "secrets"]
     }
@@ -294,7 +294,7 @@ impl Adapter for SpinCliAdapter {
         adapter_manifest_path: Option<&str>,
         component_selector: Option<&str>,
     ) -> Result<(), String> {
-        // §6.7 check 3: spin.toml must exist and either declare
+        // check 3: spin.toml must exist and either declare
         // exactly one `[component.*]` or carry an explicit selector
         // that matches one of the declared ids.
         let Some(rel) = adapter_manifest_path else {
@@ -344,7 +344,7 @@ impl Adapter for SpinCliAdapter {
     }
 
     fn validate_app_config_keys(&self, keys: &[&str]) -> Result<(), String> {
-        // §6.7 check 1: each dotted config key, translated `.→__`,
+        // check 1: each dotted config key, translated `.→__`,
         // must match `^[a-z][a-z0-9_]*$` — Spin's flat variable
         // namespace has no other escaping.
         for key in keys {
@@ -363,7 +363,7 @@ impl Adapter for SpinCliAdapter {
         config_keys: &[&str],
         plain_secrets: &[(&str, &str)],
     ) -> Result<(), String> {
-        // §6.7 check 2: flattened config keys ∪ `#[secret]` values
+        // check 2: flattened config keys ∪ `#[secret]` values
         // must be a unique set in the effective Spin variable
         // namespace, since Spin has one flat namespace per
         // component. The CLI already filtered out
@@ -441,7 +441,7 @@ fn collect_spin_component_ids(parsed: &toml::Value) -> Vec<String> {
 
 /// Resolve which `[component.<id>]` table `provision` should
 /// write into. Mirrors the rule used by `validate_adapter_manifest`
-/// (§6.7): single-component spin.toml resolves implicitly,
+///: single-component spin.toml resolves implicitly,
 /// multi-component requires an explicit `component = "..."` in
 /// `[adapters.spin.adapter]`, and a selector that doesn't match
 /// any declared id is an error.
@@ -551,7 +551,7 @@ fn ensure_kv_label_in_component(
 }
 
 /// Translate a dotted CLI config key into a Spin variable name
-/// (§6.7). Spin's flat variable namespace has no concept of
+///. Spin's flat variable namespace has no concept of
 /// nested paths, so we encode the dotted path as `__`-separated
 /// segments and lowercase the result.
 fn translate_key_for_spin(dotted_key: &str) -> String {
@@ -849,7 +849,7 @@ mod tests {
     fn validate_typed_secrets_detects_collision() {
         // `api_token = "greeting"` makes the config key `greeting`
         // and the Spin variable derived from the secret value
-        // `greeting` collide (§6.7 check 2).
+        // `greeting` collide.
         let err = SpinCliAdapter
             .validate_typed_secrets(&["greeting"], &[("api_token", "greeting")])
             .expect_err("collision must error");
@@ -869,7 +869,7 @@ mod tests {
             .expect("non-colliding inputs must pass");
     }
 
-    // ---------- Stage 9.2 regressions (review finding 3) ----------
+    // ---------- secret-value canonicalisation regressions ----------
 
     /// Runtime `SpinSecretStore::get_bytes` lowercases the key
     /// before calling `variables::get`. The validator must
@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn translate_key_for_spin_lowercases() {
         // Spin's `^[a-z][a-z0-9_]*$` rule rejects uppercase; the
-        // translator normalises so the validator in §6.7 sees the
+        // translator normalises so the validator in sees the
         // canonical form before push.
         assert_eq!(translate_key_for_spin("GREETING"), "greeting");
         assert_eq!(
@@ -1306,7 +1306,7 @@ mod tests {
         write_spin_variables(&path, "demo", &entries).expect("write");
         let after = fs::read_to_string(&path).expect("read back");
         // The generated manifest must round-trip through a TOML
-        // parser (spec §13 "validation strength" — regex + parse
+        // parser (spec "validation strength" — regex + parse
         // is the floor when neither the spin CLI nor spin_sdk is
         // reachable from the test harness).
         let parsed: toml::Value = toml::from_str(&after).expect("parses as TOML");
@@ -1385,7 +1385,7 @@ mod tests {
 
     #[test]
     fn write_spin_variables_golden_round_trips_and_passes_spin_key_regex() {
-        // §13 golden test — floor of the validation ladder when
+        // golden test — floor of the validation ladder when
         // neither the spin CLI nor spin_sdk validation is
         // reachable: every variable name matches the Spin
         // `^[a-z][a-z0-9_]*$` rule, and the generated manifest
@@ -1428,7 +1428,7 @@ mod tests {
 
     #[test]
     fn push_dry_run_does_not_edit_spin_toml() {
-        // Stage 9.4 (review finding 4): the spec calls for the
+        // the spec calls for the
         // dry-run to print the would-be `__`-encoded keys and the
         // would-be content of BOTH spin.toml tables, then leave
         // the on-disk file unchanged. Exercise a multi-entry

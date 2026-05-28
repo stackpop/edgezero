@@ -1,4 +1,4 @@
-//! `auth` command (spec §11).
+//! `auth` command.
 //!
 //! Pure thin delegate to the adapter registry — the same dispatch
 //! path `build` / `deploy` / `serve` use. The CLI does NOT know how

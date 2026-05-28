@@ -24,7 +24,7 @@
 //! # Usage
 //!
 //! Use the [`crate::extractor::Kv`] extractor with the `#[action]`
-//! macro and pick a store by id at the call site (Stage 2 portable
+//! macro and pick a store by id at the call site (portable
 //! store API):
 //!
 //! ```rust,ignore

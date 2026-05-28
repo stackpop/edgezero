@@ -164,7 +164,7 @@ pub async fn dispatch_with_config_handle(
 /// Dispatch a request with a Cloudflare KV-backed config store injected.
 ///
 /// Opens `binding_name` as a KV namespace and injects a [`CloudflareConfigStore`]
-/// handle whose `get` reads asynchronously from that namespace (§6.6). The KV
+/// handle whose `get` reads asynchronously from that namespace. The KV
 /// namespace bound to [`DEFAULT_KV_BINDING`] is also resolved and injected
 /// (non-required: missing bindings are silently skipped).
 pub async fn dispatch_with_config(
@@ -282,7 +282,7 @@ async fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<CfResponse, WorkerError> {
-    // Stage 10.1 hard-cutoff: see fastly's `dispatch_core_request`
+    // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
     // at the dispatch boundary.
@@ -323,7 +323,7 @@ async fn dispatch_core_request(
 
 /// Dispatch with per-id store registries built from baked metadata.
 ///
-/// Cloudflare capability map (§6.6):
+/// Cloudflare capability map:
 /// - KV (Multi): each declared id opens its own KV namespace binding via
 ///   `EDGEZERO__STORES__KV__<ID>__NAME` (default = id).
 /// - Config (Multi): each declared id opens its own KV namespace via

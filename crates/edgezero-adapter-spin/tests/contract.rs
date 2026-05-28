@@ -135,7 +135,7 @@ fn build_test_app() -> App {
     }
 
     async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        // Stage 10.1 hard-cutoff: legacy `ctx.config_handle()` is
+        // Hard-cutoff: legacy `ctx.config_handle()` is
         // gone. The dispatch boundary synthesises a one-id
         // `ConfigRegistry` from the wired handle.
         let value = match ctx.config_store_default() {
@@ -155,7 +155,7 @@ fn build_test_app() -> App {
     }
 
     async fn kv_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        // Stage 10.1 hard-cutoff: `ctx.kv_handle()` removed —
+        // Hard-cutoff: `ctx.kv_handle()` removed —
         // `kv_store_default()` returns a `BoundKvStore` (alias
         // for `KvHandle`) with the same `get_bytes` method.
         let value = if let Some(handle) = ctx.kv_store_default() {
@@ -175,7 +175,7 @@ fn build_test_app() -> App {
     }
 
     async fn secret_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        // Stage 10.1 hard-cutoff: `ctx.secret_handle()` removed.
+        // Hard-cutoff: `ctx.secret_handle()` removed.
         // `secret_store_default()` returns a `BoundSecretStore`,
         // which bundles the platform store name with the handle —
         // so the lookup is `bound.get_bytes(key)` (single arg),

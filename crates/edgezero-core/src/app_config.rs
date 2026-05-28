@@ -1,17 +1,16 @@
-//! Typed app-config loading (spec §4, §6.10).
+//! Typed app-config loading.
 //!
-//! Stage 3 surface for downstream `<name>.toml` files (e.g.
-//! `app-demo.toml`). The loader reads the file's top-level table
-//! verbatim — there is no `[config]` wrapper — optionally applies the
-//! `<APP_NAME>__<SECTION>__…<KEY>` env-var overlay (§6.10), and
-//! either:
+//! Loader for downstream `<name>.toml` files (e.g. `app-demo.toml`).
+//! Reads the file's top-level table verbatim — there is no `[config]`
+//! wrapper — optionally applies the `<APP_NAME>__<SECTION>__…<KEY>`
+//! env-var overlay, and either:
 //!
 //! - Deserialises into a downstream `C: DeserializeOwned + Validate`
 //!   and runs `validator::Validate::validate()` —
 //!   [`load_app_config`] / [`load_app_config_with_options`].
 //! - Returns the parsed root table as raw `toml::Value` for tools
-//!   that don't have access to the typed struct (`config push` shell
-//!   mode, Stage 7) — [`load_app_config_raw`] /
+//!   that don't have access to the typed struct (the raw `config
+//!   push` flow) — [`load_app_config_raw`] /
 //!   [`load_app_config_raw_with_options`].
 
 use std::any;
@@ -28,10 +27,10 @@ use toml::value::Datetime;
 use toml::Value;
 use validator::{Validate, ValidationErrors};
 
-/// Per-field metadata emitted by `#[derive(AppConfig)]` (Task 3.2). The
+/// Per-field metadata emitted by `#[derive(AppConfig)]`. The
 /// derive enumerates every field annotated with `#[secret]` /
-/// `#[secret(store_ref)]`; `config validate` (Stage 4) and `config push`
-/// (Stage 7) reflect over this array to gate secret-aware behaviour.
+/// `#[secret(store_ref)]`; `config validate` and `config push`
+/// reflect over this array to gate secret-aware behaviour.
 pub trait AppConfigMeta {
     /// Every `#[secret]` / `#[secret(store_ref)]` field on the struct.
     const SECRET_FIELDS: &'static [SecretField];
@@ -44,7 +43,7 @@ pub struct SecretField {
     /// or the logical id of a `[stores.secrets]` entry.
     pub kind: SecretKind,
     /// Rust field name verbatim (no `serde(rename)` translation —
-    /// `#[secret]` rejects renames at compile time per §6.8).
+    /// `#[secret]` rejects renames at compile time).
     pub name: &'static str,
 }
 
@@ -63,8 +62,8 @@ pub enum SecretKind {
 /// Options for the app-config loader.
 ///
 /// Constructed with `Default::default()` (overlay on) by the simple
-/// loader functions; `--no-env` flips `env_overlay` to `false` (Stage 4 /
-/// Stage 7).
+/// loader functions; `--no-env` on the CLI flips `env_overlay` to
+/// `false`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct AppConfigLoadOptions {
@@ -100,7 +99,7 @@ pub enum AppConfigError {
         #[source]
         source: Box<TomlDeError>,
     },
-    /// The env-overlay step (§6.10) failed — ambiguous sibling-key
+    /// The env-overlay step failed — ambiguous sibling-key
     /// mapping, value not parseable against the existing TOML type,
     /// etc.
     #[error("env overlay failed for {}: {message}", path.display())]
@@ -216,7 +215,7 @@ where
 }
 
 /// Read the file's root table as a raw `toml::Value`, with the env
-/// overlay applied (when on). Used by `config push` (Stage 7) and
+/// overlay applied (when on). Used by `config push` and
 /// other tools that don't have access to the typed struct.
 ///
 /// # Errors
@@ -251,7 +250,7 @@ pub fn load_app_config_raw_with_options(
 }
 
 /// Apply the `<APP_NAME>__<SECTION>__…__<KEY>` env-var overlay
-/// against the parsed root table (§6.10).
+/// against the parsed root table.
 ///
 /// The overlay only overrides keys that already exist in the parsed
 /// tree (the existing TOML value's type drives coercion of the env
@@ -269,7 +268,7 @@ fn apply_env_overlay(
 }
 
 /// Normalise an app name to the env-var prefix (`<APP_NAME>` form
-/// from §6.10): uppercase, `-`→`_`. A single leading `_` from a
+/// from): uppercase, `-`→`_`. A single leading `_` from a
 /// project name that starts with a digit is preserved.
 fn app_name_prefix(app_name: &str) -> String {
     app_name.to_ascii_uppercase().replace('-', "_")
@@ -336,7 +335,7 @@ fn coercion_error(
     }
 }
 
-/// Translate a config field name into its env-segment form per §6.10:
+/// Translate a config field name into its env-segment form:
 /// uppercase, `_` left as-is. Sibling keys that produce the same
 /// segment are rejected by the caller as ambiguous.
 fn env_segment(field_name: &str) -> String {
@@ -535,7 +534,7 @@ timeout_ms = 1500
         );
     }
 
-    // -- Env overlay (§6.10) ------------------------------------------------
+    // -- Env overlay ------------------------------------------------
 
     fn parse_root_table(contents: &str) -> Value {
         toml::from_str(contents).expect("parse fixture")
@@ -696,7 +695,7 @@ timeout_ms = 1500
     fn env_overlay_only_overrides_existing_keys() {
         // An env var for a key that is not already present in the
         // parsed table is silently ignored (the overlay never adds
-        // new keys — §6.10 "env vars override existing keys only").
+        // new keys — "env vars override existing keys only").
         let mut table = parse_root_table(
             r#"
 greeting = "hello"

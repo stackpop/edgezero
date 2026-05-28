@@ -6,7 +6,7 @@
 //! `^[a-z][a-z0-9_]*$` (no dots; see the [Spin manifest reference][1]).
 //! `SpinConfigStore::get` translates the dotted form to the flat form
 //! before delegating to the backend so the handler-facing key surface
-//! stays platform-neutral (spec §6.7).
+//! stays platform-neutral.
 //!
 //! Uppercase keys are passed through unchanged; the real Spin backend
 //! will reject them as `InvalidName`. The translation is dot-only.
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn translate_key_does_not_lowercase() {
-        // Spec §6.7: uppercase keys reaching the backend yield InvalidName;
+        // Spec: uppercase keys reaching the backend yield InvalidName;
         // the translation itself is dot-only and case-preserving.
         assert_eq!(
             SpinConfigStore::translate_key("Service.Timeout_Ms"),

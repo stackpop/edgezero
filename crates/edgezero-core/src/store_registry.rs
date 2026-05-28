@@ -3,8 +3,9 @@
 //! Each adapter builds a [`StoreRegistry`] at request setup, keyed by the
 //! logical ids declared in `[stores.<kind>]`. Handlers resolve a handle by id
 //! (or via the `_default()` helper for the common single-store case). For
-//! adapters that are *Single* for a given kind (§6.6 capability matrix) every
-//! id maps to the same flat handle.
+//! adapters that are *Single* for a given store kind (per the
+//! capability matrix in the design doc) every id maps to the same
+//! flat handle.
 //!
 //! Type aliases:
 //! - [`KvRegistry`] = `StoreRegistry<BoundKvStore>`

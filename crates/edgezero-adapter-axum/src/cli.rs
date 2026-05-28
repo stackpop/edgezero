@@ -134,7 +134,7 @@ impl Adapter for AxumCliAdapter {
         match action {
             // The axum adapter is the in-process native dev server —
             // there is no remote auth provider to sign in/out of.
-            // Per spec §11 this is an explicit no-op.
+            // Per spec this is an explicit no-op.
             AdapterAction::AuthLogin | AdapterAction::AuthLogout | AdapterAction::AuthStatus => {
                 log::info!(
                     "[edgezero] axum has no remote auth surface; `auth` is a no-op for this adapter"
@@ -160,7 +160,7 @@ impl Adapter for AxumCliAdapter {
         stores: &ProvisionStores<'_>,
         _dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §12: axum has no remote resources. Print one note per
+        //: axum has no remote resources. Print one note per
         // declared store id so the operator sees the CLI heard
         // them — same shape `dry_run` would have, since there is
         // nothing to actually perform.
@@ -201,7 +201,7 @@ impl Adapter for AxumCliAdapter {
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §13: axum is local-only. Push writes the same flat
+        //: axum is local-only. Push writes the same flat
         // `string -> string` JSON object `AxumConfigStore` reads
         // back from `.edgezero/local-config-<id>.json`.
         let local_dir = manifest_root.join(".edgezero");
@@ -231,7 +231,7 @@ impl Adapter for AxumCliAdapter {
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
-        // §6.6: axum is Multi for KV (local file dirs) and Config
+        //: axum is Multi for KV (local file dirs) and Config
         // (local JSON files), Single for Secrets (env vars).
         &["secrets"]
     }
@@ -291,9 +291,9 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     );
     command.args(extra_args);
     command.current_dir(&project.crate_dir);
-    // Stage 2 canonical env vars. The runtime's `EnvConfig` reads only the
+    // Canonical env vars. The runtime's `EnvConfig` reads only the
     // `EDGEZERO__*` form (see `crates/edgezero-core/src/env_config.rs`);
-    // setting the legacy `EDGEZERO_HOST`/`EDGEZERO_PORT` here would be a
+    // setting the legacy `EDGEZERO_HOST` / `EDGEZERO_PORT` here would be a
     // no-op for the child process.
     command.env("EDGEZERO__ADAPTER__HOST", bind_addr.ip().to_string());
     command.env("EDGEZERO__ADAPTER__PORT", bind_addr.port().to_string());
@@ -477,10 +477,10 @@ fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
-    // Canonical Stage 2 env vars take precedence. Fall back to the
-    // pre-Stage-2 `EDGEZERO_HOST`/`EDGEZERO_PORT` for back-compat so a user
-    // who set the old names in CI scripts still gets a working address
-    // override; they'll be re-emitted to the subprocess under the canonical
+    // Canonical `EDGEZERO__*` env vars take precedence. Fall back to the
+    // legacy `EDGEZERO_HOST` / `EDGEZERO_PORT` names for back-compat so a
+    // user who set them in CI scripts still gets a working address override;
+    // they'll be re-emitted to the subprocess under the canonical
     // `EDGEZERO__ADAPTER__*` names that the runtime actually reads.
     let env_host = env::var("EDGEZERO__ADAPTER__HOST")
         .ok()

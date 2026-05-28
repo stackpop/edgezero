@@ -153,11 +153,9 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
         );
     }
 
-    // The registry-aware accessor reads the wired `ConfigRegistry` and falls
-    // back to the legacy `ConfigStoreHandle` when no registry has been
-    // attached (e.g. an adapter that has not yet moved to Task 2.6's
-    // registry wiring). The pre-rewrite `ctx.config_handle()` was
-    // registry-blind, so it 503'd on every registry-backed adapter.
+    // The registry-aware accessor reads the wired `ConfigRegistry`
+    // (adapter dispatchers synthesise one from any legacy bare handle
+    // before reaching the router).
     let Some(store) = ctx.config_store_default() else {
         return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -512,7 +510,7 @@ mod tests {
     }
 
     fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
-        // Stage 9.3 hard-cutoff: wire a real `ConfigRegistry`
+        // Hard-cutoff: wire a real `ConfigRegistry`
         // rather than a bare `ConfigStoreHandle`. The
         // registry-aware accessor `ctx.config_store_default()`
         // no longer falls back to a wired bare handle.
@@ -637,7 +635,7 @@ mod tests {
     }
 
     fn context_with_unavailable_config_store(key: &str) -> RequestContext {
-        // Stage 9.3 hard-cutoff: same registry wiring as
+        // Hard-cutoff: same registry wiring as
         // `context_with_config_key` — wire a one-id
         // `ConfigRegistry` so the registry-aware accessor
         // resolves a backend (the `UnavailableConfigStore` then

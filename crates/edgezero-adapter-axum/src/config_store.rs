@@ -1,9 +1,9 @@
 //! Axum adapter config store: reads from a per-id local JSON file.
 //!
 //! Each declared `[stores.config].ids` id maps to a file at
-//! `.edgezero/local-config-<id>.json` (§15 of the design spec). The file
-//! holds a flat object of `string -> string` pairs — the same shape
-//! `config push --adapter axum` will write when Stage 7 lands.
+//! `.edgezero/local-config-<id>.json`. The file holds a flat object of
+//! `string -> string` pairs — the same shape `edgezero config push
+//! --adapter axum` writes.
 //!
 //! If the file is absent the store is empty (`get` returns `Ok(None)` for
 //! every key). This keeps `edgezero serve --adapter axum` permissive when

@@ -136,7 +136,7 @@ impl Adapter for CloudflareCliAdapter {
         match action {
             // `wrangler` is the native sign-in surface for Cloudflare
             // Workers. EdgeZero stores no credentials — this is a thin
-            // shell-out (spec §11).
+            // shell-out.
             AdapterAction::AuthLogin => {
                 run_native_cli("wrangler", &["login"], WRANGLER_INSTALL_HINT)
             }
@@ -170,7 +170,7 @@ impl Adapter for CloudflareCliAdapter {
         stores: &ProvisionStores<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §12: KV ids and config ids both back to Cloudflare KV
+        //: KV ids and config ids both back to Cloudflare KV
         // namespaces. Secrets are runtime-managed via
         // `wrangler secret put` — provision is a no-op for them.
         let Some(rel) = adapter_manifest_path else {
@@ -217,7 +217,7 @@ impl Adapter for CloudflareCliAdapter {
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §13: read namespace id from wrangler.toml (matched by
+        //: read namespace id from wrangler.toml (matched by
         // `binding = <store_id>`), then `wrangler kv bulk put
         // <tempfile.json> --namespace-id=<id>`. Keys in dotted
         // form — the CLI already flattened them.
@@ -279,7 +279,7 @@ impl Adapter for CloudflareCliAdapter {
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
-        // §6.6: cloudflare is Multi for KV (KV namespaces) and
+        //: cloudflare is Multi for KV (KV namespaces) and
         // Config (KV namespaces), Single for Secrets (Worker
         // Secrets is a single flat bag).
         &["secrets"]
@@ -411,7 +411,7 @@ fn append_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), Strin
 
 /// Render the entries as the `[{"key": "...", "value": "..."}, …]`
 /// JSON wrangler expects for `kv bulk put`. Keys arrive pre-flattened
-/// from the CLI (dotted form, §6.4); cloudflare passes them through.
+/// from the CLI (dotted form,); cloudflare passes them through.
 fn bulk_payload(entries: &[(String, String)]) -> Result<String, String> {
     let payload: Vec<serde_json::Value> = entries
         .iter()

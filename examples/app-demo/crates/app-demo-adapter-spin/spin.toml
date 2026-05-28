@@ -9,10 +9,10 @@ version = "0.1.0"
 # `SpinConfigStore` adapter translates the canonical dotted handler-facing
 # keys (`feature.new_checkout`, `service.timeout_ms`) into flat variable
 # names (`feature__new_checkout`, `service__timeout_ms`) before lookup,
-# matching the spec §6.7 rule. Override at runtime via
+# matching the spec rule. Override at runtime via
 # SPIN_VARIABLE_<UPPERCASE_NAME>=value or `spin up --env KEY=value`.
 #
-# Spec §15 + §6.7 also says secret variables must be declared MANUALLY
+# Spec + also says secret variables must be declared MANUALLY
 # by the developer (config push never writes them). `api_token` is the
 # `#[secret]` field from AppDemoConfig — its value resolves through
 # the Spin secret store, but the variable must still be declared here

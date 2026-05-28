@@ -1,4 +1,4 @@
-//! `config validate` (spec §10).
+//! `config validate`.
 //!
 //! Two entry points share the same checks against the manifest, the
 //! app-config file, and (when `spin` is in the adapter set) the Spin
@@ -11,11 +11,11 @@
 //! - [`run_config_validate_typed`] — typed flow. Adds typed
 //!   deserialisation, `validator::Validate::validate()`, the
 //!   `#[secret]` / `#[secret(store_ref)]` checks, and the Spin
-//!   config/secret collision check (§6.7 check 2). Downstream
+//!   config/secret collision check. Downstream
 //!   project CLIs that own an app-config struct wire this up.
 //!
 //! Both run the manifest through [`ManifestLoader`] (which itself
-//! validates everything per §3) and reject the typed app-config's
+//! validates everything) and reject the typed app-config's
 //! env-overlay unless `--no-env` is passed, so the validation sees
 //! the values the runtime would.
 
@@ -78,7 +78,7 @@ impl ValidationContext {
 /// Raw flow — no typed `C`. Runs every check the typed flow runs
 /// *except* the typed deserialise, the validator rules, the secret
 /// presence / store-ref checks, and the Spin config-vs-secret
-/// collision (§6.7 check 2), which all require `AppConfigMeta`.
+/// collision, which all require `AppConfigMeta`.
 ///
 /// # Errors
 /// Returns a human-readable error string on any validation failure.
@@ -120,7 +120,7 @@ where
 /// Skips no fields (no `SECRET_FIELDS` knowledge); the operator is
 /// responsible for keeping sensitive material out of a raw push.
 ///
-/// Spec §13: push runs strict pre-flight validation before writing
+/// Spec: push runs strict pre-flight validation before writing
 /// anything. For the raw flow that means the same shared checks
 /// `config validate --strict` runs — adapter manifest discovery
 /// (Spin component, etc.), per-adapter config-key validation
@@ -157,7 +157,7 @@ where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
     let ctx = load_push_context(args)?;
-    // Spec §13: strict pre-flight. The typed flow already runs
+    // Spec: strict pre-flight. The typed flow already runs
     // typed-only checks below; `run_shared_checks` here adds
     // everything `config validate --strict` does — shared
     // adapter checks (Spin key syntax, `[component.*]`
@@ -192,7 +192,7 @@ where
 // -------------------------------------------------------------------
 
 fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
-    // Spec §13: push is strict — the synthesized validate args
+    // Spec: push is strict — the synthesized validate args
     // unconditionally request `--strict` so `run_shared_checks`
     // runs the capability-completeness + handler-path checks
     // alongside the schema and per-adapter shared checks.
@@ -311,7 +311,7 @@ where
     }
     // Skip every `#[secret]` AND `#[secret(store_ref)]` top-level
     // field — runtime store ids and secret values both belong out
-    // of the config-store payload (§13).
+    // of the config-store payload.
     let secret_field_names: BTreeSet<String> = C::SECRET_FIELDS
         .iter()
         .map(|field| field.name.to_owned())
@@ -342,7 +342,7 @@ fn flatten_json_into(
             Ok(())
         }
         serde_json::Value::Array(_) => {
-            // §6.5: arrays are JSON-encoded into a single value.
+            //: arrays are JSON-encoded into a single value.
             let encoded = serde_json::to_string(value)
                 .map_err(|err| format!("failed to JSON-encode array at key `{prefix}`: {err}"))?;
             out.push((prefix.to_owned(), encoded));
@@ -371,7 +371,7 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     let manifest_loader = ManifestLoader::from_path(&args.manifest)
         .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
 
-    // Spec §3: every project carries a `[app].name`. Without it we
+    // Spec: every project carries a `[app].name`. Without it we
     // can't compute the env-overlay prefix or resolve the default
     // app-config path.
     let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
@@ -495,7 +495,7 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
 }
 
 // -------------------------------------------------------------------
-// Typed secret checks (§6.8)
+// Typed secret checks
 // -------------------------------------------------------------------
 
 fn typed_secret_checks<C: AppConfigMeta>(
@@ -589,11 +589,11 @@ fn flatten_keys_into(table: &Table, prefix: &str, out: &mut Vec<String>) {
 }
 
 // -------------------------------------------------------------------
-// --strict checks (spec §10)
+// --strict checks
 // -------------------------------------------------------------------
 
 fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
-    // Spec §6.6 capability matrix, driven by each adapter crate's
+    // Spec capability matrix, driven by each adapter crate's
     // `Adapter::single_store_kinds()` impl. Adapters not in the
     // registry (e.g. a feature-gated build that omitted some) are
     // skipped — we can't speak for what isn't linked.
@@ -614,7 +614,7 @@ fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
             };
             if adapter.single_store_kinds().contains(&kind) {
                 return Err(format!(
-                    "adapter `{adapter_name}` is Single-capable for {kind} stores (spec §6.6) but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
+                    "adapter `{adapter_name}` is Single-capable for {kind} stores but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
                     declaration.ids.len()
                 ));
             }
@@ -966,7 +966,7 @@ serve = "echo"
         );
     }
 
-    // ---------- Spin checks (spec §6.7) ----------
+    // ---------- Spin checks ----------
 
     fn spin_manifest(extra_section: &str) -> String {
         format!(
@@ -1347,7 +1347,7 @@ deep = true
     }
 
     // -------------------------------------------------------------------
-    // config push (raw + typed) — spec §13
+    // config push (raw + typed) — spec
     // -------------------------------------------------------------------
 
     // ---------- raw push ----------
@@ -1515,7 +1515,7 @@ timeout_ms = 1500
 
     #[test]
     fn raw_push_json_encodes_arrays() {
-        // §6.5: arrays become a single JSON-encoded string value.
+        //: arrays become a single JSON-encoded string value.
         let app_config = "tags = [\"a\", \"b\", \"c\"]\n";
         let (dir, manifest, _) = setup_project(PUSH_MANIFEST, app_config);
         run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
@@ -1642,7 +1642,7 @@ ids = ["default"]
         let mut args = push_args(&manifest, "axum");
         // FixtureConfig requires `api_token` (#[secret]) and `vault`
         // (#[secret(store_ref)]) — both should be absent from the
-        // pushed payload (§13).
+        // pushed payload.
         args.app_config = Some(dir.path().join("demo-app.toml"));
         run_config_push_typed::<FixtureConfig>(&args).expect("typed push succeeds");
         let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
@@ -1691,11 +1691,11 @@ timeout_ms = 50
         );
     }
 
-    // ---------- Stage 9.1: push runs the strict preflight (regression) ----------
+    // ---------- push runs the strict preflight (regression) ----------
 
     /// Push must run the same shared adapter checks `config
     /// validate` runs, including Spin's `^[a-z][a-z0-9_]*$`
-    /// key-syntax check (spec §13 strict pre-flight). Pre-fix,
+    /// key-syntax check (spec strict pre-flight). Pre-fix,
     /// `load_push_context` synthesised `ConfigValidateArgs { strict:
     /// false }` and `run_config_push*` never called
     /// `run_shared_checks`, so an invalid Spin config key (e.g. a
@@ -1746,7 +1746,7 @@ ids = ["default"]
 
     #[test]
     fn typed_push_runs_strict_capability_completeness_before_push() {
-        // Spin is Single-capable for `[stores.secrets]` (§6.6);
+        // Spin is Single-capable for `[stores.secrets]`;
         // declaring two ids is a `--strict` capability violation
         // that the typed push must catch before invoking the
         // adapter.

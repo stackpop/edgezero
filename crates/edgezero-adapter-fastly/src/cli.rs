@@ -119,14 +119,14 @@ struct FastlyCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "fastly is Multi for every store kind (§6.6) and has no additional validation hooks; the trait defaults already model that"
+    reason = "fastly is Multi for every store kind and has no additional validation hooks; the trait defaults already model that"
 )]
 impl Adapter for FastlyCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `fastly profile {create|delete|list}` is the native
             // sign-in surface for Fastly Compute. EdgeZero stores no
-            // credentials — this is a thin shell-out (spec §11).
+            // credentials — this is a thin shell-out.
             AdapterAction::AuthLogin => {
                 run_native_cli("fastly", &["profile", "create"], FASTLY_INSTALL_HINT)
             }
@@ -159,7 +159,7 @@ impl Adapter for FastlyCliAdapter {
         stores: &ProvisionStores<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §12: fastly is Multi for every store kind. Each id maps
+        //: fastly is Multi for every store kind. Each id maps
         // 1:1 to a Fastly resource (kv-store / config-store /
         // secret-store) created via the Fastly CLI; the manifest
         // writeback declares the resource link for `fastly compute
@@ -216,7 +216,7 @@ impl Adapter for FastlyCliAdapter {
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // §13: resolve the platform config-store id on demand via
+        //: resolve the platform config-store id on demand via
         // `fastly config-store list --json` (matched by name =
         // `store_id`), then `fastly config-store-entry create
         // --store-id=<id> --key=<k> --value=<v>` per key. Keys
@@ -300,7 +300,7 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
 /// the file (and the parent `[setup]` / `[local_server]` tables)
 /// if absent. Both new blocks are written as empty tables — the
 /// resource-link declaration is enough for `fastly compute deploy`
-/// to honour, and `config push` fills in entries later (§13).
+/// to honour, and `config push` fills in entries later.
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
     use toml_edit::{table, DocumentMut, Item};
 
@@ -342,7 +342,7 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
 }
 
 // -------------------------------------------------------------------
-// `config push` helpers (spec §13)
+// `config push` helpers
 // -------------------------------------------------------------------
 
 /// Shell out to `fastly config-store-entry create --store-id=<id>
@@ -404,7 +404,7 @@ fn find_config_store_id(stdout: &str, name: &str) -> Option<String> {
 
 /// Resolve the platform config-store id on demand: shell out to
 /// `fastly config-store list --json`, parse the JSON, match by
-/// `name`. The provision flow doesn't persist this id (spec §12),
+/// `name`. The provision flow doesn't persist this id,
 /// so push has to re-fetch every time.
 fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
     let output = Command::new("fastly")
