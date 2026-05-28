@@ -115,9 +115,26 @@ pub async fn handler(kv: Kv, secrets: Secrets) -> Result<Response, EdgeError> {
 `RequestContext` mirrors the same shape:
 `ctx.kv_store(id)` / `ctx.kv_store_default()` (and the same for
 `config_store` / `secret_store`). The pre-rewrite no-arg accessors
-(`ctx.kv_handle()`, `ctx.config_handle()`, `ctx.secret_handle()`) are
-preserved as legacy single-handle helpers and continue to work, but
-new code should prefer the id-keyed pair.
+(`ctx.kv_handle()`, `ctx.config_handle()`, `ctx.secret_handle()`)
+are **gone** — Stage 10.1 enforced the spec's "no backward
+compatibility with the pre-rewrite runtime store API" promise.
+Migrating handler code is mechanical: replace each
+`ctx.kv_handle()` with `ctx.kv_store_default()`,
+`ctx.config_handle()` with `ctx.config_store_default()`, and
+`ctx.secret_handle()` with `ctx.secret_store_default()` (the
+last one returns a `BoundSecretStore` whose `get_bytes(key)` is
+single-arg — the platform store name is bound by the
+dispatcher, not passed at the call site).
+
+Adapter setup code still has `with_*_handle` /
+`dispatch_with_*_handle` convenience constructors that take a
+single bare handle. Internally each dispatcher synthesises a
+one-id `KvRegistry` / `ConfigRegistry` / `SecretRegistry`
+under the conventional `"default"` id from that handle before
+the request reaches the router — so the registry-aware
+accessors and the `Kv` / `Config` / `Secrets` extractors
+resolve uniformly regardless of which constructor wired the
+store.
 
 ## What about local config-store seeding?
 

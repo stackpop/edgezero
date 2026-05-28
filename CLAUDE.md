@@ -19,7 +19,7 @@ crates/
   edgezero-adapter-cloudflare/# Cloudflare Workers bridge (wasm32-unknown-unknown)
   edgezero-adapter-spin/      # Fermyon Spin bridge (wasm32-wasip1)
   edgezero-adapter-axum/      # Axum/Tokio bridge (native, dev server)
-  edgezero-cli/               # CLI lib + bin: new, build, deploy, demo, serve
+  edgezero-cli/               # CLI lib + bin: new, build, deploy, serve, auth, provision, config (validate|push), demo
 examples/app-demo/            # Reference app with all 4 adapters (excluded from workspace)
 docs/                         # VitePress documentation site (Node.js)
 scripts/                      # Build/deploy/test helper scripts
@@ -170,7 +170,7 @@ Each adapter follows the same structure:
 - `response.rs` — core response → platform response conversion
 - `proxy.rs` — platform-specific proxy client
 - `logger.rs` — platform-specific logging init
-- `cli.rs` — build/deploy commands (behind `cli` feature)
+- `cli.rs` — adapter dispatch behind the `cli` feature: `build` / `deploy` / `serve` (legacy) plus `Adapter::execute` for `auth` (login/logout/status) and dedicated trait methods `provision` (Stage 6 — platform-resource creation) and `push_config_entries` (Stage 7 — `config push` writeback). Self-registers via `#[ctor]` into the `edgezero-adapter` registry.
 
 Contract tests live in `tests/contract.rs` within each adapter crate.
 
