@@ -1428,10 +1428,21 @@ mod tests {
 
     #[test]
     fn push_dry_run_does_not_edit_spin_toml() {
+        // Stage 9.4 (review finding 4): the spec calls for the
+        // dry-run to print the would-be `__`-encoded keys and the
+        // would-be content of BOTH spin.toml tables, then leave
+        // the on-disk file unchanged. Exercise a multi-entry
+        // input whose translation isn't a no-op so the test
+        // verifies `.→__` lowercasing actually surfaces in the
+        // preview.
         let dir = tempdir().expect("tempdir");
         let original = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
         let path = write_spin(dir.path(), original);
-        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+            ("feature.new_checkout".to_owned(), "false".to_owned()),
+        ];
         let out = SpinCliAdapter
             .push_config_entries(
                 dir.path(),
@@ -1442,17 +1453,51 @@ mod tests {
                 true,
             )
             .expect("dry-run succeeds");
+        // Header line names the count + both tables.
         assert!(
             out.iter()
-                .any(|line| line.contains("would write 1 Spin variable")),
-            "dry-run summary present: {out:?}"
+                .any(|line| line.contains("would write 3 Spin variable")),
+            "dry-run summary present with count: {out:?}"
         );
         assert!(
-            out.iter().any(|line| line.contains("greeting")),
-            "dry-run names the variable: {out:?}"
+            out.iter().any(|line| {
+                line.contains("[variables]") && line.contains("[component.demo.variables]")
+            }),
+            "dry-run summary names BOTH spin.toml tables: {out:?}"
         );
+        // Each translated key appears in some preview line, with
+        // the `.→__` lowercased form (not the dotted source).
+        for translated in &["greeting", "service__timeout_ms", "feature__new_checkout"] {
+            assert!(
+                out.iter().any(|line| line.contains(translated)),
+                "dry-run names translated key `{translated}`: {out:?}"
+            );
+        }
+        // No dotted source keys leaked through.
+        for dotted in &["service.timeout_ms", "feature.new_checkout"] {
+            assert!(
+                !out.iter().any(|line| line.contains(dotted)),
+                "dry-run must not leak the dotted source form `{dotted}`: {out:?}"
+            );
+        }
+        // Each preview line also surfaces the spin template
+        // syntax for the component binding (the literal `{{ key
+        // }}` form, asserted as `{{ <key>` to dodge prettier-
+        // unfriendly closing-brace pairs).
+        for translated in &["greeting", "service__timeout_ms", "feature__new_checkout"] {
+            assert!(
+                out.iter().any(|line| {
+                    line.contains(&format!(".{translated}"))
+                        && line.contains(&format!("{{{{ {translated}"))
+                }),
+                "dry-run shows component binding template for `{translated}`: {out:?}"
+            );
+        }
         let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, original, "dry-run mutated spin.toml");
+        assert_eq!(
+            after, original,
+            "dry-run must leave spin.toml byte-identical"
+        );
     }
 
     #[test]

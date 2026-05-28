@@ -224,11 +224,14 @@ fn config_push_spin_dry_run_prints_translated_keys_and_preserves_manifest() {
     //   - resolve the single-component spin.toml,
     //   - announce the would-be writeback (preview output),
     //   - leave spin.toml untouched (no half-written manifest).
-    // The CLI returns status lines via log::info!, so the
-    // most reliable assertion here is the side-effect one:
-    // spin.toml is byte-identical after the call. We also
-    // exercise the typed flow so SECRET_FIELDS stripping
-    // happens before key translation.
+    // The CLI emits status lines via `log::info!`, which a unit
+    // test can't reliably intercept without process-global
+    // logger surgery. So this test asserts the integration
+    // contract — typed flow dispatches cleanly + spin.toml is
+    // byte-identical — and relies on the printed-content
+    // assertions in `edgezero_adapter_spin::cli::tests::
+    // push_dry_run_does_not_edit_spin_toml` (Stage 9.4) for
+    // the `__`-translated keys + both-table preview lines.
     let (dir, manifest) = write_app_demo_project("spin");
     let spin_path = dir.path().join("spin.toml");
     let before = fs::read_to_string(&spin_path).expect("read spin.toml before");
@@ -241,4 +244,70 @@ fn config_push_spin_dry_run_prints_translated_keys_and_preserves_manifest() {
         before, after,
         "spin dry-run must leave spin.toml byte-identical"
     );
+}
+
+/// Stage 9.4 companion to the CLI dispatch test above: confirm
+/// the spin adapter's dry-run preview surfaces every translated
+/// key derivable from `AppDemoConfig` (with `#[secret]` and
+/// `#[secret(store_ref)]` fields stripped) and the bindings
+/// reference both spin.toml tables. Goes through the adapter
+/// directly so the assertion can inspect the `Vec<String>`
+/// status lines the CLI would otherwise hand to `log::info!`.
+#[test]
+fn spin_dry_run_preview_lists_app_demo_translated_keys_and_both_tables() {
+    use edgezero_adapter::registry as adapter_registry;
+    use tempfile::tempdir;
+
+    let dir = tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("spin.toml"),
+        "spin_manifest_version = 2\n[application]\nname = \"app-demo\"\nversion = \"0.1.0\"\n[component.app-demo]\nsource = \"app_demo.wasm\"\n",
+    )
+    .expect("write spin.toml");
+
+    // These are the entries the typed flow produces from
+    // AppDemoConfig — secrets (`api_token`, `vault`) stripped,
+    // nested struct flattened to dotted keys.
+    let entries = vec![
+        ("greeting".to_owned(), "hello from app-demo".to_owned()),
+        ("feature.new_checkout".to_owned(), "false".to_owned()),
+        ("service.timeout_ms".to_owned(), "1500".to_owned()),
+    ];
+
+    let adapter = adapter_registry::get_adapter("spin").expect("spin adapter registered");
+    let out = adapter
+        .push_config_entries(
+            dir.path(),
+            Some("spin.toml"),
+            None,
+            "app_config",
+            &entries,
+            true,
+        )
+        .expect("spin dry-run with app-demo entries");
+
+    // Translated key form (`.→__`, lowercased) appears in
+    // some preview line for each entry.
+    for translated in &["greeting", "feature__new_checkout", "service__timeout_ms"] {
+        assert!(
+            out.iter().any(|line| line.contains(translated)),
+            "dry-run preview names translated key `{translated}`: {out:?}"
+        );
+    }
+    // Both spin.toml tables are referenced.
+    assert!(
+        out.iter().any(|line| {
+            line.contains("[variables]") && line.contains("[component.app-demo.variables]")
+        }),
+        "dry-run preview references both [variables] and [component.app-demo.variables] tables: {out:?}"
+    );
+    // Stripped fields must NOT appear (regression — typed-flow
+    // SECRET_FIELDS stripping must reach the adapter before the
+    // dry-run preview is built).
+    for secret in &["api_token", "vault"] {
+        assert!(
+            !out.iter().any(|line| line.contains(secret)),
+            "dry-run preview must not leak `{secret}` (the typed flow strips SECRET_FIELDS): {out:?}"
+        );
+    }
 }

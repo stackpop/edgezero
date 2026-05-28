@@ -15,7 +15,9 @@ edgezero-cli = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+edgezero-adapter = { workspace = true, features = ["cli"] }
 edgezero-adapter-axum = { workspace = true }
+edgezero-adapter-spin = { workspace = true, features = ["cli"] }
 edgezero-core = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
