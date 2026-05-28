@@ -245,8 +245,9 @@ impl Adapter for SpinCliAdapter {
         for (key, value) in entries {
             let spin_key = translate_key_for_spin(key);
             if !is_valid_spin_key(&spin_key) {
+                let reason = spin_key_rule_violation(&spin_key);
                 return Err(format!(
-                    "config key `{key}` translates to Spin variable `{spin_key}`, which does not match `^[a-z][a-z0-9_]*$` (run `edgezero config validate --strict` to surface this earlier)"
+                    "config key `{key}` translates to Spin variable `{spin_key}`, which is not a valid Spin variable name. {reason}. Rename the config key so the translated name conforms. (Run `edgezero config validate --strict` to surface this earlier.)"
                 ));
             }
             translated.push((spin_key, value.clone()));
@@ -350,8 +351,9 @@ impl Adapter for SpinCliAdapter {
         for key in keys {
             let spin_var = key.replace('.', "__");
             if !is_valid_spin_key(&spin_var) {
+                let reason = spin_key_rule_violation(&spin_var);
                 return Err(format!(
-                    "config key `{key}` translates to Spin variable `{spin_var}`, which does not match `^[a-z][a-z0-9_]*$`"
+                    "config key `{key}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Rename the config key so the translated name conforms."
                 ));
             }
         }
@@ -405,8 +407,9 @@ impl Adapter for SpinCliAdapter {
             // doesn't translate them either).
             let spin_var = value.to_ascii_lowercase();
             if !is_valid_spin_key(&spin_var) {
+                let reason = spin_key_rule_violation(&spin_var);
                 return Err(format!(
-                    "`#[secret]` field `{field_name}` value `{value}` translates to Spin variable `{spin_var}`, which does not match `^[a-z][a-z0-9_]*$`"
+                    "`#[secret]` field `{field_name}` value `{value}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Pick a `#[secret]` value that conforms."
                 ));
             }
             if !seen.insert(spin_var.clone()) {
@@ -428,6 +431,49 @@ fn is_valid_spin_key(key: &str) -> bool {
         return false;
     }
     chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+/// Return a per-failure-mode diagnostic for a key that failed
+/// `is_valid_spin_key`. Spin's variable-name rule
+/// (`^[a-z][a-z0-9_]*$`) is one regex but the operator usually
+/// wants to know WHICH bit they broke: digit-leading, uppercase,
+/// or stray punctuation. Returns a short phrase to splice into
+/// the caller's full error.
+fn spin_key_rule_violation(key: &str) -> &'static str {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return "Spin variable names must not be empty";
+    };
+    if first.is_ascii_digit() {
+        return "Spin variable names must start with a lowercase letter, not a digit";
+    }
+    if first.is_ascii_uppercase() {
+        return "Spin variable names must be lowercase (uppercase letters are not allowed)";
+    }
+    if !first.is_ascii_lowercase() {
+        return "Spin variable names must start with a lowercase ASCII letter";
+    }
+    for ch in chars {
+        if ch.is_ascii_uppercase() {
+            return "Spin variable names must be lowercase (uppercase letters are not allowed)";
+        }
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_') {
+            return "Spin variable names may only contain lowercase letters, digits, and underscores";
+        }
+    }
+    "Spin variable names must match `^[a-z][a-z0-9_]*$`"
+}
+
+/// Standard error wording when a TOML key we expected to be a
+/// table (`[variables]`, `[component.X]`, `[component.X.variables]`,
+/// `[variables.<key>]`) is found as a non-table value. Spin requires
+/// these slots to be tables; an inline value usually means an old
+/// hand-edited spin.toml that pre-dates the variables convention.
+fn not_a_table_error(spin_path: &Path, what: &str) -> String {
+    format!(
+        "{}: `{what}` exists but is not a TOML table. Spin requires `[{what}]` table syntax with key/value pairs underneath. If `{what} = ...` was set as a single inline value, replace it with `[{what}]` block syntax and move keys into it.",
+        spin_path.display()
+    )
 }
 
 fn collect_spin_component_ids(parsed: &toml::Value) -> Vec<String> {
@@ -586,17 +632,14 @@ fn write_spin_variables(
     let variables_entry = doc.entry("variables").or_insert_with(table);
     let variables_tbl = variables_entry
         .as_table_mut()
-        .ok_or_else(|| format!("{}: `variables` is not a table", spin_path.display()))?;
+        .ok_or_else(|| not_a_table_error(spin_path, "variables"))?;
     for (spin_key, val) in entries {
         let var_entry = variables_tbl
             .entry(spin_key.as_str())
             .or_insert_with(|| Item::Table(toml_edit::Table::new()));
-        let var_tbl = var_entry.as_table_mut().ok_or_else(|| {
-            format!(
-                "{}: [variables.{spin_key}] is not a table",
-                spin_path.display()
-            )
-        })?;
+        let var_tbl = var_entry
+            .as_table_mut()
+            .ok_or_else(|| not_a_table_error(spin_path, &format!("variables.{spin_key}")))?;
         var_tbl.insert("default", value(val.as_str()));
     }
 
@@ -607,20 +650,14 @@ fn write_spin_variables(
     let component_root = doc.entry("component").or_insert_with(table);
     let component_tbl = component_root
         .as_table_mut()
-        .ok_or_else(|| format!("{}: `component` is not a table", spin_path.display()))?;
+        .ok_or_else(|| not_a_table_error(spin_path, "component"))?;
     let target = component_tbl.entry(component_id).or_insert_with(table);
-    let target_tbl = target.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: [component.{component_id}] is not a table",
-            spin_path.display()
-        )
-    })?;
+    let target_tbl = target
+        .as_table_mut()
+        .ok_or_else(|| not_a_table_error(spin_path, &format!("component.{component_id}")))?;
     let bindings_entry = target_tbl.entry("variables").or_insert_with(table);
     let bindings_tbl = bindings_entry.as_table_mut().ok_or_else(|| {
-        format!(
-            "{}: [component.{component_id}.variables] is not a table",
-            spin_path.display()
-        )
+        not_a_table_error(spin_path, &format!("component.{component_id}.variables"))
     })?;
     for (spin_key, _) in entries {
         let template = format!("{{{{ {spin_key} }}}}");
@@ -824,6 +861,33 @@ mod tests {
         assert!(!is_valid_spin_key("1foo"));
         assert!(!is_valid_spin_key("foo-bar"));
         assert!(!is_valid_spin_key("_foo"));
+    }
+
+    #[test]
+    fn spin_key_rule_violation_picks_the_right_diagnostic_per_mode() {
+        // Each failure mode produces a distinct, actionable phrase
+        // so the error message tells the operator WHICH bit of the
+        // rule they broke -- not just "doesn't match a regex".
+        assert!(spin_key_rule_violation("").contains("empty"));
+        assert!(spin_key_rule_violation("1foo").contains("digit"));
+        assert!(spin_key_rule_violation("Foo").contains("lowercase"));
+        assert!(spin_key_rule_violation("foo-bar").contains("lowercase letters, digits"));
+        assert!(spin_key_rule_violation("fooBar").contains("lowercase"));
+        // `_foo` starts with `_` -- not digit, not uppercase, not
+        // lowercase ASCII letter. Falls through to the catch-all.
+        assert!(spin_key_rule_violation("_foo").contains("lowercase ASCII letter"));
+    }
+
+    #[test]
+    fn not_a_table_error_includes_path_keyword_and_migration_hint() {
+        let path = Path::new("/tmp/spin.toml");
+        let err = not_a_table_error(path, "variables");
+        assert!(err.contains("/tmp/spin.toml"), "names path: {err}");
+        assert!(err.contains("`variables`"), "names keyword: {err}");
+        assert!(
+            err.contains("block syntax") || err.contains("[variables]"),
+            "points at fix: {err}"
+        );
     }
 
     #[test]
