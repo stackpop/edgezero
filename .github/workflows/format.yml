@@ -52,6 +52,19 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # Plan task 8.3 corollary: `examples/app-demo` is excluded
+      # from the root workspace, so the fmt/clippy steps above
+      # don't cover it. Run the same gates against it explicitly
+      # — the app-demo workspace has the same strict-clippy
+      # config and is the showcase a new user clones.
+      - name: Run cargo fmt (app-demo workspace)
+        working-directory: examples/app-demo
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy (app-demo workspace)
+        working-directory: examples/app-demo
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   format-docs:
     runs-on: ubuntu-latest
     defaults:

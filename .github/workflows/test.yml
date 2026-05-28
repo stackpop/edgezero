@@ -58,6 +58,20 @@ jobs:
       - name: Verify a generated project compiles
         run: cargo test -p edgezero-cli --test generated_project_builds -- --ignored
 
+      # Plan task 8.3: `examples/app-demo` is excluded from the
+      # root workspace, so `cargo test --workspace` above does not
+      # cover it. Run its own workspace tests separately. Stage 8.5
+      # added an end-to-end push→AxumConfigStore→handler roundtrip
+      # in `app-demo-cli/tests/config_flow.rs` that exists to be
+      # exercised by THIS step — without it, a regression in the
+      # JSON-file contract between `config push --adapter axum`
+      # and `AxumConfigStore::from_path` would not be caught by CI.
+      # Axum-only path, no live external calls — intentionally kept
+      # off the wasm matrix.
+      - name: Run app-demo workspace tests
+        working-directory: examples/app-demo
+        run: cargo test --workspace --all-targets
+
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests
     runs-on: ubuntu-latest
