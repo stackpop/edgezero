@@ -61,7 +61,22 @@ impl AxumConfigStore {
         }
     }
 
-    fn from_path(path: &Path) -> Result<Self, ConfigStoreError> {
+    /// Open the local-file config store at an explicit path
+    /// (overrides the `.edgezero/local-config-<id>.json` default
+    /// from [`Self::from_local_file`]). Intended for downstream
+    /// integration tests that want to load a JSON payload written
+    /// by `config push --adapter axum` to a tempdir, without
+    /// changing the process CWD.
+    ///
+    /// Behaviour matches `from_local_file`: a missing file yields
+    /// an empty store; a present-but-malformed file yields
+    /// [`ConfigStoreError::Unavailable`].
+    ///
+    /// # Errors
+    /// Returns [`ConfigStoreError::Unavailable`] when the file
+    /// exists but cannot be read or parsed.
+    #[inline]
+    pub fn from_path(path: &Path) -> Result<Self, ConfigStoreError> {
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == ErrorKind::NotFound => {

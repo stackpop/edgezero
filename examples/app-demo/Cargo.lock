@@ -151,7 +151,10 @@ version = "0.1.0"
 dependencies = [
  "app-demo-core",
  "clap",
+ "edgezero-adapter-axum",
  "edgezero-cli",
+ "edgezero-core",
+ "futures",
  "log",
  "serde_json",
  "tempfile",
