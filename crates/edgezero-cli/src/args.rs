@@ -49,8 +49,12 @@ pub enum ConfigCmd {
 
 /// Arguments for the `auth` command.
 ///
-/// Intentionally has no `Default` impl — every invocation
-/// must name a subcommand, so an empty `AuthArgs` is meaningless.
+/// Intentionally has no `Default` impl: unlike the other `*Args`
+/// types in this module (whose fields default to empty strings /
+/// vectors / `None`), `AuthSub` is a required subcommand with no
+/// "neutral" variant. A default-constructed `AuthArgs` would have
+/// no sensible interpretation, so clap derives the required-arg
+/// machinery instead.
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
 pub struct AuthArgs {

@@ -68,6 +68,21 @@ impl AxumConfigStore {
     /// by `config push --adapter axum` to a tempdir, without
     /// changing the process CWD.
     ///
+    /// The file must contain a flat JSON object of `string -> string`
+    /// pairs, matching what `config push --adapter axum` writes:
+    ///
+    /// ```json
+    /// {
+    ///   "greeting": "hello",
+    ///   "feature.new_checkout": "false",
+    ///   "service.timeout_ms": "1500"
+    /// }
+    /// ```
+    ///
+    /// Dotted keys are stored verbatim (no nesting): the runtime
+    /// extractors look up the dotted form as a single key. Non-string
+    /// values (`{"x": 42}`, nested objects, arrays) are rejected.
+    ///
     /// Behaviour matches `from_local_file`: a missing file yields
     /// an empty store; a present-but-malformed file yields
     /// [`ConfigStoreError::Unavailable`].
