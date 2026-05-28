@@ -177,6 +177,20 @@ impl<H: Clone> StoreRegistry<H> {
         );
         Self { by_id, default_id }
     }
+
+    /// Build a one-id registry from a single handle, used when an
+    /// adapter has a single store and wants to normalise its
+    /// wiring to the registry path (so the extractor and
+    /// registry-aware accessors don't need a legacy-handle
+    /// fallback). `id` is the logical id the handle is registered
+    /// under AND the resolved default.
+    #[must_use]
+    #[inline]
+    pub fn single_id(id: String, handle: H) -> Self {
+        let mut by_id: BTreeMap<String, H> = BTreeMap::new();
+        by_id.insert(id.clone(), handle);
+        Self::new(by_id, id)
+    }
 }
 
 /// Registry of per-id KV handles.

@@ -8,6 +8,7 @@ use crate::proxy::ProxyHandle;
 use crate::secret_store::SecretHandle;
 use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
+    StoreRegistry,
 };
 use serde::de::DeserializeOwned;
 
@@ -35,26 +36,29 @@ impl RequestContext {
             .cloned()
     }
 
-    /// Resolve the [`BoundConfigStore`] for `id`. When the adapter has wired
-    /// a [`ConfigRegistry`], the lookup is strict — an unregistered id yields
-    /// `None`. Adapters that still wire a single legacy handle return that
-    /// handle for any id (single-store fallback).
+    /// Resolve the [`BoundConfigStore`] for `id`. Strict lookup: when a
+    /// [`ConfigRegistry`] is wired, an unregistered id yields `None`. When
+    /// no registry is wired this returns `None` — adapter dispatchers
+    /// normalise legacy bare-handle inputs to a single-id registry under
+    /// the conventional `"default"` id, so a missing registry is a real
+    /// bug rather than a hand-wired single-handle adapter (spec hard-cutoff).
     #[inline]
     pub fn config_store(&self, id: &str) -> Option<BoundConfigStore> {
-        match self.request.extensions().get::<ConfigRegistry>() {
-            Some(registry) => registry.named(id),
-            None => self.config_handle(),
-        }
+        self.request
+            .extensions()
+            .get::<ConfigRegistry>()
+            .and_then(|registry| registry.named(id))
     }
 
-    /// Resolve the default [`BoundConfigStore`] — the registry's declared
-    /// default id, or the legacy single handle if no registry has been wired.
+    /// Resolve the default [`BoundConfigStore`] — the wired registry's
+    /// declared default id, or `None` when no registry is in extensions.
+    /// See [`Self::config_store`] for the hard-cutoff rationale.
     #[inline]
     pub fn config_store_default(&self) -> Option<BoundConfigStore> {
-        match self.request.extensions().get::<ConfigRegistry>() {
-            Some(registry) => registry.default(),
-            None => self.config_handle(),
-        }
+        self.request
+            .extensions()
+            .get::<ConfigRegistry>()
+            .and_then(StoreRegistry::default)
     }
 
     /// # Errors
@@ -100,25 +104,28 @@ impl RequestContext {
         self.request.extensions().get::<KvHandle>().cloned()
     }
 
-    /// Resolve the [`BoundKvStore`] for `id`. Registry-aware (strict lookup
-    /// when a [`KvRegistry`] is wired); falls back to the legacy single
-    /// handle otherwise.
+    /// Resolve the [`BoundKvStore`] for `id`. Strict lookup: when a
+    /// [`KvRegistry`] is wired, an unregistered id yields `None`. When no
+    /// registry is wired this returns `None` — adapter dispatchers
+    /// normalise legacy bare-handle inputs to a single-id registry under
+    /// the conventional `"default"` id (spec hard-cutoff).
     #[inline]
     pub fn kv_store(&self, id: &str) -> Option<BoundKvStore> {
-        match self.request.extensions().get::<KvRegistry>() {
-            Some(registry) => registry.named(id),
-            None => self.kv_handle(),
-        }
+        self.request
+            .extensions()
+            .get::<KvRegistry>()
+            .and_then(|registry| registry.named(id))
     }
 
-    /// Resolve the default [`BoundKvStore`] — the registry's declared default
-    /// id, or the legacy single handle if no registry has been wired.
+    /// Resolve the default [`BoundKvStore`] — the wired registry's
+    /// declared default id, or `None` when no registry is in extensions.
+    /// See [`Self::kv_store`] for the hard-cutoff rationale.
     #[inline]
     pub fn kv_store_default(&self) -> Option<BoundKvStore> {
-        match self.request.extensions().get::<KvRegistry>() {
-            Some(registry) => registry.default(),
-            None => self.kv_handle(),
-        }
+        self.request
+            .extensions()
+            .get::<KvRegistry>()
+            .and_then(StoreRegistry::default)
     }
 
     #[inline]
@@ -182,31 +189,28 @@ impl RequestContext {
         self.request.extensions().get::<SecretHandle>().cloned()
     }
 
-    /// Resolve the [`BoundSecretStore`] for `id`. Registry-aware (strict
-    /// lookup when a [`SecretRegistry`] is wired); falls back to wrapping
-    /// the legacy single [`SecretHandle`] under the conventional `"default"`
-    /// platform name otherwise.
+    /// Resolve the [`BoundSecretStore`] for `id`. Strict lookup: when a
+    /// [`SecretRegistry`] is wired, an unregistered id yields `None`.
+    /// When no registry is wired this returns `None` — adapter
+    /// dispatchers normalise legacy bare-handle inputs to a single-id
+    /// registry under the conventional `"default"` id (spec hard-cutoff).
     #[inline]
     pub fn secret_store(&self, id: &str) -> Option<BoundSecretStore> {
-        match self.request.extensions().get::<SecretRegistry>() {
-            Some(registry) => registry.named(id),
-            None => self
-                .secret_handle()
-                .map(|handle| BoundSecretStore::new(handle, "default".to_owned())),
-        }
+        self.request
+            .extensions()
+            .get::<SecretRegistry>()
+            .and_then(|registry| registry.named(id))
     }
 
-    /// Resolve the default [`BoundSecretStore`] — the registry's declared
-    /// default id, or the legacy single handle (bound to `"default"`)
-    /// if no registry has been wired.
+    /// Resolve the default [`BoundSecretStore`] — the wired registry's
+    /// declared default id, or `None` when no registry is in extensions.
+    /// See [`Self::secret_store`] for the hard-cutoff rationale.
     #[inline]
     pub fn secret_store_default(&self) -> Option<BoundSecretStore> {
-        match self.request.extensions().get::<SecretRegistry>() {
-            Some(registry) => registry.default(),
-            None => self
-                .secret_handle()
-                .map(|handle| BoundSecretStore::new(handle, "default".to_owned())),
-        }
+        self.request
+            .extensions()
+            .get::<SecretRegistry>()
+            .and_then(StoreRegistry::default)
     }
 }
 
@@ -567,7 +571,16 @@ mod tests {
     }
 
     #[test]
-    fn kv_store_falls_back_to_legacy_handle_without_registry() {
+    fn kv_store_returns_none_when_only_legacy_handle_wired() {
+        // Stage 9.3 hard-cutoff: the registry-aware accessor must
+        // NOT silently fall back to the legacy bare handle. When a
+        // bare `KvHandle` is in extensions but no `KvRegistry` is,
+        // `kv_store*` returns None — the caller can still reach
+        // the handle via `kv_handle()` if they explicitly opt in.
+        // Adapter dispatchers synthesise a registry from any
+        // legacy handle at the dispatch boundary, so in practice
+        // this code path only fires when a test or callsite
+        // bypasses the dispatcher.
         use crate::key_value_store::{KvHandle, NoopKvStore};
         use std::sync::Arc;
 
@@ -581,9 +594,20 @@ mod tests {
             .insert(KvHandle::new(Arc::new(NoopKvStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
-        // Without a registry every id resolves to the lone legacy handle.
-        assert!(ctx.kv_store("anything").is_some());
-        assert!(ctx.kv_store_default().is_some());
+        assert!(
+            ctx.kv_store("anything").is_none(),
+            "registry-aware accessor must not auto-upgrade a bare handle"
+        );
+        assert!(
+            ctx.kv_store_default().is_none(),
+            "registry-aware default accessor must not auto-upgrade a bare handle"
+        );
+        // The legacy handle escape hatch still works for callers
+        // that explicitly opt in.
+        assert!(
+            ctx.kv_handle().is_some(),
+            "ctx.kv_handle() still returns the wired handle"
+        );
     }
 
     #[test]
@@ -666,7 +690,13 @@ mod tests {
     }
 
     #[test]
-    fn secret_store_default_falls_back_to_legacy_handle_under_default_name() {
+    fn secret_store_default_returns_none_when_only_legacy_handle_wired() {
+        // Stage 9.3 hard-cutoff: same semantics as
+        // `kv_store_returns_none_when_only_legacy_handle_wired` —
+        // the registry-aware accessor must not auto-upgrade a
+        // bare `SecretHandle` into a synthetic registry. Adapter
+        // dispatchers normalise legacy bare-handle inputs to
+        // single-id registries at the dispatch boundary.
         use crate::secret_store::{NoopSecretStore, SecretHandle};
         use std::sync::Arc;
 
@@ -680,13 +710,13 @@ mod tests {
             .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
-        let bound = ctx
-            .secret_store_default()
-            .expect("legacy fallback yields a bound store");
-        assert_eq!(
-            bound.store_name(),
-            "default",
-            "legacy fallback binds the conventional `default` platform name"
+        assert!(
+            ctx.secret_store_default().is_none(),
+            "registry-aware default accessor must not auto-upgrade a bare handle"
+        );
+        assert!(
+            ctx.secret_handle().is_some(),
+            "ctx.secret_handle() still returns the wired handle"
         );
     }
 }

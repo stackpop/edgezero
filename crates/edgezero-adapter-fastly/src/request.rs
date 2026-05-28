@@ -95,19 +95,48 @@ fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<FastlyResponse, FastlyError> {
-    if let Some(registry) = stores.config_registry {
+    // Stage 9.3: enforce the runtime store-API hard-cutoff at the
+    // dispatch boundary. When only a legacy bare handle is wired
+    // (no explicit registry), synthesise a one-id registry under
+    // the conventional `"default"` id and insert it alongside the
+    // bare handle. The extractor (`Kv` / `Config` / `Secrets`)
+    // and the registry-aware `RequestContext` accessors no longer
+    // fall back to legacy handles silently, so this synthesis is
+    // what keeps `dispatch_with_config_handle` working as a
+    // convenience wrapper.
+    let config_registry = stores.config_registry.or_else(|| {
+        stores
+            .config_store
+            .clone()
+            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+    });
+    let kv_registry = stores.kv_registry.or_else(|| {
+        stores
+            .kv
+            .clone()
+            .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
+    });
+    let secret_registry = stores.secret_registry.or_else(|| {
+        stores.secrets.clone().map(|handle| {
+            SecretRegistry::single_id(
+                "default".to_owned(),
+                BoundSecretStore::new(handle, "default".to_owned()),
+            )
+        })
+    });
+    if let Some(registry) = config_registry {
         core_request.extensions_mut().insert(registry);
     }
     if let Some(handle) = stores.config_store {
         core_request.extensions_mut().insert(handle);
     }
-    if let Some(registry) = stores.kv_registry {
+    if let Some(registry) = kv_registry {
         core_request.extensions_mut().insert(registry);
     }
     if let Some(handle) = stores.kv {
         core_request.extensions_mut().insert(handle);
     }
-    if let Some(registry) = stores.secret_registry {
+    if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
     }
     if let Some(handle) = stores.secrets {

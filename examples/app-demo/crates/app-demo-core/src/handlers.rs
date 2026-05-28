@@ -512,6 +512,11 @@ mod tests {
     }
 
     fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
+        // Stage 9.3 hard-cutoff: wire a real `ConfigRegistry`
+        // rather than a bare `ConfigStoreHandle`. The
+        // registry-aware accessor `ctx.config_store_default()`
+        // no longer falls back to a wired bare handle.
+        use edgezero_core::store_registry::{ConfigRegistry, StoreRegistry};
         let mut request = request_builder()
             .method(Method::GET)
             .uri(format!("/config/{key}"))
@@ -523,9 +528,9 @@ mod tests {
                 .map(|&(name, value)| (name.to_owned(), value.to_owned()))
                 .collect(),
         );
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(store)));
+        let handle = ConfigStoreHandle::new(Arc::new(store));
+        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), handle);
+        request.extensions_mut().insert(registry);
         let mut params = HashMap::new();
         params.insert("name".to_owned(), key.to_owned());
         RequestContext::new(request, PathParams::new(params))
@@ -632,14 +637,20 @@ mod tests {
     }
 
     fn context_with_unavailable_config_store(key: &str) -> RequestContext {
+        // Stage 9.3 hard-cutoff: same registry wiring as
+        // `context_with_config_key` — wire a one-id
+        // `ConfigRegistry` so the registry-aware accessor
+        // resolves a backend (the `UnavailableConfigStore` then
+        // errors on lookup, which is what the test asserts).
+        use edgezero_core::store_registry::{ConfigRegistry, StoreRegistry};
         let mut request = request_builder()
             .method(Method::GET)
             .uri(format!("/config/{key}"))
             .body(Body::empty())
             .expect("request");
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(UnavailableConfigStore)));
+        let handle = ConfigStoreHandle::new(Arc::new(UnavailableConfigStore));
+        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), handle);
+        request.extensions_mut().insert(registry);
         let mut params = HashMap::new();
         params.insert("name".to_owned(), key.to_owned());
         RequestContext::new(request, PathParams::new(params))
