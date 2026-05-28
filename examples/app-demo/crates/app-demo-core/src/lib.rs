@@ -1,5 +1,5 @@
 pub mod config;
-// Stage 8.5: `handlers` is `pub` so downstream integration tests
+// `handlers` is `pub` so downstream integration tests
 // can dispatch them directly against a wired `ConfigRegistry` /
 // `KvRegistry` / `SecretRegistry` — the same fixture shape the
 // runtime sets up. This avoids spinning a real HTTP server in

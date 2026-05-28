@@ -74,7 +74,7 @@ struct ProjectLayout {
     project_mod: String,
     /// `NameUpperCamel` Handlebars key — the project name converted to
     /// upper-camel-case (`my-app` → `MyApp`) and guaranteed to be a
-    /// valid Rust type identifier (Task 3.4). Used by the `<Name>Config`
+    /// valid Rust type identifier. Used by the `<Name>Config`
     /// struct in the generated `config.rs` and reused by the stage-8
     /// `*-cli` template.
     upper_camel: String,
@@ -139,8 +139,7 @@ struct AdapterArtifacts {
 /// a leading `_` that `sanitize_crate_name` may have inserted), then
 /// upper-cases the first character of each segment. If the result
 /// would be empty or start with a non-letter, it is prefixed with
-/// `App` so the output is always a valid `struct` name (Task 3.4 step
-/// 1 derivation rule).
+/// `App` so the output is always a valid `struct` name.
 fn upper_camel_from_sanitized(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for segment in name.split(['-', '_']).filter(|seg| !seg.is_empty()) {
@@ -264,7 +263,7 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
         "spin-sdk = { version = \"5.2\", default-features = false }".to_owned(),
     );
     // Core depends on `validator` for `#[derive(Validate)]` on the
-    // generated `<Name>Config` struct (Task 3.4). Pinned to the same
+    // generated `<Name>Config` struct. Pinned to the same
     // major as the edgezero workspace so a `workspace = true` dep in
     // the generated core crate resolves cleanly.
     deps.insert(
@@ -846,9 +845,9 @@ mod tests {
     }
 
     fn assert_scaffold_app_config(project_dir: &Path) {
-        // Task 3.4: `<name>.toml` and `<name>-core/src/config.rs` must be
-        // produced, with the `<NameUpperCamel>Config` struct named after
-        // the project (`demo-app` → `DemoAppConfig`).
+        // `<name>.toml` and `<name>-core/src/config.rs` must be produced,
+        // with the `<NameUpperCamel>Config` struct named after the project
+        // (`demo-app` → `DemoAppConfig`).
         let app_toml_path = project_dir.join("demo-app.toml");
         assert!(
             app_toml_path.exists(),
@@ -1035,7 +1034,7 @@ mod tests {
         assert_scaffold_cli_full_command_set(&project_dir);
     }
 
-    /// Stage 8 (plan task 8.2): the scaffolded `<name>-cli` must
+    /// The scaffolded `<name>-cli` must
     /// expose the full seven-command surface (`Build`, `Deploy`,
     /// `New`, `Serve`, `Auth`, `Provision`, `Config(Validate|Push)`)
     /// and wire the `Config` arm to the **typed** entry points

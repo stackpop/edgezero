@@ -110,7 +110,7 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
-        // Stage 10.1 hard-cutoff: legacy bare `KvHandle` /
+        // Hard-cutoff: legacy bare `KvHandle` /
         // `ConfigStoreHandle` / `SecretHandle` entries are NO
         // LONGER inserted into request extensions. The legacy
         // `with_*_handle` constructors still take a single
@@ -227,7 +227,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_config_store_handle_injects_into_request() {
-        // Stage 10.1 hard-cutoff: legacy `ctx.config_handle()` is
+        // Hard-cutoff: legacy `ctx.config_handle()` is
         // gone. The service synthesises a one-id `ConfigRegistry`
         // from the wired handle at the dispatch boundary, so
         // `ctx.config_store_default()` resolves the same store.
@@ -275,7 +275,7 @@ mod tests {
 
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {
-                // Stage 10.1 hard-cutoff: see
+                // Hard-cutoff: see
                 // `with_config_store_handle_injects_into_request`.
                 let kv = ctx.kv_store_default().expect("kv handle should be present");
                 let val: String = kv.get_or("test_key", String::new()).await.unwrap();
@@ -303,7 +303,7 @@ mod tests {
     async fn service_without_config_store_handle_still_works() {
         let router = RouterService::builder()
             .get("/no-config", |ctx: RequestContext| async move {
-                // Stage 10.1 hard-cutoff: with no handle and no
+                // Hard-cutoff: with no handle and no
                 // registry wired, the registry-aware accessor
                 // returns None — same observable result as the
                 // legacy `config_handle().is_some()` check.
@@ -334,7 +334,7 @@ mod tests {
         use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
         use std::sync::Arc;
 
-        // Stage 10.1 hard-cutoff: the service synthesises a one-id
+        // Hard-cutoff: the service synthesises a one-id
         // `SecretRegistry` from `with_secret_handle`, binding the
         // handle under the platform store name `"default"`. The
         // fixture keys mirror that bound name (`"default/<key>"`)
@@ -380,7 +380,7 @@ mod tests {
     async fn service_without_kv_handle_still_works() {
         let router = RouterService::builder()
             .get("/no-kv", |ctx: RequestContext| async move {
-                // Stage 10.1 hard-cutoff: see
+                // Hard-cutoff: see
                 // `service_without_config_store_handle_still_works`.
                 let has_kv = ctx.kv_store_default().is_some();
                 let response = response_builder()

@@ -3,7 +3,7 @@
 //! make `config push` (which reads `SECRET_FIELDS`, then serialises
 //! the typed struct) drop the secret key under the condition —
 //! desyncing the on-the-wire shape from the SECRET_FIELDS invariant
-//! Stage 4 relies on (spec §6.8). Reject at compile time.
+//! relies on. Reject at compile time.
 
 #[derive(serde::Deserialize, serde::Serialize, validator::Validate, edgezero_core::AppConfig)]
 #[serde(deny_unknown_fields)]

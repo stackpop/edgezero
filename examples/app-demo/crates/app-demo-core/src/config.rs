@@ -7,7 +7,7 @@
 
 #![expect(
     clippy::module_name_repetitions,
-    reason = "`<Name>Config` is the canonical name the generator emits and the spec refers to (§6.8)"
+    reason = "`<Name>Config` is the canonical name the generator emits and the spec refers to"
 )]
 
 use serde::{Deserialize, Serialize};

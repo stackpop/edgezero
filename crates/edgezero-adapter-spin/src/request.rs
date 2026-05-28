@@ -146,7 +146,7 @@ pub(crate) async fn dispatch_with_handles(
     stores: Stores,
 ) -> anyhow::Result<spin_sdk::http::Response> {
     let mut core_request = into_core_request(req).await?;
-    // Stage 10.1 hard-cutoff: see fastly's `dispatch_core_request`
+    // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
     // at the dispatch boundary.
@@ -183,7 +183,7 @@ pub(crate) async fn dispatch_with_handles(
 
 /// Dispatch with per-id store registries built from baked metadata.
 ///
-/// Spin capability map (§6.6):
+/// Spin capability map:
 /// - KV: **Multi** — each declared id opens its own [`SpinKvStore`] under the
 ///   label resolved from `EDGEZERO__STORES__KV__<ID>__NAME`. Optional
 ///   `EDGEZERO__STORES__KV__<ID>__MAX_LIST_KEYS` overrides the paging cap.
@@ -268,7 +268,7 @@ fn build_secret_registry(
     let meta = secret_meta?;
     // Spin is `Single` for secrets: every id resolves to the same flat
     // variable store. `SpinSecretStore::get_bytes` ignores `store_name`
-    // (logs a debug if non-empty per §6.7), so the per-id bound name is
+    // (logs a debug if non-empty), so the per-id bound name is
     // observable only via [`BoundSecretStore::store_name`]. Construction
     // is infallible.
     let handle = SecretHandle::new(Arc::new(SpinSecretStore::new()));

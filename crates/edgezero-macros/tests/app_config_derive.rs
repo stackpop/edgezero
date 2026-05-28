@@ -1,4 +1,4 @@
-//! Happy-path coverage for `#[derive(AppConfig)]` (Task 3.2). Compile-
+//! Happy-path coverage for `#[derive(AppConfig)]`. Compile-
 //! fail coverage lives next to `tests/ui/*.rs` and runs via `trybuild`.
 
 #[cfg(test)]

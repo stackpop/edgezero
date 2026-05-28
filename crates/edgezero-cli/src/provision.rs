@@ -1,4 +1,4 @@
-//! `provision` command (spec §12).
+//! `provision` command.
 //!
 //! Thin delegate to the adapter registry. The CLI loads the manifest,
 //! resolves the named adapter, hands it the declared store ids per

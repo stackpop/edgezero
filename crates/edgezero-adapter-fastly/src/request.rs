@@ -95,7 +95,7 @@ fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<FastlyResponse, FastlyError> {
-    // Stage 10.1 hard-cutoff: legacy bare handles are no longer
+    // Hard-cutoff: legacy bare handles are no longer
     // inserted into request extensions. `dispatch_with_config_handle`
     // still accepts a `ConfigStoreHandle`, but the dispatcher
     // synthesises a one-id `<kind>Registry` from any wired handle
@@ -407,7 +407,7 @@ fn build_secret_registry(
     env: &EnvConfig,
 ) -> Option<SecretRegistry> {
     let meta = secret_meta?;
-    // Fastly is `Multi` for secrets (§6.6). The provider trait is stateless —
+    // Fastly is `Multi` for secrets. The provider trait is stateless —
     // `FastlySecretStore::get_bytes(store_name, key)` opens the named Fastly
     // Secret Store per call — so we share one provider handle across all
     // bindings, then capture the per-id platform store name in the bound

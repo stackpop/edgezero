@@ -140,8 +140,8 @@ fn manifest_command<'manifest>(
 
 /// `(host, port)` from `[adapters.<name>.adapter]`. Translated into
 /// `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT` on the
-/// subprocess env so the runtime (which reads only the canonical Stage 2
-/// names) actually sees the values declared in the manifest.
+/// subprocess env so the runtime (which reads only the canonical
+/// `EDGEZERO__*` names) actually sees the values declared in the manifest.
 fn adapter_bind_from_manifest(
     manifest: &Manifest,
     adapter_name: &str,

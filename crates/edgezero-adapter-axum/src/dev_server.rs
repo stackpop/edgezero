@@ -435,7 +435,7 @@ fn build_kv_registry(
 
 /// Build the per-request config registry from the per-id local-file stores.
 ///
-/// Each declared id reads `.edgezero/local-config-<id>.json` (§15). A missing
+/// Each declared id reads `.edgezero/local-config-<id>.json`. A missing
 /// file yields an empty store for that id — the dev server stays usable
 /// before any `config push` has populated the file. A malformed file logs a
 /// warning and the id is dropped from the registry rather than failing

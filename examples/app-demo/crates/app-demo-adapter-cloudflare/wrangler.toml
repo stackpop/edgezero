@@ -24,8 +24,8 @@ binding = "cache"
 id = "local-dev-placeholder"
 
 # `[stores.config].ids = ["app_config"]` — config is KV-backed on Cloudflare
-# (§6.6 / Task 2.6E). Seed values via `wrangler kv key put` against this
-# namespace; the pre-rewrite `[vars] app_config = '{ … }'` form is gone.
+#. Seed values via `wrangler kv key put` against this namespace;
+# the pre-rewrite `[vars] app_config = '{ … }'` form is gone.
 [[kv_namespaces]]
 binding = "app_config"
 id = "local-dev-placeholder"

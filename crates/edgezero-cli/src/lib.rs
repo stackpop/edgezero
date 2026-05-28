@@ -470,7 +470,7 @@ auth-status = "echo whoami"
     /// `auth-{login,logout,status}` override to a harmless `echo`
     /// command and assert each subcommand runs cleanly. The real
     /// per-adapter implementations (`wrangler login`, etc.) live in
-    /// the adapter crates and are not exercised in CI per spec §13.
+    /// the adapter crates and are not exercised in CI.
     #[cfg(not(windows))]
     #[test]
     fn run_auth_dispatches_each_subcommand_via_manifest_override() {
@@ -612,7 +612,7 @@ auth-status = "echo whoami"
         // Real impl shipped in 6.2 — dry-run path doesn't shell
         // out to wrangler, so CI can exercise dispatch without
         // wrangler installed. Non-dry-run is an operator workflow
-        // and isn't exercised here (spec §13).
+        // and isn't exercised here.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -638,7 +638,7 @@ auth-status = "echo whoami"
         // Real impl shipped in 6.3 — dry-run path doesn't shell
         // out to fastly, so CI can exercise dispatch without
         // fastly installed. Non-dry-run is an operator workflow
-        // and isn't exercised here (spec §12).
+        // and isn't exercised here.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");

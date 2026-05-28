@@ -40,8 +40,8 @@ impl ManifestLoader {
 
     /// Loads a manifest from a static, in-process TOML string —
     /// fixture data in tests, build-time compile-checks, and the
-    /// `app!` macro's compile-time consumption are the in-tree callers
-    /// post Stage 2. The Stage 2 rewrite removed the per-adapter
+    /// `app!` macro's compile-time consumption are the in-tree callers.
+    /// The portable store-registry rewrite removed the per-adapter
     /// `run_app(include_str!("edgezero.toml"), …)` shape, so an adapter
     /// binary no longer carries the manifest at runtime; the portable
     /// store registry it would have extracted is baked into
@@ -383,8 +383,8 @@ pub struct ManifestAdapter {
 #[validate(schema(function = "validate_manifest_adapter_definition"))]
 pub struct ManifestAdapterDefinition {
     /// Spin component id, when the adapter's `manifest` (`spin.toml`) declares
-    /// more than one `[component.*]`. Read by `provision` (Stage 6) and
-    /// `config push` (Stage 7); ignored at runtime. `config validate --strict`
+    /// more than one `[component.*]`. Read by `provision` and
+    /// `config push`; ignored at runtime. `config validate --strict`
     /// requires it when `spin.toml` declares multiple components.
     #[serde(default)]
     #[validate(length(min = 1_u64))]
@@ -785,7 +785,7 @@ fn validate_manifest_adapter_definition(
 
 /// Validates a single `[adapters.<name>]` block. The portable manifest model
 /// has no per-adapter store / runtime tuning surface — all of that moved to
-/// `EDGEZERO__*` env vars in Stage 2. The pre-rewrite
+/// `EDGEZERO__*` env vars. The pre-rewrite
 /// `[adapters.<name>.stores.<kind>]` tables and the legacy
 /// `[adapters.<name>.adapter] runtime` block were silently ignored by the
 /// deserializer before this hard-cutoff, so projects could carry over
@@ -799,7 +799,7 @@ fn validate_manifest_adapter(adapter: &ManifestAdapter) -> Result<(), Validation
             format!(
                 "the pre-rewrite `[adapters.<name>.<key>]` subtables are no longer \
                  supported (offending field(s): {}); per-adapter store / runtime \
-                 tuning moved to `EDGEZERO__*` env vars in Stage 2 -- see \
+                 tuning moved to `EDGEZERO__*` env vars -- see \
                  docs/guide/manifest-store-migration.md",
                 keys.join(", ")
             )
@@ -1732,8 +1732,8 @@ crate = "crates/axum-adapter"
 
     #[test]
     fn adapter_definition_accepts_spin_component_field() {
-        // `component` is the Spin component id used by `provision` (Stage 6)
-        // and `config push` (Stage 7) when `spin.toml` declares multiple
+        // `component` is the Spin component id used by `provision`
+        // and `config push` when `spin.toml` declares multiple
         // `[component.*]`. Documented in docs/guide/adapters/spin.md and
         // must round-trip through the manifest model now even though the
         // runtime ignores it.

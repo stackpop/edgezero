@@ -225,7 +225,7 @@ mod tests {
         PathParams::new(inner)
     }
 
-    // Stage 10.1 removed `RequestContext::config_handle()`. The
+    // `RequestContext::config_handle()` was removed. The
     // present/absent behaviour is now covered by
     // `config_store_*` tests against a wired `ConfigRegistry`.
 
@@ -344,7 +344,7 @@ mod tests {
         );
     }
 
-    // Stage 10.1 removed `RequestContext::kv_handle()`. The
+    // `RequestContext::kv_handle()` was removed. The
     // present/absent behaviour is now covered by `kv_store_*`
     // tests against a wired `KvRegistry`.
 
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(request.uri().path(), "/items/123");
     }
 
-    // Stage 10.1 removed `RequestContext::secret_handle()`. The
+    // `RequestContext::secret_handle()` was removed. The
     // present/absent behaviour is now covered by `secret_store_*`
     // tests against a wired `SecretRegistry`.
 
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn kv_store_returns_none_when_only_legacy_handle_wired() {
-        // Stage 10.1 hard-cutoff: a bare `KvHandle` in extensions
+        // Hard-cutoff: a bare `KvHandle` in extensions
         // is ignored by the registry-aware accessor. Adapter
         // dispatchers no longer insert bare handles — they
         // always synthesise a `KvRegistry` from any wired handle
@@ -580,7 +580,7 @@ mod tests {
 
     #[test]
     fn secret_store_default_returns_none_when_only_legacy_handle_wired() {
-        // Stage 10.1 hard-cutoff: same semantics as
+        // Hard-cutoff: same semantics as
         // `kv_store_returns_none_when_only_legacy_handle_wired` —
         // a bare `SecretHandle` in extensions (a state that
         // only arises if a test bypasses the dispatcher) must

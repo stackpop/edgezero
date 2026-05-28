@@ -449,7 +449,7 @@ impl<T> ValidatedForm<T> {
     }
 }
 
-/// Extractor that yields the per-request [`KvRegistry`] (§6.9).
+/// Extractor that yields the per-request [`KvRegistry`].
 ///
 /// Handlers pick a bound store by id at the call site:
 ///
@@ -522,7 +522,7 @@ impl Kv {
     }
 }
 
-/// Extractor that yields the per-request [`SecretRegistry`] (§6.9).
+/// Extractor that yields the per-request [`SecretRegistry`].
 ///
 /// The returned [`BoundSecretStore`] is pre-bound to a platform store name
 /// (resolved per id from `EDGEZERO__STORES__SECRETS__<ID>__NAME`), so
@@ -583,7 +583,7 @@ impl Secrets {
     }
 }
 
-/// Extractor that yields the per-request [`ConfigRegistry`] (§6.9).
+/// Extractor that yields the per-request [`ConfigRegistry`].
 ///
 /// ```ignore
 /// #[action]
@@ -640,7 +640,7 @@ impl Config {
     }
 }
 
-// Stage 9.3 removed the private `single_id_registry` helper that
+// removed the private `single_id_registry` helper that
 // the Kv/Config/Secrets extractors used to synthesise a one-id
 // registry from a legacy bare handle. The equivalent normalisation
 // now happens at each adapter's dispatch boundary via
@@ -1165,7 +1165,7 @@ mod tests {
 
     #[test]
     fn kv_extractor_errors_when_only_legacy_handle_wired() {
-        // Stage 9.3 hard-cutoff: the extractor used to synthesise
+        // Hard-cutoff: the extractor used to synthesise
         // a one-id registry from a lone `ctx.kv_handle()` when no
         // `KvRegistry` was in extensions. That path silently
         // masked missing registry wiring, which violates the
@@ -1243,7 +1243,7 @@ mod tests {
 
     #[test]
     fn secrets_extractor_errors_when_only_legacy_handle_wired() {
-        // Stage 9.3 hard-cutoff — same semantics as
+        // Hard-cutoff — same semantics as
         // `kv_extractor_errors_when_only_legacy_handle_wired`.
         use crate::secret_store::{NoopSecretStore, SecretHandle};
         use std::sync::Arc;
@@ -1376,7 +1376,7 @@ mod tests {
 
     #[test]
     fn config_extractor_errors_when_only_legacy_handle_wired() {
-        // Stage 9.3 hard-cutoff — same semantics as
+        // Hard-cutoff — same semantics as
         // `kv_extractor_errors_when_only_legacy_handle_wired`.
         use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
         use std::sync::Arc;

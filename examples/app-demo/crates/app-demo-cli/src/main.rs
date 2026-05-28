@@ -21,7 +21,7 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Sign in / out / status against the adapter's native CLI
-    /// (`wrangler` / `fastly` / `spin`). See spec §11.
+    /// (`wrangler` / `fastly` / `spin`). See spec.
     Auth(AuthArgs),
     /// Build the project for a target edge.
     Build(BuildArgs),
@@ -33,7 +33,7 @@ enum Cmd {
     /// Create a new `EdgeZero` app skeleton.
     New(NewArgs),
     /// Create the platform resources backing the declared
-    /// `[stores.<kind>].ids` (spec §12).
+    /// `[stores.<kind>].ids`.
     Provision(ProvisionArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
@@ -44,7 +44,7 @@ enum Cmd {
 /// parameterised over `AppDemoConfig` — the downstream project owns
 /// the struct, so it can enforce the typed deserialise, `validator`
 /// rules, and `#[secret]` / `#[secret(store_ref)]` checks the raw
-/// default-binary path skips (spec §10, §13).
+/// default-binary path skips.
 #[derive(Subcommand, Debug)]
 enum AppDemoConfigCmd {
     /// Push `app-demo.toml` (flattened, secret-stripped) to the

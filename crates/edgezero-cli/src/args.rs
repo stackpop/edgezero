@@ -12,7 +12,7 @@ pub struct Args {
 pub enum Command {
     /// Sign in / out / status against the adapter's native CLI
     /// (`wrangler` / `fastly` / `spin`). `EdgeZero` stores no
-    /// credentials itself — `auth` just delegates (spec §11).
+    /// credentials itself — `auth` just delegates.
     Auth(AuthArgs),
     /// Build the project for a target edge.
     Build(BuildArgs),
@@ -27,7 +27,7 @@ pub enum Command {
     /// Create a new `EdgeZero` app skeleton (multi-crate workspace).
     New(NewArgs),
     /// Create the platform resources backing the declared
-    /// `[stores.<kind>].ids` (spec §12). Each adapter owns its
+    /// `[stores.<kind>].ids`. Each adapter owns its
     /// own dispatch: cloudflare shells out to `wrangler`, fastly to
     /// `fastly`, spin edits `spin.toml` in-place, axum is a no-op.
     Provision(ProvisionArgs),
@@ -35,21 +35,21 @@ pub enum Command {
     Serve(ServeArgs),
 }
 
-/// Subcommands under `edgezero config …` (spec §10, §13). Stage 4
-/// shipped `validate`; Stage 7 adds `push`.
+/// Subcommands under `edgezero config …`. Carries
+/// `validate` and `push`.
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
     /// Push the typed `<name>.toml` (flattened, secret-stripped) to
-    /// the adapter's config store (spec §13).
+    /// the adapter's config store.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed `<name>.toml` against the
     /// manifest / app-config / Spin-key contract.
     Validate(ConfigValidateArgs),
 }
 
-/// Arguments for the `auth` command (spec §11).
+/// Arguments for the `auth` command.
 ///
-/// Intentionally has no `Default` impl (§6.11) — every invocation
+/// Intentionally has no `Default` impl — every invocation
 /// must name a subcommand, so an empty `AuthArgs` is meaningless.
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
@@ -119,7 +119,7 @@ pub struct NewArgs {
     pub name: String,
 }
 
-/// Arguments for the `provision` command (spec §12).
+/// Arguments for the `provision` command.
 #[derive(clap::Args, Debug, Default)]
 #[non_exhaustive]
 pub struct ProvisionArgs {
@@ -144,7 +144,7 @@ pub struct ServeArgs {
     pub adapter: String,
 }
 
-/// Arguments for the `config push` command (spec §13).
+/// Arguments for the `config push` command.
 #[derive(clap::Args, Debug, Default)]
 #[non_exhaustive]
 pub struct ConfigPushArgs {
@@ -173,7 +173,7 @@ pub struct ConfigPushArgs {
     pub store: Option<String>,
 }
 
-/// Arguments for the `config validate` command (spec §10).
+/// Arguments for the `config validate` command.
 #[derive(clap::Args, Debug, Default)]
 #[non_exhaustive]
 pub struct ConfigValidateArgs {

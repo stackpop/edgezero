@@ -1,6 +1,6 @@
-//! Stage 8 integration tests — drive `edgezero-cli`'s typed flows
-//! through `AppDemoConfig`, the downstream-CLI surface this example
-//! exists to exercise.
+//! Integration tests — drive `edgezero-cli`'s typed flows through
+//! `AppDemoConfig`, the downstream-CLI surface this example exists
+//! to exercise.
 //!
 //! These tests construct an app-demo-shaped manifest + config in a
 //! tempdir rather than pointing at the in-repo `examples/app-demo/`
@@ -134,7 +134,7 @@ fn config_push_axum_writes_local_config_json_without_secrets() {
     // The typed push must strip BOTH `#[secret]` (`api_token`)
     // and `#[secret(store_ref)]` (`vault`) before writing —
     // runtime store ids and secret values both belong out of
-    // the config-store payload (spec §13).
+    // the config-store payload.
     let (dir, manifest) = write_app_demo_project("axum");
     edgezero_cli::run_config_push_typed::<AppDemoConfig>(&push_args(&manifest, "axum", false))
         .expect("typed axum push succeeds");
@@ -158,13 +158,13 @@ fn config_push_axum_writes_local_config_json_without_secrets() {
 
 #[test]
 fn config_push_axum_round_trip_serves_pushed_value_via_handler() {
-    // Stage 8.5 / plan task 8.1 step 2 — the spec-intent half of
-    // "config push --adapter axum writes the file AND a running
-    // demo server returns greeting on /config/greeting". We
-    // skip the HTTP transport (axum's own contract tests cover
-    // that) and verify the data contract that actually matters
-    // for app-demo: the JSON `config push` writes is exactly the
-    // payload `AxumConfigStore` reads back, and the demo's
+    // The spec-intent half of "config push --adapter axum writes
+    // the file AND a running demo server returns greeting on
+    // /config/greeting". We skip the HTTP transport (axum's own
+    // contract tests cover that) and verify the data contract that
+    // actually matters for app-demo: the JSON `config push` writes
+    // is exactly the payload `AxumConfigStore` reads back, and the
+    // demo's
     // `config_get` handler dispatched against that store
     // surfaces the value. A full subprocess-server lifecycle
     // (ephemeral port + readiness + RAII teardown) would add
@@ -230,7 +230,7 @@ fn config_push_spin_dry_run_prints_translated_keys_and_preserves_manifest() {
     // contract — typed flow dispatches cleanly + spin.toml is
     // byte-identical — and relies on the printed-content
     // assertions in `edgezero_adapter_spin::cli::tests::
-    // push_dry_run_does_not_edit_spin_toml` (Stage 9.4) for
+    // push_dry_run_does_not_edit_spin_toml` for
     // the `__`-translated keys + both-table preview lines.
     let (dir, manifest) = write_app_demo_project("spin");
     let spin_path = dir.path().join("spin.toml");
@@ -246,7 +246,7 @@ fn config_push_spin_dry_run_prints_translated_keys_and_preserves_manifest() {
     );
 }
 
-/// Stage 9.4 companion to the CLI dispatch test above: confirm
+/// Companion to the CLI dispatch test above: confirm
 /// the spin adapter's dry-run preview surfaces every translated
 /// key derivable from `AppDemoConfig` (with `#[secret]` and
 /// `#[secret(store_ref)]` fields stripped) and the bindings
