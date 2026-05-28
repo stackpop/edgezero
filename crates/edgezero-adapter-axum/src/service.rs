@@ -10,7 +10,7 @@ use edgezero_core::http::StatusCode;
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
-use edgezero_core::store_registry::{ConfigRegistry, KvRegistry, SecretRegistry};
+use edgezero_core::store_registry::{BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry};
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
@@ -110,12 +110,36 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
-        let config_registry = self.config_registry.clone();
+        // Stage 9.3: when only a legacy single-handle is wired
+        // (no explicit registry), synthesise a one-id registry
+        // under the conventional `"default"` id and insert it
+        // alongside the bare handle. This keeps `with_*_handle`
+        // working as a convenience wrapper but routes every
+        // request through the registry path — so the extractor
+        // (`Kv` / `Config` / `Secrets`) and the registry-aware
+        // `RequestContext` accessors don't need a legacy-handle
+        // fallback to silently upgrade unwired requests.
+        let config_registry = self.config_registry.clone().or_else(|| {
+            self.config_store_handle
+                .clone()
+                .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+        });
         let config_store_handle = self.config_store_handle.clone();
         let kv_handle = self.kv_handle.clone();
-        let kv_registry = self.kv_registry.clone();
+        let kv_registry = self.kv_registry.clone().or_else(|| {
+            self.kv_handle
+                .clone()
+                .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
+        });
         let secret_handle = self.secret_handle.clone();
-        let secret_registry = self.secret_registry.clone();
+        let secret_registry = self.secret_registry.clone().or_else(|| {
+            self.secret_handle.clone().map(|handle| {
+                SecretRegistry::single_id(
+                    "default".to_owned(),
+                    BoundSecretStore::new(handle, "default".to_owned()),
+                )
+            })
+        });
         Box::pin(async move {
             let mut core_request = match into_core_request(req).await {
                 Ok(converted) => converted,
