@@ -117,9 +117,51 @@ const FASTLY_INSTALL_HINT: &str =
 
 struct FastlyCliAdapter;
 
+/// Outcome of scanning `fastly config-store list --json` for a
+/// platform store id by `name`. Distinguishes three cases the
+/// caller wants to act on differently:
+///
+/// - `Found(id)` — happy path.
+/// - `NotFound` — JSON parsed cleanly and the array contains
+///   entries with well-formed `name` + `id` string fields, but no
+///   entry matched `name`. Operator likely needs to run
+///   `provision`.
+/// - `SchemaDrift(detail)` — the JSON parsed but doesn't match
+///   the expected shape (no `items` envelope nor bare array, OR
+///   entries are missing `name` / `id` string fields, OR the
+///   bytes didn't parse as JSON at all). Likely a fastly CLI
+///   version bump that changed the output schema; surface the
+///   detail so the operator can pin a known-compatible version.
+#[derive(Debug)]
+enum ConfigStoreLookup {
+    Found(String),
+    NotFound,
+    SchemaDrift(String),
+}
+
+// The three `validate_*` trait methods exist on `Adapter` because
+// spin requires them (variable-name regex, `[component.*]`
+// discovery, flat-namespace collision). The trait surface is typed
+// generically so any future adapter with similar constraints can
+// override — but fastly has no equivalent platform requirements,
+// so the no-op defaults are correct:
+//
+// - `validate_app_config_keys`: Fastly Config Store keys accept
+//   alphanumeric + `-` / `_` / `.` up to 256 chars. Any reasonable
+//   Rust struct field name passes; no regex check needed.
+// - `validate_adapter_manifest`: would require shelling out to
+//   `fastly compute validate` at validate-time. We keep
+//   `config validate` pure-Rust so it stays fast and
+//   tool-independent.
+// - `validate_typed_secrets`: Fastly's KV / Config / Secret
+//   stores are independent namespaces — no spin-style flat-
+//   namespace collision risk to detect.
+//
+// `single_store_kinds` IS overridden below — explicitly returns
+// `&[]` for documentation, matching the inherited default.
 #[expect(
     clippy::missing_trait_methods,
-    reason = "fastly is Multi for every store kind and has no additional validation hooks; the trait defaults already model that"
+    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented"
 )]
 impl Adapter for FastlyCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -159,11 +201,11 @@ impl Adapter for FastlyCliAdapter {
         stores: &ProvisionStores<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        //: fastly is Multi for every store kind. Each id maps
-        // 1:1 to a Fastly resource (kv-store / config-store /
+        // Fastly is Multi for every store kind. Each id maps 1:1
+        // to a Fastly resource (kv-store / config-store /
         // secret-store) created via the Fastly CLI; the manifest
-        // writeback declares the resource link for `fastly compute
-        // deploy` and the local viceroy server.
+        // writeback declares the resource link for `fastly
+        // compute deploy` and the local viceroy server.
         let Some(rel) = adapter_manifest_path else {
             return Err(
                 "[adapters.fastly.adapter].manifest must point at fastly.toml for provision"
@@ -194,7 +236,19 @@ impl Adapter for FastlyCliAdapter {
                     continue;
                 }
                 create_fastly_store(kind, id)?;
-                append_fastly_setup(&fastly_path, kind, id)?;
+                // If the platform store was created but the
+                // writeback fails, remote state and the local
+                // manifest are out of sync. Re-running `provision`
+                // would attempt to create the platform store again
+                // and fail with "already exists". Surface the
+                // recovery path explicitly so the operator isn't
+                // stuck.
+                append_fastly_setup(&fastly_path, kind, id).map_err(|err| {
+                    format!(
+                        "fastly {kind}-store `{id}` was created remotely, but writeback to {path} failed: {err}\n  To recover, either:\n    1. Manually append `[setup.{kind}_stores.{id}]` and `[local_server.{kind}_stores.{id}]` to {path} and re-run, or\n    2. Delete the orphan remote store via `fastly {kind}-store delete --name={id}` and re-run `edgezero provision --adapter fastly`.",
+                        path = fastly_path.display()
+                    )
+                })?;
                 out.push(format!(
                     "created fastly {kind}-store `{id}`; appended setup tables to {}",
                     fastly_path.display()
@@ -216,7 +270,7 @@ impl Adapter for FastlyCliAdapter {
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        //: resolve the platform config-store id on demand via
+        // Resolve the platform config-store id on demand via
         // `fastly config-store list --json` (matched by name =
         // `store_id`), then `fastly config-store-entry create
         // --store-id=<id> --key=<k> --value=<v>` per key. Keys
@@ -227,19 +281,55 @@ impl Adapter for FastlyCliAdapter {
             )]);
         }
         if dry_run {
-            return Ok(vec![format!(
-                "would resolve fastly config-store `{store_id}` via `fastly config-store list --json` and run `fastly config-store-entry create` for {} entries",
+            // List each entry so the operator can verify intent
+            // before committing. Matches the spin dry-run preview
+            // shape.
+            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            out.push(format!(
+                "would resolve fastly config-store `{store_id}` via `fastly config-store list --json` and run `fastly config-store-entry create` for {} entries:",
                 entries.len()
-            )]);
+            ));
+            for (key, _) in entries {
+                out.push(format!("  would create entry `{key}`"));
+            }
+            return Ok(out);
         }
         let resolved_id = resolve_remote_config_store_id(store_id)?;
+        // The per-entry shell-out is spec-compliant but
+        // non-atomic. Track which entries succeeded so a mid-loop
+        // failure surfaces what got pushed and what didn't — the
+        // operator can resume from a known boundary rather than
+        // re-pushing the whole set.
+        let mut pushed: Vec<String> = Vec::with_capacity(entries.len());
         for (key, value) in entries {
-            create_config_store_entry(&resolved_id, key, value)?;
+            if let Err(err) = create_config_store_entry(&resolved_id, key, value) {
+                let remaining: Vec<&str> = entries
+                    .iter()
+                    .skip(pushed.len().saturating_add(1))
+                    .map(|(remaining_key, _)| remaining_key.as_str())
+                    .collect();
+                return Err(format!(
+                    "fastly push failed at entry `{key}` after committing {committed} of {total} entries; the remaining {remaining_count} entries were NOT pushed.\n  Committed (safe to skip on retry): {pushed:?}\n  Failed: `{key}` — {err}\n  Not attempted (re-push these): {remaining:?}",
+                    committed = pushed.len(),
+                    total = entries.len(),
+                    remaining_count = remaining.len()
+                ));
+            }
+            pushed.push(key.clone());
         }
         Ok(vec![format!(
             "pushed {} entries to fastly config-store `{store_id}` (id={resolved_id})",
             entries.len()
         )])
+    }
+
+    fn single_store_kinds(&self) -> &'static [&'static str] {
+        // Explicit `&[]` rather than inheriting the trait default,
+        // so the "Multi for every store kind" intent is documented
+        // at the call site. Fastly KV / Config / Secrets all
+        // support multiple distinct platform resources per kind,
+        // unlike spin's flat-namespace single-store model.
+        &[]
     }
 }
 
@@ -386,26 +476,67 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
 /// both a bare array (`[ {"id": "...", "name": "..."}, ... ]`)
 /// and an `{"items": [...]}` envelope so this stays compatible
 /// across fastly CLI versions.
-fn find_config_store_id(stdout: &str, name: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(stdout).ok()?;
-    let array = parsed
+fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
+    let parsed: serde_json::Value = match serde_json::from_str(stdout) {
+        Ok(value) => value,
+        Err(err) => {
+            return ConfigStoreLookup::SchemaDrift(format!("stdout did not parse as JSON: {err}"));
+        }
+    };
+    let Some(array) = parsed
         .as_array()
-        .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))?;
+        .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))
+    else {
+        return ConfigStoreLookup::SchemaDrift(format!(
+            "expected a bare array `[...]` or an `{{\"items\": [...]}}` envelope; got JSON of shape `{}`",
+            shape_summary(&parsed)
+        ));
+    };
+    let mut any_well_formed = false;
     for entry in array {
-        if entry.get("name").and_then(serde_json::Value::as_str) == Some(name) {
-            return entry
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
+        let entry_name = entry.get("name").and_then(serde_json::Value::as_str);
+        let entry_id = entry.get("id").and_then(serde_json::Value::as_str);
+        if entry_name.is_some() && entry_id.is_some() {
+            any_well_formed = true;
+        }
+        if entry_name == Some(name) {
+            return entry_id.map_or_else(
+                || {
+                    ConfigStoreLookup::SchemaDrift(format!(
+                        "entry matched name `{name}` but is missing a string `id` field"
+                    ))
+                },
+                |id| ConfigStoreLookup::Found(id.to_owned()),
+            );
         }
     }
-    None
+    if array.is_empty() || any_well_formed {
+        ConfigStoreLookup::NotFound
+    } else {
+        ConfigStoreLookup::SchemaDrift(
+            "no entry has both string `name` and `id` fields -- fastly CLI may have changed its output schema"
+                .to_owned(),
+        )
+    }
+}
+
+/// One-line type label for a `serde_json::Value` (for diagnostic
+/// error messages — not a canonical JSON-schema description).
+fn shape_summary(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// Resolve the platform config-store id on demand: shell out to
 /// `fastly config-store list --json`, parse the JSON, match by
-/// `name`. The provision flow doesn't persist this id,
-/// so push has to re-fetch every time.
+/// `name`. The provision flow doesn't persist this id, so push
+/// has to re-fetch every time.
 fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
     let output = Command::new("fastly")
         .args(["config-store", "list", "--json"])
@@ -425,11 +556,15 @@ fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    find_config_store_id(&stdout, name).ok_or_else(|| {
-        format!(
+    match find_config_store_id(&stdout, name) {
+        ConfigStoreLookup::Found(id) => Ok(id),
+        ConfigStoreLookup::NotFound => Err(format!(
             "no fastly config-store matches `{name}` (did you run `edgezero provision --adapter fastly`?)"
-        )
-    })
+        )),
+        ConfigStoreLookup::SchemaDrift(detail) => Err(format!(
+            "could not parse `fastly config-store list --json` output: {detail}.\n  The fastly CLI may have changed its JSON schema in a recent version. Please file a bug report at https://github.com/stackpop/edgezero/issues with the fastly CLI version (`fastly version`) and the raw stdout. Workaround: pin to a known-compatible fastly CLI version."
+        )),
+    }
 }
 
 /// # Errors
@@ -889,10 +1024,13 @@ mod tests {
             {"id": "abc123", "name": "app_config"},
             {"id": "def456", "name": "other_store"}
         ]"#;
-        assert_eq!(
-            find_config_store_id(stdout, "app_config").as_deref(),
-            Some("abc123")
-        );
+        match find_config_store_id(stdout, "app_config") {
+            ConfigStoreLookup::Found(id) => assert_eq!(id, "abc123"),
+            ConfigStoreLookup::NotFound => panic!("expected Found, got NotFound"),
+            ConfigStoreLookup::SchemaDrift(detail) => {
+                panic!("expected Found, got SchemaDrift({detail})")
+            }
+        }
     }
 
     #[test]
@@ -900,22 +1038,85 @@ mod tests {
         let stdout = r#"{"items": [
             {"id": "xyz789", "name": "app_config"}
         ]}"#;
-        assert_eq!(
-            find_config_store_id(stdout, "app_config").as_deref(),
-            Some("xyz789")
+        match find_config_store_id(stdout, "app_config") {
+            ConfigStoreLookup::Found(id) => assert_eq!(id, "xyz789"),
+            ConfigStoreLookup::NotFound => panic!("expected Found, got NotFound"),
+            ConfigStoreLookup::SchemaDrift(detail) => {
+                panic!("expected Found, got SchemaDrift({detail})")
+            }
+        }
+    }
+
+    #[test]
+    fn find_config_store_id_distinguishes_not_found_from_match_failure() {
+        // JSON parses cleanly, entries are well-formed
+        // (`name` + `id` strings present), but no entry matches
+        // → NotFound. Operator likely needs to run `provision`.
+        let stdout = r#"[{"id": "abc", "name": "other"}]"#;
+        assert!(matches!(
+            find_config_store_id(stdout, "missing"),
+            ConfigStoreLookup::NotFound
+        ));
+    }
+
+    #[test]
+    fn find_config_store_id_flags_schema_drift_on_malformed_json() {
+        // Unparseable bytes are NOT a "store not found" — they're
+        // a "fastly CLI output format changed" signal. Operator
+        // needs different recovery (file a bug, pin CLI version)
+        // than for the "store doesn't exist yet" case.
+        let drift = find_config_store_id("not json", "anything");
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "non-JSON stdout must be schema drift, got {drift:?}"
+        );
+        let empty = find_config_store_id("", "anything");
+        assert!(
+            matches!(empty, ConfigStoreLookup::SchemaDrift(_)),
+            "empty stdout must be schema drift, got {empty:?}"
         );
     }
 
     #[test]
-    fn find_config_store_id_returns_none_on_mismatch() {
-        let stdout = r#"[{"id": "abc", "name": "other"}]"#;
-        assert!(find_config_store_id(stdout, "missing").is_none());
+    fn find_config_store_id_flags_schema_drift_when_shape_unexpected() {
+        // JSON parses but the top-level is neither a bare array
+        // nor an `{items: [...]}` envelope.
+        let stdout = r#"{"namespace": "fastly", "list": []}"#;
+        match find_config_store_id(stdout, "any") {
+            ConfigStoreLookup::SchemaDrift(detail) => {
+                assert!(
+                    detail.contains("bare array") || detail.contains("items"),
+                    "schema-drift detail names the expected shapes: {detail}"
+                );
+            }
+            ConfigStoreLookup::Found(id) => panic!("expected SchemaDrift, got Found({id})"),
+            ConfigStoreLookup::NotFound => panic!("expected SchemaDrift, got NotFound"),
+        }
     }
 
     #[test]
-    fn find_config_store_id_returns_none_on_malformed_json() {
-        assert!(find_config_store_id("not json", "anything").is_none());
-        assert!(find_config_store_id("", "anything").is_none());
+    fn find_config_store_id_flags_schema_drift_when_entries_lack_name_id() {
+        // Array of objects but none have BOTH string `name` and
+        // string `id` fields — suggests schema rename (e.g.
+        // fastly renamed `name` → `title`).
+        let stdout = r#"[{"title": "app_config", "uid": "abc"}]"#;
+        let drift = find_config_store_id(stdout, "app_config");
+        assert!(
+            matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
+            "entries lacking name/id must be schema drift, got {drift:?}"
+        );
+    }
+
+    #[test]
+    fn find_config_store_id_returns_not_found_for_empty_array() {
+        // Empty array IS a valid "store doesn't exist yet" signal,
+        // not schema drift — fastly CLI legitimately returns `[]`
+        // when no config-stores exist.
+        let drift = find_config_store_id("[]", "any");
+        assert!(
+            matches!(drift, ConfigStoreLookup::NotFound),
+            "empty array must be NotFound, got {drift:?}"
+        );
     }
 
     // ---------- push_config_entries (dry-run + error paths) ----------
@@ -923,7 +1124,10 @@ mod tests {
     #[test]
     fn push_dry_run_does_not_invoke_fastly() {
         let dir = tempdir().expect("tempdir");
-        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("feature.new_checkout".to_owned(), "false".to_owned()),
+        ];
         let out = FastlyCliAdapter
             .push_config_entries(
                 dir.path(),
@@ -934,11 +1138,23 @@ mod tests {
                 true,
             )
             .expect("dry-run succeeds");
-        assert_eq!(out.len(), 1);
+        // First line names the resolve+publish flow; subsequent lines preview
+        // each key the push would create (so callers can eyeball the keyset
+        // before running for real).
+        assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
         assert!(
             out[0].contains("would resolve fastly config-store `app_config`")
                 && out[0].contains("config-store-entry create"),
-            "dry-run line describes the would-be flow: {out:?}"
+            "dry-run header describes the would-be flow: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("`greeting`")),
+            "dry-run lists `greeting`: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("`feature.new_checkout`")),
+            "dry-run lists `feature.new_checkout`: {out:?}"
         );
     }
 
