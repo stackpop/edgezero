@@ -157,6 +157,68 @@ fn config_push_axum_writes_local_config_json_without_secrets() {
 }
 
 #[test]
+fn config_push_axum_round_trip_serves_pushed_value_via_handler() {
+    // Stage 8.5 / plan task 8.1 step 2 — the spec-intent half of
+    // "config push --adapter axum writes the file AND a running
+    // demo server returns greeting on /config/greeting". We
+    // skip the HTTP transport (axum's own contract tests cover
+    // that) and verify the data contract that actually matters
+    // for app-demo: the JSON `config push` writes is exactly the
+    // payload `AxumConfigStore` reads back, and the demo's
+    // `config_get` handler dispatched against that store
+    // surfaces the value. A full subprocess-server lifecycle
+    // (ephemeral port + readiness + RAII teardown) would add
+    // significant complexity for the same end-to-end coverage.
+    use app_demo_core::handlers::config_get;
+    use edgezero_adapter_axum::config_store::AxumConfigStore;
+    use edgezero_core::body::Body;
+    use edgezero_core::config_store::ConfigStoreHandle;
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::http::{request_builder, Method, StatusCode};
+    use edgezero_core::params::PathParams;
+    use edgezero_core::store_registry::{ConfigRegistry, StoreRegistry};
+    use futures::executor::block_on;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    let (dir, manifest) = write_app_demo_project("axum");
+    edgezero_cli::run_config_push_typed::<AppDemoConfig>(&push_args(&manifest, "axum", false))
+        .expect("typed axum push succeeds");
+
+    // Load the JSON the push just wrote via the SAME loader the
+    // axum runtime uses — this is the contract test: file format
+    // must match the reader's expectations.
+    let local_config_path = dir.path().join(".edgezero/local-config-app_config.json");
+    let store = AxumConfigStore::from_path(&local_config_path).expect("AxumConfigStore loads");
+    let handle = ConfigStoreHandle::new(Arc::new(store));
+    let by_id: BTreeMap<String, ConfigStoreHandle> =
+        [("app_config".to_owned(), handle)].into_iter().collect();
+    let registry: ConfigRegistry = StoreRegistry::new(by_id, "app_config".to_owned());
+
+    // Build a /config/greeting request and dispatch the demo's
+    // config_get handler — same dispatch path the wasm router
+    // would invoke at runtime.
+    let mut request = request_builder()
+        .method(Method::GET)
+        .uri("/config/greeting")
+        .body(Body::empty())
+        .expect("build request");
+    request.extensions_mut().insert(registry);
+    let mut params = HashMap::new();
+    params.insert("name".to_owned(), "greeting".to_owned());
+    let ctx = RequestContext::new(request, PathParams::new(params));
+
+    let response = block_on(config_get(ctx)).expect("config_get handler ok");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().into_bytes().expect("buffered");
+    assert_eq!(
+        body.as_ref(),
+        b"hello from app-demo",
+        "handler must serve the value `config push` wrote"
+    );
+}
+
+#[test]
 fn config_push_spin_dry_run_prints_translated_keys_and_preserves_manifest() {
     // Spin dry-run must:
     //   - resolve the single-component spin.toml,
