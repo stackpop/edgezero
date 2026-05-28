@@ -43,6 +43,16 @@ pub struct ProvisionStores<'stores> {
 pub trait Adapter: Sync + Send {
     /// Execute the requested action with optional adapter-specific args.
     ///
+    /// `args` is a stringly-typed pass-through for arguments meant
+    /// for the underlying native CLI (`wrangler` / `fastly` / `spin`):
+    /// `edgezero build --adapter cloudflare -- --foo bar` forwards
+    /// `["--foo", "bar"]` here. The loose typing is deliberate for
+    /// passthrough but stands out against the typed `provision` /
+    /// `push_config_entries` parameters below. A future cleanup
+    /// could replace the enum + string-vec pair with per-action
+    /// typed parameter structs (e.g. `BuildArgs { manifest_root,
+    /// extra_args }`) mirroring the rest of the trait.
+    ///
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;

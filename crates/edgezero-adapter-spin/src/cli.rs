@@ -247,7 +247,7 @@ impl Adapter for SpinCliAdapter {
             if !is_valid_spin_key(&spin_key) {
                 let reason = spin_key_rule_violation(&spin_key);
                 return Err(format!(
-                    "config key `{key}` translates to Spin variable `{spin_key}`, which is not a valid Spin variable name. {reason}. Rename the config key so the translated name conforms. (Run `edgezero config validate --strict` to surface this earlier.)"
+                    "config key `{key}` translates to Spin variable `{spin_key}`, which is not a valid Spin variable name. {reason}. Rename the config key so the translated name conforms. (`edgezero config validate` -- typed or raw -- runs the same Spin-variable check against the manifest before push, so a validate step earlier in the flow would have surfaced this without a push attempt.)"
                 ));
             }
             translated.push((spin_key, value.clone()));
