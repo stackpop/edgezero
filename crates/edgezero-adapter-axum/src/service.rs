@@ -300,6 +300,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_kv_handle_synthesises_one_id_registry_under_default() {
+        // Verifies the one-id-registry contract for the setup API:
+        // `with_kv_handle(h)` wraps `h` in a `KvRegistry` with the
+        // logical id `"default"`. So in a handler:
+        //   - `ctx.kv_store_default()` must resolve.
+        //   - `ctx.kv_store("default")` must resolve to the same handle.
+        //   - `ctx.kv_store("any-other-id")` must return None (the
+        //     registry has only one id; named lookups for anything
+        //     else are misses, not silent fallbacks).
+        // This is the precedence guarantee that lets handlers use
+        // the named-lookup path uniformly across adapters with one
+        // or many declared stores.
+        use crate::key_value_store::PersistentKvStore;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+        let store: Arc<dyn KvStore> = Arc::new(PersistentKvStore::new(db_path).unwrap());
+        let handle = KvHandle::new(Arc::clone(&store));
+        handle.put("k", &"v").await.unwrap();
+
+        let router = RouterService::builder()
+            .get("/probe", |ctx: RequestContext| async move {
+                let by_default = ctx.kv_store_default().is_some();
+                let by_default_name = ctx.kv_store("default").is_some();
+                let unknown = ctx.kv_store("custom-id").is_none();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(format!(
+                        "default={by_default} named_default={by_default_name} unknown_is_none={unknown}"
+                    )))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        let mut service = EdgeZeroAxumService::new(router).with_kv_handle(handle);
+
+        let request = Request::builder()
+            .uri("/probe")
+            .body(AxumBody::empty())
+            .unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &*body, b"default=true named_default=true unknown_is_none=true",
+            "synthesised one-id registry: default + named-`default` resolve; unknown id misses"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn service_without_config_store_handle_still_works() {
         let router = RouterService::builder()
             .get("/no-config", |ctx: RequestContext| async move {
