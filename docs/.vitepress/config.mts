@@ -58,6 +58,11 @@ export default defineConfig({
             link: '/guide/configuration',
           },
           { text: 'CLI Reference', link: '/guide/cli-reference' },
+          { text: 'CLI Walkthrough', link: '/guide/cli-walkthrough' },
+          {
+            text: 'Manifest Store Migration',
+            link: '/guide/manifest-store-migration',
+          },
         ],
       },
     ],
