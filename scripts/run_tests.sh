@@ -31,7 +31,10 @@ section() {
 }
 
 section "Workspace Tests"
-run cargo test --workspace
+run cargo test --workspace --all-targets
+
+section "Workspace Feature Compilation"
+run cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
 section "Fastly CLI Tests"
 run cargo test -p edgezero-adapter-fastly --no-default-features --features cli
@@ -40,6 +43,22 @@ section "Fastly Wasm Tests"
 (
   cd crates/edgezero-adapter-fastly
   run cargo test --features fastly --target wasm32-wasip1 -- --nocapture
+)
+
+# Spin compiles to wasm32-wasip1 too; CI runs the full contract
+# test under wasmtime. Locally we just check it compiles — the
+# contract test needs wasmtime + the wasm runner pinned in CI.
+section "Spin Wasm Compile Check"
+run cargo check -p edgezero-adapter-spin --features spin --target wasm32-wasip1
+
+# `examples/app-demo` is excluded from the root workspace
+# (per `exclude = ["examples/app-demo"]`), so the workspace
+# test above doesn't cover it. Stage 8.6 wired this gate into
+# CI; this script mirrors it for local runs.
+section "app-demo Workspace Tests"
+(
+  cd examples/app-demo
+  run cargo test --workspace --all-targets
 )
 
 echo "All tests completed successfully."

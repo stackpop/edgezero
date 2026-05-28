@@ -124,9 +124,11 @@ new code should prefer the id-keyed pair.
 The pre-rewrite `[stores.config.defaults]` table seeded the axum
 config store from the manifest. That table is gone. The axum config
 store now reads `.edgezero/local-config-<id>.json` (one file per
-declared config id). The `config push` command (§10 of the design,
-landing in Stage 7) writes that file; until it lands, write the JSON
-fixture directly when you need values for local testing.
+declared config id). Use the `edgezero config push --adapter axum`
+command (spec §13, [CLI reference](./cli-reference#edgezero-config-push))
+to write that file from your typed `<name>.toml` app-config — or
+hand-edit the JSON directly when you just need a quick fixture for
+local testing.
 
 ## Cloudflare config store: `[vars]` → KV namespace
 
