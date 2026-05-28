@@ -18,6 +18,7 @@ async-trait = "0.1"
 axum = "0.8"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+edgezero-adapter = { path = "../../crates/edgezero-adapter" }
 edgezero-adapter-axum = { path = "../../crates/edgezero-adapter-axum" }
 edgezero-adapter-cloudflare = { path = "../../crates/edgezero-adapter-cloudflare" }
 edgezero-adapter-fastly = { path = "../../crates/edgezero-adapter-fastly" }
