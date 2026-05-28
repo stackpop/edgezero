@@ -192,6 +192,16 @@ impl Adapter for CloudflareCliAdapter {
             // hex string, like the `local-dev-placeholder` the scaffold
             // wrangler.toml writes) is treated as "not yet provisioned"
             // so the entry gets rewritten with the real id.
+            //
+            // We deliberately do NOT cross-check the stored id against
+            // Cloudflare's API (e.g. by calling `wrangler kv namespace
+            // list` to confirm the id still exists). Verifying every
+            // entry on every provision run would add a network round-trip
+            // per id and require parsing yet another wrangler subcommand
+            // output. The skip line names the existing id explicitly so
+            // the operator can verify it themselves and, if the
+            // Cloudflare-side namespace was deleted out-of-band, remove
+            // the stale entry by hand before re-running provision.
             let existing = existing_real_namespace_id(&wrangler_path, id)?;
             if let Some(existing_id) = existing {
                 out.push(format!(

@@ -55,6 +55,12 @@ pub enum ConfigCmd {
 /// "neutral" variant. A default-constructed `AuthArgs` would have
 /// no sensible interpretation, so clap derives the required-arg
 /// machinery instead.
+///
+/// The `#[non_exhaustive]` attribute is purely forward-compatibility
+/// scaffolding -- there's no struct-literal construction it blocks
+/// today (the single `sub` field has no default), but it reserves
+/// the option to add a non-`Default` field later without it counting
+/// as a `SemVer` break for external callers.
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
 pub struct AuthArgs {

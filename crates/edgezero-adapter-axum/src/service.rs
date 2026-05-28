@@ -300,6 +300,84 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kv_registry_wins_over_bare_handle_when_both_wired() {
+        // Documents the precedence rule baked into the dispatcher:
+        // `self.kv_registry.clone().or_else(|| self.kv_handle.map(...single_id))`.
+        // If a caller wires BOTH `.with_kv_registry(...)` and
+        // `.with_kv_handle(...)`, the registry wins outright -- the
+        // bare handle is NOT used as a fallback for ids the registry
+        // doesn't define, and is NOT synthesised into a "default"
+        // entry alongside the registry's ids.
+        use crate::key_value_store::PersistentKvStore;
+        use edgezero_core::store_registry::{KvRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let registry_store: Arc<dyn KvStore> =
+            Arc::new(PersistentKvStore::new(temp_dir.path().join("registry.redb")).unwrap());
+        let registry_handle = KvHandle::new(Arc::clone(&registry_store));
+        registry_handle
+            .put("marker", &"from_registry")
+            .await
+            .unwrap();
+
+        let handle_store: Arc<dyn KvStore> =
+            Arc::new(PersistentKvStore::new(temp_dir.path().join("handle.redb")).unwrap());
+        let bare_handle = KvHandle::new(Arc::clone(&handle_store));
+        bare_handle.put("marker", &"from_bare").await.unwrap();
+
+        // Registry binds only `sessions` (NOT `default`). If the
+        // dispatcher merged in the bare handle, `default` would
+        // resolve to the bare-handle store; the test asserts it does
+        // NOT.
+        let by_id: BTreeMap<String, KvHandle> = [("sessions".to_owned(), registry_handle)]
+            .into_iter()
+            .collect();
+        let registry: KvRegistry = StoreRegistry::new(by_id, "sessions".to_owned());
+
+        let router = RouterService::builder()
+            .get("/probe", |ctx: RequestContext| async move {
+                // Registry's id resolves to the registry's store.
+                let named = ctx.kv_store("sessions").expect("registry binding");
+                let from_named: String = named.get_or("marker", String::new()).await.unwrap();
+                // Default ALSO resolves to the registry (registry's
+                // own declared default), NOT the bare handle.
+                let default = ctx.kv_store_default().expect("registry default");
+                let from_default: String = default.get_or("marker", String::new()).await.unwrap();
+                // The bare handle's synthesised `default` id is NOT
+                // exposed -- registry wins outright.
+                let bare_default_visible = ctx.kv_store("default").is_some();
+                let response = response_builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(format!(
+                        "named={from_named} default={from_default} bare_default={bare_default_visible}"
+                    )))
+                    .expect("response");
+                Ok::<_, EdgeError>(response)
+            })
+            .build();
+        // Wire BOTH: registry first, then a bare handle. The bare
+        // handle would synthesise a "default" id under the legacy
+        // path; the dispatcher's `or_else` precedence must skip it.
+        let mut service = EdgeZeroAxumService::new(router)
+            .with_kv_registry(registry)
+            .with_kv_handle(bare_handle);
+
+        let request = Request::builder()
+            .uri("/probe")
+            .body(AxumBody::empty())
+            .unwrap();
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &*body, b"named=from_registry default=from_registry bare_default=false",
+            "registry must win: bare handle is neither merged in nor a fallback"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_kv_handle_synthesises_one_id_registry_under_default() {
         // Verifies the one-id-registry contract for the setup API:
         // `with_kv_handle(h)` wraps `h` in a `KvRegistry` with the
