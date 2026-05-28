@@ -120,12 +120,24 @@ where
 /// Skips no fields (no `SECRET_FIELDS` knowledge); the operator is
 /// responsible for keeping sensitive material out of a raw push.
 ///
+/// Spec §13: push runs strict pre-flight validation before writing
+/// anything. For the raw flow that means the same shared checks
+/// `config validate --strict` runs — adapter manifest discovery
+/// (Spin component, etc.), per-adapter config-key validation
+/// (Spin's `^[a-z][a-z0-9_]*$` rule), capability-aware
+/// completeness (rejects multi-id stores against Single-capable
+/// adapters), and handler-path well-formedness — not just the
+/// schema/load-time checks. Skipping these would let a push
+/// half-mutate a manifest before a key collision or a Single-
+/// capable adapter rejected the entries downstream.
+///
 /// # Errors
 /// Returns a human-readable error string on any load / resolution /
 /// adapter-push failure.
 #[inline]
 pub fn run_config_push(args: &ConfigPushArgs) -> Result<(), String> {
     let ctx = load_push_context(args)?;
+    run_shared_checks(&ctx.validation)?;
     let entries = flatten_raw_for_push(&ctx.validation.raw_config)?;
     dispatch_push(&ctx, &entries, args.dry_run)
 }
@@ -145,6 +157,16 @@ where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
     let ctx = load_push_context(args)?;
+    // Spec §13: strict pre-flight. The typed flow already runs
+    // typed-only checks below; `run_shared_checks` here adds
+    // everything `config validate --strict` does — shared
+    // adapter checks (Spin key syntax, `[component.*]`
+    // discovery), capability-aware completeness, and
+    // handler-path well-formedness. Without this an invalid
+    // Spin key (`api-token`) or a Single-capable adapter with
+    // multi-id stores would only surface inside the per-adapter
+    // push, potentially after a partial mutation.
+    run_shared_checks(&ctx.validation)?;
 
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
@@ -170,11 +192,15 @@ where
 // -------------------------------------------------------------------
 
 fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
+    // Spec §13: push is strict — the synthesized validate args
+    // unconditionally request `--strict` so `run_shared_checks`
+    // runs the capability-completeness + handler-path checks
+    // alongside the schema and per-adapter shared checks.
     let validate_args = ConfigValidateArgs {
         app_config: args.app_config.clone(),
         manifest: args.manifest.clone(),
         no_env: args.no_env,
-        strict: false,
+        strict: true,
     };
     let validation = load_validation_context(&validate_args)?;
     ensure_adapter_defined(&args.adapter, Some(&validation.manifest_loader))?;
@@ -1662,6 +1688,115 @@ timeout_ms = 50
         assert!(
             !dir.path().join(".edgezero").exists(),
             ".edgezero must not be created in dry-run"
+        );
+    }
+
+    // ---------- Stage 9.1: push runs the strict preflight (regression) ----------
+
+    /// Push must run the same shared adapter checks `config
+    /// validate` runs, including Spin's `^[a-z][a-z0-9_]*$`
+    /// key-syntax check (spec §13 strict pre-flight). Pre-fix,
+    /// `load_push_context` synthesised `ConfigValidateArgs { strict:
+    /// false }` and `run_config_push*` never called
+    /// `run_shared_checks`, so an invalid Spin config key (e.g. a
+    /// dash) only surfaced inside `Adapter::push_config_entries`
+    /// — which for Spin was caught belt-and-braces, but for any
+    /// future adapter without the same guard would have written
+    /// half a manifest before erroring.
+    #[test]
+    fn raw_push_runs_spin_key_validation_before_push() {
+        let app_config_with_dash = r#"
+"api-token" = "x"
+greeting = "hi"
+"#;
+        let manifest_spin = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_spin, app_config_with_dash);
+        // A real spin.toml so the validator's [component.*]
+        // discovery doesn't trip first.
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"a.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let err = run_config_push(&push_args(&manifest, "spin"))
+            .expect_err("dashed config key must fail Spin's preflight");
+        assert!(
+            err.contains("api-token") && err.contains("Spin"),
+            "error must come from the shared Spin key check, not a generic schema error: {err}"
+        );
+    }
+
+    #[test]
+    fn typed_push_runs_strict_capability_completeness_before_push() {
+        // Spin is Single-capable for `[stores.secrets]` (§6.6);
+        // declaring two ids is a `--strict` capability violation
+        // that the typed push must catch before invoking the
+        // adapter.
+        let manifest_strict_violation = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["one", "two"]
+default = "one"
+"#;
+        let (dir, manifest, _) = setup_project(manifest_strict_violation, FIXTURE_APP_CONFIG);
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"a.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        // Adapter the push targets doesn't matter — the strict
+        // capability check fires per declared adapter set. We
+        // push to axum to keep the rest of the flow simple.
+        let err = run_config_push_typed::<FixtureConfig>(&push_args(&manifest, "axum"))
+            .expect_err("Single-capable adapter with multi-id store must fail preflight");
+        // BTreeMap iteration order on the manifest's adapter set
+        // means the check reports whichever Single-capable
+        // adapter sorts first (axum or spin) — both are
+        // Single-capable for secrets in this fixture. The
+        // contract that matters is "the strict check ran before
+        // the per-adapter push", which the `Single` +
+        // `secrets` substrings prove.
+        assert!(
+            err.contains("Single") && err.contains("secrets"),
+            "error must come from --strict capability check: {err}"
         );
     }
 }
