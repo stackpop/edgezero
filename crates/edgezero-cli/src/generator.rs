@@ -1032,5 +1032,83 @@ mod tests {
         assert_scaffold_workspace(&project_dir);
         assert_scaffold_app_config(&project_dir);
         assert_scaffold_crate_lints(&project_dir);
+        assert_scaffold_cli_full_command_set(&project_dir);
+    }
+
+    /// Stage 8 (plan task 8.2): the scaffolded `<name>-cli` must
+    /// expose the full seven-command surface (`Build`, `Deploy`,
+    /// `New`, `Serve`, `Auth`, `Provision`, `Config(Validate|Push)`)
+    /// and wire the `Config` arm to the **typed** entry points
+    /// parameterised over `<NameUpperCamel>Config` from the
+    /// project's core crate. Without these, a freshly-scaffolded
+    /// project would silently lose access to commands that landed
+    /// in Stages 4–7.
+    fn assert_scaffold_cli_full_command_set(project_dir: &Path) {
+        let cargo_path = project_dir.join("crates/demo-app-cli/Cargo.toml");
+        let cargo = fs::read_to_string(&cargo_path).expect("read cli Cargo.toml");
+        assert!(
+            cargo.contains("demo-app-core = { path = \"../demo-app-core\" }"),
+            "<name>-cli/Cargo.toml must depend on <name>-core (typed config lives there): {cargo}"
+        );
+
+        let main_path = project_dir.join("crates/demo-app-cli/src/main.rs");
+        let main = fs::read_to_string(&main_path).expect("read cli main.rs");
+
+        // Imports — every args type the seven-command Cmd enum
+        // references must be in scope.
+        for import in [
+            "AuthArgs",
+            "BuildArgs",
+            "ConfigPushArgs",
+            "ConfigValidateArgs",
+            "DeployArgs",
+            "NewArgs",
+            "ProvisionArgs",
+            "ServeArgs",
+        ] {
+            assert!(
+                main.contains(import),
+                "<name>-cli/src/main.rs must import `{import}`: {main}"
+            );
+        }
+
+        // Plan task 8.2 step 2 explicit warning: use
+        // `{{proj_core_mod}}` for the core crate's *Rust module*
+        // name, not the package name with a `_core` suffix —
+        // `demo-app_core` (mixing `-` and `_`) is invalid Rust.
+        assert!(
+            main.contains("use demo_app_core::config::DemoAppConfig;"),
+            "<name>-cli must import the typed config via the underscored core module name: {main}"
+        );
+
+        // Cmd variants — all seven plus the nested ConfigCmd.
+        for variant in [
+            "Auth(AuthArgs)",
+            "Build(BuildArgs)",
+            "Config(DemoAppConfigCmd)",
+            "Deploy(DeployArgs)",
+            "New(NewArgs)",
+            "Provision(ProvisionArgs)",
+            "Serve(ServeArgs)",
+        ] {
+            assert!(
+                main.contains(variant),
+                "<name>-cli Cmd must include `{variant}`: {main}"
+            );
+        }
+
+        // Typed dispatch — the whole reason a downstream CLI
+        // exists. Raw push/validate would defeat the point.
+        for call in [
+            "run_config_push_typed::<DemoAppConfig>",
+            "run_config_validate_typed::<DemoAppConfig>",
+            "edgezero_cli::run_auth",
+            "edgezero_cli::run_provision",
+        ] {
+            assert!(
+                main.contains(call),
+                "<name>-cli main.rs must dispatch via `{call}`: {main}"
+            );
+        }
     }
 }
