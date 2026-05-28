@@ -364,9 +364,13 @@ fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
     ))
 }
 
-/// Probe `fastly.toml` for the existence of
-/// `[setup.<kind>_stores.<id>]`. Treats a missing file as
-/// "not present" so the first provision call can create it.
+/// Probe `fastly.toml` for the existence of BOTH
+/// `[setup.<kind>_stores.<id>]` AND `[local_server.<kind>_stores.<id>]`.
+/// Both are required for a complete provision; checking only `[setup]`
+/// would let a half-edited manifest (e.g. `[setup.*]` present but
+/// `[local_server.*]` missing) slip through as "already provisioned"
+/// and never get repaired. Treats a missing file as "not present" so
+/// the first provision call can create it.
 fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String> {
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -377,12 +381,17 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
         .parse()
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
     let plural = format!("{kind}_stores");
-    let exists = doc
-        .get("setup")
-        .and_then(|setup| setup.get(plural.as_str()))
-        .and_then(|kind_tbl| kind_tbl.get(id))
-        .is_some();
-    Ok(exists)
+    let has = |parent: &str| {
+        doc.get(parent)
+            .and_then(|root| root.get(plural.as_str()))
+            .and_then(|kind_tbl| kind_tbl.get(id))
+            .is_some()
+    };
+    // append_fastly_setup is idempotent per parent: if only one of
+    // the two blocks is present, returning false here lets it run
+    // again and add just the missing block (the present-key check
+    // inside append_fastly_setup skips the one that already exists).
+    Ok(has("setup") && has("local_server"))
 }
 
 /// Append `[setup.<kind>_stores.<id>]` and
@@ -836,6 +845,35 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("does-not-exist.toml");
         assert!(!setup_block_present(&path, "kv", "sessions").expect("probe"));
+    }
+
+    #[test]
+    fn setup_block_present_false_when_only_setup_or_only_local_server_exists() {
+        // Spec requires BOTH [setup.<kind>_stores.<id>] AND
+        // [local_server.<kind>_stores.<id>] for a fully provisioned
+        // store. A half-edited manifest (e.g. operator hand-added
+        // the [setup.*] block but skipped [local_server.*]) must
+        // return false so the next provision repairs the missing
+        // block; append_fastly_setup is idempotent per parent, so
+        // it skips the present one and writes the missing one.
+        let dir = tempdir().expect("tempdir");
+        let only_setup = dir.path().join("only_setup.toml");
+        fs::write(&only_setup, "name = \"demo\"\n[setup.kv_stores.sessions]\n").expect("write");
+        assert!(
+            !setup_block_present(&only_setup, "kv", "sessions").expect("probe"),
+            "[setup.*] alone is not enough -- [local_server.*] also required"
+        );
+
+        let only_local = dir.path().join("only_local.toml");
+        fs::write(
+            &only_local,
+            "name = \"demo\"\n[local_server.kv_stores.sessions]\n",
+        )
+        .expect("write");
+        assert!(
+            !setup_block_present(&only_local, "kv", "sessions").expect("probe"),
+            "[local_server.*] alone is not enough -- [setup.*] also required"
+        );
     }
 
     // ---------- append_fastly_setup ----------
