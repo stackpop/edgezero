@@ -183,6 +183,23 @@ impl Adapter for CloudflareCliAdapter {
 
         let mut out = Vec::new();
         for id in stores.kv.iter().chain(stores.config.iter()) {
+            // Idempotency check BEFORE shelling out: if a [[kv_namespaces]]
+            // entry with `binding = id` is already present and has a real
+            // namespace id, skip. Without this guard a re-run of provision
+            // would invoke `wrangler kv namespace create` again and orphan
+            // the previously-created namespace -- wasting account quota.
+            // A placeholder id (anything that isn't a 32-char lowercase
+            // hex string, like the `local-dev-placeholder` the scaffold
+            // wrangler.toml writes) is treated as "not yet provisioned"
+            // so the entry gets rewritten with the real id.
+            let existing = existing_real_namespace_id(&wrangler_path, id)?;
+            if let Some(existing_id) = existing {
+                out.push(format!(
+                    "binding `{id}` already provisioned (id={existing_id} in {}); skipping. Delete the entry and re-run provision if you want a fresh namespace.",
+                    wrangler_path.display()
+                ));
+                continue;
+            }
             if dry_run {
                 out.push(format!(
                     "would run `wrangler kv namespace create {id}` and append [[kv_namespaces]] binding = \"{id}\" to {}",
@@ -191,9 +208,9 @@ impl Adapter for CloudflareCliAdapter {
                 continue;
             }
             let namespace_id = create_kv_namespace(id)?;
-            append_kv_namespace(&wrangler_path, id, &namespace_id)?;
+            upsert_kv_namespace(&wrangler_path, id, &namespace_id)?;
             out.push(format!(
-                "created KV namespace `{id}` (id={namespace_id}); appended to {}",
+                "created KV namespace `{id}` (id={namespace_id}); written to {}",
                 wrangler_path.display()
             ));
         }
@@ -228,16 +245,31 @@ impl Adapter for CloudflareCliAdapter {
             );
         };
         let wrangler_path = manifest_root.join(rel);
+        // Dry-run is lenient about a missing/unresolved binding so
+        // operators can preview the keyset BEFORE running provision.
+        // Real runs still err loudly so we don't silently push to
+        // a non-existent namespace.
+        if dry_run {
+            let header = find_namespace_id(&wrangler_path, store_id).map_or_else(
+                |_| format!(
+                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id=<unresolved>` with {} entries for binding `{store_id}` (binding not yet provisioned -- run `edgezero provision --adapter cloudflare` to resolve the namespace id)",
+                    entries.len()
+                ),
+                |ns_id| format!(
+                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id={ns_id}` with {} entries for binding `{store_id}`",
+                    entries.len()
+                ),
+            );
+            let mut out = vec![header];
+            for (key, _) in entries {
+                out.push(format!("  would create entry `{key}`"));
+            }
+            return Ok(out);
+        }
         let namespace_id = find_namespace_id(&wrangler_path, store_id)?;
         if entries.is_empty() {
             return Ok(vec![format!(
                 "no config entries to push to KV namespace `{store_id}` (id={namespace_id})"
-            )]);
-        }
-        if dry_run {
-            return Ok(vec![format!(
-                "would run `wrangler kv bulk put <tempfile.json> --namespace-id={namespace_id}` with {} entries for binding `{store_id}`",
-                entries.len()
             )]);
         }
         let payload = bulk_payload(entries)?;
@@ -316,7 +348,7 @@ fn create_kv_namespace(binding: &str) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     extract_namespace_id(&stdout).ok_or_else(|| {
         format!(
-            "wrangler created `{binding}` but stdout did not include a parseable `id = \"...\"` line; raw output:\n{stdout}"
+            "wrangler created `{binding}` but stdout did not include a parseable `id = \"...\"` line -- wrangler may have changed its output format; pin a known-compatible wrangler version or file an issue. Raw stdout:\n{stdout}"
         )
     })
 }
@@ -357,37 +389,84 @@ fn extract_namespace_id(stdout: &str) -> Option<String> {
     None
 }
 
-/// Append a `[[kv_namespaces]]` block to the user's `wrangler.toml`
-/// (creating the array if absent). Existing entries are preserved;
-/// if a binding with the same name is already present this is a
-/// no-op (idempotent across re-runs).
-fn append_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), String> {
-    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table, Value};
+/// Heuristic: is `id` a real Cloudflare KV namespace id (32-char
+/// lowercase hex), as opposed to a scaffold placeholder like
+/// `local-dev-placeholder`? Cloudflare's API consistently returns
+/// 32-char lowercase hex, so we use that as a tight cheap signal.
+fn is_real_namespace_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// If `path` already declares a `[[kv_namespaces]]` entry with
+/// `binding = binding` AND its `id` looks like a real Cloudflare
+/// namespace id, return that id. Returns `Ok(None)` if the binding
+/// is absent OR present with a placeholder id (so provision can
+/// treat both cases as "needs (re-)create"). A failure to read /
+/// parse the file is a hard error -- provision needs an authoritative
+/// answer.
+fn existing_real_namespace_id(path: &Path, binding: &str) -> Result<Option<String>, String> {
+    let Some(existing) = read_namespace_id(path, binding)? else {
+        return Ok(None);
+    };
+    if is_real_namespace_id(&existing) {
+        Ok(Some(existing))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Internal: look up `binding`'s `id` in `wrangler.toml` without
+/// the "did you run provision?" error path that `find_namespace_id`
+/// adds. Missing file -> `Ok(None)`. Returns the raw id whether or
+/// not it looks like a real Cloudflare id.
+fn read_namespace_id(path: &Path, binding: &str) -> Result<Option<String>, String> {
+    use toml_edit::{DocumentMut, Item, Value};
+
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let id = match doc.get("kv_namespaces") {
+        Some(Item::ArrayOfTables(arr)) => arr.iter().find_map(|table| {
+            if table.get("binding").and_then(Item::as_str) == Some(binding) {
+                table.get("id").and_then(Item::as_str).map(str::to_owned)
+            } else {
+                None
+            }
+        }),
+        Some(Item::Value(Value::Array(arr))) => arr.iter().find_map(|item| {
+            let table = item.as_inline_table()?;
+            if table.get("binding").and_then(Value::as_str) == Some(binding) {
+                table.get("id").and_then(Value::as_str).map(str::to_owned)
+            } else {
+                None
+            }
+        }),
+        Some(_) | None => None,
+    };
+    Ok(id)
+}
+
+/// Insert OR update the `[[kv_namespaces]]` entry for `binding`,
+/// rewriting `id` if the binding already exists (e.g. provision
+/// is replacing a `local-dev-placeholder`). Used by provision so
+/// re-running on a scaffolded wrangler.toml replaces the placeholder
+/// with the real id instead of silently skipping.
+fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), String> {
+    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
 
     let raw = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
     let mut doc: DocumentMut = raw
         .parse()
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
-
-    // Accept both representations for the idempotency check so a
-    // re-run silently skips even if the user happens to use the
-    // inline-array form. We only force array-of-tables on insert.
-    let already_present = match doc.get("kv_namespaces") {
-        Some(Item::ArrayOfTables(arr)) => arr
-            .iter()
-            .any(|table| table.get("binding").and_then(Item::as_str) == Some(binding)),
-        Some(Item::Value(Value::Array(arr))) => arr.iter().any(|item| {
-            item.as_inline_table()
-                .and_then(|table| table.get("binding"))
-                .and_then(Value::as_str)
-                == Some(binding)
-        }),
-        Some(_) | None => false,
-    };
-    if already_present {
-        return Ok(());
-    }
 
     let entry = doc
         .entry("kv_namespaces")
@@ -399,10 +478,19 @@ fn append_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), Strin
         )
     })?;
 
-    let mut new_table = Table::new();
-    new_table.insert("binding", value(binding));
-    new_table.insert("id", value(id));
-    arr_of_tables.push(new_table);
+    let existing_idx = arr_of_tables
+        .iter()
+        .position(|table| table.get("binding").and_then(Item::as_str) == Some(binding));
+    if let Some(idx) = existing_idx {
+        if let Some(existing) = arr_of_tables.get_mut(idx) {
+            existing.insert("id", value(id));
+        }
+    } else {
+        let mut new_table = Table::new();
+        new_table.insert("binding", value(binding));
+        new_table.insert("id", value(id));
+        arr_of_tables.push(new_table);
+    }
 
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
@@ -496,36 +584,12 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
 /// provision?" hint if the binding is absent — the most common
 /// cause of this error is forgetting to provision first.
 fn find_namespace_id(wrangler_path: &Path, binding: &str) -> Result<String, String> {
-    use toml_edit::{DocumentMut, Item, Value};
-
-    let raw = fs::read_to_string(wrangler_path).map_err(|err| {
-        format!(
-            "failed to read {}: {err} (did you run `edgezero provision --adapter cloudflare`?)",
-            wrangler_path.display()
-        )
-    })?;
-    let doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", wrangler_path.display()))?;
-    let id = match doc.get("kv_namespaces") {
-        Some(Item::ArrayOfTables(arr)) => arr.iter().find_map(|table| {
-            if table.get("binding").and_then(Item::as_str) == Some(binding) {
-                table.get("id").and_then(Item::as_str).map(str::to_owned)
-            } else {
-                None
-            }
-        }),
-        Some(Item::Value(Value::Array(arr))) => arr.iter().find_map(|item| {
-            let table = item.as_inline_table()?;
-            if table.get("binding").and_then(Value::as_str) == Some(binding) {
-                table.get("id").and_then(Value::as_str).map(str::to_owned)
-            } else {
-                None
-            }
-        }),
-        Some(_) | None => None,
-    };
-    id.ok_or_else(|| {
+    // read_namespace_id returns Ok(None) for both
+    // missing-file AND binding-not-present; for `find_namespace_id`
+    // the user wants a "did you run provision?" hint in both cases,
+    // so collapse them into the same error message.
+    let raw = read_namespace_id(wrangler_path, binding)?;
+    raw.ok_or_else(|| {
         format!(
             "{}: no [[kv_namespaces]] entry with binding = {binding:?} (did you run `edgezero provision --adapter cloudflare`?)",
             wrangler_path.display()
@@ -691,46 +755,89 @@ id = "abc123def456"
         assert!(extract_namespace_id("identifier = \"x\"").is_none());
     }
 
-    // ---------- append_kv_namespace ----------
-
     fn write_wrangler(dir: &Path, contents: &str) -> PathBuf {
         let path = dir.join("wrangler.toml");
         fs::write(&path, contents).expect("write wrangler.toml");
         path
     }
 
+    // ---------- is_real_namespace_id ----------
+
     #[test]
-    fn append_kv_namespace_adds_block_to_minimal_file() {
+    fn is_real_namespace_id_accepts_32_char_lowercase_hex() {
+        assert!(is_real_namespace_id("00112233445566778899aabbccddeeff"));
+        assert!(is_real_namespace_id("a".repeat(32).as_str()));
+    }
+
+    #[test]
+    fn is_real_namespace_id_rejects_placeholder_or_short_id() {
+        assert!(!is_real_namespace_id("local-dev-placeholder"));
+        assert!(!is_real_namespace_id("abc123"));
+        assert!(!is_real_namespace_id(""));
+    }
+
+    #[test]
+    fn is_real_namespace_id_rejects_uppercase_or_non_hex() {
+        // Uppercase rejected: Cloudflare's API returns lowercase.
+        assert!(!is_real_namespace_id("00112233445566778899AABBCCDDEEFF"));
+        // Non-hex digits rejected.
+        assert!(!is_real_namespace_id("z0112233445566778899aabbccddeeff"));
+    }
+
+    // ---------- upsert_kv_namespace ----------
+
+    #[test]
+    fn upsert_kv_namespace_replaces_placeholder_id_for_existing_binding() {
         let dir = tempdir().expect("tempdir");
-        let path = write_wrangler(dir.path(), "name = \"my-worker\"\n");
-        append_kv_namespace(&path, "sessions", "abc123").expect("append");
-        let after = fs::read_to_string(&path).expect("read back");
+        let path = write_wrangler(
+            dir.path(),
+            "[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\n",
+        );
+        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        let after = fs::read_to_string(&path).expect("read");
         assert!(
-            after.contains("[[kv_namespaces]]"),
-            "added array entry: {after}"
+            after.contains("id = \"00112233445566778899aabbccddeeff\""),
+            "placeholder replaced: {after}"
         );
         assert!(
-            after.contains("binding = \"sessions\""),
-            "binding present: {after}"
+            !after.contains("local-dev-placeholder"),
+            "placeholder removed: {after}"
         );
-        assert!(after.contains("id = \"abc123\""), "id present: {after}");
+        assert_eq!(
+            after.matches("binding = \"sessions\"").count(),
+            1,
+            "no duplicate binding: {after}"
+        );
+    }
+
+    #[test]
+    fn upsert_kv_namespace_appends_when_binding_absent() {
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(dir.path(), "name = \"demo\"\n");
+        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        let after = fs::read_to_string(&path).expect("read");
         assert!(
-            after.contains("name = \"my-worker\""),
+            after.contains("binding = \"sessions\"")
+                && after.contains("id = \"00112233445566778899aabbccddeeff\""),
+            "appended new entry: {after}"
+        );
+        assert!(
+            after.contains("name = \"demo\""),
             "preserved original keys: {after}"
         );
     }
 
     #[test]
-    fn append_kv_namespace_appends_to_existing_array_of_tables() {
+    fn upsert_kv_namespace_appends_next_to_existing_entries() {
         let dir = tempdir().expect("tempdir");
         let path = write_wrangler(
             dir.path(),
             "[[kv_namespaces]]\nbinding = \"cache\"\nid = \"old\"\n",
         );
-        append_kv_namespace(&path, "sessions", "abc123").expect("append");
-        let after = fs::read_to_string(&path).expect("read back");
+        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        let after = fs::read_to_string(&path).expect("read");
         assert!(
-            after.contains("binding = \"cache\""),
+            after.contains("binding = \"cache\"") && after.contains("id = \"old\""),
             "existing entry kept: {after}"
         );
         assert!(
@@ -745,34 +852,14 @@ id = "abc123def456"
     }
 
     #[test]
-    fn append_kv_namespace_is_idempotent_on_duplicate_binding() {
-        let dir = tempdir().expect("tempdir");
-        let path = write_wrangler(
-            dir.path(),
-            "[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"existing\"\n",
-        );
-        append_kv_namespace(&path, "sessions", "new-id").expect("idempotent append");
-        let after = fs::read_to_string(&path).expect("read back");
-        assert!(
-            after.contains("id = \"existing\""),
-            "did not overwrite existing id: {after}"
-        );
-        assert_eq!(
-            after.matches("binding = \"sessions\"").count(),
-            1,
-            "no duplicate binding: {after}"
-        );
-    }
-
-    #[test]
-    fn append_kv_namespace_preserves_top_comments() {
+    fn upsert_kv_namespace_preserves_top_comments() {
         let dir = tempdir().expect("tempdir");
         let path = write_wrangler(
             dir.path(),
             "# managed by hand -- please keep this line\nname = \"my-worker\"\n",
         );
-        append_kv_namespace(&path, "sessions", "abc123").expect("append");
-        let after = fs::read_to_string(&path).expect("read back");
+        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        let after = fs::read_to_string(&path).expect("read");
         assert!(
             after.contains("# managed by hand"),
             "preserved comment: {after}"
@@ -822,6 +909,63 @@ id = "abc123def456"
         assert!(
             err.contains("wrangler.toml"),
             "error names what's missing: {err}"
+        );
+    }
+
+    #[test]
+    fn provision_dry_run_skips_bindings_already_provisioned_with_real_id() {
+        let dir = tempdir().expect("tempdir");
+        // 32-char lowercase hex id == real Cloudflare namespace id.
+        let path = write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"00112233445566778899aabbccddeeff\"\n",
+        );
+        let kv_ids = vec!["sessions".to_owned()];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = CloudflareCliAdapter
+            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("already provisioned")
+                && out[0].contains("00112233445566778899aabbccddeeff"),
+            "skip line names the existing id: {out:?}"
+        );
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("00112233445566778899aabbccddeeff"),
+            "did not touch existing id: {after}"
+        );
+    }
+
+    #[test]
+    fn provision_dry_run_treats_placeholder_id_as_unprovisioned() {
+        // A scaffolded wrangler.toml ships with placeholder ids the
+        // user is expected to overwrite by running provision.
+        // Dry-run should report the would-be create call, NOT the
+        // already-provisioned skip.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\n",
+        );
+        let kv_ids = vec!["sessions".to_owned()];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = CloudflareCliAdapter
+            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("would run `wrangler kv namespace create sessions`"),
+            "placeholder id is treated as unprovisioned: {out:?}"
         );
     }
 
@@ -923,7 +1067,10 @@ id = "abc123def456"
         let original =
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"abc123\"\n";
         let path = write_wrangler(dir.path(), original);
-        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("feature.new_checkout".to_owned(), "false".to_owned()),
+        ];
         let out = CloudflareCliAdapter
             .push_config_entries(
                 dir.path(),
@@ -934,14 +1081,49 @@ id = "abc123def456"
                 true,
             )
             .expect("dry-run succeeds");
-        assert_eq!(out.len(), 1);
+        // Header + per-entry preview, matching the fastly dry-run shape.
+        assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
         assert!(
             out[0].contains("would run `wrangler kv bulk put")
                 && out[0].contains("--namespace-id=abc123"),
-            "dry-run line names namespace id: {out:?}"
+            "dry-run header names namespace id: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("`greeting`")),
+            "dry-run lists `greeting`: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("`feature.new_checkout`")),
+            "dry-run lists `feature.new_checkout`: {out:?}"
         );
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, original, "dry-run must not mutate wrangler.toml");
+    }
+
+    #[test]
+    fn push_dry_run_is_lenient_when_binding_not_yet_provisioned() {
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let entries = vec![("greeting".to_owned(), "hello".to_owned())];
+        let out = CloudflareCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                "app_config",
+                &entries,
+                true,
+            )
+            .expect("dry-run is lenient: pre-provision preview is allowed");
+        assert!(
+            out[0].contains("<unresolved>") && out[0].contains("provision"),
+            "dry-run header explains the namespace is unresolved and points at provision: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("`greeting`")),
+            "dry-run still lists the entries it would push: {out:?}"
+        );
     }
 
     #[test]
@@ -958,7 +1140,11 @@ id = "abc123def456"
     }
 
     #[test]
-    fn push_errors_with_provision_hint_when_binding_absent() {
+    fn push_real_run_errors_with_provision_hint_when_binding_absent() {
+        // dry-run is now lenient (see
+        // `push_dry_run_is_lenient_when_binding_not_yet_provisioned`),
+        // but a real run still must err so we don't silently push
+        // to a non-existent namespace.
         let dir = tempdir().expect("tempdir");
         write_wrangler(dir.path(), "name = \"demo\"\n");
         let entries = vec![("greeting".to_owned(), "hello".to_owned())];
@@ -969,9 +1155,9 @@ id = "abc123def456"
                 None,
                 "app_config",
                 &entries,
-                true,
+                false,
             )
-            .expect_err("missing binding must error");
+            .expect_err("missing binding must error on real run");
         assert!(
             err.contains("provision") && err.contains("app_config"),
             "error points at provision: {err}"
