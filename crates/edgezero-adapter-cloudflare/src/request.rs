@@ -282,26 +282,22 @@ async fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<CfResponse, WorkerError> {
-    // Stage 9.3: enforce the runtime store-API hard-cutoff at the
-    // dispatch boundary. See fastly/request.rs dispatch_core_request
-    // for the rationale — every request now has a registry in
-    // extensions even when only the legacy bare handle was wired,
-    // so the extractor and registry-aware accessors no longer
-    // need a legacy-handle fallback.
+    // Stage 10.1 hard-cutoff: see fastly's `dispatch_core_request`
+    // for the rationale. Only registries go into extensions —
+    // legacy bare handles are synthesised into a one-id registry
+    // at the dispatch boundary.
     let config_registry = stores.config_registry.or_else(|| {
         stores
             .config_store
-            .clone()
             .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
     });
     let kv_registry = stores.kv_registry.or_else(|| {
         stores
             .kv
-            .clone()
             .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
     });
     let secret_registry = stores.secret_registry.or_else(|| {
-        stores.secrets.clone().map(|handle| {
+        stores.secrets.map(|handle| {
             SecretRegistry::single_id(
                 "default".to_owned(),
                 BoundSecretStore::new(handle, "default".to_owned()),
@@ -311,20 +307,11 @@ async fn dispatch_core_request(
     if let Some(registry) = config_registry {
         core_request.extensions_mut().insert(registry);
     }
-    if let Some(handle) = stores.config_store {
-        core_request.extensions_mut().insert(handle);
-    }
     if let Some(registry) = kv_registry {
         core_request.extensions_mut().insert(registry);
     }
-    if let Some(handle) = stores.kv {
-        core_request.extensions_mut().insert(handle);
-    }
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
-    }
-    if let Some(handle) = stores.secrets {
-        core_request.extensions_mut().insert(handle);
     }
     let svc = app.router().clone();
     let response = svc

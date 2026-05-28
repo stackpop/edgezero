@@ -135,7 +135,10 @@ fn build_test_app() -> App {
     }
 
     async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = match ctx.config_handle() {
+        // Stage 10.1 hard-cutoff: legacy `ctx.config_handle()` is
+        // gone. The dispatch boundary synthesises a one-id
+        // `ConfigRegistry` from the wired handle.
+        let value = match ctx.config_store_default() {
             Some(store) => store
                 .get("greeting")
                 .await
@@ -152,7 +155,10 @@ fn build_test_app() -> App {
     }
 
     async fn kv_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = if let Some(handle) = ctx.kv_handle() {
+        // Stage 10.1 hard-cutoff: `ctx.kv_handle()` removed —
+        // `kv_store_default()` returns a `BoundKvStore` (alias
+        // for `KvHandle`) with the same `get_bytes` method.
+        let value = if let Some(handle) = ctx.kv_store_default() {
             match handle.get_bytes("test-key").await {
                 Ok(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
                 Ok(None) => "missing".to_string(),
@@ -169,8 +175,13 @@ fn build_test_app() -> App {
     }
 
     async fn secret_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = if let Some(handle) = ctx.secret_handle() {
-            match handle.get_bytes("default", "test-secret").await {
+        // Stage 10.1 hard-cutoff: `ctx.secret_handle()` removed.
+        // `secret_store_default()` returns a `BoundSecretStore`,
+        // which bundles the platform store name with the handle —
+        // so the lookup is `bound.get_bytes(key)` (single arg),
+        // not `handle.get_bytes(store_name, key)` (two args).
+        let value = if let Some(bound) = ctx.secret_store_default() {
+            match bound.get_bytes("test-secret").await {
                 Ok(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
                 Ok(None) => "missing".to_string(),
                 Err(_) => "error".to_string(),

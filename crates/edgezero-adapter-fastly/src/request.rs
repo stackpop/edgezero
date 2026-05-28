@@ -95,29 +95,26 @@ fn dispatch_core_request(
     mut core_request: Request,
     stores: Stores,
 ) -> Result<FastlyResponse, FastlyError> {
-    // Stage 9.3: enforce the runtime store-API hard-cutoff at the
-    // dispatch boundary. When only a legacy bare handle is wired
-    // (no explicit registry), synthesise a one-id registry under
-    // the conventional `"default"` id and insert it alongside the
-    // bare handle. The extractor (`Kv` / `Config` / `Secrets`)
-    // and the registry-aware `RequestContext` accessors no longer
-    // fall back to legacy handles silently, so this synthesis is
-    // what keeps `dispatch_with_config_handle` working as a
-    // convenience wrapper.
+    // Stage 10.1 hard-cutoff: legacy bare handles are no longer
+    // inserted into request extensions. `dispatch_with_config_handle`
+    // still accepts a `ConfigStoreHandle`, but the dispatcher
+    // synthesises a one-id `<kind>Registry` from any wired handle
+    // and only the registry goes into extensions. The
+    // `ctx.{config,kv,secret}_handle()` accessors are gone; handlers
+    // use `ctx.{config,kv,secret}_store_default()` or the
+    // `Kv` / `Config` / `Secrets` extractors.
     let config_registry = stores.config_registry.or_else(|| {
         stores
             .config_store
-            .clone()
             .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
     });
     let kv_registry = stores.kv_registry.or_else(|| {
         stores
             .kv
-            .clone()
             .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
     });
     let secret_registry = stores.secret_registry.or_else(|| {
-        stores.secrets.clone().map(|handle| {
+        stores.secrets.map(|handle| {
             SecretRegistry::single_id(
                 "default".to_owned(),
                 BoundSecretStore::new(handle, "default".to_owned()),
@@ -127,20 +124,11 @@ fn dispatch_core_request(
     if let Some(registry) = config_registry {
         core_request.extensions_mut().insert(registry);
     }
-    if let Some(handle) = stores.config_store {
-        core_request.extensions_mut().insert(handle);
-    }
     if let Some(registry) = kv_registry {
         core_request.extensions_mut().insert(registry);
     }
-    if let Some(handle) = stores.kv {
-        core_request.extensions_mut().insert(handle);
-    }
     if let Some(registry) = secret_registry {
         core_request.extensions_mut().insert(registry);
-    }
-    if let Some(handle) = stores.secrets {
-        core_request.extensions_mut().insert(handle);
     }
     let response = executor::block_on(app.router().oneshot(core_request))
         .map_err(|err| map_edge_error(&err))?;

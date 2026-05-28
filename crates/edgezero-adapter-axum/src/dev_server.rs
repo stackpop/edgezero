@@ -853,13 +853,13 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_persists_across_requests() {
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let store = ctx.kv_handle().expect("kv configured");
+            let store = ctx.kv_store_default().expect("kv configured");
             store.put("counter", &42_i32).await?;
             Ok("written")
         }
 
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let store = ctx.kv_handle().expect("kv configured");
+            let store = ctx.kv_store_default().expect("kv configured");
             let val: i32 = store.get_or("counter", 0_i32).await?;
             Ok(val.to_string())
         }
@@ -892,19 +892,19 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_delete_across_requests() {
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             kv.put("temp", &"to_delete").await?;
             Ok("written")
         }
 
         async fn delete_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             kv.delete("temp").await?;
             Ok("deleted")
         }
 
         async fn check_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let exists = kv.exists("temp").await?;
             Ok(format!("exists={exists}"))
         }
@@ -942,7 +942,7 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_update_across_requests() {
         async fn increment_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let val = kv
                 .read_modify_write("counter", 0_i32, |n| n + 1_i32)
                 .await?;
@@ -972,7 +972,7 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_returns_not_found_gracefully() {
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let val: i32 = kv.get_or("nonexistent", -1_i32).await?;
             Ok(val.to_string())
         }
@@ -1001,7 +1001,7 @@ mod integration_tests {
         }
 
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let profile = UserProfile {
                 name: "Alice".to_owned(),
                 age: 30,
@@ -1012,7 +1012,7 @@ mod integration_tests {
         }
 
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let profile: Option<UserProfile> = kv.get("user:alice").await?;
             match profile {
                 Some(found) => Ok(format!("{}:{}", found.name, found.age)),

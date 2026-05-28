@@ -54,7 +54,11 @@ fn build_test_app() -> App {
     }
 
     async fn config_presence(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let present = if ctx.config_handle().is_some() {
+        // Stage 10.1 hard-cutoff: legacy `ctx.config_handle()` is
+        // gone. The dispatch boundary now synthesises a one-id
+        // `ConfigRegistry` from the wired `ConfigStoreHandle`, so
+        // the registry-aware accessor resolves the same store.
+        let present = if ctx.config_store_default().is_some() {
             "yes"
         } else {
             "no"
@@ -80,7 +84,9 @@ fn build_test_app() -> App {
     }
 
     async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = match ctx.config_handle() {
+        // Stage 10.1 hard-cutoff: legacy `ctx.config_handle()` is
+        // gone. See `config_presence` for the migration rationale.
+        let value = match ctx.config_store_default() {
             Some(store) => store
                 .get("greeting")
                 .await
@@ -225,7 +231,7 @@ async fn dispatch_passes_request_body_to_handlers() {
 async fn dispatch_with_config_missing_binding_skips_injection() {
     // The test env is an empty JS object; any env.var() call returns None.
     // dispatch_with_config should log a warning and dispatch without injecting
-    // a config-store handle, so the handler receives ctx.config_handle() == None.
+    // a config-store handle, so the handler sees `ctx.config_store_default()` return `None`.
     let app = build_test_app();
     let req = cf_request(CfMethod::Get, "/has-config", None);
     let (env, ctx) = test_env_ctx();

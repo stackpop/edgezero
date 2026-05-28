@@ -60,7 +60,10 @@ fn build_test_app() -> App {
     }
 
     async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = match ctx.config_handle() {
+        // Stage 10.1 hard-cutoff: legacy `ctx.config_handle()` is
+        // gone. The dispatch boundary now synthesises a one-id
+        // `ConfigRegistry` from the wired `ConfigStoreHandle`.
+        let value = match ctx.config_store_default() {
             Some(store) => store
                 .get("greeting")
                 .await

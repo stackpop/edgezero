@@ -110,28 +110,30 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
     #[inline]
     fn call(&mut self, req: Request<AxumBody>) -> Self::Future {
         let router = self.router.clone();
-        // Stage 9.3: when only a legacy single-handle is wired
-        // (no explicit registry), synthesise a one-id registry
-        // under the conventional `"default"` id and insert it
-        // alongside the bare handle. This keeps `with_*_handle`
-        // working as a convenience wrapper but routes every
-        // request through the registry path — so the extractor
-        // (`Kv` / `Config` / `Secrets`) and the registry-aware
-        // `RequestContext` accessors don't need a legacy-handle
-        // fallback to silently upgrade unwired requests.
+        // Stage 10.1 hard-cutoff: legacy bare `KvHandle` /
+        // `ConfigStoreHandle` / `SecretHandle` entries are NO
+        // LONGER inserted into request extensions. The legacy
+        // `with_*_handle` constructors still take a single
+        // handle, but the dispatcher synthesises a one-id
+        // `<kind>Registry` under the conventional `"default"`
+        // id from that handle — and only the registry goes into
+        // extensions. Handlers must use the registry-aware
+        // `RequestContext` accessors (`kv_store_default`,
+        // `config_store_default`, `secret_store_default`) or
+        // the `Kv` / `Config` / `Secrets` extractors. The
+        // pre-rewrite `ctx.kv_handle()` / `config_handle()` /
+        // `secret_handle()` accessors are gone (spec
+        // hard-cutoff).
         let config_registry = self.config_registry.clone().or_else(|| {
             self.config_store_handle
                 .clone()
                 .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
         });
-        let config_store_handle = self.config_store_handle.clone();
-        let kv_handle = self.kv_handle.clone();
         let kv_registry = self.kv_registry.clone().or_else(|| {
             self.kv_handle
                 .clone()
                 .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
         });
-        let secret_handle = self.secret_handle.clone();
         let secret_registry = self.secret_registry.clone().or_else(|| {
             self.secret_handle.clone().map(|handle| {
                 SecretRegistry::single_id(
@@ -154,22 +156,11 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
             if let Some(registry) = config_registry {
                 core_request.extensions_mut().insert(registry);
             }
-            if let Some(handle) = config_store_handle {
-                core_request.extensions_mut().insert(handle);
-            }
-
             if let Some(registry) = kv_registry {
                 core_request.extensions_mut().insert(registry);
             }
-            if let Some(handle) = kv_handle {
-                core_request.extensions_mut().insert(handle);
-            }
-
             if let Some(registry) = secret_registry {
                 core_request.extensions_mut().insert(registry);
-            }
-            if let Some(handle) = secret_handle {
-                core_request.extensions_mut().insert(handle);
             }
 
             let core_response = task::block_in_place(move || {
@@ -236,11 +227,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn with_config_store_handle_injects_into_request() {
+        // Stage 10.1 hard-cutoff: legacy `ctx.config_handle()` is
+        // gone. The service synthesises a one-id `ConfigRegistry`
+        // from the wired handle at the dispatch boundary, so
+        // `ctx.config_store_default()` resolves the same store.
         let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("injected".to_owned())));
 
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {
-                let store = ctx.config_handle().expect("config store should be present");
+                let store = ctx
+                    .config_store_default()
+                    .expect("config store should be present");
                 let val = store
                     .get("any_key")
                     .await
@@ -278,7 +275,9 @@ mod tests {
 
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {
-                let kv = ctx.kv_handle().expect("kv handle should be present");
+                // Stage 10.1 hard-cutoff: see
+                // `with_config_store_handle_injects_into_request`.
+                let kv = ctx.kv_store_default().expect("kv handle should be present");
                 let val: String = kv.get_or("test_key", String::new()).await.unwrap();
                 let response = response_builder()
                     .status(StatusCode::OK)
@@ -304,7 +303,11 @@ mod tests {
     async fn service_without_config_store_handle_still_works() {
         let router = RouterService::builder()
             .get("/no-config", |ctx: RequestContext| async move {
-                let has_config = ctx.config_handle().is_some();
+                // Stage 10.1 hard-cutoff: with no handle and no
+                // registry wired, the registry-aware accessor
+                // returns None — same observable result as the
+                // legacy `config_handle().is_some()` check.
+                let has_config = ctx.config_store_default().is_some();
                 let response = response_builder()
                     .status(StatusCode::OK)
                     .body(Body::from(format!("has_config={has_config}")))
@@ -331,17 +334,25 @@ mod tests {
         use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
         use std::sync::Arc;
 
+        // Stage 10.1 hard-cutoff: the service synthesises a one-id
+        // `SecretRegistry` from `with_secret_handle`, binding the
+        // handle under the platform store name `"default"`. The
+        // fixture keys mirror that bound name (`"default/<key>"`)
+        // so the registry-aware lookup resolves.
         let handle = SecretHandle::new(Arc::new(InMemorySecretStore::new([(
-            "env/__EDGEZERO_SERVICE_TEST_SECRET__",
+            "default/__EDGEZERO_SERVICE_TEST_SECRET__",
             Bytes::from("injected_value"),
         )])));
         let router = RouterService::builder()
             .get("/check", |ctx: RequestContext| async move {
+                // `BoundSecretStore::get_bytes(key)` is single-arg —
+                // the platform store name is bound by the
+                // dispatcher's synthesis.
                 let secrets = ctx
-                    .secret_handle()
-                    .expect("secret handle should be present");
+                    .secret_store_default()
+                    .expect("secret store should be present");
                 let val = secrets
-                    .get_bytes("env", "__EDGEZERO_SERVICE_TEST_SECRET__")
+                    .get_bytes("__EDGEZERO_SERVICE_TEST_SECRET__")
                     .await
                     .unwrap()
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -369,7 +380,9 @@ mod tests {
     async fn service_without_kv_handle_still_works() {
         let router = RouterService::builder()
             .get("/no-kv", |ctx: RequestContext| async move {
-                let has_kv = ctx.kv_handle().is_some();
+                // Stage 10.1 hard-cutoff: see
+                // `service_without_config_store_handle_still_works`.
+                let has_kv = ctx.kv_store_default().is_some();
                 let response = response_builder()
                     .status(StatusCode::OK)
                     .body(Body::from(format!("has_kv={has_kv}")))

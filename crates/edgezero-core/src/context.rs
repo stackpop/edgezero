@@ -1,11 +1,8 @@
 use crate::body::Body;
-use crate::config_store::ConfigStoreHandle;
 use crate::error::EdgeError;
 use crate::http::Request;
-use crate::key_value_store::KvHandle;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
-use crate::secret_store::SecretHandle;
 use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
     StoreRegistry,
@@ -22,18 +19,6 @@ impl RequestContext {
     #[inline]
     pub fn body(&self) -> &Body {
         self.request.body()
-    }
-
-    /// Legacy single-handle accessor — returns the lone [`ConfigStoreHandle`]
-    /// stashed by an adapter that has not yet been switched to the registry
-    /// wiring. Prefer [`Self::config_store`] or [`Self::config_store_default`]
-    /// for new code.
-    #[inline]
-    pub fn config_handle(&self) -> Option<ConfigStoreHandle> {
-        self.request
-            .extensions()
-            .get::<ConfigStoreHandle>()
-            .cloned()
     }
 
     /// Resolve the [`BoundConfigStore`] for `id`. Strict lookup: when a
@@ -93,15 +78,6 @@ impl RequestContext {
             .body()
             .to_json()
             .map_err(|err| EdgeError::bad_request(format!("invalid JSON payload: {err}")))
-    }
-
-    /// Returns the KV store handle if one was configured for this request.
-    ///
-    /// Legacy single-handle accessor; prefer [`Self::kv_store`] or
-    /// [`Self::kv_store_default`].
-    #[inline]
-    pub fn kv_handle(&self) -> Option<KvHandle> {
-        self.request.extensions().get::<KvHandle>().cloned()
     }
 
     /// Resolve the [`BoundKvStore`] for `id`. Strict lookup: when a
@@ -180,15 +156,6 @@ impl RequestContext {
         &mut self.request
     }
 
-    /// Returns the secret store handle if one was configured for this request.
-    ///
-    /// Legacy single-handle accessor; prefer [`Self::secret_store`] or
-    /// [`Self::secret_store_default`].
-    #[inline]
-    pub fn secret_handle(&self) -> Option<SecretHandle> {
-        self.request.extensions().get::<SecretHandle>().cloned()
-    }
-
     /// Resolve the [`BoundSecretStore`] for `id`. Strict lookup: when a
     /// [`SecretRegistry`] is wired, an unregistered id yields `None`.
     /// When no registry is wired this returns `None` — adapter
@@ -258,41 +225,9 @@ mod tests {
         PathParams::new(inner)
     }
 
-    #[test]
-    fn config_handle_is_retrieved_when_present() {
-        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
-        use std::sync::Arc;
-
-        struct FixedStore;
-        #[async_trait(?Send)]
-        impl ConfigStore for FixedStore {
-            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some("value".to_owned()))
-            }
-        }
-
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/config")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(FixedStore)));
-
-        let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.config_handle().is_some());
-        assert_eq!(
-            block_on(ctx.config_handle().unwrap().get("any")).expect("config value"),
-            Some("value".to_owned())
-        );
-    }
-
-    #[test]
-    fn config_handle_returns_none_when_absent() {
-        let ctx = ctx("/test", Body::empty(), PathParams::default());
-        assert!(ctx.config_handle().is_none());
-    }
+    // Stage 10.1 removed `RequestContext::config_handle()`. The
+    // present/absent behaviour is now covered by
+    // `config_store_*` tests against a wired `ConfigRegistry`.
 
     #[test]
     fn form_deserialises_successfully() {
@@ -409,29 +344,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kv_handle_is_retrieved_when_present() {
-        use crate::key_value_store::{KvHandle, NoopKvStore};
-        use std::sync::Arc;
-
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/kv")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(KvHandle::new(Arc::new(NoopKvStore)));
-
-        let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.kv_handle().is_some());
-    }
-
-    #[test]
-    fn kv_handle_returns_none_when_absent() {
-        let ctx = ctx("/test", Body::empty(), PathParams::default());
-        assert!(ctx.kv_handle().is_none());
-    }
+    // Stage 10.1 removed `RequestContext::kv_handle()`. The
+    // present/absent behaviour is now covered by `kv_store_*`
+    // tests against a wired `KvRegistry`.
 
     #[test]
     fn path_deserialises_successfully() {
@@ -512,29 +427,9 @@ mod tests {
         assert_eq!(request.uri().path(), "/items/123");
     }
 
-    #[test]
-    fn secret_handle_is_retrieved_when_present() {
-        use crate::secret_store::{NoopSecretStore, SecretHandle};
-        use std::sync::Arc;
-
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/secrets")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
-
-        let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.secret_handle().is_some());
-    }
-
-    #[test]
-    fn secret_handle_returns_none_when_absent() {
-        let ctx = ctx("/test", Body::empty(), PathParams::default());
-        assert!(ctx.secret_handle().is_none());
-    }
+    // Stage 10.1 removed `RequestContext::secret_handle()`. The
+    // present/absent behaviour is now covered by `secret_store_*`
+    // tests against a wired `SecretRegistry`.
 
     #[test]
     fn kv_store_resolves_named_handle_from_registry() {
@@ -572,15 +467,15 @@ mod tests {
 
     #[test]
     fn kv_store_returns_none_when_only_legacy_handle_wired() {
-        // Stage 9.3 hard-cutoff: the registry-aware accessor must
-        // NOT silently fall back to the legacy bare handle. When a
-        // bare `KvHandle` is in extensions but no `KvRegistry` is,
-        // `kv_store*` returns None — the caller can still reach
-        // the handle via `kv_handle()` if they explicitly opt in.
-        // Adapter dispatchers synthesise a registry from any
-        // legacy handle at the dispatch boundary, so in practice
-        // this code path only fires when a test or callsite
-        // bypasses the dispatcher.
+        // Stage 10.1 hard-cutoff: a bare `KvHandle` in extensions
+        // is ignored by the registry-aware accessor. Adapter
+        // dispatchers no longer insert bare handles — they
+        // always synthesise a `KvRegistry` from any wired handle
+        // first — so this code path only fires when a test or
+        // callsite bypasses the dispatcher and inserts a bare
+        // handle directly into extensions. The accessor must
+        // surface that as a missing registry (None) rather than
+        // silently upgrading.
         use crate::key_value_store::{KvHandle, NoopKvStore};
         use std::sync::Arc;
 
@@ -601,12 +496,6 @@ mod tests {
         assert!(
             ctx.kv_store_default().is_none(),
             "registry-aware default accessor must not auto-upgrade a bare handle"
-        );
-        // The legacy handle escape hatch still works for callers
-        // that explicitly opt in.
-        assert!(
-            ctx.kv_handle().is_some(),
-            "ctx.kv_handle() still returns the wired handle"
         );
     }
 
@@ -691,12 +580,11 @@ mod tests {
 
     #[test]
     fn secret_store_default_returns_none_when_only_legacy_handle_wired() {
-        // Stage 9.3 hard-cutoff: same semantics as
+        // Stage 10.1 hard-cutoff: same semantics as
         // `kv_store_returns_none_when_only_legacy_handle_wired` —
-        // the registry-aware accessor must not auto-upgrade a
-        // bare `SecretHandle` into a synthetic registry. Adapter
-        // dispatchers normalise legacy bare-handle inputs to
-        // single-id registries at the dispatch boundary.
+        // a bare `SecretHandle` in extensions (a state that
+        // only arises if a test bypasses the dispatcher) must
+        // not auto-upgrade into a synthetic registry.
         use crate::secret_store::{NoopSecretStore, SecretHandle};
         use std::sync::Arc;
 
@@ -713,10 +601,6 @@ mod tests {
         assert!(
             ctx.secret_store_default().is_none(),
             "registry-aware default accessor must not auto-upgrade a bare handle"
-        );
-        assert!(
-            ctx.secret_handle().is_some(),
-            "ctx.secret_handle() still returns the wired handle"
         );
     }
 }
