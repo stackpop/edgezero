@@ -103,24 +103,7 @@ fn dispatch_core_request(
     // `ctx.{config,kv,secret}_handle()` accessors are gone; handlers
     // use `ctx.{config,kv,secret}_store_default()` or the
     // `Kv` / `Config` / `Secrets` extractors.
-    let config_registry = stores.config_registry.or_else(|| {
-        stores
-            .config_store
-            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
-    });
-    let kv_registry = stores.kv_registry.or_else(|| {
-        stores
-            .kv
-            .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
-    });
-    let secret_registry = stores.secret_registry.or_else(|| {
-        stores.secrets.map(|handle| {
-            SecretRegistry::single_id(
-                "default".to_owned(),
-                BoundSecretStore::new(handle, "default".to_owned()),
-            )
-        })
-    });
+    let (config_registry, kv_registry, secret_registry) = synthesise_store_registries(stores);
     if let Some(registry) = config_registry {
         core_request.extensions_mut().insert(registry);
     }
@@ -272,6 +255,16 @@ pub fn dispatch_with_kv_and_secrets(
 /// from the manifest automatically. Use `dispatch_with_secrets` only when you
 /// need direct control over the dispatch lifecycle without a manifest.
 ///
+/// Platform-name binding: the synthesised `SecretRegistry` binds
+/// the handle to a `BoundSecretStore` whose underlying Fastly
+/// Secret Store name is the literal string `"default"`. So
+/// handlers reading `ctx.secret_store_default()?.require_str(key)`
+/// open a Fastly Secret Store named `"default"` -- the operator's
+/// Fastly account must have a Secret Store with that exact name,
+/// or the runtime `require_str` will surface a clear store-name
+/// error. Use `dispatch_with_kv_and_secrets` (or the manifest-aware
+/// `run_app`) if your account uses a different store name.
+///
 /// # Errors
 /// Returns an error if the named secret store is required but cannot be opened, or the underlying handler returns an error.
 #[inline]
@@ -350,6 +343,44 @@ pub(crate) fn dispatch_with_registries(
             ..Default::default()
         },
     )
+}
+
+/// Pure synthesis: collapse a `Stores` (which may carry both a
+/// wired multi-id registry AND a legacy bare handle) into the
+/// three registries that go into request extensions. Precedence
+/// is "registry wins": a wired registry is taken verbatim; only
+/// in its absence is a bare handle wrapped into a one-id registry
+/// keyed under `"default"`. The bare handle is never merged
+/// in, never used as a fallback for ids the registry doesn't
+/// define. Pulled out as a pure function so the precedence
+/// contract is unit-testable without spinning up a real
+/// `Request` and async dispatcher.
+fn synthesise_store_registries(
+    stores: Stores,
+) -> (
+    Option<ConfigRegistry>,
+    Option<KvRegistry>,
+    Option<SecretRegistry>,
+) {
+    let config_registry = stores.config_registry.or_else(|| {
+        stores
+            .config_store
+            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+    });
+    let kv_registry = stores.kv_registry.or_else(|| {
+        stores
+            .kv
+            .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
+    });
+    let secret_registry = stores.secret_registry.or_else(|| {
+        stores.secrets.map(|handle| {
+            SecretRegistry::single_id(
+                "default".to_owned(),
+                BoundSecretStore::new(handle, "default".to_owned()),
+            )
+        })
+    });
+    (config_registry, kv_registry, secret_registry)
 }
 
 fn build_kv_registry(
@@ -513,4 +544,116 @@ fn warn_missing_store_once(store_name: &str, detail: &str) {
         store_name,
         &format!("{detail}; skipping config-store injection"),
     );
+}
+
+#[cfg(test)]
+mod synthesis_tests {
+    use super::*;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::key_value_store::{KvStore, NoopKvStore};
+    use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    struct StubConfig;
+    #[async_trait::async_trait(?Send)]
+    impl ConfigStore for StubConfig {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(None)
+        }
+    }
+
+    fn kv_handle() -> KvHandle {
+        let store: Arc<dyn KvStore> = Arc::new(NoopKvStore);
+        KvHandle::new(store)
+    }
+
+    fn config_handle() -> ConfigStoreHandle {
+        ConfigStoreHandle::new(Arc::new(StubConfig))
+    }
+
+    fn secret_handle() -> SecretHandle {
+        SecretHandle::new(Arc::new(NoopSecretStore))
+    }
+
+    #[test]
+    fn synthesis_wraps_bare_kv_handle_under_default_when_no_registry() {
+        let stores = Stores {
+            kv: Some(kv_handle()),
+            ..Default::default()
+        };
+        let (config_out, kv_out, secret_out) = synthesise_store_registries(stores);
+        assert!(
+            config_out.is_none(),
+            "no config wiring -> no config registry"
+        );
+        assert!(
+            secret_out.is_none(),
+            "no secret wiring -> no secret registry"
+        );
+        let kv_reg = kv_out.expect("kv registry synthesised from bare handle");
+        assert_eq!(
+            kv_reg.default_id(),
+            "default",
+            "synthesised id is `default`"
+        );
+        assert!(kv_reg.named("default").is_some());
+        assert!(
+            kv_reg.named("other").is_none(),
+            "synthesised registry only knows the `default` id"
+        );
+    }
+
+    #[test]
+    fn synthesis_registry_wins_over_bare_handle_when_both_wired() {
+        // Multi-id registry declaring only `sessions` paired with a
+        // bare handle that would otherwise synthesise to a
+        // `default`-keyed entry. Precedence rule: the bare handle
+        // is dropped entirely; the registry stands alone with no
+        // `default` id.
+        let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+        by_id.insert("sessions".to_owned(), kv_handle());
+        let registry = KvRegistry::new(by_id, "sessions".to_owned());
+        let stores = Stores {
+            kv: Some(kv_handle()),
+            kv_registry: Some(registry),
+            ..Default::default()
+        };
+        let (_, kv_out, _) = synthesise_store_registries(stores);
+        let kv_reg = kv_out.expect("registry survives synthesis");
+        assert_eq!(kv_reg.default_id(), "sessions");
+        assert!(
+            kv_reg.named("default").is_none(),
+            "bare handle's `default` synth NOT merged in"
+        );
+    }
+
+    #[test]
+    fn synthesis_returns_none_for_each_kind_with_no_wiring() {
+        let (config, kv, secret) = synthesise_store_registries(Stores::default());
+        assert!(config.is_none() && kv.is_none() && secret.is_none());
+    }
+
+    #[test]
+    fn synthesis_handles_config_and_secret_bare_handles_symmetrically() {
+        let stores = Stores {
+            config_store: Some(config_handle()),
+            secrets: Some(secret_handle()),
+            ..Default::default()
+        };
+        let (config_out, _, secret_out) = synthesise_store_registries(stores);
+        let config_reg = config_out.expect("config wrapped");
+        assert_eq!(config_reg.default_id(), "default");
+        let secret_reg = secret_out.expect("secret wrapped");
+        assert_eq!(secret_reg.default_id(), "default");
+        // BoundSecretStore binds the synthesised secret to platform
+        // store name "default" -- if the underlying Fastly account
+        // has no Secret Store literally named "default", the
+        // require_str() call from a handler will fail with a clear
+        // store-name error rather than silent miss.
+        assert_eq!(
+            secret_reg.default().expect("default bound").store_name(),
+            "default"
+        );
+    }
 }

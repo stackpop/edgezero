@@ -51,6 +51,24 @@ mod tests {
 
         let project = temp.path().join("scaffold-probe");
 
+        // The scaffold's `edgezero.toml` + `<name>.toml` + AppConfig
+        // must be internally consistent (no `#[secret]` field
+        // without a matching `[stores.secrets]`, no env-overlay
+        // mismatches). `edgezero config validate` exercises the
+        // typed config validator end-to-end. We do this BEFORE
+        // `cargo check` so a manifest/config drift surfaces as a
+        // fast, clear error -- not as a compilation cascade from
+        // a downstream macro tripping over the bad config.
+        let validate = Command::new(env!("CARGO_BIN_EXE_edgezero"))
+            .args(["config", "validate"])
+            .current_dir(&project)
+            .status()
+            .expect("run `edgezero config validate` on the generated workspace");
+        assert!(
+            validate.success(),
+            "generated workspace should pass `edgezero config validate`",
+        );
+
         // Host target: the whole workspace, including the generated CLI
         // crate that imports `edgezero_cli`.
         let host = Command::new(env!("CARGO"))

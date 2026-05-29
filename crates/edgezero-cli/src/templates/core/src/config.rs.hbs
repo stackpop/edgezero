@@ -17,11 +17,6 @@ use validator::Validate;
 #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
 #[serde(deny_unknown_fields)]
 pub struct {{NameUpperCamel}}Config {
-    /// Resolved at runtime via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
-    /// The value here is the *key* in the default secret store, not the secret bytes.
-    #[secret]
-    pub api_token: String,
-
     /// Free-form greeting surfaced by example handlers. Replace or
     /// remove as the app grows.
     pub greeting: String,
@@ -33,12 +28,26 @@ pub struct {{NameUpperCamel}}Config {
     /// `timeout_ms` silently no-ops.
     #[validate(nested)]
     pub service: ServiceConfig,
+    // `#[secret]` — uncomment when the project declares
+    // `[stores.secrets]` in `edgezero.toml` (with at least a
+    // `default` id) and the handler loads the secret bytes at
+    // runtime via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
+    // The value here is the *key* in the default secret store,
+    // NOT the secret bytes; the runtime resolves it through the
+    // wired adapter binding (Cloudflare worker secret, Fastly
+    // secret-store, Spin secret variable, ...). EdgeZero's typed
+    // validator rejects the field unless the secret store is
+    // declared, so this is opt-in to keep the scaffold's `serve`
+    // path runnable out of the box.
+    //
+    // #[secret]
+    // pub api_token: String,
+    //
     // `#[secret(store_ref)]` — uncomment when the project declares
-    // more than one secret store id under `[stores.secrets].ids` in
-    // `edgezero.toml`. The value is then the logical id of the
-    // secret store to resolve at runtime via
-    // `ctx.secret_store(&cfg.vault)?`. Single-secret-store projects
-    // (the default scaffold) don't need this.
+    // more than one secret store id under `[stores.secrets].ids`.
+    // The value is then the logical id of the secret store to
+    // resolve at runtime via `ctx.secret_store(&cfg.vault)?`.
+    // Single-secret-store projects don't need this.
     //
     // #[secret(store_ref)]
     // pub vault: String,

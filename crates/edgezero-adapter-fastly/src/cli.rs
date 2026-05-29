@@ -295,28 +295,9 @@ impl Adapter for FastlyCliAdapter {
             return Ok(out);
         }
         let resolved_id = resolve_remote_config_store_id(store_id)?;
-        // The per-entry shell-out is spec-compliant but
-        // non-atomic. Track which entries succeeded so a mid-loop
-        // failure surfaces what got pushed and what didn't — the
-        // operator can resume from a known boundary rather than
-        // re-pushing the whole set.
-        let mut pushed: Vec<String> = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
-            if let Err(err) = create_config_store_entry(&resolved_id, key, value) {
-                let remaining: Vec<&str> = entries
-                    .iter()
-                    .skip(pushed.len().saturating_add(1))
-                    .map(|(remaining_key, _)| remaining_key.as_str())
-                    .collect();
-                return Err(format!(
-                    "fastly push failed at entry `{key}` after committing {committed} of {total} entries; the remaining {remaining_count} entries were NOT pushed.\n  Committed (safe to skip on retry): {pushed:?}\n  Failed: `{key}` — {err}\n  Not attempted (re-push these): {remaining:?}",
-                    committed = pushed.len(),
-                    total = entries.len(),
-                    remaining_count = remaining.len()
-                ));
-            }
-            pushed.push(key.clone());
-        }
+        push_entries_with_committer(entries, |key, value| {
+            create_config_store_entry(&resolved_id, key, value)
+        })?;
         Ok(vec![format!(
             "pushed {} entries to fastly config-store `{store_id}` (id={resolved_id})",
             entries.len()
@@ -357,11 +338,36 @@ fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
+    // Idempotency: the fastly CLI returns non-zero with an
+    // "already exists" message when a store of this name was
+    // created by a prior provision run. Treat that as success so
+    // the operator's recovery path -- "either manually append the
+    // setup block or delete the remote and re-run provision" --
+    // doesn't get blocked. The append step is itself idempotent,
+    // so re-running provision after a writeback failure is the
+    // documented recovery and now actually works.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if looks_like_already_exists(&stderr) {
+        return Ok(());
+    }
     Err(format!(
         "`fastly {subcommand} create --name={name}` exited with status {}\nstderr: {}",
         output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
+        stderr.trim()
     ))
+}
+
+/// Heuristic: does the stderr blob look like a "store of this
+/// name already exists" failure from the fastly CLI? Different
+/// CLI versions phrase this slightly differently
+/// ("a kv-store with that name already exists",
+/// `"Conflict: duplicate kv_store name"`, etc.); we accept any
+/// case-insensitive substring that names the conflict.
+fn looks_like_already_exists(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("already exists")
+        || (lower.contains("duplicate") && lower.contains("name"))
+        || lower.contains("conflict")
 }
 
 /// Probe `fastly.toml` for the existence of BOTH
@@ -371,6 +377,15 @@ fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
 /// `[local_server.*]` missing) slip through as "already provisioned"
 /// and never get repaired. Treats a missing file as "not present" so
 /// the first provision call can create it.
+///
+/// Limitation: this only verifies that the two tables EXIST with
+/// the right names. It does not verify their inner shape (no
+/// `format` field probe, no resource-link validation). A manifest
+/// the operator hand-edited into a structurally-correct-but-empty
+/// state will be treated as "already provisioned" and the skip
+/// line will say so. The fastly CLI itself ends up being the
+/// authoritative checker at deploy time; `provision` only owns
+/// the "did `EdgeZero` write these blocks?" question.
 fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String> {
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -450,6 +465,41 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
 /// exists" error, which is the operator's signal to delete the
 /// entry (or use `config-store-entry update` manually) before
 /// re-running push.
+/// Drive a sequential per-entry commit loop and produce the
+/// partial-failure diagnostic when the committer fails mid-way.
+/// Pure (no I/O) so the diagnostic shape is unit-testable without
+/// the fastly CLI on PATH; production calls it with a closure that
+/// shells out via `create_config_store_entry`. On success returns
+/// the count of committed entries; on failure returns an error
+/// string naming committed / failed / not-attempted keys so the
+/// operator can resume from a known boundary.
+fn push_entries_with_committer<F>(
+    entries: &[(String, String)],
+    mut committer: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    let mut pushed: Vec<String> = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        if let Err(err) = committer(key, value) {
+            let remaining: Vec<&str> = entries
+                .iter()
+                .skip(pushed.len().saturating_add(1))
+                .map(|(remaining_key, _)| remaining_key.as_str())
+                .collect();
+            return Err(format!(
+                "fastly push failed at entry `{key}` after committing {committed} of {total} entries; the remaining {remaining_count} entries were NOT pushed.\n  Committed (safe to skip on retry): {pushed:?}\n  Failed: `{key}` — {err}\n  Not attempted (re-push these): {remaining:?}",
+                committed = pushed.len(),
+                total = entries.len(),
+                remaining_count = remaining.len()
+            ));
+        }
+        pushed.push(key.clone());
+    }
+    Ok(pushed.len())
+}
+
 fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(), String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
@@ -816,6 +866,133 @@ mod tests {
         fs::write(&manifest, "[package]\nname = \"demo\"\n").unwrap();
         let name = read_package_name(&manifest).unwrap();
         assert_eq!(name, "demo");
+    }
+
+    // ---------- push_entries_with_committer ----------
+
+    #[test]
+    fn push_entries_with_committer_returns_count_when_all_succeed() {
+        let entries = vec![
+            ("a".to_owned(), "1".to_owned()),
+            ("b".to_owned(), "2".to_owned()),
+            ("c".to_owned(), "3".to_owned()),
+        ];
+        let pushed = push_entries_with_committer(&entries, |_, _| Ok(())).expect("all succeed");
+        assert_eq!(pushed, 3);
+    }
+
+    #[test]
+    fn push_entries_with_committer_zero_entries_is_ok() {
+        let pushed = push_entries_with_committer(&[], |_, _| Ok(())).expect("empty is fine");
+        assert_eq!(pushed, 0);
+    }
+
+    #[test]
+    fn push_entries_with_committer_failure_surfaces_committed_failed_not_attempted() {
+        // Mock committer: succeed for first 2 keys, fail at third.
+        let entries = vec![
+            ("k1".to_owned(), "v1".to_owned()),
+            ("k2".to_owned(), "v2".to_owned()),
+            ("k3".to_owned(), "v3".to_owned()),
+            ("k4".to_owned(), "v4".to_owned()),
+            ("k5".to_owned(), "v5".to_owned()),
+        ];
+        let mut calls: usize = 0;
+        let err = push_entries_with_committer(&entries, |key, _| {
+            calls = calls.saturating_add(1);
+            if key == "k3" {
+                Err("simulated fastly stderr".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("middle failure must error");
+        // Committer was invoked for k1, k2, k3 and stopped.
+        assert_eq!(calls, 3_usize, "no retries beyond failure point");
+        // Error names all three categories.
+        assert!(err.contains("k1") && err.contains("k2"), "committed: {err}");
+        assert!(
+            err.contains("Failed: `k3`"),
+            "failed entry named exactly: {err}"
+        );
+        assert!(
+            err.contains("k4") && err.contains("k5"),
+            "not-attempted: {err}"
+        );
+        assert!(err.contains("simulated fastly stderr"), "inner err: {err}");
+        // Counts are sane.
+        assert!(
+            err.contains("committing 2 of 5 entries"),
+            "committed/total count: {err}"
+        );
+    }
+
+    #[test]
+    fn push_entries_with_committer_first_entry_failure_reports_zero_committed() {
+        let entries = vec![
+            ("only".to_owned(), "val".to_owned()),
+            ("never".to_owned(), "tried".to_owned()),
+        ];
+        let err = push_entries_with_committer(&entries, |_, _| Err("nope".to_owned()))
+            .expect_err("first-entry failure");
+        assert!(err.contains("committing 0 of 2"), "zero committed: {err}");
+        assert!(
+            err.contains("Failed: `only`"),
+            "first-entry failure named: {err}"
+        );
+        assert!(
+            err.contains("never"),
+            "second entry as not-attempted: {err}"
+        );
+    }
+
+    #[test]
+    fn push_entries_with_committer_last_entry_failure_reports_n_minus_one_committed() {
+        let entries = vec![
+            ("a".to_owned(), "1".to_owned()),
+            ("b".to_owned(), "2".to_owned()),
+            ("c".to_owned(), "3".to_owned()),
+        ];
+        let err = push_entries_with_committer(&entries, |key, _| {
+            if key == "c" {
+                Err("late failure".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("last-entry failure");
+        assert!(err.contains("committing 2 of 3"), "n-1 committed: {err}");
+        assert!(
+            err.contains("the remaining 0 entries"),
+            "zero not-attempted when last fails: {err}"
+        );
+    }
+
+    // ---------- looks_like_already_exists ----------
+
+    #[test]
+    fn looks_like_already_exists_recognises_common_phrasings() {
+        // Real-shaped fastly CLI error strings (paraphrased; the
+        // CLI varies across versions). Each must be detected so
+        // create_fastly_store can treat it as idempotent success.
+        assert!(looks_like_already_exists(
+            "Error: a kv-store with that name already exists"
+        ));
+        assert!(looks_like_already_exists(
+            "ERROR: Conflict (409): duplicate kv_store name"
+        ));
+        assert!(looks_like_already_exists(
+            "A config-store with this name already exists"
+        ));
+    }
+
+    #[test]
+    fn looks_like_already_exists_rejects_unrelated_errors() {
+        assert!(!looks_like_already_exists(
+            "Error: unauthenticated; run `fastly profile create`"
+        ));
+        assert!(!looks_like_already_exists("Error: network unreachable"));
+        assert!(!looks_like_already_exists(""));
     }
 
     // ---------- setup_block_present ----------
