@@ -51,8 +51,21 @@ fn apply_environment(
     environment: &ResolvedEnvironment,
     command: &mut Command,
 ) -> Result<(), String> {
+    // Precedence: a `[environment.variables].value` in the manifest
+    // is a DEFAULT, not an override. If the parent process already
+    // exported the same env var (e.g. an operator ran
+    // `EDGEZERO__ADAPTER__HOST=parent-env edgezero build`), the
+    // parent value must reach the child command unchanged. Calling
+    // `cmd.env(...)` unconditionally would shadow the parent value;
+    // `Command` doesn't inherit-then-override per key, so we check
+    // `env::var_os` first and skip the explicit set when the parent
+    // already has one. This mirrors the precedence the plan + the
+    // typed-config env-overlay docs both promise.
     for binding in &environment.variables {
         if let Some(value) = &binding.value {
+            if env::var_os(&binding.env).is_some() {
+                continue;
+            }
             command.env(&binding.env, value);
         }
     }
@@ -278,6 +291,76 @@ mod tests {
         assert!(has_var);
 
         env::remove_var("EDGEZERO_TEST_SECRET");
+    }
+
+    #[test]
+    fn apply_environment_defers_to_parent_env_when_already_set() {
+        // Manifest `[environment.variables].value` is a DEFAULT.
+        // When the operator exports the same env var in the parent
+        // shell (e.g. `EDGEZERO__ADAPTER__HOST=parent edgezero build`),
+        // the parent value must win -- the manifest default must
+        // not stomp it. Without the precedence guard, `cmd.env(...)`
+        // would inject the manifest value and the parent override
+        // would be lost.
+        const KEY: &str = "EDGEZERO_TEST_PARENT_WINS";
+        env::set_var(KEY, "from_parent_shell");
+
+        let env = ResolvedEnvironment {
+            secrets: vec![],
+            variables: vec![ResolvedEnvironmentBinding {
+                description: None,
+                env: KEY.into(),
+                name: "Parent-Wins".into(),
+                value: Some("from_manifest_default".into()),
+            }],
+        };
+
+        let mut cmd = Command::new("echo");
+        apply_environment("test-adapter", &env, &mut cmd).expect("apply env");
+
+        // The child's explicitly-set envs are what `Command::env`
+        // recorded. We DID NOT call it for this key, so it should
+        // not appear in `get_envs`. Instead the child inherits the
+        // parent's value via the OS env (verified separately by
+        // env::var_os in the production path).
+        let injected = cmd.get_envs().any(|(key, _)| key.to_str() == Some(KEY));
+        assert!(
+            !injected,
+            "manifest default must NOT be injected when parent env is already set; \
+             parent value would otherwise be shadowed"
+        );
+
+        env::remove_var(KEY);
+    }
+
+    #[test]
+    fn apply_environment_uses_manifest_default_when_parent_env_unset() {
+        // Mirror of the above: when the parent shell has NOT set the
+        // env var, the manifest default fills it in.
+        const KEY: &str = "EDGEZERO_TEST_MANIFEST_FILLS";
+        env::remove_var(KEY);
+
+        let env = ResolvedEnvironment {
+            secrets: vec![],
+            variables: vec![ResolvedEnvironmentBinding {
+                description: None,
+                env: KEY.into(),
+                name: "Manifest-Fills".into(),
+                value: Some("from_manifest_default".into()),
+            }],
+        };
+
+        let mut cmd = Command::new("echo");
+        apply_environment("test-adapter", &env, &mut cmd).expect("apply env");
+
+        let injected = cmd.get_envs().any(|(key, value)| {
+            key.to_str() == Some(KEY)
+                && value.and_then(|val| val.to_str()) == Some("from_manifest_default")
+        });
+        assert!(
+            injected,
+            "manifest default must fill the slot when parent env is unset"
+        );
     }
 
     #[test]
