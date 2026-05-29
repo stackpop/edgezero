@@ -2,8 +2,9 @@
 //! via `edgezero_core::app_config::load_app_config::<AppDemoConfig>`.
 //!
 //! The TOML file maps directly onto `AppDemoConfig` — no `[config]`
-//! wrapper. The `app_demo__<SECTION>__…__<KEY>` env-var overlay
-//! (uppercase, `-`→`_`) overrides any key already present.
+//! wrapper. The `APP_DEMO__<SECTION>__…__<KEY>` env-var overlay
+//! (project name uppercased with `-`→`_`, nested sections joined
+//! by `__`) overrides any key already present.
 
 #![expect(
     clippy::module_name_repetitions,
@@ -37,7 +38,7 @@ pub struct AppDemoConfig {
     pub greeting: String,
 
     /// Nested section — exercises the env-var overlay on a sub-table
-    /// (`app_demo__SERVICE__TIMEOUT_MS=…`). `#[validate(nested)]`
+    /// (`APP_DEMO__SERVICE__TIMEOUT_MS=…`). `#[validate(nested)]`
     /// propagates the inner `range` rule on `timeout_ms` up to the
     /// outer `AppDemoConfig::validate()` — without it the inner
     /// validator silently no-ops.
@@ -58,7 +59,7 @@ pub struct AppDemoConfig {
 pub struct FeatureConfig {
     /// Toggles the (hypothetical) new-checkout code path. Exercises a
     /// non-string scalar through the env-var overlay
-    /// (`app_demo__FEATURE__NEW_CHECKOUT=true`).
+    /// (`APP_DEMO__FEATURE__NEW_CHECKOUT=true`).
     pub new_checkout: bool,
 }
 

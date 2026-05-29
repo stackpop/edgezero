@@ -3,8 +3,9 @@
 //!
 //! The TOML file maps directly onto this struct — there is no
 //! `[config]` wrapper; top-level keys correspond to top-level
-//! fields. The `{{name}}__<SECTION>__…__<KEY>` env-var overlay
-//! (uppercase, `-`→`_`) overrides any key already present.
+//! fields. The `{{EnvPrefix}}__<SECTION>__…__<KEY>` env-var
+//! overlay (project name uppercased with `-`→`_`, nested sections
+//! joined by `__`) overrides any key already present.
 
 #![expect(
     clippy::module_name_repetitions,
@@ -22,7 +23,7 @@ pub struct {{NameUpperCamel}}Config {
     pub greeting: String,
 
     /// Nested section — exercises the env-var overlay
-    /// (`{{name}}__SERVICE__TIMEOUT_MS=…` at runtime).
+    /// (`{{EnvPrefix}}__SERVICE__TIMEOUT_MS=…` at runtime).
     /// `#[validate(nested)]` makes the outer `validate()` recurse
     /// into `ServiceConfig`; without it the inner `range` rule on
     /// `timeout_ms` silently no-ops.

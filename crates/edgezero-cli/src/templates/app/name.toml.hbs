@@ -6,9 +6,12 @@
 # wrapper: every key here is a field on the struct.
 #
 # Env-var overlay: every key here can be overridden at runtime by
-# `{{name}}__<SECTION>__…__<KEY>` (uppercase, `-`→`_`, `__` separator)
+# `{{EnvPrefix}}__<SECTION>__…__<KEY>` (the prefix is the project
+# name, uppercased with `-`→`_`; nested sections are joined by `__`)
 # as long as the key already exists below. The loader infers the type
 # from the parsed value and coerces the env string accordingly.
+# Example: `{{EnvPrefix}}__SERVICE__TIMEOUT_MS=2500` overrides the
+# `[service] timeout_ms` field below.
 
 greeting = "hello from {{name}}"
 
