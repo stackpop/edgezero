@@ -9,7 +9,9 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
-use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction, ProvisionStores};
+use edgezero_adapter::registry::{
+    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -130,7 +132,7 @@ struct CloudflareCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; the trait defaults already model that"
+    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for CloudflareCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -183,51 +185,65 @@ impl Adapter for CloudflareCliAdapter {
         let wrangler_path = manifest_root.join(rel);
 
         let mut out = Vec::new();
-        for id in stores.kv.iter().chain(stores.config.iter()) {
-            // Idempotency check BEFORE shelling out: if a [[kv_namespaces]]
-            // entry with `binding = id` is already present and has a real
-            // namespace id, skip. Without this guard a re-run of provision
-            // would invoke `wrangler kv namespace create` again and orphan
-            // the previously-created namespace -- wasting account quota.
-            // A placeholder id (anything that isn't a 32-char lowercase
-            // hex string, like the `local-dev-placeholder` the scaffold
-            // wrangler.toml writes) is treated as "not yet provisioned"
-            // so the entry gets rewritten with the real id.
+        for store in stores.kv.iter().chain(stores.config.iter()) {
+            let logical = &store.logical;
+            // The Cloudflare KV binding name is what the runtime
+            // calls `env.kv(...)` with -- it's resolved at request
+            // time from `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME`
+            // (default = logical id). Provision must write the
+            // resolved PLATFORM name into wrangler.toml, otherwise
+            // the runtime will look up a binding the CLI never
+            // created.
+            let binding = &store.platform;
+            // Idempotency check BEFORE shelling out: if a
+            // [[kv_namespaces]] entry with `binding = <platform>`
+            // is already present and has a real namespace id, skip.
+            // Without this guard a re-run of provision would invoke
+            // `wrangler kv namespace create` again and orphan the
+            // previously-created namespace -- wasting account quota.
+            // A placeholder id (anything that isn't a 32-char
+            // lowercase hex string, like the
+            // `local-dev-placeholder` the scaffold wrangler.toml
+            // writes) is treated as "not yet provisioned" so the
+            // entry gets rewritten with the real id.
             //
-            // We deliberately do NOT cross-check the stored id against
-            // Cloudflare's API (e.g. by calling `wrangler kv namespace
-            // list` to confirm the id still exists). Verifying every
-            // entry on every provision run would add a network round-trip
-            // per id and require parsing yet another wrangler subcommand
-            // output. The skip line names the existing id explicitly so
-            // the operator can verify it themselves and, if the
-            // Cloudflare-side namespace was deleted out-of-band, remove
-            // the stale entry by hand before re-running provision.
-            let existing = existing_real_namespace_id(&wrangler_path, id)?;
+            // We deliberately do NOT cross-check the stored id
+            // against Cloudflare's API (e.g. by calling `wrangler
+            // kv namespace list` to confirm the id still exists).
+            // Verifying every entry on every provision run would
+            // add a network round-trip per id and require parsing
+            // yet another wrangler subcommand output. The skip
+            // line names the existing id explicitly so the operator
+            // can verify it themselves and, if the Cloudflare-side
+            // namespace was deleted out-of-band, remove the stale
+            // entry by hand before re-running provision.
+            let existing = existing_real_namespace_id(&wrangler_path, binding)?;
             if let Some(existing_id) = existing {
                 out.push(format!(
-                    "binding `{id}` already provisioned (id={existing_id} in {}); skipping. To force a fresh namespace: delete the [[kv_namespaces]] entry for binding `{id}` AND run `wrangler kv namespace delete --namespace-id={existing_id}` (the old remote namespace lingers otherwise), then re-run provision.",
+                    "binding `{binding}` (logical id `{logical}`) already provisioned (id={existing_id} in {}); skipping. To force a fresh namespace: delete the [[kv_namespaces]] entry for binding `{binding}` AND run `wrangler kv namespace delete --namespace-id={existing_id}` (the old remote namespace lingers otherwise), then re-run provision.",
                     wrangler_path.display()
                 ));
                 continue;
             }
             if dry_run {
                 out.push(format!(
-                    "would run `wrangler kv namespace create {id}` and append [[kv_namespaces]] binding = \"{id}\" to {}",
+                    "would run `wrangler kv namespace create {binding}` and append [[kv_namespaces]] binding = \"{binding}\" to {} (logical id `{logical}`)",
                     wrangler_path.display()
                 ));
                 continue;
             }
-            let namespace_id = create_kv_namespace(id)?;
-            upsert_kv_namespace(&wrangler_path, id, &namespace_id)?;
+            let namespace_id = create_kv_namespace(binding)?;
+            upsert_kv_namespace(&wrangler_path, binding, &namespace_id)?;
             out.push(format!(
-                "created KV namespace `{id}` (id={namespace_id}); written to {}",
+                "created KV namespace `{binding}` (logical id `{logical}`, namespace id={namespace_id}); written to {}",
                 wrangler_path.display()
             ));
         }
-        for id in stores.secrets {
+        for store in stores.secrets {
+            let logical = &store.logical;
+            let platform = &store.platform;
             out.push(format!(
-                "cloudflare secret `{id}` is runtime-managed via `wrangler secret put`; nothing to provision"
+                "cloudflare secret `{platform}` (logical id `{logical}`) is runtime-managed via `wrangler secret put`; nothing to provision"
             ));
         }
         if out.is_empty() {
@@ -241,12 +257,12 @@ impl Adapter for CloudflareCliAdapter {
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        store_id: &str,
+        store: &ResolvedStoreId,
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         //: read namespace id from wrangler.toml (matched by
-        // `binding = <store_id>`), then `wrangler kv bulk put
+        // `binding = <platform>`), then `wrangler kv bulk put
         // <tempfile.json> --namespace-id=<id>`. Keys in dotted
         // form — the CLI already flattened them.
         let Some(rel) = adapter_manifest_path else {
@@ -256,18 +272,20 @@ impl Adapter for CloudflareCliAdapter {
             );
         };
         let wrangler_path = manifest_root.join(rel);
+        let binding = store.platform.as_str();
+        let logical = store.logical.as_str();
         // Dry-run is lenient about a missing/unresolved binding so
         // operators can preview the keyset BEFORE running provision.
         // Real runs still err loudly so we don't silently push to
         // a non-existent namespace.
         if dry_run {
-            let header = find_namespace_id(&wrangler_path, store_id).map_or_else(
+            let header = find_namespace_id(&wrangler_path, binding).map_or_else(
                 |_| format!(
-                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id=<unresolved>` with {} entries for binding `{store_id}` (binding not yet provisioned -- run `edgezero provision --adapter cloudflare` to resolve the namespace id)",
+                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id=<unresolved>` with {} entries for binding `{binding}` (logical id `{logical}`, binding not yet provisioned -- run `edgezero provision --adapter cloudflare` to resolve the namespace id)",
                     entries.len()
                 ),
                 |ns_id| format!(
-                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id={ns_id}` with {} entries for binding `{store_id}`",
+                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id={ns_id}` with {} entries for binding `{binding}` (logical id `{logical}`)",
                     entries.len()
                 ),
             );
@@ -277,10 +295,10 @@ impl Adapter for CloudflareCliAdapter {
             }
             return Ok(out);
         }
-        let namespace_id = find_namespace_id(&wrangler_path, store_id)?;
+        let namespace_id = find_namespace_id(&wrangler_path, binding)?;
         if entries.is_empty() {
             return Ok(vec![format!(
-                "no config entries to push to KV namespace `{store_id}` (id={namespace_id})"
+                "no config entries to push to KV namespace `{binding}` (logical id `{logical}`, id={namespace_id})"
             )]);
         }
         let payload = bulk_payload(entries)?;
@@ -316,7 +334,7 @@ impl Adapter for CloudflareCliAdapter {
             ));
         }
         Ok(vec![format!(
-            "pushed {} entries to KV namespace `{store_id}` (id={namespace_id})",
+            "pushed {} entries to KV namespace `{binding}` (logical id `{logical}`, id={namespace_id})",
             entries.len()
         )])
     }
@@ -376,11 +394,33 @@ fn create_kv_namespace(binding: &str) -> Result<String, String> {
 /// id = "abc123..."
 /// ```
 ///
-/// We tolerate leading whitespace + surrounding decoration; the
-/// only contract is a line containing `id` `=` `"<value>"`.
+/// We tolerate leading whitespace + surrounding decoration. To
+/// avoid grabbing a stray informational line like
+/// `id = "<workspace_id>"` printed somewhere else in wrangler
+/// output (or a hypothetical future `id = ...` line that names a
+/// non-KV resource), we anchor to the `[[kv_namespaces]]` table
+/// header AND require the value to be 32-char lowercase hex
+/// (Cloudflare's actual namespace-id shape). The scan walks
+/// lines top-down: when we see `[[kv_namespaces]]` we set a
+/// scope flag; the next `id = "<32-char-hex>"` line within that
+/// scope is the result. A new top-level header resets the scope.
 fn extract_namespace_id(stdout: &str) -> Option<String> {
+    let mut in_kv_namespaces = false;
     for line in stdout.lines() {
         let trimmed = line.trim();
+        if trimmed == "[[kv_namespaces]]" {
+            in_kv_namespaces = true;
+            continue;
+        }
+        // Any other table header ends the scope so we don't reach
+        // forward into a sibling block.
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_kv_namespaces = false;
+            continue;
+        }
+        if !in_kv_namespaces {
+            continue;
+        }
         let Some(after_id_kw) = trimmed.strip_prefix("id") else {
             continue;
         };
@@ -393,7 +433,7 @@ fn extract_namespace_id(stdout: &str) -> Option<String> {
         let Some((id, _)) = quoted.split_once('"') else {
             continue;
         };
-        if !id.is_empty() {
+        if is_real_namespace_id(id) {
             return Some(id.to_owned());
         }
     }
@@ -411,9 +451,9 @@ fn extract_namespace_id(stdout: &str) -> Option<String> {
 /// all-`a`, `deadbeefdeadbeefdeadbeefdeadbeef`, etc.). A real id
 /// generated by Cloudflare's API has effectively uniform random
 /// hex distribution: expected distinct chars over 32 draws from
-/// 16 symbols is ~14, and the probability of < 6 distinct chars
-/// is on the order of 10^-9 -- so false rejections of real ids
-/// are astronomically unlikely.
+/// 16 symbols is ~14, and the dominant term P(=5 distinct) is on
+/// the order of 10^-13 -- so false rejections of real ids are
+/// astronomically unlikely.
 fn is_real_namespace_id(id: &str) -> bool {
     if id.len() != 32 {
         return false;
@@ -815,24 +855,28 @@ mod tests {
         // wrangler decorates these lines with unicode glyphs in real
         // output; we drop them from the fixture to keep the source
         // file ASCII-only (clippy::non_ascii_literal). The parser
-        // only cares about the literal `id = "..."` line.
+        // requires both the `[[kv_namespaces]]` anchor and a
+        // 32-char-lowercase-hex id.
         let stdout = r#"Creating namespace with title "my-kv"
 Success!
 Add the following to your configuration file in your kv_namespaces array:
 [[kv_namespaces]]
 binding = "my-kv"
-id = "abc123def456"
+id = "00112233445566778899aabbccddeeff"
 "#;
         assert_eq!(
             extract_namespace_id(stdout).as_deref(),
-            Some("abc123def456")
+            Some("00112233445566778899aabbccddeeff")
         );
     }
 
     #[test]
     fn extract_namespace_id_tolerates_extra_whitespace() {
-        let stdout = "   id   =   \"xyz789\"   \n";
-        assert_eq!(extract_namespace_id(stdout).as_deref(), Some("xyz789"));
+        let stdout = "[[kv_namespaces]]\n   id   =   \"00112233445566778899aabbccddeeff\"   \n";
+        assert_eq!(
+            extract_namespace_id(stdout).as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
     }
 
     #[test]
@@ -840,16 +884,44 @@ id = "abc123def456"
         assert!(extract_namespace_id("nothing to see here").is_none());
         assert!(extract_namespace_id("").is_none());
         assert!(
-            extract_namespace_id("id = \"\"").is_none(),
+            extract_namespace_id("[[kv_namespaces]]\nid = \"\"").is_none(),
             "empty value not a real id"
         );
     }
 
     #[test]
     fn extract_namespace_id_ignores_unrelated_lines_starting_with_id() {
-        // A line like `identifier = "..."` shouldn't match — we
-        // strip exactly the prefix `id` then require `=`.
-        assert!(extract_namespace_id("identifier = \"x\"").is_none());
+        // `identifier = "..."` doesn't match -- we strip exactly the
+        // prefix `id` then require `=`. Also doesn't match because
+        // there's no `[[kv_namespaces]]` anchor.
+        assert!(extract_namespace_id("[[kv_namespaces]]\nidentifier = \"x\"").is_none());
+    }
+
+    #[test]
+    fn extract_namespace_id_requires_kv_namespaces_anchor() {
+        // A bare `id = "<32-char-hex>"` line that isn't preceded by
+        // `[[kv_namespaces]]` must not match -- otherwise a future
+        // wrangler info line like `id = "<workspace_id>"` printed
+        // somewhere else in stdout would be picked up as the
+        // namespace id and silently corrupt wrangler.toml on writeback.
+        let unanchored = "id = \"00112233445566778899aabbccddeeff\"\n";
+        assert!(extract_namespace_id(unanchored).is_none());
+
+        // A different table header BEFORE the `id` line scopes us
+        // out of the kv-namespaces context.
+        let other_block = "[[d1_databases]]\nid = \"00112233445566778899aabbccddeeff\"\n";
+        assert!(extract_namespace_id(other_block).is_none());
+    }
+
+    #[test]
+    fn extract_namespace_id_rejects_non_real_id_inside_kv_namespaces_anchor() {
+        // Even with the anchor, the value must look like a real
+        // Cloudflare id (32-char lowercase hex with the diversity
+        // floor). Shorter or non-hex values are skipped, not
+        // returned -- forces the operator to investigate stdout
+        // drift rather than silently writing a bogus id.
+        let stdout = "[[kv_namespaces]]\nbinding = \"my-kv\"\nid = \"abc123\"\n";
+        assert!(extract_namespace_id(stdout).is_none());
     }
 
     fn write_wrangler(dir: &Path, contents: &str) -> PathBuf {
@@ -940,15 +1012,19 @@ id = "abc123def456"
     // ---------- extract_namespace_id (pinning behaviour) ----------
 
     #[test]
-    fn extract_namespace_id_returns_first_match_when_multiple_id_lines_present() {
-        // Pin the behaviour explicitly: extract_namespace_id walks
-        // lines top-down and returns the first `id = "..."` it sees.
-        // Real wrangler output has exactly one; a hypothetical
-        // future format with multiple lines would surface the
-        // earliest, which matches how the wrangler hint block is
-        // ordered today.
-        let stdout = "id = \"first_id\"\nid = \"second_id\"\n";
-        assert_eq!(extract_namespace_id(stdout).as_deref(), Some("first_id"));
+    fn extract_namespace_id_returns_first_real_match_inside_kv_namespaces_anchor() {
+        // Pin: top-down scan, first qualifying line inside the
+        // `[[kv_namespaces]]` anchor wins. Real wrangler output has
+        // exactly one. A hypothetical future format with multiple
+        // qualifying lines would surface the earliest, but only
+        // values that look like real Cloudflare ids count.
+        let stdout = "[[kv_namespaces]]\n\
+                      id = \"00112233445566778899aabbccddeeff\"\n\
+                      id = \"ffeeddccbbaa99887766554433221100\"\n";
+        assert_eq!(
+            extract_namespace_id(stdout).as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
     }
 
     // ---------- upsert_kv_namespace ----------
@@ -1092,9 +1168,9 @@ id = "abc123def456"
     fn provision_dry_run_does_not_invoke_wrangler() {
         let dir = tempdir().expect("tempdir");
         write_wrangler(dir.path(), "name = \"demo\"\n");
-        let kv_ids = vec!["sessions".to_owned(), "cache".to_owned()];
-        let config_ids = vec!["app_config".to_owned()];
-        let secret_ids = vec!["default".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions", "cache"]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["app_config"]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["default"]);
         let stores = ProvisionStores {
             config: &config_ids,
             kv: &kv_ids,
@@ -1115,9 +1191,44 @@ id = "abc123def456"
     }
 
     #[test]
+    fn provision_dry_run_writes_resolved_platform_name_into_binding() {
+        // Regression: provision used to receive only logical ids
+        // and write them verbatim into wrangler.toml. With the
+        // platform-name flow, an operator who sets
+        // `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config`
+        // sees `prod_config` land as the binding name (matching what
+        // the runtime resolves via `env.kv(...)`), with the logical
+        // id still mentioned for human-facing wording.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let config_ids = vec![ResolvedStoreId::new("app_config", "prod_config")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        let out = CloudflareCliAdapter
+            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .expect("dry-run succeeds");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("wrangler kv namespace create prod_config"),
+            "dry-run uses platform name in the `wrangler` invocation: {out:?}"
+        );
+        assert!(
+            out[0].contains("binding = \"prod_config\""),
+            "dry-run writes platform name as the binding: {out:?}"
+        );
+        assert!(
+            out[0].contains("logical id `app_config`"),
+            "logical id is preserved for operator wording: {out:?}"
+        );
+    }
+
+    #[test]
     fn provision_errors_when_adapter_manifest_path_missing() {
         let dir = tempdir().expect("tempdir");
-        let kv_ids = vec!["sessions".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1140,7 +1251,7 @@ id = "abc123def456"
             dir.path(),
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"00112233445566778899aabbccddeeff\"\n",
         );
-        let kv_ids = vec!["sessions".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1173,7 +1284,7 @@ id = "abc123def456"
             dir.path(),
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\n",
         );
-        let kv_ids = vec!["sessions".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1318,7 +1429,7 @@ id = "abc123def456"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &entries,
                 true,
             )
@@ -1353,7 +1464,7 @@ id = "abc123def456"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &entries,
                 true,
             )
@@ -1373,7 +1484,14 @@ id = "abc123def456"
         let dir = tempdir().expect("tempdir");
         let entries = vec![("k".to_owned(), "v".to_owned())];
         let err = CloudflareCliAdapter
-            .push_config_entries(dir.path(), None, None, "app_config", &entries, true)
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &entries,
+                true,
+            )
             .expect_err("missing adapter manifest path must error");
         assert!(
             err.contains("wrangler.toml") && err.contains("config push"),
@@ -1395,7 +1513,7 @@ id = "abc123def456"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &entries,
                 false,
             )
@@ -1418,7 +1536,7 @@ id = "abc123def456"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &[],
                 false,
             )

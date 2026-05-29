@@ -255,7 +255,7 @@ fn config_push_spin_dry_run_prints_translated_keys_and_preserves_manifest() {
 /// status lines the CLI would otherwise hand to `log::info!`.
 #[test]
 fn spin_dry_run_preview_lists_app_demo_translated_keys_and_both_tables() {
-    use edgezero_adapter::registry as adapter_registry;
+    use edgezero_adapter::registry::{self as adapter_registry, ResolvedStoreId};
     use tempfile::tempdir;
 
     let dir = tempdir().expect("tempdir");
@@ -280,7 +280,7 @@ fn spin_dry_run_preview_lists_app_demo_translated_keys_and_both_tables() {
             dir.path(),
             Some("spin.toml"),
             None,
-            "app_config",
+            &ResolvedStoreId::from_logical("app_config"),
             &entries,
             true,
         )

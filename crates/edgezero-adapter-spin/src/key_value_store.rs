@@ -60,11 +60,6 @@ impl SpinKvStore {
             max_list_keys,
         })
     }
-
-    /// Open the default EdgeZero KV store label (`"EDGEZERO_KV"`).
-    pub fn open_default() -> Result<Self, KvError> {
-        Self::open(edgezero_core::manifest::DEFAULT_KV_STORE_NAME)
-    }
 }
 
 #[async_trait(?Send)]

@@ -8,7 +8,9 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
-use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction, ProvisionStores};
+use edgezero_adapter::registry::{
+    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -169,36 +171,48 @@ impl Adapter for SpinCliAdapter {
         let mut out = Vec::new();
         if !stores.kv.is_empty() {
             let component_id = resolve_spin_component(&spin_path, component_selector)?;
-            for id in stores.kv {
+            for store in stores.kv {
+                let logical = store.logical.as_str();
+                // The KV label the runtime opens is what
+                // `EDGEZERO__STORES__KV__<LOGICAL>__NAME` resolves
+                // to (default = the logical id). Provision writes
+                // the PLATFORM label into
+                // `[component.X].key_value_stores` so that the
+                // runtime's lookup matches.
+                let label = store.platform.as_str();
                 if dry_run {
                     out.push(format!(
-                        "would ensure KV label `{id}` is in [component.{component_id}].key_value_stores in {}",
+                        "would ensure KV label `{label}` (logical id `{logical}`) is in [component.{component_id}].key_value_stores in {}",
                         spin_path.display()
                     ));
                     continue;
                 }
-                let added = ensure_kv_label_in_component(&spin_path, &component_id, id)?;
+                let added = ensure_kv_label_in_component(&spin_path, &component_id, label)?;
                 if added {
                     out.push(format!(
-                        "added KV label `{id}` to [component.{component_id}].key_value_stores in {}",
+                        "added KV label `{label}` (logical id `{logical}`) to [component.{component_id}].key_value_stores in {}",
                         spin_path.display()
                     ));
                 } else {
                     out.push(format!(
-                        "KV label `{id}` already present in [component.{component_id}].key_value_stores in {}; skipping",
+                        "KV label `{label}` (logical id `{logical}`) already present in [component.{component_id}].key_value_stores in {}; skipping",
                         spin_path.display()
                     ));
                 }
             }
         }
-        for id in stores.config {
+        for store in stores.config {
+            let logical = store.logical.as_str();
+            let platform = store.platform.as_str();
             out.push(format!(
-                "spin config id `{id}` is provisioned by `config push --adapter spin` (declares Spin variables); nothing to do here"
+                "spin config id `{logical}` (platform name `{platform}`) is provisioned by `config push --adapter spin` (declares Spin variables); nothing to do here"
             ));
         }
-        for id in stores.secrets {
+        for store in stores.secrets {
+            let logical = store.logical.as_str();
+            let platform = store.platform.as_str();
             out.push(format!(
-                "spin secret id `{id}` requires manual `[variables].* secret = true` + `[component.*.variables].*` declarations in spin.toml; nothing to do here"
+                "spin secret id `{logical}` (platform name `{platform}`) requires manual `[variables].* secret = true` + `[component.*.variables].*` declarations in spin.toml; nothing to do here"
             ));
         }
         if out.is_empty() {
@@ -212,7 +226,12 @@ impl Adapter for SpinCliAdapter {
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
         component_selector: Option<&str>,
-        _store_id: &str,
+        // Spin's "config store" is the Spin variable namespace --
+        // there is no per-store binding to write. The resolved id
+        // is accepted for trait-shape uniformity but the variable
+        // names are derived from the config KEYS, not the store
+        // name.
+        _store: &ResolvedStoreId,
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
@@ -658,6 +677,22 @@ fn translate_key_for_spin(dotted_key: &str) -> String {
 /// Idempotent: re-running updates the `default` value in place
 /// and overwrites the component binding. Preserves the rest of
 /// the spin manifest (formatting, comments, sibling tables).
+///
+/// Inline-table tolerance: existing `[variables].<key>` and
+/// `[component.X.variables]` entries are accepted in BOTH block
+/// form (`[variables.<key>]\ndefault = "..."`) and inline-table
+/// form (`<key> = { default = "..." }`); the writeback preserves
+/// whichever shape the user chose.
+///
+/// LIMITATION: the OUTER tables (`[variables]`, `[component]`,
+/// `[component.<X>]`) are still required to be block tables. A
+/// spin.toml with `component = { demo = { ... } }` (inline at the
+/// component-root level) or `variables = { foo = "..." }` (inline
+/// at the variables-root level) errors with `not_a_table_error`
+/// because we'd otherwise need to convert the whole structure to
+/// block form to insert keys. Realistic spin.toml files
+/// (scaffolds AND hand-edited) always use block form for these
+/// slots, so the limitation has not been observed in practice.
 fn write_spin_variables(
     spin_path: &Path,
     component_id: &str,
@@ -1333,7 +1368,7 @@ mod tests {
         let original =
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
         let path = write_spin(dir.path(), original);
-        let kv_ids = vec!["sessions".to_owned(), "cache".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions", "cache"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1350,13 +1385,53 @@ mod tests {
     }
 
     #[test]
+    fn provision_writes_resolved_platform_label_into_kv_array() {
+        // Regression: spin provision used to receive only logical
+        // ids and add them verbatim to
+        // `[component.X].key_value_stores`. With the platform-name
+        // flow, an operator who sets
+        // `EDGEZERO__STORES__KV__SESSIONS__NAME=prod_sessions` now
+        // sees `prod_sessions` land as the KV label (matching what
+        // the runtime opens), with the logical id preserved for
+        // human-facing wording.
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let kv_ids = vec![ResolvedStoreId::new("sessions", "prod_sessions")];
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = SpinCliAdapter
+            .provision(dir.path(), Some("spin.toml"), None, &stores, false)
+            .expect("real-run succeeds");
+        assert!(
+            out[0].contains("`prod_sessions`") && out[0].contains("`sessions`"),
+            "status line names BOTH the platform label and the logical id: {out:?}"
+        );
+
+        let after = fs::read_to_string(&path).expect("read spin.toml");
+        assert!(
+            after.contains("\"prod_sessions\""),
+            "platform label written into spin.toml KV array: {after}"
+        );
+        assert!(
+            !after.contains("\"sessions\""),
+            "logical id is NOT written (would shadow the platform binding): {after}"
+        );
+    }
+
+    #[test]
     fn provision_writes_kv_labels_into_resolved_component() {
         let dir = tempdir().expect("tempdir");
         write_spin(
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
-        let kv_ids = vec!["sessions".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1377,7 +1452,7 @@ mod tests {
     #[test]
     fn provision_errors_when_adapter_manifest_path_missing() {
         let dir = tempdir().expect("tempdir");
-        let kv_ids = vec!["sessions".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1399,8 +1474,8 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
-        let config_ids = vec!["app_config".to_owned()];
-        let secret_ids = vec!["default".to_owned()];
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["app_config"]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["default"]);
         let stores = ProvisionStores {
             config: &config_ids,
             kv: &[],
@@ -1741,7 +1816,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &entries,
                 true,
             )
@@ -1809,7 +1884,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &entries,
                 false,
             )
@@ -1837,7 +1912,14 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let entries = vec![("greeting".to_owned(), "hi".to_owned())];
         let err = SpinCliAdapter
-            .push_config_entries(dir.path(), None, None, "app_config", &entries, true)
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &entries,
+                true,
+            )
             .expect_err("missing adapter manifest path must error");
         assert!(
             err.contains("spin.toml"),
@@ -1861,7 +1943,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &entries,
                 false,
             )
@@ -1882,7 +1964,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &[],
                 false,
             )

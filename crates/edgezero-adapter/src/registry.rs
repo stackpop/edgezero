@@ -22,15 +22,77 @@ pub enum AdapterAction {
     Serve,
 }
 
+/// A single declared store id, paired with the platform name the
+/// runtime will resolve via `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
+///
+/// The CLI's `provision` and `push` paths resolve the env override
+/// once (against `std::env`) and pass both names through, so the
+/// adapter writes the PLATFORM name into wrangler.toml /
+/// spin.toml / fastly.toml. Without the platform name on this
+/// side, `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config`
+/// would be silently ignored at provision time and the runtime
+/// would later look up a binding named `prod_config` that
+/// provision never created.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedStoreId {
+    /// The logical id declared in `[stores.<kind>].ids`. Used for
+    /// human-facing messages and for the validate/strict checks.
+    pub logical: String,
+    /// The platform name the runtime resolves at request time --
+    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME` or, when unset,
+    /// the logical id itself.
+    pub platform: String,
+}
+
+impl ResolvedStoreId {
+    /// Shorthand for the common case where the platform name
+    /// equals the logical id (no env override applied).
+    #[must_use]
+    #[inline]
+    pub fn from_logical<S: Into<String>>(logical: S) -> Self {
+        let logical_str = logical.into();
+        Self {
+            platform: logical_str.clone(),
+            logical: logical_str,
+        }
+    }
+
+    /// Test helper: collect a slice of logical ids into a
+    /// `Vec<ResolvedStoreId>` with platform names defaulted to the
+    /// logical ids themselves (no env overlay). Keeps the
+    /// per-adapter test fixtures terse.
+    #[must_use]
+    #[inline]
+    pub fn from_logicals(logicals: &[&str]) -> Vec<Self> {
+        logicals.iter().copied().map(Self::from_logical).collect()
+    }
+
+    /// Construct a resolved id with explicit logical and platform
+    /// names. Useful for tests that exercise the env-overlay
+    /// case + for the CLI's manual `resolve_kind` helper.
+    #[must_use]
+    #[inline]
+    pub fn new<L: Into<String>, P: Into<String>>(logical: L, platform: P) -> Self {
+        Self {
+            logical: logical.into(),
+            platform: platform.into(),
+        }
+    }
+}
+
 /// Per-kind store ids extracted from `[stores.<kind>].ids` in the
-/// manifest, handed to [`Adapter::provision`] so the adapter knows
-/// what to create. Empty slices mean the user didn't declare that
-/// store kind.
+/// manifest, with each id paired against its env-resolved platform
+/// name (`EDGEZERO__STORES__<KIND>__<ID>__NAME` or the id itself).
+/// Handed to [`Adapter::provision`] so the adapter writes the
+/// PLATFORM name into the per-platform manifest -- not the
+/// logical id, which the runtime would never look up.
+///
+/// Empty slices mean the user didn't declare that store kind.
 #[derive(Clone, Copy, Debug)]
 pub struct ProvisionStores<'stores> {
-    pub config: &'stores [String],
-    pub kv: &'stores [String],
-    pub secrets: &'stores [String],
+    pub config: &'stores [ResolvedStoreId],
+    pub kv: &'stores [ResolvedStoreId],
+    pub secrets: &'stores [ResolvedStoreId],
 }
 
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
@@ -120,7 +182,7 @@ pub trait Adapter: Sync + Send {
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _store_id: &str,
+        _store: &ResolvedStoreId,
         _entries: &[(String, String)],
         _dry_run: bool,
     ) -> Result<Vec<String>, String> {

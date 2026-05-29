@@ -146,7 +146,8 @@ pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastl
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
 }
 
-/// Dispatch with a config store. Prefer this over `run_app_with_logging` for new code.
+/// Dispatch with a config store wired explicitly. Use `run_app` for
+/// the manifest-driven flow that resolves stores automatically.
 ///
 /// # Errors
 /// Returns an error if logger setup fails or the underlying handler returns an error.
@@ -161,25 +162,6 @@ pub fn run_app_with_config<A: Hooks>(
         logging,
         req,
         config_store_name,
-        DEFAULT_KV_STORE_NAME,
-        &StoreRequirements::default(),
-    )
-}
-
-/// Compatibility wrapper for callers that do not use a config store.
-///
-/// # Errors
-/// Returns an error if logger setup fails or the underlying handler returns an error.
-#[cfg(feature = "fastly")]
-#[inline]
-pub fn run_app_with_logging<A: Hooks>(
-    logging: &FastlyLogging,
-    req: fastly::Request,
-) -> Result<fastly::Response, fastly::Error> {
-    run_app_with_stores::<A>(
-        logging,
-        req,
-        None,
         DEFAULT_KV_STORE_NAME,
         &StoreRequirements::default(),
     )

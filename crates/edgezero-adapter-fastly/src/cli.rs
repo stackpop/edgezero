@@ -8,7 +8,9 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
-use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction, ProvisionStores};
+use edgezero_adapter::registry::{
+    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -161,7 +163,7 @@ enum ConfigStoreLookup {
 // `&[]` for documentation, matching the inherited default.
 #[expect(
     clippy::missing_trait_methods,
-    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented"
+    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -220,22 +222,30 @@ impl Adapter for FastlyCliAdapter {
             ("config", stores.config),
             ("secret", stores.secrets),
         ] {
-            for id in ids {
+            for store in ids {
+                // Fastly setup tables key on the resource name the
+                // CLI creates. The runtime resolves that same name
+                // via `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME`,
+                // so provision must use the env-resolved PLATFORM
+                // name -- the logical id stays in status lines for
+                // human-facing wording.
+                let logical = store.logical.as_str();
+                let name = store.platform.as_str();
                 if dry_run {
                     out.push(format!(
-                        "would run `fastly {kind}-store create --name={id}` and append [setup.{kind}_stores.{id}] / [local_server.{kind}_stores.{id}] to {}",
+                        "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] / [local_server.{kind}_stores.{name}] to {} (logical id `{logical}`)",
                         fastly_path.display()
                     ));
                     continue;
                 }
-                if setup_block_present(&fastly_path, kind, id)? {
+                if setup_block_present(&fastly_path, kind, name)? {
                     out.push(format!(
-                        "fastly {kind}-store `{id}` already declared in {}; skipping",
+                        "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] / [local_server.{kind}_stores.{name}] blocks AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
                         fastly_path.display()
                     ));
                     continue;
                 }
-                create_fastly_store(kind, id)?;
+                create_fastly_store(kind, name)?;
                 // If the platform store was created but the
                 // writeback fails, remote state and the local
                 // manifest are out of sync. Re-running `provision`
@@ -243,14 +253,14 @@ impl Adapter for FastlyCliAdapter {
                 // and fail with "already exists". Surface the
                 // recovery path explicitly so the operator isn't
                 // stuck.
-                append_fastly_setup(&fastly_path, kind, id).map_err(|err| {
+                append_fastly_setup(&fastly_path, kind, name).map_err(|err| {
                     format!(
-                        "fastly {kind}-store `{id}` was created remotely, but writeback to {path} failed: {err}\n  To recover, either:\n    1. Manually append `[setup.{kind}_stores.{id}]` and `[local_server.{kind}_stores.{id}]` to {path} and re-run, or\n    2. Delete the orphan remote store via `fastly {kind}-store delete --name={id}` and re-run `edgezero provision --adapter fastly`.",
+                        "fastly {kind}-store `{name}` (logical id `{logical}`) was created remotely, but writeback to {path} failed: {err}\n  To recover, either:\n    1. Manually append `[setup.{kind}_stores.{name}]` and `[local_server.{kind}_stores.{name}]` to {path} and re-run, or\n    2. Delete the orphan remote store via `fastly {kind}-store delete --name={name}` and re-run `edgezero provision --adapter fastly`.",
                         path = fastly_path.display()
                     )
                 })?;
                 out.push(format!(
-                    "created fastly {kind}-store `{id}`; appended setup tables to {}",
+                    "created fastly {kind}-store `{name}` (logical id `{logical}`); appended setup tables to {}",
                     fastly_path.display()
                 ));
             }
@@ -266,18 +276,20 @@ impl Adapter for FastlyCliAdapter {
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        store_id: &str,
+        store: &ResolvedStoreId,
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         // Resolve the platform config-store id on demand via
         // `fastly config-store list --json` (matched by name =
-        // `store_id`), then `fastly config-store-entry create
+        // `store.platform`), then `fastly config-store-entry create
         // --store-id=<id> --key=<k> --value=<v>` per key. Keys
         // arrive pre-flattened from the CLI (dotted form).
+        let logical = store.logical.as_str();
+        let name = store.platform.as_str();
         if entries.is_empty() {
             return Ok(vec![format!(
-                "no config entries to push to fastly config-store `{store_id}`"
+                "no config entries to push to fastly config-store `{name}` (logical id `{logical}`)"
             )]);
         }
         if dry_run {
@@ -286,7 +298,7 @@ impl Adapter for FastlyCliAdapter {
             // shape.
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would resolve fastly config-store `{store_id}` via `fastly config-store list --json` and run `fastly config-store-entry create` for {} entries:",
+                "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and run `fastly config-store-entry create` for {} entries:",
                 entries.len()
             ));
             for (key, _) in entries {
@@ -294,12 +306,12 @@ impl Adapter for FastlyCliAdapter {
             }
             return Ok(out);
         }
-        let resolved_id = resolve_remote_config_store_id(store_id)?;
+        let resolved_id = resolve_remote_config_store_id(name)?;
         push_entries_with_committer(entries, |key, value| {
             create_config_store_entry(&resolved_id, key, value)
         })?;
         Ok(vec![format!(
-            "pushed {} entries to fastly config-store `{store_id}` (id={resolved_id})",
+            "pushed {} entries to fastly config-store `{name}` (logical id `{logical}`, id={resolved_id})",
             entries.len()
         )])
     }
@@ -347,7 +359,7 @@ fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
     // so re-running provision after a writeback failure is the
     // documented recovery and now actually works.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if looks_like_already_exists(&stderr) {
+    if looks_like_already_exists(&stderr, kind) {
         return Ok(());
     }
     Err(format!(
@@ -358,16 +370,31 @@ fn create_fastly_store(kind: &str, name: &str) -> Result<(), String> {
 }
 
 /// Heuristic: does the stderr blob look like a "store of this
-/// name already exists" failure from the fastly CLI? Different
-/// CLI versions phrase this slightly differently
+/// kind, by this name, already exists" failure from the fastly
+/// CLI? Different CLI versions phrase this slightly differently
 /// ("a kv-store with that name already exists",
-/// `"Conflict: duplicate kv_store name"`, etc.); we accept any
-/// case-insensitive substring that names the conflict.
-fn looks_like_already_exists(stderr: &str) -> bool {
+/// `"Conflict: duplicate kv_store name"`, etc.); we require BOTH
+/// a conflict-signal keyword AND a store-kind reference so an
+/// unrelated 409 ("Error: 409 Conflict on /service/...") cannot
+/// be misread as idempotent success. The earlier wider heuristic
+/// would have swallowed any stderr containing the word
+/// "conflict" and let provision march on to writeback against a
+/// nonexistent store, surfacing as a confusing deploy-time error.
+fn looks_like_already_exists(stderr: &str, kind: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
-    lower.contains("already exists")
+    let conflict_signal = lower.contains("already exists")
         || (lower.contains("duplicate") && lower.contains("name"))
-        || lower.contains("conflict")
+        || lower.contains("conflict");
+    if !conflict_signal {
+        return false;
+    }
+    // Accept the three common spellings of `<kind>-store` /
+    // `<kind>_store` / `<kind> store` so a fastly CLI version
+    // bump that reshuffles punctuation still hits.
+    let dashed = format!("{kind}-store");
+    let underscored = format!("{kind}_store");
+    let spaced = format!("{kind} store");
+    lower.contains(&dashed) || lower.contains(&underscored) || lower.contains(&spaced)
 }
 
 /// Probe `fastly.toml` for the existence of BOTH
@@ -976,23 +1003,67 @@ mod tests {
         // CLI varies across versions). Each must be detected so
         // create_fastly_store can treat it as idempotent success.
         assert!(looks_like_already_exists(
-            "Error: a kv-store with that name already exists"
+            "Error: a kv-store with that name already exists",
+            "kv",
         ));
         assert!(looks_like_already_exists(
-            "ERROR: Conflict (409): duplicate kv_store name"
+            "ERROR: Conflict (409): duplicate kv_store name",
+            "kv",
         ));
         assert!(looks_like_already_exists(
-            "A config-store with this name already exists"
+            "A config-store with this name already exists",
+            "config",
+        ));
+        // Spaced form: some fastly CLI versions emit prose
+        // ("kv store"); accept it alongside the punctuated forms.
+        assert!(looks_like_already_exists(
+            "Error: kv store conflict: name already in use",
+            "kv",
         ));
     }
 
     #[test]
     fn looks_like_already_exists_rejects_unrelated_errors() {
         assert!(!looks_like_already_exists(
-            "Error: unauthenticated; run `fastly profile create`"
+            "Error: unauthenticated; run `fastly profile create`",
+            "kv",
         ));
-        assert!(!looks_like_already_exists("Error: network unreachable"));
-        assert!(!looks_like_already_exists(""));
+        assert!(!looks_like_already_exists(
+            "Error: network unreachable",
+            "kv",
+        ));
+        assert!(!looks_like_already_exists("", "kv"));
+    }
+
+    #[test]
+    fn looks_like_already_exists_rejects_unrelated_conflict_errors() {
+        // The earlier wider heuristic swallowed ANY stderr
+        // containing "conflict" or "already exists", which would
+        // misread an unrelated 409 from a different fastly
+        // subcommand (e.g. a service-version conflict during a
+        // parallel deploy) as idempotent store-create success.
+        // Now we require the kind context too, so unrelated
+        // conflicts surface as failures.
+        assert!(
+            !looks_like_already_exists(
+                "Error: 409 Conflict on /service/abc/version/42 -- already exists",
+                "kv",
+            ),
+            "service-version conflict must NOT be misread as kv-store idempotency"
+        );
+        assert!(
+            !looks_like_already_exists(
+                "Error: invalid duplicate request; check name resolution",
+                "kv",
+            ),
+            "unrelated `duplicate ... name` AND-match must NOT trigger"
+        );
+        // And the kind must match: a config-store conflict must
+        // not look-like-already-exists for a kv-store create call.
+        assert!(
+            !looks_like_already_exists("Error: a config-store with that name already exists", "kv",),
+            "wrong-kind conflict must NOT trigger"
+        );
     }
 
     // ---------- setup_block_present ----------
@@ -1149,9 +1220,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
-        let kv_ids = vec!["sessions".to_owned()];
-        let config_ids = vec!["app_config".to_owned()];
-        let secret_ids = vec!["default".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["app_config"]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["default"]);
         let stores = ProvisionStores {
             config: &config_ids,
             kv: &kv_ids,
@@ -1173,7 +1244,7 @@ mod tests {
     #[test]
     fn provision_errors_when_adapter_manifest_path_missing() {
         let dir = tempdir().expect("tempdir");
-        let kv_ids = vec!["sessions".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1218,7 +1289,7 @@ mod tests {
             "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
         )
         .expect("write");
-        let kv_ids = vec!["sessions".to_owned()];
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1348,7 +1419,7 @@ mod tests {
                 dir.path(),
                 Some("fastly.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &entries,
                 true,
             )
@@ -1381,7 +1452,7 @@ mod tests {
                 dir.path(),
                 Some("fastly.toml"),
                 None,
-                "app_config",
+                &ResolvedStoreId::from_logical("app_config"),
                 &[],
                 false,
             )

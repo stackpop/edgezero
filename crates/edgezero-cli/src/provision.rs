@@ -11,10 +11,11 @@
 use std::path::Path;
 
 use crate::args::ProvisionArgs;
-use crate::config::enforce_single_store_capability;
+use crate::config::{enforce_single_store_capability, strict_handler_paths};
 use crate::ensure_adapter_defined;
-use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores};
-use edgezero_core::manifest::ManifestLoader;
+use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
+use edgezero_core::env_config::EnvConfig;
+use edgezero_core::manifest::{ManifestLoader, StoreDeclaration};
 
 /// # Errors
 ///
@@ -60,28 +61,44 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // declaration.
     enforce_single_store_capability(manifest, &args.adapter)?;
 
+    // Manifest-shape gate: provision is the most expensive
+    // operation in the CLI (it can create real Cloudflare / Fastly
+    // resources), so a malformed handler path or a broken
+    // adapter manifest should fail HERE rather than after the
+    // remote create succeeded. `strict_handler_paths` is cheap
+    // and unconditional in `config validate --strict`; we run it
+    // unconditionally here for the same reason as the capability
+    // check above. The per-adapter `validate_adapter_manifest`
+    // hook (Spin's `[component.*]` discovery, etc.) is the other
+    // half of the strict-validate preflight; it's adapter-specific
+    // so we call it only for the targeted adapter.
+    strict_handler_paths(manifest)?;
     let manifest_root = args
         .manifest
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    adapter.validate_adapter_manifest(
+        manifest_root,
+        adapter_cfg.adapter.manifest.as_deref(),
+        adapter_cfg.adapter.component.as_deref(),
+    )?;
 
+    // Resolve each logical store id to its platform name via the
+    // same `EDGEZERO__STORES__<KIND>__<ID>__NAME` env overlay the
+    // runtime reads. Provision writes the PLATFORM name into the
+    // per-platform manifest (wrangler.toml, spin.toml,
+    // fastly.toml); the logical id stays available for status-line
+    // wording so operators see what they declared even when the
+    // env override redirected the create.
+    let env_config = EnvConfig::from_env();
+    let config_ids = resolve_kind(manifest.stores.config.as_ref(), &env_config, "config");
+    let kv_ids = resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv");
+    let secret_ids = resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets");
     let stores = ProvisionStores {
-        config: manifest
-            .stores
-            .config
-            .as_ref()
-            .map_or(&[][..], |decl| decl.ids.as_slice()),
-        kv: manifest
-            .stores
-            .kv
-            .as_ref()
-            .map_or(&[][..], |decl| decl.ids.as_slice()),
-        secrets: manifest
-            .stores
-            .secrets
-            .as_ref()
-            .map_or(&[][..], |decl| decl.ids.as_slice()),
+        config: &config_ids,
+        kv: &kv_ids,
+        secrets: &secret_ids,
     };
 
     let lines = adapter.provision(
@@ -99,4 +116,296 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         log::info!("{line}");
     }
     Ok(())
+}
+
+/// Pair each declared id in `declaration` with its platform name
+/// via the `EDGEZERO__STORES__<KIND>__<ID>__NAME` env overlay.
+/// Returns empty when the manifest doesn't declare the kind.
+fn resolve_kind(
+    declaration: Option<&StoreDeclaration>,
+    env_config: &EnvConfig,
+    kind: &str,
+) -> Vec<ResolvedStoreId> {
+    declaration.map_or_else(Vec::new, |decl| {
+        decl.ids
+            .iter()
+            .map(|id| ResolvedStoreId::new(id.clone(), env_config.store_name(kind, id)))
+            .collect()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::ProvisionArgs;
+    use crate::test_support::{manifest_guard, EnvOverride, PROVISION_MANIFEST};
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn run_provision_axum_prints_local_only_notes_for_each_store() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: false,
+            manifest: manifest_path.clone(),
+        })
+        .expect("axum provision exits 0 (no remote resources)");
+    }
+
+    #[test]
+    fn run_provision_axum_dry_run_is_also_a_no_op() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("axum dry-run also exits 0");
+    }
+
+    #[test]
+    fn run_provision_errors_on_unknown_adapter() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "wat".to_owned(),
+            dry_run: false,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("unknown adapter must error");
+        assert!(
+            err.contains("wat"),
+            "error should name the unknown adapter: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_spin_dry_run_dispatches_to_adapter() {
+        // Dry-run path doesn't edit spin.toml, so CI can exercise
+        // dispatch by writing a single-component spin.toml the
+        // resolver can locate.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("spin dry-run dispatches cleanly");
+    }
+
+    #[test]
+    fn run_provision_rejects_malformed_handler_path_before_dispatching() {
+        // Provision is the most expensive operation in the CLI --
+        // it can create real platform resources. A trigger handler
+        // path that isn't a well-formed Rust `module::function`
+        // must fail HERE, not after the remote create succeeded.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[[triggers.http]]
+path = "/"
+methods = ["GET"]
+handler = "not a valid path"
+adapters = ["axum"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("malformed handler must error before dispatch");
+        assert!(
+            err.contains("handler") && err.contains("Rust path"),
+            "error names handler + Rust-path hint: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_spin_rejects_malformed_adapter_manifest_before_dispatching() {
+        // The adapter-specific `validate_adapter_manifest` hook
+        // also gates provision now -- a spin.toml with zero
+        // components must error before we touch any remote.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        // spin.toml with NO [component.*] table.
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n",
+        )
+        .expect("write empty spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("zero-component spin.toml must error pre-dispatch");
+        assert!(
+            err.contains("component") || err.contains("spin"),
+            "error names the manifest shape problem: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_spin_rejects_multi_config_ids_via_capability_gate() {
+        // Spin is Single-capable for `config` and `secrets`. Without
+        // an enforce_single_store_capability gate in run_provision,
+        // a manifest declaring two config ids would dispatch to the
+        // spin adapter dry-run and silently succeed, even though
+        // `config validate --strict` would correctly reject the same
+        // shape. This test pins the parity.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config", "other_config"]
+default = "app_config"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("Single-capability violation must error");
+        assert!(
+            err.contains("spin") && err.contains("Single-capable for config"),
+            "error names the adapter + kind: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_skips_capability_gate_for_kinds_within_single_id_floor() {
+        // Sanity: the capability gate fires ONLY when ids.len() > 1.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("single-id case dispatches cleanly");
+    }
+
+    #[test]
+    fn run_provision_cloudflare_dry_run_dispatches_to_adapter() {
+        // Dry-run path doesn't shell out to wrangler, so CI can
+        // exercise dispatch without wrangler installed.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::write(temp.path().join("wrangler.toml"), "name = \"demo\"\n")
+            .expect("write wrangler.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&ProvisionArgs {
+            adapter: "cloudflare".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("cloudflare dry-run dispatches cleanly");
+    }
+
+    #[test]
+    fn run_provision_fastly_dry_run_dispatches_to_adapter() {
+        // Dry-run path doesn't shell out to fastly, so CI can
+        // exercise dispatch without fastly installed.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::write(temp.path().join("fastly.toml"), "name = \"demo\"\n").expect("write fastly.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&ProvisionArgs {
+            adapter: "fastly".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("fastly dry-run dispatches cleanly");
+    }
 }

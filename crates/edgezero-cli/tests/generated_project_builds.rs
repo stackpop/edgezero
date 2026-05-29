@@ -69,6 +69,23 @@ mod tests {
             "generated workspace should pass `edgezero config validate`",
         );
 
+        // Also exercise --strict so the capability matrix
+        // (`strict_capability_completeness`) and the handler-path
+        // rule (`strict_handler_paths`) fire against a freshly
+        // generated project. A scaffold that emits a triggers list
+        // with a malformed handler or a manifest that violates the
+        // adapter capability matrix would silently pass plain
+        // validate but fail under strict.
+        let validate_strict = Command::new(env!("CARGO_BIN_EXE_edgezero"))
+            .args(["config", "validate", "--strict"])
+            .current_dir(&project)
+            .status()
+            .expect("run `edgezero config validate --strict` on the generated workspace");
+        assert!(
+            validate_strict.success(),
+            "generated workspace should pass `edgezero config validate --strict`",
+        );
+
         // Host target: the whole workspace, including the generated CLI
         // crate that imports `edgezero_cli`.
         let host = Command::new(env!("CARGO"))
