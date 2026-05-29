@@ -477,17 +477,16 @@ fn find_axum_manifest(start: &Path) -> Result<PathBuf, String> {
 }
 
 fn read_axum_project(manifest: &Path) -> Result<AxumProject, String> {
-    // Canonical `EDGEZERO__*` env vars take precedence. Fall back to the
-    // legacy `EDGEZERO_HOST` / `EDGEZERO_PORT` names for back-compat so a
-    // user who set them in CI scripts still gets a working address override;
-    // they'll be re-emitted to the subprocess under the canonical
-    // `EDGEZERO__ADAPTER__*` names that the runtime actually reads.
-    let env_host = env::var("EDGEZERO__ADAPTER__HOST")
-        .ok()
-        .or_else(|| env::var("EDGEZERO_HOST").ok());
-    let env_port = env::var("EDGEZERO__ADAPTER__PORT")
-        .ok()
-        .or_else(|| env::var("EDGEZERO_PORT").ok());
+    // Per the spec hard-cutoff: only the canonical
+    // `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT` env
+    // vars are honoured. The pre-rewrite `EDGEZERO_HOST` /
+    // `EDGEZERO_PORT` shim is gone -- the core runtime stopped
+    // reading those names, and keeping the axum wrapper compatible
+    // with them silently revived a precedence path the rest of
+    // the codebase had cut. Operators with legacy CI scripts must
+    // rename to the canonical form.
+    let env_host = env::var("EDGEZERO__ADAPTER__HOST").ok();
+    let env_port = env::var("EDGEZERO__ADAPTER__PORT").ok();
     read_axum_project_with_env(manifest, env_host.as_deref(), env_port.as_deref())
 }
 
