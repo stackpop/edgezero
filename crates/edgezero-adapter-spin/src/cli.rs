@@ -345,15 +345,27 @@ impl Adapter for SpinCliAdapter {
     }
 
     fn validate_app_config_keys(&self, keys: &[&str]) -> Result<(), String> {
-        // check 1: each dotted config key, translated `.→__`,
-        // must match `^[a-z][a-z0-9_]*$` — Spin's flat variable
-        // namespace has no other escaping.
+        // check 1: each dotted config key, translated via
+        // `translate_key_for_spin` (which both replaces `.→__` AND
+        // lowercases), must match `^[a-z][a-z0-9_]*$`. We mirror
+        // the writer's translation EXACTLY so the diagnostic names
+        // the form that would actually be written -- previously the
+        // validator left case intact and produced errors about a
+        // string that the writer would have lowercased before
+        // committing. The uppercase case is still surfaced via the
+        // source-key check below so the operator notices the
+        // mismatch instead of being silently lowercased.
         for key in keys {
-            let spin_var = key.replace('.', "__");
+            let spin_var = translate_key_for_spin(key);
             if !is_valid_spin_key(&spin_var) {
                 let reason = spin_key_rule_violation(&spin_var);
                 return Err(format!(
                     "config key `{key}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Rename the config key so the translated name conforms."
+                ));
+            }
+            if key.chars().any(|ch| ch.is_ascii_uppercase()) {
+                return Err(format!(
+                    "config key `{key}` contains uppercase characters. Spin variable names must be lowercase; the writer would otherwise silently produce `{spin_var}` and the source/runtime forms would disagree. Rename the config key to all-lowercase to match."
                 ));
             }
         }
@@ -440,6 +452,19 @@ fn is_valid_spin_key(key: &str) -> bool {
 /// or stray punctuation. Returns a short phrase to splice into
 /// the caller's full error.
 fn spin_key_rule_violation(key: &str) -> &'static str {
+    // Callers only invoke this AFTER `is_valid_spin_key` returned
+    // false; in production the per-char branches below exhaust the
+    // failure modes and the catch-all at the bottom is unreachable.
+    // It's kept defensively so a future regex tweak (e.g. allowing
+    // a new char class) doesn't crash the diagnostic helper with
+    // an unreachable!() before the caller can produce its error.
+    //
+    // Reachability notes for the per-mode branches:
+    // - `push_config_entries` translates keys via
+    //   `translate_key_for_spin` (which lowercases) BEFORE this
+    //   call, so the uppercase-first branch is unreachable from
+    //   that site. It IS reachable from `validate_app_config_keys`
+    //   and `validate_typed_secrets`, which check raw user input.
     let mut chars = key.chars();
     let Some(first) = chars.next() else {
         return "Spin variable names must not be empty";
@@ -461,6 +486,10 @@ fn spin_key_rule_violation(key: &str) -> &'static str {
             return "Spin variable names may only contain lowercase letters, digits, and underscores";
         }
     }
+    debug_assert!(
+        false,
+        "spin_key_rule_violation called with key `{key}` that satisfies the regex; check is_valid_spin_key + caller agreement"
+    );
     "Spin variable names must match `^[a-z][a-z0-9_]*$`"
 }
 
@@ -469,7 +498,21 @@ fn spin_key_rule_violation(key: &str) -> &'static str {
 /// `[variables.<key>]`) is found as a non-table value. Spin requires
 /// these slots to be tables; an inline value usually means an old
 /// hand-edited spin.toml that pre-dates the variables convention.
+///
+/// Wording differs by depth:
+/// - `variables.<key>`: the user almost certainly wrote
+///   `[variables]\n<key> = "..."` (scalar leaf). The right fix
+///   is `<key> = { default = "..." }`, NOT `[variables.<key>]` block.
+/// - Other slots: the user wrote `<what> = ...` (inline at the
+///   parent). The right fix is to break out the parent into block
+///   form.
 fn not_a_table_error(spin_path: &Path, what: &str) -> String {
+    if let Some(leaf) = what.strip_prefix("variables.") {
+        return format!(
+            "{}: [variables].{leaf} is a scalar value but Spin requires every variable declaration to be a sub-table with at least `default = \"...\"`. Replace `{leaf} = \"<value>\"` with `{leaf} = {{ default = \"<value>\" }}` (or a block-form `[variables.{leaf}]\\ndefault = \"<value>\"`).",
+            spin_path.display()
+        );
+    }
     format!(
         "{}: `{what}` exists but is not a TOML table. Spin requires `[{what}]` table syntax with key/value pairs underneath. If `{what} = ...` was set as a single inline value, replace it with `[{what}]` block syntax and move keys into it.",
         spin_path.display()
@@ -671,7 +714,11 @@ fn write_spin_variables(
     // (2) Component-level bindings under
     // [component.<component>.variables]. Surfaces the
     // application variable into the wasm component via spin's
-    // `{{ <key> }}` template syntax.
+    // `{{ <key> }}` template syntax. Mirrors the [variables]
+    // handling above: existing inline-table bindings
+    // (`variables = { foo = "..." }`) are preserved in-place
+    // rather than erroring -- the hand-edit habit that produces
+    // inline `[variables]` also produces this shape.
     let component_root = doc.entry("component").or_insert_with(table);
     let component_tbl = component_root
         .as_table_mut()
@@ -681,12 +728,31 @@ fn write_spin_variables(
         .as_table_mut()
         .ok_or_else(|| not_a_table_error(spin_path, &format!("component.{component_id}")))?;
     let bindings_entry = target_tbl.entry("variables").or_insert_with(table);
-    let bindings_tbl = bindings_entry.as_table_mut().ok_or_else(|| {
-        not_a_table_error(spin_path, &format!("component.{component_id}.variables"))
-    })?;
     for (spin_key, _) in entries {
         let template = format!("{{{{ {spin_key} }}}}");
-        bindings_tbl.insert(spin_key.as_str(), value(template));
+        match bindings_entry {
+            Item::Table(tbl) => {
+                tbl.insert(spin_key.as_str(), value(template));
+            }
+            Item::Value(toml_edit::Value::InlineTable(inline)) => {
+                inline.insert(spin_key.as_str(), toml_edit::Value::from(template));
+            }
+            Item::Value(
+                toml_edit::Value::String(_)
+                | toml_edit::Value::Integer(_)
+                | toml_edit::Value::Float(_)
+                | toml_edit::Value::Boolean(_)
+                | toml_edit::Value::Datetime(_)
+                | toml_edit::Value::Array(_),
+            )
+            | Item::None
+            | Item::ArrayOfTables(_) => {
+                return Err(not_a_table_error(
+                    spin_path,
+                    &format!("component.{component_id}.variables"),
+                ));
+            }
+        }
     }
 
     fs::write(spin_path, doc.to_string())
@@ -890,17 +956,37 @@ mod tests {
 
     #[test]
     fn spin_key_rule_violation_picks_the_right_diagnostic_per_mode() {
-        // Each failure mode produces a distinct, actionable phrase
-        // so the error message tells the operator WHICH bit of the
-        // rule they broke -- not just "doesn't match a regex".
-        assert!(spin_key_rule_violation("").contains("empty"));
-        assert!(spin_key_rule_violation("1foo").contains("digit"));
-        assert!(spin_key_rule_violation("Foo").contains("lowercase"));
-        assert!(spin_key_rule_violation("foo-bar").contains("lowercase letters, digits"));
-        assert!(spin_key_rule_violation("fooBar").contains("lowercase"));
+        // Pin the exact diagnostic string per failure mode so a
+        // future branch reorder can't pass these assertions by
+        // accident (e.g. "lowercase" appears in two distinct return
+        // values, so a substring-only check was too lax).
+        assert_eq!(
+            spin_key_rule_violation(""),
+            "Spin variable names must not be empty"
+        );
+        assert_eq!(
+            spin_key_rule_violation("1foo"),
+            "Spin variable names must start with a lowercase letter, not a digit"
+        );
+        assert_eq!(
+            spin_key_rule_violation("Foo"),
+            "Spin variable names must be lowercase (uppercase letters are not allowed)"
+        );
+        assert_eq!(
+            spin_key_rule_violation("foo-bar"),
+            "Spin variable names may only contain lowercase letters, digits, and underscores"
+        );
+        assert_eq!(
+            spin_key_rule_violation("fooBar"),
+            "Spin variable names must be lowercase (uppercase letters are not allowed)"
+        );
         // `_foo` starts with `_` -- not digit, not uppercase, not
-        // lowercase ASCII letter. Falls through to the catch-all.
-        assert!(spin_key_rule_violation("_foo").contains("lowercase ASCII letter"));
+        // lowercase ASCII letter. Falls through to the "must start
+        // with a lowercase ASCII letter" branch.
+        assert_eq!(
+            spin_key_rule_violation("_foo"),
+            "Spin variable names must start with a lowercase ASCII letter"
+        );
     }
 
     #[test]
@@ -1493,6 +1579,80 @@ mod tests {
         assert!(
             after.contains("greeting = {") || after.contains("greeting= {"),
             "preserved inline-table shape: {after}"
+        );
+    }
+
+    #[test]
+    fn write_spin_variables_updates_inline_component_bindings_in_place() {
+        // Symmetric with the [variables] inline-table case: if the
+        // operator hand-edited spin.toml with
+        // `[component.demo]` ... `variables = { foo = "{{ foo }}" }`,
+        // the writer must update the inline binding in place rather
+        // than erring "is not a table".
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n\
+             [application]\nname = \"x\"\nversion = \"0\"\n\
+             [variables]\n\
+             greeting = { default = \"hi\" }\n\
+             [component.demo]\nsource = \"demo.wasm\"\n\
+             variables = { greeting = \"{{ greeting }}\" }\n",
+        );
+        let entries = vec![
+            ("greeting".to_owned(), "updated".to_owned()),
+            ("vault".to_owned(), "default".to_owned()),
+        ];
+        write_spin_variables(&path, "demo", &entries)
+            .expect("inline component-binding writeback succeeds");
+
+        let after = fs::read_to_string(&path).expect("read back");
+        let parsed: toml::Value = toml::from_str(&after).expect("parses");
+        // Both [variables] inline-table entries updated.
+        assert_eq!(
+            parsed["variables"]["greeting"]["default"].as_str(),
+            Some("updated"),
+            "existing inline entry updated: {after}"
+        );
+        // Component binding still resolves greeting; new key added.
+        let bindings = parsed["component"]["demo"]["variables"]
+            .as_table()
+            .expect("bindings table");
+        assert_eq!(
+            bindings["greeting"].as_str(),
+            Some("{{ greeting }}"),
+            "existing binding preserved: {after}"
+        );
+        assert_eq!(
+            bindings["vault"].as_str(),
+            Some("{{ vault }}"),
+            "new binding inserted: {after}"
+        );
+    }
+
+    #[test]
+    fn write_spin_variables_rejects_bare_scalar_variable_entry_with_targeted_hint() {
+        // Hand-edited `[variables]\ngreeting = "hi"` is structurally
+        // wrong: Spin requires every variable to be a sub-table with
+        // a `default`. The error wording must steer the operator
+        // towards `greeting = { default = "hi" }`, NOT towards
+        // `[variables.greeting]` block syntax (which is also valid
+        // but misleads when the parent is already correctly a block).
+        let dir = tempdir().expect("tempdir");
+        let path = write_spin(
+            dir.path(),
+            "spin_manifest_version = 2\n\
+             [application]\nname = \"x\"\nversion = \"0\"\n\
+             [variables]\n\
+             greeting = \"hi\"\n\
+             [component.demo]\nsource = \"demo.wasm\"\n",
+        );
+        let entries = vec![("greeting".to_owned(), "updated".to_owned())];
+        let err = write_spin_variables(&path, "demo", &entries)
+            .expect_err("bare scalar value at variables.<key> must error");
+        assert!(
+            err.contains("scalar") && err.contains("default ="),
+            "error steers toward `key = {{ default = ... }}`: {err}"
         );
     }
 

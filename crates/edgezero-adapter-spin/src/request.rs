@@ -150,24 +150,7 @@ pub(crate) async fn dispatch_with_handles(
     // for the rationale. Only registries go into extensions —
     // legacy bare handles are synthesised into a one-id registry
     // at the dispatch boundary.
-    let config_registry = stores.config_registry.or_else(|| {
-        stores
-            .config_store
-            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
-    });
-    let kv_registry = stores.kv_registry.or_else(|| {
-        stores
-            .kv
-            .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
-    });
-    let secret_registry = stores.secret_registry.or_else(|| {
-        stores.secrets.map(|handle| {
-            SecretRegistry::single_id(
-                "default".to_owned(),
-                BoundSecretStore::new(handle, "default".to_owned()),
-            )
-        })
-    });
+    let (config_registry, kv_registry, secret_registry) = synthesise_store_registries(stores);
     if let Some(registry) = config_registry {
         core_request.extensions_mut().insert(registry);
     }
@@ -213,6 +196,42 @@ pub(crate) async fn dispatch_with_registries(
         },
     )
     .await
+}
+
+/// Pure synthesis: collapse a `Stores` (which may carry both a
+/// wired multi-id registry AND a legacy bare handle) into the
+/// three registries that go into request extensions. Precedence
+/// is "registry wins": a wired registry is taken verbatim; only
+/// in its absence is a bare handle wrapped into a one-id registry
+/// keyed under `"default"`. Pulled out as a pure function so the
+/// precedence contract is unit-testable without spinning up a
+/// real `IncomingRequest` and async dispatcher.
+fn synthesise_store_registries(
+    stores: Stores,
+) -> (
+    Option<ConfigRegistry>,
+    Option<KvRegistry>,
+    Option<SecretRegistry>,
+) {
+    let config_registry = stores.config_registry.or_else(|| {
+        stores
+            .config_store
+            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+    });
+    let kv_registry = stores.kv_registry.or_else(|| {
+        stores
+            .kv
+            .map(|handle| KvRegistry::single_id("default".to_owned(), handle))
+    });
+    let secret_registry = stores.secret_registry.or_else(|| {
+        stores.secrets.map(|handle| {
+            SecretRegistry::single_id(
+                "default".to_owned(),
+                BoundSecretStore::new(handle, "default".to_owned()),
+            )
+        })
+    });
+    (config_registry, kv_registry, secret_registry)
 }
 
 fn build_kv_registry(
@@ -333,5 +352,89 @@ fn into_core_method(
         spin_sdk::http::Method::Trace => Ok(edgezero_core::http::Method::TRACE),
         spin_sdk::http::Method::Other(s) => edgezero_core::http::Method::from_bytes(s.as_bytes())
             .map_err(|_| EdgeError::bad_request(format!("unsupported HTTP method: {s}"))),
+    }
+}
+
+#[cfg(test)]
+mod synthesis_tests {
+    use super::*;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::key_value_store::{KvStore, NoopKvStore};
+    use edgezero_core::secret_store::{NoopSecretStore, SecretHandle};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    struct StubConfig;
+    #[async_trait::async_trait(?Send)]
+    impl ConfigStore for StubConfig {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(None)
+        }
+    }
+
+    fn kv_handle() -> KvHandle {
+        let store: Arc<dyn KvStore> = Arc::new(NoopKvStore);
+        KvHandle::new(store)
+    }
+
+    fn config_handle() -> ConfigStoreHandle {
+        ConfigStoreHandle::new(Arc::new(StubConfig))
+    }
+
+    fn secret_handle() -> SecretHandle {
+        SecretHandle::new(Arc::new(NoopSecretStore))
+    }
+
+    #[test]
+    fn synthesis_wraps_bare_kv_handle_under_default_when_no_registry() {
+        let stores = Stores {
+            kv: Some(kv_handle()),
+            ..Default::default()
+        };
+        let (config, kv, secret) = synthesise_store_registries(stores);
+        assert!(config.is_none());
+        assert!(secret.is_none());
+        let kv = kv.expect("kv registry synthesised");
+        assert_eq!(kv.default_id(), "default");
+        assert!(kv.named("other").is_none());
+    }
+
+    #[test]
+    fn synthesis_registry_wins_over_bare_handle_when_both_wired() {
+        let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+        by_id.insert("sessions".to_owned(), kv_handle());
+        let registry = KvRegistry::new(by_id, "sessions".to_owned());
+        let stores = Stores {
+            kv: Some(kv_handle()),
+            kv_registry: Some(registry),
+            ..Default::default()
+        };
+        let (_, kv, _) = synthesise_store_registries(stores);
+        let kv = kv.expect("registry survives");
+        assert_eq!(kv.default_id(), "sessions");
+        assert!(
+            kv.named("default").is_none(),
+            "bare handle's `default` synth NOT merged in"
+        );
+    }
+
+    #[test]
+    fn synthesis_returns_none_for_each_kind_with_no_wiring() {
+        let (config, kv, secret) = synthesise_store_registries(Stores::default());
+        assert!(config.is_none() && kv.is_none() && secret.is_none());
+    }
+
+    #[test]
+    fn synthesis_handles_config_and_secret_bare_handles_symmetrically() {
+        let stores = Stores {
+            config_store: Some(config_handle()),
+            secrets: Some(secret_handle()),
+            ..Default::default()
+        };
+        let (config, _, secret) = synthesise_store_registries(stores);
+        assert_eq!(config.expect("config").default_id(), "default");
+        let secret = secret.expect("secret");
+        assert_eq!(secret.default_id(), "default");
+        assert_eq!(secret.default().expect("bound").store_name(), "default");
     }
 }
