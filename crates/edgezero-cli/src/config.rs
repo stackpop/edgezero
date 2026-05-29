@@ -597,6 +597,29 @@ fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
     // `Adapter::single_store_kinds()` impl. Adapters not in the
     // registry (e.g. a feature-gated build that omitted some) are
     // skipped — we can't speak for what isn't linked.
+    for adapter_name in manifest.adapters.keys() {
+        enforce_single_store_capability(manifest, adapter_name)?;
+    }
+    Ok(())
+}
+
+/// Per-adapter capability check shared by `config validate --strict`
+/// (which iterates over every declared adapter) and `provision` /
+/// `config push` (which target a single adapter). Surfaces a clear
+/// error when the manifest declares more ids for a store kind than
+/// the adapter can model. An unregistered adapter is a no-op --
+/// we can't speak for what isn't linked into this build.
+pub(crate) fn enforce_single_store_capability(
+    manifest: &Manifest,
+    adapter_name: &str,
+) -> Result<(), String> {
+    let Some(adapter) = adapter_registry::get_adapter(adapter_name) else {
+        return Ok(());
+    };
+    let single_kinds = adapter.single_store_kinds();
+    if single_kinds.is_empty() {
+        return Ok(());
+    }
     for (kind, maybe_decl) in [
         ("kv", manifest.stores.kv.as_ref()),
         ("config", manifest.stores.config.as_ref()),
@@ -608,16 +631,11 @@ fn strict_capability_completeness(manifest: &Manifest) -> Result<(), String> {
         if declaration.ids.len() <= 1 {
             continue;
         }
-        for adapter_name in manifest.adapters.keys() {
-            let Some(adapter) = adapter_registry::get_adapter(adapter_name) else {
-                continue;
-            };
-            if adapter.single_store_kinds().contains(&kind) {
-                return Err(format!(
-                    "adapter `{adapter_name}` is Single-capable for {kind} stores but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
-                    declaration.ids.len()
-                ));
-            }
+        if single_kinds.contains(&kind) {
+            return Err(format!(
+                "adapter `{adapter_name}` is Single-capable for {kind} stores but [stores.{kind}].ids declares {} ids; pick one or drop the adapter",
+                declaration.ids.len()
+            ));
         }
     }
     Ok(())

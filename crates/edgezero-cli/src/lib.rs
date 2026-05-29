@@ -608,6 +608,85 @@ auth-status = "echo whoami"
     }
 
     #[test]
+    fn run_provision_spin_rejects_multi_config_ids_via_capability_gate() {
+        // Spin is Single-capable for `config` and `secrets` (one
+        // flat variable namespace per component). Without an
+        // enforce_single_store_capability gate in run_provision,
+        // a manifest declaring two config ids would dispatch to
+        // the spin adapter dry-run and silently succeed, even
+        // though `config validate --strict` would correctly
+        // reject the same shape. This test pins the parity: the
+        // provision capability gate fires for the operator-named
+        // adapter and surfaces the same error.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config", "other_config"]
+default = "app_config"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&args::ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("Single-capability violation must error");
+        assert!(
+            err.contains("spin") && err.contains("Single-capable for config"),
+            "error names the adapter + kind: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_skips_capability_gate_for_kinds_within_single_id_floor() {
+        // Sanity: the capability gate fires ONLY when ids.len() > 1.
+        // A manifest with exactly one config id (Single-bound) and
+        // one secret id is a valid spin manifest and must dispatch.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        run_provision(&args::ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("single-id case dispatches cleanly");
+    }
+
+    #[test]
     fn run_provision_cloudflare_dry_run_dispatches_to_adapter() {
         // Real impl shipped in 6.2 — dry-run path doesn't shell
         // out to wrangler, so CI can exercise dispatch without
