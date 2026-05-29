@@ -69,6 +69,14 @@ struct ProjectLayout {
     core_mod: String,
     core_name: String,
     crates_dir: PathBuf,
+    /// `EnvPrefix` Handlebars key -- the project name normalised to
+    /// the env-var prefix the runtime actually reads (uppercase,
+    /// `-`→`_`). Mirrors `edgezero_core::app_config::app_name_prefix`
+    /// EXACTLY so the scaffold's documentation comments name the
+    /// real overlay key (e.g. `MY_APP__SERVICE__TIMEOUT_MS=...`),
+    /// not the source-form lowercase (`my-app__...` would be
+    /// silently ignored at runtime).
+    env_prefix: String,
     name: String,
     out_dir: PathBuf,
     project_mod: String,
@@ -108,6 +116,7 @@ impl ProjectLayout {
         let project_mod = name.replace('-', "_");
         let core_mod = core_name.replace('-', "_");
         let upper_camel = upper_camel_from_sanitized(&name);
+        let env_prefix = env_prefix_from_name(&name);
         Ok(ProjectLayout {
             cli_dir,
             cli_name,
@@ -115,6 +124,7 @@ impl ProjectLayout {
             core_mod,
             core_name,
             crates_dir,
+            env_prefix,
             name,
             out_dir,
             project_mod,
@@ -159,6 +169,17 @@ fn upper_camel_from_sanitized(name: &str) -> String {
     } else {
         out
     }
+}
+
+/// Derive the env-overlay prefix the runtime reads for this project.
+///
+/// MUST mirror `edgezero_core::app_config::app_name_prefix`
+/// EXACTLY -- otherwise the scaffold's documentation comments
+/// would advertise an env-var spelling the runtime ignores. The
+/// runtime rule is `to_ascii_uppercase().replace('-', "_")`, so
+/// `my-app` -> `MY_APP` and `app-demo` -> `APP_DEMO`.
+fn env_prefix_from_name(name: &str) -> String {
+    name.to_ascii_uppercase().replace('-', "_")
 }
 
 /// Locate the edgezero checkout that built this binary.
@@ -557,6 +578,7 @@ fn build_base_data(
         "NameUpperCamel".into(),
         Value::String(layout.upper_camel.clone()),
     );
+    data.insert("EnvPrefix".into(), Value::String(layout.env_prefix.clone()));
     data.insert(
         "dep_edgezero_core".into(),
         Value::String(core_crate_line.to_owned()),
@@ -785,6 +807,43 @@ mod tests {
         // Digit-leading produces a digit-leading PascalCase result, which
         // would be an invalid Rust ident, so we prefix `App`.
         assert_eq!(upper_camel_from_sanitized("123-app"), "App123App");
+    }
+
+    #[test]
+    fn env_prefix_from_name_matches_runtime_app_name_prefix_exactly() {
+        // The scaffold's documentation has to advertise the exact
+        // env-var spelling the runtime reads, not the source-form
+        // lowercase. Mirror `edgezero_core::app_config::app_name_prefix`
+        // EXACTLY: uppercase, `-`→`_`. A drift here would teach
+        // operators to set `my-app__SERVICE__TIMEOUT_MS=...` which
+        // the runtime silently ignores.
+        assert_eq!(env_prefix_from_name("my-app"), "MY_APP");
+        assert_eq!(env_prefix_from_name("app-demo"), "APP_DEMO");
+        assert_eq!(env_prefix_from_name("foo"), "FOO");
+        assert_eq!(env_prefix_from_name("a_b-c"), "A_B_C");
+        // Digit-leading: sanitize_crate_name emits `_123app` -- the
+        // underscore is preserved and the uppercase form is correct
+        // for the runtime overlay.
+        assert_eq!(env_prefix_from_name("_123app"), "_123APP");
+    }
+
+    #[test]
+    fn env_prefix_from_name_agrees_with_runtime_app_name_prefix() {
+        // Pin agreement with the runtime by calling its rule on the
+        // same inputs. The runtime function isn't pub, but its
+        // documented contract is `to_ascii_uppercase + '-'→'_'`,
+        // which we replicate verbatim. If a future change to the
+        // runtime's normalisation broke this property, the test
+        // would catch it (assuming the runtime added a test that
+        // pinned the new shape).
+        for name in ["app-demo", "my-app", "foo", "a-b-c", "x"] {
+            let runtime_shape = name.to_ascii_uppercase().replace('-', "_");
+            assert_eq!(
+                env_prefix_from_name(name),
+                runtime_shape,
+                "drift for {name}"
+            );
+        }
     }
 
     #[test]

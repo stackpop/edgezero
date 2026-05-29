@@ -5,8 +5,11 @@
 # wrapper.
 #
 # Env-var overlay: every key here can be overridden at runtime by
-# `app_demo__<SECTION>__…__<KEY>` (uppercase, `-`→`_`, `__` separator)
-# as long as the key already exists below.
+# `APP_DEMO__<SECTION>__…__<KEY>` (the prefix is the project name
+# uppercased with `-`→`_`; nested sections are joined by `__`) as
+# long as the key already exists below. Example:
+# `APP_DEMO__SERVICE__TIMEOUT_MS=2500` overrides the
+# `[service] timeout_ms` field below.
 
 # `api_token` is the *key* inside the resolved default secret store
 # (see `[stores.secrets]` in `edgezero.toml`). The handler resolves it
