@@ -435,6 +435,13 @@ mod synthesis_tests {
         assert_eq!(config.expect("config").default_id(), "default");
         let secret = secret.expect("secret");
         assert_eq!(secret.default_id(), "default");
+        // BoundSecretStore binds the synthesised secret to platform
+        // store name "default". A handler reading via
+        // `ctx.secret_store_default()?.require_str(key)` resolves
+        // the spin variable literally named "default"; if the
+        // operator's spin.toml uses a different name, the runtime
+        // require_str() surfaces a clear variable-name error
+        // rather than a silent miss.
         assert_eq!(secret.default().expect("bound").store_name(), "default");
     }
 }

@@ -113,37 +113,31 @@ Key listing is paginated by design. This avoids buffering an unbounded number of
 
 ### Local Development
 
-- **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. The default store name uses `.edgezero/kv.redb`; custom store names get their own derived file. Data persists across restarts (add `.edgezero/` to your `.gitignore`).
-- **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` entry in `fastly.toml`.
+- **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. Each declared KV id gets its own derived file; data persists across restarts (add `.edgezero/` to your `.gitignore`).
+- **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` and `[setup.kv_stores]` entry per declared KV id. `edgezero provision --adapter fastly` writes both blocks for you; the example below assumes a `sessions` id.
 
   ```toml
-  [[local_server.kv_stores.EDGEZERO_KV]]
+  [[local_server.kv_stores.sessions]]
   key = "__init__"
   data = ""
 
-  [setup.kv_stores.EDGEZERO_KV]
+  [setup.kv_stores.sessions]
   description = "Application KV store"
   ```
 
-- **Cloudflare (Workerd)**: Requires a KV namespace and a binding in `wrangler.toml`.
-  1. Create the namespace (run once per environment):
+  Override the platform name per environment via
+  `EDGEZERO__STORES__KV__SESSIONS__NAME=<other-name>`; provision honours
+  the override when it writes the setup blocks.
 
-     ```sh
-     wrangler kv namespace create EDGEZERO_KV
-     wrangler kv namespace create EDGEZERO_KV --preview
-     ```
+- **Cloudflare (Workerd)**: `edgezero provision --adapter cloudflare` creates the namespace and appends the `[[kv_namespaces]]` binding using the env-resolved platform name (`EDGEZERO__STORES__KV__<ID>__NAME` or the logical id by default). The example below shows what provision writes for a `sessions` id with no override:
 
-     Each command prints an `id` — copy them into `wrangler.toml`:
+  ```toml
+  [[kv_namespaces]]
+  binding = "sessions"
+  id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"       # filled by provision
+  ```
 
-  2. Add the binding to `wrangler.toml`:
-     ```toml
-     [[kv_namespaces]]
-     binding = "EDGEZERO_KV"
-     id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"       # from step 1
-     preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" # from step 1 --preview
-     ```
-
-  The `binding` name MUST match the store name configured in `edgezero.toml` (default: `"EDGEZERO_KV"`).
+  The `binding` name MUST match what the runtime opens — by default the logical id, otherwise the env override.
 
 - **Spin**: Requires a `key_value_stores` label in `spin.toml`.
 

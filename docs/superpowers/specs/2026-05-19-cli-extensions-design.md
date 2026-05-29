@@ -526,9 +526,13 @@ Cloudflare/Fastly and the spec must encode that explicitly.
 
 **KV — label-backed, multi-store.** `SpinKvStore` is backed by
 `spin_sdk::key_value`. Each logical KV id maps to a Spin KV store
-**label** via `[adapters.spin.stores.kv.<id>].name`. Multiple labels
-are fine. The runtime adapter opens each configured label and
-registers it by logical id.
+**label** resolved at runtime from
+`EDGEZERO__STORES__KV__<ID>__NAME` (default = the logical id).
+Multiple labels are fine. The runtime adapter opens each
+configured label and registers it by logical id. (Pre-rewrite,
+this lived in `[adapters.spin.stores.kv.<id>].name` -- gone now;
+the manifest declares only logical ids and the env-resolved
+platform name takes over.)
 
 - **TTL is unsupported.** `spin_sdk::key_value` has no expiry. The
   `BoundKvStore` surface still exposes `put_*_with_ttl` (used by other
@@ -1084,7 +1088,8 @@ push` resolves them on demand (§13).
 provisioned by the Spin runtime / Fermyon at deploy). `provision
 --adapter spin` performs **KV-label `spin.toml` writeback only**:
 
-- KV: ensure each KV label (`[adapters.spin.stores.kv.<id>].name`)
+- KV: ensure each KV label (resolved from
+  `EDGEZERO__STORES__KV__<ID>__NAME`, defaulting to the logical id)
   appears in the resolved component's `key_value_stores` array field
   (`key_value_stores = [...]` under `[component.<component>]`).
 - **Config and secret variables are NOT handled by `provision`.** The

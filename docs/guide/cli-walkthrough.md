@@ -175,19 +175,23 @@ Then set the value at run time via `SPIN_VARIABLE_API_TOKEN=<value>` or
 
 ## 6. Env-var overlay
 
-Every key in `myapp.toml` can be overridden at load time by a `<APP_NAME>__…__<KEY>`
-environment variable (uppercase, dotted segments joined by `__`). The overlay applies
-to both `config validate` and `config push` so the values you see match the runtime:
+Every key in `myapp.toml` can be overridden at load time by an
+`<APP_NAME>__…__<KEY>` environment variable, where `<APP_NAME>` is the
+manifest's `[app].name` uppercased with `-` → `_`. For an app named `myapp`
+the prefix is `MYAPP__`; for `my-app` it would be `MY_APP__`. Dotted config
+keys are joined with `__`. The overlay applies to both `config validate`
+and `config push` so the values you see match the runtime:
 
 ```bash
 # myapp.toml: service.timeout_ms = 1500
-APP_NAME__SERVICE__TIMEOUT_MS=5000 myapp-cli config push --adapter axum
+MYAPP__SERVICE__TIMEOUT_MS=5000 myapp-cli config push --adapter axum
 # .edgezero/local-config-app_config.json now has "service.timeout_ms": "5000"
 ```
 
-`<APP_NAME>` is the manifest's `[app].name`, uppercased with `-` → `_`. Pass
-`--no-env` to skip the overlay (useful when CI builds want the on-disk values
-verbatim).
+Pass `--no-env` to skip the overlay (useful when CI builds want the on-disk
+values verbatim). Setting the lowercase / source-form spelling
+(`myapp__...`) is silently ignored at runtime — the prefix must be the
+normalised form.
 
 ## 7. Build + deploy
 

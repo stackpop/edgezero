@@ -759,6 +759,7 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::app_config::app_name_prefix;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -829,19 +830,19 @@ mod tests {
 
     #[test]
     fn env_prefix_from_name_agrees_with_runtime_app_name_prefix() {
-        // Pin agreement with the runtime by calling its rule on the
-        // same inputs. The runtime function isn't pub, but its
-        // documented contract is `to_ascii_uppercase + '-'→'_'`,
-        // which we replicate verbatim. If a future change to the
-        // runtime's normalisation broke this property, the test
-        // would catch it (assuming the runtime added a test that
-        // pinned the new shape).
-        for name in ["app-demo", "my-app", "foo", "a-b-c", "x"] {
-            let runtime_shape = name.to_ascii_uppercase().replace('-', "_");
+        // Pin agreement with the runtime by calling the actual
+        // runtime function. If a future change to
+        // `edgezero_core::app_config::app_name_prefix` updates the
+        // normalisation rule (adds character handling, strips a
+        // prefix, etc.) without a matching change here, this test
+        // catches the drift immediately and the scaffold's
+        // documentation stays correct.
+        for name in ["app-demo", "my-app", "foo", "a-b-c", "x", "_123app"] {
+            let runtime_shape = app_name_prefix(name);
             assert_eq!(
                 env_prefix_from_name(name),
                 runtime_shape,
-                "drift for {name}"
+                "scaffold env_prefix_from_name drifted from runtime app_name_prefix for {name:?}"
             );
         }
     }
@@ -942,6 +943,31 @@ mod tests {
         assert!(
             config_rs.contains("edgezero_core::AppConfig"),
             "config.rs must derive edgezero_core::AppConfig"
+        );
+
+        // The scaffold's env-overlay documentation must name the
+        // ACTUAL prefix the runtime reads -- `DEMO_APP__SERVICE__TIMEOUT_MS`
+        // for project `demo-app`. A regression that reintroduced
+        // `{{name}}__...` in the templates would render as
+        // `demo-app__...` here and teach operators an env-var
+        // spelling the runtime silently ignores. Both the typed
+        // struct's rustdoc AND `<name>.toml`'s comment block must
+        // pass this check.
+        assert!(
+            config_rs.contains("DEMO_APP__SERVICE__TIMEOUT_MS"),
+            "config.rs rustdoc must advertise the DEMO_APP__-prefixed env override: {config_rs}"
+        );
+        assert!(
+            !config_rs.contains("demo-app__") && !config_rs.contains("demo_app__SERVICE"),
+            "config.rs must NOT show source-form lowercase env prefixes: {config_rs}"
+        );
+        assert!(
+            app_toml.contains("DEMO_APP__"),
+            "<name>.toml env-overlay comment must use the DEMO_APP__ prefix: {app_toml}"
+        );
+        assert!(
+            !app_toml.contains("demo-app__") && !app_toml.contains("demo_app__SERVICE"),
+            "<name>.toml must NOT show source-form lowercase env prefixes: {app_toml}"
         );
 
         let core_cargo = fs::read_to_string(project_dir.join("crates/demo-app-core/Cargo.toml"))

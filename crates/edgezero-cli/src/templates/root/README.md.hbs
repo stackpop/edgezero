@@ -21,4 +21,4 @@ This workspace demonstrates a multi-target EdgeZero app.
 
 ## Configuration
 
-Environment variables are declared in `edgezero.toml`. Set `API_BASE_URL` to the upstream origin you want `/proxy/...` to target and provide adapter-specific secrets (for example `API_TOKEN`) when deploying.
+Environment variables are declared in `edgezero.toml`. Set `API_BASE_URL` to the upstream origin you want `/proxy/...` to target. Adapter-specific secrets are opt-in: uncomment the `#[secret]` field in `crates/{{proj_core}}/src/config.rs` and the matching `[stores.secrets]` block in `edgezero.toml`, then provide the secret value through the wired backend (Cloudflare Worker secret, Fastly Secret Store, Spin secret variable, ...).

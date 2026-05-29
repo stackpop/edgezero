@@ -21,10 +21,11 @@
 
 use crate::args::{ConfigPushArgs, ConfigValidateArgs};
 use crate::ensure_adapter_defined;
-use edgezero_adapter::registry as adapter_registry;
+use edgezero_adapter::registry::{self as adapter_registry, ResolvedStoreId};
 use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind,
 };
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -40,9 +41,14 @@ use validator::Validate;
 /// target adapter + store id.
 struct PushContext {
     adapter: &'static dyn adapter_registry::Adapter,
-    /// Resolved logical config store id (`--store` or the manifest
-    /// default).
-    store_id: String,
+    /// Resolved config store id (`--store` or the manifest
+    /// default), paired with its env-resolved platform name. The
+    /// platform name is what the adapter writes / pushes into
+    /// the per-platform backing (wrangler.toml binding, fastly
+    /// config-store-name, spin variable space), so an operator
+    /// who sets `EDGEZERO__STORES__CONFIG__<ID>__NAME=...` sees
+    /// it honoured at push time, not just at runtime.
+    store: ResolvedStoreId,
     /// Validate-shaped pre-loaded state (manifest + raw config).
     validation: ValidationContext,
 }
@@ -211,10 +217,12 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
             args.manifest.display()
         )
     })?;
-    let store_id = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
+    let logical = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
+    let env_config = EnvConfig::from_env();
+    let platform = env_config.store_name("config", &logical);
     Ok(PushContext {
         adapter,
-        store_id,
+        store: ResolvedStoreId::new(logical, platform),
         validation,
     })
 }
@@ -242,15 +250,16 @@ fn dispatch_push(
         manifest_root,
         adapter_cfg.adapter.manifest.as_deref(),
         adapter_cfg.adapter.component.as_deref(),
-        &ctx.store_id,
+        &ctx.store,
         entries,
         dry_run,
     )?;
     if dry_run {
         log::info!(
-            "[edgezero] config push --dry-run for `{}` -> store `{}`:",
+            "[edgezero] config push --dry-run for `{}` -> store `{}` (platform name `{}`):",
             ctx.adapter.name(),
-            ctx.store_id
+            ctx.store.logical,
+            ctx.store.platform
         );
     }
     for line in lines {
@@ -641,7 +650,7 @@ pub(crate) fn enforce_single_store_capability(
     Ok(())
 }
 
-fn strict_handler_paths(manifest: &Manifest) -> Result<(), String> {
+pub(crate) fn strict_handler_paths(manifest: &Manifest) -> Result<(), String> {
     for trigger in &manifest.triggers.http {
         let Some(handler) = &trigger.handler else {
             continue;

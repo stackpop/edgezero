@@ -270,7 +270,14 @@ fn apply_env_overlay(
 /// Normalise an app name to the env-var prefix (`<APP_NAME>` form
 /// from): uppercase, `-`→`_`. A single leading `_` from a
 /// project name that starts with a digit is preserved.
-fn app_name_prefix(app_name: &str) -> String {
+///
+/// Exposed as `pub` so the scaffold generator can mirror this rule
+/// exactly when emitting `{{EnvPrefix}}__...` documentation -- if
+/// the two derivations drift, operators see env-var spellings the
+/// runtime silently ignores.
+#[must_use]
+#[inline]
+pub fn app_name_prefix(app_name: &str) -> String {
     app_name.to_ascii_uppercase().replace('-', "_")
 }
 

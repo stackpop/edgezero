@@ -9,7 +9,9 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
-use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction, ProvisionStores};
+use edgezero_adapter::registry::{
+    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
@@ -127,7 +129,7 @@ struct EdgezeroAxumConfig {
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; the trait defaults already model that"
+    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for AxumCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -171,19 +173,26 @@ impl Adapter for AxumCliAdapter {
                 .saturating_add(stores.config.len())
                 .saturating_add(stores.secrets.len()),
         );
-        for id in stores.kv {
+        for store in stores.kv {
+            let logical = store.logical.as_str();
             out.push(format!(
-                "axum KV store `{id}` is in-memory; nothing to provision"
+                "axum KV store `{logical}` is in-memory; nothing to provision"
             ));
         }
-        for id in stores.config {
+        for store in stores.config {
+            // Axum reads `.edgezero/local-config-<logical>.json`.
+            // The platform name is informational here -- the env
+            // overlay isn't used for local file paths because the
+            // path encoding is the spec's canonical form.
+            let logical = store.logical.as_str();
             out.push(format!(
-                "axum config store `{id}` reads `.edgezero/local-config-{id}.json`; nothing to provision"
+                "axum config store `{logical}` reads `.edgezero/local-config-{logical}.json`; nothing to provision"
             ));
         }
-        for id in stores.secrets {
+        for store in stores.secrets {
+            let logical = store.logical.as_str();
             out.push(format!(
-                "axum secret store `{id}` reads env vars; nothing to provision"
+                "axum secret store `{logical}` reads env vars; nothing to provision"
             ));
         }
         if out.is_empty() {
@@ -197,15 +206,21 @@ impl Adapter for AxumCliAdapter {
         manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        store_id: &str,
+        store: &ResolvedStoreId,
         entries: &[(String, String)],
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         //: axum is local-only. Push writes the same flat
         // `string -> string` JSON object `AxumConfigStore` reads
-        // back from `.edgezero/local-config-<id>.json`.
+        // back from `.edgezero/local-config-<id>.json`. The path
+        // is keyed on the LOGICAL id, not the env-resolved
+        // platform name -- the local file flow is the spec's
+        // canonical form and isn't subject to the per-store env
+        // overlay (which targets platform store names, not local
+        // file paths).
+        let logical = store.logical.as_str();
         let local_dir = manifest_root.join(".edgezero");
-        let target = local_dir.join(format!("local-config-{store_id}.json"));
+        let target = local_dir.join(format!("local-config-{logical}.json"));
         if dry_run {
             return Ok(vec![format!(
                 "would write {} entries to {}",
@@ -1076,7 +1091,14 @@ mod tests {
             ("service.timeout_ms".to_owned(), "1500".to_owned()),
         ];
         let lines = AxumCliAdapter
-            .push_config_entries(dir.path(), None, None, "app_config", &entries, false)
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &entries,
+                false,
+            )
             .expect("push succeeds");
         assert_eq!(lines.len(), 1);
         assert!(
@@ -1095,7 +1117,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let entries = vec![("greeting".to_owned(), "hello".to_owned())];
         let lines = AxumCliAdapter
-            .push_config_entries(dir.path(), None, None, "app_config", &entries, true)
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &entries,
+                true,
+            )
             .expect("dry-run succeeds");
         assert!(
             lines[0].contains("would write 1 entries"),
@@ -1112,7 +1141,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let entries = vec![("key".to_owned(), "value".to_owned())];
         AxumCliAdapter
-            .push_config_entries(dir.path(), None, None, "x", &entries, false)
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("x"),
+                &entries,
+                false,
+            )
             .expect("push succeeds");
         assert!(dir.path().join(".edgezero").is_dir(), ".edgezero created");
     }
@@ -1121,7 +1157,14 @@ mod tests {
     fn push_with_empty_entries_writes_empty_json_object() {
         let dir = tempfile::tempdir().expect("tempdir");
         AxumCliAdapter
-            .push_config_entries(dir.path(), None, None, "empty", &[], false)
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("empty"),
+                &[],
+                false,
+            )
             .expect("push succeeds even with no entries");
         let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-empty.json"))
             .expect("read written file");
