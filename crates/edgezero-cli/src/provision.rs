@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use crate::args::ProvisionArgs;
+use crate::config::enforce_single_store_capability;
 use crate::ensure_adapter_defined;
 use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores};
 use edgezero_core::manifest::ManifestLoader;
@@ -48,6 +49,16 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
             args.manifest.display()
         )
     })?;
+
+    // Capability gate: mirror the strict `config validate` check for
+    // THIS adapter only. Without it, `provision --adapter spin`
+    // happily accepts a manifest with two config ids and dispatches
+    // to a backend that has no way to model multiple stores -- the
+    // failure only surfaces at runtime as a confusing "wrong store"
+    // miss. The check is unconditional (no --strict gate) because
+    // it's not stylistic: the platform genuinely cannot honour the
+    // declaration.
+    enforce_single_store_capability(manifest, &args.adapter)?;
 
     let manifest_root = args
         .manifest
