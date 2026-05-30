@@ -10,43 +10,48 @@ pub struct SpinConfigStore {
 }
 
 enum SpinConfigBackend {
-    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    Spin,
     #[cfg(test)]
     InMemory(HashMap<String, String>),
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    Spin,
     /// Never constructed; keeps the enum inhabited outside production Spin and tests.
     #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
     _Uninhabited(std::convert::Infallible),
 }
 
 impl SpinConfigStore {
-    /// Create a new `SpinConfigStore` using the Spin variables API.
-    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: SpinConfigBackend::Spin,
-        }
-    }
-
     #[cfg(test)]
     fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
         Self {
             inner: SpinConfigBackend::InMemory(entries.into_iter().collect()),
         }
     }
+
+    /// Create a new `SpinConfigStore` using the Spin variables API.
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: SpinConfigBackend::Spin,
+        }
+    }
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl Default for SpinConfigStore {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl ConfigStore for SpinConfigStore {
+    #[inline]
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         match &self.inner {
+            #[cfg(test)]
+            SpinConfigBackend::InMemory(data) => Ok(data.get(key).cloned()),
             #[cfg(all(feature = "spin", target_arch = "wasm32"))]
             SpinConfigBackend::Spin => {
                 use spin_sdk::variables;
@@ -56,11 +61,9 @@ impl ConfigStore for SpinConfigStore {
                     Err(variables::Error::InvalidName(msg)) => {
                         Err(ConfigStoreError::invalid_key(msg))
                     }
-                    Err(e) => Err(ConfigStoreError::unavailable(e.to_string())),
+                    Err(err) => Err(ConfigStoreError::unavailable(err.to_string())),
                 }
             }
-            #[cfg(test)]
-            SpinConfigBackend::InMemory(data) => Ok(data.get(key).cloned()),
             #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
             SpinConfigBackend::_Uninhabited(never) => {
                 let _: &str = key;
