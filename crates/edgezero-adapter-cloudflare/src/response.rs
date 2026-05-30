@@ -4,10 +4,18 @@ use edgezero_core::http::Response;
 use futures_util::StreamExt as _;
 use worker::{Error as WorkerError, Response as CfResponse};
 
+/// Convert an `EdgeZero` `Response` into a Cloudflare Worker `Response`.
+///
+/// # Errors
+/// Returns an [`EdgeError`] if the response body cannot be materialised
+/// into a Workers response (empty body construction failure, byte body
+/// conversion failure, stream adoption failure) or if any response
+/// header is non-UTF-8 and the Workers header table rejects it.
+#[inline]
 pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
     let (parts, body) = response.into_parts();
 
-    let cf_response = match body {
+    let body_response = match body {
         Body::Once(bytes) if bytes.is_empty() => {
             CfResponse::empty().map_err(EdgeError::internal)?
         }
@@ -23,7 +31,7 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
         }
     };
 
-    let mut cf_response = cf_response.with_status(parts.status.as_u16());
+    let mut cf_response = body_response.with_status(parts.status.as_u16());
     let headers = cf_response.headers_mut();
     for (name, value) in &parts.headers {
         if let Ok(value_str) = value.to_str() {
@@ -41,10 +49,11 @@ mod tests {
     use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::http::response_builder;
-    use futures_util::{stream, StreamExt as _};
+    use futures::executor::block_on;
+    use futures_util::stream;
 
     #[test]
-    #[ignore] // Requires worker runtime — cannot construct worker::Response in unit tests
+    #[ignore = "requires worker runtime — worker::Response cannot be constructed in unit tests"]
     fn propagates_status_and_headers() {
         let response = response_builder()
             .status(201)
@@ -67,10 +76,10 @@ mod tests {
 
         let mut cf = from_core_response(response).expect("cf response");
         let mut byte_stream = cf.stream().expect("byte stream");
-        let collected = futures::executor::block_on(async {
+        let collected = block_on(async {
             let mut out = Vec::new();
-            while let Some(chunk) = byte_stream.next().await {
-                let chunk = chunk.expect("chunk");
+            while let Some(item) = byte_stream.next().await {
+                let chunk = item.expect("chunk");
                 out.extend_from_slice(&chunk);
             }
             out

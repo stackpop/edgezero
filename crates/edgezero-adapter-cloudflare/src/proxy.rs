@@ -4,7 +4,7 @@ use edgezero_core::body::Body;
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
-use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
+use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse, PROXY_HEADER};
 use futures_util::stream::{self, LocalBoxStream, StreamExt as _};
 use futures_util::TryStreamExt as _;
 use std::io;
@@ -13,37 +13,39 @@ use worker::{
     Request as CfRequest, RequestInit, Response as CfResponse,
 };
 
+type ChunkStream = LocalBoxStream<'static, Result<Vec<u8>, io::Error>>;
+
 pub struct CloudflareProxyClient;
 
 #[async_trait(?Send)]
 impl ProxyClient for CloudflareProxyClient {
+    #[inline]
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _ext) = request.into_parts();
-        let cf_request = build_cf_request(method, &uri, headers, body).await?;
+        let cf_request = build_cf_request(&method, &uri, &headers, body)?;
         let mut cf_response = Fetch::Request(cf_request)
             .send()
             .await
             .map_err(EdgeError::internal)?;
 
-        let mut proxy_response = convert_response(&mut cf_response).await?;
-        proxy_response.headers_mut().insert(
-            edgezero_core::proxy::PROXY_HEADER,
-            HeaderValue::from_static("cloudflare"),
-        );
+        let mut proxy_response = convert_response(&mut cf_response)?;
+        proxy_response
+            .headers_mut()
+            .insert(PROXY_HEADER, HeaderValue::from_static("cloudflare"));
         Ok(proxy_response)
     }
 }
 
-async fn build_cf_request(
-    method: Method,
+fn build_cf_request(
+    method: &Method,
     uri: &Uri,
-    headers: HeaderMap,
+    headers: &HeaderMap,
     body: Body,
 ) -> Result<CfRequest, EdgeError> {
     let mut init = RequestInit::new();
-    init.with_method(http_method_to_cf(method.clone()));
+    init.with_method(http_method_to_cf(method));
 
-    let cf_headers = Headers::from(&headers);
+    let cf_headers = Headers::from(headers);
     init.with_headers(cf_headers);
 
     attach_body(&mut init, body)?;
@@ -82,7 +84,7 @@ fn attach_body(init: &mut RequestInit, body: Body) -> Result<(), EdgeError> {
     Ok(())
 }
 
-async fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse, EdgeError> {
+fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse, EdgeError> {
     let status = StatusCode::from_u16(cf_response.status_code()).map_err(EdgeError::internal)?;
     let mut proxy_response = ProxyResponse::new(status, Body::empty());
 
@@ -102,7 +104,9 @@ async fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse,
 
     let worker_stream = cf_response.stream().map_err(EdgeError::internal)?;
 
-    let chunk_stream: ChunkStream = worker_stream.map_err(worker_error_to_io).boxed_local();
+    let chunk_stream: ChunkStream = worker_stream
+        .map_err(|err| worker_error_to_io(&err))
+        .boxed_local();
     let body_stream = transform_stream(chunk_stream, encoding.as_deref());
     *proxy_response.body_mut() = Body::from_stream(body_stream);
 
@@ -116,9 +120,8 @@ async fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse,
     Ok(proxy_response)
 }
 
-fn http_method_to_cf(method: Method) -> CfMethod {
-    match method {
-        Method::GET => CfMethod::Get,
+fn http_method_to_cf(method: &Method) -> CfMethod {
+    match *method {
         Method::POST => CfMethod::Post,
         Method::PUT => CfMethod::Put,
         Method::PATCH => CfMethod::Patch,
@@ -131,12 +134,6 @@ fn http_method_to_cf(method: Method) -> CfMethod {
     }
 }
 
-type ChunkStream = LocalBoxStream<'static, Result<Vec<u8>, io::Error>>;
-
-fn worker_error_to_io(err: worker::Error) -> io::Error {
-    io::Error::other(err.to_string())
-}
-
 fn transform_stream(
     stream: ChunkStream,
     encoding: Option<&str>,
@@ -146,6 +143,10 @@ fn transform_stream(
         Some("br") => decode_brotli_stream(stream).boxed_local(),
         _ => stream.map(|res| res.map(Bytes::from)).boxed_local(),
     }
+}
+
+fn worker_error_to_io(err: &worker::Error) -> io::Error {
+    io::Error::other(err.to_string())
 }
 
 #[cfg(test)]
@@ -162,8 +163,8 @@ mod tests {
             Body::Once(bytes) => bytes.to_vec(),
             Body::Stream(mut stream) => block_on(async {
                 let mut out = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.expect("chunk");
+                while let Some(item) = stream.next().await {
+                    let chunk = item.expect("chunk");
                     out.extend_from_slice(&chunk);
                 }
                 out
@@ -192,13 +193,12 @@ mod tests {
         assert_eq!(collect_body(body), b"gzip payload");
 
         let mut brotli_data = Vec::new();
-        {
-            let mut compressor = CompressorWriter::new(&mut brotli_data, 4096, 5, 21);
-            compressor.write_all(b"brotli payload").unwrap()
-        };
+        let mut compressor = CompressorWriter::new(&mut brotli_data, 4096, 5, 21);
+        compressor.write_all(b"brotli payload").unwrap();
+        drop(compressor);
         let brotli_stream: ChunkStream =
             Box::pin(stream::iter(vec![Ok::<Vec<u8>, io::Error>(brotli_data)]));
-        let body = Body::from_stream(transform_stream(brotli_stream, Some("br")));
-        assert_eq!(collect_body(body), b"brotli payload");
+        let brotli_body = Body::from_stream(transform_stream(brotli_stream, Some("br")));
+        assert_eq!(collect_body(brotli_body), b"brotli payload");
     }
 }
