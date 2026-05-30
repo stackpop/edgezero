@@ -1,196 +1,207 @@
 #![cfg(all(feature = "fastly", target_arch = "wasm32"))]
-// Keep coverage for the deprecated low-level dispatch path while it remains public.
-#![allow(deprecated)]
+// Keep coverage for the deprecated low-level dispatch path while it remains
+// public.
+#![allow(
+    deprecated,
+    reason = "the deprecated dispatch helper is still part of the public API; \
+              contract coverage stays until the helper is removed"
+)]
 
-use bytes::Bytes;
-use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_adapter_fastly::request::{dispatch, dispatch_with_config_handle, into_core_request};
-use edgezero_adapter_fastly::response::from_core_response;
-use edgezero_core::app::App;
-use edgezero_core::body::Body;
-use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
-use edgezero_core::context::RequestContext;
-use edgezero_core::error::EdgeError;
-use edgezero_core::http::{response_builder, Method, Response, StatusCode};
-use edgezero_core::router::RouterService;
-use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
-use fastly::Request as FastlyRequest;
-use futures::stream;
-use std::sync::Arc;
-
-struct FixedConfigStore(&'static str);
-
-impl ConfigStore for FixedConfigStore {
-    fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(Some(self.0.to_owned()))
-    }
-}
-
-fn build_test_app() -> App {
-    async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let body = Body::text(ctx.request().uri().to_string());
-        let response = response_builder()
-            .status(StatusCode::OK)
-            .body(body)
-            .expect("response");
-        Ok(response)
-    }
-
-    async fn mirror_body(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let bytes = ctx.request().body().as_bytes().expect("buffered").to_vec();
-        let response = response_builder()
-            .status(StatusCode::OK)
-            .body(Body::from(bytes))
-            .expect("response");
-        Ok(response)
-    }
-
-    async fn stream_response(_ctx: RequestContext) -> Result<Response, EdgeError> {
-        let chunks = stream::iter(vec![
-            Bytes::from_static(b"chunk-1"),
-            Bytes::from_static(b"chunk-2"),
-        ]);
-
-        let response = response_builder()
-            .status(StatusCode::OK)
-            .body(Body::stream(chunks))
-            .expect("response");
-        Ok(response)
-    }
-
-    async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-        let value = ctx
-            .config_store()
-            .and_then(|store| store.get("greeting").ok().flatten())
-            .unwrap_or_else(|| "missing".to_owned());
-        let response = response_builder()
-            .status(StatusCode::OK)
-            .body(Body::text(value))
-            .expect("response");
-        Ok(response)
-    }
-
-    let router = RouterService::builder()
-        .get("/uri", capture_uri)
-        .post("/mirror", mirror_body)
-        .get("/stream", stream_response)
-        .get("/config", config_value)
-        .build();
-
-    App::new(router)
-}
-
-fn fastly_request(method: FastlyMethod, path: &str, body: Option<&[u8]>) -> FastlyRequest {
-    // Viceroy validates Fastly request URLs at construction time, so the
-    // contract tests must use absolute URLs instead of path-only strings.
-    let mut req = FastlyRequest::new(method, format!("http://example.com{path}"));
-    req.set_header("host", "example.com");
-    req.set_header("x-edgezero-test", "1");
-    if let Some(bytes) = body {
-        req.set_body(bytes.to_vec());
-    }
-    req
-}
-
-#[test]
-fn into_core_request_preserves_method_uri_headers_body_and_context() {
-    let req = fastly_request(FastlyMethod::POST, "/mirror?foo=bar", Some(b"payload"));
-    let expected_ip = req.get_client_ip_addr();
-
-    let core_request = into_core_request(req).expect("core request");
-
-    assert_eq!(core_request.method(), &Method::POST);
-    assert_eq!(core_request.uri().path(), "/mirror");
-    assert_eq!(core_request.uri().query(), Some("foo=bar"));
-
-    let headers = core_request.headers();
-    assert_eq!(
-        headers
-            .get("x-edgezero-test")
-            .and_then(|value| value.to_str().ok()),
-        Some("1")
-    );
-
-    assert_eq!(
-        core_request.body().as_bytes().expect("buffered"),
-        b"payload"
-    );
-
-    let context = FastlyRequestContext::get(&core_request).expect("context");
-    assert_eq!(context.client_ip, expected_ip);
-}
-
-#[test]
-fn from_core_response_translates_status_headers_and_streaming_body() {
-    let response = response_builder()
-        .status(StatusCode::CREATED)
-        .header("x-edgezero-res", "1")
-        .body(Body::stream(stream::iter(vec![
-            Bytes::from_static(b"hello"),
-            Bytes::from_static(b" "),
-            Bytes::from_static(b"world"),
-        ])))
-        .expect("response");
-
-    let mut fastly_response = from_core_response(response).expect("fastly response");
-
-    assert_eq!(fastly_response.get_status(), FastlyStatus::CREATED);
-    assert!(fastly_response.get_header("x-edgezero-res").is_some());
-    assert_eq!(fastly_response.take_body_bytes(), b"hello world");
-}
-
-#[test]
-fn dispatch_runs_router_and_returns_response() {
-    let app = build_test_app();
-    let req = fastly_request(FastlyMethod::GET, "/uri", None);
-
-    let mut response = dispatch(&app, req).expect("fastly response");
-
-    assert_eq!(response.get_status(), FastlyStatus::OK);
-    assert_eq!(response.take_body_bytes(), b"http://example.com/uri");
-}
-
-#[test]
-fn dispatch_streaming_route_preserves_chunks() {
-    let app = build_test_app();
-    let req = fastly_request(FastlyMethod::GET, "/stream", None);
-
-    let mut response = dispatch(&app, req).expect("fastly response");
-
-    assert_eq!(response.get_status(), FastlyStatus::OK);
-    assert_eq!(response.take_body_bytes(), b"chunk-1chunk-2");
-}
-
-#[test]
-fn dispatch_passes_request_body_to_handlers() {
-    let app = build_test_app();
-    let req = fastly_request(FastlyMethod::POST, "/mirror", Some(b"echo"));
-
-    let mut response = dispatch(&app, req).expect("fastly response");
-
-    assert_eq!(response.get_status(), FastlyStatus::OK);
-    assert_eq!(response.take_body_bytes(), b"echo");
-}
-
-#[test]
-fn dispatch_with_config_handle_injects_handle() {
-    let app = build_test_app();
-    let req = fastly_request(FastlyMethod::GET, "/config", None);
-    let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from fastly test")));
-
-    let mut response = dispatch_with_config_handle(&app, req, handle).expect("fastly response");
-
-    assert_eq!(response.get_status(), FastlyStatus::OK);
-    assert_eq!(response.take_body_bytes(), b"hello from fastly test");
-}
-
-#[cfg(all(feature = "fastly", target_arch = "wasm32"))]
+// Compile-time check: FastlySecretStore implements SecretStore.
 mod secret_store_compile_check {
     use edgezero_adapter_fastly::secret_store::FastlySecretStore;
     use edgezero_core::secret_store::SecretStore;
 
-    fn _assert_provider_impl<T: SecretStore>() {}
-    fn _check() {
-        _assert_provider_impl::<FastlySecretStore>();
+    fn assert_provider_impl<T: SecretStore>() {}
+
+    // Anonymous const whose initializer is a never-called fn pointer; the
+    // type bound is checked at type-check time.
+    const _: fn() = assert_provider_impl::<FastlySecretStore>;
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use edgezero_adapter_fastly::context::FastlyRequestContext;
+    use edgezero_adapter_fastly::request::{
+        dispatch, dispatch_with_config_handle, into_core_request,
+    };
+    use edgezero_adapter_fastly::response::from_core_response;
+    use edgezero_core::app::App;
+    use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use edgezero_core::context::RequestContext;
+    use edgezero_core::error::EdgeError;
+    use edgezero_core::http::{response_builder, Method, Response, StatusCode};
+    use edgezero_core::router::RouterService;
+    use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
+    use fastly::Request as FastlyRequest;
+    use futures::stream;
+    use std::sync::Arc;
+
+    struct FixedConfigStore(&'static str);
+
+    impl ConfigStore for FixedConfigStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(Some(self.0.to_owned()))
+        }
+    }
+
+    fn build_test_app() -> App {
+        async fn capture_uri(ctx: RequestContext) -> Result<Response, EdgeError> {
+            let body = Body::text(ctx.request().uri().to_string());
+            let response = response_builder()
+                .status(StatusCode::OK)
+                .body(body)
+                .expect("response");
+            Ok(response)
+        }
+
+        async fn mirror_body(ctx: RequestContext) -> Result<Response, EdgeError> {
+            let bytes = ctx.request().body().as_bytes().expect("buffered").to_vec();
+            let response = response_builder()
+                .status(StatusCode::OK)
+                .body(Body::from(bytes))
+                .expect("response");
+            Ok(response)
+        }
+
+        async fn stream_response(_ctx: RequestContext) -> Result<Response, EdgeError> {
+            let chunks = stream::iter(vec![
+                Bytes::from_static(b"chunk-1"),
+                Bytes::from_static(b"chunk-2"),
+            ]);
+
+            let response = response_builder()
+                .status(StatusCode::OK)
+                .body(Body::stream(chunks))
+                .expect("response");
+            Ok(response)
+        }
+
+        async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
+            let value = ctx
+                .config_store()
+                .and_then(|store| store.get("greeting").ok().flatten())
+                .unwrap_or_else(|| "missing".to_owned());
+            let response = response_builder()
+                .status(StatusCode::OK)
+                .body(Body::text(value))
+                .expect("response");
+            Ok(response)
+        }
+
+        let router = RouterService::builder()
+            .get("/uri", capture_uri)
+            .post("/mirror", mirror_body)
+            .get("/stream", stream_response)
+            .get("/config", config_value)
+            .build();
+
+        App::new(router)
+    }
+
+    fn fastly_request(method: FastlyMethod, path: &str, body: Option<&[u8]>) -> FastlyRequest {
+        // Viceroy validates Fastly request URLs at construction time, so the
+        // contract tests must use absolute URLs instead of path-only strings.
+        let mut req = FastlyRequest::new(method, format!("http://example.com{path}"));
+        req.set_header("host", "example.com");
+        req.set_header("x-edgezero-test", "1");
+        if let Some(bytes) = body {
+            req.set_body(bytes.to_vec());
+        }
+        req
+    }
+
+    #[test]
+    fn into_core_request_preserves_method_uri_headers_body_and_context() {
+        let req = fastly_request(FastlyMethod::POST, "/mirror?foo=bar", Some(b"payload"));
+        let expected_ip = req.get_client_ip_addr();
+
+        let core_request = into_core_request(req).expect("core request");
+
+        assert_eq!(core_request.method(), &Method::POST);
+        assert_eq!(core_request.uri().path(), "/mirror");
+        assert_eq!(core_request.uri().query(), Some("foo=bar"));
+
+        let headers = core_request.headers();
+        assert_eq!(
+            headers
+                .get("x-edgezero-test")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        assert_eq!(
+            core_request.body().as_bytes().expect("buffered"),
+            b"payload"
+        );
+
+        let context = FastlyRequestContext::get(&core_request).expect("context");
+        assert_eq!(context.client_ip, expected_ip);
+    }
+
+    #[test]
+    fn from_core_response_translates_status_headers_and_streaming_body() {
+        let response = response_builder()
+            .status(StatusCode::CREATED)
+            .header("x-edgezero-res", "1")
+            .body(Body::stream(stream::iter(vec![
+                Bytes::from_static(b"hello"),
+                Bytes::from_static(b" "),
+                Bytes::from_static(b"world"),
+            ])))
+            .expect("response");
+
+        let mut fastly_response = from_core_response(response).expect("fastly response");
+
+        assert_eq!(fastly_response.get_status(), FastlyStatus::CREATED);
+        assert!(fastly_response.get_header("x-edgezero-res").is_some());
+        assert_eq!(fastly_response.take_body_bytes(), b"hello world");
+    }
+
+    #[test]
+    fn dispatch_runs_router_and_returns_response() {
+        let app = build_test_app();
+        let req = fastly_request(FastlyMethod::GET, "/uri", None);
+
+        let mut response = dispatch(&app, req).expect("fastly response");
+
+        assert_eq!(response.get_status(), FastlyStatus::OK);
+        assert_eq!(response.take_body_bytes(), b"http://example.com/uri");
+    }
+
+    #[test]
+    fn dispatch_streaming_route_preserves_chunks() {
+        let app = build_test_app();
+        let req = fastly_request(FastlyMethod::GET, "/stream", None);
+
+        let mut response = dispatch(&app, req).expect("fastly response");
+
+        assert_eq!(response.get_status(), FastlyStatus::OK);
+        assert_eq!(response.take_body_bytes(), b"chunk-1chunk-2");
+    }
+
+    #[test]
+    fn dispatch_passes_request_body_to_handlers() {
+        let app = build_test_app();
+        let req = fastly_request(FastlyMethod::POST, "/mirror", Some(b"echo"));
+
+        let mut response = dispatch(&app, req).expect("fastly response");
+
+        assert_eq!(response.get_status(), FastlyStatus::OK);
+        assert_eq!(response.take_body_bytes(), b"echo");
+    }
+
+    #[test]
+    fn dispatch_with_config_handle_injects_handle() {
+        let app = build_test_app();
+        let req = fastly_request(FastlyMethod::GET, "/config", None);
+        let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from fastly test")));
+
+        let mut response = dispatch_with_config_handle(&app, req, handle).expect("fastly response");
+
+        assert_eq!(response.get_status(), FastlyStatus::OK);
+        assert_eq!(response.take_body_bytes(), b"hello from fastly test");
     }
 }
