@@ -408,7 +408,7 @@ fn missing_store_handles_return_absent_values_in_handler() {
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod wasm {
     use super::*;
-    use edgezero_adapter_spin::from_core_response;
+    use edgezero_adapter_spin::response::from_core_response;
 
     #[test]
     fn from_core_response_translates_status_and_headers() {
@@ -465,7 +465,8 @@ mod wasm {
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod store_trait_compile_checks {
-    use edgezero_adapter_spin::{SpinKvStore, SpinSecretStore};
+    use edgezero_adapter_spin::key_value_store::SpinKvStore;
+    use edgezero_adapter_spin::secret_store::SpinSecretStore;
     use edgezero_core::key_value_store::KvStore;
     use edgezero_core::secret_store::SecretStore;
 
