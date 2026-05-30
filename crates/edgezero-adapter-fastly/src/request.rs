@@ -10,7 +10,6 @@ use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Request};
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::manifest::DEFAULT_KV_STORE_NAME as CORE_DEFAULT_KV_STORE_NAME;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
@@ -26,12 +25,6 @@ use crate::key_value_store::FastlyKvStore;
 use crate::proxy::FastlyProxyClient;
 use crate::response::{from_core_response, parse_uri};
 use crate::secret_store::FastlySecretStore;
-
-/// Default Fastly KV Store name.
-///
-/// If a KV Store with this name exists in your Fastly service, it will
-/// be automatically available to handlers via the `Kv` extractor.
-pub const DEFAULT_KV_STORE_NAME: &str = CORE_DEFAULT_KV_STORE_NAME;
 
 const WARNED_STORE_CACHE_LIMIT: usize = 64;
 
@@ -74,20 +67,185 @@ struct Stores {
     secrets: Option<SecretHandle>,
 }
 
-/// Low-level manual dispatch.
+enum ConfigSource {
+    Handle(ConfigStoreHandle),
+    Name(String),
+    None,
+}
+
+/// Fastly per-request dispatch service.
 ///
-/// This path does not resolve or inject config-store metadata from a manifest.
-/// Prefer `run_app` or `dispatch_with_config` for normal config-store-aware
-/// dispatch. Use `dispatch_with_config_handle` only when you already have a
-/// prepared `ConfigStoreHandle`.
-#[deprecated(
-    note = "dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
-)]
-/// # Errors
-/// Returns an error if request conversion fails or the underlying handler returns an error.
-#[inline]
-pub fn dispatch(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
-    dispatch_raw(app, req)
+/// Builds a router invocation with the stores the operator wants
+/// injected into request extensions, then dispatches one request
+/// against the wrapped `App`. The store wiring is a per-Service
+/// decision; on Fastly Compute that means per-request (the worker
+/// model invokes the entrypoint per HTTP request), but the Service
+/// type itself is cheap to build.
+///
+/// Replaces the prior `dispatch_with_*` variant fan-out. Each
+/// builder method is independent: enable any combination of KV,
+/// config, and secret stores by chaining the relevant `with_*` /
+/// `require_*` calls. The manifest-driven `run_app` is still the
+/// recommended entrypoint for normal flows -- the Service builder
+/// is for manual / no-manifest deployments.
+///
+/// ```rust,ignore
+/// FastlyService::new(&app)
+///     .with_kv("sessions").require_kv()
+///     .with_config("app_config")
+///     .with_secrets()
+///     .dispatch(req)
+/// ```
+pub struct FastlyService<'app> {
+    app: &'app App,
+    config: ConfigSource,
+    kv: Option<KvSource>,
+    secrets: SecretSource,
+}
+
+struct KvSource {
+    name: String,
+    required: bool,
+}
+
+enum SecretSource {
+    Off,
+    On { required: bool },
+}
+
+impl<'app> FastlyService<'app> {
+    /// Resolve every wired store at request time and dispatch
+    /// against the wrapped `App`. Consumes the service so a builder
+    /// can't be reused with stale wiring.
+    ///
+    /// # Errors
+    /// Returns an error if a required store cannot be opened or
+    /// the underlying handler returns an error.
+    #[inline]
+    pub fn dispatch(self, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
+        let config_store = match self.config {
+            ConfigSource::Handle(handle) => Some(handle),
+            ConfigSource::Name(name) => match FastlyConfigStore::try_open(&name) {
+                Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
+                Err(err) => {
+                    warn_missing_store_once(&name, &err.to_string());
+                    None
+                }
+            },
+            ConfigSource::None => None,
+        };
+        let kv = match self.kv {
+            Some(source) => resolve_kv_handle(&source.name, source.required)?,
+            None => None,
+        };
+        let secrets = match self.secrets {
+            SecretSource::Off => None,
+            SecretSource::On { required } => resolve_secret_handle(required),
+        };
+        dispatch_with_handles(
+            self.app,
+            req,
+            Stores {
+                config_store,
+                kv,
+                secrets,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Build a new service that dispatches against `app` with NO
+    /// stores wired. Chain `.with_*` / `.require_*` to add stores.
+    #[must_use]
+    #[inline]
+    pub fn new(app: &'app App) -> Self {
+        Self {
+            app,
+            config: ConfigSource::None,
+            kv: None,
+            secrets: SecretSource::Off,
+        }
+    }
+
+    /// Promote the previously-wired KV store to required: an
+    /// unavailable store causes dispatch to return an error
+    /// instead of silently degrading. No-op when `with_kv` wasn't
+    /// called.
+    #[must_use]
+    #[inline]
+    pub fn require_kv(mut self) -> Self {
+        if let Some(kv) = self.kv.as_mut() {
+            kv.required = true;
+        }
+        self
+    }
+
+    /// Promote the previously-wired secret store to required.
+    /// No-op when `with_secrets` wasn't called.
+    #[must_use]
+    #[inline]
+    pub fn require_secrets(mut self) -> Self {
+        if let SecretSource::On { ref mut required } = self.secrets {
+            *required = true;
+        }
+        self
+    }
+
+    /// Open the Fastly Config Store named `name` and inject its
+    /// handle into request extensions. If the store is unavailable
+    /// at request time, the dispatcher logs the warning once and
+    /// proceeds without it.
+    #[must_use]
+    #[inline]
+    pub fn with_config<S: Into<String>>(mut self, name: S) -> Self {
+        self.config = ConfigSource::Name(name.into());
+        self
+    }
+
+    /// Inject a pre-built `ConfigStoreHandle`. Use this when the
+    /// caller has already opened (or mocked) the backend. Mutually
+    /// exclusive with `with_config(name)` -- the last call wins.
+    #[must_use]
+    #[inline]
+    pub fn with_config_handle(mut self, handle: ConfigStoreHandle) -> Self {
+        self.config = ConfigSource::Handle(handle);
+        self
+    }
+
+    /// Open a Fastly KV Store by `name` and inject its handle.
+    /// Non-required by default: an absent store logs once and
+    /// dispatch continues. Pair with `require_kv()` when the
+    /// manifest declares `[stores.kv]` and a missing store should
+    /// fail loudly.
+    #[must_use]
+    #[inline]
+    pub fn with_kv<S: Into<String>>(mut self, name: S) -> Self {
+        self.kv = Some(KvSource {
+            name: name.into(),
+            required: false,
+        });
+        self
+    }
+
+    /// Enable the Fastly Secret Store and inject its handle.
+    /// Non-required by default: an absent store leaves no secret
+    /// handle in extensions and dispatch continues. Pair with
+    /// `require_secrets()` when the manifest declares
+    /// `[stores.secrets]`.
+    ///
+    /// Platform-name binding: the synthesised `SecretRegistry`
+    /// binds the handle to platform store name `"default"`.
+    /// Handlers reading `ctx.secret_store_default()?.require_str(key)`
+    /// open a Fastly Secret Store literally named `"default"`. Use
+    /// the manifest-aware `run_app` if your account uses a
+    /// different store name -- it routes through the env-overlay
+    /// resolution path instead.
+    #[must_use]
+    #[inline]
+    pub fn with_secrets(mut self) -> Self {
+        self.secrets = SecretSource::On { required: false };
+        self
+    }
 }
 
 fn dispatch_core_request(
@@ -96,7 +254,7 @@ fn dispatch_core_request(
     stores: Stores,
 ) -> Result<FastlyResponse, FastlyError> {
     // Hard-cutoff: legacy bare handles are no longer
-    // inserted into request extensions. `dispatch_with_config_handle`
+    // inserted into request extensions. `with_config_handle`
     // still accepts a `ConfigStoreHandle`, but the dispatcher
     // synthesises a one-id `<kind>Registry` from any wired handle
     // and only the registry goes into extensions. The
@@ -118,73 +276,6 @@ fn dispatch_core_request(
     from_core_response(response).map_err(|err| map_edge_error(&err))
 }
 
-pub(crate) fn dispatch_raw(app: &App, req: FastlyRequest) -> Result<FastlyResponse, FastlyError> {
-    dispatch_with_kv(app, req, DEFAULT_KV_STORE_NAME, false)
-}
-
-/// Dispatch a request with a Fastly Config Store injected into extensions.
-///
-/// If the named store is not available, suppresses repeated warnings for
-/// recently seen store names and dispatches without it.
-///
-/// The KV store named [`DEFAULT_KV_STORE_NAME`] is also resolved and injected
-/// (non-required: unavailable stores are silently skipped).
-///
-/// # Errors
-/// Returns an error if the named config store cannot be opened or the underlying handler returns an error.
-#[inline]
-pub fn dispatch_with_config(
-    app: &App,
-    req: FastlyRequest,
-    store_name: &str,
-) -> Result<FastlyResponse, FastlyError> {
-    let config_store_handle = match FastlyConfigStore::try_open(store_name) {
-        Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
-        Err(err) => {
-            warn_missing_store_once(store_name, &err.to_string());
-            None
-        }
-    };
-    let kv = resolve_kv_handle(DEFAULT_KV_STORE_NAME, false)?;
-    dispatch_with_handles(
-        app,
-        req,
-        Stores {
-            config_store: config_store_handle,
-            kv,
-            ..Default::default()
-        },
-    )
-}
-
-/// Dispatch a request with a prepared config-store handle injected into extensions.
-///
-/// This is the advanced/manual path. Prefer `dispatch_with_config` when you
-/// want the adapter to resolve the configured backend for you.
-///
-/// The KV store named [`DEFAULT_KV_STORE_NAME`] is also resolved and injected
-/// (non-required: unavailable stores are silently skipped).
-///
-/// # Errors
-/// Returns an error if request conversion fails or the underlying handler returns an error.
-#[inline]
-pub fn dispatch_with_config_handle(
-    app: &App,
-    req: FastlyRequest,
-    config_store_handle: ConfigStoreHandle,
-) -> Result<FastlyResponse, FastlyError> {
-    let kv = resolve_kv_handle(DEFAULT_KV_STORE_NAME, false)?;
-    dispatch_with_handles(
-        app,
-        req,
-        Stores {
-            config_store: Some(config_store_handle),
-            kv,
-            ..Default::default()
-        },
-    )
-}
-
 fn dispatch_with_handles(
     app: &App,
     req: FastlyRequest,
@@ -192,128 +283,6 @@ fn dispatch_with_handles(
 ) -> Result<FastlyResponse, FastlyError> {
     let core_request = into_core_request(req).map_err(|err| map_edge_error(&err))?;
     dispatch_core_request(app, core_request, stores)
-}
-
-/// Dispatch a Fastly request with a custom KV store name.
-///
-/// `kv_required` should be `true` when `[stores.kv]` is explicitly present
-/// in the manifest, causing the request to fail if the store is unavailable
-/// rather than silently degrading.
-///
-/// # Errors
-/// Returns an error if the named KV store cannot be opened or the underlying handler returns an error.
-#[inline]
-pub fn dispatch_with_kv(
-    app: &App,
-    req: FastlyRequest,
-    kv_store_name: &str,
-    kv_required: bool,
-) -> Result<FastlyResponse, FastlyError> {
-    let kv = resolve_kv_handle(kv_store_name, kv_required)?;
-    dispatch_with_handles(
-        app,
-        req,
-        Stores {
-            kv,
-            ..Default::default()
-        },
-    )
-}
-
-/// Dispatch a Fastly request with both KV and secret stores attached.
-///
-/// For most applications, prefer [`crate::run_app`] which resolves all stores
-/// from the manifest automatically. Use `dispatch_with_kv_and_secrets` only
-/// when you need direct control over the dispatch lifecycle without a manifest.
-///
-/// # Errors
-/// Returns an error if a required store cannot be opened or the underlying handler returns an error.
-#[inline]
-pub fn dispatch_with_kv_and_secrets(
-    app: &App,
-    req: FastlyRequest,
-    kv_store_name: &str,
-    kv_required: bool,
-    secrets_required: bool,
-) -> Result<FastlyResponse, FastlyError> {
-    let kv = resolve_kv_handle(kv_store_name, kv_required)?;
-    let secrets = resolve_secret_handle(secrets_required);
-    dispatch_with_handles(
-        app,
-        req,
-        Stores {
-            kv,
-            secrets,
-            ..Default::default()
-        },
-    )
-}
-
-/// Dispatch a Fastly request with a secret store attached.
-///
-/// For most applications, prefer [`crate::run_app`] which resolves all stores
-/// from the manifest automatically. Use `dispatch_with_secrets` only when you
-/// need direct control over the dispatch lifecycle without a manifest.
-///
-/// Platform-name binding: the synthesised `SecretRegistry` binds
-/// the handle to a `BoundSecretStore` whose underlying Fastly
-/// Secret Store name is the literal string `"default"`. So
-/// handlers reading `ctx.secret_store_default()?.require_str(key)`
-/// open a Fastly Secret Store named `"default"` -- the operator's
-/// Fastly account must have a Secret Store with that exact name,
-/// or the runtime `require_str` will surface a clear store-name
-/// error. Use `dispatch_with_kv_and_secrets` (or the manifest-aware
-/// `run_app`) if your account uses a different store name.
-///
-/// # Errors
-/// Returns an error if the named secret store is required but cannot be opened, or the underlying handler returns an error.
-#[inline]
-pub fn dispatch_with_secrets(
-    app: &App,
-    req: FastlyRequest,
-    secrets_required: bool,
-) -> Result<FastlyResponse, FastlyError> {
-    let secrets = resolve_secret_handle(secrets_required);
-    dispatch_with_handles(
-        app,
-        req,
-        Stores {
-            secrets,
-            ..Default::default()
-        },
-    )
-}
-
-pub(crate) fn dispatch_with_store_names(
-    app: &App,
-    req: FastlyRequest,
-    config_store_name: Option<&str>,
-    kv_store_name: &str,
-    kv_required: bool,
-    secrets_required: bool,
-) -> Result<FastlyResponse, FastlyError> {
-    let config_store_handle = match config_store_name {
-        Some(store_name) => match FastlyConfigStore::try_open(store_name) {
-            Ok(store) => Some(ConfigStoreHandle::new(Arc::new(store))),
-            Err(err) => {
-                warn_missing_store_once(store_name, &err.to_string());
-                None
-            }
-        },
-        None => None,
-    };
-    let kv = resolve_kv_handle(kv_store_name, kv_required)?;
-    let secrets = resolve_secret_handle(secrets_required);
-    dispatch_with_handles(
-        app,
-        req,
-        Stores {
-            config_store: config_store_handle,
-            kv,
-            secrets,
-            ..Default::default()
-        },
-    )
 }
 
 /// Dispatch with per-id store registries built from baked metadata.

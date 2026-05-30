@@ -54,15 +54,20 @@ myapp`) build their own CLI binary that:
 
 Alongside the extensibility substrate, ship:
 
-- A **multi-store manifest model**: the app declares logical stores it
-  uses (`[stores.kv] ids = ["foo", "bar"]`); for each store kind an
-  adapter is _Multi-capable_ for, it maps every logical id to a
-  platform-specific `name`, with room for adapter-specific tuning.
-  Stores are addressed in code by logical id. Per-adapter, per-kind
-  **capability rules** (§6.6) constrain what is valid — some adapters
-  support multiple named stores of a kind, others only a single flat
-  one, and the per-adapter mapping block is required for the former and
-  forbidden for the latter.
+- A **portable multi-store manifest model**: the app declares logical
+  stores it uses (`[stores.kv] ids = ["foo", "bar"]`); the manifest
+  carries only logical ids, with `default` resolving the per-kind
+  pick when more than one id is declared. Platform names are NOT in
+  the manifest -- the runtime resolves each logical id via
+  `EDGEZERO__STORES__<KIND>__<ID>__NAME` env vars, defaulting to the
+  logical id itself when unset (and falling back to the logical id
+  when the env value is empty / whitespace / control-bearing, so a
+  blank export can't flow into a platform create call). Stores are
+  addressed in code by logical id. Per-adapter, per-kind
+  **capability rules** (§6.6) constrain how many logical ids are
+  valid per kind: Multi-capable adapters accept multiple ids, Single
+  adapters reject `ids.len() > 1` at `config validate --strict` /
+  provision time.
 - A **typed per-service app-config file** (`myapp.toml`) with a
   Rust-defined schema, validated by `config validate`, uploaded by
   `config push`. `#[secret]` / `#[secret(store_ref)]` fields are
@@ -699,7 +704,49 @@ let token = ctx.secret_store_default()?.require_str(&cfg.api_token).await?;
 let token = ctx.secret_store(&cfg.vault)?.require_str("active").await?;
 ```
 
-### 6.9 Extractor design
+### 6.9 Adapter dispatch service builder
+
+Each non-axum adapter exposes a per-request dispatch service that
+collapses the prior `dispatch_with_*` variant fan-out into one
+fluent builder. The Service type is constructed per-request, wires
+the stores the handler needs, and consumes itself on dispatch so a
+stale builder can't be reused.
+
+```rust
+// Fastly:
+FastlyService::new(&app)
+    .with_kv("sessions").require_kv()
+    .with_config("app_config")
+    .with_secrets()
+    .dispatch(req)
+
+// Cloudflare:
+CloudflareService::new(&app)
+    .with_kv("sessions").require_kv()
+    .with_config_handle(my_handle)   // mutually exclusive with with_config(name)
+    .dispatch(req, env, ctx).await
+```
+
+Builder methods are independent — any combination of KV, config,
+and secret stores can be wired. `require_*` promotes the
+previously-wired store to required (an unavailable store causes
+dispatch to return an error instead of silently degrading).
+`with_config_handle` is the escape hatch for callers that already
+have a pre-built `ConfigStoreHandle` (typically tests).
+
+The manifest-driven `run_app::<MyHooks>(req[, env, ctx])` remains
+the recommended entrypoint for normal flows; internally it builds
+the same Service using the `Hooks::stores()` metadata and the
+`EDGEZERO__STORES__<KIND>__<ID>__NAME` env overlay.
+
+Hard cutoff: there are no `DEFAULT_KV_STORE_NAME` /
+`DEFAULT_SECRET_STORE_NAME` constants and no public
+`dispatch()` / `dispatch_with_*` free functions. A caller that
+wants "no stores at all" writes `Service::new(&app).dispatch(req)`.
+A caller that wants the legacy `EDGEZERO_KV` binding must spell it
+explicitly — the runtime no longer hands out an implicit default.
+
+### 6.10 Extractor design
 
 `Kv` / `Secrets` / `Config` extractors yield a per-request registry
 handle; the handler picks the store by id at the call site (no
@@ -717,7 +764,7 @@ impl Kv {
 The only in-tree consumers of the old single-store extractors are the
 `app-demo` handlers, updated in sub-project #2.
 
-### 6.10 App-config environment-variable resolution
+### 6.11 App-config environment-variable resolution
 
 `load_app_config` / `load_app_config_raw` resolve in two layers:
 (1) the file's top-level table from `<name>.toml` (no `[config]`
@@ -752,14 +799,14 @@ server (the `demo` subcommand) resolves via the same path.
 Note the deliberate consistency: the env separator (`__`) is the same
 as the Spin config-key separator (§6.4/§6.7).
 
-### 6.11 `Default` on `*Args`
+### 6.12 `Default` on `*Args`
 
 Non-subcommand `*Args` derive `Default` (external construction despite
 `#[non_exhaustive]`). Subcommand-wrapping `AuthArgs` does not (a
 defaulted required subcommand could leak into a real auth path);
 external tests construct it via `clap::Parser::try_parse_from`.
 
-### 6.12 Documentation updates (definition-of-done for every stage)
+### 6.13 Documentation updates (definition-of-done for every stage)
 
 This effort changes the manifest schema, the runtime store API, the
 CLI surface, and the `dev`→`demo` subcommand. The VitePress docs site

@@ -35,35 +35,6 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
 
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub trait AppExt {
-    #[deprecated(
-        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
-    )]
-    fn dispatch<'a>(
-        &'a self,
-        req: worker::Request,
-        env: worker::Env,
-        ctx: worker::Context,
-    ) -> ::core::pin::Pin<
-        Box<dyn ::core::future::Future<Output = Result<worker::Response, worker::Error>> + 'a>,
-    >;
-}
-
-#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-impl AppExt for edgezero_core::app::App {
-    fn dispatch<'a>(
-        &'a self,
-        req: worker::Request,
-        env: worker::Env,
-        ctx: worker::Context,
-    ) -> ::core::pin::Pin<
-        Box<dyn ::core::future::Future<Output = Result<worker::Response, worker::Error>> + 'a>,
-    > {
-        Box::pin(crate::request::dispatch_raw(self, req, env, ctx))
-    }
-}
-
 /// Build an [`EnvConfig`](edgezero_core::env_config::EnvConfig) from a
 /// Cloudflare `Env`. Workers have no `std::env`, and the `Env` binding object
 /// cannot be enumerated, so the exact `EDGEZERO__STORES__<KIND>__<ID>__NAME`

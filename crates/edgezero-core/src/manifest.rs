@@ -7,13 +7,6 @@ use std::sync::Arc;
 use std::{env, fs, io};
 use validator::{Validate, ValidationError};
 
-/// Default config store / binding name used when `[stores.config]` is omitted.
-pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
-/// Default KV store / binding name used when `[stores.kv]` is omitted.
-pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
-/// Default secret store / binding name used when `[stores.secrets]` is omitted.
-pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
-
 pub struct ManifestLoader {
     manifest: Arc<Manifest>,
 }
@@ -171,20 +164,6 @@ impl Manifest {
         self.logging_resolved = resolved;
     }
 
-    /// Returns the KV store name for a given adapter.
-    ///
-    /// In the portable model the manifest carries no platform name; the name
-    /// resolves to the declared default logical id, or `"EDGEZERO_KV"` when
-    /// `[stores.kv]` is omitted.
-    #[must_use]
-    #[inline]
-    pub fn kv_store_name(&self, _adapter: &str) -> &str {
-        self.stores
-            .kv
-            .as_ref()
-            .map_or(DEFAULT_KV_STORE_NAME, StoreDeclaration::default_id)
-    }
-
     #[must_use]
     #[inline]
     pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
@@ -201,20 +180,6 @@ impl Manifest {
     #[inline]
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
-    }
-
-    /// Returns the secret store binding identifier for a given adapter.
-    ///
-    /// In the portable model the manifest carries no platform name; the name
-    /// resolves to the declared default logical id, or `"EDGEZERO_SECRETS"`
-    /// when `[stores.secrets]` is omitted.
-    #[must_use]
-    #[inline]
-    pub fn secret_store_binding(&self, _adapter: &str) -> &str {
-        self.stores
-            .secrets
-            .as_ref()
-            .map_or(DEFAULT_SECRET_STORE_NAME, StoreDeclaration::default_id)
     }
 
     /// Returns whether the secret store should be attached for a given adapter.
@@ -1641,49 +1606,7 @@ body-mode = "buffered"
         assert_eq!(trigger.body_mode, Some(BodyMode::Buffered));
     }
 
-    // -- KV store config ---------------------------------------------------
-
-    #[test]
-    fn kv_store_name_defaults_when_omitted() {
-        let loader = ManifestLoader::load_from_str("[app]\nname = \"test\"\n");
-        let manifest = loader.manifest();
-        assert_eq!(manifest.kv_store_name("fastly"), "EDGEZERO_KV");
-        assert_eq!(manifest.kv_store_name("cloudflare"), "EDGEZERO_KV");
-    }
-
-    #[test]
-    fn kv_store_name_resolves_to_default_id() {
-        let loader = ManifestLoader::load_from_str(
-            "[stores.kv]\nids = [\"sessions\", \"cache\"]\ndefault = \"cache\"\n",
-        );
-        let manifest = loader.manifest();
-        assert_eq!(manifest.kv_store_name("fastly"), "cache");
-        assert_eq!(manifest.kv_store_name("cloudflare"), "cache");
-    }
-
     // -- Secret store config -----------------------------------------------
-
-    #[test]
-    fn secret_store_binding_defaults_to_constant_when_absent() {
-        let manifest = ManifestLoader::load_from_str("[app]\nname = \"x\"\n");
-        assert_eq!(
-            manifest.manifest().secret_store_binding("fastly"),
-            DEFAULT_SECRET_STORE_NAME
-        );
-    }
-
-    #[test]
-    fn secret_store_binding_resolves_to_default_id() {
-        let manifest = ManifestLoader::load_from_str("[stores.secrets]\nids = [\"MY_SECRETS\"]\n");
-        assert_eq!(
-            manifest.manifest().secret_store_binding("fastly"),
-            "MY_SECRETS"
-        );
-        assert_eq!(
-            manifest.manifest().secret_store_binding("cloudflare"),
-            "MY_SECRETS"
-        );
-    }
 
     #[test]
     fn secret_store_enabled_is_false_when_absent() {
