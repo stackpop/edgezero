@@ -972,6 +972,19 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    // Shared fixture names. Pinning these as consts (instead of
+    // inline `"sessions"` / `"app_config"` / `"demo"` per call site)
+    // keeps the setup-vs-assertion pair in sync -- a typo in one
+    // place no longer silently divorces from the other, because both
+    // reference the same const. Also names the intent: these are the
+    // LOGICAL store ids + spin component id the adapter operates on,
+    // not arbitrary strings.
+    const TEST_KV_ID: &str = "sessions";
+    const TEST_KV_ID_ALT: &str = "cache";
+    const TEST_CONFIG_ID: &str = "app_config";
+    const TEST_SECRET_ID: &str = "default";
+    const TEST_COMPONENT_ID: &str = "demo";
+
     #[test]
     fn is_valid_spin_key_accepts_lowercase_with_digits_and_underscores() {
         assert!(is_valid_spin_key("foo"));
@@ -1207,7 +1220,7 @@ mod tests {
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "wasm").unwrap();
 
-        let located = locate_artifact(workspace, &manifest_dir, "demo").unwrap();
+        let located = locate_artifact(workspace, &manifest_dir, TEST_COMPONENT_ID).unwrap();
         assert_eq!(located, artifact);
     }
 
@@ -1294,7 +1307,8 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
-        let added = ensure_kv_label_in_component(&path, "demo", "sessions").expect("ensure");
+        let added =
+            ensure_kv_label_in_component(&path, TEST_COMPONENT_ID, TEST_KV_ID).expect("ensure");
         assert!(added, "newly added label should return true");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
@@ -1311,7 +1325,8 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\nkey_value_stores = [\"cache\"]\n",
         );
-        let added = ensure_kv_label_in_component(&path, "demo", "sessions").expect("ensure");
+        let added =
+            ensure_kv_label_in_component(&path, TEST_COMPONENT_ID, TEST_KV_ID).expect("ensure");
         assert!(added);
         let after = fs::read_to_string(&path).expect("read back");
         assert!(after.contains("\"cache\""), "kept existing label: {after}");
@@ -1325,7 +1340,8 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\nkey_value_stores = [\"sessions\"]\n",
         );
-        let added = ensure_kv_label_in_component(&path, "demo", "sessions").expect("ensure");
+        let added =
+            ensure_kv_label_in_component(&path, TEST_COMPONENT_ID, TEST_KV_ID).expect("ensure");
         assert!(!added, "duplicate label should return false");
     }
 
@@ -1336,7 +1352,7 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
-        let err = ensure_kv_label_in_component(&path, "missing", "sessions")
+        let err = ensure_kv_label_in_component(&path, "missing", TEST_KV_ID)
             .expect_err("missing component must error");
         assert!(
             err.contains("missing"),
@@ -1351,7 +1367,7 @@ mod tests {
             dir.path(),
             "# keep me\nspin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\nallowed_outbound_hosts = []\n",
         );
-        ensure_kv_label_in_component(&path, "demo", "sessions").expect("ensure");
+        ensure_kv_label_in_component(&path, TEST_COMPONENT_ID, TEST_KV_ID).expect("ensure");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(after.contains("# keep me"), "preserved comment: {after}");
         assert!(
@@ -1368,7 +1384,8 @@ mod tests {
         let original =
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
         let path = write_spin(dir.path(), original);
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions", "cache"]);
+        let kv_ids: Vec<ResolvedStoreId> =
+            ResolvedStoreId::from_logicals(&[TEST_KV_ID, TEST_KV_ID_ALT]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1399,7 +1416,7 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
-        let kv_ids = vec![ResolvedStoreId::new("sessions", "prod_sessions")];
+        let kv_ids = vec![ResolvedStoreId::new(TEST_KV_ID, "prod_sessions")];
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1431,7 +1448,7 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1452,7 +1469,7 @@ mod tests {
     #[test]
     fn provision_errors_when_adapter_manifest_path_missing() {
         let dir = tempdir().expect("tempdir");
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1474,8 +1491,8 @@ mod tests {
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
-        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["app_config"]);
-        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["default"]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_SECRET_ID]);
         let stores = ProvisionStores {
             config: &config_ids,
             kv: &[],
@@ -1553,7 +1570,7 @@ mod tests {
             ("greeting".to_owned(), "hi".to_owned()),
             ("service__timeout_ms".to_owned(), "1500".to_owned()),
         ];
-        write_spin_variables(&path, "demo", &entries).expect("write");
+        write_spin_variables(&path, TEST_COMPONENT_ID, &entries).expect("write");
         let after = fs::read_to_string(&path).expect("read back");
         // The generated manifest must round-trip through a TOML
         // parser (spec "validation strength" — regex + parse
@@ -1565,15 +1582,15 @@ mod tests {
             .and_then(toml::Value::as_table)
             .expect("[variables] present");
         assert_eq!(
-            variables["greeting"]["default"].as_str(),
+            variables["greeting"][TEST_SECRET_ID].as_str(),
             Some("hi"),
             "greeting default landed: {after}"
         );
         assert_eq!(
-            variables["service__timeout_ms"]["default"].as_str(),
+            variables["service__timeout_ms"][TEST_SECRET_ID].as_str(),
             Some("1500")
         );
-        let bindings = parsed["component"]["demo"]["variables"]
+        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
             .as_table()
             .expect("[component.demo.variables] present");
         assert_eq!(
@@ -1595,19 +1612,19 @@ mod tests {
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
         let first = vec![("greeting".to_owned(), "hi".to_owned())];
-        write_spin_variables(&path, "demo", &first).expect("first write");
+        write_spin_variables(&path, TEST_COMPONENT_ID, &first).expect("first write");
         // Re-push with a new value — should overwrite, not error.
         let second = vec![("greeting".to_owned(), "hello".to_owned())];
-        write_spin_variables(&path, "demo", &second).expect("second write");
+        write_spin_variables(&path, TEST_COMPONENT_ID, &second).expect("second write");
         let after = fs::read_to_string(&path).expect("read back");
         let parsed: toml::Value = toml::from_str(&after).expect("parses");
         assert_eq!(
-            parsed["variables"]["greeting"]["default"].as_str(),
+            parsed["variables"]["greeting"][TEST_SECRET_ID].as_str(),
             Some("hello"),
             "default updated: {after}"
         );
         // Component binding stays a single entry (not duplicated).
-        let bindings = parsed["component"]["demo"]["variables"]
+        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
             .as_table()
             .expect("bindings present");
         assert_eq!(bindings.len(), 1, "no duplicate bindings: {after}");
@@ -1634,17 +1651,18 @@ mod tests {
             ("greeting".to_owned(), "updated".to_owned()),
             ("feature__new_checkout".to_owned(), "true".to_owned()),
         ];
-        write_spin_variables(&path, "demo", &entries).expect("inline-table writeback succeeds");
+        write_spin_variables(&path, TEST_COMPONENT_ID, &entries)
+            .expect("inline-table writeback succeeds");
 
         let after = fs::read_to_string(&path).expect("read back");
         let parsed: toml::Value = toml::from_str(&after).expect("parses");
         assert_eq!(
-            parsed["variables"]["greeting"]["default"].as_str(),
+            parsed["variables"]["greeting"][TEST_SECRET_ID].as_str(),
             Some("updated"),
             "inline-table entry updated: {after}"
         );
         assert_eq!(
-            parsed["variables"]["feature__new_checkout"]["default"].as_str(),
+            parsed["variables"]["feature__new_checkout"][TEST_SECRET_ID].as_str(),
             Some("true"),
             "second inline-table entry updated: {after}"
         );
@@ -1676,21 +1694,21 @@ mod tests {
         );
         let entries = vec![
             ("greeting".to_owned(), "updated".to_owned()),
-            ("vault".to_owned(), "default".to_owned()),
+            ("vault".to_owned(), TEST_SECRET_ID.to_owned()),
         ];
-        write_spin_variables(&path, "demo", &entries)
+        write_spin_variables(&path, TEST_COMPONENT_ID, &entries)
             .expect("inline component-binding writeback succeeds");
 
         let after = fs::read_to_string(&path).expect("read back");
         let parsed: toml::Value = toml::from_str(&after).expect("parses");
         // Both [variables] inline-table entries updated.
         assert_eq!(
-            parsed["variables"]["greeting"]["default"].as_str(),
+            parsed["variables"]["greeting"][TEST_SECRET_ID].as_str(),
             Some("updated"),
             "existing inline entry updated: {after}"
         );
         // Component binding still resolves greeting; new key added.
-        let bindings = parsed["component"]["demo"]["variables"]
+        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
             .as_table()
             .expect("bindings table");
         assert_eq!(
@@ -1723,7 +1741,7 @@ mod tests {
              [component.demo]\nsource = \"demo.wasm\"\n",
         );
         let entries = vec![("greeting".to_owned(), "updated".to_owned())];
-        let err = write_spin_variables(&path, "demo", &entries)
+        let err = write_spin_variables(&path, TEST_COMPONENT_ID, &entries)
             .expect_err("bare scalar value at variables.<key> must error");
         assert!(
             err.contains("scalar") && err.contains("default ="),
@@ -1739,7 +1757,7 @@ mod tests {
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\nallowed_outbound_hosts = []\n",
         );
         let entries = vec![("greeting".to_owned(), "hi".to_owned())];
-        write_spin_variables(&path, "demo", &entries).expect("write");
+        write_spin_variables(&path, TEST_COMPONENT_ID, &entries).expect("write");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains("allowed_outbound_hosts = []"),
@@ -1768,7 +1786,7 @@ mod tests {
             ("service__timeout_ms".to_owned(), "1500".to_owned()),
             ("api__base_url".to_owned(), "https://example.com".to_owned()),
         ];
-        write_spin_variables(&path, "demo", &entries).expect("write");
+        write_spin_variables(&path, TEST_COMPONENT_ID, &entries).expect("write");
         let after = fs::read_to_string(&path).expect("read back");
         let parsed: toml::Value = toml::from_str(&after).expect("parses as TOML");
 
@@ -1779,7 +1797,7 @@ mod tests {
                 "variable name `{key}` violates Spin's `^[a-z][a-z0-9_]*$` rule"
             );
         }
-        let bindings = parsed["component"]["demo"]["variables"]
+        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
             .as_table()
             .expect("[component.demo.variables] present");
         for key in bindings.keys() {
@@ -1816,7 +1834,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 true,
             )
@@ -1884,7 +1902,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 false,
             )
@@ -1897,12 +1915,12 @@ mod tests {
         let after = fs::read_to_string(&path).expect("read back");
         let parsed: toml::Value = toml::from_str(&after).expect("parses");
         assert_eq!(
-            parsed["variables"]["service__timeout_ms"]["default"].as_str(),
+            parsed["variables"]["service__timeout_ms"][TEST_SECRET_ID].as_str(),
             Some("1500"),
             "`.` translated to `__`: {after}"
         );
         assert_eq!(
-            parsed["component"]["demo"]["variables"]["service__timeout_ms"].as_str(),
+            parsed["component"][TEST_COMPONENT_ID]["variables"]["service__timeout_ms"].as_str(),
             Some("{{ service__timeout_ms }}")
         );
     }
@@ -1916,7 +1934,7 @@ mod tests {
                 dir.path(),
                 None,
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 true,
             )
@@ -1943,7 +1961,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 false,
             )
@@ -1964,7 +1982,7 @@ mod tests {
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &[],
                 false,
             )
