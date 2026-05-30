@@ -1,10 +1,8 @@
 #![cfg(all(feature = "fastly", target_arch = "wasm32"))]
-// Keep coverage for the deprecated low-level dispatch path while it remains public.
-#![allow(deprecated)]
 
 use bytes::Bytes;
 use edgezero_adapter_fastly::context::FastlyRequestContext;
-use edgezero_adapter_fastly::request::{dispatch, dispatch_with_config_handle, into_core_request};
+use edgezero_adapter_fastly::request::{into_core_request, FastlyService};
 use edgezero_adapter_fastly::response::from_core_response;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
@@ -153,7 +151,9 @@ fn dispatch_runs_router_and_returns_response() {
     let app = build_test_app();
     let req = fastly_request(FastlyMethod::GET, "/uri", None);
 
-    let mut response = dispatch(&app, req).expect("fastly response");
+    let mut response = FastlyService::new(&app)
+        .dispatch(req)
+        .expect("fastly response");
 
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"http://example.com/uri");
@@ -164,7 +164,9 @@ fn dispatch_streaming_route_preserves_chunks() {
     let app = build_test_app();
     let req = fastly_request(FastlyMethod::GET, "/stream", None);
 
-    let mut response = dispatch(&app, req).expect("fastly response");
+    let mut response = FastlyService::new(&app)
+        .dispatch(req)
+        .expect("fastly response");
 
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"chunk-1chunk-2");
@@ -175,19 +177,24 @@ fn dispatch_passes_request_body_to_handlers() {
     let app = build_test_app();
     let req = fastly_request(FastlyMethod::POST, "/mirror", Some(b"echo"));
 
-    let mut response = dispatch(&app, req).expect("fastly response");
+    let mut response = FastlyService::new(&app)
+        .dispatch(req)
+        .expect("fastly response");
 
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"echo");
 }
 
 #[test]
-fn dispatch_with_config_handle_injects_handle() {
+fn service_with_config_handle_injects_handle() {
     let app = build_test_app();
     let req = fastly_request(FastlyMethod::GET, "/config", None);
     let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from fastly test")));
 
-    let mut response = dispatch_with_config_handle(&app, req, handle).expect("fastly response");
+    let mut response = FastlyService::new(&app)
+        .with_config_handle(handle)
+        .dispatch(req)
+        .expect("fastly response");
 
     assert_eq!(response.get_status(), FastlyStatus::OK);
     assert_eq!(response.take_body_bytes(), b"hello from fastly test");

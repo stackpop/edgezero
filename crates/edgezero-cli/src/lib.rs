@@ -375,11 +375,14 @@ deploy = "echo deploy"
 serve = "echo serve"
 "#;
         let loader = ManifestLoader::load_from_str(manifest_with_secrets);
-        assert_eq!(
-            loader.manifest().secret_store_binding("fastly"),
-            "MY_SECRETS"
-        );
-        assert!(loader.manifest().stores.secrets.is_some());
+        let declared = loader
+            .manifest()
+            .stores
+            .secrets
+            .as_ref()
+            .expect("[stores.secrets] declared");
+        assert_eq!(declared.ids, vec!["MY_SECRETS".to_owned()]);
+        assert_eq!(declared.default_id(), "MY_SECRETS");
     }
 
     #[test]

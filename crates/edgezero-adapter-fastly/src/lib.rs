@@ -20,32 +20,11 @@ pub mod response;
 pub mod secret_store;
 
 #[cfg(feature = "fastly")]
-use edgezero_core::app::{App, Hooks};
+use edgezero_core::app::Hooks;
 #[cfg(feature = "fastly")]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
 use edgezero_core::manifest::ResolvedLoggingConfig;
-#[cfg(feature = "fastly")]
-use request::DEFAULT_KV_STORE_NAME;
-
-#[cfg(feature = "fastly")]
-pub trait AppExt {
-    #[deprecated(
-        note = "AppExt::dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
-    )]
-    /// # Errors
-    /// Returns an error if the underlying handler returns an error or the response cannot be converted into a Fastly response.
-    fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error>;
-}
-
-#[cfg(feature = "fastly")]
-impl AppExt for App {
-    #[inline]
-    fn dispatch(&self, req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-        request::dispatch_raw(self, req)
-    }
-}
-
 #[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
 pub struct FastlyLogging {
@@ -66,17 +45,6 @@ impl From<ResolvedLoggingConfig> for FastlyLogging {
             use_fastly_logger: true,
         }
     }
-}
-
-/// Whether each optional store is required to be present at startup.
-///
-/// Using a named struct instead of positional `bool` arguments prevents
-/// accidental parameter swaps between `kv_required` and `secrets_required`.
-#[cfg(feature = "fastly")]
-#[derive(Default)]
-struct StoreRequirements {
-    kv_required: bool,
-    secrets_required: bool,
 }
 
 /// # Errors
@@ -147,7 +115,9 @@ pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastl
 }
 
 /// Dispatch with a config store wired explicitly. Use `run_app` for
-/// the manifest-driven flow that resolves stores automatically.
+/// the manifest-driven flow that resolves stores automatically. KV
+/// is NOT auto-injected on this path; chain `.with_kv(name)` on a
+/// `FastlyService` builder if you need KV alongside the config store.
 ///
 /// # Errors
 /// Returns an error if logger setup fails or the underlying handler returns an error.
@@ -158,37 +128,16 @@ pub fn run_app_with_config<A: Hooks>(
     req: fastly::Request,
     config_store_name: Option<&str>,
 ) -> Result<fastly::Response, fastly::Error> {
-    run_app_with_stores::<A>(
-        logging,
-        req,
-        config_store_name,
-        DEFAULT_KV_STORE_NAME,
-        &StoreRequirements::default(),
-    )
-}
-
-#[cfg(feature = "fastly")]
-fn run_app_with_stores<A: Hooks>(
-    logging: &FastlyLogging,
-    req: fastly::Request,
-    config_store_name: Option<&str>,
-    kv_store_name: &str,
-    requirements: &StoreRequirements,
-) -> Result<fastly::Response, fastly::Error> {
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
-
     let app = A::build_app();
-    request::dispatch_with_store_names(
-        &app,
-        req,
-        config_store_name,
-        kv_store_name,
-        requirements.kv_required,
-        requirements.secrets_required,
-    )
+    let mut service = request::FastlyService::new(&app);
+    if let Some(name) = config_store_name {
+        service = service.with_config(name);
+    }
+    service.dispatch(req)
 }
 
 #[cfg(test)]

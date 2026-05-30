@@ -18,7 +18,6 @@ use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
@@ -202,10 +201,12 @@ fn kv_init_requirement(stores: StoresMetadata) -> KvInitRequirement {
 }
 
 fn kv_store_path(store_name: &str) -> PathBuf {
-    if store_name == DEFAULT_KV_STORE_NAME {
-        return PathBuf::from(".edgezero/kv.redb");
-    }
-
+    // Every declared id gets its own slug-based filename. The
+    // pre-rewrite hard-coded `.edgezero/kv.redb` shortcut for
+    // store_name == "EDGEZERO_KV" is gone -- the runtime no longer
+    // hands out a default name; if you reach here you have a real
+    // declared id and the slug encoding handles every shape
+    // uniformly.
     PathBuf::from(".edgezero").join(format!(
         "kv-{}-{:016x}.redb",
         store_name_slug(store_name),
@@ -568,11 +569,29 @@ mod tests {
     }
 
     #[test]
-    fn default_store_name_uses_legacy_kv_path() {
-        assert_eq!(
-            kv_store_path(DEFAULT_KV_STORE_NAME),
-            PathBuf::from(".edgezero/kv.redb")
+    fn every_store_name_gets_a_slug_based_path() {
+        // The pre-rewrite shortcut hard-coded `.edgezero/kv.redb`
+        // when the store name equalled the legacy `EDGEZERO_KV`
+        // constant. Hard cutoff: now every name -- including any
+        // historical value an operator might still set -- flows
+        // through the slug+hash encoder, so no name gets a
+        // special shortcut path.
+        let legacy = kv_store_path("EDGEZERO_KV");
+        assert_ne!(
+            legacy,
+            PathBuf::from(".edgezero/kv.redb"),
+            "post-cutoff: the legacy default name no longer gets the bare `kv.redb` shortcut: {legacy:?}"
         );
+        assert!(
+            legacy.to_string_lossy().starts_with(".edgezero/kv-"),
+            "legacy name still gets a slug-based path: {legacy:?}"
+        );
+        let custom = kv_store_path("sessions");
+        assert!(
+            custom.to_string_lossy().contains("sessions"),
+            "regular name gets a slug-based filename: {custom:?}"
+        );
+        assert_ne!(legacy, custom);
     }
 
     #[test]

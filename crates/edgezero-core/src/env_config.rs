@@ -100,12 +100,28 @@ impl EnvConfig {
     }
 
     /// Platform name for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__NAME`
-    /// — falling back to `id` itself when the variable is unset. `kind` is
-    /// `"kv"` / `"config"` / `"secrets"`.
+    /// — falling back to `id` itself when the variable is unset OR when
+    /// the value is empty / whitespace-only. `kind` is `"kv"` /
+    /// `"config"` / `"secrets"`.
+    ///
+    /// The empty/whitespace skip is deliberate: an env var like
+    /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=` (set but blank)
+    /// would otherwise flow into `wrangler kv namespace create ""`
+    /// or `fastly config-store create --name=` or be written as
+    /// the binding name in wrangler.toml -- all of which fail at
+    /// the platform with confusing errors rather than the clear
+    /// "did you forget to set the env var" message you'd expect.
+    /// Falling back to the logical id is consistent with the
+    /// "unset" path and gives the operator a working default.
+    ///
+    /// Control characters are similarly rejected because no
+    /// platform (cloudflare bindings, fastly store names, spin
+    /// labels) accepts them as resource identifiers.
     #[must_use]
     #[inline]
     pub fn store_name(&self, kind: &str, id: &str) -> String {
         self.get(&["stores", kind, id, "name"])
+            .filter(|value| !is_blank_or_control(value))
             .map_or_else(|| id.to_owned(), str::to_owned)
     }
 
@@ -115,6 +131,16 @@ impl EnvConfig {
     pub fn store_setting(&self, kind: &str, id: &str, key: &str) -> Option<&str> {
         self.get(&["stores", kind, id, key])
     }
+}
+
+/// `true` if `value` is empty, made entirely of whitespace, or
+/// contains any ASCII / Unicode control character. Used to reject
+/// platform-name overrides that would otherwise flow as empty
+/// strings (or control chars) into platform-side resource names.
+fn is_blank_or_control(value: &str) -> bool {
+    value.is_empty()
+        || value.chars().all(char::is_whitespace)
+        || value.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -160,6 +186,46 @@ mod tests {
     fn store_name_falls_back_to_id() {
         let cfg = sample();
         assert_eq!(cfg.store_name("kv", "cache"), "cache");
+    }
+
+    #[test]
+    fn store_name_falls_back_to_id_when_env_value_is_empty() {
+        // An exported but empty `EDGEZERO__STORES__<KIND>__<ID>__NAME=`
+        // would otherwise flow into a platform `create` call with
+        // an empty name and a binding written as `binding = ""` in
+        // wrangler.toml. Treat it the same as unset.
+        let cfg = EnvConfig::from_vars([("EDGEZERO__STORES__KV__SESSIONS__NAME", "")]);
+        assert_eq!(cfg.store_name("kv", "sessions"), "sessions");
+    }
+
+    #[test]
+    fn store_name_falls_back_to_id_when_env_value_is_whitespace_only() {
+        let cfg = EnvConfig::from_vars([("EDGEZERO__STORES__KV__SESSIONS__NAME", "   \t  ")]);
+        assert_eq!(cfg.store_name("kv", "sessions"), "sessions");
+    }
+
+    #[test]
+    fn store_name_falls_back_to_id_when_env_value_has_control_chars() {
+        // A literal newline or NUL embedded in the override would
+        // be passed through to `wrangler kv namespace create
+        // <name>` and similar. Reject and fall back to the id.
+        let with_newline =
+            EnvConfig::from_vars([("EDGEZERO__STORES__KV__SESSIONS__NAME", "prod\nname")]);
+        assert_eq!(with_newline.store_name("kv", "sessions"), "sessions");
+        let with_nul =
+            EnvConfig::from_vars([("EDGEZERO__STORES__KV__SESSIONS__NAME", "prod\x00name")]);
+        assert_eq!(with_nul.store_name("kv", "sessions"), "sessions");
+    }
+
+    #[test]
+    fn store_name_accepts_real_world_punctuation() {
+        // Underscores, dashes, and dots are valid in every platform
+        // store-name we target. Don't false-reject them.
+        let cfg = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__KV__SESSIONS__NAME",
+            "prod-app_v2.sessions",
+        )]);
+        assert_eq!(cfg.store_name("kv", "sessions"), "prod-app_v2.sessions");
     }
 
     #[test]

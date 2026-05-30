@@ -1,12 +1,8 @@
 #![cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-// Keep coverage for the deprecated low-level dispatch path while it remains public.
-#![allow(deprecated)]
 
 use bytes::Bytes;
 use edgezero_adapter_cloudflare::context::CloudflareRequestContext;
-use edgezero_adapter_cloudflare::request::{
-    dispatch, dispatch_with_config, dispatch_with_config_handle, into_core_request,
-};
+use edgezero_adapter_cloudflare::request::{into_core_request, CloudflareService};
 use edgezero_adapter_cloudflare::response::from_core_response;
 use edgezero_core::{
     app::App,
@@ -194,7 +190,10 @@ async fn dispatch_runs_router_and_returns_response() {
     let req = cf_request(CfMethod::Get, "/uri", None);
     let (env, ctx) = test_env_ctx();
 
-    let mut response = dispatch(&app, req, env, ctx).await.expect("cf response");
+    let mut response = CloudflareService::new(&app)
+        .dispatch(req, env, ctx)
+        .await
+        .expect("cf response");
 
     assert_eq!(response.status_code(), StatusCode::OK.as_u16());
     let body = response.text().await.expect("text");
@@ -207,7 +206,10 @@ async fn dispatch_streaming_route_preserves_chunks() {
     let req = cf_request(CfMethod::Get, "/stream", None);
     let (env, ctx) = test_env_ctx();
 
-    let mut response = dispatch(&app, req, env, ctx).await.expect("cf response");
+    let mut response = CloudflareService::new(&app)
+        .dispatch(req, env, ctx)
+        .await
+        .expect("cf response");
 
     assert_eq!(response.status_code(), StatusCode::OK.as_u16());
     let bytes = response.bytes().await.expect("bytes");
@@ -220,7 +222,10 @@ async fn dispatch_passes_request_body_to_handlers() {
     let req = cf_request(CfMethod::Post, "/mirror", Some(b"echo"));
     let (env, ctx) = test_env_ctx();
 
-    let mut response = dispatch(&app, req, env, ctx).await.expect("cf response");
+    let mut response = CloudflareService::new(&app)
+        .dispatch(req, env, ctx)
+        .await
+        .expect("cf response");
 
     assert_eq!(response.status_code(), StatusCode::OK.as_u16());
     let bytes = response.bytes().await.expect("bytes");
@@ -228,15 +233,18 @@ async fn dispatch_passes_request_body_to_handlers() {
 }
 
 #[wasm_bindgen_test]
-async fn dispatch_with_config_missing_binding_skips_injection() {
+async fn service_with_config_missing_binding_skips_injection() {
     // The test env is an empty JS object; any env.var() call returns None.
-    // dispatch_with_config should log a warning and dispatch without injecting
-    // a config-store handle, so the handler sees `ctx.config_store_default()` return `None`.
+    // `CloudflareService::with_config(name)` should log a warning and
+    // dispatch without injecting a config-store handle, so the handler
+    // sees `ctx.config_store_default()` return `None`.
     let app = build_test_app();
     let req = cf_request(CfMethod::Get, "/has-config", None);
     let (env, ctx) = test_env_ctx();
 
-    let mut response = dispatch_with_config(&app, req, env, ctx, "nonexistent_binding")
+    let mut response = CloudflareService::new(&app)
+        .with_config("nonexistent_binding")
+        .dispatch(req, env, ctx)
         .await
         .expect("cf response");
 
@@ -246,13 +254,15 @@ async fn dispatch_with_config_missing_binding_skips_injection() {
 }
 
 #[wasm_bindgen_test]
-async fn dispatch_with_config_handle_injects_handle() {
+async fn service_with_config_handle_injects_handle() {
     let app = build_test_app();
     let req = cf_request(CfMethod::Get, "/config-value", None);
     let (env, ctx) = test_env_ctx();
     let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore("hello from cf test")));
 
-    let mut response = dispatch_with_config_handle(&app, req, env, ctx, handle)
+    let mut response = CloudflareService::new(&app)
+        .with_config_handle(handle)
+        .dispatch(req, env, ctx)
         .await
         .expect("cf response");
 

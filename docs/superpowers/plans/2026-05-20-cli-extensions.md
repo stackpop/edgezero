@@ -142,11 +142,17 @@
   dispatchers, and migrated 9 dev-server callers + 3 axum
   service tests + 4 contract-test handlers (cloudflare /
   fastly / spin) to the registry-aware accessors. The
-  `with_*_handle` / `dispatch_with_*_handle` convenience
-  constructors stay public but route through the
-  one-id-registry synthesis path internally, so pre-rewrite
-  setup code keeps compiling while pre-rewrite handler code
-  fails to compile (exactly the spec contract).
+  axum `with_*_handle` setup APIs stay public but route
+  through the one-id-registry synthesis path internally.
+
+  Subsequent dispatch-API consolidation: the per-store
+  `dispatch_with_*` variant fan-out on fastly + cloudflare
+  collapsed into a single `FastlyService` / `CloudflareService`
+  builder. Per-request store wiring uses the fluent form
+  `Service::new(&app).with_kv("name").require_kv()
+  .with_config("name").with_secrets().dispatch(req[, env, ctx])`.
+  The manifest-driven `run_app` remains the recommended
+  entrypoint and now internally builds a Service.
 
 ## Codebase facts this plan relies on
 
