@@ -18,10 +18,12 @@ impl CloudflareRequestContext {
         });
     }
 
+    #[must_use]
     pub fn env(&self) -> &Env {
         &self.env
     }
 
+    #[must_use]
     pub fn ctx(&self) -> &Context {
         &self.ctx
     }

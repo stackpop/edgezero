@@ -22,7 +22,7 @@ struct FixedConfigStore(&'static str);
 
 impl ConfigStore for FixedConfigStore {
     fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(Some(self.0.to_string()))
+        Ok(Some(self.0.to_owned()))
     }
 }
 
@@ -62,7 +62,7 @@ fn build_test_app() -> App {
         let value = ctx
             .config_store()
             .and_then(|store| store.get("greeting").ok().flatten())
-            .unwrap_or_else(|| "missing".to_string());
+            .unwrap_or_else(|| "missing".to_owned());
         let response = response_builder()
             .status(StatusCode::OK)
             .body(Body::text(value))

@@ -30,6 +30,7 @@ pub struct CloudflareSecretStore {
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 impl CloudflareSecretStore {
     /// Create a secret store from a cloned `Env`.
+    #[must_use]
     pub fn from_env(env: worker::Env) -> Self {
         Self { env }
     }

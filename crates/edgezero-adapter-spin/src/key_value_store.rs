@@ -40,7 +40,7 @@ impl SpinKvStore {
         Ok(Self { store })
     }
 
-    /// Open the default EdgeZero KV store label (`"EDGEZERO_KV"`).
+    /// Open the default `EdgeZero` KV store label (`"EDGEZERO_KV"`).
     pub fn open_default() -> Result<Self, KvError> {
         Self::open(edgezero_core::manifest::DEFAULT_KV_STORE_NAME)
     }
@@ -68,7 +68,7 @@ impl KvStore for SpinKvStore {
         _ttl: Duration,
     ) -> Result<(), KvError> {
         Err(KvError::Validation(
-            "Spin KV does not support TTL; use put_bytes for non-expiring values".to_string(),
+            "Spin KV does not support TTL; use put_bytes for non-expiring values".to_owned(),
         ))
     }
 
@@ -91,7 +91,7 @@ impl KvStore for SpinKvStore {
         _limit: usize,
     ) -> Result<KvPage, KvError> {
         Err(KvError::Validation(
-            "Spin KV key listing is unsupported because Store::get_keys() is unbounded".to_string(),
+            "Spin KV key listing is unsupported because Store::get_keys() is unbounded".to_owned(),
         ))
     }
 }

@@ -22,13 +22,12 @@ impl ProxyClient for SpinProxyClient {
 
         // Spin's WASI HTTP interface requires string-typed header values,
         // so non-UTF-8 values cannot be forwarded and are dropped with a warning.
-        for (name, value) in headers.iter() {
+        for (name, value) in &headers {
             if let Ok(v) = value.to_str() {
                 builder.header(name.as_str(), v);
             } else {
                 log::warn!(
-                    "dropping non-UTF-8 proxy request header (Spin WASI limitation): {}",
-                    name
+                    "dropping non-UTF-8 proxy request header (Spin WASI limitation): {name}"
                 );
             }
         }
@@ -49,13 +48,13 @@ impl ProxyClient for SpinProxyClient {
         let mut response_headers = Vec::new();
         for (name, value) in spin_response.headers() {
             let Ok(hname) = edgezero_core::http::HeaderName::from_bytes(name.as_bytes()) else {
-                log::warn!("dropping invalid proxy response header name: {}", name);
+                log::warn!("dropping invalid proxy response header name: {name}");
                 continue;
             };
             match edgezero_core::http::HeaderValue::from_bytes(value.as_bytes()) {
                 Ok(hval) => response_headers.push((hname, hval)),
                 Err(_) => {
-                    log::warn!("dropping invalid proxy response header value for: {}", name);
+                    log::warn!("dropping invalid proxy response header value for: {name}");
                 }
             }
         }
@@ -66,7 +65,7 @@ impl ProxyClient for SpinProxyClient {
             .iter()
             .find(|(name, _)| *name == header::CONTENT_ENCODING)
             .and_then(|(_, value)| value.to_str().ok())
-            .map(|v| v.to_ascii_lowercase());
+            .map(str::to_ascii_lowercase);
 
         let response_body = spin_response.into_body();
         let decompressed = decompress_body(response_body, encoding.as_deref())?;
@@ -78,7 +77,7 @@ impl ProxyClient for SpinProxyClient {
 
         // Strip encoding headers after decompression so downstream
         // handlers see plain bytes (consistent with Fastly/Cloudflare).
-        if matches!(encoding.as_deref(), Some("gzip") | Some("br")) {
+        if matches!(encoding.as_deref(), Some("gzip" | "br")) {
             proxy_response
                 .headers_mut()
                 .remove(header::CONTENT_ENCODING);

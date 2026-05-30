@@ -1,7 +1,7 @@
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
-use futures_util::StreamExt;
+use futures_util::StreamExt as _;
 use worker::{Error as WorkerError, Response as CfResponse};
 
 pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
@@ -25,7 +25,7 @@ pub fn from_core_response(response: Response) -> Result<CfResponse, EdgeError> {
 
     let mut cf_response = cf_response.with_status(parts.status.as_u16());
     let headers = cf_response.headers_mut();
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         if let Ok(value_str) = value.to_str() {
             headers
                 .set(name.as_str(), value_str)
@@ -41,7 +41,7 @@ mod tests {
     use bytes::Bytes;
     use edgezero_core::body::Body;
     use edgezero_core::http::response_builder;
-    use futures_util::{stream, StreamExt};
+    use futures_util::{stream, StreamExt as _};
 
     #[test]
     #[ignore] // Requires worker runtime — cannot construct worker::Response in unit tests
