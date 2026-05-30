@@ -22,6 +22,7 @@ enum SpinConfigBackend {
 impl SpinConfigStore {
     /// Create a new `SpinConfigStore` using the Spin variables API.
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: SpinConfigBackend::Spin,

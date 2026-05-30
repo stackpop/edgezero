@@ -24,17 +24,17 @@ pub(crate) struct Stores {
     pub(crate) secrets: Option<SecretHandle>,
 }
 
-/// Convert a Spin `IncomingRequest` into an EdgeZero core `Request`.
+/// Convert a Spin `IncomingRequest` into an `EdgeZero` core `Request`.
 ///
 /// Reads the full body into a buffered `Body::Once`, inserts
 /// `SpinRequestContext` and a `ProxyHandle` into extensions.
 pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeError> {
     let method = req.method();
-    let path_with_query = req.path_with_query().unwrap_or_else(|| "/".to_string());
+    let path_with_query = req.path_with_query().unwrap_or_else(|| "/".to_owned());
 
     let uri: Uri = path_with_query
         .parse()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {}", err)))?;
+        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {err}")))?;
 
     // Extract headers before consuming the request body. The WASI `headers()`
     // handle borrows the request and must be dropped before `into_body()`.
@@ -51,7 +51,7 @@ pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeErro
                 builder = builder.header(name.as_str(), hval);
             }
             Err(_) => {
-                log::warn!("dropping invalid request header value: {}", name);
+                log::warn!("dropping invalid request header value: {name}");
             }
         }
     }
@@ -70,11 +70,11 @@ pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeErro
     let body_bytes = req
         .into_body()
         .await
-        .map_err(|e| EdgeError::bad_request(format!("failed to read request body: {}", e)))?;
+        .map_err(|e| EdgeError::bad_request(format!("failed to read request body: {e}")))?;
 
     let mut request = builder
         .body(Body::from(body_bytes))
-        .map_err(|e| EdgeError::bad_request(format!("failed to build request: {}", e)))?;
+        .map_err(|e| EdgeError::bad_request(format!("failed to build request: {e}")))?;
 
     SpinRequestContext::insert(
         &mut request,
@@ -98,7 +98,7 @@ fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<Strin
         .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
 }
 
-/// Dispatch a Spin request through the EdgeZero router using the `"default"`
+/// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
 /// KV store label.
 ///
 /// This is a low-level manual path. It does not read `edgezero.toml` and
@@ -138,7 +138,7 @@ pub(crate) async fn dispatch_with_store_settings(
     dispatch_with_handles(app, req, stores).await
 }
 
-/// Dispatch a Spin request through the EdgeZero router and return
+/// Dispatch a Spin request through the `EdgeZero` router and return
 /// a Spin-compatible response, opening the KV store under `kv_label`.
 ///
 /// Injects all available stores into request extensions:
@@ -195,15 +195,12 @@ fn resolve_kv_handle(kv_label: &str, kv_required: bool) -> anyhow::Result<Option
         Err(e) => {
             if kv_required {
                 return Err(anyhow::anyhow!(
-                    "Spin KV store '{}' is explicitly configured but could not be opened: {}",
-                    kv_label,
-                    e
+                    "Spin KV store '{kv_label}' is explicitly configured but could not be opened: {e}"
                 ));
             }
             log::warn!(
-                "SpinKvStore: could not open KV store (label {:?}); \
-                 KV operations will be unavailable: {e}",
-                kv_label
+                "SpinKvStore: could not open KV store (label {kv_label:?}); \
+                 KV operations will be unavailable: {e}"
             );
             Ok(None)
         }

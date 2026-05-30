@@ -51,6 +51,7 @@ impl CloudflareConfigStore {
     /// Missing bindings or invalid JSON are treated as configuration problems, logged at warn
     /// level (once per binding name per isolate lifetime), and return `None` so the adapter
     /// can skip injecting the handle.
+    #[must_use]
     pub fn try_new(env: &Env, binding_name: &str) -> Option<Self> {
         Some(Self {
             data: lookup_cached(env, binding_name)?,
@@ -91,7 +92,7 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
     // Fast path: already cached.
     if let Some(entry) = config_cache()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(binding_name)
     {
         return entry;
@@ -101,8 +102,7 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
     let resolved = match env.var(binding_name).ok().map(|v| v.to_string()) {
         None => {
             log::warn!(
-                "configured config store binding '{}' is missing from the Worker environment; skipping config-store injection",
-                binding_name
+                "configured config store binding '{binding_name}' is missing from the Worker environment; skipping config-store injection"
             );
             None
         }
@@ -110,9 +110,7 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
             Ok(data) => Some(Arc::new(data)),
             Err(err) => {
                 log::warn!(
-                    "configured config store binding '{}' contains invalid JSON: {}; skipping config-store injection",
-                    binding_name,
-                    err
+                    "configured config store binding '{binding_name}' contains invalid JSON: {err}; skipping config-store injection"
                 );
                 None
             }
@@ -125,7 +123,7 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
     // so caching a failed parse prevents redundant warnings on every request.
     config_cache()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get_or_insert(binding_name, resolved, CONFIG_CACHE_LIMIT)
 }
 
@@ -161,7 +159,7 @@ impl ConfigCache {
             }
         }
 
-        let key = key.to_string();
+        let key = key.to_owned();
         self.order.push_back(key.clone());
         self.entries.insert(key, value.clone());
         value
@@ -175,8 +173,8 @@ mod tests {
 
     edgezero_core::config_store_contract_tests!(cloudflare_config_store_contract, #[wasm_bindgen_test], {
         CloudflareConfigStore::from_entries([
-            ("contract.key.a".to_string(), "value_a".to_string()),
-            ("contract.key.b".to_string(), "value_b".to_string()),
+            ("contract.key.a".to_owned(), "value_a".to_owned()),
+            ("contract.key.b".to_owned(), "value_b".to_owned()),
         ])
     });
 }

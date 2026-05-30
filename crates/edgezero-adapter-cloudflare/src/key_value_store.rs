@@ -93,14 +93,14 @@ impl KvStore for CloudflareKvStore {
         limit: usize,
     ) -> Result<KvPage, KvError> {
         let limit = u64::try_from(limit)
-            .map_err(|_| KvError::Validation("list limit exceeds u64".to_string()))?;
+            .map_err(|_| KvError::Validation("list limit exceeds u64".to_owned()))?;
         let mut request = self.store.list().limit(limit);
 
         if !prefix.is_empty() {
-            request = request.prefix(prefix.to_string());
+            request = request.prefix(prefix.to_owned());
         }
         if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-            request = request.cursor(cursor.to_string());
+            request = request.cursor(cursor.to_owned());
         }
 
         let response = request

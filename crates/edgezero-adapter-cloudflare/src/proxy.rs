@@ -5,8 +5,8 @@ use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
-use futures_util::stream::{self, LocalBoxStream, StreamExt};
-use futures_util::TryStreamExt;
+use futures_util::stream::{self, LocalBoxStream, StreamExt as _};
+use futures_util::TryStreamExt as _;
 use std::io;
 use worker::{
     wasm_bindgen::JsValue, Body as WorkerBody, Fetch, Headers, Method as CfMethod,
@@ -134,7 +134,7 @@ fn http_method_to_cf(method: Method) -> CfMethod {
 type ChunkStream = LocalBoxStream<'static, Result<Vec<u8>, io::Error>>;
 
 fn worker_error_to_io(err: worker::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, err.to_string())
+    io::Error::other(err.to_string())
 }
 
 fn transform_stream(
@@ -155,7 +155,7 @@ mod tests {
     use flate2::{write::GzEncoder, Compression};
     use futures::executor::block_on;
     use futures_util::stream;
-    use std::io::Write;
+    use std::io::Write as _;
 
     fn collect_body(body: Body) -> Vec<u8> {
         match body {
@@ -194,8 +194,8 @@ mod tests {
         let mut brotli_data = Vec::new();
         {
             let mut compressor = CompressorWriter::new(&mut brotli_data, 4096, 5, 21);
-            compressor.write_all(b"brotli payload").unwrap();
-        }
+            compressor.write_all(b"brotli payload").unwrap()
+        };
         let brotli_stream: ChunkStream =
             Box::pin(stream::iter(vec![Ok::<Vec<u8>, io::Error>(brotli_data)]));
         let body = Body::from_stream(transform_stream(brotli_stream, Some("br")));

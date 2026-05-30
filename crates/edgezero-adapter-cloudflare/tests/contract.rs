@@ -20,7 +20,7 @@ use edgezero_core::{
 use futures::stream;
 use std::sync::Arc;
 use wasm_bindgen_test::*;
-use worker::wasm_bindgen::{JsCast, JsValue};
+use worker::wasm_bindgen::{JsCast as _, JsValue};
 use worker::{Context, Env, Method as CfMethod, Request as CfRequest, RequestInit};
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -29,7 +29,7 @@ struct FixedConfigStore(&'static str);
 
 impl ConfigStore for FixedConfigStore {
     fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(Some(self.0.to_string()))
+        Ok(Some(self.0.to_owned()))
     }
 }
 
@@ -82,7 +82,7 @@ fn build_test_app() -> App {
         let value = ctx
             .config_store()
             .and_then(|store| store.get("greeting").ok().flatten())
-            .unwrap_or_else(|| "missing".to_string());
+            .unwrap_or_else(|| "missing".to_owned());
         let response = response_builder()
             .status(StatusCode::OK)
             .body(Body::text(value))
@@ -117,7 +117,7 @@ fn cf_request(method: CfMethod, path: &str, body: Option<&[u8]>) -> CfRequest {
         init.with_body(Some(JsValue::from(array))); // Uint8Array -> JsValue
     }
 
-    let url = format!("https://example.com{}", path);
+    let url = format!("https://example.com{path}");
     CfRequest::new_with_init(&url, &init).expect("cf request")
 }
 

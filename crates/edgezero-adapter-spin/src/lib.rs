@@ -100,7 +100,7 @@ pub(crate) fn resolve_store_settings(
 }
 
 /// Convenience entry point: build the app from `Hooks`, dispatch the
-/// incoming Spin request through the EdgeZero router, and return the
+/// incoming Spin request through the `EdgeZero` router, and return the
 /// response.
 ///
 /// `manifest_src` must be the contents of `edgezero.toml`. `run_app` uses it

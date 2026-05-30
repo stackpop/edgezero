@@ -45,11 +45,11 @@ pub async fn into_core_request(
     let method = into_core_method(req.method());
     let url = req
         .url()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URL: {}", err)))?;
+        .map_err(|err| EdgeError::bad_request(format!("invalid URL: {err}")))?;
     let uri: Uri = url
         .as_str()
         .parse()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {}", err)))?;
+        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {err}")))?;
 
     let mut builder = request_builder().method(method).uri(uri);
     let headers = req.headers();
@@ -324,8 +324,7 @@ pub(crate) fn resolve_kv_handle(
         Err(e) => {
             if kv_required {
                 return Err(WorkerError::RustError(format!(
-                    "KV binding '{}' is explicitly configured but could not be opened: {}",
-                    kv_binding, e
+                    "KV binding '{kv_binding}' is explicitly configured but could not be opened: {e}"
                 )));
             }
             warn_missing_kv_binding_once(kv_binding, &e);
@@ -353,13 +352,13 @@ fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl std::fmt::Display
 
     match warned_bindings.lock() {
         Ok(mut warned_bindings) => {
-            if !warned_bindings.insert(kv_binding.to_string()) {
+            if !warned_bindings.insert(kv_binding.to_owned()) {
                 return;
             }
-            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+            log::warn!("KV binding '{kv_binding}' not available: {error}");
         }
         Err(_) => {
-            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+            log::warn!("KV binding '{kv_binding}' not available: {error}");
         }
     }
 }
@@ -390,7 +389,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn into_http_method_defaults_unknown_to_get() {
-        let method = Method::from("FOO".to_string());
+        let method = Method::from("FOO".to_owned());
         assert_eq!(into_core_method(method), CoreMethod::GET);
     }
 }

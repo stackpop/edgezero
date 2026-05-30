@@ -27,7 +27,7 @@ struct FixedConfigStore {
 impl ConfigStore for FixedConfigStore {
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         if key == self.key {
-            Ok(Some(self.value.to_string()))
+            Ok(Some(self.value.to_owned()))
         } else {
             Ok(None)
         }
@@ -73,7 +73,7 @@ impl KvStore for FixedKvStore {
         _limit: usize,
     ) -> Result<KvPage, KvError> {
         Ok(KvPage {
-            keys: vec![self.key.to_string()],
+            keys: vec![self.key.to_owned()],
             cursor: None,
         })
     }
@@ -137,7 +137,7 @@ fn build_test_app() -> App {
         let value = ctx
             .config_store()
             .and_then(|store| store.get("greeting").ok().flatten())
-            .unwrap_or_else(|| "missing".to_string());
+            .unwrap_or_else(|| "missing".to_owned());
         let response = response_builder()
             .status(StatusCode::OK)
             .body(Body::text(value))
@@ -149,11 +149,11 @@ fn build_test_app() -> App {
         let value = if let Some(handle) = ctx.kv_handle() {
             match handle.get_bytes("test-key").await {
                 Ok(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
-                Ok(None) => "missing".to_string(),
-                Err(_) => "error".to_string(),
+                Ok(None) => "missing".to_owned(),
+                Err(_) => "error".to_owned(),
             }
         } else {
-            "no-handle".to_string()
+            "no-handle".to_owned()
         };
         let response = response_builder()
             .status(StatusCode::OK)
@@ -166,11 +166,11 @@ fn build_test_app() -> App {
         let value = if let Some(handle) = ctx.secret_handle() {
             match handle.get_bytes("default", "test-secret").await {
                 Ok(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
-                Ok(None) => "missing".to_string(),
-                Err(_) => "error".to_string(),
+                Ok(None) => "missing".to_owned(),
+                Err(_) => "error".to_owned(),
             }
         } else {
-            "no-handle".to_string()
+            "no-handle".to_owned()
         };
         let response = response_builder()
             .status(StatusCode::OK)
@@ -264,7 +264,7 @@ fn router_dispatches_streaming_route() {
     let (_, body) = response.into_parts();
     let mut stream = body.into_stream().expect("should be a stream");
     let collected = block_on(async {
-        use futures::StreamExt;
+        use futures::StreamExt as _;
         let mut out = Vec::new();
         while let Some(chunk) = stream.next().await {
             out.extend_from_slice(&chunk.expect("chunk"));

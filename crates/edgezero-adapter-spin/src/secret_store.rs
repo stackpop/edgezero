@@ -15,6 +15,7 @@ use edgezero_core::secret_store::{SecretError, SecretStore};
 pub struct SpinSecretStore;
 
 impl SpinSecretStore {
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
@@ -33,9 +34,8 @@ impl SecretStore for SpinSecretStore {
         if !store_name.is_empty() {
             // Spin's variable namespace is flat; named stores are not supported.
             log::debug!(
-                "SpinSecretStore: store_name {:?} is ignored; \
-                 Spin uses a single flat variable namespace",
-                store_name
+                "SpinSecretStore: store_name {store_name:?} is ignored; \
+                 Spin uses a single flat variable namespace"
             );
         }
         // Spin variable names must be lowercase. Normalise via ascii_lowercase
