@@ -52,6 +52,54 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  adapter-wasm-clippy:
+    name: ${{ matrix.adapter }} wasm clippy
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - adapter: cloudflare
+            target: wasm32-unknown-unknown
+          - adapter: fastly
+            target: wasm32-wasip1
+          - adapter: spin
+            target: wasm32-wasip1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.adapter }}-clippy-
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust tool chain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          components: clippy
+
+      - name: Add wasm target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Fetch dependencies (locked)
+        run: cargo fetch --locked
+
+      - name: Clippy ${{ matrix.adapter }} on ${{ matrix.target }}
+        run: cargo clippy -p edgezero-adapter-${{ matrix.adapter }} --features ${{ matrix.adapter }} --target ${{ matrix.target }} --all-targets -- -D warnings
+
   format-docs:
     runs-on: ubuntu-latest
     defaults:
