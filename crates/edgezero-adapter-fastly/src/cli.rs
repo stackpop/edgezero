@@ -832,6 +832,16 @@ mod tests {
     use edgezero_adapter::cli_support::read_package_name;
     use tempfile::tempdir;
 
+    // Shared fixture names. Pinning these as consts (instead of
+    // inline `"sessions"` / `"app_config"` per call site) keeps the
+    // setup-vs-assertion pair in sync -- a typo in one place no
+    // longer silently divorces from the other, because both reference
+    // the same const. Also names the intent: these are the LOGICAL
+    // store ids the fastly adapter operates on, not arbitrary strings.
+    const TEST_KV_ID: &str = "sessions";
+    const TEST_CONFIG_ID: &str = "app_config";
+    const TEST_SECRET_ID: &str = "default";
+
     #[test]
     fn finds_closest_manifest_when_multiple_exist() {
         let dir = tempdir().unwrap();
@@ -1077,7 +1087,7 @@ mod tests {
             "name = \"demo\"\n[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
         )
         .expect("write");
-        assert!(setup_block_present(&path, "kv", "sessions").expect("probe"));
+        assert!(setup_block_present(&path, "kv", TEST_KV_ID).expect("probe"));
     }
 
     #[test]
@@ -1085,14 +1095,14 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n[setup.kv_stores.other]\n").expect("write");
-        assert!(!setup_block_present(&path, "kv", "sessions").expect("probe"));
+        assert!(!setup_block_present(&path, "kv", TEST_KV_ID).expect("probe"));
     }
 
     #[test]
     fn setup_block_present_false_for_missing_file() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("does-not-exist.toml");
-        assert!(!setup_block_present(&path, "kv", "sessions").expect("probe"));
+        assert!(!setup_block_present(&path, "kv", TEST_KV_ID).expect("probe"));
     }
 
     #[test]
@@ -1108,7 +1118,7 @@ mod tests {
         let only_setup = dir.path().join("only_setup.toml");
         fs::write(&only_setup, "name = \"demo\"\n[setup.kv_stores.sessions]\n").expect("write");
         assert!(
-            !setup_block_present(&only_setup, "kv", "sessions").expect("probe"),
+            !setup_block_present(&only_setup, "kv", TEST_KV_ID).expect("probe"),
             "[setup.*] alone is not enough -- [local_server.*] also required"
         );
 
@@ -1119,7 +1129,7 @@ mod tests {
         )
         .expect("write");
         assert!(
-            !setup_block_present(&only_local, "kv", "sessions").expect("probe"),
+            !setup_block_present(&only_local, "kv", TEST_KV_ID).expect("probe"),
             "[local_server.*] alone is not enough -- [setup.*] also required"
         );
     }
@@ -1131,7 +1141,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
-        append_fastly_setup(&path, "kv", "sessions").expect("append");
+        append_fastly_setup(&path, "kv", TEST_KV_ID).expect("append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains("[setup.kv_stores.sessions]"),
@@ -1156,7 +1166,7 @@ mod tests {
             "[setup.kv_stores.cache]\n[local_server.kv_stores.cache]\n",
         )
         .expect("write");
-        append_fastly_setup(&path, "kv", "sessions").expect("append");
+        append_fastly_setup(&path, "kv", TEST_KV_ID).expect("append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains("[setup.kv_stores.cache]"),
@@ -1177,7 +1187,7 @@ mod tests {
             "[setup.kv_stores.sessions]\nfoo = \"keep\"\n[local_server.kv_stores.sessions]\n",
         )
         .expect("write");
-        append_fastly_setup(&path, "kv", "sessions").expect("idempotent append");
+        append_fastly_setup(&path, "kv", TEST_KV_ID).expect("idempotent append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains("foo = \"keep\""),
@@ -1190,7 +1200,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         // Note: no fs::write — file starts absent.
-        append_fastly_setup(&path, "config", "app_config").expect("create");
+        append_fastly_setup(&path, "config", TEST_CONFIG_ID).expect("create");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(after.contains("[setup.config_stores.app_config]"));
         assert!(after.contains("[local_server.config_stores.app_config]"));
@@ -1205,7 +1215,7 @@ mod tests {
             "# managed by hand -- please keep this line\nname = \"demo\"\n",
         )
         .expect("write");
-        append_fastly_setup(&path, "secret", "default").expect("append");
+        append_fastly_setup(&path, "secret", TEST_SECRET_ID).expect("append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains("# managed by hand"),
@@ -1220,9 +1230,9 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
-        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["app_config"]);
-        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["default"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_SECRET_ID]);
         let stores = ProvisionStores {
             config: &config_ids,
             kv: &kv_ids,
@@ -1244,7 +1254,7 @@ mod tests {
     #[test]
     fn provision_errors_when_adapter_manifest_path_missing() {
         let dir = tempdir().expect("tempdir");
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1289,7 +1299,7 @@ mod tests {
             "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
         )
         .expect("write");
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1306,11 +1316,13 @@ mod tests {
 
     #[test]
     fn find_config_store_id_matches_bare_array_by_name() {
-        let stdout = r#"[
-            {"id": "abc123", "name": "app_config"},
-            {"id": "def456", "name": "other_store"}
-        ]"#;
-        match find_config_store_id(stdout, "app_config") {
+        let stdout = format!(
+            r#"[
+                {{"id": "abc123", "name": "{TEST_CONFIG_ID}"}},
+                {{"id": "def456", "name": "other_store"}}
+            ]"#
+        );
+        match find_config_store_id(&stdout, TEST_CONFIG_ID) {
             ConfigStoreLookup::Found(id) => assert_eq!(id, "abc123"),
             ConfigStoreLookup::NotFound => panic!("expected Found, got NotFound"),
             ConfigStoreLookup::SchemaDrift(detail) => {
@@ -1321,10 +1333,12 @@ mod tests {
 
     #[test]
     fn find_config_store_id_tolerates_items_envelope() {
-        let stdout = r#"{"items": [
-            {"id": "xyz789", "name": "app_config"}
-        ]}"#;
-        match find_config_store_id(stdout, "app_config") {
+        let stdout = format!(
+            r#"{{"items": [
+                {{"id": "xyz789", "name": "{TEST_CONFIG_ID}"}}
+            ]}}"#
+        );
+        match find_config_store_id(&stdout, TEST_CONFIG_ID) {
             ConfigStoreLookup::Found(id) => assert_eq!(id, "xyz789"),
             ConfigStoreLookup::NotFound => panic!("expected Found, got NotFound"),
             ConfigStoreLookup::SchemaDrift(detail) => {
@@ -1385,8 +1399,8 @@ mod tests {
         // Array of objects but none have BOTH string `name` and
         // string `id` fields — suggests schema rename (e.g.
         // fastly renamed `name` → `title`).
-        let stdout = r#"[{"title": "app_config", "uid": "abc"}]"#;
-        let drift = find_config_store_id(stdout, "app_config");
+        let stdout = format!(r#"[{{"title": "{TEST_CONFIG_ID}", "uid": "abc"}}]"#);
+        let drift = find_config_store_id(&stdout, TEST_CONFIG_ID);
         assert!(
             matches!(drift, ConfigStoreLookup::SchemaDrift(_)),
             "entries lacking name/id must be schema drift, got {drift:?}"
@@ -1419,7 +1433,7 @@ mod tests {
                 dir.path(),
                 Some("fastly.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 true,
             )
@@ -1452,7 +1466,7 @@ mod tests {
                 dir.path(),
                 Some("fastly.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &[],
                 false,
             )

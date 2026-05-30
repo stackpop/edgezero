@@ -848,6 +848,18 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    // Shared fixture names. Pinning these as consts (instead of
+    // inline `"sessions"` / `"app_config"` per call site) keeps the
+    // setup-vs-assertion pair in sync -- a typo in one place no
+    // longer silently divorces from the other, because both reference
+    // the same const. Also names the intent: these are the LOGICAL
+    // store ids the cloudflare adapter operates on, not arbitrary
+    // strings.
+    const TEST_KV_ID: &str = "sessions";
+    const TEST_KV_ID_ALT: &str = "cache";
+    const TEST_CONFIG_ID: &str = "app_config";
+    const TEST_SECRET_ID: &str = "default";
+
     // ---------- extract_namespace_id ----------
 
     #[test]
@@ -997,8 +1009,8 @@ id = "00112233445566778899aabbccddeeff"
         // doesn't match the expected shape".
         let dir = tempdir().expect("tempdir");
         let path = write_wrangler(dir.path(), "name = \"demo\"\nkv_namespaces = \"oops\"\n");
-        let err =
-            read_namespace_id(&path, "app_config").expect_err("non-array kv_namespaces must error");
+        let err = read_namespace_id(&path, TEST_CONFIG_ID)
+            .expect_err("non-array kv_namespaces must error");
         assert!(
             err.contains("array-of-tables") || err.contains("inline array"),
             "error names the expected shapes: {err}"
@@ -1036,7 +1048,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\n",
         );
-        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        upsert_kv_namespace(&path, TEST_KV_ID, "00112233445566778899aabbccddeeff").expect("upsert");
         let after = fs::read_to_string(&path).expect("read");
         assert!(
             after.contains("id = \"00112233445566778899aabbccddeeff\""),
@@ -1057,7 +1069,7 @@ id = "00112233445566778899aabbccddeeff"
     fn upsert_kv_namespace_appends_when_binding_absent() {
         let dir = tempdir().expect("tempdir");
         let path = write_wrangler(dir.path(), "name = \"demo\"\n");
-        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        upsert_kv_namespace(&path, TEST_KV_ID, "00112233445566778899aabbccddeeff").expect("upsert");
         let after = fs::read_to_string(&path).expect("read");
         assert!(
             after.contains("binding = \"sessions\"")
@@ -1077,7 +1089,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "[[kv_namespaces]]\nbinding = \"cache\"\nid = \"old\"\n",
         );
-        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        upsert_kv_namespace(&path, TEST_KV_ID, "00112233445566778899aabbccddeeff").expect("upsert");
         let after = fs::read_to_string(&path).expect("read");
         assert!(
             after.contains("binding = \"cache\"") && after.contains("id = \"old\""),
@@ -1101,7 +1113,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "# managed by hand -- please keep this line\nname = \"my-worker\"\n",
         );
-        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        upsert_kv_namespace(&path, TEST_KV_ID, "00112233445566778899aabbccddeeff").expect("upsert");
         let after = fs::read_to_string(&path).expect("read");
         assert!(
             after.contains("# managed by hand"),
@@ -1122,7 +1134,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\npreview_id = \"local-preview\"\ndescription = \"hand-added by ops\"\n",
         );
-        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff").expect("upsert");
+        upsert_kv_namespace(&path, TEST_KV_ID, "00112233445566778899aabbccddeeff").expect("upsert");
         let after = fs::read_to_string(&path).expect("read");
         assert!(
             after.contains("id = \"00112233445566778899aabbccddeeff\""),
@@ -1149,7 +1161,7 @@ id = "00112233445566778899aabbccddeeff"
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("missing.toml");
         assert!(!path.exists(), "precondition: file must not exist");
-        upsert_kv_namespace(&path, "sessions", "00112233445566778899aabbccddeeff")
+        upsert_kv_namespace(&path, TEST_KV_ID, "00112233445566778899aabbccddeeff")
             .expect("missing file is permissive");
         let after = fs::read_to_string(&path).expect("file now exists");
         assert!(
@@ -1168,9 +1180,10 @@ id = "00112233445566778899aabbccddeeff"
     fn provision_dry_run_does_not_invoke_wrangler() {
         let dir = tempdir().expect("tempdir");
         write_wrangler(dir.path(), "name = \"demo\"\n");
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions", "cache"]);
-        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["app_config"]);
-        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["default"]);
+        let kv_ids: Vec<ResolvedStoreId> =
+            ResolvedStoreId::from_logicals(&[TEST_KV_ID, TEST_KV_ID_ALT]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_SECRET_ID]);
         let stores = ProvisionStores {
             config: &config_ids,
             kv: &kv_ids,
@@ -1201,7 +1214,7 @@ id = "00112233445566778899aabbccddeeff"
         // id still mentioned for human-facing wording.
         let dir = tempdir().expect("tempdir");
         write_wrangler(dir.path(), "name = \"demo\"\n");
-        let config_ids = vec![ResolvedStoreId::new("app_config", "prod_config")];
+        let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
         let stores = ProvisionStores {
             config: &config_ids,
             kv: &[],
@@ -1228,7 +1241,7 @@ id = "00112233445566778899aabbccddeeff"
     #[test]
     fn provision_errors_when_adapter_manifest_path_missing() {
         let dir = tempdir().expect("tempdir");
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1251,7 +1264,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"00112233445566778899aabbccddeeff\"\n",
         );
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1284,7 +1297,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\n",
         );
-        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&["sessions"]);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
         let stores = ProvisionStores {
             config: &[],
             kv: &kv_ids,
@@ -1324,7 +1337,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"00112233445566778899aabbccddeeff\"\n",
         );
-        let id = find_namespace_id(&path, "app_config").expect("found");
+        let id = find_namespace_id(&path, TEST_CONFIG_ID).expect("found");
         assert_eq!(id, "00112233445566778899aabbccddeeff");
     }
 
@@ -1335,7 +1348,7 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "name = \"demo\"\nkv_namespaces = [{ binding = \"app_config\", id = \"ffeeddccbbaa99887766554433221100\" }]\n",
         );
-        let id = find_namespace_id(&path, "app_config").expect("found");
+        let id = find_namespace_id(&path, TEST_CONFIG_ID).expect("found");
         assert_eq!(id, "ffeeddccbbaa99887766554433221100");
     }
 
@@ -1346,9 +1359,9 @@ id = "00112233445566778899aabbccddeeff"
             dir.path(),
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"other\"\nid = \"00112233445566778899aabbccddeeff\"\n",
         );
-        let err = find_namespace_id(&path, "app_config").expect_err("missing must error");
+        let err = find_namespace_id(&path, TEST_CONFIG_ID).expect_err("missing must error");
         assert!(
-            err.contains("app_config") && err.contains("provision"),
+            err.contains(TEST_CONFIG_ID) && err.contains("provision"),
             "error names the binding and points at provision: {err}"
         );
     }
@@ -1368,7 +1381,7 @@ id = "00112233445566778899aabbccddeeff"
             "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"local-dev-placeholder\"\n",
         );
         let err =
-            find_namespace_id(&path, "app_config").expect_err("placeholder id must be rejected");
+            find_namespace_id(&path, TEST_CONFIG_ID).expect_err("placeholder id must be rejected");
         assert!(
             err.contains("local-dev-placeholder") && err.contains("provision"),
             "error names the placeholder and points at provision: {err}"
@@ -1380,7 +1393,7 @@ id = "00112233445566778899aabbccddeeff"
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("does-not-exist.toml");
         let err =
-            find_namespace_id(&path, "app_config").expect_err("missing wrangler.toml must error");
+            find_namespace_id(&path, TEST_CONFIG_ID).expect_err("missing wrangler.toml must error");
         assert!(
             err.contains("provision"),
             "error points at provision: {err}"
@@ -1429,7 +1442,7 @@ id = "00112233445566778899aabbccddeeff"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 true,
             )
@@ -1464,7 +1477,7 @@ id = "00112233445566778899aabbccddeeff"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 true,
             )
@@ -1488,7 +1501,7 @@ id = "00112233445566778899aabbccddeeff"
                 dir.path(),
                 None,
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 true,
             )
@@ -1513,13 +1526,13 @@ id = "00112233445566778899aabbccddeeff"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
                 false,
             )
             .expect_err("missing binding must error on real run");
         assert!(
-            err.contains("provision") && err.contains("app_config"),
+            err.contains("provision") && err.contains(TEST_CONFIG_ID),
             "error points at provision: {err}"
         );
     }
@@ -1536,7 +1549,7 @@ id = "00112233445566778899aabbccddeeff"
                 dir.path(),
                 Some("wrangler.toml"),
                 None,
-                &ResolvedStoreId::from_logical("app_config"),
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &[],
                 false,
             )
