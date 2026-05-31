@@ -179,9 +179,13 @@ fn run_shell(
     } else {
         format!("{} {}", command, shell_join(adapter_args))
     };
+    // Log only the manifest-defined `command`, never the trailing
+    // `adapter_args` — passthrough args from `edgezero build/deploy <adapter>
+    // -- --token …` can carry deploy tokens, API keys, or other secrets that
+    // must not land in logs or in the `Err` strings below.
     log::info!(
         "[edgezero] executing `{}` for adapter `{}` in {}",
-        full_command,
+        command,
         adapter_name,
         cwd.display()
     );
@@ -219,13 +223,13 @@ fn run_shell(
 
     let status = cmd
         .status()
-        .map_err(|err| format!("failed to run {action} command `{full_command}`: {err}"))?;
+        .map_err(|err| format!("failed to run {action} command `{command}`: {err}"))?;
 
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "{action} command `{full_command}` exited with status {status}"
+            "{action} command `{command}` exited with status {status}"
         ))
     }
 }
