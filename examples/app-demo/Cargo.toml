@@ -25,7 +25,7 @@ edgezero-adapter-fastly = { path = "../../crates/edgezero-adapter-fastly" }
 edgezero-adapter-spin = { path = "../../crates/edgezero-adapter-spin" }
 edgezero-cli = { path = "../../crates/edgezero-cli" }
 edgezero-core = { path = "../../crates/edgezero-core" }
-spin-sdk = { version = "5.2", default-features = false }
+spin-sdk = { version = "6", default-features = false }
 fastly = "0.12"
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 log = "0.4"

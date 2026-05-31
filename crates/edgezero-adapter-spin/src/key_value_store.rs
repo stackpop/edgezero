@@ -46,14 +46,18 @@ impl SpinKvStore {
     ///
     /// The `label` must match a `key_value_stores` entry in `spin.toml`.
     /// Returns `KvError::Internal` if the store cannot be opened.
-    pub fn open(label: &str) -> Result<Self, KvError> {
-        Self::open_with_max_list_keys(label, DEFAULT_MAX_LIST_KEYS)
+    pub async fn open(label: &str) -> Result<Self, KvError> {
+        Self::open_with_max_list_keys(label, DEFAULT_MAX_LIST_KEYS).await
     }
 
     /// Open a Spin KV store by label with a custom `max_list_keys` cap.
     /// Pass `0` to disable the cap (not recommended in production).
-    pub fn open_with_max_list_keys(label: &str, max_list_keys: usize) -> Result<Self, KvError> {
+    pub async fn open_with_max_list_keys(
+        label: &str,
+        max_list_keys: usize,
+    ) -> Result<Self, KvError> {
         let store = spin_sdk::key_value::Store::open(label)
+            .await
             .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?;
         Ok(Self {
             store,
@@ -67,6 +71,7 @@ impl KvStore for SpinKvStore {
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         self.store
             .get(key)
+            .await
             .map(|opt| opt.map(Bytes::from))
             .map_err(|e| KvError::Internal(anyhow::anyhow!("get failed: {e}")))
     }
@@ -74,6 +79,7 @@ impl KvStore for SpinKvStore {
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         self.store
             .set(key, value.as_ref())
+            .await
             .map_err(|e| KvError::Internal(anyhow::anyhow!("set failed: {e}")))
     }
 
@@ -91,12 +97,14 @@ impl KvStore for SpinKvStore {
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         self.store
             .delete(key)
+            .await
             .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
     }
 
     async fn exists(&self, key: &str) -> Result<bool, KvError> {
         self.store
             .exists(key)
+            .await
             .map_err(|e| KvError::Internal(anyhow::anyhow!("exists failed: {e}")))
     }
 
@@ -109,6 +117,9 @@ impl KvStore for SpinKvStore {
         let all_keys = self
             .store
             .get_keys()
+            .await
+            .collect()
+            .await
             .map_err(|e| KvError::Internal(anyhow::anyhow!("get_keys failed: {e}")))?;
         paginate_keys(all_keys, prefix, cursor, limit, self.max_list_keys)
     }

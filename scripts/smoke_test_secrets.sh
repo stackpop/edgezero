@@ -120,8 +120,8 @@ start_server() {
         echo "Spin CLI is required. Install from https://developer.fermyon.com/spin/v3/install" >&2
         exit 1
       }
-      echo "==> Building Spin WASM (wasm32-wasip1)..."
-      (cd "$DEMO_DIR" && cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin 2>&1)
+      echo "==> Building Spin WASM (wasm32-wasip2)..."
+      (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
       echo "==> Starting Spin on port $PORT..."
       # SpinSecretStore normalises the key to lowercase, so SMOKE_SECRET maps to
       # the Spin variable smoke_secret.  Pass the value via SPIN_VARIABLE_SMOKE_SECRET.

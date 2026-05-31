@@ -37,7 +37,7 @@ route = "/..."
 component = "app-demo"
 
 [component.app-demo]
-source = "../../target/wasm32-wasip1/release/app_demo_adapter_spin.wasm"
+source = "../../target/wasm32-wasip2/release/app_demo_adapter_spin.wasm"
 allowed_outbound_hosts = ["https://*:*"]
 # Spin labels match the logical KV ids declared in edgezero.toml
 # (`[stores.kv].ids = ["sessions", "cache"]`). Override per-id via
@@ -53,5 +53,5 @@ vault = "{{ vault }}"
 smoke_secret = "{{ smoke_secret }}"
 
 [component.app-demo.build]
-command = "cargo build --target wasm32-wasip1 --release"
+command = "cargo build --target wasm32-wasip2 --release"
 watch = ["src/**/*.rs", "Cargo.toml"]

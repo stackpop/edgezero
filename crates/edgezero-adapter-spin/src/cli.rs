@@ -31,12 +31,12 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     dependencies: SPIN_DEPENDENCIES,
     manifest: ManifestSpec {
         manifest_filename: "spin.toml",
-        build_target: "wasm32-wasip1",
+        build_target: "wasm32-wasip2",
         build_profile: "release",
         build_features: &["spin"],
     },
     commands: CommandTemplates {
-        build: "cargo build --target wasm32-wasip1 --release -p {crate}",
+        build: "cargo build --target wasm32-wasip2 --release -p {crate}",
         deploy: "spin deploy --from {crate_dir}",
         serve: "spin up --from {crate_dir}",
     },
@@ -106,7 +106,7 @@ static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     },
 ];
 
-const TARGET_TRIPLE: &str = "wasm32-wasip1";
+const TARGET_TRIPLE: &str = "wasm32-wasip2";
 
 const SPIN_INSTALL_HINT: &str = "install the Spin CLI (https://spinframework.dev/) and try again";
 
@@ -1215,8 +1215,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let workspace = dir.path();
         let manifest_dir = workspace.join("service");
-        fs::create_dir_all(manifest_dir.join("target/wasm32-wasip1/release")).unwrap();
-        let artifact = workspace.join("target/wasm32-wasip1/release/demo.wasm");
+        fs::create_dir_all(manifest_dir.join("target/wasm32-wasip2/release")).unwrap();
+        let artifact = workspace.join("target/wasm32-wasip2/release/demo.wasm");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "wasm").unwrap();
 
@@ -1232,7 +1232,7 @@ mod tests {
         fs::create_dir_all(&manifest_dir).unwrap();
 
         // Cargo emits underscored filenames for hyphenated crate names.
-        let artifact = workspace.join("target/wasm32-wasip1/release/my_cool_crate.wasm");
+        let artifact = workspace.join("target/wasm32-wasip2/release/my_cool_crate.wasm");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "wasm").unwrap();
 

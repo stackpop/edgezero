@@ -12,14 +12,14 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{request_builder, Request, Uri};
+use edgezero_core::http::{request_builder, Request};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use spin_sdk::http::IncomingRequest;
+use spin_sdk::http::body::IncomingBodyExt;
 
 #[derive(Default)]
 pub(crate) struct Stores {
@@ -31,56 +31,40 @@ pub(crate) struct Stores {
     pub(crate) secrets: Option<SecretHandle>,
 }
 
-/// Convert a Spin `IncomingRequest` into an EdgeZero core `Request`.
+/// Convert a Spin `Request` into an EdgeZero core `Request`.
 ///
 /// Reads the full body into a buffered `Body::Once`, inserts
 /// `SpinRequestContext` and a `ProxyHandle` into extensions.
-pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeError> {
-    let method = req.method();
-    let path_with_query = req.path_with_query().unwrap_or_else(|| "/".to_string());
+pub async fn into_core_request(req: spin_sdk::http::Request) -> Result<Request, EdgeError> {
+    let (parts, body) = req.into_parts();
 
-    let uri: Uri = path_with_query
-        .parse()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {}", err)))?;
+    let client_addr = parts
+        .headers
+        .get("spin-client-addr")
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::context::parse_client_addr);
+    let full_url = parts
+        .headers
+        .get("spin-full-url")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
 
-    // Extract headers before consuming the request body. The WASI `headers()`
-    // handle borrows the request and must be dropped before `into_body()`.
-    let headers = req.headers();
-    let header_entries = headers.entries();
-
-    let mut builder = request_builder()
-        .method(into_core_method(&method)?)
-        .uri(uri);
-
-    for (name, value) in &header_entries {
-        match edgezero_core::http::HeaderValue::from_bytes(value) {
-            Ok(hval) => {
-                builder = builder.header(name.as_str(), hval);
-            }
-            Err(_) => {
-                log::warn!("dropping invalid request header value: {}", name);
-            }
-        }
+    let mut builder = request_builder().method(parts.method).uri(parts.uri);
+    for (name, value) in parts.headers.iter() {
+        builder = builder.header(name, value);
     }
-
-    let client_addr = find_header_string(&header_entries, "spin-client-addr")
-        .and_then(|raw| crate::context::parse_client_addr(&raw));
-    let full_url = find_header_string(&header_entries, "spin-full-url");
-
-    // Drop the WASI resource handle before consuming the body.
-    drop(headers);
 
     // Inbound body size is not capped at the adapter level. The Spin runtime
     // enforces its own request body limit (configurable via `spin.toml`), which
     // is consistent with how the Fastly and Cloudflare adapters delegate inbound
     // size enforcement to their respective platform runtimes.
-    let body_bytes = req
-        .into_body()
+    let body_bytes = body
+        .bytes()
         .await
         .map_err(|e| EdgeError::bad_request(format!("failed to read request body: {}", e)))?;
 
     let mut request = builder
-        .body(Body::from(body_bytes))
+        .body(Body::from(body_bytes.to_vec()))
         .map_err(|e| EdgeError::bad_request(format!("failed to build request: {}", e)))?;
 
     SpinRequestContext::insert(
@@ -97,21 +81,16 @@ pub async fn into_core_request(req: IncomingRequest) -> Result<Request, EdgeErro
     Ok(request)
 }
 
-/// Find a header value by name from pre-extracted header entries.
-fn find_header_string(entries: &[(String, Vec<u8>)], name: &str) -> Option<String> {
-    entries
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .and_then(|(_, v)| String::from_utf8(v.clone()).ok())
-}
-
 /// Dispatch a Spin request through the EdgeZero router using the `"default"`
 /// KV store label.
 ///
 /// This is a low-level manual path. It does not read `EDGEZERO__*` environment
 /// config and therefore does not honor baked store metadata for KV, config, or
 /// secret stores. Prefer [`crate::run_app`] for normal dispatch.
-pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sdk::http::Response> {
+pub async fn dispatch(
+    app: &App,
+    req: spin_sdk::http::Request,
+) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
     dispatch_with_kv_label(app, req, "default").await
 }
 
@@ -128,12 +107,12 @@ pub async fn dispatch(app: &App, req: IncomingRequest) -> anyhow::Result<spin_sd
 /// the same value `EDGEZERO__STORES__KV__<ID>__NAME` resolves to at runtime.
 pub async fn dispatch_with_kv_label(
     app: &App,
-    req: IncomingRequest,
+    req: spin_sdk::http::Request,
     kv_label: &str,
-) -> anyhow::Result<spin_sdk::http::Response> {
+) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
     let stores = Stores {
         config_store: resolve_config_handle(true),
-        kv: resolve_kv_handle(kv_label, false)?,
+        kv: resolve_kv_handle(kv_label, false).await?,
         secrets: resolve_secret_handle(true),
         ..Default::default()
     };
@@ -142,9 +121,9 @@ pub async fn dispatch_with_kv_label(
 
 pub(crate) async fn dispatch_with_handles(
     app: &App,
-    req: IncomingRequest,
+    req: spin_sdk::http::Request,
     stores: Stores,
-) -> anyhow::Result<spin_sdk::http::Response> {
+) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
     let mut core_request = into_core_request(req).await?;
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
@@ -176,13 +155,13 @@ pub(crate) async fn dispatch_with_handles(
 ///   [`SpinSecretStore`] (same flat namespace).
 pub(crate) async fn dispatch_with_registries(
     app: &App,
-    req: IncomingRequest,
+    req: spin_sdk::http::Request,
     config_meta: Option<StoreMetadata>,
     kv_meta: Option<StoreMetadata>,
     secret_meta: Option<StoreMetadata>,
     env: &EnvConfig,
-) -> anyhow::Result<spin_sdk::http::Response> {
-    let kv_registry = build_kv_registry(kv_meta, env)?;
+) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
+    let kv_registry = build_kv_registry(kv_meta, env).await?;
     let config_registry = build_config_registry(config_meta);
     let secret_registry = build_secret_registry(secret_meta, env);
     dispatch_with_handles(
@@ -205,7 +184,7 @@ pub(crate) async fn dispatch_with_registries(
 /// in its absence is a bare handle wrapped into a one-id registry
 /// keyed under `"default"`. Pulled out as a pure function so the
 /// precedence contract is unit-testable without spinning up a
-/// real `IncomingRequest` and async dispatcher.
+/// real Spin `Request` and async dispatcher.
 fn synthesise_store_registries(
     stores: Stores,
 ) -> (
@@ -234,7 +213,7 @@ fn synthesise_store_registries(
     (config_registry, kv_registry, secret_registry)
 }
 
-fn build_kv_registry(
+async fn build_kv_registry(
     kv_meta: Option<StoreMetadata>,
     env: &EnvConfig,
 ) -> anyhow::Result<Option<KvRegistry>> {
@@ -248,7 +227,7 @@ fn build_kv_registry(
             .store_setting("kv", id, "MAX_LIST_KEYS")
             .and_then(|raw| raw.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_LIST_KEYS);
-        match SpinKvStore::open_with_max_list_keys(&label, max_list_keys) {
+        match SpinKvStore::open_with_max_list_keys(&label, max_list_keys).await {
             Ok(store) => {
                 by_id.insert((*id).to_owned(), KvHandle::new(Arc::new(store)));
             }
@@ -309,8 +288,8 @@ fn resolve_config_handle(config_enabled: bool) -> Option<ConfigStoreHandle> {
     Some(ConfigStoreHandle::new(Arc::new(SpinConfigStore::new())))
 }
 
-fn resolve_kv_handle(kv_label: &str, kv_required: bool) -> anyhow::Result<Option<KvHandle>> {
-    match SpinKvStore::open(kv_label) {
+async fn resolve_kv_handle(kv_label: &str, kv_required: bool) -> anyhow::Result<Option<KvHandle>> {
+    match SpinKvStore::open(kv_label).await {
         Ok(store) => Ok(Some(KvHandle::new(Arc::new(store)))),
         Err(e) => {
             if kv_required {
@@ -335,24 +314,6 @@ fn resolve_secret_handle(secrets_enabled: bool) -> Option<SecretHandle> {
         return None;
     }
     Some(SecretHandle::new(Arc::new(SpinSecretStore::new())))
-}
-
-fn into_core_method(
-    method: &spin_sdk::http::Method,
-) -> Result<edgezero_core::http::Method, EdgeError> {
-    match method {
-        spin_sdk::http::Method::Get => Ok(edgezero_core::http::Method::GET),
-        spin_sdk::http::Method::Post => Ok(edgezero_core::http::Method::POST),
-        spin_sdk::http::Method::Put => Ok(edgezero_core::http::Method::PUT),
-        spin_sdk::http::Method::Delete => Ok(edgezero_core::http::Method::DELETE),
-        spin_sdk::http::Method::Patch => Ok(edgezero_core::http::Method::PATCH),
-        spin_sdk::http::Method::Head => Ok(edgezero_core::http::Method::HEAD),
-        spin_sdk::http::Method::Options => Ok(edgezero_core::http::Method::OPTIONS),
-        spin_sdk::http::Method::Connect => Ok(edgezero_core::http::Method::CONNECT),
-        spin_sdk::http::Method::Trace => Ok(edgezero_core::http::Method::TRACE),
-        spin_sdk::http::Method::Other(s) => edgezero_core::http::Method::from_bytes(s.as_bytes())
-            .map_err(|_| EdgeError::bad_request(format!("unsupported HTTP method: {s}"))),
-    }
 }
 
 #[cfg(test)]

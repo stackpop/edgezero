@@ -10,14 +10,16 @@ command -v cargo >/dev/null 2>&1 || {
 }
 
 command -v rustup >/dev/null 2>&1 || {
-  echo "rustup is required to verify the wasm32-wasip1 target" >&2
+  echo "rustup is required to verify the wasm32-wasip1 / wasm32-wasip2 targets" >&2
   exit 1
 }
 
-if ! rustup target list --installed | grep -Fxq 'wasm32-wasip1'; then
-  echo "wasm32-wasip1 target is not installed. Run 'rustup target add wasm32-wasip1' before re-running this script." >&2
-  exit 1
-fi
+for target in wasm32-wasip1 wasm32-wasip2; do
+  if ! rustup target list --installed | grep -Fxq "$target"; then
+    echo "$target target is not installed. Run 'rustup target add $target' before re-running this script." >&2
+    exit 1
+  fi
+done
 
 run() {
   echo "==> $*"
@@ -45,11 +47,11 @@ section "Fastly Wasm Tests"
   run cargo test --features fastly --target wasm32-wasip1 -- --nocapture
 )
 
-# Spin compiles to wasm32-wasip1 too; CI runs the full contract
+# Spin 6.0 compiles to wasm32-wasip2; CI runs the full contract
 # test under wasmtime. Locally we just check it compiles — the
 # contract test needs wasmtime + the wasm runner pinned in CI.
 section "Spin Wasm Compile Check"
-run cargo check -p edgezero-adapter-spin --features spin --target wasm32-wasip1
+run cargo check -p edgezero-adapter-spin --features spin --target wasm32-wasip2
 
 # `examples/app-demo` is excluded from the root workspace
 # (per `exclude = ["examples/app-demo"]`), so the workspace

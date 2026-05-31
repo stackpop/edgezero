@@ -122,5 +122,5 @@ Adapters that fulfil these steps can be dropped into the EdgeZero CLI without re
 | ---------------------------------------- | ------------------- | ------------------------ | ------ |
 | [Fastly](/guide/adapters/fastly)         | Fastly Compute@Edge | `wasm32-wasip1`          | Stable |
 | [Cloudflare](/guide/adapters/cloudflare) | Cloudflare Workers  | `wasm32-unknown-unknown` | Stable |
-| [Spin](/guide/adapters/spin)             | Fermyon Spin        | `wasm32-wasip1`          | Stable |
+| [Spin](/guide/adapters/spin)             | Fermyon Spin        | `wasm32-wasip2`          | Stable |
 | [Axum](/guide/adapters/axum)             | Native (Tokio)      | Host                     | Stable |

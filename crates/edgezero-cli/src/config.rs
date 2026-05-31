@@ -772,7 +772,7 @@ route = "/..."
 component = "demo"
 
 [component.demo]
-source = "target/wasm32-wasip1/release/demo.wasm"
+source = "target/wasm32-wasip2/release/demo.wasm"
 "#;
 
     /// `AppDemoConfig`-shaped fixture: `greeting` + `api_token` (a

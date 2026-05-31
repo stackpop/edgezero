@@ -104,7 +104,7 @@ mod tests {
         for (adapter, target) in [
             ("cloudflare", "wasm32-unknown-unknown"),
             ("fastly", "wasm32-wasip1"),
-            ("spin", "wasm32-wasip1"),
+            ("spin", "wasm32-wasip2"),
         ] {
             if !targets.contains(target) {
                 eprintln!("skipping {adapter} wasm check: target {target} not installed");

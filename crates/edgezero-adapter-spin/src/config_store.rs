@@ -83,7 +83,7 @@ impl ConfigStore for SpinConfigStore {
             #[cfg(all(feature = "spin", target_arch = "wasm32"))]
             SpinConfigBackend::Spin => {
                 use spin_sdk::variables;
-                match variables::get(&translated) {
+                match variables::get(&translated).await {
                     Ok(value) => Ok(Some(value)),
                     Err(variables::Error::Undefined(_)) => Ok(None),
                     Err(variables::Error::InvalidName(msg)) => {

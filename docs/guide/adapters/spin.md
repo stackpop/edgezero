@@ -1,12 +1,12 @@
 # Fermyon Spin
 
 Run EdgeZero applications on [Fermyon Spin](https://spinframework.dev/),
-a WebAssembly-first application platform with a `wasm32-wasip1` target and
+a WebAssembly-first application platform with a `wasm32-wasip2` target and
 component-scoped KV / variable stores.
 
 ## Prerequisites
 
-- Rust toolchain with `wasm32-wasip1` target (`rustup target add wasm32-wasip1`)
+- Rust toolchain with `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
 - Spin CLI ([install](https://spinframework.dev/install))
 
 ## Project Setup
@@ -23,14 +23,14 @@ crates/my-app-adapter-spin/
 
 ### Entrypoint
 
-The Spin entrypoint wires the adapter via `#[http_component]`:
+The Spin entrypoint wires the adapter via `#[http_service]`:
 
 ```rust
-use spin_sdk::{http::IncomingRequest, http::IntoResponse, http_component};
+use spin_sdk::{http::IntoResponse, http::Request, http_service};
 use my_app_core::App;
 
-#[http_component]
-async fn handle(req: IncomingRequest) -> anyhow::Result<impl IntoResponse> {
+#[http_service]
+async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     edgezero_adapter_spin::run_app::<App>(req).await
 }
 ```
@@ -48,7 +48,7 @@ Build the Spin component:
 edgezero build --adapter spin
 
 # Or directly
-cargo build --target wasm32-wasip1 --release -p my-app-adapter-spin
+cargo build --target wasm32-wasip2 --release -p my-app-adapter-spin
 ```
 
 ## Local Development

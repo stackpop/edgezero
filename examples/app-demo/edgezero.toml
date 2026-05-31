@@ -194,12 +194,12 @@ crate = "crates/app-demo-adapter-spin"
 manifest = "crates/app-demo-adapter-spin/spin.toml"
 
 [adapters.spin.build]
-target = "wasm32-wasip1"
+target = "wasm32-wasip2"
 profile = "release"
 features = ["spin"]
 
 [adapters.spin.commands]
-build = "cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin"
+build = "cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin"
 deploy = "spin deploy --from crates/app-demo-adapter-spin"
 serve = "spin up --from crates/app-demo-adapter-spin"
 

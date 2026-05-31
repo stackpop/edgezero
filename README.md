@@ -34,7 +34,7 @@ Full documentation is available at **[stackpop.github.io/edgezero](https://stack
 | ------------------ | ------------------------ | ------ |
 | Fastly Compute     | `wasm32-wasip1`          | Stable |
 | Cloudflare Workers | `wasm32-unknown-unknown` | Stable |
-| Fermyon Spin       | `wasm32-wasip1`          | Preview |
+| Fermyon Spin       | `wasm32-wasip2`          | Preview |
 | Axum (Native)      | Host                     | Stable |
 
 ## License
