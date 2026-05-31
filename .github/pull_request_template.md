@@ -27,7 +27,7 @@ Closes #
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
-- [ ] WASM builds: `wasm32-wasip1` (Fastly, Spin) / `wasm32-unknown-unknown` (Cloudflare)
+- [ ] WASM builds: `wasm32-wasip1` (Fastly) / `wasm32-wasip2` (Spin) / `wasm32-unknown-unknown` (Cloudflare)
 - [ ] `examples/app-demo` workspace: `cd examples/app-demo && cargo test --workspace --all-targets`
 - [ ] Docs build: `cd docs && npm run lint && npm run format && npm run build`
 - [ ] Manual testing via `edgezero serve --adapter axum` (the pre-rewrite `edgezero-cli dev` was renamed; see [cli-reference](docs/guide/cli-reference.md#edgezero-demo))

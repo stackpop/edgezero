@@ -419,13 +419,14 @@ fn missing_store_handles_return_absent_values_in_handler() {
 //
 // `from_core_response` returns `spin_sdk::http::Response` which is only
 // available on wasm32.  `into_core_request` and `dispatch` additionally
-// require a WASI `IncomingRequest` handle from the Spin runtime.
+// require a WASI `Request` handle from the Spin runtime.
 // ---------------------------------------------------------------------------
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 mod wasm {
     use super::*;
     use edgezero_adapter_spin::from_core_response;
+    use http_body_util::BodyExt as _;
 
     #[test]
     fn from_core_response_translates_status_and_headers() {
@@ -438,11 +439,8 @@ mod wasm {
 
             let spin_response = from_core_response(response).await.expect("spin response");
 
-            assert_eq!(*spin_response.status(), 201);
-            let header = spin_response
-                .headers()
-                .find(|(name, _)| *name == "x-edgezero-res");
-            assert!(header.is_some());
+            assert_eq!(spin_response.status(), StatusCode::CREATED);
+            assert!(spin_response.headers().get("x-edgezero-res").is_some());
         });
     }
 
@@ -459,8 +457,14 @@ mod wasm {
 
             let spin_response = from_core_response(response).await.expect("spin response");
 
-            assert_eq!(*spin_response.status(), 200);
-            assert_eq!(spin_response.into_body(), b"chunk-1chunk-2");
+            assert_eq!(spin_response.status(), StatusCode::OK);
+            let body = spin_response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes();
+            assert_eq!(body.as_ref(), b"chunk-1chunk-2");
         });
     }
 
@@ -474,8 +478,14 @@ mod wasm {
 
             let spin_response = from_core_response(response).await.expect("spin response");
 
-            assert_eq!(*spin_response.status(), 204);
-            assert!(spin_response.into_body().is_empty());
+            assert_eq!(spin_response.status(), StatusCode::NO_CONTENT);
+            let body = spin_response
+                .into_body()
+                .collect()
+                .await
+                .expect("collect")
+                .to_bytes();
+            assert!(body.is_empty());
         });
     }
 }

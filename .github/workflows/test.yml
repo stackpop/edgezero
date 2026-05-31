@@ -44,7 +44,7 @@ jobs:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
       - name: Add wasm targets
-        run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
+        run: rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
@@ -88,8 +88,8 @@ jobs:
             runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
             runner_value: viceroy run
           - adapter: spin
-            target: wasm32-wasip1
-            runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
+            target: wasm32-wasip2
+            runner_env: CARGO_TARGET_WASM32_WASIP2_RUNNER
             runner_value: wasmtime run
     steps:
       - uses: actions/checkout@v6

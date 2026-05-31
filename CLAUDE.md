@@ -17,7 +17,7 @@ crates/
   edgezero-adapter/           # Adapter registry and traits
   edgezero-adapter-fastly/    # Fastly Compute bridge (wasm32-wasip1)
   edgezero-adapter-cloudflare/# Cloudflare Workers bridge (wasm32-unknown-unknown)
-  edgezero-adapter-spin/      # Fermyon Spin bridge (wasm32-wasip1)
+  edgezero-adapter-spin/      # Fermyon Spin bridge (wasm32-wasip2)
   edgezero-adapter-axum/      # Axum/Tokio bridge (native, dev server)
   edgezero-cli/               # CLI lib + bin: new, build, deploy, serve, auth, provision, config (validate|push), demo
 examples/app-demo/            # Reference app with all 4 adapters (excluded from workspace)
@@ -53,7 +53,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo check --workspace --all-targets --features "fastly cloudflare spin"
 
 # Spin wasm32 compilation check
-cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
+cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 
 # Run the demo server
 cargo run -p edgezero-cli --features demo-example -- demo
@@ -71,7 +71,7 @@ faster iteration on a single crate.
 | ---------- | ------------------------ | ---------------------------------- |
 | Fastly     | `wasm32-wasip1`          | Requires Viceroy for local testing |
 | Cloudflare | `wasm32-unknown-unknown` | Requires `wrangler` for dev/deploy |
-| Spin       | `wasm32-wasip1`          | Requires `spin` CLI for dev/deploy |
+| Spin       | `wasm32-wasip2`          | Requires `spin` CLI for dev/deploy |
 | Axum       | Native (host triple)     | Standard Tokio runtime             |
 
 ## Coding Conventions
@@ -187,7 +187,7 @@ Every PR must pass:
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 3. `cargo test --workspace --all-targets`
 4. `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
-5. `cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin`
+5. `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`
 
 Docs CI additionally runs ESLint + Prettier on the `docs/` directory.
 

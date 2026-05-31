@@ -47,9 +47,15 @@ pub use secret_store::SpinSecretStore;
 pub trait AppExt {
     fn dispatch<'a>(
         &'a self,
-        req: spin_sdk::http::IncomingRequest,
+        req: spin_sdk::http::Request,
     ) -> ::core::pin::Pin<
-        Box<dyn ::core::future::Future<Output = anyhow::Result<spin_sdk::http::Response>> + 'a>,
+        Box<
+            dyn ::core::future::Future<
+                    Output = anyhow::Result<
+                        spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>,
+                    >,
+                > + 'a,
+        >,
     >;
 }
 
@@ -57,9 +63,15 @@ pub trait AppExt {
 impl AppExt for edgezero_core::app::App {
     fn dispatch<'a>(
         &'a self,
-        req: spin_sdk::http::IncomingRequest,
+        req: spin_sdk::http::Request,
     ) -> ::core::pin::Pin<
-        Box<dyn ::core::future::Future<Output = anyhow::Result<spin_sdk::http::Response>> + 'a>,
+        Box<
+            dyn ::core::future::Future<
+                    Output = anyhow::Result<
+                        spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>,
+                    >,
+                > + 'a,
+        >,
     > {
         Box::pin(request::dispatch(self, req))
     }
@@ -90,20 +102,20 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 /// Usage in a Spin component:
 ///
 /// ```ignore
-/// use spin_sdk::http_component;
+/// use spin_sdk::http_service;
 /// use my_core::App;
 ///
-/// #[http_component]
-/// async fn handle(req: spin_sdk::http::IncomingRequest) -> anyhow::Result<impl spin_sdk::http::IntoResponse> {
+/// #[http_service]
+/// async fn handle(req: spin_sdk::http::Request) -> anyhow::Result<impl spin_sdk::http::IntoResponse> {
 ///     edgezero_adapter_spin::run_app::<App>(req).await
 /// }
 /// ```
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub async fn run_app<A: edgezero_core::app::Hooks>(
-    req: spin_sdk::http::IncomingRequest,
+    req: spin_sdk::http::Request,
 ) -> anyhow::Result<impl spin_sdk::http::IntoResponse> {
     // Use `let _ =` instead of `.expect()` because Spin calls
-    // `#[http_component]` per-request. Once a real logger is wired in,
+    // `#[http_service]` per-request. Once a real logger is wired in,
     // `log::set_logger` returns Err on the second call — `.expect()`
     // would panic on every subsequent request.
     let _ = init_logger();

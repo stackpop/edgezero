@@ -386,7 +386,8 @@ error: target may not be installed
 Install the required target:
 
 ```bash
-rustup target add wasm32-wasip1            # For Fastly or Spin
+rustup target add wasm32-wasip1            # For Fastly
+rustup target add wasm32-wasip2            # For Spin
 rustup target add wasm32-unknown-unknown   # For Cloudflare
 ```
 

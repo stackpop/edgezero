@@ -7,7 +7,7 @@ This guide walks you through creating your first EdgeZero application.
 - Rust toolchain (stable; see `.tool-versions` in the repo)
 - For Fastly: `wasm32-wasip1` target and the Fastly CLI
 - For Cloudflare: `wasm32-unknown-unknown` target and Wrangler
-- For Spin: `wasm32-wasip1` target and the [Spin CLI](https://spinframework.dev/)
+- For Spin: `wasm32-wasip2` target and the [Spin CLI](https://spinframework.dev/)
 
 ## Installation
 

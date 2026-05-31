@@ -46,7 +46,7 @@ impl SecretStore for SpinSecretStore {
         // (e.g. "stripeKey" → "stripekey"). Document accepted key formats at
         // the call site.
         let lower = key.to_ascii_lowercase();
-        match variables::get(&lower) {
+        match variables::get(&lower).await {
             Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
             Err(variables::Error::Undefined(_)) => Ok(None),
             Err(variables::Error::InvalidName(msg)) => Err(SecretError::Validation(msg)),
