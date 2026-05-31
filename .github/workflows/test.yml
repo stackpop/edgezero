@@ -152,17 +152,24 @@ jobs:
         # Direct GitHub-release tarball install. The official
         # `https://wasmtime.dev/install.sh` script broke as of
         # 2026-05-19 (interpolation failure: tried to download
-        # version literal `{`), so we pin via .tool-versions.
+        # version literal `{`), so we pin via .tool-versions and
+        # land the binary in `~/.wasmtime/bin/` so the cache step
+        # above actually short-circuits the download on subsequent
+        # runs.
         run: |
+          install_dir="$HOME/.wasmtime/bin"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          export PATH="$install_dir:$PATH"
           if ! command -v wasmtime &>/dev/null; then
             version="${{ steps.wasmtime-version.outputs.version }}"
             tag="v${version}"
             archive="wasmtime-${tag}-x86_64-linux"
+            mkdir -p "$install_dir"
             curl -fL "https://github.com/bytecodealliance/wasmtime/releases/download/${tag}/${archive}.tar.xz" -o /tmp/wasmtime.tar.xz
             tar -xJf /tmp/wasmtime.tar.xz -C /tmp
-            sudo install -m 0755 "/tmp/${archive}/wasmtime" /usr/local/bin/wasmtime
-            wasmtime --version
+            install -m 0755 "/tmp/${archive}/wasmtime" "$install_dir/wasmtime"
           fi
+          wasmtime --version
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
