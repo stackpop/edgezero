@@ -1,7 +1,7 @@
 use log::LevelFilter;
 use serde::de::Error as DeError;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs, io};
@@ -468,16 +468,6 @@ pub struct StoreDeclaration {
 }
 
 impl StoreDeclaration {
-    /// Resolve the config store name for a given adapter.
-    ///
-    /// In the portable model the manifest carries no platform name; the name
-    /// resolves to the logical [`StoreDeclaration::default_id`].
-    #[must_use]
-    #[inline]
-    pub fn config_store_name(&self, _adapter: &str) -> &str {
-        self.default_id()
-    }
-
     /// Resolve the default logical store id (the explicit `default`, else the
     /// first declared id).
     #[must_use]
@@ -802,6 +792,29 @@ fn validate_store_declaration(declaration: &StoreDeclaration) -> Result<(), Vali
         let mut error = ValidationError::new("store_ids_empty");
         error.message =
             Some("`[stores.<kind>].ids` must declare at least one logical store id".into());
+        return Err(error);
+    }
+
+    if let Some(blank) = declaration
+        .ids
+        .iter()
+        .find(|id| id.trim().is_empty() || id.chars().any(char::is_control))
+    {
+        let mut error = ValidationError::new("store_id_blank");
+        error.message = Some(
+            format!(
+                "`[stores.<kind>].ids` entries must be non-empty and printable \
+                 (offending value: {blank:?})"
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    if let Some(dup) = declaration.ids.iter().find(|id| !seen.insert(id.as_str())) {
+        let mut error = ValidationError::new("store_id_duplicate");
+        error.message = Some(format!("`[stores.<kind>].ids` contains duplicate id `{dup}`").into());
         return Err(error);
     }
 
@@ -1476,7 +1489,6 @@ ids = ["default"]
         let config = stores.config.as_ref().expect("config declared");
         assert_eq!(config.ids, ["app_config"]);
         assert_eq!(config.default_id(), "app_config");
-        assert_eq!(config.config_store_name("fastly"), "app_config");
 
         let secrets = stores.secrets.as_ref().expect("secrets declared");
         assert_eq!(secrets.default_id(), "default");
@@ -1496,6 +1508,39 @@ ids = ["default"]
         assert!(
             manifest.validate().is_err(),
             "empty `ids` list should fail validation"
+        );
+    }
+
+    #[test]
+    fn store_declaration_blank_id_fails_validation() {
+        for raw in [
+            "[stores.kv]\nids = [\"\"]\n",
+            "[stores.kv]\nids = [\"   \"]\n",
+            "[stores.kv]\nids = [\"good\", \"\\n\"]\ndefault = \"good\"\n",
+        ] {
+            let manifest: Manifest = toml::from_str(raw).expect("should parse");
+            let err = manifest
+                .validate()
+                .expect_err("blank/whitespace/control id should fail validation");
+            assert!(
+                err.to_string().contains("non-empty and printable"),
+                "error should mention printable rule, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn store_declaration_duplicate_id_fails_validation() {
+        let manifest: Manifest = toml::from_str(
+            "[stores.kv]\nids = [\"app_config\", \"app_config\"]\ndefault = \"app_config\"\n",
+        )
+        .expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("duplicate ids should fail validation");
+        assert!(
+            err.to_string().contains("duplicate id"),
+            "error should mention duplicate, got: {err}"
         );
     }
 
