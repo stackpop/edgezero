@@ -1,6 +1,23 @@
-// Adapter contract tests run on the Spin wasm32 target, matching the
-// fastly and cloudflare contract suites. Gating the whole file keeps the
-// host `cargo test`/`clippy` runs consistent across adapters.
+// In-process unit-style contract tests for the Spin adapter.
+//
+// Despite living in `tests/`, these are NOT integration tests against a
+// real Spin runtime — they exercise the adapter's internal routing,
+// store-injection, and response-conversion logic with hand-rolled
+// fixtures (`FixedConfigStore` / `FixedKvStore` / `FixedSecretStore`)
+// and never construct a `spin_sdk` `IncomingRequest` or invoke
+// `spin_sdk::http::send`. They compile to `wasm32-wasip1` and run
+// under `wasmtime run` only because `spin_sdk` types (and the
+// `from_core_response` API they back) are gated to that target.
+//
+// The compile checks in `store_trait_compile_checks` pin the
+// type-level contract between the adapter's store types and the
+// `KvStore`/`SecretStore` traits so a future Spin SDK type change
+// would fail at compile time. ABI-level coverage against an actual
+// Spin runtime belongs in a separate end-to-end suite.
+//
+// Gating the whole file keeps the host `cargo test`/`clippy` runs
+// consistent across the fastly, cloudflare, and spin adapter
+// contract suites.
 #![cfg(all(feature = "spin", target_arch = "wasm32"))]
 
 // Compile-time check: SpinKvStore and SpinSecretStore implement their
