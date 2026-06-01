@@ -4,75 +4,61 @@
 pub mod cli;
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-mod config_store;
+pub mod config_store;
 pub mod context;
 mod decompress;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub mod proxy;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub mod request;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-mod response;
-
-// SpinConfigStore is available without the `spin` feature flag because its
-// production spin_sdk backend is feature-gated internally, allowing the
-// InMemory test backend to compile on all targets. SpinKvStore and
-// SpinSecretStore import spin_sdk types at the module level and therefore
-// require `all(feature = "spin", target_arch = "wasm32")`.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-mod key_value_store;
+pub mod key_value_store;
 // `kv_pagination` is the pure paging logic for `SpinKvStore::list_keys_page`.
 // It is host-compilable so its tests run under `cargo test`, while the wasm32
 // `SpinKvStore` is the production consumer.
 mod kv_pagination;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-mod secret_store;
+pub mod proxy;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub mod request;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub mod response;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+pub mod secret_store;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use config_store::SpinConfigStore;
+use core::future::Future;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use core::pin::Pin;
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use bytes::Bytes;
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use edgezero_core::app::{App, Hooks};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use key_value_store::SpinKvStore;
+use spin_sdk::http::{FullBody, IntoResponse, Request as SpinRequest, Response as SpinResponse};
+
+/// Spin SDK response with a fully-buffered body. Extracted as a type alias
+/// because the full `Response<FullBody<Bytes>>` form appears in multiple
+/// signatures (`AppExt::dispatch`, `request::dispatch*`, `from_core_response`).
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use proxy::SpinProxyClient;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use request::{dispatch, dispatch_with_kv_label, into_core_request};
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use response::from_core_response;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub use secret_store::SpinSecretStore;
+pub type SpinFullResponse = SpinResponse<FullBody<Bytes>>;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub trait AppExt {
-    fn dispatch<'a>(
-        &'a self,
-        req: spin_sdk::http::Request,
-    ) -> ::core::pin::Pin<
-        Box<
-            dyn ::core::future::Future<
-                    Output = anyhow::Result<
-                        spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>,
-                    >,
-                > + 'a,
-        >,
-    >;
+    /// Dispatch a Spin request through the `EdgeZero` router and return a
+    /// fully-buffered Spin response.
+    fn dispatch<'app>(
+        &'app self,
+        req: SpinRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpinFullResponse>> + 'app>>;
 }
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-impl AppExt for edgezero_core::app::App {
-    fn dispatch<'a>(
-        &'a self,
-        req: spin_sdk::http::Request,
-    ) -> ::core::pin::Pin<
-        Box<
-            dyn ::core::future::Future<
-                    Output = anyhow::Result<
-                        spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>,
-                    >,
-                > + 'a,
-        >,
-    > {
+impl AppExt for App {
+    #[inline]
+    fn dispatch<'app>(
+        &'app self,
+        req: SpinRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<SpinFullResponse>> + 'app>> {
         Box::pin(request::dispatch(self, req))
     }
 }
@@ -84,6 +70,7 @@ impl AppExt for edgezero_core::app::App {
 /// `#[cfg(all(feature = "spin", target_arch = "wasm32"))]` /
 /// `#[cfg(not(...))]` branches following the Fastly/Cloudflare pattern.
 // TODO: wire in real Spin logger when available
+///
 /// # Errors
 /// Returns [`log::SetLoggerError`] if a global logger is already installed.
 #[inline]
@@ -92,7 +79,7 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 }
 
 /// Convenience entry point: build the app from `Hooks`, dispatch the
-/// incoming Spin request through the EdgeZero router, and return the
+/// incoming Spin request through the `EdgeZero` router, and return the
 /// response.
 ///
 /// Portable store config is baked into `A` by the `app!` macro; the KV store
@@ -110,15 +97,17 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 ///     edgezero_adapter_spin::run_app::<App>(req).await
 /// }
 /// ```
+///
+/// # Errors
+/// Returns [`anyhow::Error`] when the inner dispatch fails — transport,
+/// router, store binding, or response translation errors propagate here.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub async fn run_app<A: edgezero_core::app::Hooks>(
-    req: spin_sdk::http::Request,
-) -> anyhow::Result<impl spin_sdk::http::IntoResponse> {
-    // Use `let _ =` instead of `.expect()` because Spin calls
-    // `#[http_service]` per-request. Once a real logger is wired in,
-    // `log::set_logger` returns Err on the second call — `.expect()`
-    // would panic on every subsequent request.
-    let _ = init_logger();
+#[inline]
+pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<impl IntoResponse> {
+    // Best-effort: every Spin `#[http_service]` re-enters this function, so a
+    // second `log::set_logger` call returns Err — drop the result instead of
+    // `.expect()` to avoid panicking on every subsequent request.
+    drop(init_logger());
     let env = EnvConfig::from_env();
     let stores = A::stores();
     let app = A::build_app();

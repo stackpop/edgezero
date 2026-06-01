@@ -2,8 +2,10 @@ use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
-use futures_util::StreamExt;
-use spin_sdk::http::FullBody;
+use futures_util::StreamExt as _;
+use spin_sdk::http::{FullBody, Response as SpinResponse};
+
+use crate::SpinFullResponse;
 
 /// Maximum body size (16 MiB) when collecting a streamed body into a buffer.
 /// Prevents unbounded memory growth from malicious or misconfigured upstreams.
@@ -27,10 +29,12 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        if collected.len() + bytes.len() > MAX_BODY_SIZE {
+                        // `usize::saturating_add` keeps the bound check
+                        // honest against pathological inputs without
+                        // triggering arithmetic_side_effects.
+                        if collected.len().saturating_add(bytes.len()) > MAX_BODY_SIZE {
                             return Err(EdgeError::internal(anyhow::anyhow!(
-                                "body exceeds maximum size of {} bytes",
-                                MAX_BODY_SIZE
+                                "body exceeds maximum size of {MAX_BODY_SIZE} bytes"
                             )));
                         }
                         collected.extend_from_slice(&bytes);
@@ -43,24 +47,28 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
     }
 }
 
-/// Convert an EdgeZero core `Response` into a Spin SDK `Response`.
+/// Convert an `EdgeZero` core `Response` into a Spin SDK `Response`.
 ///
 /// Both `Body::Once` and `Body::Stream` are converted to a buffered
 /// byte body. Streaming bodies are collected into a single `Vec<u8>`.
-pub async fn from_core_response(
-    response: Response,
-) -> Result<spin_sdk::http::Response<FullBody<Bytes>>, EdgeError> {
+///
+/// # Errors
+/// Returns [`EdgeError::internal`] if the response body cannot be collected
+/// (stream error or size cap exceeded) or if the resulting Spin response
+/// cannot be built from the collected bytes.
+#[inline]
+pub async fn from_core_response(response: Response) -> Result<SpinFullResponse, EdgeError> {
     let (parts, body) = response.into_parts();
 
-    let mut builder = spin_sdk::http::Response::builder().status(parts.status);
+    let mut builder = SpinResponse::builder().status(parts.status);
 
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         builder = builder.header(name, value);
     }
 
-    let body_bytes = collect_body_bytes(body).await?;
+    let collected = collect_body_bytes(body).await?;
 
     builder
-        .body(FullBody::new(Bytes::from(body_bytes)))
-        .map_err(|e| EdgeError::internal(anyhow::anyhow!("failed to build response: {e}")))
+        .body(FullBody::new(Bytes::from(collected)))
+        .map_err(|err| EdgeError::internal(anyhow::anyhow!("failed to build response: {err}")))
 }

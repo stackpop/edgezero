@@ -24,10 +24,10 @@ pub struct SpinConfigStore {
 }
 
 enum SpinConfigBackend {
-    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    Spin,
     #[cfg(test)]
     InMemory(HashMap<String, String>),
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    Spin,
     /// Never constructed; keeps the enum inhabited outside production Spin and tests.
     #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
     _Uninhabited(std::convert::Infallible),
@@ -53,6 +53,8 @@ impl SpinConfigStore {
 
     /// Create a new `SpinConfigStore` using the Spin variables API.
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: SpinConfigBackend::Spin,
@@ -70,6 +72,7 @@ impl SpinConfigStore {
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl Default for SpinConfigStore {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -77,9 +80,12 @@ impl Default for SpinConfigStore {
 
 #[async_trait(?Send)]
 impl ConfigStore for SpinConfigStore {
+    #[inline]
     async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         let translated = SpinConfigStore::translate_key(key);
         match &self.inner {
+            #[cfg(test)]
+            SpinConfigBackend::InMemory(data) => Ok(data.get(&translated).cloned()),
             #[cfg(all(feature = "spin", target_arch = "wasm32"))]
             SpinConfigBackend::Spin => {
                 use spin_sdk::variables;
@@ -89,11 +95,9 @@ impl ConfigStore for SpinConfigStore {
                     Err(variables::Error::InvalidName(msg)) => {
                         Err(ConfigStoreError::invalid_key(msg))
                     }
-                    Err(e) => Err(ConfigStoreError::unavailable(e.to_string())),
+                    Err(err) => Err(ConfigStoreError::unavailable(err.to_string())),
                 }
             }
-            #[cfg(test)]
-            SpinConfigBackend::InMemory(data) => Ok(data.get(&translated).cloned()),
             #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
             SpinConfigBackend::_Uninhabited(never) => {
                 let _: &str = key;
