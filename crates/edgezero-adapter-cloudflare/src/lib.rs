@@ -20,9 +20,17 @@ pub mod response;
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 pub mod secret_store;
 
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use edgezero_core::app::{Hooks, StoresMetadata};
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use edgezero_core::env_config::EnvConfig;
+#[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+use worker::{Context, Env, Error as WorkerError, Request, Response};
+
 /// # Errors
 /// Returns [`log::SetLoggerError`] if a global logger is already installed.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+#[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
@@ -35,27 +43,24 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
 }
 
-/// Build an [`EnvConfig`](edgezero_core::env_config::EnvConfig) from a
-/// Cloudflare `Env`. Workers have no `std::env`, and the `Env` binding object
-/// cannot be enumerated, so the exact `EDGEZERO__STORES__<KIND>__<ID>__NAME`
-/// keys are derived from the baked store metadata and queried individually,
-/// alongside the fixed `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*` keys.
+/// Build an [`EnvConfig`] from a Cloudflare `Env`. Workers have no
+/// `std::env`, and the `Env` binding object cannot be enumerated, so the exact
+/// `EDGEZERO__STORES__<KIND>__<ID>__NAME` keys are derived from the baked
+/// store metadata and queried individually, alongside the fixed
+/// `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*` keys.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-fn env_config_from_worker(
-    env: &worker::Env,
-    stores: edgezero_core::app::StoresMetadata,
-) -> edgezero_core::env_config::EnvConfig {
+fn env_config_from_worker(env: &Env, stores: StoresMetadata) -> EnvConfig {
     let mut keys: Vec<String> = vec![
         "EDGEZERO__ADAPTER__HOST".to_owned(),
         "EDGEZERO__ADAPTER__PORT".to_owned(),
         "EDGEZERO__LOGGING__LEVEL".to_owned(),
     ];
-    for (kind, meta) in [
+    for (kind, store_meta) in [
         ("CONFIG", stores.config),
         ("KV", stores.kv),
         ("SECRETS", stores.secrets),
     ] {
-        if let Some(meta) = meta {
+        if let Some(meta) = store_meta {
             for id in meta.ids {
                 keys.push(format!(
                     "EDGEZERO__STORES__{kind}__{}__NAME",
@@ -67,7 +72,7 @@ fn env_config_from_worker(
     let vars = keys
         .into_iter()
         .filter_map(|key| env.var(&key).ok().map(|value| (key, value.to_string())));
-    edgezero_core::env_config::EnvConfig::from_vars(vars)
+    EnvConfig::from_vars(vars)
 }
 
 /// Entry point for a Cloudflare Workers application.
@@ -75,25 +80,34 @@ fn env_config_from_worker(
 /// Portable store config is baked into `A` by the `app!` macro; adapter-specific
 /// values (platform store names) are read at runtime from `EDGEZERO__*`
 /// variables on the worker `Env`. No `edgezero.toml` is required.
+///
+/// # Errors
+/// Returns [`worker::Error`] if the inner dispatch fails or any required
+/// store binding cannot be opened.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-pub async fn run_app<A: edgezero_core::app::Hooks>(
-    req: worker::Request,
-    env: worker::Env,
-    ctx: worker::Context,
-) -> Result<worker::Response, worker::Error> {
-    init_logger().expect("init cloudflare logger");
+#[inline]
+pub async fn run_app<A: Hooks>(
+    req: Request,
+    env: Env,
+    ctx: Context,
+) -> Result<Response, WorkerError> {
+    // Best-effort: if a logger is already installed, ignore the error rather
+    // than panicking — every Worker request re-enters this function.
+    drop(init_logger());
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
     let app = A::build_app();
-    crate::request::dispatch_with_registries(
+    request::dispatch_with_registries(
         &app,
         req,
         env,
         ctx,
-        stores.config,
-        stores.kv,
-        stores.secrets,
-        &env_config,
+        request::RegistryInputs {
+            config_meta: stores.config,
+            kv_meta: stores.kv,
+            secret_meta: stores.secrets,
+            env_config: &env_config,
+        },
     )
     .await
 }

@@ -2,11 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::config_store::SpinConfigStore;
-use crate::context::SpinRequestContext;
+use crate::context::{parse_client_addr, SpinRequestContext};
 use crate::key_value_store::{SpinKvStore, DEFAULT_MAX_LIST_KEYS};
 use crate::proxy::SpinProxyClient;
 use crate::response::from_core_response;
 use crate::secret_store::SpinSecretStore;
+use crate::SpinFullResponse;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
@@ -19,38 +20,48 @@ use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use spin_sdk::http::body::IncomingBodyExt;
+use spin_sdk::http::body::IncomingBodyExt as _;
+use spin_sdk::http::Request as SpinRequest;
 
+/// Per-dispatch store wiring assembled before the request enters the router.
+/// The struct itself is `pub(crate)` because `dispatch_with_handles` takes it
+/// by value, but fields are constructed only inside this module so they stay
+/// private and the field-scoped-visibility lint does not fire.
 #[derive(Default)]
 pub(crate) struct Stores {
-    pub(crate) config_registry: Option<ConfigRegistry>,
-    pub(crate) config_store: Option<ConfigStoreHandle>,
-    pub(crate) kv: Option<KvHandle>,
-    pub(crate) kv_registry: Option<KvRegistry>,
-    pub(crate) secret_registry: Option<SecretRegistry>,
-    pub(crate) secrets: Option<SecretHandle>,
+    config_registry: Option<ConfigRegistry>,
+    config_store: Option<ConfigStoreHandle>,
+    kv: Option<KvHandle>,
+    kv_registry: Option<KvRegistry>,
+    secret_registry: Option<SecretRegistry>,
+    secrets: Option<SecretHandle>,
 }
 
-/// Convert a Spin `Request` into an EdgeZero core `Request`.
+/// Convert a Spin `Request` into an `EdgeZero` core `Request`.
 ///
 /// Reads the full body into a buffered `Body::Once`, inserts
 /// `SpinRequestContext` and a `ProxyHandle` into extensions.
-pub async fn into_core_request(req: spin_sdk::http::Request) -> Result<Request, EdgeError> {
+///
+/// # Errors
+/// Returns [`EdgeError::bad_request`] if the request body cannot be read or
+/// the core `Request` cannot be built from the resulting parts.
+#[inline]
+pub async fn into_core_request(req: SpinRequest) -> Result<Request, EdgeError> {
     let (parts, body) = req.into_parts();
 
     let client_addr = parts
         .headers
         .get("spin-client-addr")
-        .and_then(|v| v.to_str().ok())
-        .and_then(crate::context::parse_client_addr);
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_client_addr);
     let full_url = parts
         .headers
         .get("spin-full-url")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
 
     let mut builder = request_builder().method(parts.method).uri(parts.uri);
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         builder = builder.header(name, value);
     }
 
@@ -61,11 +72,11 @@ pub async fn into_core_request(req: spin_sdk::http::Request) -> Result<Request, 
     let body_bytes = body
         .bytes()
         .await
-        .map_err(|e| EdgeError::bad_request(format!("failed to read request body: {}", e)))?;
+        .map_err(|err| EdgeError::bad_request(format!("failed to read request body: {err}")))?;
 
     let mut request = builder
         .body(Body::from(body_bytes.to_vec()))
-        .map_err(|e| EdgeError::bad_request(format!("failed to build request: {}", e)))?;
+        .map_err(|err| EdgeError::bad_request(format!("failed to build request: {err}")))?;
 
     SpinRequestContext::insert(
         &mut request,
@@ -81,20 +92,23 @@ pub async fn into_core_request(req: spin_sdk::http::Request) -> Result<Request, 
     Ok(request)
 }
 
-/// Dispatch a Spin request through the EdgeZero router using the `"default"`
+/// Dispatch a Spin request through the `EdgeZero` router using the `"default"`
 /// KV store label.
 ///
 /// This is a low-level manual path. It does not read `EDGEZERO__*` environment
 /// config and therefore does not honor baked store metadata for KV, config, or
 /// secret stores. Prefer [`crate::run_app`] for normal dispatch.
-pub async fn dispatch(
-    app: &App,
-    req: spin_sdk::http::Request,
-) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
+///
+/// # Errors
+/// Returns [`anyhow::Error`] if KV open fails for `"default"`, the request
+/// cannot be converted, the router dispatch fails, or response translation
+/// fails.
+#[inline]
+pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
     dispatch_with_kv_label(app, req, "default").await
 }
 
-/// Dispatch a Spin request through the EdgeZero router and return
+/// Dispatch a Spin request through the `EdgeZero` router and return
 /// a Spin-compatible response, opening the KV store under `kv_label`.
 ///
 /// Injects all available stores into request extensions:
@@ -105,11 +119,17 @@ pub async fn dispatch(
 ///
 /// Pass the label that matches your `spin.toml` `key_value_stores` entry —
 /// the same value `EDGEZERO__STORES__KV__<ID>__NAME` resolves to at runtime.
+///
+/// # Errors
+/// Returns [`anyhow::Error`] if KV open fails when the store is required,
+/// the request cannot be converted, the router dispatch fails, or response
+/// translation fails.
+#[inline]
 pub async fn dispatch_with_kv_label(
     app: &App,
-    req: spin_sdk::http::Request,
+    req: SpinRequest,
     kv_label: &str,
-) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
+) -> anyhow::Result<SpinFullResponse> {
     let stores = Stores {
         config_store: resolve_config_handle(true),
         kv: resolve_kv_handle(kv_label, false).await?,
@@ -121,9 +141,9 @@ pub async fn dispatch_with_kv_label(
 
 pub(crate) async fn dispatch_with_handles(
     app: &App,
-    req: spin_sdk::http::Request,
+    req: SpinRequest,
     stores: Stores,
-) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
+) -> anyhow::Result<SpinFullResponse> {
     let mut core_request = into_core_request(req).await?;
     // Hard-cutoff: see fastly's `dispatch_core_request`
     // for the rationale. Only registries go into extensions —
@@ -155,12 +175,12 @@ pub(crate) async fn dispatch_with_handles(
 ///   [`SpinSecretStore`] (same flat namespace).
 pub(crate) async fn dispatch_with_registries(
     app: &App,
-    req: spin_sdk::http::Request,
+    req: SpinRequest,
     config_meta: Option<StoreMetadata>,
     kv_meta: Option<StoreMetadata>,
     secret_meta: Option<StoreMetadata>,
     env: &EnvConfig,
-) -> anyhow::Result<spin_sdk::http::Response<spin_sdk::http::FullBody<bytes::Bytes>>> {
+) -> anyhow::Result<SpinFullResponse> {
     let kv_registry = build_kv_registry(kv_meta, env).await?;
     let config_registry = build_config_registry(config_meta);
     let secret_registry = build_secret_registry(secret_meta, env);
@@ -291,18 +311,15 @@ fn resolve_config_handle(config_enabled: bool) -> Option<ConfigStoreHandle> {
 async fn resolve_kv_handle(kv_label: &str, kv_required: bool) -> anyhow::Result<Option<KvHandle>> {
     match SpinKvStore::open(kv_label).await {
         Ok(store) => Ok(Some(KvHandle::new(Arc::new(store)))),
-        Err(e) => {
+        Err(err) => {
             if kv_required {
                 return Err(anyhow::anyhow!(
-                    "Spin KV store '{}' is explicitly configured but could not be opened: {}",
-                    kv_label,
-                    e
+                    "Spin KV store '{kv_label}' is explicitly configured but could not be opened: {err}"
                 ));
             }
             log::warn!(
-                "SpinKvStore: could not open KV store (label {:?}); \
-                 KV operations will be unavailable: {e}",
-                kv_label
+                "SpinKvStore: could not open KV store (label {kv_label:?}); \
+                 KV operations will be unavailable: {err}"
             );
             Ok(None)
         }
@@ -353,11 +370,18 @@ mod synthesis_tests {
             ..Default::default()
         };
         let (config, kv, secret) = synthesise_store_registries(stores);
-        assert!(config.is_none());
-        assert!(secret.is_none());
-        let kv = kv.expect("kv registry synthesised");
-        assert_eq!(kv.default_id(), "default");
-        assert!(kv.named("other").is_none());
+        assert!(config.is_none(), "no config registry without input");
+        assert!(secret.is_none(), "no secret registry without input");
+        let kv_registry = kv.expect("kv registry synthesised");
+        assert_eq!(
+            kv_registry.default_id(),
+            "default",
+            "bare kv keyed under default"
+        );
+        assert!(
+            kv_registry.named("other").is_none(),
+            "no other id synthesised"
+        );
     }
 
     #[test]
@@ -371,10 +395,10 @@ mod synthesis_tests {
             ..Default::default()
         };
         let (_, kv, _) = synthesise_store_registries(stores);
-        let kv = kv.expect("registry survives");
-        assert_eq!(kv.default_id(), "sessions");
+        let kv_registry = kv.expect("registry survives");
+        assert_eq!(kv_registry.default_id(), "sessions", "wired default wins");
         assert!(
-            kv.named("default").is_none(),
+            kv_registry.named("default").is_none(),
             "bare handle's `default` synth NOT merged in"
         );
     }
@@ -382,7 +406,10 @@ mod synthesis_tests {
     #[test]
     fn synthesis_returns_none_for_each_kind_with_no_wiring() {
         let (config, kv, secret) = synthesise_store_registries(Stores::default());
-        assert!(config.is_none() && kv.is_none() && secret.is_none());
+        assert!(
+            config.is_none() && kv.is_none() && secret.is_none(),
+            "all registries empty"
+        );
     }
 
     #[test]
@@ -393,9 +420,17 @@ mod synthesis_tests {
             ..Default::default()
         };
         let (config, _, secret) = synthesise_store_registries(stores);
-        assert_eq!(config.expect("config").default_id(), "default");
-        let secret = secret.expect("secret");
-        assert_eq!(secret.default_id(), "default");
+        assert_eq!(
+            config.expect("config").default_id(),
+            "default",
+            "config synth under default"
+        );
+        let secret_registry = secret.expect("secret");
+        assert_eq!(
+            secret_registry.default_id(),
+            "default",
+            "secret synth under default"
+        );
         // BoundSecretStore binds the synthesised secret to platform
         // store name "default". A handler reading via
         // `ctx.secret_store_default()?.require_str(key)` resolves
@@ -403,6 +438,10 @@ mod synthesis_tests {
         // operator's spin.toml uses a different name, the runtime
         // require_str() surfaces a clear variable-name error
         // rather than a silent miss.
-        assert_eq!(secret.default().expect("bound").store_name(), "default");
+        assert_eq!(
+            secret_registry.default().expect("bound").store_name(),
+            "default",
+            "bound name copied verbatim"
+        );
     }
 }

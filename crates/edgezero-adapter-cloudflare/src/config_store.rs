@@ -36,16 +36,23 @@ pub struct CloudflareConfigStore {
 }
 
 enum CloudflareConfigBackend {
-    #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
-    Kv(WorkerKvStore),
     #[cfg(test)]
     InMemory(HashMap<String, String>),
+    #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
+    Kv(WorkerKvStore),
     /// Never constructed; keeps the enum inhabited off production/test cfgs.
     #[cfg(not(any(all(feature = "cloudflare", target_arch = "wasm32"), test)))]
     _Uninhabited(Infallible),
 }
 
 impl CloudflareConfigStore {
+    #[cfg(test)]
+    fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            inner: CloudflareConfigBackend::InMemory(entries.into_iter().collect()),
+        }
+    }
+
     /// Open the KV namespace bound as `binding_name`.
     ///
     /// # Errors
@@ -62,13 +69,6 @@ impl CloudflareConfigStore {
         Ok(Self {
             inner: CloudflareConfigBackend::Kv(store),
         })
-    }
-
-    #[cfg(test)]
-    fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            inner: CloudflareConfigBackend::InMemory(entries.into_iter().collect()),
-        }
     }
 }
 
