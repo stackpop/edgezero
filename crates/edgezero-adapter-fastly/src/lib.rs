@@ -84,11 +84,18 @@ fn logging_from_env(env: &EnvConfig) -> FastlyLogging {
         .logging_level()
         .and_then(|raw| log::LevelFilter::from_str(raw).ok())
         .unwrap_or(log::LevelFilter::Info);
+    // Only attach Fastly's named-endpoint logger when `EDGEZERO__LOGGING__ENDPOINT`
+    // is set. Production deployments set it to a real `[log_endpoints]` entry from
+    // `fastly.toml`; local Viceroy runs leave it unset and avoid the
+    // "endpoint not found, or is reserved" error that fires when the adapter
+    // would otherwise fall back to a reserved name like `stdout`.
+    let endpoint = env.logging_endpoint().map(str::to_owned);
+    let use_fastly_logger = endpoint.is_some();
     FastlyLogging {
         echo_stdout: true,
-        endpoint: None,
+        endpoint,
         level,
-        use_fastly_logger: true,
+        use_fastly_logger,
     }
 }
 
