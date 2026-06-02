@@ -92,6 +92,11 @@ impl ValidationContext {
 pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx)?;
+    log::info!(
+        "[edgezero] config validate (raw): {} OK{}",
+        args.manifest.display(),
+        if args.strict { " (strict)" } else { "" },
+    );
     Ok(())
 }
 
@@ -119,6 +124,12 @@ where
     typed_secret_checks(&typed, &ctx)?;
     run_adapter_typed_checks::<C>(&ctx)?;
 
+    log::info!(
+        "[edgezero] config validate (typed): {} + {} OK{}",
+        args.manifest.display(),
+        ctx.app_config_path.display(),
+        if args.strict { " (strict)" } else { "" },
+    );
     Ok(())
 }
 
