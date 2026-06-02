@@ -316,6 +316,57 @@ impl Adapter for FastlyCliAdapter {
         )])
     }
 
+    fn push_config_entries_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        entries: &[(String, String)],
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Local-emulator path: edit
+        // `[local_server.config_stores.<platform>.contents]` in
+        // `fastly.toml`. Viceroy reads it on startup, so a
+        // subsequent `fastly compute serve` exposes the new values
+        // to the wasm component. No shell-out to the production
+        // Fastly CLI -- the operator may not be authenticated and
+        // wouldn't want a local push to touch production anyway.
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.fastly.adapter].manifest must point at fastly.toml for config push --local"
+                    .to_owned(),
+            );
+        };
+        let fastly_path = manifest_root.join(rel);
+        let logical = store.logical.as_str();
+        let name = store.platform.as_str();
+        if entries.is_empty() {
+            return Ok(vec![format!(
+                "no config entries to push to `[local_server.config_stores.{name}]` in {} (logical id `{logical}`)",
+                fastly_path.display()
+            )]);
+        }
+        if dry_run {
+            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            out.push(format!(
+                "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with {} entries:",
+                fastly_path.display(),
+                entries.len()
+            ));
+            for (key, _) in entries {
+                out.push(format!("  would set `{key}`"));
+            }
+            return Ok(out);
+        }
+        write_fastly_local_config_store(&fastly_path, name, entries)?;
+        Ok(vec![format!(
+            "wrote {} entries to `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`); restart `fastly compute serve` to pick up changes",
+            entries.len(),
+            fastly_path.display()
+        )])
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         // Explicit `&[]` rather than inheriting the trait default,
         // so the "Multi for every store kind" intent is documented
@@ -479,6 +530,64 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
             kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
         }
     }
+
+    fs::write(path, doc.to_string())
+        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    Ok(())
+}
+
+/// Write the local-server config-store entries to `fastly.toml`:
+/// `[local_server.config_stores.<platform_name>]` becomes
+/// `format = "inline-toml"`, and `[local_server.config_stores.<platform_name>.contents]`
+/// gets the flat `key = "value"` pairs (overwriting any previous
+/// values). Idempotent — re-running just rewrites `contents`. Other
+/// blocks in `fastly.toml` (setup, scripts, the actual `[local_server]`
+/// secret stores, etc.) are preserved via `toml_edit`.
+fn write_fastly_local_config_store(
+    path: &Path,
+    platform_name: &str,
+    entries: &[(String, String)],
+) -> Result<(), String> {
+    use toml_edit::{table, DocumentMut, Item, Table, Value};
+
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let mut doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+
+    let local_server_entry = doc.entry("local_server").or_insert_with(table);
+    let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `local_server` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+    let config_stores_entry = local_server_tbl
+        .entry("config_stores")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let config_stores_tbl = config_stores_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `local_server.config_stores` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+
+    // Replace the per-store block wholesale so stale entries don't
+    // linger across pushes (the inverse of provision's "preserve
+    // existing tables" rule -- here the push is the source of truth
+    // for the contents).
+    let mut store_tbl = Table::new();
+    store_tbl.insert("format", toml_edit::value("inline-toml"));
+    let mut contents_tbl = Table::new();
+    for (key, value) in entries {
+        contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
+    }
+    store_tbl.insert("contents", Item::Table(contents_tbl));
+    config_stores_tbl.insert(platform_name, Item::Table(store_tbl));
 
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
@@ -1224,6 +1333,123 @@ mod tests {
             after.contains("# managed by hand"),
             "preserved comment: {after}"
         );
+    }
+
+    // ---------- write_fastly_local_config_store (config push --local) ----------
+
+    #[test]
+    fn write_fastly_local_config_store_creates_inline_block_in_minimal_file() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        write_fastly_local_config_store(&path, TEST_CONFIG_ID, &entries).expect("write");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains(&format!("[local_server.config_stores.{TEST_CONFIG_ID}]")),
+            "store table: {after}"
+        );
+        assert!(
+            after.contains("format = \"inline-toml\""),
+            "format field: {after}"
+        );
+        assert!(
+            after.contains(&format!(
+                "[local_server.config_stores.{TEST_CONFIG_ID}.contents]"
+            )),
+            "contents table: {after}"
+        );
+        assert!(after.contains("greeting = \"hello\""), "key 1: {after}");
+        assert!(
+            after.contains("\"service.timeout_ms\" = \"1500\""),
+            "dotted key quoted: {after}"
+        );
+        assert!(after.contains("name = \"demo\""), "preserved: {after}");
+    }
+
+    #[test]
+    fn write_fastly_local_config_store_replaces_existing_block_on_re_push() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        write_fastly_local_config_store(
+            &path,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "stale".to_owned())],
+        )
+        .expect("first write");
+        write_fastly_local_config_store(
+            &path,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "fresh".to_owned())],
+        )
+        .expect("second write");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(after.contains("greeting = \"fresh\""), "new value: {after}");
+        assert!(
+            !after.contains("greeting = \"stale\""),
+            "stale value dropped: {after}"
+        );
+    }
+
+    #[test]
+    fn write_fastly_local_config_store_preserves_unrelated_blocks() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        let original = "\
+[setup.kv_stores.sessions]
+
+[[local_server.kv_stores.sessions]]
+key = \"__init__\"
+data = \"\"
+
+[scripts]
+build = \"cargo build --release\"
+";
+        fs::write(&path, original).expect("write");
+        write_fastly_local_config_store(
+            &path,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+        )
+        .expect("write");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(
+            after.contains("[setup.kv_stores.sessions]"),
+            "setup KV kept: {after}"
+        );
+        assert!(after.contains("[scripts]"), "scripts table kept: {after}");
+        assert!(
+            after.contains("build = \"cargo build --release\""),
+            "scripts value kept: {after}"
+        );
+        assert!(
+            after.contains(&format!(
+                "[local_server.config_stores.{TEST_CONFIG_ID}.contents]"
+            )),
+            "new config_stores block added: {after}"
+        );
+    }
+
+    #[test]
+    fn write_fastly_local_config_store_creates_file_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // No fs::write — file absent.
+        write_fastly_local_config_store(
+            &path,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), "hi".to_owned())],
+        )
+        .expect("write");
+        let after = fs::read_to_string(&path).expect("read back");
+        assert!(after.contains(&format!(
+            "[local_server.config_stores.{TEST_CONFIG_ID}.contents]"
+        )));
+        assert!(after.contains("greeting = \"hi\""));
     }
 
     // ---------- provision (dry-run + error path) ----------

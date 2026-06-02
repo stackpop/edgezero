@@ -302,6 +302,37 @@ impl Adapter for SpinCliAdapter {
         )])
     }
 
+    fn push_config_entries_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        entries: &[(String, String)],
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Spin has no separate local-emulator state for config:
+        // `spin up` reads the same `spin.toml` `[variables]` +
+        // `[component.<id>.variables]` tables that `spin deploy`
+        // ships. So `--local` performs the same edit as the
+        // default push -- we delegate and prepend a one-line
+        // notice so an operator who typed `--local` for parity
+        // with fastly/cloudflare knows there was nothing extra
+        // to write.
+        let mut lines = self.push_config_entries(
+            manifest_root,
+            adapter_manifest_path,
+            component_selector,
+            store,
+            entries,
+            dry_run,
+        )?;
+        let notice =
+            "spin push is always local: `--local` has no separate effect (edits spin.toml either way)".to_owned();
+        lines.insert(0, notice);
+        Ok(lines)
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: Multi for KV (label-backed); Single for Config and
         // Secrets (flat-variable namespace).

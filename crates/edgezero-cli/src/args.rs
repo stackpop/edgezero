@@ -168,6 +168,15 @@ pub struct ConfigPushArgs {
     /// Print the would-be operations without performing them.
     #[arg(long)]
     pub dry_run: bool,
+    /// Push to the adapter's local-emulator state instead of the live
+    /// platform. For Fastly this edits `[local_server.config_stores]`
+    /// in the adapter's `fastly.toml` (the Viceroy reads it on startup);
+    /// for Cloudflare it runs `wrangler kv bulk put --local` so writes
+    /// land in `.wrangler/state`. Axum and Spin's pushes are already
+    /// local-only, so `--local` is a no-op there (identical to the
+    /// default).
+    #[arg(long)]
+    pub local: bool,
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,

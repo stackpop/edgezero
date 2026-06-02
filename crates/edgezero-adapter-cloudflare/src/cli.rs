@@ -339,6 +339,98 @@ impl Adapter for CloudflareCliAdapter {
         )])
     }
 
+    fn push_config_entries_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        entries: &[(String, String)],
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Same flow as the prod push but with `--local` appended to
+        // the wrangler invocation. Wrangler writes the entries into
+        // `.wrangler/state/<v?>/kv/<namespace_id>/...` so a follow-up
+        // `wrangler dev --local` (or `edgezero serve --adapter
+        // cloudflare`) reads them from the local emulator instead
+        // of the live account.
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.cloudflare.adapter].manifest must point at wrangler.toml for config push --local"
+                    .to_owned(),
+            );
+        };
+        let wrangler_path = manifest_root.join(rel);
+        let binding = store.platform.as_str();
+        let logical = store.logical.as_str();
+        if dry_run {
+            let header = find_namespace_id(&wrangler_path, binding).map_or_else(
+                |_| format!(
+                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id=<unresolved> --local` with {} entries for binding `{binding}` (logical id `{logical}`, binding not yet provisioned -- run `edgezero provision --adapter cloudflare` to resolve the namespace id)",
+                    entries.len()
+                ),
+                |ns_id| format!(
+                    "would run `wrangler kv bulk put <tempfile.json> --namespace-id={ns_id} --local` with {} entries for binding `{binding}` (logical id `{logical}`)",
+                    entries.len()
+                ),
+            );
+            let mut out = vec![header];
+            for (key, _) in entries {
+                out.push(format!("  would create local entry `{key}`"));
+            }
+            return Ok(out);
+        }
+        let namespace_id = find_namespace_id(&wrangler_path, binding)?;
+        if entries.is_empty() {
+            return Ok(vec![format!(
+                "no config entries to push to local KV namespace `{binding}` (logical id `{logical}`, id={namespace_id})"
+            )]);
+        }
+        let payload = bulk_payload(entries)?;
+        let temp = tempfile::Builder::new()
+            .prefix("edgezero-cf-push-local-")
+            .suffix(".json")
+            .tempfile()
+            .map_err(|err| {
+                format!("failed to create temp file for wrangler bulk payload: {err}")
+            })?;
+        fs::write(temp.path(), payload.as_bytes())
+            .map_err(|err| format!("failed to write {}: {err}", temp.path().display()))?;
+        let temp_arg = temp
+            .path()
+            .to_str()
+            .ok_or_else(|| format!("temp file path {} is not UTF-8", temp.path().display()))?;
+        let namespace_arg = format!("--namespace-id={namespace_id}");
+        let output = Command::new("wrangler")
+            .args([
+                "kv",
+                "bulk",
+                "put",
+                temp_arg,
+                namespace_arg.as_str(),
+                "--local",
+            ])
+            .output()
+            .map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    format!("`wrangler` not found on PATH; {WRANGLER_INSTALL_HINT}")
+                } else {
+                    format!("failed to spawn `wrangler`: {err}")
+                }
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "`wrangler kv bulk put --local` exited with status {}\nstderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(vec![format!(
+            "pushed {} entries to local KV namespace `{binding}` (logical id `{logical}`, id={namespace_id}); `.wrangler/state` updated",
+            entries.len()
+        )])
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: cloudflare is Multi for KV (KV namespaces) and
         // Config (KV namespaces), Single for Secrets (Worker
