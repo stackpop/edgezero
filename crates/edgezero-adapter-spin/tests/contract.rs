@@ -114,6 +114,9 @@ mod tests {
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{SecretError, SecretHandle, SecretStore};
+    use edgezero_core::store_registry::{
+        BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
+    };
     use futures::executor::block_on;
     use futures::stream;
     use std::sync::Arc;
@@ -402,12 +405,18 @@ mod tests {
             .uri("http://example.com/config")
             .body(Body::empty())
             .expect("request");
+        // Mirror the dispatch boundary: the runtime synthesises a one-id
+        // `ConfigRegistry` keyed under `"default"` from the wired handle.
+        // `RequestContext::config_store_default()` reads `ConfigRegistry`
+        // only (hard-cutoff), so inserting a bare handle here would yield
+        // `None` and the handler would return "missing".
+        let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore {
+            key: "greeting",
+            value: "hello-spin",
+        }));
         request
             .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(FixedConfigStore {
-                key: "greeting",
-                value: "hello-spin",
-            })));
+            .insert(ConfigRegistry::single_id("default".to_owned(), handle));
 
         let response = block_on(app.router().oneshot(request)).expect("response");
 
@@ -427,12 +436,13 @@ mod tests {
             .uri("http://example.com/kv-value")
             .body(Body::empty())
             .expect("request");
+        let handle = KvHandle::new(Arc::new(FixedKvStore {
+            key: "test-key",
+            value: b"kv-payload",
+        }));
         request
             .extensions_mut()
-            .insert(KvHandle::new(Arc::new(FixedKvStore {
-                key: "test-key",
-                value: b"kv-payload",
-            })));
+            .insert(KvRegistry::single_id("default".to_owned(), handle));
 
         let response = block_on(app.router().oneshot(request)).expect("response");
 
@@ -452,12 +462,16 @@ mod tests {
             .uri("http://example.com/secret-value")
             .body(Body::empty())
             .expect("request");
-        request
-            .extensions_mut()
-            .insert(SecretHandle::new(Arc::new(FixedSecretStore {
-                key: "test-secret",
-                value: b"s3cr3t",
-            })));
+        // Secrets registry wraps the handle in a `BoundSecretStore` carrying
+        // the platform store name — mirrors the dispatch-boundary synthesis.
+        let handle = SecretHandle::new(Arc::new(FixedSecretStore {
+            key: "test-secret",
+            value: b"s3cr3t",
+        }));
+        request.extensions_mut().insert(SecretRegistry::single_id(
+            "default".to_owned(),
+            BoundSecretStore::new(handle, "default".to_owned()),
+        ));
 
         let response = block_on(app.router().oneshot(request)).expect("response");
 

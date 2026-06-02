@@ -141,10 +141,12 @@ api_token = "{{ api_token }}"
 ```
 
 Because Spin's config and secret namespaces share keys, `config validate`
-also runs a collision check: the effective Spin variable name set
-({flattened config keys} ∪ {`#[secret]` field values}, each
-`.`→`__`-translated) must have no duplicates when `spin` is in the
-adapter set.
+also runs a collision check. Config keys translate `.` → `__` (mirrors the
+runtime `SpinConfigStore`). `#[secret]` field values are only lowercased —
+the runtime `SpinSecretStore` does not translate dots, so neither does the
+validator. The effective Spin variable name set (translated config keys ∪
+lowercased `#[secret]` values) must have no duplicates when `spin` is in
+the adapter set.
 
 ## Spin component discovery
 

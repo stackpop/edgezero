@@ -85,13 +85,28 @@ Per-adapter behaviour:
 
 - **axum** — local-only. Prints one note per declared store id (KV is in-memory; config
   reads `.edgezero/local-config-<id>.json`; secrets read env vars).
-- **cloudflare** — shells out to `wrangler kv namespace create <id>` for each KV / config
-  id, parses the namespace id from stdout, and appends `[[kv_namespaces]] binding = "<id>",
-id = "<extracted>"` to `wrangler.toml`. Idempotent on the binding name. Secrets are
-  runtime-managed via `wrangler secret put` — no-op here.
-- **fastly** — shells out to `fastly <kind>-store create --name=<id>` for each id, then
-  appends `[setup.<kind>_stores.<id>]` + `[local_server.<kind>_stores.<id>]` tables to
-  `fastly.toml`. Idempotent on the `[setup.*]` block presence.
+- **cloudflare** — for each KV / config id, shells out to:
+
+  ```bash
+  wrangler kv namespace create <platform-name>
+  ```
+
+  where `<platform-name>` resolves from `EDGEZERO__STORES__<KIND>__<ID>__NAME`
+  and falls back to the logical `<id>`. Parses the namespace id from stdout
+  and appends `[[kv_namespaces]] binding = "<platform-name>", id = "<extracted>"`
+  to `wrangler.toml`. Idempotent on the binding name. Secrets are runtime-managed
+  via `wrangler secret put` — no-op here.
+
+- **fastly** — for each id, shells out to:
+
+  ```bash
+  fastly <kind>-store create --name=<platform-name>
+  ```
+
+  using the same `<platform-name>` resolution, then appends
+  `[setup.<kind>_stores.<platform-name>]` + `[local_server.<kind>_stores.<platform-name>]`
+  tables to `fastly.toml`. Idempotent on the `[setup.*]` block presence.
+
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
   by the Fermyon stack). For each KV id, appends the label to the resolved
   `[component.<component>].key_value_stores = [...]` array. Config and secret ids are
@@ -142,12 +157,22 @@ single string values, and pushes per-adapter:
   `.edgezero/local-config-<id>.json` (the same file `AxumConfigStore` reads back at
   runtime).
 - **cloudflare** — reads the namespace id from `wrangler.toml` (matched by binding =
-  `<store_id>`; errors with "did you run `provision`?" if absent), writes the entries
-  to a temp file in wrangler's bulk format, then `wrangler kv bulk put <tempfile>
---namespace-id=<id>`.
+  `<platform-name>`, resolved from `EDGEZERO__STORES__CONFIG__<ID>__NAME` or the
+  logical `<id>`; errors with "did you run `provision`?" if absent), writes the
+  entries to a temp file in wrangler's bulk format, then runs:
+
+  ```bash
+  wrangler kv bulk put <tempfile> --namespace-id=<id>
+  ```
+
 - **fastly** — resolves the platform config-store id on demand via
-  `fastly config-store list --json` (matched by `name = <store_id>`), then
-  `fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>` per entry.
+  `fastly config-store list --json` (matched by `name = <platform-name>`, resolved
+  the same way), then per entry:
+
+  ```bash
+  fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>
+  ```
+
 - **spin** — pure `spin.toml` editing. Translates each dotted key to a Spin variable
   name (`.→__`, lowercased), and writes BOTH `[variables].<key>` (with `default =
 "<value>"`, the application-level declaration) AND

@@ -98,6 +98,33 @@ mod tests {
             "generated workspace should compile for the host target",
         );
 
+        // Typed config validation via the generated `<name>-cli` binary.
+        // The raw `edgezero config validate` above exercises the manifest
+        // schema and capability matrix; the generated CLI additionally
+        // runs the user's `#[derive(Validate)]` impl on `AppConfig` plus
+        // the `#[app]` macro-emitted `#[secret]` discovery. Without this
+        // step, template drift that compiles but produces an invalid
+        // typed config (e.g. `#[secret]` on a non-scalar field) would
+        // slip through.
+        let typed_validate = Command::new(env!("CARGO"))
+            .args([
+                "run",
+                "-p",
+                "scaffold-probe-cli",
+                "--quiet",
+                "--",
+                "config",
+                "validate",
+                "--strict",
+            ])
+            .current_dir(&project)
+            .status()
+            .expect("run the generated typed CLI `config validate --strict`");
+        assert!(
+            typed_validate.success(),
+            "generated typed CLI should pass `config validate --strict`",
+        );
+
         // Per-adapter wasm targets: where target-gated template code lives
         // (entrypoint signatures, macro-generated unsafe exports).
         let targets = installed_targets(&project);
