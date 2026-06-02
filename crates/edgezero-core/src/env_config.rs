@@ -92,6 +92,17 @@ impl EnvConfig {
         self.entries.get(&path).map(String::as_str)
     }
 
+    /// `EDGEZERO__LOGGING__ENDPOINT`. Adapters that wire a platform-specific
+    /// logger (e.g. Fastly's named log endpoints) read this to know which
+    /// endpoint to attach to; a `None` value means "don't init a platform
+    /// logger" — useful under local emulators (Viceroy) that reject reserved
+    /// names like `stdout`.
+    #[must_use]
+    #[inline]
+    pub fn logging_endpoint(&self) -> Option<&str> {
+        self.get(&["logging", "endpoint"])
+    }
+
     /// `EDGEZERO__LOGGING__LEVEL`.
     #[must_use]
     #[inline]
