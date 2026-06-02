@@ -156,7 +156,7 @@ pub fn run_config_push(args: &ConfigPushArgs) -> Result<(), String> {
     let ctx = load_push_context(args)?;
     run_shared_checks(&ctx.validation)?;
     let entries = flatten_raw_for_push(&ctx.validation.raw_config)?;
-    dispatch_push(&ctx, &entries, args.dry_run)
+    dispatch_push(&ctx, &entries, args.dry_run, args.local)
 }
 
 /// Typed flow — push the user's `C` struct. Runs the same strict
@@ -201,7 +201,7 @@ where
     run_adapter_typed_checks::<C>(&ctx.validation)?;
 
     let entries = flatten_typed_for_push::<C>(&typed)?;
-    dispatch_push(&ctx, &entries, args.dry_run)
+    dispatch_push(&ctx, &entries, args.dry_run, args.local)
 }
 
 // -------------------------------------------------------------------
@@ -242,6 +242,7 @@ fn dispatch_push(
     ctx: &PushContext,
     entries: &[(String, String)],
     dry_run: bool,
+    local: bool,
 ) -> Result<(), String> {
     let manifest = ctx.validation.manifest();
     let adapter_cfg = manifest.adapters.get(ctx.adapter.name()).ok_or_else(|| {
@@ -257,17 +258,29 @@ fn dispatch_push(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
-    let lines = ctx.adapter.push_config_entries(
-        manifest_root,
-        adapter_cfg.adapter.manifest.as_deref(),
-        adapter_cfg.adapter.component.as_deref(),
-        &ctx.store,
-        entries,
-        dry_run,
-    )?;
+    let lines = if local {
+        ctx.adapter.push_config_entries_local(
+            manifest_root,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.component.as_deref(),
+            &ctx.store,
+            entries,
+            dry_run,
+        )?
+    } else {
+        ctx.adapter.push_config_entries(
+            manifest_root,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.component.as_deref(),
+            &ctx.store,
+            entries,
+            dry_run,
+        )?
+    };
     if dry_run {
         log::info!(
-            "[edgezero] config push --dry-run for `{}` -> store `{}` (platform name `{}`):",
+            "[edgezero] config push --dry-run{} for `{}` -> store `{}` (platform name `{}`):",
+            if local { " --local" } else { "" },
             ctx.adapter.name(),
             ctx.store.logical,
             ctx.store.platform
@@ -845,6 +858,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             adapter: adapter.to_owned(),
             app_config: None,
             dry_run: false,
+            local: false,
             manifest: manifest.to_path_buf(),
             no_env: true,
             store: None,

@@ -192,6 +192,39 @@ pub trait Adapter: Sync + Send {
         ))
     }
 
+    /// Push resolved config entries into the adapter's **local emulator**
+    /// state instead of the live platform — `config push --local`. Used
+    /// when developing against a local runtime (Viceroy for Fastly,
+    /// `wrangler dev --local` for Cloudflare) where the production
+    /// platform CLI doesn't help.
+    ///
+    /// Arguments + return shape mirror [`Self::push_config_entries`].
+    ///
+    /// Default: returns an error. Adapters opt in by overriding.
+    /// Adapters whose production push is already local-only (axum
+    /// writes a JSON file under `.edgezero/`; spin edits `spin.toml`)
+    /// should override to delegate to [`Self::push_config_entries`].
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if the local-state edit
+    /// fails or the adapter has no `--local` impl. `dry_run` impls
+    /// describe what they *would* do without performing it.
+    #[inline]
+    fn push_config_entries_local(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _entries: &[(String, String)],
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "adapter `{}` does not implement `config push --local`",
+            self.name()
+        ))
+    }
+
     /// Store kinds for which this adapter is Single-capable per
     /// spec — `--strict` rejects `[stores.<kind>].ids.len() > 1`
     /// when any listed kind matches. Default: `&[]` (Multi for

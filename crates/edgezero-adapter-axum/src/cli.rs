@@ -245,6 +245,35 @@ impl Adapter for AxumCliAdapter {
         )])
     }
 
+    fn push_config_entries_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        entries: &[(String, String)],
+        dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        // Axum is local-only: the default push already writes
+        // `.edgezero/local-config-<id>.json`, which is what the
+        // running dev server reads. `--local` is therefore the
+        // same as the default; we delegate and prepend a notice
+        // so the operator who typed `--local` for parity with
+        // fastly/cloudflare knows there was nothing extra to do.
+        let mut lines = self.push_config_entries(
+            manifest_root,
+            adapter_manifest_path,
+            component_selector,
+            store,
+            entries,
+            dry_run,
+        )?;
+        let notice =
+            "axum push is always local: `--local` has no separate effect (writes the same `.edgezero/local-config-<id>.json` either way)".to_owned();
+        lines.insert(0, notice);
+        Ok(lines)
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: axum is Multi for KV (local file dirs) and Config
         // (local JSON files), Single for Secrets (env vars).
