@@ -326,10 +326,13 @@ impl Adapter for FastlyCliAdapter {
     }
 }
 
-/// Shell out to `fastly <kind>-store create --name=<id>`. Returns
-/// `Ok(())` on success; surfaces the CLI's stderr verbatim on
-/// failure (including the "already exists" error, which is the
-/// caller's signal to fix the toml or use a different name).
+/// Shell out to `fastly <kind>-store create --name=<platform-name>`. The
+/// caller resolves `<platform-name>` from `EDGEZERO__STORES__<KIND>__<ID>__NAME`
+/// (falling back to the logical id), so this helper takes whatever the
+/// caller hands it and does not re-translate. Returns `Ok(())` on success;
+/// surfaces the CLI's stderr verbatim on failure (including the "already
+/// exists" error, which is the caller's signal to fix the toml or use a
+/// different name).
 ///
 /// # Errors
 /// Returns an error if `fastly` isn't on `PATH`, the child fails to

@@ -253,7 +253,10 @@ substrate Stage 3 builds on.)
   JSON-string — `CloudflareConfigStore::from_env(&worker::Env, binding_name)`
   opens a KV namespace and `get(key)` is async.
 - `examples/app-demo` is a **separate workspace**, excluded from the
-  root workspace; CI does not currently build or test it. The opt-in
+  root workspace. CI now runs `cd examples/app-demo && cargo test
+  --workspace --all-targets` as a dedicated job (see `format.yml` /
+  `test.yml`); previous revisions of this plan noted it was uncovered,
+  which is no longer true. The opt-in
   `cargo test -p edgezero-cli --test generated_project_builds -- --ignored`
   scaffolds a new workspace from the templates and runs `cargo check`
   on it — Stage 3's generator-template changes must keep that test
@@ -274,7 +277,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 cargo check --workspace --all-targets --features "fastly cloudflare spin"
-cargo check -p edgezero-adapter-spin --target wasm32-wasip1 --features spin
+cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 ```
 
 Plus, where the task touches adapter runtime or `app-demo`: the
@@ -929,7 +932,7 @@ post-effort built-ins).
 
 - Modify: `.github/workflows/test.yml` (or `scripts/run_tests.sh`)
 
-- [ ] **Step 1:** CI does not currently build `app-demo`. Add a job/step that runs `cd examples/app-demo && cargo test`. Prefer expressing the end-to-end axum loop **as a Rust integration test inside `app-demo`** (the Task 8.1 `app-demo` integration test) rather than as raw shell in the workflow — the Rust test already owns ephemeral-port binding, the readiness poll, and RAII teardown (Task 8.1 step 2). The CI job then just needs `cargo test`; it does not hand-roll `start server / curl / kill` in YAML, which is where shell-based e2e steps go flaky. Keep this job off the wasm matrix — axum only, no live external calls.
+- [x] **Step 1:** CI now builds `app-demo` via a dedicated `cd examples/app-demo && cargo test --workspace --all-targets` step in `test.yml`, plus a parallel `cargo fmt`/`cargo clippy` pass in `format.yml`. The end-to-end axum loop is expressed **as a Rust integration test inside `app-demo`** (Task 8.1 `app-demo` integration test) rather than as raw shell in the workflow — the Rust test already owns ephemeral-port binding, the readiness poll, and RAII teardown (Task 8.1 step 2). The CI job then just needs `cargo test`; it does not hand-roll `start server / curl / kill` in YAML, which is where shell-based e2e steps go flaky. Kept off the wasm matrix — axum only, no live external calls.
 
 - [ ] **Step 2:** If any loop step must stay as a shell step in the workflow (e.g. invoking the built `app-demo-cli` binary), it must still: select a free port (not a hard-coded one), poll readiness before curl-ing, and `kill` the server in a `trap`/`always()` cleanup so a failed assertion never leaves an orphan process. Mirror the Task 8.1 lifecycle rules.
 
