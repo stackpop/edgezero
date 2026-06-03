@@ -1,80 +1,68 @@
-//! Spin adapter config store: wraps `spin_sdk::variables`.
+//! Spin adapter config store: wraps `SpinSdkKvStore`.
 //!
-//! Handlers query the store with the canonical dotted key
-//! (`service.timeout_ms`); the Spin backend stores it as a flat variable
-//! (`service__timeout_ms`) because Spin variable names must match
-//! `^[a-z][a-z0-9_]*$` (no dots; see the [Spin manifest reference][1]).
-//! `SpinConfigStore::get` translates the dotted form to the flat form
-//! before delegating to the backend so the handler-facing key surface
-//! stays platform-neutral.
-//!
-//! Uppercase keys are passed through unchanged; the real Spin backend
-//! will reject them as `InvalidName`. The translation is dot-only.
-//!
-//! [1]: https://spinframework.dev/manifest-reference
+//! KV-backed (was variables-backed up through 2026-Q2). Handlers query
+//! the store with the canonical dotted key (`service.timeout_ms`); the
+//! Spin KV API accepts arbitrary key bytes, so no `.→__` translation
+//! is needed. The per-id platform store name is supplied at construction
+//! by [`crate::request::build_config_registry`], which resolves it
+//! through `EDGEZERO__STORES__CONFIG__<ID>__NAME`.
 
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+use spin_sdk::key_value::Store as SpinSdkKvStore;
 #[cfg(test)]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-/// Config store backed by Spin component variables.
+/// Config store backed by a Spin KV store.
 pub struct SpinConfigStore {
     inner: SpinConfigBackend,
 }
 
 enum SpinConfigBackend {
     #[cfg(test)]
-    InMemory(HashMap<String, String>),
+    InMemory(BTreeMap<String, bytes::Bytes>),
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    Spin,
+    Spin {
+        label: String,
+        store: SpinSdkKvStore,
+    },
     /// Never constructed; keeps the enum inhabited outside production Spin and tests.
     #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
     _Uninhabited(std::convert::Infallible),
 }
 
 impl SpinConfigStore {
-    /// Build an in-memory fixture from `(dotted_key, value)` pairs. The
-    /// stored representation mirrors what the real Spin backend would see:
-    /// each key is `translate_key`-translated on insert so contract tests
-    /// can call `get` with the canonical dotted form and exercise the same
-    /// translation path as production.
+    /// Build an in-memory fixture from `(key, bytes)` pairs.
+    ///
+    /// Bytes are stored verbatim — `get` strictly decodes UTF-8, mirroring
+    /// the wasm backend's behaviour (the contract `non_utf8_value_returns_unavailable`
+    /// test exercises the error path explicitly).
     #[cfg(test)]
-    fn from_entries(entries: impl IntoIterator<Item = (String, String)>) -> Self {
+    fn from_entries(entries: impl IntoIterator<Item = (String, bytes::Bytes)>) -> Self {
         Self {
-            inner: SpinConfigBackend::InMemory(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (Self::translate_key(&key), value))
-                    .collect(),
-            ),
+            inner: SpinConfigBackend::InMemory(entries.into_iter().collect()),
         }
     }
 
-    /// Create a new `SpinConfigStore` using the Spin variables API.
+    /// Open the platform store once. Called from
+    /// [`crate::request::build_config_registry`] during dispatch setup so
+    /// missing `key_value_stores = [...]` declarations surface as a clean
+    /// dispatch error instead of on first config read.
+    ///
+    /// # Errors
+    /// Returns [`ConfigStoreError::unavailable`] when the underlying
+    /// `SpinSdkKvStore::open` fails — typically because the
+    /// label isn't declared in the component's `key_value_stores = [...]`.
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     #[inline]
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            inner: SpinConfigBackend::Spin,
-        }
-    }
-
-    /// Translate a canonical handler-facing config key into a Spin variable
-    /// name: every `.` becomes `__`. Other characters are passed through.
-    /// `pub(crate)` so tests can exercise the translation directly.
-    #[inline]
-    pub(crate) fn translate_key(key: &str) -> String {
-        key.replace('.', "__")
-    }
-}
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-impl Default for SpinConfigStore {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
+    pub async fn open(label: String) -> Result<Self, ConfigStoreError> {
+        let store = SpinSdkKvStore::open(&label)
+            .await
+            .map_err(|err| ConfigStoreError::unavailable(format!("open `{label}`: {err}")))?;
+        Ok(Self {
+            inner: SpinConfigBackend::Spin { label, store },
+        })
     }
 }
 
@@ -82,22 +70,29 @@ impl Default for SpinConfigStore {
 impl ConfigStore for SpinConfigStore {
     #[inline]
     async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-        let translated = SpinConfigStore::translate_key(key);
         match &self.inner {
             #[cfg(test)]
-            SpinConfigBackend::InMemory(data) => Ok(data.get(&translated).cloned()),
+            SpinConfigBackend::InMemory(map) => match map.get(key) {
+                Some(bytes) => String::from_utf8(bytes.to_vec()).map(Some).map_err(|err| {
+                    // Strict UTF-8 to match the wasm backend's error path.
+                    // `from_utf8_lossy` would silently hide a divergence
+                    // between test and prod.
+                    ConfigStoreError::unavailable(format!("non-utf8 value for `{key}`: {err}"))
+                }),
+                None => Ok(None),
+            },
             #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-            SpinConfigBackend::Spin => {
-                use spin_sdk::variables;
-                match variables::get(&translated).await {
-                    Ok(value) => Ok(Some(value)),
-                    Err(variables::Error::Undefined(_)) => Ok(None),
-                    Err(variables::Error::InvalidName(msg)) => {
-                        Err(ConfigStoreError::invalid_key(msg))
-                    }
-                    Err(err) => Err(ConfigStoreError::unavailable(err.to_string())),
-                }
-            }
+            SpinConfigBackend::Spin { label, store } => match store.get(key).await {
+                Ok(Some(bytes)) => String::from_utf8(bytes).map(Some).map_err(|err| {
+                    ConfigStoreError::unavailable(format!(
+                        "store `{label}`: non-utf8 value for `{key}`: {err}"
+                    ))
+                }),
+                Ok(None) => Ok(None),
+                Err(err) => Err(ConfigStoreError::unavailable(format!(
+                    "store `{label}`: {err}"
+                ))),
+            },
             #[cfg(not(any(all(feature = "spin", target_arch = "wasm32"), test)))]
             SpinConfigBackend::_Uninhabited(never) => {
                 let _: &str = key;
@@ -112,54 +107,35 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
 
-    // Contract tests exercise the InMemory backend. `from_entries` translates
-    // dotted keys on insert, so calling `get("contract.key.a")` here hits the
-    // same `SpinConfigStore::translate_key("contract.key.a") = "contract__key__a"` path that
-    // production uses against `spin_sdk::variables`.
+    // Contract tests exercise the InMemory backend with bytes-backed values.
+    // KV accepts arbitrary key bytes so the dotted-key form is preserved
+    // verbatim end-to-end (no `.→__` translation any more — see module docs).
     edgezero_core::config_store_contract_tests!(spin_config_store_contract, {
         SpinConfigStore::from_entries([
-            ("contract.key.a".to_owned(), "value_a".to_owned()),
-            ("contract.key.b".to_owned(), "value_b".to_owned()),
+            (
+                "contract.key.a".to_owned(),
+                bytes::Bytes::from_static(b"value_a"),
+            ),
+            (
+                "contract.key.b".to_owned(),
+                bytes::Bytes::from_static(b"value_b"),
+            ),
         ])
     });
 
     #[test]
-    fn translate_key_replaces_dots_with_double_underscore() {
-        assert_eq!(
-            SpinConfigStore::translate_key("service.timeout_ms"),
-            "service__timeout_ms"
-        );
-        assert_eq!(
-            SpinConfigStore::translate_key("feature.new_checkout"),
-            "feature__new_checkout"
-        );
-        assert_eq!(SpinConfigStore::translate_key("a.b.c"), "a__b__c");
-    }
-
-    #[test]
-    fn translate_key_passes_flat_keys_through_unchanged() {
-        assert_eq!(SpinConfigStore::translate_key("greeting"), "greeting");
-        assert_eq!(SpinConfigStore::translate_key("api_token"), "api_token");
-        assert_eq!(SpinConfigStore::translate_key(""), "");
-    }
-
-    #[test]
-    fn translate_key_does_not_lowercase() {
-        // Spec: uppercase keys reaching the backend yield InvalidName;
-        // the translation itself is dot-only and case-preserving.
-        assert_eq!(
-            SpinConfigStore::translate_key("Service.Timeout_Ms"),
-            "Service__Timeout_Ms"
-        );
-    }
-
-    #[test]
-    fn dotted_get_resolves_against_flat_storage() {
-        // End-to-end proof: a handler-facing dotted key round-trips through
-        // the InMemory backend (which stores under the translated form).
+    fn dotted_get_resolves_verbatim_under_kv() {
+        // The KV backend stores keys verbatim — `feature.new_checkout`
+        // round-trips without the legacy `.→__` translation.
         let store = SpinConfigStore::from_entries([
-            ("feature.new_checkout".to_owned(), "false".to_owned()),
-            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+            (
+                "feature.new_checkout".to_owned(),
+                bytes::Bytes::from_static(b"false"),
+            ),
+            (
+                "service.timeout_ms".to_owned(),
+                bytes::Bytes::from_static(b"1500"),
+            ),
         ]);
 
         assert_eq!(
@@ -170,11 +146,34 @@ mod tests {
             block_on(store.get("service.timeout_ms")).expect("dotted lookup"),
             Some("1500".to_owned()),
         );
-        // Sanity: the flat form a caller-from-outside-the-translation would
-        // use also works, because translation is idempotent on flat keys.
+        // Negative: the legacy flat form is NOT a fallback any more.
         assert_eq!(
             block_on(store.get("feature__new_checkout")).expect("flat lookup"),
-            Some("false".to_owned()),
+            None,
+            "KV accepts arbitrary keys; the dotted and flat forms are distinct"
         );
+    }
+
+    #[test]
+    fn non_utf8_value_returns_unavailable() {
+        // Mirrors the wasm backend's strict-UTF-8 path. Documents the
+        // contract that binary KV values are NOT silently lossily decoded.
+        let store = SpinConfigStore::from_entries([(
+            "binary".to_owned(),
+            // `0xFF` is not a valid UTF-8 lead byte.
+            bytes::Bytes::from_static(&[0xFF_u8, 0xFE_u8]),
+        )]);
+        let err = block_on(store.get("binary")).expect_err("non-utf8 -> error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("non-utf8 value for `binary`"),
+            "expected non-utf8 message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn missing_key_returns_none() {
+        let store = SpinConfigStore::from_entries([]);
+        assert_eq!(block_on(store.get("absent")).expect("ok"), None);
     }
 }
