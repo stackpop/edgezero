@@ -112,7 +112,11 @@ pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinFullRes
 /// a Spin-compatible response, opening the KV store under `kv_label`.
 ///
 /// Injects all available stores into request extensions:
-/// - `ConfigStoreHandle` backed by `SpinConfigStore` (Spin component variables)
+/// - `ConfigStoreHandle` backed by `SpinConfigStore` opened on `kv_label`
+///   (KV-backed since 2026-Q3; was variables-backed before that). The
+///   same label opens the config-store backend as the KV store on this
+///   low-level path — registry-aware callers should use [`run_app`]
+///   instead, which resolves per-id labels from `EDGEZERO__STORES__CONFIG__<ID>__NAME`.
 /// - `KvHandle` backed by `SpinKvStore` opened on `kv_label` (best-effort;
 ///   logged and omitted if the label is not declared in `spin.toml`)
 /// - `SecretHandle` backed by `SpinSecretStore` (Spin component variables)
@@ -122,8 +126,8 @@ pub async fn dispatch(app: &App, req: SpinRequest) -> anyhow::Result<SpinFullRes
 ///
 /// # Errors
 /// Returns [`anyhow::Error`] if KV open fails when the store is required,
-/// the request cannot be converted, the router dispatch fails, or response
-/// translation fails.
+/// if the config-store open fails, if the request cannot be converted, if
+/// the router dispatch fails, or if response translation fails.
 #[inline]
 pub async fn dispatch_with_kv_label(
     app: &App,
@@ -131,7 +135,7 @@ pub async fn dispatch_with_kv_label(
     kv_label: &str,
 ) -> anyhow::Result<SpinFullResponse> {
     let stores = Stores {
-        config_store: resolve_config_handle(true),
+        config_store: resolve_config_handle(kv_label).await?,
         kv: resolve_kv_handle(kv_label, false).await?,
         secrets: resolve_secret_handle(true),
         ..Default::default()
@@ -169,10 +173,11 @@ pub(crate) async fn dispatch_with_handles(
 /// - KV: **Multi** — each declared id opens its own [`SpinKvStore`] under the
 ///   label resolved from `EDGEZERO__STORES__KV__<ID>__NAME`. Optional
 ///   `EDGEZERO__STORES__KV__<ID>__MAX_LIST_KEYS` overrides the paging cap.
-/// - Config: **Single** — every declared id maps to the one shared
-///   [`SpinConfigStore`] (flat variable namespace).
+/// - Config: **Multi** — each declared id opens its own [`SpinConfigStore`]
+///   under the label resolved from `EDGEZERO__STORES__CONFIG__<ID>__NAME`.
+///   KV-backed under the hood (was variables-backed up through 2026-Q2).
 /// - Secrets: **Single** — every declared id maps to the one shared
-///   [`SpinSecretStore`] (same flat namespace).
+///   [`SpinSecretStore`] (flat variable namespace).
 pub(crate) async fn dispatch_with_registries(
     app: &App,
     req: SpinRequest,
@@ -182,7 +187,7 @@ pub(crate) async fn dispatch_with_registries(
     env: &EnvConfig,
 ) -> anyhow::Result<SpinFullResponse> {
     let kv_registry = build_kv_registry(kv_meta, env).await?;
-    let config_registry = build_config_registry(config_meta);
+    let config_registry = build_config_registry(config_meta, env).await?;
     let secret_registry = build_secret_registry(secret_meta, env);
     dispatch_with_handles(
         app,
@@ -266,17 +271,35 @@ async fn build_kv_registry(
     Ok(StoreRegistry::from_parts(by_id, meta.default.to_owned()))
 }
 
-fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
-    let meta = config_meta?;
-    // Spin is `Single` for config: every id resolves to the same flat
-    // variable store. Construction is infallible, so the default id is
-    // always present in `by_id`.
-    let handle = ConfigStoreHandle::new(Arc::new(SpinConfigStore::new()));
+async fn build_config_registry(
+    config_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> anyhow::Result<Option<ConfigRegistry>> {
+    let Some(meta) = config_meta else {
+        return Ok(None);
+    };
+    // Spin is `Multi` for config (KV-backed): each declared id opens its
+    // own `key_value::Store` under the label resolved from
+    // `EDGEZERO__STORES__CONFIG__<ID>__NAME`. Mirrors `build_kv_registry`
+    // so missing `key_value_stores = [...]` declarations surface at
+    // dispatch setup, not on first config read.
     let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
     for id in meta.ids {
-        by_id.insert((*id).to_owned(), handle.clone());
+        let label = env.store_name("config", id);
+        match SpinConfigStore::open(label.clone()).await {
+            Ok(store) => {
+                by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+            }
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "Spin config KV store '{label}' (id `{id}`) is explicitly configured but could not be opened: {err}"
+                ));
+            }
+        }
     }
-    StoreRegistry::from_parts(by_id, meta.default.to_owned())
+    // Every id is required to open (any failure returns Err above), so
+    // `from_parts` is guaranteed to have the default id present.
+    Ok(StoreRegistry::from_parts(by_id, meta.default.to_owned()))
 }
 
 fn build_secret_registry(
@@ -301,11 +324,17 @@ fn build_secret_registry(
     StoreRegistry::from_parts(by_id, meta.default.to_owned())
 }
 
-fn resolve_config_handle(config_enabled: bool) -> Option<ConfigStoreHandle> {
-    if !config_enabled {
-        return None;
-    }
-    Some(ConfigStoreHandle::new(Arc::new(SpinConfigStore::new())))
+async fn resolve_config_handle(label: &str) -> anyhow::Result<Option<ConfigStoreHandle>> {
+    // Low-level path (`dispatch` / `dispatch_with_kv_label`): open the
+    // KV-backed config store under the same label used for KV. Registry
+    // callers (`dispatch_with_registries`) use `build_config_registry`
+    // instead, which resolves per-id labels via env.
+    let store = SpinConfigStore::open(label.to_owned()).await.map_err(|err| {
+        anyhow::anyhow!(
+            "Spin config KV store '{label}' could not be opened on the low-level dispatch path: {err}"
+        )
+    })?;
+    Ok(Some(ConfigStoreHandle::new(Arc::new(store))))
 }
 
 async fn resolve_kv_handle(kv_label: &str, kv_required: bool) -> anyhow::Result<Option<KvHandle>> {
