@@ -14,5 +14,11 @@ use spin_sdk::http_service;
 #[cfg(target_arch = "wasm32")]
 #[http_service]
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
-    edgezero_adapter_spin::run_app::<{{proj_core_mod}}::App>(req).await
+    // `run_app_with_seeder` adds the `/__edgezero/config/seed` route so
+    // `config push --adapter spin --local` works against this app out of
+    // the box. The seed handler is fail-closed (returns 401 on every
+    // request unless `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` is set to a
+    // token of at least 16 bytes), so no surface is opened by default.
+    // Projects that want to opt out can swap to `run_app` here.
+    edgezero_adapter_spin::run_app_with_seeder::<{{proj_core_mod}}::App>(req).await
 }
