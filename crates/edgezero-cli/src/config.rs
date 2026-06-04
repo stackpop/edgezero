@@ -194,12 +194,12 @@ where
     // Spec: strict pre-flight. The typed flow already runs
     // typed-only checks below; `run_shared_checks` here adds
     // everything `config validate --strict` does — shared
-    // adapter checks (Spin key syntax, `[component.*]`
-    // discovery), capability-aware completeness, and
-    // handler-path well-formedness. Without this an invalid
-    // Spin key (`api-token`) or a Single-capable adapter with
-    // multi-id stores would only surface inside the per-adapter
-    // push, potentially after a partial mutation.
+    // adapter checks (`[component.*]` discovery for Spin,
+    // adapter-manifest well-formedness), capability-aware
+    // completeness, and handler-path well-formedness. Without
+    // this a Single-capable adapter with multi-id stores would
+    // only surface inside the per-adapter push, potentially
+    // after a partial mutation.
     run_shared_checks(&ctx.validation)?;
 
     let mut opts = AppConfigLoadOptions::default();
@@ -497,8 +497,8 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
 
     // Load the raw root table once. The typed flow will re-load it
     // via `load_app_config_with_options::<C>` to drive deserialise +
-    // validator; we keep this copy for shared checks (Spin key
-    // syntax, component discovery) that don't need `C`.
+    // validator; we keep this copy for shared checks (e.g. Spin
+    // `[component.*]` discovery) that don't need `C`.
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
     let raw_config =
@@ -1128,32 +1128,6 @@ ids = ["default"]
     }
 
     #[test]
-    fn spin_key_syntax_rejects_uppercase_top_level_key() {
-        let app_config = r#"
-api_token = "x"
-GREETING = "hi"
-"#;
-        let (dir, manifest, _) = setup_project(&spin_manifest(""), app_config);
-        write_spin_toml(dir.path(), VALID_SPIN_TOML);
-        let err = run_config_validate(&args_for(&manifest)).expect_err("uppercase key must error");
-        assert!(
-            err.contains("GREETING") && err.contains("Spin"),
-            "error names the bad key + Spin: {err}"
-        );
-    }
-
-    #[test]
-    fn spin_key_syntax_rejects_dash_in_key() {
-        let app_config = r#"
-api-token = "x"
-"#;
-        let (dir, manifest, _) = setup_project(&spin_manifest(""), app_config);
-        write_spin_toml(dir.path(), VALID_SPIN_TOML);
-        let err = run_config_validate(&args_for(&manifest)).expect_err("dashed key must error");
-        assert!(err.contains("api-token"), "error names the bad key: {err}");
-    }
-
-    #[test]
     fn spin_component_discovery_errors_on_zero_components() {
         let spin_toml = r#"
 spin_manifest_version = 2
@@ -1343,35 +1317,6 @@ timeout_ms = 1500
         write_spin_toml(dir.path(), VALID_SPIN_TOML);
         run_config_validate_typed::<StoreRefRegressionConfig>(&args_for(&manifest_path))
             .expect("store_ref value coinciding with a config key must not collide");
-    }
-
-    #[test]
-    fn spin_config_secret_collision_typed_only() {
-        // `api_token = "greeting"` makes both the config key
-        // `greeting` and the secret-store key derived from
-        // `api_token`'s value translate to the same Spin variable
-        // `greeting`. Typed flow must reject; raw flow can't see it.
-        let app_config = r#"
-api_token = "greeting"
-greeting = "hi"
-vault = "default"
-
-[service]
-timeout_ms = 1500
-"#;
-        let (dir, manifest, _) = setup_project(&spin_manifest(""), app_config);
-        write_spin_toml(dir.path(), VALID_SPIN_TOML);
-
-        // Raw flow tolerates it (no SECRET_FIELDS).
-        run_config_validate(&args_for(&manifest)).expect("raw flow can't detect the collision");
-
-        // Typed flow detects it.
-        let err = run_config_validate_typed::<FixtureConfig>(&args_for(&manifest))
-            .expect_err("typed flow must detect the collision");
-        assert!(
-            err.contains("greeting") && err.contains("collides"),
-            "error names the colliding name: {err}"
-        );
     }
 
     // ---------- --strict checks ----------
@@ -1829,19 +1774,21 @@ timeout_ms = 50
     // ---------- push runs the strict preflight (regression) ----------
 
     /// Push must run the same shared adapter checks `config
-    /// validate` runs, including Spin's `^[a-z][a-z0-9_]*$`
-    /// key-syntax check (spec strict pre-flight). Pre-fix,
+    /// validate` runs (spec strict pre-flight). Pre-fix,
     /// `load_push_context` synthesised `ConfigValidateArgs { strict:
     /// false }` and `run_config_push*` never called
-    /// `run_shared_checks`, so an invalid Spin config key (e.g. a
-    /// dash) only surfaced inside `Adapter::push_config_entries`
-    /// — which for Spin was caught belt-and-braces, but for any
-    /// future adapter without the same guard would have written
-    /// half a manifest before erroring.
+    /// `run_shared_checks`, so an adapter-specific shape error
+    /// only surfaced inside `Adapter::push_config_entries` —
+    /// risking a partial mutation in any future adapter without
+    /// the same belt-and-braces guard. We probe via Spin's
+    /// `validate_adapter_manifest`, which fails when the
+    /// referenced spin.toml has no `[component.*]` declarations
+    /// (Stage 6+: Spin no longer enforces a key-syntax rule, so
+    /// the original `api-token` probe no longer fires).
     #[test]
-    fn raw_push_runs_spin_key_validation_before_push() {
-        let app_config_with_dash = r#"
-"api-token" = "x"
+    fn raw_push_runs_spin_adapter_manifest_check_before_push() {
+        let app_config = r#"
+api_token = "x"
 greeting = "hi"
 "#;
         let manifest_spin = r#"
@@ -1863,19 +1810,20 @@ ids = ["app_config"]
 [stores.secrets]
 ids = ["default"]
 "#;
-        let (dir, manifest, _) = setup_project(manifest_spin, app_config_with_dash);
-        // A real spin.toml so the validator's [component.*]
-        // discovery doesn't trip first.
+        let (dir, manifest, _) = setup_project(manifest_spin, app_config);
+        // spin.toml with ZERO components — Spin's
+        // validate_adapter_manifest must reject before the per-
+        // adapter push gets a chance to mutate anything.
         fs::write(
             dir.path().join("spin.toml"),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"a.wasm\"\n",
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n",
         )
         .expect("write spin.toml");
         let err = run_config_push(&push_args(&manifest, "spin"))
-            .expect_err("dashed config key must fail Spin's preflight");
+            .expect_err("missing [component.*] must fail Spin's shared-check preflight");
         assert!(
-            err.contains("api-token") && err.contains("Spin"),
-            "error must come from the shared Spin key check, not a generic schema error: {err}"
+            err.contains("no [component.*]") || err.contains("component"),
+            "error must come from Spin's shared validate_adapter_manifest: {err}"
         );
     }
 

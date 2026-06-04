@@ -114,6 +114,10 @@ const SPIN_INSTALL_HINT: &str = "install the Spin CLI (https://spinframework.dev
 
 struct SpinCliAdapter;
 
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation)."
+)]
 impl Adapter for SpinCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
@@ -421,79 +425,26 @@ impl Adapter for SpinCliAdapter {
         ))
     }
 
-    fn validate_app_config_keys(&self, keys: &[&str]) -> Result<(), String> {
-        // check 1: each dotted config key, translated via
-        // `translate_key_for_spin` (which both replaces `.→__` AND
-        // lowercases), must match `^[a-z][a-z0-9_]*$`. We mirror
-        // the writer's translation EXACTLY so the diagnostic names
-        // the form that would actually be written -- previously the
-        // validator left case intact and produced errors about a
-        // string that the writer would have lowercased before
-        // committing. The uppercase case is still surfaced via the
-        // source-key check below so the operator notices the
-        // mismatch instead of being silently lowercased.
-        for key in keys {
-            let spin_var = translate_key_for_spin(key);
-            if !is_valid_spin_key(&spin_var) {
-                let reason = spin_key_rule_violation(&spin_var);
-                return Err(format!(
-                    "config key `{key}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Rename the config key so the translated name conforms."
-                ));
-            }
-            if key.chars().any(|ch| ch.is_ascii_uppercase()) {
-                return Err(format!(
-                    "config key `{key}` contains uppercase characters. Spin variable names must be lowercase; the writer would otherwise silently produce `{spin_var}` and the source/runtime forms would disagree. Rename the config key to all-lowercase to match."
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn validate_typed_secrets(
         &self,
-        config_keys: &[&str],
+        _config_keys: &[&str],
         plain_secrets: &[(&str, &str)],
     ) -> Result<(), String> {
-        // check 2: flattened config keys ∪ `#[secret]` values
-        // must be a unique set in the effective Spin variable
-        // namespace, since Spin has one flat namespace per
-        // component. The CLI already filtered out
-        // `#[secret(store_ref)]` entries (those are runtime store
-        // ids, not Spin variables).
-        //
-        // The runtime stores are ASYMMETRIC in how they canonicalise
-        // lookups:
-        //   - `SpinConfigStore::translate_key` does `.→__`, case-
-        //     preserving. (Uppercase config keys are rejected
-        //     separately by `validate_app_config_keys`, so by the
-        //     time we reach this check `config_keys` are already
-        //     guaranteed lowercase.)
-        //   - `SpinSecretStore::get_bytes` lowercases the key
-        //     before calling `variables::get` (since Spin variable
-        //     names must be lowercase).
-        //
-        // The validator must mirror both, or a collision like
-        // config key `greeting` + `#[secret]` value `"GREETING"`
-        // — which resolve to the same Spin variable at runtime —
-        // would be missed. We also run `is_valid_spin_key` on
-        // each canonicalised secret value so invalid Spin chars
-        // (dashes, digit-first values) fail at validation rather
-        // than at runtime with an opaque `InvalidName` error.
-        let mut seen: HashSet<String> =
-            HashSet::with_capacity(config_keys.len().saturating_add(plain_secrets.len()));
-        for key in config_keys {
-            let spin_var = key.replace('.', "__");
-            if !seen.insert(spin_var.clone()) {
-                return Err(format!(
-                    "duplicate Spin variable `{spin_var}` derived from config key `{key}`"
-                ));
-            }
-        }
+        // Stage 5+: KV-backed config no longer shares Spin's flat
+        // variable namespace, so `config_keys` are NOT considered
+        // here — config can use arbitrary UTF-8 keys without
+        // colliding with `#[secret]` values. Secrets still resolve
+        // through `spin_sdk::variables`, so two checks remain:
+        //   1. each `#[secret]` value canonicalises (lowercase, no
+        //      `.→__` — secrets don't get translated at runtime)
+        //      to a valid Spin variable name, so invalid chars
+        //      (dashes, digit-first) fail validation rather than
+        //      at runtime with an opaque `InvalidName`;
+        //   2. no two `#[secret]` values collapse to the same
+        //      lowercased Spin variable, since Spin's flat
+        //      namespace cannot disambiguate them.
+        let mut seen: HashSet<String> = HashSet::with_capacity(plain_secrets.len());
         for (field_name, value) in plain_secrets {
-            // Match `SpinSecretStore`'s runtime canonicalisation
-            // exactly: lowercase only (no `.→__` — secret keys
-            // aren't expected to contain dots, and the runtime
-            // doesn't translate them either).
             let spin_var = value.to_ascii_lowercase();
             if !is_valid_spin_key(&spin_var) {
                 let reason = spin_key_rule_violation(&spin_var);
@@ -503,7 +454,7 @@ impl Adapter for SpinCliAdapter {
             }
             if !seen.insert(spin_var.clone()) {
                 return Err(format!(
-                    "Spin variable `{spin_var}` (from `#[secret]` field `{field_name}`) collides with a config key under the same name; Spin's flat variable namespace cannot disambiguate them"
+                    "Spin variable `{spin_var}` (from `#[secret]` field `{field_name}`) collides with another `#[secret]` value resolving to the same lowercased name; Spin's flat variable namespace cannot disambiguate them"
                 ));
             }
         }
@@ -709,14 +660,6 @@ fn ensure_kv_label_in_component(
     fs::write(spin_path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
     Ok(true)
-}
-
-/// Translate a dotted CLI config key into a Spin variable name
-///. Spin's flat variable namespace has no concept of
-/// nested paths, so we encode the dotted path as `__`-separated
-/// segments and lowercase the result.
-fn translate_key_for_spin(dotted_key: &str) -> String {
-    dotted_key.replace('.', "__").to_ascii_lowercase()
 }
 
 /// # Errors
@@ -962,39 +905,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_app_config_keys_rejects_uppercase() {
-        let err = SpinCliAdapter
-            .validate_app_config_keys(&["api_token", "GREETING"])
-            .expect_err("uppercase key must error");
-        assert!(
-            err.contains("GREETING") && err.contains("Spin"),
-            "error names the bad key + Spin: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_app_config_keys_rejects_dashes() {
-        let err = SpinCliAdapter
-            .validate_app_config_keys(&["api-token"])
-            .expect_err("dashed key must error");
-        assert!(err.contains("api-token"), "error names the bad key: {err}");
-    }
-
-    #[test]
-    fn validate_typed_secrets_detects_collision() {
-        // `api_token = "greeting"` makes the config key `greeting`
-        // and the Spin variable derived from the secret value
-        // `greeting` collide.
-        let err = SpinCliAdapter
-            .validate_typed_secrets(&["greeting"], &[("api_token", "greeting")])
-            .expect_err("collision must error");
-        assert!(
-            err.contains("greeting") && err.contains("collides"),
-            "error names the colliding name: {err}"
-        );
-    }
-
-    #[test]
     fn validate_typed_secrets_passes_with_no_collision() {
         SpinCliAdapter
             .validate_typed_secrets(
@@ -1002,25 +912,6 @@ mod tests {
                 &[("api_token", "demo_api_token")],
             )
             .expect("non-colliding inputs must pass");
-    }
-
-    // ---------- secret-value canonicalisation regressions ----------
-
-    /// Runtime `SpinSecretStore::get_bytes` lowercases the key
-    /// before calling `variables::get`. The validator must
-    /// mirror that or a `#[secret]` value like `"GREETING"`
-    /// (uppercase) silently passes validation but collides with
-    /// the config key `greeting` at runtime — both resolve to
-    /// the same Spin variable `greeting`.
-    #[test]
-    fn validate_typed_secrets_detects_collision_after_lowercasing_secret_value() {
-        let err = SpinCliAdapter
-            .validate_typed_secrets(&["greeting"], &[("api_token", "GREETING")])
-            .expect_err("case-only collision against config key must error");
-        assert!(
-            err.contains("greeting") && err.contains("collides"),
-            "error names the lowercased collision: {err}"
-        );
     }
 
     /// `#[secret]` values must also be valid Spin variable names
@@ -1453,33 +1344,6 @@ mod tests {
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
             .expect("no-store provision is fine");
         assert_eq!(out, vec!["spin has no declared stores to provision"]);
-    }
-
-    // ---------- translate_key_for_spin ----------
-
-    #[test]
-    fn translate_key_for_spin_replaces_dots_with_double_underscores() {
-        assert_eq!(
-            translate_key_for_spin("service.timeout_ms"),
-            "service__timeout_ms"
-        );
-    }
-
-    #[test]
-    fn translate_key_for_spin_passes_through_unsegmented_keys() {
-        assert_eq!(translate_key_for_spin("greeting"), "greeting");
-    }
-
-    #[test]
-    fn translate_key_for_spin_lowercases() {
-        // Spin's `^[a-z][a-z0-9_]*$` rule rejects uppercase; the
-        // translator normalises so the validator in sees the
-        // canonical form before push.
-        assert_eq!(translate_key_for_spin("GREETING"), "greeting");
-        assert_eq!(
-            translate_key_for_spin("Service.TimeoutMs"),
-            "service__timeoutms"
-        );
     }
 
     // ---------- push_config_entries (Stage 4: HTTP POST to seed handler) ----------
