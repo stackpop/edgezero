@@ -337,11 +337,13 @@ pub trait Adapter: Sync + Send {
     }
 
     /// Reject the user's `<name>.toml` if it violates an
-    /// adapter-specific naming constraint — Spin's
-    /// `^[a-z][a-z0-9_]*$` after `.→__` translation, for example.
+    /// adapter-specific naming constraint on raw config keys.
     /// `keys` are the flattened dotted paths into the typed
     /// app-config (e.g. `["greeting", "service.timeout_ms"]`).
-    /// Default: no-op.
+    /// No registered adapter currently overrides this — Spin's
+    /// previous `^[a-z][a-z0-9_]*$` rule lapsed when config moved
+    /// to KV — but the hook stays for future adapters whose
+    /// stores impose a naming convention. Default: no-op.
     ///
     /// # Errors
     /// Returns a human-readable error string if any key violates
@@ -360,9 +362,10 @@ pub trait Adapter: Sync + Send {
     /// before calling. Default: no-op.
     ///
     /// # Errors
-    /// Returns a human-readable error string on any conflict
-    /// between config keys and secret values (e.g. a Spin variable
-    /// collision).
+    /// Returns a human-readable error string on any adapter-
+    /// specific conflict — e.g. two `#[secret]` values that
+    /// collapse to the same Spin variable name under the
+    /// runtime's canonicalisation.
     #[inline]
     fn validate_typed_secrets(
         &self,
