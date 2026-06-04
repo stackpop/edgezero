@@ -106,30 +106,51 @@ full rationale):
 
 ## Config Store
 
-Spin config is backed by `spin_sdk::variables`, which exposes a **single
-flat variable namespace** per component (no notion of multiple named
-config stores). `[stores.config].ids` must therefore have exactly one id
-for any project targeting Spin — `config validate` catches violations.
-
-Spin variable names must match `^[a-z][a-z0-9_]*$` ([Spin manifest
-reference](https://spinframework.dev/manifest-reference)). The adapter
-translates the canonical dotted key (`service.timeout_ms`) to a Spin
-variable (`service__timeout_ms`) on read.
+Spin config is **KV-backed and multi-store** — each logical id in
+`[stores.config].ids` opens a separate `spin_sdk::key_value::Store` at
+runtime. The store accepts arbitrary UTF-8 keys, so the canonical dotted
+key (`service.timeout_ms`) is read back verbatim — no key translation.
+Override the label per id with `EDGEZERO__STORES__CONFIG__<ID>__NAME`;
+with the variable unset the label defaults to the logical id.
 
 ```toml
-# spin.toml
-[variables]
-greeting = { default = "hello from config store" }
-
-[component.my-app.variables]
-greeting = "{{ greeting }}"
+# edgezero.toml
+[stores.config]
+ids     = ["app_config", "feature_flags"]
+default = "app_config"
 ```
+
+```toml
+# spin.toml — declare every label in the component's `key_value_stores`
+[component.my-app]
+key_value_stores = ["app_config", "feature_flags"]
+```
+
+`provision` writes the labels into `key_value_stores` for you. To seed
+the store from `edgezero.toml` + your typed app-config:
+
+```bash
+# Production target — POST against the deployed app's seed handler.
+edgezero config push --adapter spin \
+  --seed-url https://my-app.fermyon.app/__edgezero/config/seed \
+  --seed-token $EDGEZERO_SEED_TOKEN
+
+# Local development — POST against `spin up`'s seed handler.
+edgezero config push --adapter spin --local
+```
+
+The seed handler (built into `run_app` at `/__edgezero/config/seed`)
+authenticates via the `x-edgezero-seed` header and writes entries
+atomically; see [config push](/guide/cli-reference#config-push) for the
+full URL / token resolution chain.
 
 ## Secret Store
 
-Spin secrets share the **same flat variable namespace** as Spin config
-(single-store, no named overrides). Secret variables are declared
-manually in `spin.toml` with `secret = true`:
+Spin secrets use `spin_sdk::variables`, which exposes a **single flat
+variable namespace** per component (no notion of multiple named secret
+stores). `[stores.secrets].ids.len() > 1` while targeting Spin is caught
+by `config validate --strict`. Secret variables are declared manually in
+`spin.toml` with `secret = true`:
 
 ```toml
 # spin.toml
@@ -140,13 +161,11 @@ api_token = { required = true, secret = true }
 api_token = "{{ api_token }}"
 ```
 
-Because Spin's config and secret namespaces share keys, `config validate`
-also runs a collision check. Config keys translate `.` → `__` (mirrors the
-runtime `SpinConfigStore`). `#[secret]` field values are only lowercased —
-the runtime `SpinSecretStore` does not translate dots, so neither does the
-validator. The effective Spin variable name set (translated config keys ∪
-lowercased `#[secret]` values) must have no duplicates when `spin` is in
-the adapter set.
+`config validate` runs a within-secrets canonicalisation check: each
+`#[secret]` field value is lowercased to mirror the runtime
+`SpinSecretStore::get_bytes` lookup, must be a valid Spin variable name
+(`^[a-z][a-z0-9_]*$`), and must not collide with another `#[secret]`
+value that lowercases to the same form.
 
 ## Spin component discovery
 

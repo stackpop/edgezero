@@ -5,29 +5,22 @@ name = "app-demo-adapter-spin"
 version = "0.1.0"
 
 # Application-level variable declarations.
-# Spin variable names are lowercase and may not contain dots; the
-# `SpinConfigStore` adapter translates the canonical dotted handler-facing
-# keys (`feature.new_checkout`, `service.timeout_ms`) into flat variable
-# names (`feature__new_checkout`, `service__timeout_ms`) before lookup,
-# matching the spec rule. Override at runtime via
-# SPIN_VARIABLE_<UPPERCASE_NAME>=value or `spin up --env KEY=value`.
 #
-# Spec + also says secret variables must be declared MANUALLY
-# by the developer (config push never writes them). `api_token` is the
-# `#[secret]` field from AppDemoConfig — its value resolves through
-# the Spin secret store, but the variable must still be declared here
-# with `secret = true` so the wasm component is allowed to read it.
-# `vault` is `#[secret(store_ref)]` — the value is a runtime store id,
-# not material to keep secret, but bound the same way for consistency
-# with the AppDemoConfig surface.
+# As of the Spin KV-config migration, app-config keys live in the
+# KV-backed `app_config` store (see `[component.app-demo].key_value_stores`
+# below) — `[variables]` here is now SECRETS-ONLY.
+#
+# `api_token` is the `#[secret]` field from `AppDemoConfig`; its value
+# resolves through Spin's flat variable namespace, so it must be declared
+# with `secret = true` for the wasm component to read it. `vault` is
+# `#[secret(store_ref)]` — the value is a runtime store id, not material
+# to keep secret, but bound the same way for consistency with the
+# `AppDemoConfig` surface. `smoke_secret` keeps an empty default so the
+# server starts without a value set; pass
+# `SPIN_VARIABLE_SMOKE_SECRET=<value>` when running smoke_test_secrets.sh.
 [variables]
-greeting = { default = "hello from config store" }
-feature__new_checkout = { default = "false" }
-service__timeout_ms = { default = "1500" }
 api_token = { required = true, secret = true }
 vault = { default = "default" }
-# smoke_secret has an empty default so the server starts without a value set.
-# Pass SPIN_VARIABLE_SMOKE_SECRET=<value> when running smoke_test_secrets.sh.
 smoke_secret = { default = "" }
 
 # Component name is shortened for brevity; scaffolded projects use the full
@@ -39,15 +32,14 @@ component = "app-demo"
 [component.app-demo]
 source = "../../target/wasm32-wasip2/release/app_demo_adapter_spin.wasm"
 allowed_outbound_hosts = ["https://*:*"]
-# Spin labels match the logical KV ids declared in edgezero.toml
-# (`[stores.kv].ids = ["sessions", "cache"]`). Override per-id via
-# `EDGEZERO__STORES__KV__SESSIONS__NAME=<label>` if you need to remap.
-key_value_stores = ["sessions", "cache"]
+# Each label is the platform name of a `[stores.kv]` / `[stores.config]`
+# id from `edgezero.toml`. `app_config` is the KV-backed config store the
+# adapter opens on demand; `sessions` and `cache` are the KV labels.
+# Override per-id via `EDGEZERO__STORES__<KIND>__<ID>__NAME=<label>` if
+# you need to remap.
+key_value_stores = ["app_config", "sessions", "cache"]
 
 [component.app-demo.variables]
-greeting = "{{ greeting }}"
-feature__new_checkout = "{{ feature__new_checkout }}"
-service__timeout_ms = "{{ service__timeout_ms }}"
 api_token = "{{ api_token }}"
 vault = "{{ vault }}"
 smoke_secret = "{{ smoke_secret }}"
