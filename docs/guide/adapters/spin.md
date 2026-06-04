@@ -126,7 +126,28 @@ default = "app_config"
 key_value_stores = ["app_config", "feature_flags"]
 ```
 
-`provision` writes the labels into `key_value_stores` for you. To seed
+```toml
+# runtime-config.toml — register each custom label with a backend
+# (the default `default` label is auto-provided by Spin; everything
+# else needs an entry here, or `spin up` errors with
+# "unknown key_value_stores label <name>").
+[key_value_store.app_config]
+type = "spin"
+
+[key_value_store.feature_flags]
+type = "spin"
+```
+
+`edgezero new --adapter spin` scaffolds both files; `edgezero serve
+--adapter spin` runs `spin up --runtime-config-file runtime-config.toml`
+so locally-declared labels resolve to the SQLite-backed Spin KV
+implementation. For production, swap `type = "spin"` for a managed
+backend (`type = "azure"`, `type = "redis"`, …) per the
+[Spin runtime-config docs](https://spinframework.dev/v3/dynamic-configuration#key-value-store-runtime-configuration).
+
+`provision` writes the `[component.<id>].key_value_stores` array for
+you (it does NOT touch `runtime-config.toml` — keep that one
+hand-edited). To seed
 the store from `edgezero.toml` + your typed app-config:
 
 ```bash

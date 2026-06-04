@@ -1,0 +1,21 @@
+# Spin runtime configuration — declares the KV labels that
+# `{{proj_spin}}`'s component is allowed to open at runtime.
+# Each label uses the default SQLite-backed Spin KV backend,
+# which persists to `.spin/sqlite_key_value.db` next to this
+# file.
+#
+# Custom labels (anything other than `default`) require a
+# declaration here; without one, `spin up` errors with
+# "unknown key_value_stores label <name>". EdgeZero's KV-backed
+# config store reads from the label declared in
+# `[stores.config].ids` (default `app_config`); add a stanza
+# below for every additional `[stores.kv]` / `[stores.config]`
+# id you declare in `edgezero.toml`.
+#
+# For production deployments, swap `type = "spin"` for a
+# managed backend (e.g. `type = "azure"`, `type = "redis"`) per
+# the Spin runtime-config docs:
+# https://spinframework.dev/v3/dynamic-configuration#key-value-store-runtime-configuration
+
+[key_value_store.app_config]
+type = "spin"

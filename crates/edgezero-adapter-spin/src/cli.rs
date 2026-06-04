@@ -40,7 +40,7 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     commands: CommandTemplates {
         build: "cargo build --target wasm32-wasip2 --release -p {crate}",
         deploy: "spin deploy --from {crate_dir}",
-        serve: "spin up --from {crate_dir}",
+        serve: "spin up --from {crate_dir} --runtime-config-file {crate_dir}/runtime-config.toml",
     },
     logging: LoggingDefaults {
         endpoint: None,
@@ -84,6 +84,10 @@ static SPIN_FILE_SPECS: &[AdapterFileSpec] = &[
         output: "Cargo.toml",
     },
     AdapterFileSpec {
+        template: "spin_runtime_config_toml",
+        output: "runtime-config.toml",
+    },
+    AdapterFileSpec {
         template: "spin_src_lib_rs",
         output: "src/lib.rs",
     },
@@ -97,6 +101,10 @@ static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     TemplateRegistration {
         name: "spin_Cargo_toml",
         contents: include_str!("templates/Cargo.toml.hbs"),
+    },
+    TemplateRegistration {
+        name: "spin_runtime_config_toml",
+        contents: include_str!("templates/runtime-config.toml.hbs"),
     },
     TemplateRegistration {
         name: "spin_src_lib_rs",
