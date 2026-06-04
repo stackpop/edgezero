@@ -295,13 +295,62 @@ adapters = ["axum"]
     }
 
     #[test]
-    fn run_provision_spin_rejects_multi_config_ids_via_capability_gate() {
-        // Spin is Single-capable for `config` and `secrets`. Without
-        // an enforce_single_store_capability gate in run_provision,
-        // a manifest declaring two config ids would dispatch to the
-        // spin adapter dry-run and silently succeed, even though
-        // `config validate --strict` would correctly reject the same
-        // shape. This test pins the parity.
+    fn run_provision_spin_rejects_multi_secret_ids_via_capability_gate() {
+        // Stage 5: Spin moved `config` to KV (multi-capable). Secrets
+        // remain Single-capable until we ship native secret support,
+        // so a manifest declaring two secret ids must still trip the
+        // gate before dispatching to the spin adapter dry-run. This
+        // test pins parity with `config validate --strict`.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+default = "app_config"
+
+[stores.secrets]
+ids = ["default", "other"]
+default = "default"
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("Single-capability violation must error");
+        assert!(
+            err.contains("spin") && err.contains("Single-capable for secrets"),
+            "error names the adapter + kind: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_spin_accepts_multi_config_ids_since_kv_migration() {
+        // Stage 5: config is KV-backed for Spin, so multiple config
+        // ids no longer trip enforce_single_store_capability. The
+        // dispatch reaches the adapter dry-run and reports one
+        // `key_value_stores` write per id.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -333,16 +382,12 @@ ids = ["default"]
         let manifest_str = manifest_path.to_string_lossy().into_owned();
         let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
-        let err = run_provision(&ProvisionArgs {
+        run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
             manifest: manifest_path.clone(),
         })
-        .expect_err("Single-capability violation must error");
-        assert!(
-            err.contains("spin") && err.contains("Single-capable for config"),
-            "error names the adapter + kind: {err}"
-        );
+        .expect("multi-config dispatch must succeed under KV-backed config");
     }
 
     #[test]

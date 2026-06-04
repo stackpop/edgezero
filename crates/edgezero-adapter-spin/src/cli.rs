@@ -154,15 +154,13 @@ impl Adapter for SpinCliAdapter {
     ) -> Result<Vec<String>, String> {
         //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
-        // runtime / Fermyon at deploy). For each declared KV id,
-        // append the label to the resolved component's
-        // `key_value_stores` array. Config and secret variables
-        // are NOT handled here: the manifest carries only store
-        // ids, not app-config field keys or secret key names —
-        // `config push --adapter spin` declares config variables
-        // (it loads the typed `<name>.toml`), and secret
-        // variables are manually declared by the developer in
-        // spin.toml.
+        // runtime / Fermyon at deploy). For each declared KV id
+        // AND each declared CONFIG id (KV-backed since Stage 5
+        // of the spin-kv-config plan), append the env-resolved
+        // platform label to the component's `key_value_stores`
+        // array. Secret variables are manually declared by the
+        // developer in spin.toml -- secrets stay on Spin
+        // variables for the platform's `secret = true` flagging.
         let Some(rel) = adapter_manifest_path else {
             return Err(
                 "[adapters.spin.adapter].manifest must point at spin.toml for provision".to_owned(),
@@ -171,20 +169,29 @@ impl Adapter for SpinCliAdapter {
         let spin_path = manifest_root.join(rel);
 
         let mut out = Vec::new();
-        if !stores.kv.is_empty() {
+        // Resolve the component once if either KV or config has
+        // anything to provision.
+        let needs_component = !stores.kv.is_empty() || !stores.config.is_empty();
+        if needs_component {
             let component_id = resolve_spin_component(&spin_path, component_selector)?;
-            for store in stores.kv {
+            for (kind, store) in stores
+                .kv
+                .iter()
+                .map(|store| ("KV", store))
+                .chain(stores.config.iter().map(|store| ("config", store)))
+            {
                 let logical = store.logical.as_str();
-                // The KV label the runtime opens is what
-                // `EDGEZERO__STORES__KV__<LOGICAL>__NAME` resolves
-                // to (default = the logical id). Provision writes
-                // the PLATFORM label into
-                // `[component.X].key_value_stores` so that the
-                // runtime's lookup matches.
+                // The label the runtime opens is what
+                // `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME`
+                // resolves to (default = the logical id). Provision
+                // writes the PLATFORM label into
+                // `[component.X].key_value_stores` so that both the
+                // KV runtime lookup AND the KV-backed config
+                // runtime lookup match.
                 let label = store.platform.as_str();
                 if dry_run {
                     out.push(format!(
-                        "would ensure KV label `{label}` (logical id `{logical}`) is in [component.{component_id}].key_value_stores in {}",
+                        "would ensure {kind} label `{label}` (logical id `{logical}`) is in [component.{component_id}].key_value_stores in {}",
                         spin_path.display()
                     ));
                     continue;
@@ -192,23 +199,16 @@ impl Adapter for SpinCliAdapter {
                 let added = ensure_kv_label_in_component(&spin_path, &component_id, label)?;
                 if added {
                     out.push(format!(
-                        "added KV label `{label}` (logical id `{logical}`) to [component.{component_id}].key_value_stores in {}",
+                        "added {kind} label `{label}` (logical id `{logical}`) to [component.{component_id}].key_value_stores in {}",
                         spin_path.display()
                     ));
                 } else {
                     out.push(format!(
-                        "KV label `{label}` (logical id `{logical}`) already present in [component.{component_id}].key_value_stores in {}; skipping",
+                        "{kind} label `{label}` (logical id `{logical}`) already present in [component.{component_id}].key_value_stores in {}; skipping",
                         spin_path.display()
                     ));
                 }
             }
-        }
-        for store in stores.config {
-            let logical = store.logical.as_str();
-            let platform = store.platform.as_str();
-            out.push(format!(
-                "spin config id `{logical}` (platform name `{platform}`) is provisioned by `config push --adapter spin` (declares Spin variables); nothing to do here"
-            ));
         }
         for store in stores.secrets {
             let logical = store.logical.as_str();
@@ -360,9 +360,10 @@ impl Adapter for SpinCliAdapter {
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
-        //: Multi for KV (label-backed); Single for Config and
-        // Secrets (flat-variable namespace).
-        &["config", "secrets"]
+        //: Multi for KV AND Config (both label-backed via the
+        // Spin KV API since Stage 5 of the spin-kv-config plan).
+        // Single for Secrets (still flat-variable namespace).
+        &["secrets"]
     }
 
     fn validate_adapter_manifest(
@@ -569,37 +570,6 @@ fn spin_key_rule_violation(key: &str) -> &'static str {
     "Spin variable names must match `^[a-z][a-z0-9_]*$`"
 }
 
-/// Standard error wording when a TOML key we expected to be a
-/// table (`[variables]`, `[component.X]`, `[component.X.variables]`,
-/// `[variables.<key>]`) is found as a non-table value. Spin requires
-/// these slots to be tables; an inline value usually means an old
-/// hand-edited spin.toml that pre-dates the variables convention.
-///
-/// Wording differs by depth:
-/// - `variables.<key>`: the user almost certainly wrote
-///   `[variables]\n<key> = "..."` (scalar leaf). The right fix
-///   is `<key> = { default = "..." }`, NOT `[variables.<key>]` block.
-/// - Other slots: the user wrote `<what> = ...` (inline at the
-///   parent). The right fix is to break out the parent into block
-///   form.
-// Stage 4 (KV-backed config push): helper only used by the now-dormant
-// `write_spin_variables` provision path. Stage 5 deletes both helpers
-// along with the provision-side variable writes. Gated to `#[cfg(test)]`
-// in the meantime so it doesn't trip the unused-code lint.
-#[cfg(test)]
-fn not_a_table_error(spin_path: &Path, what: &str) -> String {
-    if let Some(leaf) = what.strip_prefix("variables.") {
-        return format!(
-            "{}: [variables].{leaf} is a scalar value but Spin requires every variable declaration to be a sub-table with at least `default = \"...\"`. Replace `{leaf} = \"<value>\"` with `{leaf} = {{ default = \"<value>\" }}` (or a block-form `[variables.{leaf}]\\ndefault = \"<value>\"`).",
-            spin_path.display()
-        );
-    }
-    format!(
-        "{}: `{what}` exists but is not a TOML table. Spin requires `[{what}]` table syntax with key/value pairs underneath. If `{what} = ...` was set as a single inline value, replace it with `[{what}]` block syntax and move keys into it.",
-        spin_path.display()
-    )
-}
-
 fn collect_spin_component_ids(parsed: &toml::Value) -> Vec<String> {
     parsed
         .as_table()
@@ -747,138 +717,6 @@ fn ensure_kv_label_in_component(
 /// segments and lowercase the result.
 fn translate_key_for_spin(dotted_key: &str) -> String {
     dotted_key.replace('.', "__").to_ascii_lowercase()
-}
-
-/// Declare + bind each Spin variable so the component can read
-/// it. Writes both:
-/// 1. `[variables].<key>` with `default = "<value>"` — the
-///    application-level declaration.
-/// 2. `[component.<component>.variables].<key>` = `"{{ <key> }}"`
-///    — the component binding (without it the variable is
-///    invisible to the wasm component).
-///
-/// Idempotent: re-running updates the `default` value in place
-/// and overwrites the component binding. Preserves the rest of
-/// the spin manifest (formatting, comments, sibling tables).
-///
-/// Inline-table tolerance: existing `[variables].<key>` and
-/// `[component.X.variables]` entries are accepted in BOTH block
-/// form (`[variables.<key>]\ndefault = "..."`) and inline-table
-/// form (`<key> = { default = "..." }`); the writeback preserves
-/// whichever shape the user chose.
-///
-/// LIMITATION: the OUTER tables (`[variables]`, `[component]`,
-/// `[component.<X>]`) are still required to be block tables. A
-/// spin.toml with `component = { demo = { ... } }` (inline at the
-/// component-root level) or `variables = { foo = "..." }` (inline
-/// at the variables-root level) errors with `not_a_table_error`
-/// because we'd otherwise need to convert the whole structure to
-/// block form to insert keys. Realistic spin.toml files
-/// (scaffolds AND hand-edited) always use block form for these
-/// slots, so the limitation has not been observed in practice.
-// Stage 4: see `not_a_table_error` above. Gated until Stage 5 deletes it
-// along with the provision-side variable writes.
-#[cfg(test)]
-fn write_spin_variables(
-    spin_path: &Path,
-    component_id: &str,
-    entries: &[(String, String)],
-) -> Result<(), String> {
-    use toml_edit::{table, value, DocumentMut, Item};
-
-    let raw = fs::read_to_string(spin_path)
-        .map_err(|err| format!("failed to read {}: {err}", spin_path.display()))?;
-    let mut doc: DocumentMut = raw
-        .parse()
-        .map_err(|err| format!("failed to parse {}: {err}", spin_path.display()))?;
-
-    // (1) Application-level declarations under [variables].
-    // Existing entries may be either a `[variables.<key>]` block
-    // table OR an inline-table value (`<key> = { default = "..." }`).
-    // Real-world spin.toml files hand-edited by developers very often
-    // use the inline form; preserve whichever shape the user chose
-    // and update the `default` field in place. New entries (no prior
-    // declaration) get the block form by default.
-    let variables_entry = doc.entry("variables").or_insert_with(table);
-    let variables_tbl = variables_entry
-        .as_table_mut()
-        .ok_or_else(|| not_a_table_error(spin_path, "variables"))?;
-    for (spin_key, val) in entries {
-        let var_entry = variables_tbl
-            .entry(spin_key.as_str())
-            .or_insert_with(|| Item::Table(toml_edit::Table::new()));
-        match var_entry {
-            Item::Table(tbl) => {
-                tbl.insert("default", value(val.as_str()));
-            }
-            Item::Value(toml_edit::Value::InlineTable(inline)) => {
-                inline.insert("default", toml_edit::Value::from(val.as_str()));
-            }
-            Item::Value(
-                toml_edit::Value::String(_)
-                | toml_edit::Value::Integer(_)
-                | toml_edit::Value::Float(_)
-                | toml_edit::Value::Boolean(_)
-                | toml_edit::Value::Datetime(_)
-                | toml_edit::Value::Array(_),
-            )
-            | Item::None
-            | Item::ArrayOfTables(_) => {
-                return Err(not_a_table_error(
-                    spin_path,
-                    &format!("variables.{spin_key}"),
-                ));
-            }
-        }
-    }
-
-    // (2) Component-level bindings under
-    // [component.<component>.variables]. Surfaces the
-    // application variable into the wasm component via spin's
-    // `{{ <key> }}` template syntax. Mirrors the [variables]
-    // handling above: existing inline-table bindings
-    // (`variables = { foo = "..." }`) are preserved in-place
-    // rather than erroring -- the hand-edit habit that produces
-    // inline `[variables]` also produces this shape.
-    let component_root = doc.entry("component").or_insert_with(table);
-    let component_tbl = component_root
-        .as_table_mut()
-        .ok_or_else(|| not_a_table_error(spin_path, "component"))?;
-    let target = component_tbl.entry(component_id).or_insert_with(table);
-    let target_tbl = target
-        .as_table_mut()
-        .ok_or_else(|| not_a_table_error(spin_path, &format!("component.{component_id}")))?;
-    let bindings_entry = target_tbl.entry("variables").or_insert_with(table);
-    for (spin_key, _) in entries {
-        let template = format!("{{{{ {spin_key} }}}}");
-        match bindings_entry {
-            Item::Table(tbl) => {
-                tbl.insert(spin_key.as_str(), value(template));
-            }
-            Item::Value(toml_edit::Value::InlineTable(inline)) => {
-                inline.insert(spin_key.as_str(), toml_edit::Value::from(template));
-            }
-            Item::Value(
-                toml_edit::Value::String(_)
-                | toml_edit::Value::Integer(_)
-                | toml_edit::Value::Float(_)
-                | toml_edit::Value::Boolean(_)
-                | toml_edit::Value::Datetime(_)
-                | toml_edit::Value::Array(_),
-            )
-            | Item::None
-            | Item::ArrayOfTables(_) => {
-                return Err(not_a_table_error(
-                    spin_path,
-                    &format!("component.{component_id}.variables"),
-                ));
-            }
-        }
-    }
-
-    fs::write(spin_path, doc.to_string())
-        .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
-    Ok(())
 }
 
 /// # Errors
@@ -1124,18 +962,6 @@ mod tests {
     }
 
     #[test]
-    fn not_a_table_error_includes_path_keyword_and_migration_hint() {
-        let path = Path::new("/tmp/spin.toml");
-        let err = not_a_table_error(path, "variables");
-        assert!(err.contains("/tmp/spin.toml"), "names path: {err}");
-        assert!(err.contains("`variables`"), "names keyword: {err}");
-        assert!(
-            err.contains("block syntax") || err.contains("[variables]"),
-            "points at fix: {err}"
-        );
-    }
-
-    #[test]
     fn validate_app_config_keys_rejects_uppercase() {
         let err = SpinCliAdapter
             .validate_app_config_keys(&["api_token", "GREETING"])
@@ -1261,8 +1087,11 @@ mod tests {
     }
 
     #[test]
-    fn single_store_kinds_is_config_and_secrets() {
-        assert_eq!(SpinCliAdapter.single_store_kinds(), &["config", "secrets"]);
+    fn single_store_kinds_is_secrets_only() {
+        // Stage 5: config moved to KV (provisioned via `key_value_stores`,
+        // entries pushed via the seed handler). Secrets remain Spin
+        // `[variables]` until we ship native secret support.
+        assert_eq!(SpinCliAdapter.single_store_kinds(), &["secrets"]);
     }
 
     #[test]
@@ -1571,9 +1400,13 @@ mod tests {
     }
 
     #[test]
-    fn provision_reports_config_and_secrets_as_out_of_scope() {
+    fn provision_writes_config_labels_into_kv_array_and_leaves_secrets_manual() {
+        // Stage 5: config now lives in Spin KV. Provision writes each
+        // `[stores.config].id` into `[component.X].key_value_stores`
+        // (same machinery as `[stores.kv]`). Secrets stay manual until
+        // we ship native secret support.
         let dir = tempdir().expect("tempdir");
-        write_spin(
+        let path = write_spin(
             dir.path(),
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         );
@@ -1586,15 +1419,21 @@ mod tests {
         };
         let out = SpinCliAdapter
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
-            .expect("config/secrets-only provision still succeeds");
+            .expect("config + secrets provision succeeds");
         assert_eq!(out.len(), 2);
         assert!(
-            out[0].contains("config push"),
-            "config row points at config push: {out:?}"
+            out[0].contains("config label") && out[0].contains("key_value_stores"),
+            "config row reports KV-array write: {out:?}"
         );
         assert!(
             out[1].contains("manual"),
-            "secret row flags manual declaration: {out:?}"
+            "secret row still flags manual declaration: {out:?}"
+        );
+
+        let after = fs::read_to_string(&path).expect("read spin.toml");
+        assert!(
+            after.contains(&format!("\"{TEST_CONFIG_ID}\"")),
+            "config label landed in spin.toml: {after}"
         );
     }
 
@@ -1641,259 +1480,6 @@ mod tests {
             translate_key_for_spin("Service.TimeoutMs"),
             "service__timeoutms"
         );
-    }
-
-    // ---------- write_spin_variables ----------
-
-    #[test]
-    fn write_spin_variables_writes_both_tables() {
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        );
-        let entries = vec![
-            ("greeting".to_owned(), "hi".to_owned()),
-            ("service__timeout_ms".to_owned(), "1500".to_owned()),
-        ];
-        write_spin_variables(&path, TEST_COMPONENT_ID, &entries).expect("write");
-        let after = fs::read_to_string(&path).expect("read back");
-        // The generated manifest must round-trip through a TOML
-        // parser (spec "validation strength" — regex + parse
-        // is the floor when neither the spin CLI nor spin_sdk is
-        // reachable from the test harness).
-        let parsed: toml::Value = toml::from_str(&after).expect("parses as TOML");
-        let variables = parsed
-            .get("variables")
-            .and_then(toml::Value::as_table)
-            .expect("[variables] present");
-        assert_eq!(
-            variables["greeting"][TEST_SECRET_ID].as_str(),
-            Some("hi"),
-            "greeting default landed: {after}"
-        );
-        assert_eq!(
-            variables["service__timeout_ms"][TEST_SECRET_ID].as_str(),
-            Some("1500")
-        );
-        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
-            .as_table()
-            .expect("[component.demo.variables] present");
-        assert_eq!(
-            bindings["greeting"].as_str(),
-            Some("{{ greeting }}"),
-            "binding uses spin template: {after}"
-        );
-        assert_eq!(
-            bindings["service__timeout_ms"].as_str(),
-            Some("{{ service__timeout_ms }}")
-        );
-    }
-
-    #[test]
-    fn write_spin_variables_is_idempotent_and_updates_in_place() {
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        );
-        let first = vec![("greeting".to_owned(), "hi".to_owned())];
-        write_spin_variables(&path, TEST_COMPONENT_ID, &first).expect("first write");
-        // Re-push with a new value — should overwrite, not error.
-        let second = vec![("greeting".to_owned(), "hello".to_owned())];
-        write_spin_variables(&path, TEST_COMPONENT_ID, &second).expect("second write");
-        let after = fs::read_to_string(&path).expect("read back");
-        let parsed: toml::Value = toml::from_str(&after).expect("parses");
-        assert_eq!(
-            parsed["variables"]["greeting"][TEST_SECRET_ID].as_str(),
-            Some("hello"),
-            "default updated: {after}"
-        );
-        // Component binding stays a single entry (not duplicated).
-        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
-            .as_table()
-            .expect("bindings present");
-        assert_eq!(bindings.len(), 1, "no duplicate bindings: {after}");
-    }
-
-    #[test]
-    fn write_spin_variables_updates_existing_inline_table_entry_in_place() {
-        // Hand-edited spin.toml files often declare variables in
-        // inline-table form: `greeting = { default = "hello" }`. The
-        // writeback path must update such entries in place (matching
-        // the user's chosen shape) instead of erring "is not a
-        // table". app-demo's spin.toml is exactly this shape.
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n\
-             [application]\nname = \"x\"\nversion = \"0\"\n\
-             [variables]\n\
-             greeting = { default = \"old\" }\n\
-             feature__new_checkout = { default = \"false\" }\n\
-             [component.demo]\nsource = \"demo.wasm\"\n",
-        );
-        let entries = vec![
-            ("greeting".to_owned(), "updated".to_owned()),
-            ("feature__new_checkout".to_owned(), "true".to_owned()),
-        ];
-        write_spin_variables(&path, TEST_COMPONENT_ID, &entries)
-            .expect("inline-table writeback succeeds");
-
-        let after = fs::read_to_string(&path).expect("read back");
-        let parsed: toml::Value = toml::from_str(&after).expect("parses");
-        assert_eq!(
-            parsed["variables"]["greeting"][TEST_SECRET_ID].as_str(),
-            Some("updated"),
-            "inline-table entry updated: {after}"
-        );
-        assert_eq!(
-            parsed["variables"]["feature__new_checkout"][TEST_SECRET_ID].as_str(),
-            Some("true"),
-            "second inline-table entry updated: {after}"
-        );
-        // The original inline-table shape is preserved (not
-        // converted to a block table), so the user's formatting
-        // stays intact.
-        assert!(
-            after.contains("greeting = {") || after.contains("greeting= {"),
-            "preserved inline-table shape: {after}"
-        );
-    }
-
-    #[test]
-    fn write_spin_variables_updates_inline_component_bindings_in_place() {
-        // Symmetric with the [variables] inline-table case: if the
-        // operator hand-edited spin.toml with
-        // `[component.demo]` ... `variables = { foo = "{{ foo }}" }`,
-        // the writer must update the inline binding in place rather
-        // than erring "is not a table".
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n\
-             [application]\nname = \"x\"\nversion = \"0\"\n\
-             [variables]\n\
-             greeting = { default = \"hi\" }\n\
-             [component.demo]\nsource = \"demo.wasm\"\n\
-             variables = { greeting = \"{{ greeting }}\" }\n",
-        );
-        let entries = vec![
-            ("greeting".to_owned(), "updated".to_owned()),
-            ("vault".to_owned(), TEST_SECRET_ID.to_owned()),
-        ];
-        write_spin_variables(&path, TEST_COMPONENT_ID, &entries)
-            .expect("inline component-binding writeback succeeds");
-
-        let after = fs::read_to_string(&path).expect("read back");
-        let parsed: toml::Value = toml::from_str(&after).expect("parses");
-        // Both [variables] inline-table entries updated.
-        assert_eq!(
-            parsed["variables"]["greeting"][TEST_SECRET_ID].as_str(),
-            Some("updated"),
-            "existing inline entry updated: {after}"
-        );
-        // Component binding still resolves greeting; new key added.
-        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
-            .as_table()
-            .expect("bindings table");
-        assert_eq!(
-            bindings["greeting"].as_str(),
-            Some("{{ greeting }}"),
-            "existing binding preserved: {after}"
-        );
-        assert_eq!(
-            bindings["vault"].as_str(),
-            Some("{{ vault }}"),
-            "new binding inserted: {after}"
-        );
-    }
-
-    #[test]
-    fn write_spin_variables_rejects_bare_scalar_variable_entry_with_targeted_hint() {
-        // Hand-edited `[variables]\ngreeting = "hi"` is structurally
-        // wrong: Spin requires every variable to be a sub-table with
-        // a `default`. The error wording must steer the operator
-        // towards `greeting = { default = "hi" }`, NOT towards
-        // `[variables.greeting]` block syntax (which is also valid
-        // but misleads when the parent is already correctly a block).
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n\
-             [application]\nname = \"x\"\nversion = \"0\"\n\
-             [variables]\n\
-             greeting = \"hi\"\n\
-             [component.demo]\nsource = \"demo.wasm\"\n",
-        );
-        let entries = vec![("greeting".to_owned(), "updated".to_owned())];
-        let err = write_spin_variables(&path, TEST_COMPONENT_ID, &entries)
-            .expect_err("bare scalar value at variables.<key> must error");
-        assert!(
-            err.contains("scalar") && err.contains("default ="),
-            "error steers toward `key = {{ default = ... }}`: {err}"
-        );
-    }
-
-    #[test]
-    fn write_spin_variables_preserves_other_component_fields() {
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\nallowed_outbound_hosts = []\n",
-        );
-        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
-        write_spin_variables(&path, TEST_COMPONENT_ID, &entries).expect("write");
-        let after = fs::read_to_string(&path).expect("read back");
-        assert!(
-            after.contains("allowed_outbound_hosts = []"),
-            "preserved sibling field: {after}"
-        );
-        assert!(
-            after.contains("source = \"demo.wasm\""),
-            "preserved source: {after}"
-        );
-    }
-
-    #[test]
-    fn write_spin_variables_golden_round_trips_and_passes_spin_key_regex() {
-        // golden test — floor of the validation ladder when
-        // neither the spin CLI nor spin_sdk validation is
-        // reachable: every variable name matches the Spin
-        // `^[a-z][a-z0-9_]*$` rule, and the generated manifest
-        // parses as TOML.
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        );
-        let entries = vec![
-            ("greeting".to_owned(), "hello".to_owned()),
-            ("service__timeout_ms".to_owned(), "1500".to_owned()),
-            ("api__base_url".to_owned(), "https://example.com".to_owned()),
-        ];
-        write_spin_variables(&path, TEST_COMPONENT_ID, &entries).expect("write");
-        let after = fs::read_to_string(&path).expect("read back");
-        let parsed: toml::Value = toml::from_str(&after).expect("parses as TOML");
-
-        let variables = parsed["variables"].as_table().expect("[variables] present");
-        for key in variables.keys() {
-            assert!(
-                is_valid_spin_key(key),
-                "variable name `{key}` violates Spin's `^[a-z][a-z0-9_]*$` rule"
-            );
-        }
-        let bindings = parsed["component"][TEST_COMPONENT_ID]["variables"]
-            .as_table()
-            .expect("[component.demo.variables] present");
-        for key in bindings.keys() {
-            assert!(
-                is_valid_spin_key(key),
-                "binding name `{key}` violates Spin's `^[a-z][a-z0-9_]*$` rule"
-            );
-            let template = bindings[key].as_str().expect("binding is a string");
-            assert_eq!(template, format!("{{{{ {key} }}}}"));
-        }
     }
 
     // ---------- push_config_entries (Stage 4: HTTP POST to seed handler) ----------
