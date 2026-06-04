@@ -131,11 +131,13 @@ This runs:
 - Typed deserialise into `MyappConfig` + `validator::Validate::validate()`.
 - `#[secret]` field presence + non-empty + `[stores.secrets]` declared.
 - `#[secret(store_ref)]` value is one of `[stores.secrets].ids`.
-- Spin key syntax (`^[a-z][a-z0-9_]*$` after `.→__` translation) + component discovery
-  - config/secret variable namespace collision check — if `spin` is in your declared
-    adapter set.
-- `--strict` adds capability-aware completeness (rejects e.g. multi-id `[stores.config]`
-  when Spin is targeted, since Spin is Single-capable for config).
+- Spin `[component.*]` discovery + within-`#[secret]` flat-namespace
+  collision check — if `spin` is in your declared adapter set. (Spin
+  config keys live in KV and accept arbitrary UTF-8; only secret
+  values still share the variable namespace.)
+- `--strict` adds capability-aware completeness (rejects e.g. multi-id
+  `[stores.secrets]` when Spin is targeted, since Spin is
+  Single-capable for secrets).
 
 The default `edgezero` binary runs the same checks except the typed ones (it has no
 `MyappConfig` to deserialise into). Use the typed flow for the strongest signal.
@@ -173,12 +175,17 @@ single string values, and pushes per-adapter:
   fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>
   ```
 
-- **spin** — pure `spin.toml` editing. Translates each dotted key to a Spin variable
-  name (`.→__`, lowercased), and writes BOTH `[variables].<key>` (with `default =
-"<value>"`, the application-level declaration) AND
-  `[component.<component>.variables].<key>` (with `<key> = "&#123;&#123; <key> &#125;&#125;"`,
-  the component binding — Spin's template syntax). Without both tables the wasm
-  component cannot read the variable.
+- **spin** — HTTP POST to the seed handler at
+  `/__edgezero/config/seed` on the running Spin app. Resolves the seed
+  URL from `--seed-url` / `EDGEZERO__ADAPTERS__SPIN__SEED_URL`
+  (or `…__LOCAL_SEED_URL` under `--local`) /
+  `[adapters.spin.commands].seed_url`; auth token from `--seed-token`
+  or `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN`. The handler verifies the
+  token in constant time, then writes entries verbatim into the
+  `spin_sdk::key_value::Store` whose label matches the resolved
+  platform name of the target `[stores.config]` id. Keys pass through
+  with no translation. Run `edgezero config push --adapter spin
+  --local` against `spin up` to seed the local KV emulator.
 
 ### Spin manual secret declarations
 

@@ -198,10 +198,11 @@ Runtime behavior by adapter:
 - Axum reads from `.edgezero/local-config-<id>.json` per logical id
   (one file per declared config id). The `config push` command will
   write that file in Stage 7; until then, populate it directly.
-- Spin reads component variables declared in `spin.toml`. Spin's
-  variable namespace is flat (single-store), so declaring `ids.len() > 1`
-  for `[stores.config]` while targeting Spin is caught by
-  `config validate`.
+- Spin reads a `spin_sdk::key_value::Store` per id, one label per
+  declared `[stores.config]` id (multi-store). Labels must be declared
+  in `spin.toml`'s `[component.<id>].key_value_stores` — `provision`
+  writes them automatically. Seed entries via `config push --adapter
+  spin` (POSTs to the app's `/__edgezero/config/seed` handler).
 
 When `[stores.config]` is present, the `app!` macro bakes the portable
 store registry into `Hooks::stores()`. Adapter `run_app` helpers build
