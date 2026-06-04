@@ -416,6 +416,9 @@ pub struct ManifestAdapterCommands {
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub deploy: Option<String>,
+    #[serde(default, rename = "seed-url")]
+    #[validate(length(min = 1_u64))]
+    pub seed_url: Option<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub serve: Option<String>,

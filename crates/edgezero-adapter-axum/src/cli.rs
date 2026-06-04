@@ -10,7 +10,7 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -208,6 +208,7 @@ impl Adapter for AxumCliAdapter {
         _component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         //: axum is local-only. Push writes the same flat
@@ -252,6 +253,7 @@ impl Adapter for AxumCliAdapter {
         component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
+        push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         // Axum is local-only: the default push already writes
@@ -266,6 +268,7 @@ impl Adapter for AxumCliAdapter {
             component_selector,
             store,
             entries,
+            push_ctx,
             dry_run,
         )?;
         let notice =
@@ -1126,6 +1129,7 @@ mod tests {
                 None,
                 &ResolvedStoreId::from_logical("app_config"),
                 &entries,
+                &AdapterPushContext::new(),
                 false,
             )
             .expect("push succeeds");
@@ -1152,6 +1156,7 @@ mod tests {
                 None,
                 &ResolvedStoreId::from_logical("app_config"),
                 &entries,
+                &AdapterPushContext::new(),
                 true,
             )
             .expect("dry-run succeeds");
@@ -1176,6 +1181,7 @@ mod tests {
                 None,
                 &ResolvedStoreId::from_logical("x"),
                 &entries,
+                &AdapterPushContext::new(),
                 false,
             )
             .expect("push succeeds");
@@ -1192,6 +1198,7 @@ mod tests {
                 None,
                 &ResolvedStoreId::from_logical("empty"),
                 &[],
+                &AdapterPushContext::new(),
                 false,
             )
             .expect("push succeeds even with no entries");
