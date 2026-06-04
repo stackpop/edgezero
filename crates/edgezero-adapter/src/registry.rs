@@ -95,6 +95,76 @@ pub struct ProvisionStores<'stores> {
     pub secrets: &'stores [ResolvedStoreId],
 }
 
+/// Context passed to [`Adapter::push_config_entries`] and
+/// [`Adapter::push_config_entries_local`] carrying already-resolved
+/// `config push` overlay values (seed URL / token / local flag).
+///
+/// The CLI's `dispatch_push` builds this via the builder API
+/// ([`Self::new`] + the `with_*` setters) so future fields can be
+/// added without breaking out-of-tree adapters that just RECEIVE
+/// it via the trait method. `#[non_exhaustive]` enforces that
+/// downstream construction stays inside the builder.
+///
+/// Lifetime: borrows the resolved strings from the CLI's owned
+/// `PushContext` (config.rs) so adapters see `Option<&str>` without
+/// any extra cloning.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct AdapterPushContext<'ctx> {
+    /// `true` when the operator passed `--local`. Adapters that
+    /// have a separate local-emulator path use this to pick the
+    /// right writeback target; adapters where local == default
+    /// can ignore it.
+    pub local: bool,
+    /// Already-resolved seed token. `None` means the operator
+    /// did not pass `--seed-token` and
+    /// `EDGEZERO__ADAPTERS__<NAME>__SEED_TOKEN` is unset.
+    pub seed_token: Option<&'ctx str>,
+    /// Already-resolved seed URL. The CLI follows the
+    /// prod or local resolution chain depending on `--local`,
+    /// per spin-kv-config plan D3 / D8, and stores the final
+    /// string here. `None` means "no URL was set anywhere in
+    /// the chain" — the adapter errors loudly if it needs one.
+    pub seed_url: Option<&'ctx str>,
+}
+
+impl<'ctx> AdapterPushContext<'ctx> {
+    /// Construct a default context: no seed URL / token, prod (not
+    /// local). Rust rejects struct-literal construction of
+    /// `#[non_exhaustive]` types from outside the defining crate, so
+    /// the CLI MUST build via this constructor and the `with_*`
+    /// setters below.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the `--local` flag.
+    #[must_use]
+    #[inline]
+    pub fn with_local(mut self, local: bool) -> Self {
+        self.local = local;
+        self
+    }
+
+    /// Set the seed token.
+    #[must_use]
+    #[inline]
+    pub fn with_seed_token(mut self, token: &'ctx str) -> Self {
+        self.seed_token = Some(token);
+        self
+    }
+
+    /// Set the seed URL.
+    #[must_use]
+    #[inline]
+    pub fn with_seed_url(mut self, url: &'ctx str) -> Self {
+        self.seed_url = Some(url);
+        self
+    }
+}
+
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 ///
 /// The non-`execute` methods carry the adapter's `config validate`
@@ -177,6 +247,10 @@ pub trait Adapter: Sync + Send {
     /// `push` impl. `dry_run` impls describe what they *would* do
     /// without performing it.
     #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "config push needs the manifest root, adapter manifest path, component selector, resolved store, entries, push-time overlay (AdapterPushContext), and dry-run flag — 8 args. Each is distinct and the alternative aggregate struct is a bigger ergonomic regression for adapter implementers than the lint cost."
+    )]
     fn push_config_entries(
         &self,
         _manifest_root: &Path,
@@ -184,6 +258,7 @@ pub trait Adapter: Sync + Send {
         _component_selector: Option<&str>,
         _store: &ResolvedStoreId,
         _entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
         _dry_run: bool,
     ) -> Result<Vec<String>, String> {
         Err(format!(
@@ -210,6 +285,10 @@ pub trait Adapter: Sync + Send {
     /// fails or the adapter has no `--local` impl. `dry_run` impls
     /// describe what they *would* do without performing it.
     #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors `push_config_entries` — same 8-argument shape."
+    )]
     fn push_config_entries_local(
         &self,
         _manifest_root: &Path,
@@ -217,6 +296,7 @@ pub trait Adapter: Sync + Send {
         _component_selector: Option<&str>,
         _store: &ResolvedStoreId,
         _entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
         _dry_run: bool,
     ) -> Result<Vec<String>, String> {
         Err(format!(

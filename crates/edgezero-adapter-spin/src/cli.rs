@@ -9,12 +9,14 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
+#[cfg(feature = "cli")]
+use reqwest::blocking::Client as HttpClient;
 use walkdir::WalkDir;
 
 static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
@@ -223,83 +225,111 @@ impl Adapter for SpinCliAdapter {
 
     fn push_config_entries(
         &self,
-        manifest_root: &Path,
-        adapter_manifest_path: Option<&str>,
-        component_selector: Option<&str>,
-        // Spin's "config store" is the Spin variable namespace --
-        // there is no per-store binding to write. The resolved id
-        // is accepted for trait-shape uniformity but the variable
-        // names are derived from the config KEYS, not the store
-        // name.
-        _store: &ResolvedStoreId,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
         entries: &[(String, String)],
+        push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        //: pure spin.toml editing — no shell-out. Spec
-        // says Spin variables must match `^[a-z][a-z0-9_]*$`, and
-        // dotted CLI keys translate `.→__` (lowercase). A Spin
-        // variable is only readable by a component when it is both
-        // declared in `[variables]` AND bound in
-        // `[component.<component>.variables]`, so push writes
-        // both tables. Secret variables are intentionally NOT
-        // touched — the typed CLI flow already stripped
-        // `SECRET_FIELDS`, and the raw flow leaves declaration to
-        // the developer (manual `[variables].* secret = true`).
-        let Some(rel) = adapter_manifest_path else {
-            return Err(
-                "[adapters.spin.adapter].manifest must point at spin.toml for config push"
-                    .to_owned(),
-            );
-        };
-        let spin_path = manifest_root.join(rel);
-        let component_id = resolve_spin_component(&spin_path, component_selector)?;
+        // Stage 4: HTTP POST to the seed handler at `push_ctx.seed_url`.
+        // The CLI's load_push_context (D8) resolves the URL through
+        // the prod or local chain (per D3) and stashes it in
+        // `push_ctx.seed_url`. The body's `store` is the platform
+        // label (NOT logical id) so an operator with
+        // `EDGEZERO__STORES__CONFIG__<ID>__NAME=…` set sees the
+        // matching label flow through. See D9 + D12 for the
+        // request/response contract.
+        let platform = store.platform.as_str();
+        let logical = store.logical.as_str();
 
-        // Translate `.→__` lowercase up front so both the
-        // dry-run preview and the writeback see the exact key
-        // form that will land in spin.toml. Reject any key whose
-        // translation fails `^[a-z][a-z0-9_]*$` — `config
-        // validate` should already have caught it, but a
-        // belt-and-braces check keeps spin.toml well-formed.
-        let mut translated: Vec<(String, String)> = Vec::with_capacity(entries.len());
-        for (key, value) in entries {
-            let spin_key = translate_key_for_spin(key);
-            if !is_valid_spin_key(&spin_key) {
-                let reason = spin_key_rule_violation(&spin_key);
-                return Err(format!(
-                    "config key `{key}` translates to Spin variable `{spin_key}`, which is not a valid Spin variable name. {reason}. Rename the config key so the translated name conforms. (`edgezero config validate` -- typed or raw -- runs the same Spin-variable check against the manifest before push, so a validate step earlier in the flow would have surfaced this without a push attempt.)"
-                ));
-            }
-            translated.push((spin_key, value.clone()));
-        }
-
-        if translated.is_empty() {
+        if entries.is_empty() {
             return Ok(vec![format!(
-                "no config entries to push to [component.{component_id}.variables] in {}",
-                spin_path.display()
+                "no config entries to push to spin store `{platform}` (logical id `{logical}`)"
             )]);
         }
 
-        if dry_run {
-            let mut out = Vec::with_capacity(translated.len().saturating_add(1));
-            out.push(format!(
-                "would write {} Spin variable(s) to {} (both [variables] and [component.{component_id}.variables]):",
-                translated.len(),
-                spin_path.display()
+        let Some(seed_url) = push_ctx.seed_url else {
+            return Err(format!(
+                "seed URL is not configured for spin push: pass `--seed-url <url>`, set `EDGEZERO__ADAPTERS__SPIN__SEED_URL`{}, or add `[adapters.spin.commands].seed_url` to edgezero.toml",
+                if push_ctx.local { " / `EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL`" } else { "" }
             ));
-            for (spin_key, value) in &translated {
-                out.push(format!(
-                    "  [variables.{spin_key}] default = {value:?}; [component.{component_id}.variables].{spin_key} = {{{{ {spin_key} }}}}"
-                ));
+        };
+
+        if dry_run {
+            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            out.push(format!(
+                "would POST {entries_n} entries to {seed_url} for store `{platform}` (logical id `{logical}`):",
+                entries_n = entries.len(),
+            ));
+            for (key, _) in entries {
+                out.push(format!("  would set `{key}`"));
             }
             return Ok(out);
         }
 
-        write_spin_variables(&spin_path, &component_id, &translated)?;
-        Ok(vec![format!(
-            "pushed {} Spin variable(s) to {} ([variables] + [component.{component_id}.variables])",
-            translated.len(),
-            spin_path.display()
-        )])
+        let Some(seed_token) = push_ctx.seed_token else {
+            return Err(
+                "seed token is not configured for spin push: pass `--seed-token <token>` or set `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` (tokens are NEVER read from edgezero.toml)"
+                    .to_owned(),
+            );
+        };
+
+        let payload = build_seed_payload(platform, entries);
+        let body = serde_json::to_vec(&payload)
+            .map_err(|err| format!("failed to serialize seed payload as JSON: {err}"))?;
+
+        let client = HttpClient::new();
+        let response = client
+            .post(seed_url)
+            .header("content-type", "application/json")
+            .header("x-edgezero-seed", seed_token)
+            .body(body)
+            .send()
+            .map_err(|err| {
+                if err.is_connect() {
+                    format!(
+                        "seed POST to {seed_url} failed: connection refused. Is the Spin app running?"
+                    )
+                } else {
+                    format!("seed POST to {seed_url} failed: {err}")
+                }
+            })?;
+
+        let status = response.status();
+        let response_text = response.text().unwrap_or_default();
+        // D9 status code table → D12 message table.
+        match status.as_u16() {
+            204 => Ok(vec![format!(
+                "pushed {} entries to spin store `{platform}` (logical id `{logical}`) via {seed_url}",
+                entries.len()
+            )]),
+            400 => Err(format!(
+                "seed handler rejected (400 Bad Request): {response_text}. Check CLI version / store id."
+            )),
+            401 => Err(
+                "seed handler rejected (401 Unauthorized). Fail-closed reasons (D9): server-side `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` is unset, blank, whitespace-only, or shorter than 16 bytes; OR your `--seed-token` / `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` is missing. Check the server's env first -- a 4-character placeholder triggers this even when the wire token matches.".to_owned(),
+            ),
+            403 => Err(
+                "seed handler rejected (403 Forbidden): x-edgezero-seed mismatch. Check that the token on the client matches the server's EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN.".to_owned(),
+            ),
+            404 => Err(format!(
+                "seed handler rejected (404 Not Found): store `{platform}` is not a recognised platform label. Check `[stores.config].ids` and any `EDGEZERO__STORES__CONFIG__<ID>__NAME` overrides."
+            )),
+            405 => Err(
+                "seed handler rejected (405 Method Not Allowed). This usually means a transparent proxy rewrote the POST -- check intermediaries.".to_owned(),
+            ),
+            415 => Err(
+                "seed handler rejected (415 Unsupported Media Type). Internal: the CLI should always set content-type: application/json.".to_owned(),
+            ),
+            422 => Err(format!(
+                "seed handler rejected (422 Unprocessable): KV write failed mid-stream: {response_text}"
+            )),
+            other => Err(format!(
+                "seed handler returned unexpected status {other}: {response_text}"
+            )),
+        }
     }
 
     fn push_config_entries_local(
@@ -309,28 +339,24 @@ impl Adapter for SpinCliAdapter {
         component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
+        push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Spin has no separate local-emulator state for config:
-        // `spin up` reads the same `spin.toml` `[variables]` +
-        // `[component.<id>.variables]` tables that `spin deploy`
-        // ships. So `--local` performs the same edit as the
-        // default push -- we delegate and prepend a one-line
-        // notice so an operator who typed `--local` for parity
-        // with fastly/cloudflare knows there was nothing extra
-        // to write.
-        let mut lines = self.push_config_entries(
+        // Stage 4: the local URL is already resolved in `push_ctx.seed_url`
+        // by the CLI's load_push_context (D3 local chain: --seed-url ->
+        // EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL -> builtin
+        // http://127.0.0.1:3000/__edgezero/config/seed). The implementation
+        // is identical to the prod push from this side; the URL chain
+        // already encoded "local" semantics.
+        self.push_config_entries(
             manifest_root,
             adapter_manifest_path,
             component_selector,
             store,
             entries,
+            push_ctx,
             dry_run,
-        )?;
-        let notice =
-            "spin push is always local: `--local` has no separate effect (edits spin.toml either way)".to_owned();
-        lines.insert(0, notice);
-        Ok(lines)
+        )
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -556,6 +582,11 @@ fn spin_key_rule_violation(key: &str) -> &'static str {
 /// - Other slots: the user wrote `<what> = ...` (inline at the
 ///   parent). The right fix is to break out the parent into block
 ///   form.
+// Stage 4 (KV-backed config push): helper only used by the now-dormant
+// `write_spin_variables` provision path. Stage 5 deletes both helpers
+// along with the provision-side variable writes. Gated to `#[cfg(test)]`
+// in the meantime so it doesn't trip the unused-code lint.
+#[cfg(test)]
 fn not_a_table_error(spin_path: &Path, what: &str) -> String {
     if let Some(leaf) = what.strip_prefix("variables.") {
         return format!(
@@ -580,6 +611,27 @@ fn collect_spin_component_ids(parsed: &toml::Value) -> Vec<String> {
 
 /// Resolve which `[component.<id>]` table `provision` should
 /// write into. Mirrors the rule used by `validate_adapter_manifest`
+/// Build the seed handler JSON body per D9 schema.
+///
+/// `platform` is the env-resolved platform label (NOT the logical
+/// id). The handler validates `body.store` against the set of
+/// labels computed from `A::stores().config × env.store_name`.
+fn build_seed_payload(platform: &str, entries: &[(String, String)]) -> serde_json::Value {
+    let entries_json: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(key, value)| {
+            serde_json::json!({
+                "key": key,
+                "value": value,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "store": platform,
+        "entries": entries_json,
+    })
+}
+
 ///: single-component spin.toml resolves implicitly,
 /// multi-component requires an explicit `component = "..."` in
 /// `[adapters.spin.adapter]`, and a selector that doesn't match
@@ -724,6 +776,9 @@ fn translate_key_for_spin(dotted_key: &str) -> String {
 /// block form to insert keys. Realistic spin.toml files
 /// (scaffolds AND hand-edited) always use block form for these
 /// slots, so the limitation has not been observed in practice.
+// Stage 4: see `not_a_table_error` above. Gated until Stage 5 deletes it
+// along with the provision-side variable writes.
+#[cfg(test)]
 fn write_spin_variables(
     spin_path: &Path,
     component_id: &str,
@@ -1841,186 +1896,177 @@ mod tests {
         }
     }
 
-    // ---------- push_config_entries (dry-run + error paths) ----------
+    // ---------- push_config_entries (Stage 4: HTTP POST to seed handler) ----------
+    //
+    // The variables-backed dry-run / write / key-validation / dashed-key tests
+    // that lived here before Stage 4 were deleted: they asserted spin.toml
+    // editing + `.→__` translation, neither of which the KV-backed push does.
+    // T4.7 in the plan calls for the new tests below (dry-run shape, missing-
+    // seed-url / token errors, JSON body shape). HTTP integration coverage
+    // lives in the Stage 8 `spin up` smoke test.
+
+    fn config_store(logical: &str) -> ResolvedStoreId {
+        ResolvedStoreId::from_logical(logical)
+    }
 
     #[test]
-    fn push_dry_run_does_not_edit_spin_toml() {
-        // the spec calls for the
-        // dry-run to print the would-be `__`-encoded keys and the
-        // would-be content of BOTH spin.toml tables, then leave
-        // the on-disk file unchanged. Exercise a multi-entry
-        // input whose translation isn't a no-op so the test
-        // verifies `.→__` lowercasing actually surfaces in the
-        // preview.
+    fn push_with_no_entries_reports_no_op_without_posting() {
+        // Zero entries short-circuits before any seed-url lookup -- handy
+        // when a typed AppConfig strips all `#[secret]` fields.
         let dir = tempdir().expect("tempdir");
-        let original = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
-        let path = write_spin(dir.path(), original);
-        let entries = vec![
-            ("greeting".to_owned(), "hello".to_owned()),
-            ("service.timeout_ms".to_owned(), "1500".to_owned()),
-            ("feature.new_checkout".to_owned(), "false".to_owned()),
-        ];
         let out = SpinCliAdapter
             .push_config_entries(
                 dir.path(),
                 Some("spin.toml"),
                 None,
-                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-                &entries,
-                true,
-            )
-            .expect("dry-run succeeds");
-        // Header line names the count + both tables.
-        assert!(
-            out.iter()
-                .any(|line| line.contains("would write 3 Spin variable")),
-            "dry-run summary present with count: {out:?}"
-        );
-        assert!(
-            out.iter().any(|line| {
-                line.contains("[variables]") && line.contains("[component.demo.variables]")
-            }),
-            "dry-run summary names BOTH spin.toml tables: {out:?}"
-        );
-        // Each translated key appears in some preview line, with
-        // the `.→__` lowercased form (not the dotted source).
-        for translated in &["greeting", "service__timeout_ms", "feature__new_checkout"] {
-            assert!(
-                out.iter().any(|line| line.contains(translated)),
-                "dry-run names translated key `{translated}`: {out:?}"
-            );
-        }
-        // No dotted source keys leaked through.
-        for dotted in &["service.timeout_ms", "feature.new_checkout"] {
-            assert!(
-                !out.iter().any(|line| line.contains(dotted)),
-                "dry-run must not leak the dotted source form `{dotted}`: {out:?}"
-            );
-        }
-        // Each preview line also surfaces the spin template
-        // syntax for the component binding (the literal `{{ key
-        // }}` form, asserted as `{{ <key>` to dodge prettier-
-        // unfriendly closing-brace pairs).
-        for translated in &["greeting", "service__timeout_ms", "feature__new_checkout"] {
-            assert!(
-                out.iter().any(|line| {
-                    line.contains(&format!(".{translated}"))
-                        && line.contains(&format!("{{{{ {translated}"))
-                }),
-                "dry-run shows component binding template for `{translated}`: {out:?}"
-            );
-        }
-        let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(
-            after, original,
-            "dry-run must leave spin.toml byte-identical"
-        );
-    }
-
-    #[test]
-    fn push_writes_variables_into_resolved_component() {
-        let dir = tempdir().expect("tempdir");
-        let path = write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        );
-        let entries = vec![
-            ("greeting".to_owned(), "hi".to_owned()),
-            ("service.timeout_ms".to_owned(), "1500".to_owned()),
-        ];
-        let out = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-                &entries,
-                false,
-            )
-            .expect("real push succeeds");
-        assert_eq!(out.len(), 1);
-        assert!(out[0].contains("pushed 2 Spin variable"), "got: {out:?}");
-        // Re-parse and assert both the dot-translated key and the
-        // pristine binding are present (`service.timeout_ms` →
-        // `service__timeout_ms`).
-        let after = fs::read_to_string(&path).expect("read back");
-        let parsed: toml::Value = toml::from_str(&after).expect("parses");
-        assert_eq!(
-            parsed["variables"]["service__timeout_ms"][TEST_SECRET_ID].as_str(),
-            Some("1500"),
-            "`.` translated to `__`: {after}"
-        );
-        assert_eq!(
-            parsed["component"][TEST_COMPONENT_ID]["variables"]["service__timeout_ms"].as_str(),
-            Some("{{ service__timeout_ms }}")
-        );
-    }
-
-    #[test]
-    fn push_errors_when_adapter_manifest_path_missing() {
-        let dir = tempdir().expect("tempdir");
-        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
-        let err = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                None,
-                None,
-                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-                &entries,
-                true,
-            )
-            .expect_err("missing adapter manifest path must error");
-        assert!(
-            err.contains("spin.toml"),
-            "error names what's missing: {err}"
-        );
-    }
-
-    #[test]
-    fn push_rejects_keys_that_violate_spin_variable_rule() {
-        // `config validate` should already have caught this, but
-        // the adapter belt-and-braces check keeps spin.toml
-        // well-formed if a raw push slips an invalid key through.
-        let dir = tempdir().expect("tempdir");
-        write_spin(
-            dir.path(),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        );
-        let entries = vec![("api-token".to_owned(), "x".to_owned())];
-        let err = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-                &entries,
-                false,
-            )
-            .expect_err("dashed key must error");
-        assert!(
-            err.contains("api-token") && err.contains("Spin"),
-            "error names the bad key + Spin: {err}"
-        );
-    }
-
-    #[test]
-    fn push_with_no_entries_reports_no_op_without_writing() {
-        let dir = tempdir().expect("tempdir");
-        let original = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
-        let path = write_spin(dir.path(), original);
-        let out = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &config_store(TEST_CONFIG_ID),
                 &[],
+                &AdapterPushContext::new(),
                 false,
             )
             .expect("zero-entry push is fine");
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("no config entries"), "got: {out:?}");
-        let after = fs::read_to_string(&path).expect("read back");
-        assert_eq!(after, original, "zero-entry push must not edit spin.toml");
+    }
+
+    #[test]
+    fn push_dry_run_emits_url_and_entries_without_posting() {
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("service.timeout_ms".to_owned(), "1500".to_owned()),
+        ];
+        let push_ctx =
+            AdapterPushContext::new().with_seed_url("http://127.0.0.1:3000/__edgezero/config/seed");
+        let out = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &config_store(TEST_CONFIG_ID),
+                &entries,
+                &push_ctx,
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert!(
+            out[0].contains("would POST 2 entries to http://127.0.0.1:3000/__edgezero/config/seed"),
+            "dry-run header names URL + count: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("`greeting`")),
+            "dry-run lists greeting: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("`service.timeout_ms`")),
+            "dry-run lists dotted key verbatim (no `.→__`): {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_errors_when_seed_url_unset_prod() {
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
+        let err = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &config_store(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect_err("missing seed URL must error");
+        assert!(err.contains("--seed-url"), "names CLI flag: {err}");
+        assert!(
+            err.contains("EDGEZERO__ADAPTERS__SPIN__SEED_URL"),
+            "names prod env var: {err}"
+        );
+        assert!(
+            err.contains("[adapters.spin.commands].seed_url"),
+            "names manifest fallback: {err}"
+        );
+        assert!(
+            !err.contains("LOCAL_SEED_URL"),
+            "prod chain hint should NOT name the local env var: {err}"
+        );
+    }
+
+    #[test]
+    fn push_errors_when_seed_url_unset_local_names_local_env_var() {
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
+        let push_ctx = AdapterPushContext::new().with_local(true);
+        let err = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &config_store(TEST_CONFIG_ID),
+                &entries,
+                &push_ctx,
+                true,
+            )
+            .expect_err("missing seed URL on local must error");
+        assert!(
+            err.contains("EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL"),
+            "local chain hint names the local env var: {err}"
+        );
+    }
+
+    #[test]
+    fn push_errors_when_seed_token_unset_on_real_push() {
+        // Dry-run shouldn't require a token; a real (non-dry-run) push must.
+        let dir = tempdir().expect("tempdir");
+        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
+        let push_ctx = AdapterPushContext::new().with_seed_url("http://localhost:3000/seed");
+        let err = SpinCliAdapter
+            .push_config_entries(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &config_store(TEST_CONFIG_ID),
+                &entries,
+                &push_ctx,
+                false,
+            )
+            .expect_err("missing seed token on real push must error");
+        assert!(err.contains("seed token"), "names the missing piece: {err}");
+        assert!(
+            err.contains("EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN"),
+            "names env var: {err}"
+        );
+        assert!(
+            err.contains("NEVER read from edgezero.toml"),
+            "documents manifest exclusion for tokens: {err}"
+        );
+    }
+
+    #[test]
+    fn build_seed_payload_emits_d9_body_shape() {
+        let payload = build_seed_payload(
+            "app_config",
+            &[
+                ("greeting".to_owned(), "hello".to_owned()),
+                ("service.timeout_ms".to_owned(), "1500".to_owned()),
+            ],
+        );
+        assert_eq!(payload["store"].as_str(), Some("app_config"));
+        let entries = payload["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["key"].as_str(), Some("greeting"));
+        assert_eq!(entries[0]["value"].as_str(), Some("hello"));
+        assert_eq!(entries[1]["key"].as_str(), Some("service.timeout_ms"));
+        assert_eq!(entries[1]["value"].as_str(), Some("1500"));
+    }
+
+    #[test]
+    fn build_seed_payload_uses_platform_label_not_logical_id() {
+        // T4.7: prove the body carries the platform label so an
+        // env-overridden store name flows through correctly.
+        let payload =
+            build_seed_payload("prod-config", &[("greeting".to_owned(), "hi".to_owned())]);
+        assert_eq!(payload["store"].as_str(), Some("prod-config"));
     }
 }

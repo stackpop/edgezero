@@ -10,7 +10,7 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -259,6 +259,7 @@ impl Adapter for CloudflareCliAdapter {
         _component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         //: read namespace id from wrangler.toml (matched by
@@ -346,6 +347,7 @@ impl Adapter for CloudflareCliAdapter {
         _component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         // Same flow as the prod push but with `--local` appended to
@@ -1536,6 +1538,7 @@ id = "00112233445566778899aabbccddeeff"
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
+                &AdapterPushContext::new(),
                 true,
             )
             .expect("dry-run succeeds");
@@ -1571,6 +1574,7 @@ id = "00112233445566778899aabbccddeeff"
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
+                &AdapterPushContext::new(),
                 true,
             )
             .expect("dry-run is lenient: pre-provision preview is allowed");
@@ -1595,6 +1599,7 @@ id = "00112233445566778899aabbccddeeff"
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
+                &AdapterPushContext::new(),
                 true,
             )
             .expect_err("missing adapter manifest path must error");
@@ -1620,6 +1625,7 @@ id = "00112233445566778899aabbccddeeff"
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
+                &AdapterPushContext::new(),
                 false,
             )
             .expect_err("missing binding must error on real run");
@@ -1643,6 +1649,7 @@ id = "00112233445566778899aabbccddeeff"
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &[],
+                &AdapterPushContext::new(),
                 false,
             )
             .expect("zero-entry push is fine");

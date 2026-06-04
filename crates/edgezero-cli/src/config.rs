@@ -41,6 +41,11 @@ use validator::Validate;
 /// target adapter + store id.
 struct PushContext {
     adapter: &'static dyn adapter_registry::Adapter,
+    /// Resolved push-time overlay values (seed URL / token / local
+    /// flag). Owned so the lifetime story stays simple; `dispatch_push`
+    /// borrows from this to build the `AdapterPushContext<'_>` it
+    /// hands the trait method.
+    adapter_push_ctx: ResolvedAdapterPushContext,
     /// Resolved config store id (`--store` or the manifest
     /// default), paired with its env-resolved platform name. The
     /// platform name is what the adapter writes / pushes into
@@ -51,6 +56,18 @@ struct PushContext {
     store: ResolvedStoreId,
     /// Validate-shaped pre-loaded state (manifest + raw config).
     validation: ValidationContext,
+}
+
+/// Push-time overlay values resolved by [`load_push_context`] per
+/// the spin-kv-config plan D3 / D8 chains. Owned strings so the
+/// CLI's borrow story stays simple — `dispatch_push` creates the
+/// borrowing [`adapter_registry::AdapterPushContext`] at the trait
+/// call boundary.
+#[derive(Debug, Default)]
+struct ResolvedAdapterPushContext {
+    local: bool,
+    seed_token: Option<String>,
+    seed_url: Option<String>,
 }
 
 /// Pre-loaded state shared by the raw and typed flows.
@@ -231,11 +248,61 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     let logical = resolve_config_store_id(args.store.as_deref(), validation.manifest())?;
     let env_config = EnvConfig::from_env();
     let platform = env_config.store_name("config", &logical);
+    let adapter_push_ctx =
+        resolve_adapter_push_ctx(args, &env_config, validation.manifest(), &args.adapter);
     Ok(PushContext {
         adapter,
+        adapter_push_ctx,
         store: ResolvedStoreId::new(logical, platform),
         validation,
     })
+}
+
+/// Resolve the push-time overlay values per spin-kv-config plan D3:
+///
+/// - `seed_url` follows two disjoint chains. **Prod** (`!args.local`):
+///   `--seed-url` → `EDGEZERO__ADAPTERS__<NAME>__SEED_URL` →
+///   `[adapters.<name>.commands].seed_url`. **Local** (`args.local`):
+///   `--seed-url` → `EDGEZERO__ADAPTERS__<NAME>__LOCAL_SEED_URL` →
+///   builtin `http://127.0.0.1:3000/__edgezero/config/seed`. Manifest
+///   is NEVER consulted on the local chain so a misconfigured
+///   `[adapters.spin.commands].seed_url=<prod URL>` can't accidentally
+///   leak prod URL into a local push.
+/// - `seed_token` follows one chain only: `--seed-token` →
+///   `EDGEZERO__ADAPTERS__<NAME>__SEED_TOKEN`. Manifest is never
+///   consulted (tokens stay out of manifests).
+fn resolve_adapter_push_ctx(
+    args: &ConfigPushArgs,
+    env_config: &EnvConfig,
+    manifest: &Manifest,
+    adapter_name: &str,
+) -> ResolvedAdapterPushContext {
+    let seed_url = args.seed_url.clone().or_else(|| {
+        if args.local {
+            env_config
+                .get(&["adapters", adapter_name, "local_seed_url"])
+                .map(str::to_owned)
+                .or_else(|| Some("http://127.0.0.1:3000/__edgezero/config/seed".to_owned()))
+        } else {
+            env_config
+                .get(&["adapters", adapter_name, "seed_url"])
+                .map(str::to_owned)
+                .or_else(|| {
+                    let cfg = manifest.adapters.get(adapter_name)?;
+                    cfg.commands.seed_url.clone()
+                })
+        }
+    });
+    let seed_token = args.seed_token.clone().or_else(|| {
+        env_config
+            .get(&["adapters", adapter_name, "seed_token"])
+            .map(str::to_owned)
+    });
+    ResolvedAdapterPushContext {
+        local: args.local,
+        seed_token,
+        seed_url,
+    }
 }
 
 fn dispatch_push(
@@ -258,6 +325,16 @@ fn dispatch_push(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
+    // v9 plan H1: AdapterPushContext is #[non_exhaustive], so build
+    // it via the builder API instead of a struct literal.
+    let resolved = &ctx.adapter_push_ctx;
+    let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(resolved.local);
+    if let Some(url) = resolved.seed_url.as_deref() {
+        push_ctx = push_ctx.with_seed_url(url);
+    }
+    if let Some(token) = resolved.seed_token.as_deref() {
+        push_ctx = push_ctx.with_seed_token(token);
+    }
     let lines = if local {
         ctx.adapter.push_config_entries_local(
             manifest_root,
@@ -265,6 +342,7 @@ fn dispatch_push(
             adapter_cfg.adapter.component.as_deref(),
             &ctx.store,
             entries,
+            &push_ctx,
             dry_run,
         )?
     } else {
@@ -274,6 +352,7 @@ fn dispatch_push(
             adapter_cfg.adapter.component.as_deref(),
             &ctx.store,
             entries,
+            &push_ctx,
             dry_run,
         )?
     };
@@ -861,6 +940,8 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             local: false,
             manifest: manifest.to_path_buf(),
             no_env: true,
+            seed_token: None,
+            seed_url: None,
             store: None,
         }
     }
@@ -1650,9 +1731,10 @@ ids = ["default"]
 
     #[test]
     fn raw_push_spin_dry_run_dispatches_to_adapter() {
-        // Real impl shipped in 7.4 — dry-run resolves the
-        // component but skips the spin.toml writeback, so CI
-        // exercises dispatch without leaving artifacts.
+        // Stage 4 (KV-backed): spin push is HTTP POST to the seed
+        // handler. Dry-run skips the actual POST but still requires
+        // a seed URL to print. Provide one so the CLI dispatcher
+        // exercises adapter wiring without leaving artifacts.
         let manifest_spin = r#"
 [app]
 name = "demo-app"
@@ -1683,6 +1765,7 @@ ids = ["default"]
         .expect("write spin.toml");
         let mut args = push_args(&manifest, "spin");
         args.dry_run = true;
+        args.seed_url = Some("http://127.0.0.1:3000/__edgezero/config/seed".to_owned());
         run_config_push(&args).expect("spin dry-run dispatches cleanly");
     }
 

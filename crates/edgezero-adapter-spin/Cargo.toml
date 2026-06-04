@@ -11,7 +11,7 @@ workspace = true
 [features]
 default = []
 spin = ["dep:spin-sdk"]
-cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:toml", "dep:toml_edit", "dep:walkdir"]
+cli = ["dep:edgezero-adapter", "edgezero-adapter/cli", "dep:ctor", "dep:reqwest", "dep:toml", "dep:toml_edit", "dep:walkdir"]
 
 [dependencies]
 edgezero-core = { path = "../edgezero-core" }
@@ -30,6 +30,7 @@ spin-sdk = { workspace = true, optional = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 ctor = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 toml_edit = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }

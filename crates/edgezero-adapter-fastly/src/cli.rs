@@ -9,7 +9,7 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -278,6 +278,7 @@ impl Adapter for FastlyCliAdapter {
         _component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         // Resolve the platform config-store id on demand via
@@ -323,6 +324,7 @@ impl Adapter for FastlyCliAdapter {
         _component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
         // Local-emulator path: edit
@@ -1664,6 +1666,7 @@ build = \"cargo build --release\"
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &entries,
+                &AdapterPushContext::new(),
                 true,
             )
             .expect("dry-run succeeds");
@@ -1697,6 +1700,7 @@ build = \"cargo build --release\"
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
                 &[],
+                &AdapterPushContext::new(),
                 false,
             )
             .expect("zero-entry push is fine");

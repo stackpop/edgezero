@@ -185,6 +185,19 @@ pub struct ConfigPushArgs {
     /// and the push see the same resolved values.
     #[arg(long)]
     pub no_env: bool,
+    /// Seed token for adapters that push via HTTP (currently spin).
+    /// Resolution order: this flag → `EDGEZERO__ADAPTERS__<NAME>__SEED_TOKEN`.
+    /// Never read from `edgezero.toml` (tokens stay out of manifests).
+    #[arg(long)]
+    pub seed_token: Option<String>,
+    /// Seed URL for adapters that push via HTTP (currently spin). For
+    /// the prod chain (no `--local`), resolution order is: this flag →
+    /// `EDGEZERO__ADAPTERS__<NAME>__SEED_URL` → `[adapters.<name>.commands].seed_url`
+    /// in `edgezero.toml`. For `--local`, manifest is NEVER consulted;
+    /// the order is: this flag → `EDGEZERO__ADAPTERS__<NAME>__LOCAL_SEED_URL`
+    /// → builtin `http://127.0.0.1:3000/__edgezero/config/seed`.
+    #[arg(long)]
+    pub seed_url: Option<String>,
     /// Logical config store id to push to. Defaults to the
     /// `[stores.config].default` (or the only declared id when
     /// `[stores.config].ids` has length 1).
