@@ -11,7 +11,9 @@
 use std::path::Path;
 
 use crate::args::ProvisionArgs;
-use crate::config::{enforce_single_store_capability, strict_handler_paths};
+use crate::config::{
+    enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
+};
 use crate::ensure_adapter_defined;
 use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
 use edgezero_core::env_config::EnvConfig;
@@ -92,6 +94,17 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // wording so operators see what they declared even when the
     // env override redirected the create.
     let env_config = EnvConfig::from_env();
+
+    // Same env-resolved merged-id collision check `config validate`
+    // runs. Without it, `provision --adapter spin --dry-run` would
+    // happily ack a manifest where (e.g.) [stores.kv].sessions and
+    // [stores.config].app_config both resolve to platform label
+    // `shared` via the env overlay -- both writes would silently
+    // land on the same Spin KV store at runtime. Catches BOTH
+    // logical-id collisions and env-resolved platform-label
+    // collisions across merged kinds.
+    reject_merged_id_collisions(&args.adapter, adapter, manifest, &env_config)?;
+
     let config_ids = resolve_kind(manifest.stores.config.as_ref(), &env_config, "config");
     let kv_ids = resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv");
     let secret_ids = resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets");
@@ -388,6 +401,65 @@ ids = ["default"]
             manifest: manifest_path.clone(),
         })
         .expect("multi-config dispatch must succeed under KV-backed config");
+    }
+
+    #[test]
+    fn run_provision_spin_rejects_env_overlay_platform_label_collision_across_kv_and_config() {
+        // M1: provision must run the same merged-id collision check
+        // `config validate` runs. Without it, `provision --adapter
+        // spin --dry-run` happily acks a manifest where distinct
+        // logical ids `[stores.kv].sessions` and
+        // `[stores.config].app_config` BOTH resolve to platform
+        // label `shared` via the env overlay -- both writes would
+        // silently land on the same Spin KV store at runtime.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.kv]
+ids = ["sessions"]
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(
+            temp.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let _kv_override = EnvOverride::set("EDGEZERO__STORES__KV__SESSIONS__NAME", "shared");
+        let _config_override =
+            EnvOverride::set("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "shared");
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("env-overlay platform-label collision must fail provision");
+        assert!(
+            err.contains("`shared`")
+                && err.contains("[stores.kv].sessions")
+                && err.contains("[stores.config].app_config"),
+            "error names the resolved platform label + both logical ids: {err}"
+        );
     }
 
     #[test]

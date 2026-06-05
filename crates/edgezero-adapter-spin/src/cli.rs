@@ -522,7 +522,14 @@ fn dispatch_push(
     //    backend selection looks like". An explicit `--runtime-config
     //    <path>` is still honoured for resolving the SQLite path,
     //    but the backend `type` is ignored.
+    //
+    //    We still enforce the Spin runtime invariant that any
+    //    non-`default` label MUST be declared in `runtime-config.toml`
+    //    — without it, `spin up` errors with "unknown
+    //    key_value_stores label X" and the SQLite file we wrote is
+    //    unreadable from the running app. See `verify_label_declared`.
     if push_ctx.local {
+        verify_label_declared(platform, &parsed, &runtime_config_path)?;
         return write_sqlite(
             spin_manifest_dir,
             runtime_config_dir,
@@ -548,7 +555,7 @@ fn dispatch_push(
         if dry_run {
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would shell `spin cloud key-value set --store {platform} <key> <value>` for {} entries (logical id `{logical}`):",
+                "would shell `spin cloud key-value set --store {platform} KEY=VALUE [...]` for {} entries (logical id `{logical}`):",
                 entries.len()
             ));
             for (key, _) in entries {
@@ -589,16 +596,47 @@ fn dispatch_push(
             entries,
             dry_run,
         ),
-        None => write_sqlite(
-            spin_manifest_dir,
-            runtime_config_dir,
-            None,
-            platform,
-            logical,
-            entries,
-            dry_run,
-        ),
+        None => {
+            // Spin's runtime auto-provides ONLY the `default` label;
+            // any other label must have a `[key_value_store.<label>]`
+            // stanza or `spin up` errors. We fall through to SQLite-
+            // direct only for `default`; non-default un-declared
+            // labels error early so the operator doesn't write a
+            // file the running app can't open.
+            verify_label_declared(platform, &parsed, &runtime_config_path)?;
+            write_sqlite(
+                spin_manifest_dir,
+                runtime_config_dir,
+                None,
+                platform,
+                logical,
+                entries,
+                dry_run,
+            )
+        }
     }
+}
+
+/// Spin's runtime auto-provides ONLY the `default` KV label. Any
+/// other label must be declared in `runtime-config.toml`; without
+/// it `spin up` errors with `unknown key_value_stores label X` and
+/// the `SQLite` file our writer just created is unreadable from
+/// the running app. This helper enforces the same invariant at push
+/// time so a silent "push succeeds, runtime can't open store"
+/// divergence can't happen.
+fn verify_label_declared(
+    platform: &str,
+    parsed: &runtime_config::ParsedRuntimeConfig,
+    runtime_config_path: &Path,
+) -> Result<(), String> {
+    if platform == "default" || parsed.key_value_stores.contains_key(platform) {
+        return Ok(());
+    }
+    Err(format!(
+        "label `{platform}` has no `[key_value_store.{platform}]` stanza in {}. Spin auto-provides ONLY the `default` label; any other label must be declared in runtime-config.toml or `spin up` errors with `unknown key_value_stores label {platform}`. Add `[key_value_store.{platform}]\\ntype = \"spin\"` (or the backend you want) to {} and retry.",
+        runtime_config_path.display(),
+        runtime_config_path.display(),
+    ))
 }
 
 /// `SQLite`-direct write helper: resolves the `SQLite` path (honouring
@@ -1546,6 +1584,15 @@ mod tests {
     fn dispatch_push_local_forces_sqlite_even_when_deploy_targets_fermyon_cloud() {
         let dir = tempdir().expect("tempdir");
         write_minimal_spin_toml(dir.path());
+        // Non-default labels require a runtime-config stanza so
+        // `spin up` can open them; with the stanza in place, --local
+        // dispatches to SQLite regardless of the Fermyon Cloud deploy
+        // command.
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"spin\"\n",
+        )
+        .expect("write runtime-config");
 
         let push_ctx = AdapterPushContext::new()
             .with_local(true)
@@ -1697,11 +1744,72 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_push_default_branch_dispatches_to_sqlite_at_default_path() {
-        // No runtime-config.toml, no --local, no Fermyon Cloud deploy
-        // command. Spin's default is SQLite at .spin/sqlite_key_value.db.
+    fn dispatch_push_default_label_with_no_runtime_config_dispatches_to_sqlite() {
+        // Spin auto-provides ONLY the `default` label. With no
+        // runtime-config.toml present and the platform label set to
+        // `default`, we fall through to the SQLite writer.
         let dir = tempdir().expect("tempdir");
         write_minimal_spin_toml(dir.path());
+
+        let push_ctx = AdapterPushContext::new();
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("default", "default"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("`default` label -> SQLite");
+        let expected = dir.path().join(".spin/sqlite_key_value.db");
+        assert!(
+            out.iter()
+                .any(|line| line.contains(&expected.display().to_string())),
+            "default SQLite path: expected {} in {out:?}",
+            expected.display()
+        );
+    }
+
+    #[test]
+    fn dispatch_push_non_default_label_without_runtime_config_stanza_errors() {
+        // H2: Spin's runtime can't open a custom label without a
+        // `[key_value_store.<label>]` entry. Silently writing SQLite
+        // for `app_config` when the operator hasn't declared it is
+        // worse than erroring -- the push "succeeds" but the running
+        // app fails at `Store::open("app_config")`. Catch this at
+        // push time so the operator gets an actionable hint.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+
+        let push_ctx = AdapterPushContext::new();
+        let err = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect_err("non-default label without runtime-config stanza must error");
+        assert!(
+            err.contains("`[key_value_store.app_config]`")
+                && err.contains("unknown key_value_stores label app_config")
+                && err.contains("type = \"spin\""),
+            "error must name the stanza, the runtime symptom, AND the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_non_default_label_with_runtime_config_stanza_dispatches_to_sqlite() {
+        // Counterpart to the test above: with the stanza in place,
+        // the same `app_config` dispatch succeeds.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"spin\"\n",
+        )
+        .expect("write runtime-config");
 
         let push_ctx = AdapterPushContext::new();
         let out = dispatch_push(
@@ -1712,14 +1820,8 @@ mod tests {
             &push_ctx,
             true,
         )
-        .expect("default -> SQLite");
-        let expected = dir.path().join(".spin/sqlite_key_value.db");
-        assert!(
-            out.iter()
-                .any(|line| line.contains(&expected.display().to_string())),
-            "default SQLite path: expected {} in {out:?}",
-            expected.display()
-        );
+        .expect("non-default label WITH stanza must dispatch");
+        assert!(out[0].contains("SQLite-backed Spin KV"), "{out:?}");
     }
 
     #[test]
@@ -1752,15 +1854,17 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_push_unrelated_label_in_runtime_config_does_not_affect_default_dispatch() {
+    fn dispatch_push_unrelated_label_in_runtime_config_does_not_affect_dispatch() {
         // Sanity: only the matching label's stanza is consulted. A
-        // [key_value_store.other] redis entry must NOT prevent a
-        // SQLite-direct push to app_config.
+        // [key_value_store.other_label] redis entry must NOT prevent
+        // a SQLite-direct push to app_config (which has its own
+        // declared stanza).
         let dir = tempdir().expect("tempdir");
         write_minimal_spin_toml(dir.path());
         fs::write(
             dir.path().join("runtime-config.toml"),
-            "[key_value_store.other]\ntype = \"redis\"\nurl = \"redis://nowhere\"\n",
+            "[key_value_store.app_config]\ntype = \"spin\"\n\n\
+             [key_value_store.other_label]\ntype = \"redis\"\nurl = \"redis://nowhere\"\n",
         )
         .expect("write runtime-config");
 

@@ -17,9 +17,13 @@
 # per the Spin runtime-config docs:
 # https://spinframework.dev/v3/dynamic-configuration#key-value-store-runtime-configuration
 #
-# `edgezero config push --adapter spin` currently dispatches to the
-# `type = "spin"` (local SQLite) writer; redis / azure_cosmos / etc.
-# return a clear error pointing at the backend's native CLI.
+# `edgezero config push --adapter spin` dispatches per-backend:
+# `type = "spin"` writes directly into the local SQLite KV file;
+# Fermyon Cloud deploys (auto-detected from
+# `[adapters.spin.commands].deploy = "spin deploy"`) shell out to
+# `spin cloud key-value set --store <label> KEY=VALUE …`; redis /
+# azure_cosmos / unknown types return a clear error pointing at
+# the backend's native CLI.
 
 [key_value_store.app_config]
 type = "spin"
