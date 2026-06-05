@@ -116,6 +116,15 @@ pub struct AdapterPushContext<'ctx> {
     /// right writeback target; adapters where local == default
     /// can ignore it.
     pub local: bool,
+    /// `[adapters.<name>.commands].deploy` from the manifest, if set.
+    /// Adapters use this to auto-detect the deployment target —
+    /// e.g. Spin treats `spin deploy` / `spin cloud deploy` as a
+    /// signal to shell out to `spin cloud key-value set` instead of
+    /// writing local `SQLite`. `None` means the operator left the
+    /// deploy command unset (or no manifest entry exists for this
+    /// adapter), in which case auto-detection silently does not
+    /// fire.
+    pub manifest_adapter_deploy_cmd: Option<&'ctx str>,
     /// Already-resolved path to the adapter's runtime configuration
     /// file (e.g. Spin's `runtime-config.toml`, which declares the
     /// `[key_value_store.<label>]` backends `config push --adapter
@@ -142,6 +151,14 @@ impl<'ctx> AdapterPushContext<'ctx> {
     #[inline]
     pub fn with_local(mut self, local: bool) -> Self {
         self.local = local;
+        self
+    }
+
+    /// Set the manifest-adapter deploy command.
+    #[must_use]
+    #[inline]
+    pub fn with_manifest_adapter_deploy_cmd(mut self, cmd: &'ctx str) -> Self {
+        self.manifest_adapter_deploy_cmd = Some(cmd);
         self
     }
 

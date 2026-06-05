@@ -175,15 +175,27 @@ single string values, and pushes per-adapter:
   fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>
   ```
 
-- **spin** — **under restructure.** The previous seed-handler HTTP
-  POST was retired in the same branch because every deployed app
-  shipped an EdgeZero-owned `/__edgezero/config/seed` endpoint, a
-  permanent attack surface. The replacement dispatches per-backend
-  (SQLite-direct writes against `.spin/sqlite_key_value.db` for local
-  dev; `spin cloud key-value set` shellouts for Fermyon Cloud) and
-  lands in the next commit on the branch. Until then `config push
-  --adapter spin` returns a clear "under restructure" error pointing
-  at `docs/superpowers/plans/2026-06-04-spin-per-backend-push.md`.
+- **spin** — reads `runtime-config.toml` (next to `spin.toml` by
+  default; override with `--runtime-config <path>`) to dispatch
+  per-backend. Decision order:
+  1. `--local` forces SQLite-direct against
+     `<spin.toml dir>/.spin/sqlite_key_value.db`.
+  2. If the manifest's `[adapters.spin.commands].deploy` shells to
+     `spin deploy` / `spin cloud deploy`, push shells
+     `spin cloud key-value set --store <label> <key> <value>` per
+     entry. Authenticate first via `spin cloud login`.
+  3. Otherwise dispatch on `runtime-config.toml`'s
+     `[key_value_store.<label>].type`: `type = "spin"` → SQLite-direct
+     write; `type = "redis"` / `azure_cosmos` / unknown → clear error
+     pointing at the backend's native CLI (e.g. `redis-cli -u <url>
+     SET <key> <value>`).
+  4. Default: SQLite-direct at Spin's `.spin/sqlite_key_value.db`.
+
+  No internet-facing endpoint is involved on the EdgeZero side: the
+  SQLite writer opens the file directly via `rusqlite` (using Spin's
+  exact `spin_key_value` schema, vendored from upstream + drift-tested
+  at build time), and the cloud writer shells out to the official
+  Fermyon plugin.
 
 ### Spin manual secret declarations
 

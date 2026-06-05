@@ -12,6 +12,7 @@
 
 use app_demo_core::config::AppDemoConfig;
 use edgezero_cli::args::{ConfigPushArgs, ConfigValidateArgs};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -218,11 +219,85 @@ fn config_push_axum_round_trip_serves_pushed_value_via_handler() {
     );
 }
 
+/// Spin push round-trip against the SQLite-direct backend: the
+/// typed flow drives `config push --adapter spin` against a temp
+/// project whose `runtime-config.toml` selects `type = "spin"` for
+/// `app_config`. After the push, opening the resulting
+/// `.spin/sqlite_key_value.db` via `rusqlite` MUST return the
+/// flattened, secret-stripped entries — same shape Spin's runtime
+/// would read on the next request.
 #[test]
-#[ignore = "spin push under restructure: per-backend writers (SQLite-direct + Fermyon Cloud) land in the next commit on this branch; see docs/superpowers/plans/2026-06-04-spin-per-backend-push.md"]
-fn config_push_spin_dry_run_dispatches_cleanly_and_preserves_manifest() {
-    // This test will be re-enabled in the per-backend-writers
-    // commit with assertions against a SQLite round-trip in a
-    // temp `.spin/sqlite_key_value.db` rather than the deleted
-    // seed-handler POST.
+fn config_push_spin_writes_sqlite_round_tripped_via_rusqlite() {
+    let (dir, manifest) = write_app_demo_project("spin");
+
+    // Drop in a `runtime-config.toml` next to the spin manifest so
+    // the per-backend dispatcher knows `app_config` is SQLite-backed.
+    // `write_app_demo_project` writes spin.toml at the same root, so
+    // both files live next to each other.
+    let spin_manifest_dir = dir.path();
+    fs::write(
+        spin_manifest_dir.join("runtime-config.toml"),
+        "[key_value_store.app_config]\ntype = \"spin\"\n",
+    )
+    .expect("write runtime-config.toml");
+
+    edgezero_cli::run_config_push_typed::<AppDemoConfig>(&push_args(&manifest, "spin", false))
+        .expect("typed spin push dispatches cleanly");
+
+    // The dispatcher resolves the SQLite path to
+    // `<spin_manifest_dir>/.spin/sqlite_key_value.db`. Open it and
+    // pull the entries Spin's runtime would see at request time.
+    let db_path = spin_manifest_dir.join(".spin/sqlite_key_value.db");
+    assert!(
+        db_path.exists(),
+        "push must create the SQLite file at {}",
+        db_path.display()
+    );
+    let connection = rusqlite::Connection::open(&db_path).expect("open written sqlite");
+    let entries: BTreeMap<String, String> = connection
+        .prepare("SELECT key, value FROM spin_key_value WHERE store = ?1")
+        .expect("prepare")
+        .query_map(rusqlite::params!["app_config"], |row| {
+            let key: String = row.get(0)?;
+            let value: Vec<u8> = row.get(1)?;
+            Ok((
+                key,
+                String::from_utf8(value).expect("value is utf-8 from typed push"),
+            ))
+        })
+        .expect("query_map")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+
+    assert_eq!(
+        entries.get("greeting").map(String::as_str),
+        Some("hello from app-demo"),
+        "greeting landed verbatim: {entries:?}"
+    );
+    // Nested fields flatten with dotted keys.
+    assert_eq!(
+        entries.get("service.timeout_ms").map(String::as_str),
+        Some("1500"),
+        "nested fields land as `<table>.<field>`: {entries:?}"
+    );
+    // Boolean / non-string scalars become their TOML / JSON
+    // representation (typed flow uses serde_json::to_string for the
+    // flattened values).
+    assert_eq!(
+        entries.get("feature.new_checkout").map(String::as_str),
+        Some("false"),
+        "boolean flattens to its string repr: {entries:?}"
+    );
+
+    // SECRET stripping: `#[secret]` field (api_token) and
+    // `#[secret(store_ref)]` field (vault) MUST NOT appear in the
+    // pushed entries.
+    assert!(
+        !entries.contains_key("api_token"),
+        "#[secret] field must be stripped from push payload: {entries:?}"
+    );
+    assert!(
+        !entries.contains_key("vault"),
+        "#[secret(store_ref)] field must be stripped from push payload: {entries:?}"
+    );
 }

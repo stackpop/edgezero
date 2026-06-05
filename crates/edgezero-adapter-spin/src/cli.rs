@@ -1,3 +1,12 @@
+#![expect(
+    clippy::self_named_module_files,
+    reason = "Workspace lint policy denies BOTH `self_named_module_files` (wants `cli/mod.rs`) and `mod_module_files` (wants `cli.rs`) -- they contradict, so any file with submodules must opt out of one. The repo convention is the self-named form (`cli.rs` with submodules under `cli/`); allow accordingly."
+)]
+#![expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "submodule declarations sit between the `use` block and the rest of the file's items by Rust convention; the strict-ordering lint disagrees but no human convention puts `mod` blocks AFTER trait impls"
+)]
+
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -16,6 +25,10 @@ use edgezero_adapter::scaffold::{
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
 use walkdir::WalkDir;
+
+mod push_cloud;
+mod push_sqlite;
+mod runtime_config;
 
 static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
 
@@ -243,42 +256,41 @@ impl Adapter for SpinCliAdapter {
 
     fn push_config_entries(
         &self,
-        _manifest_root: &Path,
-        _adapter_manifest_path: Option<&str>,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _store: &ResolvedStoreId,
-        _entries: &[(String, String)],
-        _push_ctx: &AdapterPushContext<'_>,
-        _dry_run: bool,
+        store: &ResolvedStoreId,
+        entries: &[(String, String)],
+        push_ctx: &AdapterPushContext<'_>,
+        dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Transitional stub: the seed handler that this method used
-        // to POST to was deleted in the same commit that landed
-        // this stub. The replacement (SQLite-direct + Fermyon Cloud
-        // shellout, per the runtime-config.toml backend type) lands
-        // in the next commit on this branch. See
-        // `docs/superpowers/plans/2026-06-04-spin-per-backend-push.md`.
-        Err("`config push --adapter spin` is being restructured: \
-            the seed handler was retired in this commit; the \
-            per-backend writers (SQLite-direct + Fermyon Cloud \
-            shellout) land in the next commit. See \
-            docs/superpowers/plans/2026-06-04-spin-per-backend-push.md."
-            .to_owned())
+        dispatch_push(
+            manifest_root,
+            adapter_manifest_path,
+            store,
+            entries,
+            push_ctx,
+            dry_run,
+        )
     }
 
     fn push_config_entries_local(
         &self,
         manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
-        component_selector: Option<&str>,
+        _component_selector: Option<&str>,
         store: &ResolvedStoreId,
         entries: &[(String, String)],
         push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        self.push_config_entries(
+        // `--local` lives in `push_ctx.local`. `dispatch_push` honours
+        // it by suppressing the Fermyon Cloud auto-detect so the
+        // operator can force a SQLite-direct write even when the
+        // manifest's deploy command shells to `spin deploy`.
+        dispatch_push(
             manifest_root,
             adapter_manifest_path,
-            component_selector,
             store,
             entries,
             push_ctx,
@@ -448,6 +460,155 @@ fn collect_spin_component_ids(parsed: &toml::Value) -> Vec<String> {
         .and_then(toml::Value::as_table)
         .map(|components| components.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Dispatch `config push --adapter spin` to the right per-backend
+/// writer based on `runtime-config.toml` + the adapter's
+/// `[adapters.spin.commands].deploy` command (auto-detect for Fermyon
+/// Cloud).
+///
+/// Decision order:
+/// 1. **`--local` is set**: force SQLite-direct against the local
+///    `.spin/sqlite_key_value.db`. Fermyon Cloud auto-detect cannot
+///    fire — even when the manifest's deploy command would otherwise
+///    trip it. This lets the operator push into a local KV without
+///    needing to authenticate with Fermyon Cloud first.
+/// 2. **Deploy command auto-detects Fermyon Cloud** (`spin deploy` /
+///    `spin cloud deploy`): shell out to `spin cloud key-value set`.
+/// 3. **`runtime-config.toml` exists and declares this label's
+///    backend**: dispatch on `type` — `spin` → SQLite-direct, `redis`
+///    / `azure_cosmos` / `Unknown` → clear error pointing at the
+///    backend's native CLI.
+/// 4. **Default**: SQLite-direct at Spin's default path.
+fn dispatch_push(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    store: &ResolvedStoreId,
+    entries: &[(String, String)],
+    push_ctx: &AdapterPushContext<'_>,
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    let platform = store.platform.as_str();
+    let logical = store.logical.as_str();
+
+    if entries.is_empty() {
+        return Ok(vec![format!(
+            "no config entries to push to spin store `{platform}` (logical id `{logical}`)"
+        )]);
+    }
+
+    let spin_manifest_path = adapter_manifest_path
+        .map(|rel| manifest_root.join(rel))
+        .ok_or_else(|| {
+            "[adapters.spin.adapter].manifest must point at spin.toml for config push".to_owned()
+        })?;
+    let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
+
+    // --runtime-config wins; otherwise default to
+    // `runtime-config.toml` next to the spin manifest.
+    let runtime_config_path = push_ctx.runtime_config_path.map_or_else(
+        || spin_manifest_dir.join("runtime-config.toml"),
+        Path::to_path_buf,
+    );
+    let runtime_config_dir = runtime_config_path.parent().unwrap_or(spin_manifest_dir);
+    let parsed = runtime_config::read(&runtime_config_path)?;
+
+    // 1. `--local` forces SQLite-direct, suppressing Fermyon Cloud
+    //    auto-detection.
+    // 2. Else, if the manifest deploy command shells to `spin deploy`,
+    //    treat as Fermyon Cloud.
+    if !push_ctx.local
+        && push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)
+    {
+        if dry_run {
+            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            out.push(format!(
+                "would shell `spin cloud key-value set --store {platform} <key> <value>` for {} entries (logical id `{logical}`):",
+                entries.len()
+            ));
+            for (key, _) in entries {
+                out.push(format!("  would set `{key}`"));
+            }
+            return Ok(out);
+        }
+        push_cloud::write_batch(platform, entries)?;
+        return Ok(vec![format!(
+            "pushed {} entries to Fermyon Cloud KV store `{platform}` (logical id `{logical}`) via `spin cloud key-value set`",
+            entries.len()
+        )]);
+    }
+
+    // 3 / 4: SQLite-direct dispatch. Look up the backend explicitly
+    // declared for this label, falling back to Spin's default
+    // `(type = "spin", path = None)` if the label has no stanza.
+    let backend = parsed.key_value_stores.get(platform);
+    match backend {
+        Some(runtime_config::KeyValueBackend::Redis { url }) => Err(format!(
+            "store `{platform}` (logical id `{logical}`) is backed by `type = \"redis\"` (url: `{url}`) in {}; `config push --adapter spin` does not yet support the redis backend in this version. Use `redis-cli -u {url} SET <key> <value>` directly.",
+            runtime_config_path.display()
+        )),
+        Some(runtime_config::KeyValueBackend::AzureCosmos) => Err(format!(
+            "store `{platform}` (logical id `{logical}`) is backed by `type = \"azure_cosmos\"` in {}; `config push --adapter spin` does not yet support the Azure backend in this version. Use Azure's CosmosDB SDK / `az cosmosdb` CLI directly.",
+            runtime_config_path.display()
+        )),
+        Some(runtime_config::KeyValueBackend::Unknown { type_name }) => Err(format!(
+            "store `{platform}` (logical id `{logical}`) is backed by an unrecognised type `{type_name}` in {}; `config push --adapter spin` only supports `type = \"spin\"` for now. Use the backend's native CLI to seed entries directly.",
+            runtime_config_path.display()
+        )),
+        Some(runtime_config::KeyValueBackend::Spin { path }) => write_sqlite(
+            spin_manifest_dir,
+            runtime_config_dir,
+            path.as_deref(),
+            platform,
+            logical,
+            entries,
+            dry_run,
+        ),
+        None => write_sqlite(
+            spin_manifest_dir,
+            runtime_config_dir,
+            None,
+            platform,
+            logical,
+            entries,
+            dry_run,
+        ),
+    }
+}
+
+/// `SQLite`-direct write helper: resolves the `SQLite` path (honouring
+/// any explicit `path` from `runtime-config.toml`), then either prints
+/// a dry-run preview or actually writes the batch through
+/// `push_sqlite::write_batch`.
+fn write_sqlite(
+    spin_manifest_dir: &Path,
+    runtime_config_dir: &Path,
+    explicit_path: Option<&Path>,
+    platform: &str,
+    logical: &str,
+    entries: &[(String, String)],
+    dry_run: bool,
+) -> Result<Vec<String>, String> {
+    let db_path =
+        push_sqlite::resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, explicit_path);
+    if dry_run {
+        let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+        out.push(format!(
+            "would write {} entries to SQLite-backed Spin KV at `{}` for store `{platform}` (logical id `{logical}`):",
+            entries.len(),
+            db_path.display()
+        ));
+        for (key, _) in entries {
+            out.push(format!("  would set `{key}`"));
+        }
+        return Ok(out);
+    }
+    push_sqlite::write_batch(&db_path, platform, entries)?;
+    Ok(vec![format!(
+        "pushed {} entries to Spin SQLite KV at `{}` for store `{platform}` (logical id `{logical}`)",
+        entries.len(),
+        db_path.display()
+    )])
 }
 
 /// Resolve which `[component.<id>]` table `provision` should

@@ -20,5 +20,8 @@ edgezero-adapter-axum = { workspace = true }
 edgezero-adapter-spin = { workspace = true, features = ["cli"] }
 edgezero-core = { workspace = true }
 futures = { workspace = true }
+# Used by the spin push integration test to verify the SQLite-direct
+# writer's round-trip against Spin's `spin_key_value` schema.
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

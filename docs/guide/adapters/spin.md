@@ -149,19 +149,46 @@ backend (`type = "azure"`, `type = "redis"`, …) per the
 you (it does NOT touch `runtime-config.toml` — keep that one
 hand-edited).
 
-::: warning Push under restructure
-`edgezero config push --adapter spin` is being rebuilt: it used to
-POST to an embedded `/__edgezero/config/seed` handler inside every
-deployed app, which exposed a permanent EdgeZero-owned attack surface.
-The replacement dispatches to the runtime backend directly: SQLite-
-direct writes to `.spin/sqlite_key_value.db` for local dev, and
-`spin cloud key-value set` shellouts for Fermyon Cloud deployments.
-The per-backend writers land in the commit after this one on the
-`feature/extensible-cli` branch; see
-`docs/superpowers/plans/2026-06-04-spin-per-backend-push.md` for the
-plan. Until they land, `config push --adapter spin` returns a clear
-"under restructure" error.
-:::
+### Seeding the store
+
+`edgezero config push --adapter spin` reads `runtime-config.toml` and
+dispatches to the right per-backend writer — no embedded HTTP endpoint,
+no token to manage. Resolution order:
+
+1. **`--local` set**: forces SQLite-direct against
+   `<spin.toml dir>/.spin/sqlite_key_value.db` (Spin's local KV file).
+   Useful for poking values in your local dev loop without
+   authenticating against Fermyon Cloud.
+2. **Manifest's `deploy` command targets Fermyon Cloud** (auto-detected
+   from `[adapters.spin.commands].deploy` containing `spin deploy` or
+   `spin cloud deploy`): shells `spin cloud key-value set --store
+   <label> <key> <value>` per entry. Authentication comes from
+   `spin cloud login` — EdgeZero does not store cloud credentials.
+3. **`runtime-config.toml` declares this label's backend**:
+   - `type = "spin"` → SQLite-direct (honours an explicit `path` field
+     if set; otherwise the default `.spin/sqlite_key_value.db`).
+   - `type = "redis"` / `azure_cosmos` / unknown → clear error
+     pointing at the backend's native CLI (e.g. `redis-cli -u <url>
+     SET <key> <value>`). Native-CLI dispatch for redis / azure is
+     planned for a follow-up release.
+4. **Default**: SQLite-direct at Spin's default path.
+
+Schema-coupling note: the SQLite writer uses the exact `spin_key_value`
+schema and `INSERT … ON CONFLICT DO UPDATE` statement vendored from
+spinframework/spin's `crates/key-value-spin/src/store.rs`. A contract
+test in `edgezero-adapter-spin/src/cli/push_sqlite.rs` asserts
+byte-equality against the upstream string, and the workspace's
+`spin-sdk = "~6.0"` pin blocks any Spin minor bump that would change
+the schema until the operator opts in.
+
+```bash
+# Local dev: writes through to .spin/sqlite_key_value.db.
+edgezero config push --adapter spin --local
+
+# Production (Fermyon Cloud): shells `spin cloud key-value set`.
+spin cloud login    # one-time
+edgezero config push --adapter spin
+```
 
 ## Secret Store
 

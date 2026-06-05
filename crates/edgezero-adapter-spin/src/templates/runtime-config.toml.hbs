@@ -13,9 +13,13 @@
 # id you declare in `edgezero.toml`.
 #
 # For production deployments, swap `type = "spin"` for a
-# managed backend (e.g. `type = "azure"`, `type = "redis"`) per
-# the Spin runtime-config docs:
+# managed backend (e.g. `type = "azure_cosmos"`, `type = "redis"`)
+# per the Spin runtime-config docs:
 # https://spinframework.dev/v3/dynamic-configuration#key-value-store-runtime-configuration
+#
+# `edgezero config push --adapter spin` currently dispatches to the
+# `type = "spin"` (local SQLite) writer; redis / azure_cosmos / etc.
+# return a clear error pointing at the backend's native CLI.
 
 [key_value_store.app_config]
 type = "spin"

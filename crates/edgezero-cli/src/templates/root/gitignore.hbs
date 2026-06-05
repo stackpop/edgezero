@@ -3,6 +3,17 @@ bin/
 pkg/
 target/
 
+# local emulator / runtime state — each adapter's local KV / config
+# store lives under one of these directories:
+#   - Cloudflare local KV  -> .wrangler/state/v3/kv/*/db.sqlite
+#   - Spin local KV        -> .spin/sqlite_key_value.db
+#   - Axum local config    -> .edgezero/local-config-<id>.json
+# All three are populated by `config push --local` (or by the
+# runtime itself on first read) and should not be committed.
+.wrangler/
+.spin/
+.edgezero/
+
 # env
 .env
 
