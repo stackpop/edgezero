@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use anyhow::Context as _;
+
 use crate::config_store::SpinConfigStore;
 use crate::context::{parse_client_addr, SpinRequestContext};
 use crate::key_value_store::{SpinKvStore, DEFAULT_MAX_LIST_KEYS};
@@ -283,19 +285,18 @@ async fn build_config_registry(
     // `EDGEZERO__STORES__CONFIG__<ID>__NAME`. Mirrors `build_kv_registry`
     // so missing `key_value_stores = [...]` declarations surface at
     // dispatch setup, not on first config read.
+    // Preserve the `ConfigStoreError` as the anyhow source so the
+    // caller can downcast to distinguish `Internal` (structural —
+    // label not declared / registered) from `Unavailable` (transient
+    // hostcall failure). `with_context` chains rather than
+    // stringifying.
     let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
     for id in meta.ids {
         let label = env.store_name("config", id);
-        match SpinConfigStore::open(label.clone()).await {
-            Ok(store) => {
-                by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
-            }
-            Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "Spin config KV store '{label}' (id `{id}`) is explicitly configured but could not be opened: {err}"
-                ));
-            }
-        }
+        let store = SpinConfigStore::open(label.clone())
+            .await
+            .with_context(|| format!("config store id `{id}` (label `{label}`) failed to open"))?;
+        by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
     }
     // Every id is required to open (any failure returns Err above), so
     // `from_parts` is guaranteed to have the default id present.
@@ -329,11 +330,9 @@ async fn resolve_config_handle(label: &str) -> anyhow::Result<Option<ConfigStore
     // KV-backed config store under the same label used for KV. Registry
     // callers (`dispatch_with_registries`) use `build_config_registry`
     // instead, which resolves per-id labels via env.
-    let store = SpinConfigStore::open(label.to_owned()).await.map_err(|err| {
-        anyhow::anyhow!(
-            "Spin config KV store '{label}' could not be opened on the low-level dispatch path: {err}"
-        )
-    })?;
+    let store = SpinConfigStore::open(label.to_owned())
+        .await
+        .with_context(|| format!("low-level dispatch: open config store `{label}`"))?;
     Ok(Some(ConfigStoreHandle::new(Arc::new(store))))
 }
 

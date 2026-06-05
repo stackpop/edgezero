@@ -1421,6 +1421,51 @@ deploy = "fastly compute deploy"
     }
 
     #[test]
+    fn adapter_commands_seed_url_uses_dashed_toml_key() {
+        // The in-memory field is `seed_url`; the TOML key is
+        // `seed-url` (serde `rename = "seed-url"`). This test pins
+        // the rename so docs / error messages that point operators
+        // at the dashed key don't drift away from what serde actually
+        // accepts.
+        let manifest = r#"
+[adapters.spin.commands]
+build = "echo"
+serve = "echo"
+deploy = "echo"
+seed-url = "https://my-app.fermyon.app/__edgezero/config/seed"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let adapter = &loader.manifest().adapters["spin"];
+        assert_eq!(
+            adapter.commands.seed_url.as_deref(),
+            Some("https://my-app.fermyon.app/__edgezero/config/seed"),
+            "the dashed TOML key `seed-url` must populate `commands.seed_url`"
+        );
+    }
+
+    #[test]
+    fn adapter_commands_seed_url_underscored_key_is_ignored() {
+        // Regression: an operator who follows the (pre-fix) docs that
+        // said `seed_url` and writes the underscored key gets a SILENT
+        // miss, because serde only honours the renamed `seed-url`.
+        // This test documents that behaviour so future doc/code drift
+        // doesn't quietly re-open the gap.
+        let manifest = r#"
+[adapters.spin.commands]
+build = "echo"
+serve = "echo"
+deploy = "echo"
+seed_url = "https://underscored.example/seed"
+"#;
+        let loader = ManifestLoader::load_from_str(manifest);
+        let adapter = &loader.manifest().adapters["spin"];
+        assert!(
+            adapter.commands.seed_url.is_none(),
+            "the underscored TOML key `seed_url` must NOT populate `commands.seed_url` -- docs/errors must point at the dashed `seed-url` form"
+        );
+    }
+
+    #[test]
     fn adapter_definition_config() {
         let manifest = r#"
 [adapters.fastly.adapter]

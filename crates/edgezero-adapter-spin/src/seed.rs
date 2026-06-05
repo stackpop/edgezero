@@ -33,9 +33,27 @@ use crate::response::from_core_response;
 use crate::SpinFullResponse;
 
 /// Minimum server-token length below which the handler is fail-closed
-/// (returns 401 on every request). 16 bytes / 128 bits — kills practical
-/// brute-force; placeholders like `"dev"` trip it immediately.
+/// (returns 401 on every request). 16 *bytes* (not characters) — kills
+/// practical brute-force at 128 bits when the token is 16 random bytes;
+/// placeholders like `"dev"` trip it immediately. Note that hex-encoded
+/// tokens have half the entropy per byte, so operators should use raw
+/// random bytes (e.g. `openssl rand -base64 16`) or pick longer hex
+/// strings (32+ chars).
 const MIN_TOKEN_LEN: usize = 16;
+
+/// Maximum request-body size before parsing — bounds the pre-auth read
+/// surface so an unauthenticated attacker can't OOM a Spin instance with
+/// a multi-MB POST. 256 KiB comfortably fits the typed config-flattened
+/// payload for any reasonable app.
+const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Maximum entries per push. Each entry is a sequential `kv.set`; capping
+/// limits a stuck or malicious push from monopolising the runtime.
+const MAX_ENTRIES: usize = 1000;
+
+/// Maximum bytes per entry value. Spin KV is intended for small config
+/// values, not blobs.
+const MAX_VALUE_BYTES: usize = 64 * 1024;
 
 /// Fixed seed-handler route. Single canonical path per D9 — not configurable
 /// per app, so ops scripts know exactly where to point.
@@ -47,8 +65,19 @@ pub(crate) const SEED_TOKEN_HEADER: &str = "x-edgezero-seed";
 
 #[derive(Debug, Error)]
 pub(crate) enum SeedError {
-    #[error("kv write failed for key `{key}`: {source}")]
+    /// The named platform store does not exist or can't be opened — distinct
+    /// from a transient write failure so the seed handler can map it to 404
+    /// (operator declared a label the runtime doesn't know about) instead of
+    /// blanket 422.
+    #[error("no such store `{store}`: {source}")]
+    NoSuchStore {
+        store: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("kv write failed for key `{key}` at entry {index}: {source}")]
     WriteFailed {
+        index: usize,
         key: String,
         #[source]
         source: anyhow::Error,
@@ -57,14 +86,18 @@ pub(crate) enum SeedError {
 
 #[async_trait(?Send)]
 pub(crate) trait SeedWriter {
-    /// Write a `(store, key, value)` tuple. Implementations should be infallible
-    /// from a routing perspective; failures are surfaced as HTTP 422 by the
-    /// caller and the failing key is named in the body.
-    async fn write(&self, store: &str, key: &str, value: &str) -> Result<(), SeedError>;
+    /// Open `store` once and write every `(key, value)` in `entries`. The
+    /// store-open is hoisted out of the per-entry loop so an N-entry batch
+    /// costs one KV `Store::open` (not N). On the first per-entry failure,
+    /// returns the failing entry's index in the original `entries` slice
+    /// (via `SeedError::WriteFailed.index`) so the seed handler's 422 body
+    /// can name the offset — operators can trim earlier entries and retry
+    /// without re-writing committed prefixes.
+    async fn write_batch(&self, store: &str, entries: &[(&str, &str)]) -> Result<(), SeedError>;
 }
 
-/// Production wasm writer — opens the KV store fresh per write and calls
-/// `set`. Lives behind the spin/wasm32 gate because `spin_sdk::key_value`
+/// Production wasm writer — opens the KV store once and calls `set` per
+/// entry. Lives behind the spin/wasm32 gate because `spin_sdk::key_value`
 /// is a wasm hostcall.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub(crate) struct SpinKvSeedWriter;
@@ -72,43 +105,65 @@ pub(crate) struct SpinKvSeedWriter;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl SeedWriter for SpinKvSeedWriter {
-    async fn write(&self, store: &str, key: &str, value: &str) -> Result<(), SeedError> {
-        let kv = SpinSdkKvStore::open(store)
-            .await
-            .map_err(|err| SeedError::WriteFailed {
-                key: key.to_owned(),
-                source: anyhow::anyhow!("open `{store}`: {err}"),
-            })?;
-        kv.set(key, value.as_bytes())
-            .await
-            .map_err(|err| SeedError::WriteFailed {
-                key: key.to_owned(),
+    async fn write_batch(&self, store: &str, entries: &[(&str, &str)]) -> Result<(), SeedError> {
+        let kv = SpinSdkKvStore::open(store).await.map_err(|err| {
+            // Spin's `key_value::Error` does not currently expose a
+            // discriminant we can match on without coupling to the SDK's
+            // internal repr; treat any open failure as "no such store"
+            // since the seed handler has already vetted the label set.
+            SeedError::NoSuchStore {
+                store: store.to_owned(),
                 source: anyhow::anyhow!(err.to_string()),
-            })
+            }
+        })?;
+        for (index, (key, value)) in entries.iter().enumerate() {
+            kv.set(key, value.as_bytes())
+                .await
+                .map_err(|err| SeedError::WriteFailed {
+                    index,
+                    key: (*key).to_owned(),
+                    source: anyhow::anyhow!(err.to_string()),
+                })?;
+        }
+        Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) enum InMemorySeedMode {
+    /// Fail with `SeedError::WriteFailed` at the given entry index. `0`
+    /// is the original "fail on the first write" semantics.
+    FailWriteAt(usize),
+    /// Fail with `SeedError::NoSuchStore` before any write — mirrors the
+    /// runtime's "label not declared" path so the seed handler's 404
+    /// mapping can be exercised on host.
+    NoSuchStore,
+    /// Succeed on every entry.
+    Ok,
 }
 
 #[cfg(test)]
 pub(crate) struct InMemorySeedWriter {
     entries: Mutex<BTreeMap<(String, String), String>>,
-    /// When true, the next `write` call returns `Err`. Used to test 422.
-    fail_on_write: bool,
+    mode: InMemorySeedMode,
 }
 
 #[cfg(test)]
 impl InMemorySeedWriter {
     pub(crate) fn failing() -> Self {
-        Self {
-            entries: Mutex::new(BTreeMap::new()),
-            fail_on_write: true,
-        }
+        Self::with_mode(InMemorySeedMode::FailWriteAt(0))
+    }
+
+    pub(crate) fn failing_at(index: usize) -> Self {
+        Self::with_mode(InMemorySeedMode::FailWriteAt(index))
     }
 
     pub(crate) fn new() -> Self {
-        Self {
-            entries: Mutex::new(BTreeMap::new()),
-            fail_on_write: false,
-        }
+        Self::with_mode(InMemorySeedMode::Ok)
+    }
+
+    pub(crate) fn no_such_store() -> Self {
+        Self::with_mode(InMemorySeedMode::NoSuchStore)
     }
 
     pub(crate) fn recorded(&self) -> BTreeMap<(String, String), String> {
@@ -118,20 +173,36 @@ impl InMemorySeedWriter {
         let guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         guard.clone()
     }
+
+    fn with_mode(mode: InMemorySeedMode) -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+            mode,
+        }
+    }
 }
 
 #[cfg(test)]
 #[async_trait(?Send)]
 impl SeedWriter for InMemorySeedWriter {
-    async fn write(&self, store: &str, key: &str, value: &str) -> Result<(), SeedError> {
-        if self.fail_on_write {
-            return Err(SeedError::WriteFailed {
-                key: key.to_owned(),
-                source: anyhow::anyhow!("forced write failure"),
+    async fn write_batch(&self, store: &str, entries: &[(&str, &str)]) -> Result<(), SeedError> {
+        if matches!(self.mode, InMemorySeedMode::NoSuchStore) {
+            return Err(SeedError::NoSuchStore {
+                store: store.to_owned(),
+                source: anyhow::anyhow!("forced no-such-store failure"),
             });
         }
-        let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.insert((store.to_owned(), key.to_owned()), value.to_owned());
+        for (index, (key, value)) in entries.iter().enumerate() {
+            if matches!(self.mode, InMemorySeedMode::FailWriteAt(target) if target == index) {
+                return Err(SeedError::WriteFailed {
+                    index,
+                    key: (*key).to_owned(),
+                    source: anyhow::anyhow!("forced write failure at index {index}"),
+                });
+            }
+            let mut guard = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.insert((store.to_owned(), (*key).to_owned()), (*value).to_owned());
+        }
         Ok(())
     }
 }
@@ -187,18 +258,25 @@ fn validated_server_token(raw: Option<&str>) -> Option<&str> {
 
 /// Host-compilable seed handler core.
 ///
-/// Routes the request through the D9 status-code table:
+/// Routes the request through the D9 status-code table. Gates are
+/// ordered fail-closed-FIRST: an unset / blank / whitespace / short
+/// server token returns 401 on EVERY request (including GET and the
+/// wrong content-type), matching the `run_app_with_seeder` docstring
+/// contract. Without the token-first ordering an unauthenticated
+/// caller could fingerprint method/content-type behaviour before auth
+/// is enforced.
 ///
 /// | Code | Condition |
 /// |---|---|
 /// | 204 | success |
 /// | 400 | malformed JSON, missing `store`, empty `entries`, non-string values |
-/// | 401 | header missing OR server token unset/blank/whitespace/<16 bytes |
+/// | 401 | server token unset/blank/whitespace/<16 bytes, OR wire-token header missing |
 /// | 403 | wire token does not match server token |
-/// | 404 | `store` not in `known_platform_labels` |
-/// | 405 | non-POST method |
-/// | 415 | content-type not `application/json` |
-/// | 422 | `SeedWriter::write` errored mid-stream |
+/// | 404 | `store` not in `known_platform_labels`, or runtime reports no such store |
+/// | 405 | non-POST method (only checked when auth succeeded) |
+/// | 413 | request body exceeds `MAX_BODY_BYTES`, `entries.len()` exceeds `MAX_ENTRIES`, or any `value.len()` exceeds `MAX_VALUE_BYTES` |
+/// | 415 | content-type not `application/json` (only checked when auth succeeded) |
+/// | 422 | `SeedWriter::write_batch` errored mid-stream (body names failing index + key) |
 ///
 /// `valid_token` is the env-resolved server token; `None`/blank/short triggers
 /// fail-closed 401 (D9 "no token → no auth" rule).
@@ -212,25 +290,10 @@ pub(crate) async fn handle_seed_request_core<W: SeedWriter>(
     valid_token: Option<&str>,
     known_platform_labels: &[String],
 ) -> Response {
-    // Method gate.
-    if req.method() != Method::POST {
-        return empty_response(StatusCode::METHOD_NOT_ALLOWED);
-    }
-
-    // Content-type gate. Accept `application/json` plus parameters
-    // (`; charset=utf-8`) but nothing else.
-    let content_type = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    if !content_type.starts_with("application/json") {
-        return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    }
-
-    // Auth gate — fail-closed FIRST against the server token, then check
-    // the wire token. Reversing the order would let a missing-token attacker
-    // probe presence of a short server token.
+    // Auth gate FIRST — fail-closed against the server token regardless of
+    // method/content-type. This matches the `run_app_with_seeder`
+    // contract ("every seed-route request returns 401 when the token is
+    // unset/blank/short") and prevents pre-auth fingerprinting.
     let Some(server_token) = validated_server_token(valid_token) else {
         return empty_response(StatusCode::UNAUTHORIZED);
     };
@@ -242,20 +305,52 @@ pub(crate) async fn handle_seed_request_core<W: SeedWriter>(
         return empty_response(StatusCode::UNAUTHORIZED);
     };
     // Constant-time compare via subtle. `ct_eq` returns `Choice` (a u8-wrap)
-    // which converts to `bool` infallibly.
+    // which converts to `bool` infallibly. `subtle` short-circuits on
+    // length-mismatch, leaking server-token length via timing — acceptable
+    // because the 16-byte floor still gives 128 bits of search space, and
+    // we deliberately do NOT log the wire-token length on mismatch (would
+    // be a second oracle for the same fact).
     let eq: bool = wire_token.as_bytes().ct_eq(server_token.as_bytes()).into();
     if !eq {
-        // Never log either token. Wire-token LENGTH is OK -- helps the
-        // operator see "did I send the right shape" without leaking material.
-        log::warn!(
-            "seed handler: x-edgezero-seed mismatch (wire-token-len={})",
-            wire_token.len()
-        );
+        // Never log either token, and never log either token's length —
+        // see comment above the ct_eq call.
+        log::warn!("seed handler: x-edgezero-seed mismatch");
         return empty_response(StatusCode::FORBIDDEN);
     }
 
-    // Body parse.
+    // Method gate (post-auth).
+    if req.method() != Method::POST {
+        return empty_response(StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // Content-type gate (post-auth). Accept `application/json` with no
+    // parameters, OR `application/json` followed by `;` and parameters
+    // (`; charset=utf-8`). Plain `starts_with("application/json")` would
+    // also accept `application/json-bad`, which is the wrong shape.
+    let content_type = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if content_type != "application/json" && !content_type.starts_with("application/json;") {
+        return empty_response(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    // Body size cap — pre-parse. Bounds the read surface so an
+    // authenticated-but-malicious push (and a buggy operator script)
+    // can't wedge the runtime with a multi-MB payload.
     let body_bytes = req.body().as_bytes().unwrap_or(&[]);
+    if body_bytes.len() > MAX_BODY_BYTES {
+        return text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "request body exceeds {MAX_BODY_BYTES} bytes (got {})",
+                body_bytes.len()
+            ),
+        );
+    }
+
+    // Body parse.
     let parsed: SeedRequestBody = match serde_json::from_slice(body_bytes) {
         Ok(parsed) => parsed,
         Err(err) => {
@@ -264,6 +359,31 @@ pub(crate) async fn handle_seed_request_core<W: SeedWriter>(
     };
     if parsed.entries.is_empty() {
         return text_response(StatusCode::BAD_REQUEST, "entries must be non-empty");
+    }
+    if parsed.entries.len() > MAX_ENTRIES {
+        return text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "entries.len() = {} exceeds the {MAX_ENTRIES}-entry cap",
+                parsed.entries.len()
+            ),
+        );
+    }
+    if let Some(oversized) = parsed
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.value.len() > MAX_VALUE_BYTES)
+    {
+        let (index, entry) = oversized;
+        return text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "entries[{index}].value (key `{}`) is {} bytes, exceeds the {MAX_VALUE_BYTES}-byte per-value cap",
+                entry.key,
+                entry.value.len()
+            ),
+        );
     }
 
     // Store gate -- match the body's `store` against env-resolved platform
@@ -281,14 +401,25 @@ pub(crate) async fn handle_seed_request_core<W: SeedWriter>(
         );
     }
 
-    // Write entries sequentially. On first failure, surface 422 + the
-    // failed key so the operator knows where the partial write stopped.
-    for entry in &parsed.entries {
-        if let Err(err) = writer.write(&parsed.store, &entry.key, &entry.value).await {
-            return text_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string());
+    // Hoist the (key, value) borrow set out of the body — `write_batch`
+    // takes `&[(&str, &str)]` so the impl can open the store once.
+    let entry_refs: Vec<(&str, &str)> = parsed
+        .entries
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry.value.as_str()))
+        .collect();
+
+    match writer.write_batch(&parsed.store, &entry_refs).await {
+        Ok(()) => empty_response(StatusCode::NO_CONTENT),
+        Err(SeedError::NoSuchStore { store, source }) => text_response(
+            StatusCode::NOT_FOUND,
+            format!("runtime rejected store `{store}`: {source}. did you declare the label in spin.toml's `key_value_stores` AND register a backend for it in runtime-config.toml?"),
+        ),
+        Err(err @ SeedError::WriteFailed { .. }) => {
+            // err's Display already names the index + key.
+            text_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
         }
     }
-    empty_response(StatusCode::NO_CONTENT)
 }
 
 /// Thin wasm wrapper: Spin request → core request → core handler → core
@@ -323,6 +454,8 @@ mod tests {
     use super::*;
     use edgezero_core::http::request_builder;
     use futures::executor::block_on;
+    use std::fmt::Write as _;
+    use std::str;
 
     /// 21-byte token — exceeds the 16-byte floor.
     const VALID_TOKEN: &str = "test-token-1234567890";
@@ -536,6 +669,66 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// Runtime reports the label isn't backed by any registered KV
+    /// store (the operator added it to `key_value_stores` but forgot
+    /// the `runtime-config.toml` stanza). The seed handler already
+    /// vetted the body label against `known_platform_labels`, so this
+    /// is a configuration drift error — map to 404 with an actionable
+    /// hint instead of blanket 422.
+    #[test]
+    fn writer_no_such_store_returns_404_naming_store_and_runtime_config() {
+        let req = post(Some(VALID_TOKEN), happy_body());
+        let writer = InMemorySeedWriter::no_such_store();
+        let resp = block_on(handle_seed_request_core(
+            &req,
+            &writer,
+            Some(VALID_TOKEN),
+            &labels(),
+        ));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body_text = str::from_utf8(resp.body().as_bytes().expect("test response body is Once"))
+            .expect("404 body is utf-8");
+        assert!(
+            body_text.contains("app_config") && body_text.contains("runtime-config.toml"),
+            "404 body names the store + points at runtime-config.toml: {body_text}"
+        );
+        assert!(writer.recorded().is_empty(), "no writes on no-such-store");
+    }
+
+    /// 422 body must name BOTH the failing entry index AND the key so
+    /// the operator can trim earlier entries and retry without
+    /// re-writing committed prefixes.
+    #[test]
+    fn writer_failure_at_index_one_returns_422_naming_index_and_key() {
+        // Two-entry body — fail on the 2nd write so the first entry was
+        // already committed in the in-memory store. The 422 body must
+        // name `index = 1` and `key = "second"`.
+        let body = br#"{"store":"app_config","entries":[{"key":"first","value":"a"},{"key":"second","value":"b"}]}"#.to_vec();
+        let req = post(Some(VALID_TOKEN), body);
+        let writer = InMemorySeedWriter::failing_at(1);
+        let resp = block_on(handle_seed_request_core(
+            &req,
+            &writer,
+            Some(VALID_TOKEN),
+            &labels(),
+        ));
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body_text = str::from_utf8(resp.body().as_bytes().expect("test response body is Once"))
+            .expect("422 body is utf-8");
+        assert!(
+            body_text.contains("entry 1") && body_text.contains("`second`"),
+            "422 body must name failing index + key: {body_text}"
+        );
+        // The first entry's write committed before the second failed.
+        let recorded = writer.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "partial-write semantics: first entry stuck"
+        );
+        assert!(recorded.contains_key(&("app_config".to_owned(), "first".to_owned())));
+    }
+
     #[test]
     fn happy_path_returns_204_and_records_entries() {
         let body =
@@ -560,5 +753,165 @@ mod tests {
             recorded.get(&("app_config".to_owned(), "service.timeout_ms".to_owned())),
             Some(&"1500".to_owned()),
         );
+    }
+
+    // ---------- fail-closed ordering (token gate FIRST) ----------
+
+    /// `run_app_with_seeder`'s docstring promises that every seed-route
+    /// request returns 401 when the server token is unset/blank/short.
+    /// A GET with no server token must trip 401 NOT 405 — otherwise an
+    /// unauthenticated attacker can fingerprint the route as a seed
+    /// handler by observing method-gate behaviour.
+    #[test]
+    fn get_with_unset_server_token_returns_401_not_405() {
+        let req = request_with(Method::GET, "application/json", Some(VALID_TOKEN), vec![]);
+        let writer = InMemorySeedWriter::new();
+        let resp = block_on(handle_seed_request_core(&req, &writer, None, &labels()));
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "fail-closed token gate must fire before the method gate"
+        );
+    }
+
+    /// Same fail-closed promise — wrong content-type with no server
+    /// token must trip 401, not 415.
+    #[test]
+    fn wrong_content_type_with_unset_server_token_returns_401_not_415() {
+        let req = request_with(Method::POST, "text/plain", Some(VALID_TOKEN), vec![]);
+        let writer = InMemorySeedWriter::new();
+        let resp = block_on(handle_seed_request_core(&req, &writer, None, &labels()));
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "fail-closed token gate must fire before the content-type gate"
+        );
+    }
+
+    // ---------- body / entries / value caps ----------
+
+    /// Pre-auth attack surface bound — a body over `MAX_BODY_BYTES` is
+    /// rejected with 413 before `serde_json::from_slice` runs, so an
+    /// authenticated push can't OOM the runtime with a multi-MB POST.
+    #[test]
+    fn body_over_max_size_returns_413() {
+        let bloat = "x".repeat(MAX_BODY_BYTES + 1);
+        let body =
+            format!(r#"{{"store":"app_config","entries":[{{"key":"k","value":"{bloat}"}}]}}"#)
+                .into_bytes();
+        assert!(body.len() > MAX_BODY_BYTES);
+        let req = post(Some(VALID_TOKEN), body);
+        let writer = InMemorySeedWriter::new();
+        let resp = block_on(handle_seed_request_core(
+            &req,
+            &writer,
+            Some(VALID_TOKEN),
+            &labels(),
+        ));
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// `MAX_ENTRIES` + 1 entries -> 413 with a body that names the cap.
+    /// Use a programmatically-built body to avoid bloating the test
+    /// source; we don't need real entry contents, just count.
+    #[test]
+    fn entries_over_cap_returns_413() {
+        let mut entries = String::with_capacity(MAX_ENTRIES * 20);
+        for i in 0..=MAX_ENTRIES {
+            if i > 0 {
+                entries.push(',');
+            }
+            write!(entries, r#"{{"key":"k{i}","value":"v"}}"#)
+                .expect("write to String is infallible");
+        }
+        let body = format!(r#"{{"store":"app_config","entries":[{entries}]}}"#).into_bytes();
+        // Body itself stays well under MAX_BODY_BYTES (~25 KB at 1001
+        // entries) so the entries-cap path is exercised, not the body
+        // cap.
+        assert!(body.len() < MAX_BODY_BYTES);
+        let req = post(Some(VALID_TOKEN), body);
+        let writer = InMemorySeedWriter::new();
+        let resp = block_on(handle_seed_request_core(
+            &req,
+            &writer,
+            Some(VALID_TOKEN),
+            &labels(),
+        ));
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body_text = str::from_utf8(resp.body().as_bytes().expect("test response body is Once"))
+            .expect("413 body is utf-8");
+        assert!(
+            body_text.contains(&MAX_ENTRIES.to_string()),
+            "413 body names the cap: {body_text}"
+        );
+    }
+
+    /// A single entry whose value exceeds `MAX_VALUE_BYTES` -> 413 with a
+    /// body that names the offending entry index AND key.
+    #[test]
+    fn value_over_per_value_cap_returns_413_naming_index_and_key() {
+        let oversized = "x".repeat(MAX_VALUE_BYTES + 1);
+        let body = format!(r#"{{"store":"app_config","entries":[{{"key":"a","value":"ok"}},{{"key":"big","value":"{oversized}"}}]}}"#).into_bytes();
+        let req = post(Some(VALID_TOKEN), body);
+        let writer = InMemorySeedWriter::new();
+        let resp = block_on(handle_seed_request_core(
+            &req,
+            &writer,
+            Some(VALID_TOKEN),
+            &labels(),
+        ));
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body_text = str::from_utf8(resp.body().as_bytes().expect("test response body is Once"))
+            .expect("413 body is utf-8");
+        assert!(
+            body_text.contains("entries[1]") && body_text.contains("`big`"),
+            "413 body names oversized index + key: {body_text}"
+        );
+        assert!(
+            writer.recorded().is_empty(),
+            "value-cap rejection must fire BEFORE any write"
+        );
+    }
+
+    // ---------- content-type tightening (N-L1) ----------
+
+    /// `application/json-bad` is NOT a JSON media type — the previous
+    /// `starts_with("application/json")` check accepted it.
+    #[test]
+    fn content_type_application_json_bad_returns_415() {
+        let req = request_with(
+            Method::POST,
+            "application/json-bad",
+            Some(VALID_TOKEN),
+            happy_body(),
+        );
+        let writer = InMemorySeedWriter::new();
+        let resp = block_on(handle_seed_request_core(
+            &req,
+            &writer,
+            Some(VALID_TOKEN),
+            &labels(),
+        ));
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    /// `application/json; charset=utf-8` is still accepted (parameters
+    /// after the `;` are fine).
+    #[test]
+    fn content_type_application_json_with_charset_returns_204() {
+        let req = request_with(
+            Method::POST,
+            "application/json; charset=utf-8",
+            Some(VALID_TOKEN),
+            happy_body(),
+        );
+        let writer = InMemorySeedWriter::new();
+        let resp = block_on(handle_seed_request_core(
+            &req,
+            &writer,
+            Some(VALID_TOKEN),
+            &labels(),
+        ));
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 }

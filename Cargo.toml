@@ -59,7 +59,11 @@ serde_json = "1"
 subtle = "2"
 serde_urlencoded = "0.7"
 simple_logger = "5"
-spin-sdk = { version = "6", default-features = false, features = ["http", "key-value", "variables"] }
+# Pinned to the `~6.0` range (allows 6.0.x, blocks 6.1+) so a minor
+# bump that touches `key_value::Store::open`'s async signature or the
+# wasi-http import surface fails at build time rather than at `spin
+# up` (where a runtime mismatch surfaces as opaque WIT linker errors).
+spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
 tempfile = "3"
 toml_edit = "0.23"
 thiserror = "2"
