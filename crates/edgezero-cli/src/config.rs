@@ -29,7 +29,7 @@ use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use toml::value::Table;
 use toml::Value;
@@ -572,21 +572,86 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
             adapter_cfg.adapter.manifest.as_deref(),
             adapter_cfg.adapter.component.as_deref(),
         )?;
+        reject_reserved_path_collisions(name, adapter, ctx.manifest())?;
+        reject_merged_id_collisions(name, adapter, ctx.manifest())?;
     }
     Ok(())
 }
 
-/// Typed-only adapter dispatch: feed each adapter the flattened
-/// config keys and the `#[secret]` (`KeyInDefault` only —
-/// `#[secret(store_ref)]` values are runtime store ids, not
-/// flat-namespace candidates).
+/// Reject logical-id overlap across store kinds the adapter merges
+/// into a single backend (e.g. Spin's KV + Config both back to
+/// `spin_sdk::key_value::Store`). Without this check, declaring the
+/// same id under both kinds produces two store handles that silently
+/// write to the same underlying KV label at runtime.
+fn reject_merged_id_collisions(
+    adapter_name: &str,
+    adapter: &'static dyn adapter_registry::Adapter,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let merged = adapter.merged_id_kinds();
+    if merged.len() < 2 {
+        return Ok(());
+    }
+    // Build a (kind, id) -> first-seen-kind map; on the second
+    // appearance of a shared id, report the collision naming both
+    // kinds.
+    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    for kind in merged {
+        let maybe_decl = match *kind {
+            "kv" => manifest.stores.kv.as_ref(),
+            "config" => manifest.stores.config.as_ref(),
+            "secrets" => manifest.stores.secrets.as_ref(),
+            _ => continue,
+        };
+        let Some(decl) = maybe_decl else {
+            continue;
+        };
+        for id in &decl.ids {
+            if let Some(prior_kind) = seen.insert(id.as_str(), kind) {
+                return Err(format!(
+                    "logical id `{id}` is declared under BOTH `[stores.{prior_kind}]` and `[stores.{kind}]`, but adapter `{adapter_name}` backs those kinds with the same runtime store. Rename one — the two would silently share writes via the same `key_value_stores` label.",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject any `[[triggers.http]].path` that collides with a route the
+/// adapter's runtime intercepts before the app router runs (e.g. Spin's
+/// `run_app_with_seeder` short-circuits `/__edgezero/config/seed`).
+/// Without this check the user's handler is silently unreachable.
+fn reject_reserved_path_collisions(
+    adapter_name: &str,
+    adapter: &'static dyn adapter_registry::Adapter,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let reserved = adapter.reserved_paths();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    for trigger in &manifest.triggers.http {
+        if reserved.contains(&trigger.path.as_str()) {
+            return Err(format!(
+                "trigger {} declares HTTP path `{}`, which adapter `{adapter_name}` reserves for its own runtime intercept (the handler would be silently unreachable). Move the user route to a different path.",
+                trigger.id.as_deref().unwrap_or(&trigger.path),
+                trigger.path,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Typed-only adapter dispatch: feed each adapter the `#[secret]`
+/// (`KeyInDefault` only — `#[secret(store_ref)]` values are runtime
+/// store ids, not flat-namespace candidates) so adapters whose
+/// secret store has a flat-namespace constraint (Spin) can detect
+/// within-secrets collisions.
 fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
     let raw_table = ctx
         .raw_config
         .as_table()
         .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
-    let flattened = flatten_keys(raw_table);
-    let key_refs: Vec<&str> = flattened.iter().map(String::as_str).collect();
 
     let mut plain_secrets: Vec<(&str, &str)> = Vec::new();
     for field in C::SECRET_FIELDS {
@@ -600,7 +665,7 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
 
     for name in ctx.manifest().adapters.keys() {
         if let Some(adapter) = adapter_registry::get_adapter(name) {
-            adapter.validate_typed_secrets(&key_refs, &plain_secrets)?;
+            adapter.validate_typed_secrets(&plain_secrets)?;
         }
     }
     Ok(())
@@ -1128,6 +1193,142 @@ ids = ["default"]
     }
 
     #[test]
+    fn spin_reserved_seed_path_collision_is_rejected() {
+        // `run_app_with_seeder` intercepts `/__edgezero/config/seed`
+        // before the app router runs. A `[[triggers.http]]` declaring
+        // the same path would be silently unreachable; the validator
+        // must catch it.
+        let manifest_str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+
+[[triggers.http]]
+path = "/__edgezero/config/seed"
+handler = "demo_spin::accidentally_shadow_the_seed"
+"#;
+        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
+        write_spin_toml(dir.path(), VALID_SPIN_TOML);
+        let err = run_config_validate(&args_for(&manifest))
+            .expect_err("reserved-path collision must error");
+        assert!(
+            err.contains("/__edgezero/config/seed") && err.contains("spin"),
+            "error names the colliding path + adapter: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_logical_id_collision_across_kv_and_config_is_rejected() {
+        // Spin merges KV + Config into one `key_value::Store` per
+        // label. Declaring `sessions` under BOTH kinds resolves to
+        // one underlying store; the runtime would silently share
+        // writes between `kv_store("sessions")` and
+        // `config_store("sessions")`. Validator catches.
+        let manifest_str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.kv]
+ids = ["sessions"]
+
+[stores.config]
+ids = ["sessions"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
+        write_spin_toml(dir.path(), VALID_SPIN_TOML);
+        let err = run_config_validate(&args_for(&manifest))
+            .expect_err("merged-kind id collision must error");
+        assert!(
+            err.contains("sessions")
+                && err.contains("[stores.kv]")
+                && err.contains("[stores.config]"),
+            "error names the colliding id + both kinds: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_distinct_logical_ids_across_kv_and_config_validate_cleanly() {
+        // Sanity: distinct ids across the merged kinds are fine.
+        let manifest_str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.kv]
+ids = ["sessions"]
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
+        write_spin_toml(dir.path(), VALID_SPIN_TOML);
+        run_config_validate(&args_for(&manifest))
+            .expect("distinct ids across kinds must validate cleanly");
+    }
+
+    #[test]
+    fn spin_non_reserved_paths_validate_cleanly() {
+        // Sanity: a regular `[[triggers.http]]` path is unaffected.
+        let manifest_str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+
+[[triggers.http]]
+path = "/api/echo"
+handler = "demo_spin::echo"
+"#;
+        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
+        write_spin_toml(dir.path(), VALID_SPIN_TOML);
+        run_config_validate(&args_for(&manifest)).expect("non-reserved path must validate cleanly");
+    }
+
+    #[test]
     fn spin_component_discovery_errors_on_zero_components() {
         let spin_toml = r#"
 spin_manifest_version = 2
@@ -1427,6 +1628,242 @@ deep = true
     // -------------------------------------------------------------------
     // config push (raw + typed) — spec
     // -------------------------------------------------------------------
+
+    // ---------- resolve_adapter_push_ctx (D3 / D8 resolution chains) ----------
+    //
+    // These tests pin the URL/token precedence rules that the seed-
+    // handler push depends on. The function is pure (no I/O beyond the
+    // already-loaded `Manifest` + `EnvConfig`), so each test builds
+    // small fixtures and asserts the resolved values directly.
+
+    /// Minimal manifest with an `[adapters.spin.commands].seed-url`
+    /// set to the supplied value (`None` = no manifest seed-url).
+    fn spin_manifest_with_seed_url(seed_url: Option<&str>) -> String {
+        let extra = seed_url.map_or_else(String::new, |url| {
+            format!("seed-url = {}", toml::Value::String(url.to_owned()))
+        });
+        format!(
+            r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+{extra}
+"#
+        )
+    }
+
+    fn load_manifest_for_resolver(manifest_body: &str) -> (TempDir, ManifestLoader) {
+        let dir = TempDir::new().expect("temp dir");
+        let manifest_path = dir.path().join("edgezero.toml");
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        let loader = ManifestLoader::from_path(&manifest_path).expect("load manifest");
+        (dir, loader)
+    }
+
+    /// Empty `(key, value)` iterator typed for `EnvConfig::from_vars`
+    /// without needing the absolute `std::iter::empty` path at call
+    /// sites (strict clippy bans the absolute form).
+    fn empty_env() -> impl Iterator<Item = (&'static str, String)> {
+        let arr: [(&str, String); 0] = [];
+        arr.into_iter()
+    }
+
+    fn push_args_for_resolver(local: bool) -> ConfigPushArgs {
+        ConfigPushArgs {
+            adapter: "spin".to_owned(),
+            app_config: None,
+            dry_run: false,
+            local,
+            manifest: PathBuf::new(),
+            no_env: true,
+            seed_token: None,
+            seed_url: None,
+            store: None,
+        }
+    }
+
+    #[test]
+    fn resolve_seed_url_flag_beats_env_and_manifest_in_prod() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
+            "https://manifest.example/seed",
+        )));
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__ADAPTERS__SPIN__SEED_URL",
+            "https://env.example/seed",
+        )]);
+        let mut args = push_args_for_resolver(false);
+        args.seed_url = Some("https://flag.example/seed".to_owned());
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(
+            resolved.seed_url.as_deref(),
+            Some("https://flag.example/seed"),
+            "CLI flag must win in prod mode"
+        );
+    }
+
+    #[test]
+    fn resolve_seed_url_env_beats_manifest_in_prod_when_flag_unset() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
+            "https://manifest.example/seed",
+        )));
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__ADAPTERS__SPIN__SEED_URL",
+            "https://env.example/seed",
+        )]);
+        let args = push_args_for_resolver(false);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(
+            resolved.seed_url.as_deref(),
+            Some("https://env.example/seed"),
+            "env must beat manifest in prod mode when flag is unset"
+        );
+    }
+
+    #[test]
+    fn resolve_seed_url_manifest_used_when_flag_and_env_unset_in_prod() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
+            "https://manifest.example/seed",
+        )));
+        let env = EnvConfig::from_vars(empty_env());
+        let args = push_args_for_resolver(false);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(
+            resolved.seed_url.as_deref(),
+            Some("https://manifest.example/seed"),
+            "manifest fallback fires in prod when both flag and env are unset"
+        );
+    }
+
+    #[test]
+    fn resolve_seed_url_none_when_nothing_set_in_prod() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
+        let env = EnvConfig::from_vars(empty_env());
+        let args = push_args_for_resolver(false);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert!(
+            resolved.seed_url.is_none(),
+            "prod mode resolves to None when nothing is configured — the adapter then surfaces its `seed URL is not configured` error: {:?}",
+            resolved.seed_url
+        );
+    }
+
+    /// SECURITY-LOAD-BEARING: `--local` MUST NOT consult the
+    /// manifest's prod URL. An operator with a prod
+    /// `[adapters.spin.commands].seed-url` set should still get the
+    /// builtin localhost URL when they run `config push --local`,
+    /// otherwise the prod URL leaks into local pushes.
+    #[test]
+    fn resolve_seed_url_local_mode_never_consults_manifest_even_when_set() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
+            "https://prod.example/seed",
+        )));
+        let env = EnvConfig::from_vars(empty_env());
+        let args = push_args_for_resolver(true);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(
+            resolved.seed_url.as_deref(),
+            Some("http://127.0.0.1:3000/__edgezero/config/seed"),
+            "local mode must fall through to the builtin localhost URL, NOT the manifest prod URL ({:?})",
+            resolved.seed_url
+        );
+    }
+
+    #[test]
+    fn resolve_seed_url_local_env_var_beats_builtin_fallback() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL",
+            "http://localhost:8000/seed",
+        )]);
+        let args = push_args_for_resolver(true);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(
+            resolved.seed_url.as_deref(),
+            Some("http://localhost:8000/seed")
+        );
+    }
+
+    #[test]
+    fn resolve_seed_url_local_flag_beats_env_and_builtin() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL",
+            "http://localhost:8000/seed",
+        )]);
+        let mut args = push_args_for_resolver(true);
+        args.seed_url = Some("http://flag.local/seed".to_owned());
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(resolved.seed_url.as_deref(), Some("http://flag.local/seed"));
+    }
+
+    /// Prod-mode env var must not bleed into local mode (different env
+    /// var names, separate chains per D3).
+    #[test]
+    fn resolve_seed_url_local_mode_ignores_prod_env_var() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__ADAPTERS__SPIN__SEED_URL",
+            "https://prod.example/seed",
+        )]);
+        let args = push_args_for_resolver(true);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(
+            resolved.seed_url.as_deref(),
+            Some("http://127.0.0.1:3000/__edgezero/config/seed"),
+            "the prod env var must NOT leak into local mode"
+        );
+    }
+
+    // ---------- seed_token resolution (D11: NEVER read from manifest) ----------
+
+    #[test]
+    fn resolve_seed_token_flag_beats_env() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
+        let env =
+            EnvConfig::from_vars([("EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN", "from-env-token")]);
+        let mut args = push_args_for_resolver(false);
+        args.seed_token = Some("from-flag-token".to_owned());
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(resolved.seed_token.as_deref(), Some("from-flag-token"));
+    }
+
+    #[test]
+    fn resolve_seed_token_env_when_flag_unset() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
+        let env =
+            EnvConfig::from_vars([("EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN", "from-env-token")]);
+        let args = push_args_for_resolver(false);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert_eq!(resolved.seed_token.as_deref(), Some("from-env-token"));
+    }
+
+    #[test]
+    fn resolve_seed_token_none_when_nothing_set() {
+        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
+        let env = EnvConfig::from_vars(empty_env());
+        let args = push_args_for_resolver(false);
+
+        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
+        assert!(resolved.seed_token.is_none());
+    }
 
     // ---------- raw push ----------
 

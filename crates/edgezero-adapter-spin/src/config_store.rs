@@ -51,15 +51,22 @@ impl SpinConfigStore {
     /// dispatch error instead of on first config read.
     ///
     /// # Errors
-    /// Returns [`ConfigStoreError::unavailable`] when the underlying
-    /// `SpinSdkKvStore::open` fails — typically because the
-    /// label isn't declared in the component's `key_value_stores = [...]`.
+    /// Returns [`ConfigStoreError::internal`] when the underlying
+    /// `SpinSdkKvStore::open` fails — typically because the label isn't
+    /// declared in the component's `key_value_stores = [...]` AND
+    /// registered with a backend in `runtime-config.toml`. This is a
+    /// structural / permanent failure (operator config drift), not a
+    /// transient backend hiccup, so we report `Internal` rather than
+    /// `Unavailable` so observability alerts on it and callers don't
+    /// retry pointlessly.
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
     #[inline]
     pub async fn open(label: String) -> Result<Self, ConfigStoreError> {
-        let store = SpinSdkKvStore::open(&label)
-            .await
-            .map_err(|err| ConfigStoreError::unavailable(format!("open `{label}`: {err}")))?;
+        let store = SpinSdkKvStore::open(&label).await.map_err(|err| {
+            ConfigStoreError::internal(anyhow::anyhow!(
+                "open `{label}`: {err} (is the label declared in spin.toml's `key_value_stores` AND registered in runtime-config.toml?)"
+            ))
+        })?;
         Ok(Self {
             inner: SpinConfigBackend::Spin { label, store },
         })

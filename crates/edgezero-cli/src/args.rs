@@ -170,11 +170,18 @@ pub struct ConfigPushArgs {
     pub dry_run: bool,
     /// Push to the adapter's local-emulator state instead of the live
     /// platform. For Fastly this edits `[local_server.config_stores]`
-    /// in the adapter's `fastly.toml` (the Viceroy reads it on startup);
-    /// for Cloudflare it runs `wrangler kv bulk put --local` so writes
-    /// land in `.wrangler/state`. Axum and Spin's pushes are already
-    /// local-only, so `--local` is a no-op there (identical to the
-    /// default).
+    /// in the adapter's `fastly.toml` (the Viceroy reads it on
+    /// startup); for Cloudflare it runs `wrangler kv bulk put --local`
+    /// so writes land in `.wrangler/state`. Axum's push is already
+    /// local-only, so `--local` is a no-op there. For Spin it
+    /// **switches `--seed-url` resolution** from the prod chain
+    /// (`--seed-url` → `EDGEZERO__ADAPTERS__SPIN__SEED_URL` →
+    /// `[adapters.spin.commands].seed-url` in `edgezero.toml`) to the
+    /// local chain (`--seed-url` →
+    /// `EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL` → builtin
+    /// `http://127.0.0.1:3000/__edgezero/config/seed`). The manifest
+    /// prod URL is NEVER consulted under `--local` so a misconfigured
+    /// prod entry can't bleed into a local push.
     #[arg(long)]
     pub local: bool,
     /// Path to the manifest (default: `edgezero.toml`).
@@ -188,14 +195,24 @@ pub struct ConfigPushArgs {
     /// Seed token for adapters that push via HTTP (currently spin).
     /// Resolution order: this flag → `EDGEZERO__ADAPTERS__<NAME>__SEED_TOKEN`.
     /// Never read from `edgezero.toml` (tokens stay out of manifests).
+    ///
+    /// **Shared between prod and `--local`.** Unlike `--seed-url`,
+    /// there is no separate `LOCAL_SEED_TOKEN` env var — the same
+    /// token chain feeds both modes. An operator with prod and local
+    /// contexts open in the same shell should set
+    /// `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` to a value that's safe
+    /// to send to BOTH, or pass `--seed-token` explicitly per push
+    /// to avoid cross-targeting.
     #[arg(long)]
     pub seed_token: Option<String>,
     /// Seed URL for adapters that push via HTTP (currently spin). For
     /// the prod chain (no `--local`), resolution order is: this flag →
-    /// `EDGEZERO__ADAPTERS__<NAME>__SEED_URL` → `[adapters.<name>.commands].seed_url`
-    /// in `edgezero.toml`. For `--local`, manifest is NEVER consulted;
-    /// the order is: this flag → `EDGEZERO__ADAPTERS__<NAME>__LOCAL_SEED_URL`
-    /// → builtin `http://127.0.0.1:3000/__edgezero/config/seed`.
+    /// `EDGEZERO__ADAPTERS__<NAME>__SEED_URL` → `seed-url` under
+    /// `[adapters.<name>.commands]` in `edgezero.toml` (TOML key has a
+    /// dash; serde renames to the in-memory `seed_url`). For
+    /// `--local`, manifest is NEVER consulted; the order is: this
+    /// flag → `EDGEZERO__ADAPTERS__<NAME>__LOCAL_SEED_URL` → builtin
+    /// `http://127.0.0.1:3000/__edgezero/config/seed`.
     #[arg(long)]
     pub seed_url: Option<String>,
     /// Logical config store id to push to. Defaults to the

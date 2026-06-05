@@ -152,6 +152,14 @@ impl Adapter for SpinCliAdapter {
         }
     }
 
+    fn merged_id_kinds(&self) -> &'static [&'static str] {
+        // Both KV and Config back to `spin_sdk::key_value::Store` via
+        // the same `provision` path; declaring the same logical id
+        // under both kinds resolves to one underlying store with
+        // silent write-collisions. CLI validate rejects.
+        &["kv", "config"]
+    }
+
     fn name(&self) -> &'static str {
         "spin"
     }
@@ -264,7 +272,7 @@ impl Adapter for SpinCliAdapter {
 
         let Some(seed_url) = push_ctx.seed_url else {
             return Err(format!(
-                "seed URL is not configured for spin push: pass `--seed-url <url>`, set `EDGEZERO__ADAPTERS__SPIN__SEED_URL`{}, or add `[adapters.spin.commands].seed_url` to edgezero.toml",
+                "seed URL is not configured for spin push: pass `--seed-url <url>`, set `EDGEZERO__ADAPTERS__SPIN__SEED_URL`{}, or add `seed-url = \"<url>\"` under `[adapters.spin.commands]` in edgezero.toml (the TOML key is `seed-url` with a dash; serde renames it to the in-memory `seed_url`)",
                 if push_ctx.local { " / `EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL`" } else { "" }
             ));
         };
@@ -371,6 +379,14 @@ impl Adapter for SpinCliAdapter {
         )
     }
 
+    fn reserved_paths(&self) -> &'static [&'static str] {
+        // `run_app_with_seeder` intercepts this path BEFORE the app
+        // router runs. A user-declared `[[triggers.http]].handler`
+        // at the same path would be silently unreachable; the CLI
+        // catches the collision at `config validate` time.
+        &["/__edgezero/config/seed"]
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: Multi for KV AND Config (both label-backed via the
         // Spin KV API since Stage 5 of the spin-kv-config plan).
@@ -433,16 +449,13 @@ impl Adapter for SpinCliAdapter {
         ))
     }
 
-    fn validate_typed_secrets(
-        &self,
-        _config_keys: &[&str],
-        plain_secrets: &[(&str, &str)],
-    ) -> Result<(), String> {
+    fn validate_typed_secrets(&self, plain_secrets: &[(&str, &str)]) -> Result<(), String> {
         // Stage 5+: KV-backed config no longer shares Spin's flat
-        // variable namespace, so `config_keys` are NOT considered
-        // here — config can use arbitrary UTF-8 keys without
-        // colliding with `#[secret]` values. Secrets still resolve
-        // through `spin_sdk::variables`, so two checks remain:
+        // variable namespace, so config keys are NOT considered here
+        // (and the trait dropped the parameter in Stage 6+) — config
+        // can use arbitrary UTF-8 keys without colliding with
+        // `#[secret]` values. Secrets still resolve through
+        // `spin_sdk::variables`, so two checks remain:
         //   1. each `#[secret]` value canonicalises (lowercase, no
         //      `.→__` — secrets don't get translated at runtime)
         //      to a valid Spin variable name, so invalid chars
@@ -915,10 +928,7 @@ mod tests {
     #[test]
     fn validate_typed_secrets_passes_with_no_collision() {
         SpinCliAdapter
-            .validate_typed_secrets(
-                &["greeting", "service.timeout_ms"],
-                &[("api_token", "demo_api_token")],
-            )
+            .validate_typed_secrets(&[("api_token", "demo_api_token")])
             .expect("non-colliding inputs must pass");
     }
 
@@ -929,11 +939,16 @@ mod tests {
     #[test]
     fn validate_typed_secrets_rejects_invalid_spin_variable_in_secret_value() {
         let err = SpinCliAdapter
-            .validate_typed_secrets(&["greeting"], &[("api_token", "api-token")])
+            .validate_typed_secrets(&[("api_token", "api-token")])
             .expect_err("dashed secret value must error");
         assert!(
-            err.contains("api-token") && err.contains("api-token") && err.contains("Spin variable"),
-            "error names the bad value + that it's a Spin variable issue: {err}"
+            // The error must name BOTH the field name (`api_token`,
+            // underscore) and the offending value (`api-token`,
+            // dash), plus mark it as a Spin variable issue. The prior
+            // assertion double-checked the value and silently missed
+            // the field-name half.
+            err.contains("api_token") && err.contains("api-token") && err.contains("Spin variable"),
+            "error names the field, the bad value, and the Spin-variable bucket: {err}"
         );
     }
 
@@ -943,7 +958,7 @@ mod tests {
     #[test]
     fn validate_typed_secrets_detects_collision_between_two_lowercased_secret_values() {
         let err = SpinCliAdapter
-            .validate_typed_secrets(&[], &[("first", "SHARED_NAME"), ("second", "shared_name")])
+            .validate_typed_secrets(&[("first", "SHARED_NAME"), ("second", "shared_name")])
             .expect_err("two values lowercasing to the same name must collide");
         assert!(
             err.contains("shared_name") && err.contains("collides"),
@@ -1441,9 +1456,13 @@ mod tests {
             err.contains("EDGEZERO__ADAPTERS__SPIN__SEED_URL"),
             "names prod env var: {err}"
         );
+        // The TOML key is `seed-url` (dashed) — serde renames it to
+        // the in-memory `seed_url`. The error must point at the
+        // dashed key so the operator can copy-paste it into their
+        // edgezero.toml without it being silently ignored.
         assert!(
-            err.contains("[adapters.spin.commands].seed_url"),
-            "names manifest fallback: {err}"
+            err.contains("seed-url") && err.contains("[adapters.spin.commands]"),
+            "names manifest fallback by its dashed TOML key: {err}"
         );
         assert!(
             !err.contains("LOCAL_SEED_URL"),

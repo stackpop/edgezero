@@ -189,6 +189,23 @@ pub trait Adapter: Sync + Send {
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
 
+    /// Store kinds whose logical-id namespaces the adapter merges into
+    /// a single backend at runtime — declaring the SAME logical id
+    /// under two merged kinds causes silent write collisions because
+    /// `provision` resolves both to the same platform label, and
+    /// runtime writes from `kv_store("x")` and `config_store("x")`
+    /// hit the same underlying store. `config validate` rejects such
+    /// overlap. Default: `&[]` (kinds are independent for all
+    /// backends).
+    ///
+    /// Spin overrides this to `&["kv", "config"]` because both kinds
+    /// back to `spin_sdk::key_value::Store` via the same `provision`
+    /// path that writes labels into `[component.<id>].key_value_stores`.
+    #[inline]
+    fn merged_id_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
 
@@ -305,6 +322,20 @@ pub trait Adapter: Sync + Send {
         ))
     }
 
+    /// Routes the adapter's runtime intercepts before the app router
+    /// runs — `config validate` rejects any `[[triggers.http]].handler`
+    /// path that matches one of these, since the user-declared
+    /// handler would be silently shadowed by the adapter's intercept.
+    /// Default: `&[]`.
+    ///
+    /// Spin overrides this to reserve `/__edgezero/config/seed` (the
+    /// `config push --adapter spin` target wired by
+    /// `run_app_with_seeder`).
+    #[inline]
+    fn reserved_paths(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Store kinds for which this adapter is Single-capable per
     /// spec — `--strict` rejects `[stores.<kind>].ids.len() > 1`
     /// when any listed kind matches. Default: `&[]` (Multi for
@@ -361,17 +392,21 @@ pub trait Adapter: Sync + Send {
     /// flat variable namespace, so they are excluded by the CLI
     /// before calling. Default: no-op.
     ///
+    /// Note: the previous signature took a `_config_keys` parameter
+    /// so Spin could detect cross-namespace collision with KV-stored
+    /// values; KV-backed config dropped that need in Stage 6, and no
+    /// remaining adapter consults it. If a future adapter needs the
+    /// flattened config-key set here, add it back via a builder
+    /// context rather than re-introducing a positional parameter
+    /// every adapter has to ignore.
+    ///
     /// # Errors
     /// Returns a human-readable error string on any adapter-
     /// specific conflict — e.g. two `#[secret]` values that
     /// collapse to the same Spin variable name under the
     /// runtime's canonicalisation.
     #[inline]
-    fn validate_typed_secrets(
-        &self,
-        _config_keys: &[&str],
-        _plain_secrets: &[(&str, &str)],
-    ) -> Result<(), String> {
+    fn validate_typed_secrets(&self, _plain_secrets: &[(&str, &str)]) -> Result<(), String> {
         Ok(())
     }
 }
