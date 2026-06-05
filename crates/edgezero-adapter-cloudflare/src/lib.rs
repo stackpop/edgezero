@@ -56,7 +56,10 @@ impl AppExt for App {
 }
 
 /// # Errors
-/// Returns [`log::SetLoggerError`] if a global logger is already installed.
+/// Never; this is currently a no-op on Cloudflare Workers (Workers manages
+/// its own logging). The signature still returns [`log::SetLoggerError`] so
+/// callers and the non-wasm stub stay drop-in compatible if a real logger
+/// is wired in later.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {

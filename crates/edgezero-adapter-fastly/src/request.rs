@@ -114,7 +114,9 @@ pub(crate) fn dispatch_raw(app: &App, req: FastlyRequest) -> Result<FastlyRespon
 /// (non-required: unavailable stores are silently skipped).
 ///
 /// # Errors
-/// Returns an error if the named config store cannot be opened or the underlying handler returns an error.
+/// Missing or unreadable config stores are logged and skipped — not
+/// surfaced as errors. Returns an error only if request conversion, KV
+/// resolution, handler dispatch, or response conversion fails.
 #[inline]
 pub fn dispatch_with_config(
     app: &App,

@@ -72,7 +72,9 @@ pub(crate) struct SpinStoreSettings {
 /// `#[cfg(not(...))]` branches following the Fastly/Cloudflare pattern.
 // TODO: wire in real Spin logger when available
 /// # Errors
-/// Returns [`log::SetLoggerError`] if a global logger is already installed.
+/// Never; this is currently a no-op because Spin manages logging
+/// internally. The signature still returns [`log::SetLoggerError`] so
+/// the future "wire in a real logger" branch stays drop-in compatible.
 #[inline]
 pub fn init_logger() -> Result<(), log::SetLoggerError> {
     Ok(())
