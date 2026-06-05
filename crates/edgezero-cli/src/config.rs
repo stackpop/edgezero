@@ -299,6 +299,9 @@ fn dispatch_push(
     if let Some(path) = resolved.runtime_config_path.as_deref() {
         push_ctx = push_ctx.with_runtime_config_path(path);
     }
+    if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
+        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
+    }
     let lines = if local {
         ctx.adapter.push_config_entries_local(
             manifest_root,

@@ -54,6 +54,12 @@ matchit = "0.9"
 once_cell = "1"
 redb = "4.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
+# `bundled` ships SQLite source so operators don't need a system
+# `libsqlite3-sys` install. Used by `edgezero-adapter-spin`'s CLI-only
+# `config push --adapter spin` writer to write into Spin's local KV
+# file (`<spin.toml dir>/.spin/sqlite_key_value.db`) using the schema
+# vendored from spinframework/spin's `crates/key-value-spin/src/store.rs`.
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
