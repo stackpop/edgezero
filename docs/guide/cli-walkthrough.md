@@ -108,9 +108,10 @@ Per-adapter behaviour:
   tables to `fastly.toml`. Idempotent on the `[setup.*]` block presence.
 
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
-  by the Fermyon stack). For each KV id, appends the label to the resolved
-  `[component.<component>].key_value_stores = [...]` array. Config and secret ids are
-  intentionally **not** handled here — see [§5 Spin manual secret declarations](#5-spin-manual-secret-declarations).
+  by the Fermyon stack). For each KV id AND each `[stores.config]` id (both KV-backed
+  at runtime since the KV-config migration), appends the platform-resolved label to
+  the resolved `[component.<component>].key_value_stores = [...]` array. Secrets stay
+  manual — see [§5 Spin manual secret declarations](#5-spin-manual-secret-declarations).
 
 If your `spin.toml` declares more than one `[component.*]`, set
 `[adapters.spin.adapter].component = "<id>"` in `edgezero.toml` so `provision` knows

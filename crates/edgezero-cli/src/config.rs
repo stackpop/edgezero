@@ -554,7 +554,7 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
 /// platform-label half, an operator can use the env overlay to
 /// silently route two logically-distinct stores to the same
 /// underlying KV label at runtime.
-fn reject_merged_id_collisions(
+pub(crate) fn reject_merged_id_collisions(
     adapter_name: &str,
     adapter: &'static dyn adapter_registry::Adapter,
     manifest: &Manifest,
@@ -1200,6 +1200,7 @@ ids = ["default"]
 
     #[test]
     fn spin_distinct_logical_ids_collide_when_env_overlay_resolves_to_same_platform_label() {
+        use crate::test_support::manifest_guard;
         // F2: distinct logical ids `sessions` (KV) and `app_config`
         // (Config) BOTH map to the same Spin KV label via the env
         // overlay. The runtime opens one underlying store for both
@@ -1230,6 +1231,9 @@ ids = ["default"]
         let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
         write_spin_toml(dir.path(), VALID_SPIN_TOML);
 
+        // Serialise tests that touch process-global env state per
+        // `crate::test_support` docs.
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Both stores forced onto the platform label `shared`.
         let _kv_override = EnvOverride::set("EDGEZERO__STORES__KV__SESSIONS__NAME", "shared");
         let _config_override =
@@ -1863,6 +1867,14 @@ ids = ["default"]
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         )
         .expect("write spin.toml");
+        // Non-default labels (here `app_config`) require a
+        // runtime-config stanza; otherwise the dispatcher errors
+        // early to keep the runtime invariant honest.
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"spin\"\n",
+        )
+        .expect("write runtime-config");
         let mut args = push_args(&manifest, "spin");
         args.dry_run = true;
         args.local = true;
