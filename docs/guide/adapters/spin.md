@@ -158,11 +158,25 @@ no token to manage. Resolution order:
 1. **`--local` set**: forces SQLite-direct against
    `<spin.toml dir>/.spin/sqlite_key_value.db` (Spin's local KV file).
    Useful for poking values in your local dev loop without
-   authenticating against Fermyon Cloud.
+   authenticating against Fermyon Cloud. Even under `--local`, every
+   non-`default` label MUST be declared in `runtime-config.toml`
+   (see point 4 below) — without the stanza, `spin up` errors with
+   `unknown key_value_stores label <name>` and the file you just
+   wrote is unreadable from the running app, so the dispatcher
+   refuses the push and tells you exactly which stanza to add.
 2. **Manifest's `deploy` command targets Fermyon Cloud** (auto-detected
    from `[adapters.spin.commands].deploy` containing `spin deploy` or
-   `spin cloud deploy`): shells `spin cloud key-value set --store
-   <label> <key> <value>` per entry. Authentication comes from
+   `spin cloud deploy`): one batched shellout per ≤96 KiB chunk of
+   `spin cloud key-value set --app <APP> --label <LABEL>
+   KEY=VALUE [KEY=VALUE …]`. `<APP>` comes from
+   `[application].name` in `spin.toml`; `<LABEL>` is the env-resolved
+   platform label (your `[stores.config].id` after the
+   `EDGEZERO__STORES__CONFIG__<ID>__NAME` overlay). EdgeZero uses
+   Fermyon's [app-scoped label model](https://developer.fermyon.com/cloud/linking-applications-to-resources-using-labels),
+   so the operator pre-links the label to a cloud KV store via
+   `spin cloud link key-value` (or the Fermyon dashboard) before
+   the first push; an unlinked label produces an actionable error
+   suggesting the link command. Authentication comes from
    `spin cloud login` — EdgeZero does not store cloud credentials.
 3. **`runtime-config.toml` declares this label's backend**:
    - `type = "spin"` → SQLite-direct (honours an explicit `path` field
@@ -171,7 +185,10 @@ no token to manage. Resolution order:
      pointing at the backend's native CLI (e.g. `redis-cli -u <url>
      SET <key> <value>`). Native-CLI dispatch for redis / azure is
      planned for a follow-up release.
-4. **Default**: SQLite-direct at Spin's default path.
+4. **Default**: only the `default` label falls through to SQLite
+   without a runtime-config stanza (Spin auto-provides `default`).
+   Any other label MUST have a `[key_value_store.<label>]` entry —
+   absent it, the dispatcher errors before any write.
 
 Schema-coupling note: the SQLite writer uses the exact `spin_key_value`
 schema and `INSERT … ON CONFLICT DO UPDATE` statement vendored from

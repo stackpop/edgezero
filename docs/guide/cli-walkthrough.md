@@ -180,17 +180,31 @@ single string values, and pushes per-adapter:
   default; override with `--runtime-config <path>`) to dispatch
   per-backend. Decision order:
   1. `--local` forces SQLite-direct against
-     `<spin.toml dir>/.spin/sqlite_key_value.db`.
+     `<spin.toml dir>/.spin/sqlite_key_value.db`. Non-`default` labels
+     still require a `[key_value_store.<label>]` stanza in
+     runtime-config.toml — without it, the dispatcher refuses the
+     push and tells you the exact stanza to add, since the file you'd
+     write would be unreadable from a running `spin up`.
   2. If the manifest's `[adapters.spin.commands].deploy` shells to
-     `spin deploy` / `spin cloud deploy`, push shells
-     `spin cloud key-value set --store <label> <key> <value>` per
-     entry. Authenticate first via `spin cloud login`.
+     `spin deploy` / `spin cloud deploy`, push batches entries into
+     `spin cloud key-value set --app <APP> --label <LABEL>
+     KEY=VALUE [KEY=VALUE …]` invocations (one shellout per
+     ≤96 KiB argv chunk, ≥1000 entries per invocation). `<APP>`
+     comes from `[application].name` in spin.toml; `<LABEL>` is the
+     env-resolved platform label per Fermyon's
+     [app-scoped label model](https://developer.fermyon.com/cloud/linking-applications-to-resources-using-labels).
+     Pre-link the label to a cloud KV store with
+     `spin cloud link key-value` (or the dashboard) before the
+     first push; authenticate first via `spin cloud login`.
   3. Otherwise dispatch on `runtime-config.toml`'s
      `[key_value_store.<label>].type`: `type = "spin"` → SQLite-direct
-     write; `type = "redis"` / `azure_cosmos` / unknown → clear error
-     pointing at the backend's native CLI (e.g. `redis-cli -u <url>
+     write (stanza required for non-`default` labels); `type =
+     "redis"` / `azure_cosmos` / unknown → clear error pointing at
+     the backend's native CLI (e.g. `redis-cli -u <url>
      SET <key> <value>`).
-  4. Default: SQLite-direct at Spin's `.spin/sqlite_key_value.db`.
+  4. Default: SQLite-direct at Spin's `.spin/sqlite_key_value.db`,
+     but ONLY for the `default` label (Spin auto-provides). Other
+     labels require a stanza per point 1.
 
   No internet-facing endpoint is involved on the EdgeZero side: the
   SQLite writer opens the file directly via `rusqlite` (using Spin's

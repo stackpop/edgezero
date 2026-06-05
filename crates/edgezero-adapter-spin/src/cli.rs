@@ -462,6 +462,37 @@ fn collect_spin_component_ids(parsed: &toml::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Read `[application].name` from `spin.toml`. Required by the
+/// Fermyon Cloud writer to address KV stores via the app-scoped
+/// label model (`--app <app> --label <label>`).
+///
+/// # Errors
+/// Returns a human-readable error string if the file can't be
+/// read, isn't valid TOML, or omits `[application].name`.
+fn read_spin_application_name(spin_path: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(spin_path).map_err(|err| {
+        format!(
+            "failed to read spin manifest at {}: {err}",
+            spin_path.display()
+        )
+    })?;
+    let parsed: toml::Value = toml::from_str(&raw)
+        .map_err(|err| format!("failed to parse {} as TOML: {err}", spin_path.display()))?;
+    parsed
+        .as_table()
+        .and_then(|root| root.get("application"))
+        .and_then(toml::Value::as_table)
+        .and_then(|app| app.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "spin manifest at {} is missing `[application].name`. Fermyon Cloud push needs the app name to address KV stores via `--app <name> --label <label>`. Add `[application]\\nname = \"<your-app>\"` to spin.toml.",
+                spin_path.display()
+            )
+        })
+}
+
 /// Dispatch `config push --adapter spin` to the right per-backend
 /// writer based on `runtime-config.toml` + the adapter's
 /// `[adapters.spin.commands].deploy` command (auto-detect for Fermyon
@@ -550,12 +581,16 @@ fn dispatch_push(
     }
 
     // 2. Else, if the manifest deploy command shells to `spin deploy`,
-    //    treat as Fermyon Cloud.
+    //    treat as Fermyon Cloud. Cloud's `set` subcommand addresses
+    //    the cloud KV store via Fermyon's app-scoped label model
+    //    (`--app <app> --label <label>`), so we need the spin app
+    //    name from spin.toml.
     if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
+        let app_name = read_spin_application_name(&spin_manifest_path)?;
         if dry_run {
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would shell `spin cloud key-value set --store {platform} KEY=VALUE [...]` for {} entries (logical id `{logical}`):",
+                "would shell `spin cloud key-value set --app {app_name} --label {platform} KEY=VALUE [...]` for {} entries (logical id `{logical}`):",
                 entries.len()
             ));
             for (key, _) in entries {
@@ -563,9 +598,9 @@ fn dispatch_push(
             }
             return Ok(out);
         }
-        push_cloud::write_batch(platform, entries)?;
+        push_cloud::write_batch(&app_name, platform, entries)?;
         return Ok(vec![format!(
-            "pushed {} entries to Fermyon Cloud KV store `{platform}` (logical id `{logical}`) via `spin cloud key-value set`",
+            "pushed {} entries to Fermyon Cloud KV store linked to app `{app_name}` label `{platform}` (logical id `{logical}`) via `spin cloud key-value set`",
             entries.len()
         )]);
     }
@@ -1644,9 +1679,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_push_fermyon_cloud_auto_detects_from_spin_deploy() {
+    fn dispatch_push_fermyon_cloud_auto_detects_from_spin_deploy_and_uses_app_label_shape() {
         let dir = tempdir().expect("tempdir");
-        write_minimal_spin_toml(dir.path());
+        write_minimal_spin_toml(dir.path()); // [application].name = "x"
 
         let push_ctx =
             AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
@@ -1659,9 +1694,53 @@ mod tests {
             true,
         )
         .expect("dispatch ok");
+        // The preview MUST show Fermyon's app-scoped label shape
+        // (`--app <APP> --label <LABEL> KEY=VALUE`), not the
+        // pre-fix `--store <STORE>` shape.
         assert!(
             out[0].contains("spin cloud key-value set"),
             "cloud writer dry-run preview: {out:?}"
+        );
+        assert!(
+            out[0].contains("--app x") && out[0].contains("--label app_config"),
+            "must use --app <spin app name> + --label <platform label> per Fermyon's app-scoped label model: {out:?}"
+        );
+        assert!(
+            !out[0].contains("--store"),
+            "must NOT use --store (conflates spin label with cloud KV resource name): {out:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_fermyon_cloud_errors_when_spin_application_name_missing() {
+        // The cloud writer needs `[application].name` for `--app`.
+        // A spin.toml without it must error with an actionable
+        // message, not silently shell `spin cloud key-value set
+        // --app  --label …` (which would fail upstream with an
+        // unhelpful clap error).
+        let dir = tempdir().expect("tempdir");
+        // Note: NO `[application]` section.
+        let spin_path = dir.path().join("spin.toml");
+        fs::write(
+            &spin_path,
+            "spin_manifest_version = 2\n[component.demo]\nsource = \"a.wasm\"\n",
+        )
+        .expect("write spin.toml");
+
+        let push_ctx =
+            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let err = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect_err("missing [application].name must error");
+        assert!(
+            err.contains("[application].name") && err.contains("spin.toml"),
+            "error must name the missing field + the file: {err}"
         );
     }
 

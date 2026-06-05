@@ -9,11 +9,21 @@
 //! ## Command shape
 //!
 //! Per [fermyon/cloud-plugin's `src/commands/key_value.rs`](https://github.com/fermyon/cloud-plugin/blob/main/src/commands/key_value.rs)
-//! `SetCommand`, the actual CLI shape is:
+//! `SetCommand`, the `set` subcommand accepts two mutually-exclusive
+//! addressing modes:
 //!
-//! ```text
-//! spin cloud key-value set --store STORE KEY=VALUE [KEY=VALUE ...]
-//! ```
+//! - `--store STORE KEY=VALUE [...]` — target the cloud KV store by
+//!   its actual resource name. Useful when the operator knows the
+//!   cloud-side store name directly.
+//! - `--app APP --label LABEL KEY=VALUE [...]` — target the cloud KV
+//!   store via the app-scoped label that's mapped to it (per
+//!   [Fermyon's label model](https://developer.fermyon.com/cloud/linking-applications-to-resources-using-labels)).
+//!
+//! We use the **app-scoped label model** because that's what
+//! `EdgeZero`'s mental model produces: `store.platform` is the env-
+//! resolved label written into `spin.toml`'s `key_value_stores`,
+//! NOT the cloud-side store resource name. The app name comes from
+//! `spin.toml`'s `[application].name`.
 //!
 //! Key/value pairs are POSITIONAL arguments in `key=value` form
 //! (parsed by `spin_common::arg_parser::parse_kv`), and the command
@@ -101,10 +111,17 @@ pub(crate) fn chunk_entries(entries: &[(String, String)]) -> Result<Vec<Vec<Stri
     Ok(chunks)
 }
 
-/// Shell out `spin cloud key-value set --store <STORE> key1=value1
-/// key2=value2 …` once per chunk. Captures stderr on non-zero exit
-/// and surfaces it in the error string. Detects "not logged in"
-/// specifically and points the operator at `spin cloud login`.
+/// Shell out `spin cloud key-value set --app <APP> --label <LABEL>
+/// key1=value1 key2=value2 …` once per chunk. Captures stderr on
+/// non-zero exit and surfaces it in the error string. Detects "not
+/// logged in" specifically and points the operator at
+/// `spin cloud login`.
+///
+/// `app_name` is the Fermyon Cloud application name (from
+/// `spin.toml`'s `[application].name`); `label` is the
+/// `key_value_stores` entry that the cloud-side store is linked to.
+/// Together they address the cloud KV store through Fermyon's
+/// app-scoped label model.
 ///
 /// # Errors
 /// Returns a human-readable error string on:
@@ -114,8 +131,14 @@ pub(crate) fn chunk_entries(entries: &[(String, String)]) -> Result<Vec<Vec<Stri
 ///   found" — the install hint points at the Spin install URL);
 /// - non-zero exit from `spin cloud key-value set` (captured stderr
 ///   included);
-/// - "not logged in" stderr (suggests `spin cloud login`).
-pub(crate) fn write_batch(store_label: &str, entries: &[(String, String)]) -> Result<(), String> {
+/// - "not logged in" stderr (suggests `spin cloud login`);
+/// - "not linked" / "no store linked to label" stderr (suggests
+///   running `spin cloud link key-value` to map the label first).
+pub(crate) fn write_batch(
+    app_name: &str,
+    label: &str,
+    entries: &[(String, String)],
+) -> Result<(), String> {
     let chunks = chunk_entries(entries)?;
     for chunk in chunks {
         let mut command = Command::new("spin");
@@ -123,8 +146,10 @@ pub(crate) fn write_batch(store_label: &str, entries: &[(String, String)]) -> Re
             .arg("cloud")
             .arg("key-value")
             .arg("set")
-            .arg("--store")
-            .arg(store_label);
+            .arg("--app")
+            .arg(app_name)
+            .arg("--label")
+            .arg(label);
         for pair in &chunk {
             command.arg(pair);
         }
@@ -147,8 +172,16 @@ pub(crate) fn write_batch(store_label: &str, entries: &[(String, String)]) -> Re
                 "`spin cloud key-value set` reports not authenticated. Run `spin cloud login` and retry. Stderr: {stderr}"
             ));
         }
+        if stderr_lower.contains("not linked")
+            || stderr_lower.contains("no store linked")
+            || stderr_lower.contains("link")
+        {
+            return Err(format!(
+                "`spin cloud key-value set --app {app_name} --label {label}` reports that the label is not linked to a cloud KV store. Run `spin cloud link key-value --app {app_name} --label {label} <store-name>` (or create + link via the Fermyon dashboard) and retry. Stderr: {stderr}"
+            ));
+        }
         return Err(format!(
-            "`spin cloud key-value set --store {store_label} <{} pairs>` failed (status {}): {stderr}",
+            "`spin cloud key-value set --app {app_name} --label {label} <{} pairs>` failed (status {}): {stderr}",
             chunk.len(),
             output.status.code().unwrap_or(-1)
         ));
