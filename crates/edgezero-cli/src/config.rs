@@ -832,7 +832,7 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 )]
 mod tests {
     use super::*;
-    use crate::test_support::EnvOverride;
+    use crate::test_support::{manifest_guard, EnvOverride};
     use edgezero_core::app_config::SecretField;
     use serde::{Deserialize, Serialize};
     use std::fs;
@@ -980,12 +980,14 @@ source = "target/wasm32-wasip2/release/demo.wasm"
 
     #[test]
     fn raw_validates_a_well_formed_project() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let (_dir, manifest, _) = setup_project(VALID_MANIFEST, VALID_APP_CONFIG);
         run_config_validate(&args_for(&manifest)).expect("valid project passes");
     }
 
     #[test]
     fn raw_errors_on_unknown_manifest_path() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let dir = TempDir::new().expect("temp dir");
         let bogus = dir.path().join("nope.toml");
         let err = run_config_validate(&args_for(&bogus)).expect_err("missing manifest must error");
@@ -1004,6 +1006,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
 
     #[test]
     fn raw_errors_when_manifest_app_name_missing() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let manifest = r#"
 [adapters.axum.adapter]
 crate = "crates/demo"
@@ -1159,6 +1162,7 @@ ids = ["default"]
 
     #[test]
     fn spin_logical_id_collision_across_kv_and_config_is_rejected() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Spin merges KV + Config into one `key_value::Store` per
         // label. Declaring `sessions` under BOTH kinds resolves to
         // one underlying store; the runtime would silently share
@@ -1200,7 +1204,6 @@ ids = ["default"]
 
     #[test]
     fn spin_distinct_logical_ids_collide_when_env_overlay_resolves_to_same_platform_label() {
-        use crate::test_support::manifest_guard;
         // F2: distinct logical ids `sessions` (KV) and `app_config`
         // (Config) BOTH map to the same Spin KV label via the env
         // overlay. The runtime opens one underlying store for both
@@ -1253,6 +1256,7 @@ ids = ["default"]
 
     #[test]
     fn spin_distinct_logical_ids_across_kv_and_config_validate_cleanly() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Sanity: distinct ids across the merged kinds are fine.
         let manifest_str = r#"
 [app]
@@ -1284,6 +1288,7 @@ ids = ["default"]
 
     #[test]
     fn spin_component_discovery_errors_on_zero_components() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let spin_toml = r#"
 spin_manifest_version = 2
 
@@ -1303,6 +1308,7 @@ version = "0.1.0"
 
     #[test]
     fn spin_component_discovery_errors_when_multi_unselected() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let spin_toml = r#"
 spin_manifest_version = 2
 [application]
@@ -1325,6 +1331,7 @@ source = "b.wasm"
 
     #[test]
     fn spin_component_discovery_rejects_bad_selector_against_single_component() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Regression: a typo in `[adapters.spin.adapter].component`
         // used to pass when `spin.toml` declared exactly one
         // component because the auto-select path returned early
@@ -1367,6 +1374,7 @@ ids = ["default"]
 
     #[test]
     fn spin_component_discovery_accepts_explicit_selector() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let spin_toml = r#"
 spin_manifest_version = 2
 [application]
@@ -1478,6 +1486,7 @@ timeout_ms = 1500
 
     #[test]
     fn strict_capability_completeness_rejects_single_adapter_with_multi_ids() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Spin's secrets capability is Single — declaring two ids
         // breaks the contract under --strict.
         let manifest = r#"
@@ -1511,6 +1520,7 @@ default = "alpha"
 
     #[test]
     fn strict_handler_paths_rejects_malformed_handler() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let manifest = r#"
 [app]
 name = "demo-app"
@@ -1587,6 +1597,7 @@ deep = true
 
     #[test]
     fn raw_push_axum_writes_local_config_json() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let (dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
         run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
         let written = dir.path().join(".edgezero/local-config-app_config.json");
@@ -1600,6 +1611,7 @@ deep = true
 
     #[test]
     fn raw_push_dry_run_does_not_write() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let (dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
         let mut args = push_args(&manifest, "axum");
         args.dry_run = true;
@@ -1612,6 +1624,7 @@ deep = true
 
     #[test]
     fn raw_push_errors_when_stores_config_missing() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let manifest_no_config = r#"
 [app]
 name = "demo-app"
@@ -1635,6 +1648,7 @@ serve = "echo"
 
     #[test]
     fn raw_push_errors_when_adapter_not_declared() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let (_dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
         let err = run_config_push(&push_args(&manifest, "not-an-adapter"))
             .expect_err("undeclared adapter must error");
@@ -1646,6 +1660,7 @@ serve = "echo"
 
     #[test]
     fn raw_push_respects_explicit_store_selection() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Two declared ids — push to the non-default one via --store.
         let manifest_two_ids = r#"
 [app]
@@ -1686,6 +1701,7 @@ ids = ["default"]
 
     #[test]
     fn raw_push_rejects_unknown_store_id() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let (_dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
         let mut args = push_args(&manifest, "axum");
         args.store = Some("does-not-exist".to_owned());
@@ -1698,6 +1714,7 @@ ids = ["default"]
 
     #[test]
     fn raw_push_resolves_default_from_multi_id_store() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // [stores.config].ids = ["one", "two"], default = "two".
         let manifest_with_default = r#"
 [app]
@@ -1728,6 +1745,7 @@ ids = ["default"]
 
     #[test]
     fn raw_push_flattens_nested_tables_into_dotted_keys() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let app_config = r#"
 greeting = "hi"
 
@@ -1748,6 +1766,7 @@ timeout_ms = 1500
 
     #[test]
     fn raw_push_json_encodes_arrays() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         //: arrays become a single JSON-encoded string value.
         let app_config = "tags = [\"a\", \"b\", \"c\"]\n";
         let (dir, manifest, _) = setup_project(PUSH_MANIFEST, app_config);
@@ -1762,6 +1781,7 @@ timeout_ms = 1500
 
     #[test]
     fn raw_push_cloudflare_dry_run_dispatches_to_adapter() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Real impl shipped in 7.2 — dry-run resolves the namespace
         // id from wrangler.toml but doesn't shell out, so CI can
         // exercise dispatch without wrangler installed.
@@ -1800,6 +1820,7 @@ ids = ["default"]
 
     #[test]
     fn raw_push_fastly_dry_run_dispatches_to_adapter() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // Real impl shipped in 7.3 — dry-run skips the `fastly
         // config-store list --json` resolver and the per-entry
         // create shell-out, so CI exercises dispatch without
@@ -1831,6 +1852,7 @@ ids = ["default"]
 
     #[test]
     fn raw_push_spin_dry_run_dispatches_to_adapter() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         // The CLI must thread `args.local` + `--runtime-config` + the
         // manifest's `[adapters.spin.commands].deploy` through to
         // Spin's `push_config_entries`, where the per-backend
@@ -1960,6 +1982,7 @@ timeout_ms = 50
     /// referenced spin.toml has no `[component.*]` declarations.
     #[test]
     fn raw_push_runs_spin_adapter_manifest_check_before_push() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
         let app_config = r#"
 api_token = "x"
 greeting = "hi"
