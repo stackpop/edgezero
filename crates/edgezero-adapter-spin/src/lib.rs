@@ -21,14 +21,6 @@ pub mod request;
 pub mod response;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub mod secret_store;
-/// Seed handler for `config push --adapter spin`. Compiled under the
-/// same gate as the other wasm-runtime modules; an extra `test` arm
-/// keeps the host-compilable core + its unit tests in scope under
-/// `cargo test` so the security surface gets covered without
-/// requiring `--features spin` or a wasm target.
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-pub(crate) mod seed;
-
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use core::future::Future;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -124,51 +116,4 @@ pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullRespo
     let app = A::build_app();
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
         .await
-}
-
-/// Convenience entry point that ALSO accepts `config push --adapter spin`
-/// seed requests on the canonical `/__edgezero/config/seed` route. Every
-/// other request falls through to [`run_app`].
-///
-/// Scaffolded projects use this entrypoint by default so
-/// `config push --adapter spin --local` Just Works against a freshly
-/// scaffolded app. Projects that don't want the seeding surface can swap
-/// the handler body to call [`run_app`] directly.
-///
-/// The seed handler reads its token from
-/// `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN`; if that variable is unset,
-/// blank, whitespace-only, or shorter than 16 bytes, every request to
-/// `/__edgezero/config/seed` returns 401 (fail-closed). See seed handler
-/// docs for the full security model.
-///
-/// # Errors
-/// Same as [`run_app`] — propagates dispatch failures via `anyhow`.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-#[inline]
-pub async fn run_app_with_seeder<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
-    if req.uri().path() == seed::SEED_ROUTE {
-        let env = EnvConfig::from_env();
-        let token_owned = env
-            .get(&["adapters", "spin", "seed_token"])
-            .map(str::to_owned);
-        let stores = A::stores();
-        let labels: Vec<String> = stores
-            .config
-            .as_ref()
-            .map(|meta| {
-                meta.ids
-                    .iter()
-                    .map(|id| env.store_name("config", id))
-                    .collect()
-            })
-            .unwrap_or_default();
-        return seed::handle_seed_request_spin(
-            req,
-            &seed::SpinKvSeedWriter,
-            token_owned.as_deref(),
-            &labels,
-        )
-        .await;
-    }
-    run_app::<A>(req).await
 }

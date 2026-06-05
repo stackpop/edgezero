@@ -175,17 +175,15 @@ single string values, and pushes per-adapter:
   fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>
   ```
 
-- **spin** — HTTP POST to the seed handler at
-  `/__edgezero/config/seed` on the running Spin app. Resolves the seed
-  URL from `--seed-url` / `EDGEZERO__ADAPTERS__SPIN__SEED_URL`
-  (or `…__LOCAL_SEED_URL` under `--local`) /
-  `[adapters.spin.commands].seed_url`; auth token from `--seed-token`
-  or `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN`. The handler verifies the
-  token in constant time, then writes entries verbatim into the
-  `spin_sdk::key_value::Store` whose label matches the resolved
-  platform name of the target `[stores.config]` id. Keys pass through
-  with no translation. Run `edgezero config push --adapter spin
-  --local` against `spin up` to seed the local KV emulator.
+- **spin** — **under restructure.** The previous seed-handler HTTP
+  POST was retired in the same branch because every deployed app
+  shipped an EdgeZero-owned `/__edgezero/config/seed` endpoint, a
+  permanent attack surface. The replacement dispatches per-backend
+  (SQLite-direct writes against `.spin/sqlite_key_value.db` for local
+  dev; `spin cloud key-value set` shellouts for Fermyon Cloud) and
+  lands in the next commit on the branch. Until then `config push
+  --adapter spin` returns a clear "under restructure" error pointing
+  at `docs/superpowers/plans/2026-06-04-spin-per-backend-push.md`.
 
 ### Spin manual secret declarations
 

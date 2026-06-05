@@ -15,8 +15,6 @@ use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
-#[cfg(feature = "cli")]
-use reqwest::blocking::Client as HttpClient;
 use walkdir::WalkDir;
 
 static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
@@ -248,108 +246,23 @@ impl Adapter for SpinCliAdapter {
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        store: &ResolvedStoreId,
-        entries: &[(String, String)],
-        push_ctx: &AdapterPushContext<'_>,
-        dry_run: bool,
+        _store: &ResolvedStoreId,
+        _entries: &[(String, String)],
+        _push_ctx: &AdapterPushContext<'_>,
+        _dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Stage 4: HTTP POST to the seed handler at `push_ctx.seed_url`.
-        // The CLI's load_push_context (D8) resolves the URL through
-        // the prod or local chain (per D3) and stashes it in
-        // `push_ctx.seed_url`. The body's `store` is the platform
-        // label (NOT logical id) so an operator with
-        // `EDGEZERO__STORES__CONFIG__<ID>__NAME=…` set sees the
-        // matching label flow through. See D9 + D12 for the
-        // request/response contract.
-        let platform = store.platform.as_str();
-        let logical = store.logical.as_str();
-
-        if entries.is_empty() {
-            return Ok(vec![format!(
-                "no config entries to push to spin store `{platform}` (logical id `{logical}`)"
-            )]);
-        }
-
-        let Some(seed_url) = push_ctx.seed_url else {
-            return Err(format!(
-                "seed URL is not configured for spin push: pass `--seed-url <url>`, set `EDGEZERO__ADAPTERS__SPIN__SEED_URL`{}, or add `seed-url = \"<url>\"` under `[adapters.spin.commands]` in edgezero.toml (the TOML key is `seed-url` with a dash; serde renames it to the in-memory `seed_url`)",
-                if push_ctx.local { " / `EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL`" } else { "" }
-            ));
-        };
-
-        if dry_run {
-            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
-            out.push(format!(
-                "would POST {entries_n} entries to {seed_url} for store `{platform}` (logical id `{logical}`):",
-                entries_n = entries.len(),
-            ));
-            for (key, _) in entries {
-                out.push(format!("  would set `{key}`"));
-            }
-            return Ok(out);
-        }
-
-        let Some(seed_token) = push_ctx.seed_token else {
-            return Err(
-                "seed token is not configured for spin push: pass `--seed-token <token>` or set `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` (tokens are NEVER read from edgezero.toml)"
-                    .to_owned(),
-            );
-        };
-
-        let payload = build_seed_payload(platform, entries);
-        let body = serde_json::to_vec(&payload)
-            .map_err(|err| format!("failed to serialize seed payload as JSON: {err}"))?;
-
-        let client = HttpClient::new();
-        let response = client
-            .post(seed_url)
-            .header("content-type", "application/json")
-            .header("x-edgezero-seed", seed_token)
-            .body(body)
-            .send()
-            .map_err(|err| {
-                if err.is_connect() {
-                    format!(
-                        "seed POST to {seed_url} failed: connection refused. Is the Spin app running?"
-                    )
-                } else {
-                    format!("seed POST to {seed_url} failed: {err}")
-                }
-            })?;
-
-        let status = response.status();
-        let response_text = response.text().unwrap_or_default();
-        // D9 status code table → D12 message table.
-        match status.as_u16() {
-            204 => Ok(vec![format!(
-                "pushed {} entries to spin store `{platform}` (logical id `{logical}`) via {seed_url}",
-                entries.len()
-            )]),
-            400 => Err(format!(
-                "seed handler rejected (400 Bad Request): {response_text}. Check CLI version / store id."
-            )),
-            401 => Err(
-                "seed handler rejected (401 Unauthorized). Fail-closed reasons (D9): server-side `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` is unset, blank, whitespace-only, or shorter than 16 bytes; OR your `--seed-token` / `EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN` is missing. Check the server's env first -- a 4-character placeholder triggers this even when the wire token matches.".to_owned(),
-            ),
-            403 => Err(
-                "seed handler rejected (403 Forbidden): x-edgezero-seed mismatch. Check that the token on the client matches the server's EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN.".to_owned(),
-            ),
-            404 => Err(format!(
-                "seed handler rejected (404 Not Found): store `{platform}` is not a recognised platform label. Check `[stores.config].ids` and any `EDGEZERO__STORES__CONFIG__<ID>__NAME` overrides."
-            )),
-            405 => Err(
-                "seed handler rejected (405 Method Not Allowed). This usually means a transparent proxy rewrote the POST -- check intermediaries.".to_owned(),
-            ),
-            415 => Err(
-                "seed handler rejected (415 Unsupported Media Type). Internal: the CLI should always set content-type: application/json.".to_owned(),
-            ),
-            422 => Err(format!(
-                "seed handler rejected (422 Unprocessable): KV write failed mid-stream: {response_text}"
-            )),
-            other => Err(format!(
-                "seed handler returned unexpected status {other}: {response_text}"
-            )),
-        }
+        // Transitional stub: the seed handler that this method used
+        // to POST to was deleted in the same commit that landed
+        // this stub. The replacement (SQLite-direct + Fermyon Cloud
+        // shellout, per the runtime-config.toml backend type) lands
+        // in the next commit on this branch. See
+        // `docs/superpowers/plans/2026-06-04-spin-per-backend-push.md`.
+        Err("`config push --adapter spin` is being restructured: \
+            the seed handler was retired in this commit; the \
+            per-backend writers (SQLite-direct + Fermyon Cloud \
+            shellout) land in the next commit. See \
+            docs/superpowers/plans/2026-06-04-spin-per-backend-push.md."
+            .to_owned())
     }
 
     fn push_config_entries_local(
@@ -362,12 +275,6 @@ impl Adapter for SpinCliAdapter {
         push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        // Stage 4: the local URL is already resolved in `push_ctx.seed_url`
-        // by the CLI's load_push_context (D3 local chain: --seed-url ->
-        // EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL -> builtin
-        // http://127.0.0.1:3000/__edgezero/config/seed). The implementation
-        // is identical to the prod push from this side; the URL chain
-        // already encoded "local" semantics.
         self.push_config_entries(
             manifest_root,
             adapter_manifest_path,
@@ -377,14 +284,6 @@ impl Adapter for SpinCliAdapter {
             push_ctx,
             dry_run,
         )
-    }
-
-    fn reserved_paths(&self) -> &'static [&'static str] {
-        // `run_app_with_seeder` intercepts this path BEFORE the app
-        // router runs. A user-declared `[[triggers.http]].handler`
-        // at the same path would be silently unreachable; the CLI
-        // catches the collision at `config validate` time.
-        &["/__edgezero/config/seed"]
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -552,29 +451,8 @@ fn collect_spin_component_ids(parsed: &toml::Value) -> Vec<String> {
 }
 
 /// Resolve which `[component.<id>]` table `provision` should
-/// write into. Mirrors the rule used by `validate_adapter_manifest`
-/// Build the seed handler JSON body per D9 schema.
-///
-/// `platform` is the env-resolved platform label (NOT the logical
-/// id). The handler validates `body.store` against the set of
-/// labels computed from `A::stores().config × env.store_name`.
-fn build_seed_payload(platform: &str, entries: &[(String, String)]) -> serde_json::Value {
-    let entries_json: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|(key, value)| {
-            serde_json::json!({
-                "key": key,
-                "value": value,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "store": platform,
-        "entries": entries_json,
-    })
-}
-
-///: single-component spin.toml resolves implicitly,
+/// write into. Mirrors the rule used by `validate_adapter_manifest`:
+/// single-component spin.toml resolves implicitly,
 /// multi-component requires an explicit `component = "..."` in
 /// `[adapters.spin.adapter]`, and a selector that doesn't match
 /// any declared id is an error.
@@ -1367,183 +1245,5 @@ mod tests {
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
             .expect("no-store provision is fine");
         assert_eq!(out, vec!["spin has no declared stores to provision"]);
-    }
-
-    // ---------- push_config_entries (Stage 4: HTTP POST to seed handler) ----------
-    //
-    // The variables-backed dry-run / write / key-validation / dashed-key tests
-    // that lived here before Stage 4 were deleted: they asserted spin.toml
-    // editing + `.→__` translation, neither of which the KV-backed push does.
-    // T4.7 in the plan calls for the new tests below (dry-run shape, missing-
-    // seed-url / token errors, JSON body shape). HTTP integration coverage
-    // lives in the Stage 8 `spin up` smoke test.
-
-    fn config_store(logical: &str) -> ResolvedStoreId {
-        ResolvedStoreId::from_logical(logical)
-    }
-
-    #[test]
-    fn push_with_no_entries_reports_no_op_without_posting() {
-        // Zero entries short-circuits before any seed-url lookup -- handy
-        // when a typed AppConfig strips all `#[secret]` fields.
-        let dir = tempdir().expect("tempdir");
-        let out = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &config_store(TEST_CONFIG_ID),
-                &[],
-                &AdapterPushContext::new(),
-                false,
-            )
-            .expect("zero-entry push is fine");
-        assert_eq!(out.len(), 1);
-        assert!(out[0].contains("no config entries"), "got: {out:?}");
-    }
-
-    #[test]
-    fn push_dry_run_emits_url_and_entries_without_posting() {
-        let dir = tempdir().expect("tempdir");
-        let entries = vec![
-            ("greeting".to_owned(), "hello".to_owned()),
-            ("service.timeout_ms".to_owned(), "1500".to_owned()),
-        ];
-        let push_ctx =
-            AdapterPushContext::new().with_seed_url("http://127.0.0.1:3000/__edgezero/config/seed");
-        let out = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &config_store(TEST_CONFIG_ID),
-                &entries,
-                &push_ctx,
-                true,
-            )
-            .expect("dry-run succeeds");
-        assert!(
-            out[0].contains("would POST 2 entries to http://127.0.0.1:3000/__edgezero/config/seed"),
-            "dry-run header names URL + count: {out:?}"
-        );
-        assert!(
-            out.iter().any(|line| line.contains("`greeting`")),
-            "dry-run lists greeting: {out:?}"
-        );
-        assert!(
-            out.iter().any(|line| line.contains("`service.timeout_ms`")),
-            "dry-run lists dotted key verbatim (no `.→__`): {out:?}"
-        );
-    }
-
-    #[test]
-    fn push_errors_when_seed_url_unset_prod() {
-        let dir = tempdir().expect("tempdir");
-        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
-        let err = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &config_store(TEST_CONFIG_ID),
-                &entries,
-                &AdapterPushContext::new(),
-                true,
-            )
-            .expect_err("missing seed URL must error");
-        assert!(err.contains("--seed-url"), "names CLI flag: {err}");
-        assert!(
-            err.contains("EDGEZERO__ADAPTERS__SPIN__SEED_URL"),
-            "names prod env var: {err}"
-        );
-        // The TOML key is `seed-url` (dashed) — serde renames it to
-        // the in-memory `seed_url`. The error must point at the
-        // dashed key so the operator can copy-paste it into their
-        // edgezero.toml without it being silently ignored.
-        assert!(
-            err.contains("seed-url") && err.contains("[adapters.spin.commands]"),
-            "names manifest fallback by its dashed TOML key: {err}"
-        );
-        assert!(
-            !err.contains("LOCAL_SEED_URL"),
-            "prod chain hint should NOT name the local env var: {err}"
-        );
-    }
-
-    #[test]
-    fn push_errors_when_seed_url_unset_local_names_local_env_var() {
-        let dir = tempdir().expect("tempdir");
-        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
-        let push_ctx = AdapterPushContext::new().with_local(true);
-        let err = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &config_store(TEST_CONFIG_ID),
-                &entries,
-                &push_ctx,
-                true,
-            )
-            .expect_err("missing seed URL on local must error");
-        assert!(
-            err.contains("EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL"),
-            "local chain hint names the local env var: {err}"
-        );
-    }
-
-    #[test]
-    fn push_errors_when_seed_token_unset_on_real_push() {
-        // Dry-run shouldn't require a token; a real (non-dry-run) push must.
-        let dir = tempdir().expect("tempdir");
-        let entries = vec![("greeting".to_owned(), "hi".to_owned())];
-        let push_ctx = AdapterPushContext::new().with_seed_url("http://localhost:3000/seed");
-        let err = SpinCliAdapter
-            .push_config_entries(
-                dir.path(),
-                Some("spin.toml"),
-                None,
-                &config_store(TEST_CONFIG_ID),
-                &entries,
-                &push_ctx,
-                false,
-            )
-            .expect_err("missing seed token on real push must error");
-        assert!(err.contains("seed token"), "names the missing piece: {err}");
-        assert!(
-            err.contains("EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN"),
-            "names env var: {err}"
-        );
-        assert!(
-            err.contains("NEVER read from edgezero.toml"),
-            "documents manifest exclusion for tokens: {err}"
-        );
-    }
-
-    #[test]
-    fn build_seed_payload_emits_d9_body_shape() {
-        let payload = build_seed_payload(
-            "app_config",
-            &[
-                ("greeting".to_owned(), "hello".to_owned()),
-                ("service.timeout_ms".to_owned(), "1500".to_owned()),
-            ],
-        );
-        assert_eq!(payload["store"].as_str(), Some("app_config"));
-        let entries = payload["entries"].as_array().expect("entries array");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["key"].as_str(), Some("greeting"));
-        assert_eq!(entries[0]["value"].as_str(), Some("hello"));
-        assert_eq!(entries[1]["key"].as_str(), Some("service.timeout_ms"));
-        assert_eq!(entries[1]["value"].as_str(), Some("1500"));
-    }
-
-    #[test]
-    fn build_seed_payload_uses_platform_label_not_logical_id() {
-        // T4.7: prove the body carries the platform label so an
-        // env-overridden store name flows through correctly.
-        let payload =
-            build_seed_payload("prod-config", &[("greeting".to_owned(), "hi".to_owned())]);
-        assert_eq!(payload["store"].as_str(), Some("prod-config"));
     }
 }

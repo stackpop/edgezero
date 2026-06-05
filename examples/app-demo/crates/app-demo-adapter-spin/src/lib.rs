@@ -16,9 +16,5 @@ use spin_sdk::http_service;
 #[cfg(target_arch = "wasm32")]
 #[http_service]
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
-    // `run_app_with_seeder` adds the `POST /__edgezero/config/seed`
-    // handler used by `edgezero config push --adapter spin`. Plain
-    // `run_app` would route the seed request through the app
-    // router (404), making `config push` unreachable.
-    edgezero_adapter_spin::run_app_with_seeder::<App>(req).await
+    edgezero_adapter_spin::run_app::<App>(req).await
 }

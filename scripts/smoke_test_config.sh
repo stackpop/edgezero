@@ -42,9 +42,10 @@ case "$ADAPTER" in
     # Stage 2 Axum config is read from `.edgezero/local-config-<id>.json`
     # per logical id (see `AxumConfigStore::from_local_file`). `config push`
     # writes that file in Stage 7; until then the smoke script seeds it
-    # directly with the same demo values Fastly's `[local_server.config_stores.app_config.contents]`
-    # carries, and that `config push --adapter spin --local` would POST into
-    # Spin's `app_config` KV store via the seed handler.
+    # directly with the same demo values Fastly's
+    # `[local_server.config_stores.app_config.contents]` carries (and that
+    # `config push --adapter spin --local` will write directly into
+    # `.spin/sqlite_key_value.db` once the per-backend writer lands).
     echo "==> Seeding .edgezero/local-config-app_config.json..."
     mkdir -p "$DEMO_DIR/.edgezero"
     cat > "$DEMO_DIR/.edgezero/local-config-app_config.json" <<'JSON'

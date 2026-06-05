@@ -147,23 +147,21 @@ backend (`type = "azure"`, `type = "redis"`, …) per the
 
 `provision` writes the `[component.<id>].key_value_stores` array for
 you (it does NOT touch `runtime-config.toml` — keep that one
-hand-edited). To seed
-the store from `edgezero.toml` + your typed app-config:
+hand-edited).
 
-```bash
-# Production target — POST against the deployed app's seed handler.
-edgezero config push --adapter spin \
-  --seed-url https://my-app.fermyon.app/__edgezero/config/seed \
-  --seed-token $EDGEZERO_SEED_TOKEN
-
-# Local development — POST against `spin up`'s seed handler.
-edgezero config push --adapter spin --local
-```
-
-The seed handler (built into `run_app` at `/__edgezero/config/seed`)
-authenticates via the `x-edgezero-seed` header and writes entries
-atomically; see [config push](/guide/cli-reference#config-push) for the
-full URL / token resolution chain.
+::: warning Push under restructure
+`edgezero config push --adapter spin` is being rebuilt: it used to
+POST to an embedded `/__edgezero/config/seed` handler inside every
+deployed app, which exposed a permanent EdgeZero-owned attack surface.
+The replacement dispatches to the runtime backend directly: SQLite-
+direct writes to `.spin/sqlite_key_value.db` for local dev, and
+`spin cloud key-value set` shellouts for Fermyon Cloud deployments.
+The per-backend writers land in the commit after this one on the
+`feature/extensible-cli` branch; see
+`docs/superpowers/plans/2026-06-04-spin-per-backend-push.md` for the
+plan. Until they land, `config push --adapter spin` returns a clear
+"under restructure" error.
+:::
 
 ## Secret Store
 
