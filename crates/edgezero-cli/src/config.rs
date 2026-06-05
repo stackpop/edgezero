@@ -1,21 +1,20 @@
 //! `config validate`.
 //!
 //! Two entry points share the same checks against the manifest, the
-//! app-config file, and (when `spin` is in the adapter set) the Spin
-//! key-syntax / component-discovery rules:
+//! app-config file, and the per-adapter validators (`[component.*]`
+//! discovery for Spin, etc.):
 //!
 //! - [`run_config_validate`] — raw flow. Loads the file's root
 //!   table as a [`toml::Value`] only; the typed deserialise /
 //!   `validator` / secret checks are skipped because no `C` is in
 //!   scope. The default `edgezero` binary uses this.
 //! - [`run_config_validate_typed`] — typed flow. Adds typed
-//!   deserialisation, `validator::Validate::validate()`, the
-//!   `#[secret]` / `#[secret(store_ref)]` checks, and the Spin
-//!   config/secret collision check. Downstream
-//!   project CLIs that own an app-config struct wire this up.
+//!   deserialisation, `validator::Validate::validate()`, and the
+//!   `#[secret]` / `#[secret(store_ref)]` checks. Downstream project
+//!   CLIs that own an app-config struct wire this up.
 //!
 //! Both run the manifest through [`ManifestLoader`] (which itself
-//! validates everything) and reject the typed app-config's
+//! validates everything) and apply the typed app-config's
 //! env-overlay unless `--no-env` is passed, so the validation sees
 //! the values the runtime would.
 
@@ -528,6 +527,7 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
     let flattened = flatten_keys(raw_table);
     let key_refs: Vec<&str> = flattened.iter().map(String::as_str).collect();
     let manifest_root = ctx.manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let env_config = EnvConfig::from_env();
 
     for (name, adapter_cfg) in &ctx.manifest().adapters {
         let Some(adapter) = adapter_registry::get_adapter(name) else {
@@ -539,29 +539,36 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
             adapter_cfg.adapter.manifest.as_deref(),
             adapter_cfg.adapter.component.as_deref(),
         )?;
-        reject_merged_id_collisions(name, adapter, ctx.manifest())?;
+        reject_merged_id_collisions(name, adapter, ctx.manifest(), &env_config)?;
     }
     Ok(())
 }
 
-/// Reject logical-id overlap across store kinds the adapter merges
-/// into a single backend (e.g. Spin's KV + Config both back to
-/// `spin_sdk::key_value::Store`). Without this check, declaring the
-/// same id under both kinds produces two store handles that silently
-/// write to the same underlying KV label at runtime.
+/// Reject overlap across store kinds the adapter merges into a single
+/// backend (e.g. Spin's KV + Config both back to
+/// `spin_sdk::key_value::Store`). Checks BOTH logical-id collisions
+/// (`[stores.kv].ids = ["x"]` + `[stores.config].ids = ["x"]`) AND
+/// env-resolved platform-label collisions (different logical ids
+/// pointing at the same platform label via
+/// `EDGEZERO__STORES__<KIND>__<ID>__NAME=shared`). Without the
+/// platform-label half, an operator can use the env overlay to
+/// silently route two logically-distinct stores to the same
+/// underlying KV label at runtime.
 fn reject_merged_id_collisions(
     adapter_name: &str,
     adapter: &'static dyn adapter_registry::Adapter,
     manifest: &Manifest,
+    env_config: &EnvConfig,
 ) -> Result<(), String> {
     let merged = adapter.merged_id_kinds();
     if merged.len() < 2 {
         return Ok(());
     }
-    // Build a (kind, id) -> first-seen-kind map; on the second
-    // appearance of a shared id, report the collision naming both
-    // kinds.
-    let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+    // (id -> first-seen-kind) tracks logical-id collisions.
+    // (platform_label -> (kind, id)) tracks env-resolved platform-label
+    // collisions across kinds.
+    let mut seen_ids: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut seen_platform: BTreeMap<String, (&str, String)> = BTreeMap::new();
     for kind in merged {
         let maybe_decl = match *kind {
             "kv" => manifest.stores.kv.as_ref(),
@@ -573,10 +580,27 @@ fn reject_merged_id_collisions(
             continue;
         };
         for id in &decl.ids {
-            if let Some(prior_kind) = seen.insert(id.as_str(), kind) {
+            if let Some(prior_kind) = seen_ids.insert(id.as_str(), kind) {
                 return Err(format!(
-                    "logical id `{id}` is declared under BOTH `[stores.{prior_kind}]` and `[stores.{kind}]`, but adapter `{adapter_name}` backs those kinds with the same runtime store. Rename one — the two would silently share writes via the same `key_value_stores` label.",
+                    "logical id `{id}` is declared under BOTH `[stores.{prior_kind}]` and `[stores.{kind}]`, but adapter `{adapter_name}` backs those kinds with the same runtime store. Rename one -- the two would silently share writes via the same `key_value_stores` label.",
                 ));
+            }
+
+            // Resolve the platform label per env: looks up
+            // EDGEZERO__STORES__<KIND>__<ID>__NAME, falling back to
+            // the logical id. Two distinct logical ids that resolve
+            // to the same platform label across merged kinds collide
+            // at runtime exactly the same way as a logical-id
+            // collision — silently shared writes.
+            let platform = env_config.store_name(kind, id);
+            if let Some((prior_kind, prior_id)) =
+                seen_platform.insert(platform.clone(), (kind, id.clone()))
+            {
+                if prior_kind != *kind || prior_id != *id {
+                    return Err(format!(
+                        "stores `[stores.{prior_kind}].{prior_id}` and `[stores.{kind}].{id}` both resolve to platform label `{platform}` (via the `EDGEZERO__STORES__<KIND>__<ID>__NAME` overlay or matching logical-id default), but adapter `{adapter_name}` backs those kinds with the same runtime store. Renaming one of the env overrides (or removing them so the logical ids stay distinct) fixes this -- both writes currently land on the same `key_value_stores` label.",
+                    ));
+                }
             }
         }
     }
@@ -808,6 +832,7 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 )]
 mod tests {
     use super::*;
+    use crate::test_support::EnvOverride;
     use edgezero_core::app_config::SecretField;
     use serde::{Deserialize, Serialize};
     use std::fs;
@@ -1170,6 +1195,55 @@ ids = ["default"]
                 && err.contains("[stores.kv]")
                 && err.contains("[stores.config]"),
             "error names the colliding id + both kinds: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_distinct_logical_ids_collide_when_env_overlay_resolves_to_same_platform_label() {
+        // F2: distinct logical ids `sessions` (KV) and `app_config`
+        // (Config) BOTH map to the same Spin KV label via the env
+        // overlay. The runtime opens one underlying store for both
+        // -- silent shared writes. The merged-id check must catch
+        // this even though the logical ids differ.
+        let manifest_str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.kv]
+ids = ["sessions"]
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
+        write_spin_toml(dir.path(), VALID_SPIN_TOML);
+
+        // Both stores forced onto the platform label `shared`.
+        let _kv_override = EnvOverride::set("EDGEZERO__STORES__KV__SESSIONS__NAME", "shared");
+        let _config_override =
+            EnvOverride::set("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "shared");
+
+        let mut args = args_for(&manifest);
+        args.no_env = false; // we WANT the env overlay here
+        let err = run_config_validate(&args)
+            .expect_err("platform-label collision via env overlay must fail validation");
+        assert!(
+            err.contains("`shared`")
+                && err.contains("[stores.kv].sessions")
+                && err.contains("[stores.config].app_config"),
+            "error names the resolved platform label + both logical ids: {err}"
         );
     }
 
@@ -1752,12 +1826,55 @@ ids = ["default"]
     }
 
     #[test]
-    #[ignore = "spin push under restructure: per-backend writers land in the next commit"]
     fn raw_push_spin_dry_run_dispatches_to_adapter() {
-        // This test asserted dispatch into the seed-handler-based
-        // push that was deleted in this commit. Will be rewritten in
-        // the per-backend-writers commit to dry-run dispatch through
-        // the SQLite-direct path against a temp `.spin/sqlite_key_value.db`.
+        // The CLI must thread `args.local` + `--runtime-config` + the
+        // manifest's `[adapters.spin.commands].deploy` through to
+        // Spin's `push_config_entries`, where the per-backend
+        // dispatcher decides whether to write SQLite-direct or shell
+        // to Fermyon Cloud. End-to-end: a raw dry-run with
+        // `args.local = true` against a fixture project should hit
+        // Spin's `dispatch_push` and announce a SQLite-direct write
+        // even with no `runtime-config.toml` present (default
+        // branch). The deeper per-backend matrix lives in spin
+        // adapter's `dispatch_push_*` tests; this one is the CLI
+        // wiring regression.
+        let manifest_spin = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest, _) = setup_project(manifest_spin, VALID_APP_CONFIG);
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let mut args = push_args(&manifest, "spin");
+        args.dry_run = true;
+        args.local = true;
+        run_config_push(&args).expect("spin --local dry-run dispatches cleanly");
+        // Spin.toml must be byte-identical after the dispatch — the
+        // per-backend writer NEVER edits it (the seed-handler-era
+        // `[variables]` writes are gone for good).
+        let spin_toml = fs::read_to_string(dir.path().join("spin.toml")).expect("re-read");
+        assert!(
+            spin_toml.contains("[component.demo]") && !spin_toml.contains("[variables]"),
+            "dispatcher must not touch spin.toml: {spin_toml}"
+        );
     }
 
     // ---------- typed push ----------

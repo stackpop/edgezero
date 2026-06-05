@@ -202,7 +202,13 @@ Runtime behavior by adapter:
   declared `[stores.config]` id (multi-store). Labels must be declared
   in `spin.toml`'s `[component.<id>].key_value_stores` — `provision`
   writes them automatically. Seed entries via `config push --adapter
-  spin` (POSTs to the app's `/__edgezero/config/seed` handler).
+  spin`, which dispatches per-backend by reading `runtime-config.toml`:
+  `type = "spin"` → direct write into the local `.spin/sqlite_key_value.db`;
+  Fermyon Cloud deploys → shell `spin cloud key-value set`; other
+  backend types (redis, azure_cosmos) print an actionable error
+  pointing at the backend's native CLI. See
+  [Spin adapter](/guide/adapters/spin#seeding-the-store) for the
+  full resolution order.
 
 When `[stores.config]` is present, the `app!` macro bakes the portable
 store registry into `Hooks::stores()`. Adapter `run_app` helpers build
