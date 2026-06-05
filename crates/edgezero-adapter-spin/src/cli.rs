@@ -513,13 +513,38 @@ fn dispatch_push(
     let runtime_config_dir = runtime_config_path.parent().unwrap_or(spin_manifest_dir);
     let parsed = runtime_config::read(&runtime_config_path)?;
 
-    // 1. `--local` forces SQLite-direct, suppressing Fermyon Cloud
-    //    auto-detection.
+    // 1. `--local` forces SQLite-direct EVERY time. We skip both the
+    //    Fermyon Cloud auto-detect AND the runtime-config backend
+    //    dispatch — even if the operator's `runtime-config.toml`
+    //    declares `type = "redis"` / `azure_cosmos` / unknown for
+    //    this label. The intent of `--local` is "I want to seed my
+    //    local dev loop, regardless of what the deployed app's
+    //    backend selection looks like". An explicit `--runtime-config
+    //    <path>` is still honoured for resolving the SQLite path,
+    //    but the backend `type` is ignored.
+    if push_ctx.local {
+        return write_sqlite(
+            spin_manifest_dir,
+            runtime_config_dir,
+            // If the operator DID declare `type = "spin"` with an
+            // explicit `path`, honour that path; otherwise fall
+            // through to Spin's default `.spin/sqlite_key_value.db`.
+            // Other backend types are silently treated as "no
+            // explicit path" so SQLite-direct still happens.
+            match parsed.key_value_stores.get(platform) {
+                Some(runtime_config::KeyValueBackend::Spin { path }) => path.as_deref(),
+                _ => None,
+            },
+            platform,
+            logical,
+            entries,
+            dry_run,
+        );
+    }
+
     // 2. Else, if the manifest deploy command shells to `spin deploy`,
     //    treat as Fermyon Cloud.
-    if !push_ctx.local
-        && push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)
-    {
+    if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
         if dry_run {
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
@@ -1406,5 +1431,349 @@ mod tests {
             .provision(dir.path(), Some("spin.toml"), None, &stores, false)
             .expect("no-store provision is fine");
         assert_eq!(out, vec!["spin has no declared stores to provision"]);
+    }
+
+    // ---------- dispatch_push matrix ----------
+    //
+    // These tests exercise `dispatch_push` directly with fixture
+    // `AdapterPushContext` / `runtime-config.toml` shapes. The
+    // function is where all the business logic of the per-backend
+    // redesign lives, so the matrix has to be tight: each branch
+    // (--local override, Fermyon Cloud auto-detect, redis-error,
+    // azure-error, unknown-error, default-SQLite, explicit-Spin-with-
+    // path, empty entries) gets a named test.
+
+    fn write_minimal_spin_toml(dir: &Path) -> PathBuf {
+        let path = dir.join("spin.toml");
+        fs::write(
+            &path,
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"a.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        path
+    }
+
+    fn entries_two() -> Vec<(String, String)> {
+        vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("svc.timeout".to_owned(), "1500".to_owned()),
+        ]
+    }
+
+    fn store(logical: &str, platform: &str) -> ResolvedStoreId {
+        ResolvedStoreId::new(logical.to_owned(), platform.to_owned())
+    }
+
+    #[test]
+    fn dispatch_push_empty_entries_returns_noop_message() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        let push_ctx = AdapterPushContext::new();
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &[],
+            &push_ctx,
+            false,
+        )
+        .expect("dispatch ok");
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("no config entries"),
+            "no-op message: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_local_forces_sqlite_even_when_runtime_config_declares_redis() {
+        // F1 (blocker): `--local` MUST bypass runtime-config backend
+        // dispatch. Without this test, the code that says "Redis: error
+        // out" would silently fire even under --local.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"redis\"\nurl = \"redis://localhost\"\n",
+        )
+        .expect("write runtime-config");
+
+        let push_ctx = AdapterPushContext::new().with_local(true);
+        let entries = entries_two();
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries,
+            &push_ctx,
+            true, // dry-run so the test doesn't actually touch disk
+        )
+        .expect("--local + redis must dispatch to SQLite, not error");
+        assert!(
+            out[0].contains("SQLite-backed Spin KV"),
+            "--local must force the SQLite writer: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|line| line.contains("redis-cli")),
+            "--local must NOT emit the redis-cli error: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_local_forces_sqlite_even_when_runtime_config_declares_azure() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"azure_cosmos\"\n",
+        )
+        .expect("write runtime-config");
+
+        let push_ctx = AdapterPushContext::new().with_local(true);
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("--local + azure must dispatch to SQLite");
+        assert!(out[0].contains("SQLite-backed Spin KV"), "{out:?}");
+    }
+
+    #[test]
+    fn dispatch_push_local_forces_sqlite_even_when_deploy_targets_fermyon_cloud() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+
+        let push_ctx = AdapterPushContext::new()
+            .with_local(true)
+            .with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("--local must beat Fermyon Cloud auto-detect");
+        assert!(out[0].contains("SQLite-backed Spin KV"), "{out:?}");
+        assert!(
+            !out.iter()
+                .any(|line| line.contains("spin cloud key-value set")),
+            "Fermyon Cloud writer must NOT fire under --local: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_local_honours_explicit_spin_path() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"spin\"\npath = \"custom/kv.db\"\n",
+        )
+        .expect("write runtime-config");
+
+        let push_ctx = AdapterPushContext::new().with_local(true);
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("dispatch ok");
+        let expected_path = dir.path().join("custom/kv.db");
+        assert!(
+            out.iter()
+                .any(|line| line.contains(&expected_path.display().to_string())),
+            "explicit path under --local: expected {} in {out:?}",
+            expected_path.display()
+        );
+    }
+
+    #[test]
+    fn dispatch_push_fermyon_cloud_auto_detects_from_spin_deploy() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+
+        let push_ctx =
+            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("dispatch ok");
+        assert!(
+            out[0].contains("spin cloud key-value set"),
+            "cloud writer dry-run preview: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_redis_backend_errors_with_redis_cli_hint() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"redis\"\nurl = \"redis://localhost:6379\"\n",
+        )
+        .expect("write runtime-config");
+
+        let push_ctx = AdapterPushContext::new();
+        let err = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect_err("redis backend without --local must error");
+        assert!(
+            err.contains("redis-cli") && err.contains("redis://localhost:6379"),
+            "redis error must name the cli + url: {err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_azure_backend_errors_with_azure_cli_hint() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"azure_cosmos\"\n",
+        )
+        .expect("write runtime-config");
+
+        let push_ctx = AdapterPushContext::new();
+        let err = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect_err("azure backend without --local must error");
+        assert!(
+            err.contains("az cosmosdb"),
+            "azure error must name the cli: {err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_unknown_backend_errors_with_type_name() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"someones-new-backend\"\n",
+        )
+        .expect("write runtime-config");
+
+        let push_ctx = AdapterPushContext::new();
+        let err = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect_err("unknown backend must error");
+        assert!(
+            err.contains("someones-new-backend"),
+            "unknown-type error must name the type: {err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_default_branch_dispatches_to_sqlite_at_default_path() {
+        // No runtime-config.toml, no --local, no Fermyon Cloud deploy
+        // command. Spin's default is SQLite at .spin/sqlite_key_value.db.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+
+        let push_ctx = AdapterPushContext::new();
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("default -> SQLite");
+        let expected = dir.path().join(".spin/sqlite_key_value.db");
+        assert!(
+            out.iter()
+                .any(|line| line.contains(&expected.display().to_string())),
+            "default SQLite path: expected {} in {out:?}",
+            expected.display()
+        );
+    }
+
+    #[test]
+    fn dispatch_push_custom_runtime_config_path_is_honoured() {
+        // H3 from the test-coverage review: prove --runtime-config
+        // <path> is actually read from the non-default location.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        let custom = dir.path().join("alternate-runtime.toml");
+        fs::write(
+            &custom,
+            "[key_value_store.app_config]\ntype = \"redis\"\nurl = \"redis://elsewhere\"\n",
+        )
+        .expect("write");
+
+        let push_ctx = AdapterPushContext::new().with_runtime_config_path(&custom);
+        let err = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect_err("custom runtime-config's redis declaration must fire");
+        assert!(
+            err.contains("redis://elsewhere"),
+            "custom runtime-config was read: {err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_unrelated_label_in_runtime_config_does_not_affect_default_dispatch() {
+        // Sanity: only the matching label's stanza is consulted. A
+        // [key_value_store.other] redis entry must NOT prevent a
+        // SQLite-direct push to app_config.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.other]\ntype = \"redis\"\nurl = \"redis://nowhere\"\n",
+        )
+        .expect("write runtime-config");
+
+        let push_ctx = AdapterPushContext::new();
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("unrelated label must not block dispatch");
+        assert!(out[0].contains("SQLite-backed Spin KV"), "{out:?}");
     }
 }

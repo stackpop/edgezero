@@ -254,9 +254,9 @@ pub trait Adapter: Sync + Send {
     /// dotted keys (`service.timeout_ms`) and string values
     /// (numbers via `to_string`, arrays/maps via `serde_json`,
     /// `Option::None` already skipped). The CLI also skips
-    /// `SECRET_FIELDS` on the typed path before calling. Adapter-
-    /// specific key translation (`.` → `__` for spin,) and
-    /// per-platform value encoding happen here.
+    /// `SECRET_FIELDS` on the typed path before calling. Any
+    /// per-platform value encoding happens here (e.g. wrangler's
+    /// bulk-put JSON shape).
     ///
     /// `manifest_root`, `adapter_manifest_path`, and
     /// `component_selector` mirror `provision` — each adapter
