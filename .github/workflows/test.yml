@@ -87,7 +87,7 @@ jobs:
             ~/.cargo/git/db/
             ~/.wasmtime/bin/
             target/
-          key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock', '.tool-versions') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.adapter }}-
 
@@ -156,12 +156,19 @@ jobs:
         # land the binary in `~/.wasmtime/bin/` so the cache step
         # above actually short-circuits the download on subsequent
         # runs.
+        #
+        # The cache key now hashes `.tool-versions` too, so a
+        # version bump invalidates the cached binary. We also
+        # explicitly compare `wasmtime --version` against the pin
+        # — without that a runner-provided wasmtime or a stale
+        # cache hit would silently shadow the pinned version.
         run: |
           install_dir="$HOME/.wasmtime/bin"
           echo "$install_dir" >> "$GITHUB_PATH"
           export PATH="$install_dir:$PATH"
-          if ! command -v wasmtime &>/dev/null; then
-            version="${{ steps.wasmtime-version.outputs.version }}"
+          version="${{ steps.wasmtime-version.outputs.version }}"
+          if ! command -v wasmtime &>/dev/null \
+              || ! wasmtime --version 2>/dev/null | grep -qF "wasmtime $version"; then
             tag="v${version}"
             archive="wasmtime-${tag}-x86_64-linux"
             mkdir -p "$install_dir"
@@ -169,6 +176,7 @@ jobs:
             tar -xJf /tmp/wasmtime.tar.xz -C /tmp
             install -m 0755 "/tmp/${archive}/wasmtime" "$install_dir/wasmtime"
           fi
+          wasmtime --version | grep -qF "wasmtime $version"
           wasmtime --version
 
       - name: Fetch dependencies (locked)

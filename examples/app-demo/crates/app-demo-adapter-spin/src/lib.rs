@@ -1,3 +1,8 @@
+#![allow(
+    unsafe_code,
+    reason = "spin_sdk::http_component expands to required WASI export glue on wasm32"
+)]
+
 #[cfg(target_arch = "wasm32")]
 use app_demo_core::App;
 #[cfg(target_arch = "wasm32")]
