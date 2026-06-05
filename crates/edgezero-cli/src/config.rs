@@ -58,16 +58,14 @@ struct PushContext {
     validation: ValidationContext,
 }
 
-/// Push-time overlay values resolved by [`load_push_context`] per
-/// the spin-kv-config plan D3 / D8 chains. Owned strings so the
-/// CLI's borrow story stays simple — `dispatch_push` creates the
-/// borrowing [`adapter_registry::AdapterPushContext`] at the trait
-/// call boundary.
+/// Push-time overlay values resolved by [`load_push_context`].
+/// Owned strings/paths so the CLI's borrow story stays simple —
+/// `dispatch_push` creates the borrowing
+/// [`adapter_registry::AdapterPushContext`] at the trait call boundary.
 #[derive(Debug, Default)]
 struct ResolvedAdapterPushContext {
     local: bool,
-    seed_token: Option<String>,
-    seed_url: Option<String>,
+    runtime_config_path: Option<PathBuf>,
 }
 
 /// Pre-loaded state shared by the raw and typed flows.
@@ -258,50 +256,19 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     })
 }
 
-/// Resolve the push-time overlay values per spin-kv-config plan D3:
-///
-/// - `seed_url` follows two disjoint chains. **Prod** (`!args.local`):
-///   `--seed-url` → `EDGEZERO__ADAPTERS__<NAME>__SEED_URL` →
-///   `[adapters.<name>.commands].seed_url`. **Local** (`args.local`):
-///   `--seed-url` → `EDGEZERO__ADAPTERS__<NAME>__LOCAL_SEED_URL` →
-///   builtin `http://127.0.0.1:3000/__edgezero/config/seed`. Manifest
-///   is NEVER consulted on the local chain so a misconfigured
-///   `[adapters.spin.commands].seed_url=<prod URL>` can't accidentally
-///   leak prod URL into a local push.
-/// - `seed_token` follows one chain only: `--seed-token` →
-///   `EDGEZERO__ADAPTERS__<NAME>__SEED_TOKEN`. Manifest is never
-///   consulted (tokens stay out of manifests).
+/// Resolve the push-time overlay values: `--local` flag (passed
+/// through verbatim) and the adapter-runtime-config path (`--runtime-
+/// config` flag if set; the adapter resolves a default location
+/// otherwise).
 fn resolve_adapter_push_ctx(
     args: &ConfigPushArgs,
-    env_config: &EnvConfig,
-    manifest: &Manifest,
-    adapter_name: &str,
+    _env_config: &EnvConfig,
+    _manifest: &Manifest,
+    _adapter_name: &str,
 ) -> ResolvedAdapterPushContext {
-    let seed_url = args.seed_url.clone().or_else(|| {
-        if args.local {
-            env_config
-                .get(&["adapters", adapter_name, "local_seed_url"])
-                .map(str::to_owned)
-                .or_else(|| Some("http://127.0.0.1:3000/__edgezero/config/seed".to_owned()))
-        } else {
-            env_config
-                .get(&["adapters", adapter_name, "seed_url"])
-                .map(str::to_owned)
-                .or_else(|| {
-                    let cfg = manifest.adapters.get(adapter_name)?;
-                    cfg.commands.seed_url.clone()
-                })
-        }
-    });
-    let seed_token = args.seed_token.clone().or_else(|| {
-        env_config
-            .get(&["adapters", adapter_name, "seed_token"])
-            .map(str::to_owned)
-    });
     ResolvedAdapterPushContext {
         local: args.local,
-        seed_token,
-        seed_url,
+        runtime_config_path: args.runtime_config.clone(),
     }
 }
 
@@ -325,15 +292,12 @@ fn dispatch_push(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
 
-    // v9 plan H1: AdapterPushContext is #[non_exhaustive], so build
-    // it via the builder API instead of a struct literal.
+    // AdapterPushContext is #[non_exhaustive], so build it via the
+    // builder API instead of a struct literal.
     let resolved = &ctx.adapter_push_ctx;
     let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(resolved.local);
-    if let Some(url) = resolved.seed_url.as_deref() {
-        push_ctx = push_ctx.with_seed_url(url);
-    }
-    if let Some(token) = resolved.seed_token.as_deref() {
-        push_ctx = push_ctx.with_seed_token(token);
+    if let Some(path) = resolved.runtime_config_path.as_deref() {
+        push_ctx = push_ctx.with_runtime_config_path(path);
     }
     let lines = if local {
         ctx.adapter.push_config_entries_local(
@@ -572,7 +536,6 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
             adapter_cfg.adapter.manifest.as_deref(),
             adapter_cfg.adapter.component.as_deref(),
         )?;
-        reject_reserved_path_collisions(name, adapter, ctx.manifest())?;
         reject_merged_id_collisions(name, adapter, ctx.manifest())?;
     }
     Ok(())
@@ -612,31 +575,6 @@ fn reject_merged_id_collisions(
                     "logical id `{id}` is declared under BOTH `[stores.{prior_kind}]` and `[stores.{kind}]`, but adapter `{adapter_name}` backs those kinds with the same runtime store. Rename one — the two would silently share writes via the same `key_value_stores` label.",
                 ));
             }
-        }
-    }
-    Ok(())
-}
-
-/// Reject any `[[triggers.http]].path` that collides with a route the
-/// adapter's runtime intercepts before the app router runs (e.g. Spin's
-/// `run_app_with_seeder` short-circuits `/__edgezero/config/seed`).
-/// Without this check the user's handler is silently unreachable.
-fn reject_reserved_path_collisions(
-    adapter_name: &str,
-    adapter: &'static dyn adapter_registry::Adapter,
-    manifest: &Manifest,
-) -> Result<(), String> {
-    let reserved = adapter.reserved_paths();
-    if reserved.is_empty() {
-        return Ok(());
-    }
-    for trigger in &manifest.triggers.http {
-        if reserved.contains(&trigger.path.as_str()) {
-            return Err(format!(
-                "trigger {} declares HTTP path `{}`, which adapter `{adapter_name}` reserves for its own runtime intercept (the handler would be silently unreachable). Move the user route to a different path.",
-                trigger.id.as_deref().unwrap_or(&trigger.path),
-                trigger.path,
-            ));
         }
     }
     Ok(())
@@ -1005,8 +943,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             local: false,
             manifest: manifest.to_path_buf(),
             no_env: true,
-            seed_token: None,
-            seed_url: None,
+            runtime_config: None,
             store: None,
         }
     }
@@ -1193,42 +1130,6 @@ ids = ["default"]
     }
 
     #[test]
-    fn spin_reserved_seed_path_collision_is_rejected() {
-        // `run_app_with_seeder` intercepts `/__edgezero/config/seed`
-        // before the app router runs. A `[[triggers.http]]` declaring
-        // the same path would be silently unreachable; the validator
-        // must catch it.
-        let manifest_str = r#"
-[app]
-name = "demo-app"
-
-[adapters.spin.adapter]
-crate = "crates/demo-spin"
-manifest = "spin.toml"
-
-[adapters.spin.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.secrets]
-ids = ["default"]
-
-[[triggers.http]]
-path = "/__edgezero/config/seed"
-handler = "demo_spin::accidentally_shadow_the_seed"
-"#;
-        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
-        write_spin_toml(dir.path(), VALID_SPIN_TOML);
-        let err = run_config_validate(&args_for(&manifest))
-            .expect_err("reserved-path collision must error");
-        assert!(
-            err.contains("/__edgezero/config/seed") && err.contains("spin"),
-            "error names the colliding path + adapter: {err}"
-        );
-    }
-
-    #[test]
     fn spin_logical_id_collision_across_kv_and_config_is_rejected() {
         // Spin merges KV + Config into one `key_value::Store` per
         // label. Declaring `sessions` under BOTH kinds resolves to
@@ -1298,34 +1199,6 @@ ids = ["default"]
         write_spin_toml(dir.path(), VALID_SPIN_TOML);
         run_config_validate(&args_for(&manifest))
             .expect("distinct ids across kinds must validate cleanly");
-    }
-
-    #[test]
-    fn spin_non_reserved_paths_validate_cleanly() {
-        // Sanity: a regular `[[triggers.http]]` path is unaffected.
-        let manifest_str = r#"
-[app]
-name = "demo-app"
-
-[adapters.spin.adapter]
-crate = "crates/demo-spin"
-manifest = "spin.toml"
-
-[adapters.spin.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.secrets]
-ids = ["default"]
-
-[[triggers.http]]
-path = "/api/echo"
-handler = "demo_spin::echo"
-"#;
-        let (dir, manifest, _) = setup_project(manifest_str, VALID_APP_CONFIG);
-        write_spin_toml(dir.path(), VALID_SPIN_TOML);
-        run_config_validate(&args_for(&manifest)).expect("non-reserved path must validate cleanly");
     }
 
     #[test]
@@ -1629,242 +1502,6 @@ deep = true
     // config push (raw + typed) — spec
     // -------------------------------------------------------------------
 
-    // ---------- resolve_adapter_push_ctx (D3 / D8 resolution chains) ----------
-    //
-    // These tests pin the URL/token precedence rules that the seed-
-    // handler push depends on. The function is pure (no I/O beyond the
-    // already-loaded `Manifest` + `EnvConfig`), so each test builds
-    // small fixtures and asserts the resolved values directly.
-
-    /// Minimal manifest with an `[adapters.spin.commands].seed-url`
-    /// set to the supplied value (`None` = no manifest seed-url).
-    fn spin_manifest_with_seed_url(seed_url: Option<&str>) -> String {
-        let extra = seed_url.map_or_else(String::new, |url| {
-            format!("seed-url = {}", toml::Value::String(url.to_owned()))
-        });
-        format!(
-            r#"
-[app]
-name = "demo-app"
-
-[adapters.spin.adapter]
-crate = "crates/demo-spin"
-manifest = "spin.toml"
-
-[adapters.spin.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-{extra}
-"#
-        )
-    }
-
-    fn load_manifest_for_resolver(manifest_body: &str) -> (TempDir, ManifestLoader) {
-        let dir = TempDir::new().expect("temp dir");
-        let manifest_path = dir.path().join("edgezero.toml");
-        fs::write(&manifest_path, manifest_body).expect("write manifest");
-        let loader = ManifestLoader::from_path(&manifest_path).expect("load manifest");
-        (dir, loader)
-    }
-
-    /// Empty `(key, value)` iterator typed for `EnvConfig::from_vars`
-    /// without needing the absolute `std::iter::empty` path at call
-    /// sites (strict clippy bans the absolute form).
-    fn empty_env() -> impl Iterator<Item = (&'static str, String)> {
-        let arr: [(&str, String); 0] = [];
-        arr.into_iter()
-    }
-
-    fn push_args_for_resolver(local: bool) -> ConfigPushArgs {
-        ConfigPushArgs {
-            adapter: "spin".to_owned(),
-            app_config: None,
-            dry_run: false,
-            local,
-            manifest: PathBuf::new(),
-            no_env: true,
-            seed_token: None,
-            seed_url: None,
-            store: None,
-        }
-    }
-
-    #[test]
-    fn resolve_seed_url_flag_beats_env_and_manifest_in_prod() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
-            "https://manifest.example/seed",
-        )));
-        let env = EnvConfig::from_vars([(
-            "EDGEZERO__ADAPTERS__SPIN__SEED_URL",
-            "https://env.example/seed",
-        )]);
-        let mut args = push_args_for_resolver(false);
-        args.seed_url = Some("https://flag.example/seed".to_owned());
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(
-            resolved.seed_url.as_deref(),
-            Some("https://flag.example/seed"),
-            "CLI flag must win in prod mode"
-        );
-    }
-
-    #[test]
-    fn resolve_seed_url_env_beats_manifest_in_prod_when_flag_unset() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
-            "https://manifest.example/seed",
-        )));
-        let env = EnvConfig::from_vars([(
-            "EDGEZERO__ADAPTERS__SPIN__SEED_URL",
-            "https://env.example/seed",
-        )]);
-        let args = push_args_for_resolver(false);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(
-            resolved.seed_url.as_deref(),
-            Some("https://env.example/seed"),
-            "env must beat manifest in prod mode when flag is unset"
-        );
-    }
-
-    #[test]
-    fn resolve_seed_url_manifest_used_when_flag_and_env_unset_in_prod() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
-            "https://manifest.example/seed",
-        )));
-        let env = EnvConfig::from_vars(empty_env());
-        let args = push_args_for_resolver(false);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(
-            resolved.seed_url.as_deref(),
-            Some("https://manifest.example/seed"),
-            "manifest fallback fires in prod when both flag and env are unset"
-        );
-    }
-
-    #[test]
-    fn resolve_seed_url_none_when_nothing_set_in_prod() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
-        let env = EnvConfig::from_vars(empty_env());
-        let args = push_args_for_resolver(false);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert!(
-            resolved.seed_url.is_none(),
-            "prod mode resolves to None when nothing is configured — the adapter then surfaces its `seed URL is not configured` error: {:?}",
-            resolved.seed_url
-        );
-    }
-
-    /// SECURITY-LOAD-BEARING: `--local` MUST NOT consult the
-    /// manifest's prod URL. An operator with a prod
-    /// `[adapters.spin.commands].seed-url` set should still get the
-    /// builtin localhost URL when they run `config push --local`,
-    /// otherwise the prod URL leaks into local pushes.
-    #[test]
-    fn resolve_seed_url_local_mode_never_consults_manifest_even_when_set() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(Some(
-            "https://prod.example/seed",
-        )));
-        let env = EnvConfig::from_vars(empty_env());
-        let args = push_args_for_resolver(true);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(
-            resolved.seed_url.as_deref(),
-            Some("http://127.0.0.1:3000/__edgezero/config/seed"),
-            "local mode must fall through to the builtin localhost URL, NOT the manifest prod URL ({:?})",
-            resolved.seed_url
-        );
-    }
-
-    #[test]
-    fn resolve_seed_url_local_env_var_beats_builtin_fallback() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
-        let env = EnvConfig::from_vars([(
-            "EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL",
-            "http://localhost:8000/seed",
-        )]);
-        let args = push_args_for_resolver(true);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(
-            resolved.seed_url.as_deref(),
-            Some("http://localhost:8000/seed")
-        );
-    }
-
-    #[test]
-    fn resolve_seed_url_local_flag_beats_env_and_builtin() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
-        let env = EnvConfig::from_vars([(
-            "EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL",
-            "http://localhost:8000/seed",
-        )]);
-        let mut args = push_args_for_resolver(true);
-        args.seed_url = Some("http://flag.local/seed".to_owned());
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(resolved.seed_url.as_deref(), Some("http://flag.local/seed"));
-    }
-
-    /// Prod-mode env var must not bleed into local mode (different env
-    /// var names, separate chains per D3).
-    #[test]
-    fn resolve_seed_url_local_mode_ignores_prod_env_var() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
-        let env = EnvConfig::from_vars([(
-            "EDGEZERO__ADAPTERS__SPIN__SEED_URL",
-            "https://prod.example/seed",
-        )]);
-        let args = push_args_for_resolver(true);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(
-            resolved.seed_url.as_deref(),
-            Some("http://127.0.0.1:3000/__edgezero/config/seed"),
-            "the prod env var must NOT leak into local mode"
-        );
-    }
-
-    // ---------- seed_token resolution (D11: NEVER read from manifest) ----------
-
-    #[test]
-    fn resolve_seed_token_flag_beats_env() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
-        let env =
-            EnvConfig::from_vars([("EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN", "from-env-token")]);
-        let mut args = push_args_for_resolver(false);
-        args.seed_token = Some("from-flag-token".to_owned());
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(resolved.seed_token.as_deref(), Some("from-flag-token"));
-    }
-
-    #[test]
-    fn resolve_seed_token_env_when_flag_unset() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
-        let env =
-            EnvConfig::from_vars([("EDGEZERO__ADAPTERS__SPIN__SEED_TOKEN", "from-env-token")]);
-        let args = push_args_for_resolver(false);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert_eq!(resolved.seed_token.as_deref(), Some("from-env-token"));
-    }
-
-    #[test]
-    fn resolve_seed_token_none_when_nothing_set() {
-        let (_dir, loader) = load_manifest_for_resolver(&spin_manifest_with_seed_url(None));
-        let env = EnvConfig::from_vars(empty_env());
-        let args = push_args_for_resolver(false);
-
-        let resolved = resolve_adapter_push_ctx(&args, &env, loader.manifest(), "spin");
-        assert!(resolved.seed_token.is_none());
-    }
-
     // ---------- raw push ----------
 
     #[test]
@@ -2112,43 +1749,12 @@ ids = ["default"]
     }
 
     #[test]
+    #[ignore = "spin push under restructure: per-backend writers land in the next commit"]
     fn raw_push_spin_dry_run_dispatches_to_adapter() {
-        // Stage 4 (KV-backed): spin push is HTTP POST to the seed
-        // handler. Dry-run skips the actual POST but still requires
-        // a seed URL to print. Provide one so the CLI dispatcher
-        // exercises adapter wiring without leaving artifacts.
-        let manifest_spin = r#"
-[app]
-name = "demo-app"
-
-[adapters.spin.adapter]
-crate = "crates/demo-spin"
-manifest = "spin.toml"
-
-[adapters.spin.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.config]
-ids = ["app_config"]
-
-[stores.secrets]
-ids = ["default"]
-"#;
-        let (dir, manifest, _) = setup_project(manifest_spin, VALID_APP_CONFIG);
-        // spin's push needs a single-component spin.toml the
-        // resolver can locate — write one even though dry-run
-        // won't edit it.
-        fs::write(
-            dir.path().join("spin.toml"),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        )
-        .expect("write spin.toml");
-        let mut args = push_args(&manifest, "spin");
-        args.dry_run = true;
-        args.seed_url = Some("http://127.0.0.1:3000/__edgezero/config/seed".to_owned());
-        run_config_push(&args).expect("spin dry-run dispatches cleanly");
+        // This test asserted dispatch into the seed-handler-based
+        // push that was deleted in this commit. Will be rewritten in
+        // the per-backend-writers commit to dry-run dispatch through
+        // the SQLite-direct path against a temp `.spin/sqlite_key_value.db`.
     }
 
     // ---------- typed push ----------
@@ -2219,9 +1825,7 @@ timeout_ms = 50
     /// risking a partial mutation in any future adapter without
     /// the same belt-and-braces guard. We probe via Spin's
     /// `validate_adapter_manifest`, which fails when the
-    /// referenced spin.toml has no `[component.*]` declarations
-    /// (Stage 6+: Spin no longer enforces a key-syntax rule, so
-    /// the original `api-token` probe no longer fires).
+    /// referenced spin.toml has no `[component.*]` declarations.
     #[test]
     fn raw_push_runs_spin_adapter_manifest_check_before_push() {
         let app_config = r#"

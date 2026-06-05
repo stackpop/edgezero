@@ -97,7 +97,7 @@ pub struct ProvisionStores<'stores> {
 
 /// Context passed to [`Adapter::push_config_entries`] and
 /// [`Adapter::push_config_entries_local`] carrying already-resolved
-/// `config push` overlay values (seed URL / token / local flag).
+/// `config push` overlay values.
 ///
 /// The CLI's `dispatch_push` builds this via the builder API
 /// ([`Self::new`] + the `with_*` setters) so future fields can be
@@ -106,7 +106,7 @@ pub struct ProvisionStores<'stores> {
 /// downstream construction stays inside the builder.
 ///
 /// Lifetime: borrows the resolved strings from the CLI's owned
-/// `PushContext` (config.rs) so adapters see `Option<&str>` without
+/// `PushContext` (config.rs) so adapters see `Option<&_>` without
 /// any extra cloning.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -116,21 +116,18 @@ pub struct AdapterPushContext<'ctx> {
     /// right writeback target; adapters where local == default
     /// can ignore it.
     pub local: bool,
-    /// Already-resolved seed token. `None` means the operator
-    /// did not pass `--seed-token` and
-    /// `EDGEZERO__ADAPTERS__<NAME>__SEED_TOKEN` is unset.
-    pub seed_token: Option<&'ctx str>,
-    /// Already-resolved seed URL. The CLI follows the
-    /// prod or local resolution chain depending on `--local`,
-    /// per spin-kv-config plan D3 / D8, and stores the final
-    /// string here. `None` means "no URL was set anywhere in
-    /// the chain" — the adapter errors loudly if it needs one.
-    pub seed_url: Option<&'ctx str>,
+    /// Already-resolved path to the adapter's runtime configuration
+    /// file (e.g. Spin's `runtime-config.toml`, which declares the
+    /// `[key_value_store.<label>]` backends `config push --adapter
+    /// spin` dispatches into). `None` means the operator did not
+    /// pass `--runtime-config`; the adapter resolves a default
+    /// location (typically next to the adapter manifest).
+    pub runtime_config_path: Option<&'ctx Path>,
 }
 
 impl<'ctx> AdapterPushContext<'ctx> {
-    /// Construct a default context: no seed URL / token, prod (not
-    /// local). Rust rejects struct-literal construction of
+    /// Construct a default context: no runtime-config path, prod
+    /// (not local). Rust rejects struct-literal construction of
     /// `#[non_exhaustive]` types from outside the defining crate, so
     /// the CLI MUST build via this constructor and the `with_*`
     /// setters below.
@@ -148,19 +145,11 @@ impl<'ctx> AdapterPushContext<'ctx> {
         self
     }
 
-    /// Set the seed token.
+    /// Set the runtime-config path.
     #[must_use]
     #[inline]
-    pub fn with_seed_token(mut self, token: &'ctx str) -> Self {
-        self.seed_token = Some(token);
-        self
-    }
-
-    /// Set the seed URL.
-    #[must_use]
-    #[inline]
-    pub fn with_seed_url(mut self, url: &'ctx str) -> Self {
-        self.seed_url = Some(url);
+    pub fn with_runtime_config_path(mut self, path: &'ctx Path) -> Self {
+        self.runtime_config_path = Some(path);
         self
     }
 }
@@ -320,20 +309,6 @@ pub trait Adapter: Sync + Send {
             "adapter `{}` does not implement `config push --local`",
             self.name()
         ))
-    }
-
-    /// Routes the adapter's runtime intercepts before the app router
-    /// runs — `config validate` rejects any `[[triggers.http]].handler`
-    /// path that matches one of these, since the user-declared
-    /// handler would be silently shadowed by the adapter's intercept.
-    /// Default: `&[]`.
-    ///
-    /// Spin overrides this to reserve `/__edgezero/config/seed` (the
-    /// `config push --adapter spin` target wired by
-    /// `run_app_with_seeder`).
-    #[inline]
-    fn reserved_paths(&self) -> &'static [&'static str] {
-        &[]
     }
 
     /// Store kinds for which this adapter is Single-capable per
