@@ -176,8 +176,14 @@ pub(crate) fn write_batch(
             || stderr_lower.contains("no store linked")
             || stderr_lower.contains("link")
         {
+            // `spin cloud link key-value` takes the label POSITIONALLY
+            // (`<LABEL>`) and the cloud store name via `--store
+            // <STORE>` per fermyon/cloud-plugin's
+            // `src/commands/link.rs::KeyValueStoreLinkCommand`. There
+            // is NO `--label` flag on link (despite there being one
+            // on `set`).
             return Err(format!(
-                "`spin cloud key-value set --app {app_name} --label {label}` reports that the label is not linked to a cloud KV store. Run `spin cloud link key-value --app {app_name} --label {label} <store-name>` (or create + link via the Fermyon dashboard) and retry. Stderr: {stderr}"
+                "`spin cloud key-value set --app {app_name} --label {label}` reports that the label is not linked to a cloud KV store. Run `spin cloud link key-value --app {app_name} --store <store-name> {label}` (or create + link via the Fermyon dashboard) and retry. Stderr: {stderr}"
             ));
         }
         return Err(format!(
@@ -192,6 +198,22 @@ pub(crate) fn write_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::env;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(unix)]
+    use std::path::Path as StdPath;
+    #[cfg(unix)]
+    use std::sync::{Mutex, OnceLock};
+    #[cfg(unix)]
+    use tempfile::{tempdir, TempDir};
 
     #[test]
     fn detect_fermyon_cloud_from_spin_deploy() {
@@ -303,6 +325,231 @@ mod tests {
         assert!(
             err.contains("safe-argv-per-invocation cap"),
             "error names the cap: {err}"
+        );
+    }
+
+    // ---------- Hermetic mock-spin argv capture ----------
+    //
+    // `chunk_entries` + `format_pair` cover the per-pair / chunking
+    // logic in isolation, but they don't prove `write_batch`
+    // assembles the EXACT argv we promise: `spin cloud key-value set
+    // --app <APP> --label <LABEL> KEY=VALUE [KEY=VALUE …]`. Past
+    // command-shape regressions (the `--store` mistake before the
+    // app-scoped label fix) would have been caught by an
+    // end-to-end argv test. These tests stand up a temp dir with a
+    // fake `spin` script that records its argv to a sibling file,
+    // prepend it to `PATH`, and assert the captured argv matches.
+
+    /// Build a tempdir containing a script named `spin` that
+    /// records its argv (one per line) to `out_path` and exits 0.
+    /// Returns the tempdir (so it stays alive for the test's
+    /// lifetime) and the path of the script.
+    #[cfg(unix)]
+    fn fake_spin(out_path: &StdPath, stderr_to_emit: Option<&str>, exit_code: i32) -> TempDir {
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("spin");
+        // Write the stderr payload to a SEPARATE file rather than
+        // interpolating it into the script body — payloads contain
+        // backticks, `$`, and other shell-active characters
+        // (`` `app_config` `` etc.) that would otherwise be
+        // re-interpreted by the shell and corrupt the capture.
+        let stderr_path = dir.path().join("stderr.txt");
+        if let Some(payload) = stderr_to_emit {
+            fs::write(&stderr_path, payload).expect("write stderr payload");
+        }
+        let mut script = fs::File::create(&script_path).expect("create script");
+        // /bin/sh writes each arg on its own line. `printf '%s\n'`
+        // is portable across macOS / Linux (unlike `echo`).
+        write!(
+            script,
+            r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >> '{out}'; done
+if [ -f '{stderr_file}' ]; then cat '{stderr_file}' >&2; fi
+exit {exit}
+"#,
+            out = out_path.display(),
+            stderr_file = stderr_path.display(),
+            exit = exit_code,
+        )
+        .expect("write script body");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    /// RAII guard that prepends a temp dir to `$PATH` and restores
+    /// the prior value on drop.
+    #[cfg(unix)]
+    struct PathPrepend {
+        original: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl PathPrepend {
+        fn new(extra: &StdPath) -> Self {
+            let original = env::var_os("PATH");
+            let new = match &original {
+                Some(prev) => {
+                    let mut accum = OsString::from(extra);
+                    accum.push(":");
+                    accum.push(prev);
+                    accum
+                }
+                None => OsString::from(extra),
+            };
+            env::set_var("PATH", new);
+            Self { original }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathPrepend {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(prev) => env::set_var("PATH", prev),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// A process-wide mutex serialising `PATH`-mutating tests in
+    /// this module so two parallel tests don't race on the env.
+    #[cfg(unix)]
+    fn path_mutation_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_batch_assembles_app_label_keyvalue_argv_against_a_mock_spin() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let out_dir = tempdir().expect("out dir");
+        let argv_log = out_dir.path().join("argv.txt");
+        let fake_dir = fake_spin(&argv_log, None, 0);
+        let _path = PathPrepend::new(fake_dir.path());
+
+        let entries = vec![
+            ("greeting".to_owned(), "hello".to_owned()),
+            ("svc.timeout".to_owned(), "1500".to_owned()),
+        ];
+        write_batch("my-app", "app_config", &entries).expect("mock spin returns 0");
+
+        let argv_contents = fs::read_to_string(&argv_log).expect("read argv");
+        let args: Vec<&str> = argv_contents.lines().collect();
+        assert_eq!(
+            args,
+            vec![
+                "cloud",
+                "key-value",
+                "set",
+                "--app",
+                "my-app",
+                "--label",
+                "app_config",
+                "greeting=hello",
+                "svc.timeout=1500",
+            ],
+            "argv shape must match Fermyon's documented `spin cloud key-value set --app APP --label LABEL KEY=VALUE` form"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_batch_translates_not_logged_in_stderr_to_actionable_error() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let out_dir = tempdir().expect("out dir");
+        let argv_log = out_dir.path().join("argv.txt");
+        let fake_dir = fake_spin(&argv_log, Some("error: not logged in to Fermyon Cloud"), 1);
+        let _path = PathPrepend::new(fake_dir.path());
+
+        let err = write_batch("my-app", "app_config", &[("k".to_owned(), "v".to_owned())])
+            .expect_err("non-zero exit must surface as error");
+        assert!(
+            err.contains("spin cloud login"),
+            "auth-error path must suggest `spin cloud login`: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_batch_translates_unlinked_stderr_to_actionable_link_hint() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let out_dir = tempdir().expect("out dir");
+        let argv_log = out_dir.path().join("argv.txt");
+        let fake_dir = fake_spin(
+            &argv_log,
+            Some("error: label `app_config` is not linked to a store"),
+            1,
+        );
+        let _path = PathPrepend::new(fake_dir.path());
+
+        let err = write_batch("my-app", "app_config", &[("k".to_owned(), "v".to_owned())])
+            .expect_err("unlinked label must surface as error");
+        // The hint must use the corrected Fermyon syntax: `--app
+        // <APP> --store <STORE> <LABEL>` (positional label, NOT
+        // `--label`). The full error includes BOTH the failing SET
+        // command (which legitimately uses `--label app_config`)
+        // AND the LINK hint, so the negative check must scope to
+        // the link region.
+        assert!(
+            err.contains("spin cloud link key-value")
+                && err.contains("--app my-app")
+                && err.contains("--store <store-name>"),
+            "hint must suggest the corrected link command shape: {err}"
+        );
+        let link_start = err
+            .find("spin cloud link key-value")
+            .expect("link hint present");
+        // String indexing here is safe: `find` returns a char-boundary
+        // byte offset, and `spin cloud link key-value` is ASCII so
+        // slicing from that offset can't split a UTF-8 character.
+        // Take everything from "link key-value" up to the next
+        // sentence-boundary (the parenthetical fallback) so we
+        // don't accidentally re-include the SET command's
+        // `--label` arg.
+        let link_tail = err.get(link_start..).expect("link tail");
+        let link_scope = link_tail.split('(').next().unwrap_or(link_tail);
+        assert!(
+            !link_scope.contains("--label"),
+            "the `link key-value` command takes the label POSITIONALLY, not via --label. Link-region of error: {link_scope}"
+        );
+        // Sanity: the link region ENDS with the positional label.
+        assert!(
+            link_scope.trim_end().ends_with("app_config`") || link_scope.contains(" app_config "),
+            "link region must mention the positional label `app_config`: {link_scope}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_batch_chunks_large_batch_into_multiple_invocations_against_mock_spin() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let out_dir = tempdir().expect("out dir");
+        let argv_log = out_dir.path().join("argv.txt");
+        let fake_dir = fake_spin(&argv_log, None, 0);
+        let _path = PathPrepend::new(fake_dir.path());
+
+        // Same fixture as `chunk_entries_splits_when_aggregate_exceeds_cap`
+        // -- 7 x ~30 KiB entries split into >=3 chunks. The mock
+        // records each invocation's argv, separated by repeats of
+        // the static header (`cloud key-value set --app ...`); the
+        // header appears once per invocation, so we count
+        // occurrences.
+        let big = "z".repeat(30_usize * 1024_usize);
+        let entries: Vec<(String, String)> = (0_u32..7_u32)
+            .map(|i| (format!("k{i}"), big.clone()))
+            .collect();
+        write_batch("my-app", "app_config", &entries).expect("mock spin");
+
+        let argv_contents = fs::read_to_string(&argv_log).expect("read argv");
+        let mid_set_count = argv_contents.matches("\nset\n").count();
+        let starts_with_set = usize::from(argv_contents.starts_with("cloud\nkey-value\nset\n"));
+        let invocations = mid_set_count.saturating_add(starts_with_set);
+        assert!(
+            invocations >= 3,
+            "expected >=3 mock invocations from chunked batch, got {invocations} (argv log: {argv_contents})"
         );
     }
 }
