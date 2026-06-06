@@ -596,10 +596,20 @@ fn dispatch_push(
     if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
         let app_name = read_spin_application_name(&spin_manifest_path)?;
         if dry_run {
+            // Run the same validation the real push runs: a `=` in
+            // a key would be silently split by `spin`'s upstream
+            // `KEY=VALUE` parser, and any single entry / cumulative
+            // argv chunk over the safe-argv cap would fail the
+            // shellout. Surfacing these in dry-run means a "clean"
+            // preview is a real predictor of push success — without
+            // it, the operator gets a green dry-run followed by a
+            // hard failure on the actual push.
+            let chunks = push_cloud::chunk_entries(entries)?;
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would shell `spin cloud key-value set --app {app_name} --label {platform} KEY=VALUE [...]` for {} entries (logical id `{logical}`):",
-                entries.len()
+                "would shell `spin cloud key-value set --app {app_name} --label {platform} KEY=VALUE [...]` for {} entries across {} invocation(s) (logical id `{logical}`):",
+                entries.len(),
+                chunks.len()
             ));
             for (key, _) in entries {
                 out.push(format!("  would set `{key}`"));
@@ -1754,6 +1764,34 @@ mod tests {
                 && out[0].contains("--app x")
                 && out[0].contains("--label app_config"),
             "cloud preview should render the app-scoped shape: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_fermyon_cloud_dry_run_rejects_equals_in_key() {
+        // The real push errors on a `=` in a key (would be silently
+        // truncated by Spin's upstream `KEY=VALUE` parser). The
+        // dry-run preview MUST surface the same error — otherwise an
+        // operator gets a green dry-run followed by a hard failure on
+        // the actual push.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        let bad = vec![("svc=timeout".to_owned(), "1500".to_owned())];
+
+        let push_ctx =
+            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let err = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &bad,
+            &push_ctx,
+            true,
+        )
+        .expect_err("dry-run must reject `=` in keys");
+        assert!(
+            err.contains("contains `=`"),
+            "dry-run error must surface the same KEY=VALUE diagnostic the real push gives: {err}"
         );
     }
 

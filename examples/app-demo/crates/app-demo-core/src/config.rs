@@ -25,10 +25,11 @@ pub struct AppDemoConfig {
     pub api_token: String,
 
     /// Feature-flag sub-table. Nested so `config push` writes the
-    /// dotted key `feature.new_checkout` (translated to
-    /// `feature__new_checkout` on Spin) — matching the existing
+    /// dotted key `feature.new_checkout` — matching the existing
     /// handler that reads `feature.new_checkout` from the config
     /// store and the per-adapter seeds in `fastly.toml`/`spin.toml`.
+    /// Spin's config store is now KV-backed and stores dotted keys
+    /// verbatim (no `feature__new_checkout` translation step).
     /// `#[validate(nested)]` makes the outer `validate()` call
     /// recurse into `FeatureConfig`'s rules.
     #[validate(nested)]

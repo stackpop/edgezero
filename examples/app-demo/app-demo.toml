@@ -24,8 +24,9 @@ vault = "default"
 # Nested so `config push` writes the dotted key
 # `feature.new_checkout` — matching the handler that reads
 # `feature.new_checkout` from the config store and the per-adapter
-# seeds in `fastly.toml`/`spin.toml` (translated to
-# `feature__new_checkout` on Spin's flat namespace).
+# seeds in `fastly.toml`/`spin.toml`. Spin's config store is now
+# KV-backed and stores dotted keys verbatim, so no translation is
+# applied: the runtime reads back exactly `feature.new_checkout`.
 [feature]
 new_checkout = false
 
