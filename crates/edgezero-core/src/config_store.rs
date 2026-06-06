@@ -209,7 +209,7 @@ impl ConfigStoreError {
 /// - `AxumConfigStore` (axum adapter) — env vars + in-memory defaults for dev
 /// - `FastlyConfigStore` (fastly adapter) — Fastly Config Store
 /// - `CloudflareConfigStore` (cloudflare adapter) — Cloudflare KV namespace
-/// - `SpinConfigStore` (spin adapter) — Spin component variables
+/// - `SpinConfigStore` (spin adapter) — Spin KV (`spin_sdk::key_value::Store`)
 #[async_trait(?Send)]
 pub trait ConfigStore: Send + Sync {
     /// Retrieve a config value by key. Returns `None` if the key does not exist.
