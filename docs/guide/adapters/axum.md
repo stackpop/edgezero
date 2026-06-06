@@ -170,9 +170,12 @@ async fn handler(config: Config) -> Result<Response, EdgeError> {
 ```
 
 Do not pass raw user input straight to `store.get(…)` in production
-handlers; validate or allowlist keys first. (`config push` will write
-`.edgezero/local-config-<id>.json` from a typed app-config in Stage 7;
-until then, populate it directly.)
+handlers; validate or allowlist keys first. Seed the per-id JSON
+files with `edgezero config push --adapter axum` (or
+`<your-cli> config push --adapter axum` for the typed flow with
+`#[secret]` stripping), which writes the same
+`.edgezero/local-config-<id>.json` files the runtime reads —
+no shell-out, no server to authenticate against.
 
 ## Container Deployment
 

@@ -196,13 +196,15 @@ Runtime behavior by adapter:
 - Fastly reads from a Fastly Config Store resource link, one per id.
 - Cloudflare reads from a KV namespace, one per id, asynchronously.
 - Axum reads from `.edgezero/local-config-<id>.json` per logical id
-  (one file per declared config id). The `config push` command will
-  write that file in Stage 7; until then, populate it directly.
+  (one file per declared config id). Seed entries with
+  `config push --adapter axum`, which writes the same file the
+  runtime reads (creates `.edgezero/` on first use). No shell-out;
+  the file is human-editable for ad-hoc tweaks.
 - Spin reads a `spin_sdk::key_value::Store` per id, one label per
   declared `[stores.config]` id (multi-store). Labels must be declared
   in `spin.toml`'s `[component.<id>].key_value_stores` — `provision`
   writes them automatically. Seed entries via `config push --adapter
-  spin`, which dispatches per-backend by reading `runtime-config.toml`:
+spin`, which dispatches per-backend by reading `runtime-config.toml`:
   `type = "spin"` → direct write into the local `.spin/sqlite_key_value.db`;
   Fermyon Cloud deploys → shell `spin cloud key-value set`; other
   backend types (redis, azure_cosmos) print an actionable error

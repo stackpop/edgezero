@@ -140,7 +140,17 @@ pub(crate) fn write_batch(
     entries: &[(String, String)],
 ) -> Result<(), String> {
     let chunks = chunk_entries(entries)?;
+    let total = entries.len();
+    // Cursor into `entries`. Chunks are built in input order by
+    // `chunk_entries` and contain `chunk.len()` entries each, so
+    // committed entries are always `entries[0..cursor]` and the
+    // current chunk's source entries are
+    // `entries[cursor..cursor + chunk.len()]`. This lets us produce
+    // a Fastly-shaped partial-failure diagnostic when a mid-stream
+    // chunk shellout fails.
+    let mut cursor: usize = 0;
     for chunk in chunks {
+        let chunk_len = chunk.len();
         let mut command = Command::new("spin");
         command
             .arg("cloud")
@@ -162,14 +172,38 @@ pub(crate) fn write_batch(
         })?;
 
         if output.status.success() {
+            cursor = cursor.saturating_add(chunk_len);
             continue;
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr_lower = stderr.to_ascii_lowercase();
+        let chunk_end = cursor.saturating_add(chunk_len);
+        let committed: Vec<&str> = entries[..cursor].iter().map(|(k, _)| k.as_str()).collect();
+        let failed_chunk: Vec<&str> = entries[cursor..chunk_end]
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        let not_attempted: Vec<&str> = entries[chunk_end..]
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        // Mirror Fastly's diagnostic shape so the operator can resume
+        // from a known boundary: which keys are already on Fermyon
+        // Cloud, which keys are in the failing chunk's commit-or-not
+        // state (the cloud API is atomic per shellout, so a non-zero
+        // exit means none of `failed` made it), and which keys never
+        // had `set` attempted at all.
+        let partial = if cursor > 0 || !not_attempted.is_empty() {
+            format!(
+                "\n  Committed (safe to skip on retry): {committed:?}\n  Failed chunk: {failed_chunk:?}\n  Not attempted (re-push these): {not_attempted:?}\n  Resume: re-run with only the failed + not-attempted keys, or with all entries (set is idempotent — committed keys will just be overwritten with the same value)."
+            )
+        } else {
+            String::new()
+        };
         if stderr_lower.contains("not logged in") || stderr_lower.contains("authentication") {
             return Err(format!(
-                "`spin cloud key-value set` reports not authenticated. Run `spin cloud login` and retry. Stderr: {stderr}"
+                "`spin cloud key-value set` reports not authenticated. Run `spin cloud login` and retry. Stderr: {stderr}{partial}"
             ));
         }
         if stderr_lower.contains("not linked")
@@ -183,13 +217,13 @@ pub(crate) fn write_batch(
             // is NO `--label` flag on link (despite there being one
             // on `set`).
             return Err(format!(
-                "`spin cloud key-value set --app {app_name} --label {label}` reports that the label is not linked to a cloud KV store. Run `spin cloud link key-value --app {app_name} --store <store-name> {label}` (or create + link via the Fermyon dashboard) and retry. Stderr: {stderr}"
+                "`spin cloud key-value set --app {app_name} --label {label}` reports that the label is not linked to a cloud KV store. Run `spin cloud link key-value --app {app_name} --store <store-name> {label}` (or create + link via the Fermyon dashboard) and retry. Stderr: {stderr}{partial}"
             ));
         }
         return Err(format!(
-            "`spin cloud key-value set --app {app_name} --label {label} <{} pairs>` failed (status {}): {stderr}",
-            chunk.len(),
-            output.status.code().unwrap_or(-1)
+            "`spin cloud key-value set --app {app_name} --label {label} <{chunk_len} pairs>` failed (status {status}) after committing {committed_count} of {total} entries: {stderr}{partial}",
+            status = output.status.code().unwrap_or(-1),
+            committed_count = cursor,
         ));
     }
     Ok(())
@@ -339,6 +373,49 @@ mod tests {
     // end-to-end argv test. These tests stand up a temp dir with a
     // fake `spin` script that records its argv to a sibling file,
     // prepend it to `PATH`, and assert the captured argv matches.
+
+    /// Variant of [`fake_spin`] that succeeds on the first `n - 1`
+    /// invocations and fails on the `n`-th. Used to drive the
+    /// partial-failure diagnostic in `write_batch` — chunk 1
+    /// succeeds, chunk 2 fails, chunk 3+ are never attempted. Uses
+    /// a counter file in the tempdir so the script can tell which
+    /// invocation it is.
+    #[cfg(unix)]
+    fn fake_spin_fail_on_nth(
+        out_path: &StdPath,
+        fail_on_invocation: u32,
+        stderr_to_emit: &str,
+    ) -> TempDir {
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("spin");
+        let stderr_path = dir.path().join("stderr.txt");
+        let counter_path = dir.path().join("invocations.txt");
+        fs::write(&stderr_path, stderr_to_emit).expect("write stderr payload");
+        let mut script = fs::File::create(&script_path).expect("create script");
+        write!(
+            script,
+            r#"#!/bin/sh
+for arg in "$@"; do printf '%s\n' "$arg" >> '{out}'; done
+n=$(cat '{counter}' 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > '{counter}'
+if [ "$n" = "{fail_on}" ]; then
+  cat '{stderr_file}' >&2
+  exit 1
+fi
+exit 0
+"#,
+            out = out_path.display(),
+            counter = counter_path.display(),
+            fail_on = fail_on_invocation,
+            stderr_file = stderr_path.display(),
+        )
+        .expect("write script body");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
 
     /// Build a tempdir containing a script named `spin` that
     /// records its argv (one per line) to `out_path` and exits 0.
@@ -550,6 +627,71 @@ exit {exit}
         assert!(
             invocations >= 3,
             "expected >=3 mock invocations from chunked batch, got {invocations} (argv log: {argv_contents})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_batch_partial_failure_reports_committed_failed_and_not_attempted_keys() {
+        // Cloud pushes shell out once per chunk, and Fermyon Cloud's
+        // `set` is atomic per shellout — so if chunk 1 succeeds and
+        // chunk 2 fails, chunk 1's keys are live in Cloud while
+        // chunk 3+ never had `set` attempted. Mirror the Fastly
+        // diagnostic shape: name committed / failed / not-attempted
+        // so the operator can resume from a known boundary.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let out_dir = tempdir().expect("out dir");
+        let argv_log = out_dir.path().join("argv.txt");
+        // Fail on the 2nd invocation: chunk 1 commits, chunk 2 errors,
+        // chunk 3 (if produced) never runs.
+        let fake_dir = fake_spin_fail_on_nth(&argv_log, 2, "error: backend write failed");
+        let _path = PathPrepend::new(fake_dir.path());
+
+        // Same shape as the chunking test — 7 x ~30 KiB entries
+        // produce >=3 chunks.
+        let big = "z".repeat(30_usize * 1024_usize);
+        let entries: Vec<(String, String)> = (0_u32..7_u32)
+            .map(|i| (format!("k{i}"), big.clone()))
+            .collect();
+
+        let err =
+            write_batch("my-app", "app_config", &entries).expect_err("second chunk must fail");
+
+        // Diagnostic must call out all three buckets.
+        assert!(
+            err.contains("Committed (safe to skip on retry):"),
+            "must label committed bucket: {err}"
+        );
+        assert!(
+            err.contains("Failed chunk:"),
+            "must label failed-chunk bucket: {err}"
+        );
+        assert!(
+            err.contains("Not attempted (re-push these):"),
+            "must label not-attempted bucket: {err}"
+        );
+        // After committing some entries, the count must appear.
+        assert!(
+            err.contains("after committing"),
+            "must surface committed count in header: {err}"
+        );
+        // Resume hint references idempotency.
+        assert!(
+            err.contains("Resume:") && err.contains("idempotent"),
+            "must include resume hint: {err}"
+        );
+        // Underlying stderr is preserved so the operator sees the
+        // real failure reason.
+        assert!(
+            err.contains("backend write failed"),
+            "must include upstream stderr: {err}"
+        );
+        // Sanity: at least one key from the input must show up in
+        // the committed list (specifically `k0`, which lives in the
+        // first chunk).
+        assert!(
+            err.contains("\"k0\""),
+            "committed bucket must include at least `k0` from chunk 1: {err}"
         );
     }
 }
