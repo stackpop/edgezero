@@ -67,12 +67,12 @@ id automatically). Both are validated at load time.
 Each (adapter, kind) pair is one of two capabilities (full table in
 the spec, §6.6):
 
-| Adapter    | KV               | Config                  | Secrets                 |
-| ---------- | ---------------- | ----------------------- | ----------------------- |
-| axum       | Multi (local)    | Multi (local files)     | Single (env vars)       |
-| cloudflare | Multi (KV ns)    | Multi (KV ns)           | Single (worker secrets) |
-| fastly     | Multi (KV store) | Multi (config store)    | Multi (secret store)    |
-| spin       | Multi (KV label) | Single (flat variables) | Single (flat variables) |
+| Adapter    | KV               | Config               | Secrets                 |
+| ---------- | ---------------- | -------------------- | ----------------------- |
+| axum       | Multi (local)    | Multi (local files)  | Single (env vars)       |
+| cloudflare | Multi (KV ns)    | Multi (KV ns)        | Single (worker secrets) |
+| fastly     | Multi (KV store) | Multi (config store) | Multi (secret store)    |
+| spin       | Multi (KV label) | Multi (KV label)     | Single (flat variables) |
 
 - **Multi**: each logical id resolves to its own platform store.
 - **Single**: every logical id maps to the same flat store; per-id
