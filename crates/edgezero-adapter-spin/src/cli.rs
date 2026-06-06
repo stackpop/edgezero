@@ -536,13 +536,16 @@ fn dispatch_push(
     let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
 
     // --runtime-config wins; otherwise default to
-    // `runtime-config.toml` next to the spin manifest.
+    // `runtime-config.toml` next to the spin manifest. Path math
+    // only — the actual `runtime_config::read` is deferred until a
+    // branch that NEEDS the parsed file, so a malformed/unreadable
+    // `runtime-config.toml` doesn't block the cloud branch (which
+    // only needs `spin.toml`'s `[application].name`).
     let runtime_config_path = push_ctx.runtime_config_path.map_or_else(
         || spin_manifest_dir.join("runtime-config.toml"),
         Path::to_path_buf,
     );
     let runtime_config_dir = runtime_config_path.parent().unwrap_or(spin_manifest_dir);
-    let parsed = runtime_config::read(&runtime_config_path)?;
 
     // 1. `--local` forces SQLite-direct EVERY time. We skip both the
     //    Fermyon Cloud auto-detect AND the runtime-config backend
@@ -560,6 +563,7 @@ fn dispatch_push(
     //    key_value_stores label X" and the SQLite file we wrote is
     //    unreadable from the running app. See `verify_label_declared`.
     if push_ctx.local {
+        let parsed = runtime_config::read(&runtime_config_path)?;
         verify_label_declared(platform, &parsed, &runtime_config_path)?;
         return write_sqlite(
             spin_manifest_dir,
@@ -584,7 +588,11 @@ fn dispatch_push(
     //    treat as Fermyon Cloud. Cloud's `set` subcommand addresses
     //    the cloud KV store via Fermyon's app-scoped label model
     //    (`--app <app> --label <label>`), so we need the spin app
-    //    name from spin.toml.
+    //    name from spin.toml. We DO NOT read `runtime-config.toml`
+    //    here — the cloud writer doesn't consult any local backend
+    //    declaration, and parsing the file would gratuitously block
+    //    cloud pushes (including `--dry-run` previews) on syntax
+    //    errors in a file that doesn't influence the cloud path.
     if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
         let app_name = read_spin_application_name(&spin_manifest_path)?;
         if dry_run {
@@ -608,6 +616,7 @@ fn dispatch_push(
     // 3 / 4: SQLite-direct dispatch. Look up the backend explicitly
     // declared for this label, falling back to Spin's default
     // `(type = "spin", path = None)` if the label has no stanza.
+    let parsed = runtime_config::read(&runtime_config_path)?;
     let backend = parsed.key_value_stores.get(platform);
     match backend {
         Some(runtime_config::KeyValueBackend::Redis { url }) => Err(format!(
@@ -1708,6 +1717,43 @@ mod tests {
         assert!(
             !out[0].contains("--store"),
             "must NOT use --store (conflates spin label with cloud KV resource name): {out:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_push_fermyon_cloud_dry_run_ignores_malformed_runtime_config() {
+        // Cloud push (set / link) consults only spin.toml's
+        // `[application].name` + the env-resolved label — it never
+        // reads `runtime-config.toml`. So a malformed local runtime
+        // config (someone mid-edit, a stale file from another
+        // project, etc.) MUST NOT block cloud `--dry-run` previews.
+        // Before this fix `dispatch_push` parsed runtime-config
+        // unconditionally at the top, so any TOML syntax error
+        // surfaced before the cloud branch even ran.
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path()); // [application].name = "x"
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "this is not [valid toml at all\n",
+        )
+        .expect("write malformed runtime-config");
+
+        let push_ctx =
+            AdapterPushContext::new().with_manifest_adapter_deploy_cmd("spin deploy --from ./");
+        let out = dispatch_push(
+            dir.path(),
+            Some("spin.toml"),
+            &store("app_config", "app_config"),
+            &entries_two(),
+            &push_ctx,
+            true,
+        )
+        .expect("cloud dry-run must succeed despite malformed runtime-config");
+        assert!(
+            out[0].contains("spin cloud key-value set")
+                && out[0].contains("--app x")
+                && out[0].contains("--label app_config"),
+            "cloud preview should render the app-scoped shape: {out:?}"
         );
     }
 

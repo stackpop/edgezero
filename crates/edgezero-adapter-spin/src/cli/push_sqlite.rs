@@ -120,7 +120,25 @@ static COMPAT_CHECK_DONE: AtomicBool = AtomicBool::new(false);
 /// Idempotent: only runs the shellout the first time it's called per
 /// process, so a batched push (multiple stores → multiple
 /// `write_batch` calls) doesn't double-warn.
+///
+/// **Test-only early-return:** under `cfg!(test)` this function
+/// exits before touching `PATH`. Without it, the `spin --version`
+/// lookup would race `push_cloud`'s tests, which temporarily prepend
+/// a fake `spin` binary to `$PATH` — the fake spin would record
+/// the `--version` invocation into the cloud test's argv log,
+/// corrupting that test's assertions. The check is best-effort
+/// warning logic with no production semantic impact, and the parser
+/// is unit-tested independently, so skipping it in tests doesn't
+/// lose meaningful coverage. `cfg!(test)` resolves at compile time
+/// to a constant the optimizer folds away in release builds, and
+/// importantly it's evaluated against THIS crate's test target — so
+/// the check still runs when `write_batch` is called from
+/// production code or from downstream crates' tests (e.g.
+/// `app-demo-cli`).
 fn verify_spin_runtime_compat() {
+    if cfg!(test) {
+        return;
+    }
     if COMPAT_CHECK_DONE.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -199,7 +217,9 @@ pub(crate) fn write_batch(
     entries: &[(String, String)],
 ) -> Result<(), String> {
     // Best-effort runtime-compat check (once per session). Always
-    // proceeds — Spin is optional from the writer's perspective.
+    // proceeds — Spin is optional from the writer's perspective. The
+    // function itself early-returns under `cfg!(test)` to avoid
+    // racing `push_cloud`'s fake-spin tests; see its doc comment.
     verify_spin_runtime_compat();
 
     if let Some(parent) = db_path.parent() {

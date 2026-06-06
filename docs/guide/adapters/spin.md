@@ -142,7 +142,7 @@ type = "spin"
 --adapter spin` runs `spin up --runtime-config-file runtime-config.toml`
 so locally-declared labels resolve to the SQLite-backed Spin KV
 implementation. For production, swap `type = "spin"` for a managed
-backend (`type = "azure"`, `type = "redis"`, …) per the
+backend (`type = "azure_cosmos"`, `type = "redis"`, …) per the
 [Spin runtime-config docs](https://spinframework.dev/v3/dynamic-configuration#key-value-store-runtime-configuration).
 
 `provision` writes the `[component.<id>].key_value_stores` array for
@@ -168,7 +168,7 @@ no token to manage. Resolution order:
    from `[adapters.spin.commands].deploy` containing `spin deploy` or
    `spin cloud deploy`): one batched shellout per ≤96 KiB chunk of
    `spin cloud key-value set --app <APP> --label <LABEL>
-   KEY=VALUE [KEY=VALUE …]`. `<APP>` comes from
+KEY=VALUE [KEY=VALUE …]`. `<APP>` comes from
    `[application].name` in `spin.toml`; `<LABEL>` is the env-resolved
    platform label (your `[stores.config].id` after the
    `EDGEZERO__STORES__CONFIG__<ID>__NAME` overlay). EdgeZero uses
@@ -183,7 +183,7 @@ no token to manage. Resolution order:
      if set; otherwise the default `.spin/sqlite_key_value.db`).
    - `type = "redis"` / `azure_cosmos` / unknown → clear error
      pointing at the backend's native CLI (e.g. `redis-cli -u <url>
-     SET <key> <value>`). Native-CLI dispatch for redis / azure is
+SET <key> <value>`). Native-CLI dispatch for redis / azure is
      planned for a follow-up release.
 4. **Default**: only the `default` label falls through to SQLite
    without a runtime-config stanza (Spin auto-provides `default`).
