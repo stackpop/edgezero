@@ -179,14 +179,30 @@ pub(crate) fn write_batch(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr_lower = stderr.to_ascii_lowercase();
         let chunk_end = cursor.saturating_add(chunk_len);
-        let committed: Vec<&str> = entries[..cursor].iter().map(|(k, _)| k.as_str()).collect();
-        let failed_chunk: Vec<&str> = entries[cursor..chunk_end]
+        // `.get(..)` keeps strict-clippy's `indexing_slicing` happy
+        // without changing semantics — `cursor` and `chunk_end` are
+        // produced from `entries.len()` and `chunk_entries`, both of
+        // which guarantee the ranges are in-bounds (so a `None` from
+        // `.get` is unreachable). Fall through to an empty slice if
+        // the invariant is ever violated rather than panicking on a
+        // hot error path.
+        let committed: Vec<&str> = entries
+            .get(..cursor)
+            .unwrap_or(&[])
             .iter()
-            .map(|(k, _)| k.as_str())
+            .map(|(key, _value)| key.as_str())
             .collect();
-        let not_attempted: Vec<&str> = entries[chunk_end..]
+        let failed_chunk: Vec<&str> = entries
+            .get(cursor..chunk_end)
+            .unwrap_or(&[])
             .iter()
-            .map(|(k, _)| k.as_str())
+            .map(|(key, _value)| key.as_str())
+            .collect();
+        let not_attempted: Vec<&str> = entries
+            .get(chunk_end..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|(key, _value)| key.as_str())
             .collect();
         // Mirror Fastly's diagnostic shape so the operator can resume
         // from a known boundary: which keys are already on Fermyon
