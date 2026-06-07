@@ -188,7 +188,7 @@ single string values, and pushes per-adapter:
   2. If the manifest's `[adapters.spin.commands].deploy` shells to
      `spin deploy` / `spin cloud deploy`, push batches entries into
      `spin cloud key-value set --app <APP> --label <LABEL>
-     KEY=VALUE [KEY=VALUE …]` invocations (one shellout per
+KEY=VALUE [KEY=VALUE …]` invocations (one shellout per
      ≤96 KiB argv chunk, ≥1000 entries per invocation). `<APP>`
      comes from `[application].name` in spin.toml; `<LABEL>` is the
      env-resolved platform label per Fermyon's
@@ -199,9 +199,9 @@ single string values, and pushes per-adapter:
   3. Otherwise dispatch on `runtime-config.toml`'s
      `[key_value_store.<label>].type`: `type = "spin"` → SQLite-direct
      write (stanza required for non-`default` labels); `type =
-     "redis"` / `azure_cosmos` / unknown → clear error pointing at
+"redis"` / `azure_cosmos` / unknown → clear error pointing at
      the backend's native CLI (e.g. `redis-cli -u <url>
-     SET <key> <value>`).
+SET <key> <value>`).
   4. Default: SQLite-direct at Spin's `.spin/sqlite_key_value.db`,
      but ONLY for the `default` label (Spin auto-provides). Other
      labels require a stanza per point 1.
