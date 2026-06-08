@@ -1,11 +1,11 @@
 # EdgeZero Outbound HTTP — Design Spec
 
-> **Status:** Draft, revised through review rounds 1–50 (round 50 = Fastly SDK correctness pass: `lazy-streamed-response-passthrough` downgraded to `BestEffort` on Fastly because `Response::stream_to_client()` is incompatible with `#[fastly::main]` and `Response::with_streaming_body` does not exist; `NameInUse` semantics corrected against the real SDK contract; false `between_bytes_timeout` write-side claim dropped; streamed-upload response overshoot tightened to closed-form bound; `OutboundResponse::into_body()` added as the app-facing consuming accessor) · **Date:** 2026-06-08
+> **Status:** Draft, revised through review rounds 1–51 (round 51 = round-50 carry-over fixes: early Fastly dynamic-backend paragraph reconciled with the corrected `NameInUse` algorithm, `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` added for the buffered passthrough fallback, §5.4 lazy-passthrough rows rebucketed so Fastly is no longer grouped with CF/Spin, residual `between_bytes_timeout` write-side claims scrubbed from §5.4 + §8 risk 7, Spin host-write race rewritten against actual WASI nonblocking + readiness-poll semantics, two appendix entries flagged as superseded by AY) · **Date:** 2026-06-08
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **not yet merged into `main`**. PR #269 introduces the multi-store manifest (`ManifestStores { config, kv, secrets }`), the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, the expanded `AdapterAction` (`AuthLogin` / `AuthLogout` / `AuthStatus` / `Build` / `Deploy` / `Serve`), separate `Adapter::provision(..)` and config-validation hooks, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the new `examples/app-demo/crates/app-demo-cli` integration crate.
 > **Current checkout (pre-#269):** `crates/edgezero-cli/src/args.rs` still has `Command::{Build, Deploy, Dev, New, Serve}`; `crates/edgezero-adapter/src/registry.rs` still has `AdapterAction::{Build, Deploy, Serve}`; `main.rs` still handles `Command::Dev`. **The CLI rows in §3.5.3 / §5.4 / §7 / Appendix AR are contingent on PR #269 landing.** If PR #269 ships in a different shape, the affected rows must be re-rebased; if it never lands, the spec's CLI surface degrades to the current `build` / `serve` / `deploy` / `dev` set plus the `ensure_capabilities` gate applied at each of those four call sites (the round-1–43 wording). Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of PR #269 and lands either way.
-> **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape (showing both the pre-#269 and PR-#269 forms), §5.4 capability test rows mentioning `demo` / `auth` / `provision` / `config push|validate`, and the §7 `edgezero-cli` migration bullet. Earlier appendices that quote `handle_build` / `handle_serve` / `handle_deploy` / `handle_dev` / `edgezero dev` are the round-1–43 historical resolution journal and remain accurate against the current checkout. **Appendix AR is the round-44 rebase snapshot and is now superseded by Appendices AS / AT / AU / AV / AW / AX / AY** (rounds 44–50): AR still describes the gate as "a single `Adapter::execute` dispatch point" — that wording was corrected to "four pre-dispatch gates" in AS, then to "five gate sites" in AU. Treat AR as round-44 history; the §3.5.3 + §7 active text is authoritative.
+> **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape (showing both the pre-#269 and PR-#269 forms), §5.4 capability test rows mentioning `demo` / `auth` / `provision` / `config push|validate`, and the §7 `edgezero-cli` migration bullet. Earlier appendices that quote `handle_build` / `handle_serve` / `handle_deploy` / `handle_dev` / `edgezero dev` are the round-1–43 historical resolution journal and remain accurate against the current checkout. **Appendix AR is the round-44 rebase snapshot and is now superseded by Appendices AS / AT / AU / AV / AW / AX / AY / AZ** (rounds 44–51): AR still describes the gate as "a single `Adapter::execute` dispatch point" — that wording was corrected to "four pre-dispatch gates" in AS, then to "five gate sites" in AU. Treat AR as round-44 history; the §3.5.3 + §7 active text is authoritative.
 
 ## 1. Overview
 
@@ -45,7 +45,7 @@ Applications today proxy a single outbound request through the current
 ### 1.4 Decisions locked before / during review
 
 - **No backward compatibility.** `ProxyClient` is renamed and reshaped in place;
-  `app-demo`, scaffolding templates, docsare migrated. No deprecated
+  `app-demo`, scaffolding templates, and docs are migrated. No deprecated
   aliases.
 - **One portable buffered fan-out primitive.** `send_all` is the only fan-out API
   for buffered request bodies + buffered responses. Its **input/output contract**
@@ -1489,13 +1489,18 @@ compressed metadata. Existing Cloudflare and Fastly proxy code already does this
 the contract codifies it.
 
 **Streaming-decompressor design (Streamed mode).** Lazy
-`lazy-streamed-response-passthrough` on CF/Fastly/Spin coexists with the cap
+`lazy-streamed-response-passthrough` on **CF / Spin** coexists with the cap
 obligation because each adapter wraps the raw compressed byte stream with a
 **streaming decoder** that emits decompressed chunks as they arrive, never buffering
-the full body. The decoder's *only* responsibilities are decoding bytes, stripping
-the two compressed-only headers, and surfacing decoder errors — it deliberately does
-**not** enforce a byte cap, because `ResponseMode::Streamed` carries no `max_bytes`
-(§3.1.3) and the cap lives with the consumer:
+the full body. (Fastly is `BestEffort` for lazy passthrough per capability footnote
+6 — its response converter performs buffered passthrough through
+`FASTLY_RESPONSE_STREAM_BUFFER_BYTES`, so its streaming-decompressor wrapper still
+runs but the converter buffers downstream of it. Axum is also `BestEffort` for an
+unrelated `Send`-bounds reason — see footnote 3.) The decoder's *only*
+responsibilities are decoding bytes, stripping the two compressed-only headers, and
+surfacing decoder errors — it deliberately does **not** enforce a byte cap, because
+`ResponseMode::Streamed` carries no `max_bytes` (§3.1.3) and the cap lives with the
+consumer:
 
 1. Pull a raw compressed chunk from the platform stream.
 2. Feed it into the decoder; emit whatever decompressed output is currently available
@@ -2124,11 +2129,18 @@ Apps that want true lazy passthrough on Fastly must:
 
 That is a structural constraint on the Fastly scaffold — `edgezero new --adapter
 fastly` today emits a `#[fastly::main]` entry, and `OutboundResponse::into_response()`
-on Fastly therefore falls back to **buffered passthrough** (drain the wrapped
-`Body::Stream` to `Bytes` within `max_response_bytes`, then return through the
-normal `#[fastly::main]` flow). Apps that need lazy passthrough on Fastly declare
-this capability required and get a hard build failure; the migration path is
-either (a) target a different adapter (CF or Spin) or (b) wait for the §8 risk 12
+on Fastly therefore falls back to **buffered passthrough**: drain the wrapped
+`Body::Stream` to `Bytes` within the adapter-level constant
+**`FASTLY_RESPONSE_STREAM_BUFFER_BYTES`** (default 16 MiB, mirroring Axum's
+`AXUM_RESPONSE_STREAM_BUFFER_BYTES`). The per-outbound-request
+`max_response_bytes` is unavailable by the time the response converter runs
+(`OutboundResponse` carries only status / headers / body — §3.1.4), so the
+adapter-level constant is what the converter uses. Over-cap during the buffered
+drain → `bad_gateway` (502) — same shape as Axum. After draining, the buffered
+`Bytes` is returned through the normal `#[fastly::main]` flow. Apps that need
+lazy passthrough on Fastly declare this capability required and get a hard
+build failure; the migration path is either (a) target a different adapter
+(CF or Spin) or (b) wait for the §8 risk 12
 follow-up that adds a non-`#[fastly::main]` entry-point template + the
 `stream_to_client()` plumbing. Buffered passthrough still works on Fastly
 unconditionally — only the *lazy* variant is gated.
@@ -2647,15 +2659,25 @@ async fn send_all(
 - **Dynamic backends.** Arbitrary HTTPS hosts use Fastly dynamic backends
   (`Backend::builder`). Per Fastly's
   [`BackendBuilder` docs](https://docs.rs/fastly/latest/fastly/backend/struct.BackendBuilder.html),
-  a dynamic backend registration with an **identical name + identical properties**
-  re-registers / re-uses the existing backend (returns `Ok`); a registration with
-  the same name but **conflicting properties** fails with `NameInUse`. Backend
-  "sameness" therefore includes every configured property — including the timeouts
-  EdgeZero sets from `dispatch_budget(req, now).duration` (§3.3.4). The identity
-  therefore covers transport **and** timeout config, not just the authority, so a
-  50 ms slot and a 3 s slot to the same host get distinct dynamic-backend names
-  (avoiding silent wrong-timeout reuse on the `NameInUse` path; see the
-  collision-detection protocol later in §4.3 for the precise reuse rules).
+  the **session-uniqueness rule is unconditional** — a dynamic backend name must
+  not match the name of any static service backend nor any other dynamic backend
+  built during this session. `NameInUse` carries no property-comparison
+  semantics: the SDK signals only "this name is taken in this session," and its
+  documented recovery (`Backend::from_str(name)`) returns a handle without
+  exposing the registered properties. EdgeZero therefore owns the entire
+  uniqueness story **at the guest layer**: an adapter-local cache
+  (`Mutex<HashMap<String, (BackendIdentity, Backend)>>` on
+  `FastlyOutboundClient`) holds the identity → backend mapping, and a hit
+  reuses the cached `Backend` while a miss calls `Backend::builder(..).finish()`
+  exactly once. Because EdgeZero hashes every relevant property into the
+  backend name (`ez_{sha256_128(identity)}`), distinct identities map to
+  distinct names — so a 50 ms slot and a 3 s slot to the same host get distinct
+  backends by construction, not by SDK-side property comparison. A
+  `NameInUse` on a name **not** in the adapter's collision map can therefore
+  only mean an externally-registered backend (another component, a prior
+  session) is squatting the name — fail-closed `EdgeError::internal` because
+  the SDK does not let us prove identity match. The precise collision-detection
+  protocol is in the §4.3 algorithm later in this section.
 
   Identity tuple:
   `scheme + ":" + host + ":" + resolved_port + ":" + tls_mode + ":" + budget_ms`,
@@ -3063,9 +3085,26 @@ service — this distinction is explicit so a green capability check is not misr
      `stream.next().await` that never yields is preempted at the deadline and the
      slot returns `gateway_timeout` — this is what makes Spin Native for the
      capability (vs. Fastly BestEffort, which cannot preempt this path, §4.3).
-  2. *Host-write race*: each `OutgoingBody::write` host call is similarly raced
-     against a wasi timer for the remaining deadline, so a slow host accepting
-     bytes also surfaces as `gateway_timeout` at the deadline, not unbounded.
+  2. *Host-write race*: WASI `output-stream` is **nonblocking + readiness-polled**,
+     not blocking. For each chunk the adapter has from the source, the
+     implementable pattern is:
+     a. obtain the stream's `subscribe()` pollable (one `Pollable` per
+        `OutputStream`);
+     b. `futures::select!` the pollable's ready signal against a wasi
+        monotonic-clock timer for `budget.deadline.remaining()`;
+     c. if the timer fires first → drop the outgoing handle and return
+        `gateway_timeout`;
+     d. if the pollable fires first → call nonblocking `check_write()` to obtain
+        the **permitted byte count** the stream can accept now, then call
+        `write(bytes)` with at most that many bytes; loop until the current
+        chunk is fully written, repeating step (a) when `check_write()` returns
+        zero or the chunk has remainder.
+
+     A slow host that never accepts bytes therefore stalls at the pollable
+     subscription, where the timer preempts at the deadline — `gateway_timeout`
+     within one timer-resolution tick of `budget.deadline`, not unbounded.
+     `write()` itself never blocks on host I/O so there is no in-progress
+     `write()` to race against the timer.
   After upload completion the adapter calls `budget.deadline.remaining()`; if
   `None`, the outgoing handle is dropped and the slot returns `gateway_timeout`
   immediately — no response wait. Otherwise the remaining duration governs the
@@ -3201,7 +3240,7 @@ async fn send_all_runs_requests_concurrently() {
 | `.timeout(short).deadline(long)` honours the *shorter* effective — **dispatch_budget classification (Tier 1):** the core helper returns `DispatchBudget { duration: short, deadline: now + short }`. Mock-driven test asserts the classification | yes | — | — |
 | `.timeout(short).deadline(long)` honours the *shorter* effective deadline end-to-end (streamed body returns 504 at `now + short`, not `now + long`) — **adapter wrapper (Tier 2 / Tier 3):** wrapper armed with `budget.duration` actually fires at `now + short` against a real platform timer | — | yes | yes |
 | Streamed request body over `max_request_body_bytes` → per-slot `bad_request` (400) on every adapter | yes | yes | — |
-| Stalled streamed-request-body upload, mechanics differ per adapter — this row is **Tier 2/3 only** because Tier 1's `MockOutboundClient` cannot prove the Axum tokio / Cloudflare `worker::Delay` / Spin wasi / Fastly host-timer behaviour; Tier 1 covers the cross-adapter *contract* (504 on stall, index alignment) via the mock, marked separately. **Axum / Cloudflare** drain `Body::Stream` into `Bytes` **before** constructing the platform request (§4.1 / §4.2), so the relevant stall is the *source-pull* during the drain — tokio / `worker::Delay` races it against `budget.deadline` and returns 504 at the deadline (no separate "host-write" race because by the time the SDK request is constructed the body is already in hand). **Spin** has both phases explicit: source-pull race via wasi monotonic-clock and host-write race over WASI outgoing-body chunk-writes, both bounded by `budget.deadline`, each returning 504 at the deadline (§4.4). **Fastly** has a single phase where source-pull cannot be preempted (BestEffort per `streamed-upload-deadlines`); once chunks are flowing, the host's `between-bytes-timeout` (= `fastly_timeout_ms(budget)`) bounds each gap, so the slot returns 504 **within one between-bytes-timeout past `budget.deadline`** — bounded overshoot per the `BoundedCooperative` rubric, not exact `budget.deadline` (§3.3.4). Test asserts per-adapter mechanics | — | yes | yes |
+| Stalled streamed-request-body upload, mechanics differ per adapter — this row is **Tier 2/3 only** because Tier 1's `MockOutboundClient` cannot prove the Axum tokio / Cloudflare `worker::Delay` / Spin WASI-readiness / Fastly host-timer behaviour; Tier 1 covers the cross-adapter *contract* (504 on stall, index alignment) via the mock, marked separately. **Axum / Cloudflare** drain `Body::Stream` into `Bytes` **before** constructing the platform request (§4.1 / §4.2), so the relevant stall is the *source-pull* during the drain — tokio / `worker::Delay` races it against `budget.deadline` and returns 504 at the deadline (no separate "host-write" race because by the time the SDK request is constructed the body is already in hand). **Spin** has both phases explicit per §4.4: (a) source-pull race — `futures::select!` of `source_stream.next()` against a wasi monotonic-clock timer for the remaining deadline; (b) host-write race — subscribe to the WASI output-stream readiness pollable, race the pollable's ready signal against the wasi timer, then call nonblocking `check_write()` to obtain the permitted byte count and `write()` within that bound (WASI output streams are nonblocking / readiness-polled). Both phases return 504 at the deadline. **Fastly** has a single phase where source-pull cannot be preempted (BestEffort per `streamed-upload-deadlines`); the cooperative `budget.deadline.is_expired()` check **between** chunks is the only adapter-side bound, and Fastly's `between_bytes_timeout` is documented as receive-side only — it does **not** bound guest-to-origin writes (BestEffort for the write phase too, no per-chunk-gap claim). The slot returns 504 at the next inter-chunk check after `budget.deadline` expires. Test asserts per-adapter mechanics | — | yes | yes |
 | Stalled streamed-request-body upload **contract only** (Tier 1, via `MockOutboundClient` with scripted stalls): on the **preemptible-source** adapters (Axum / Cloudflare / Spin) a stalled upload returns `Err(EdgeError::gateway_timeout(..))` to the caller within the configured deadline, slot index alignment is preserved, and other slots are unaffected. **Fastly is excluded from the "within the configured deadline" half of this contract** because `streamed-upload-deadlines` is `BestEffort` on Fastly (§3.5.1 / §3.5.2): a source-pull stall (`stream.next().await` that never yields) is unbounded on Fastly per §4.3, so Tier 1 cannot assert wall-clock containment there. Fastly still observes the index-alignment + partial-failure-isolation half of the contract. The `MockOutboundClient` sets the adapter under test on the mock so this row's Fastly invocation skips the wall-clock assertion and runs only the structural assertions. Mechanics-level wall-clock assertions for all four adapters (including Fastly's `BoundedCooperative` between-chunk bound) live in the Tier 2/3 row above | yes | — | — |
 | `body_bytes` / `json_within` / `form_within` after `take_body()` → `internal("body already consumed via take_body")` (no body resurrection) | yes | — | — |
 | Valid non-ASCII UTF-8 header (e.g. `x-app-display-name: café`) round-trips through every adapter on request and response | yes | yes | yes |
@@ -3227,9 +3266,9 @@ async fn send_all_runs_requests_concurrently() {
 | Fastly streamed-upload **tiny-positive-remainder edge case** — the upload drain completes with `budget.deadline.remaining() == Some(small)` (say 10 ms left out of a 200 ms budget). The cooperative check at the `wait()` boundary passes (remaining is positive), and the host then waits up to the dispatch-time `first_byte_ms` (150 ms in this example, 3/4 of `budget.duration`) for the upstream's response headers. The test asserts (a) total wall-clock from dispatch to return is bounded by `budget.duration + first_byte_ms + between_bytes_timeout` (closed-form, **not** per-chunk-accumulating), (b) the response wrapper's `is_expired()` check preempts after the first body chunk read returns rather than waiting another `between_bytes_timeout` per chunk, (c) the slot ultimately returns `gateway_timeout` with a `partial_send = true` diagnostic in the error chain. Fastly-specific (response-phase overshoot is the documented behaviour of `send_async_streaming`); Tier 2 (contract crate, time-injection hook) + Tier 3 (Viceroy wall-clock observation) | — | yes | yes |
 | `batch_deadline = Deadline::after(batch_deadline_ms)` computed once and copied into every target request → all targets share one absolute wall-clock cap (no drift); recomputing `Deadline::after(batch_deadline_ms)` per target would let later targets drift past the batch deadline (counter-example test) | yes | — | yes |
 | Outbound request header from `headers_mut()` containing a non-UTF-8 value is **dropped with `warn!`** by `normalize_for_dispatch` (lossy proxy-forward path) — distinct from `header(..)` which **rejects** with 400 (loud construction path) | yes | yes | — |
-| Adapter response-out converter (`response.rs`) on CF/Fastly/Spin: `OutboundResponse::into_response()` with a streamed body yields first bytes before the upstream stream ends (no buffer-then-return); driven by a `MockOutboundClient`-fed stream in-process, no platform runtime needed | — | yes | yes |
-| Adapter response-out converter on CF/Fastly/Spin: stream errors after headers **abort the downstream response stream** — once headers have been written, HTTP cannot change status to 502/504, so the adapter aborts the chunked body (TCP close on HTTP/1.1, RST_STREAM on HTTP/2) and emits a `log::warn!` naming the originating `EdgeError` variant (`gateway_timeout` or `bad_gateway`). Clients observe an early connection close, not a synthetic 502/504. The originating EdgeError is in the server log | — | yes | yes |
-| Adapter response-out converter on Axum: streamed body is buffered to `Bytes` within `AXUM_RESPONSE_STREAM_BUFFER_BYTES` (16 MiB, documented Axum-specific limitation) — first bytes only flow after full collection; over-cap → 502 | — | yes | yes |
+| Adapter response-out converter (`response.rs`) on **CF / Spin**: `OutboundResponse::into_response()` with a streamed body yields first bytes before the upstream stream ends (no buffer-then-return); driven by a `MockOutboundClient`-fed stream in-process, no platform runtime needed. **Fastly is excluded from this row** — `Response::stream_to_client()` is incompatible with `#[fastly::main]` (capability footnote 6), so Fastly's converter falls back to buffered passthrough (see the Axum/Fastly row below) | — | yes | yes |
+| Adapter response-out converter on **CF / Spin**: stream errors after headers **abort the downstream response stream** — once headers have been written, HTTP cannot change status to 502/504, so the adapter aborts the chunked body (TCP close on HTTP/1.1, RST_STREAM on HTTP/2) and emits a `log::warn!` naming the originating `EdgeError` variant (`gateway_timeout` or `bad_gateway`). Clients observe an early connection close, not a synthetic 502/504. The originating EdgeError is in the server log. **Fastly is excluded** because it never reaches "headers already written" — its buffered fallback materialises the whole body before the response is returned via `#[fastly::main]`, so a mid-stream error becomes a clean 502/504 in the buffered drain | — | yes | yes |
+| Adapter response-out converter buffered fallback on **Axum and Fastly**: streamed body is buffered to `Bytes` within the adapter-level constant (`AXUM_RESPONSE_STREAM_BUFFER_BYTES` on Axum, `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` on Fastly — both default 16 MiB, documented adapter-specific limitations). First bytes only flow after full collection. Over-cap → 502. The per-outbound-request `max_response_bytes` is unavailable by the time the converter runs (`OutboundResponse` carries only status / headers / body); the adapter-level constant is what the converter uses. Apps needing lazy passthrough declare `lazy-streamed-response-passthrough` required and target CF / Spin (both adapters Native; Axum + Fastly BestEffort) | — | yes | yes |
 | `Deadline::after(d)` and `dispatch_budget`'s `saturating(d)` clamp at `DEADLINE_FAR_FUTURE` (7 d) — `Duration::MAX` does not panic, never produces an `Instant` past the clamp, and `fastly_timeout_ms` of the clamped value fits within Fastly's `u32` ms ceiling without rejection | yes | yes | — |
 | `OutboundRequest::is_stream_body()` returns `true` for `Body::Stream` requests and `false` for `Body::Once`; `send_all` preflight uses this to reject without consuming | yes | — | — |
 | `OutboundRequest::is_stream_response()` returns `true` for `stream_response()`-marked requests; `send_all` preflight uses this to reject with `bad_request` without consuming, on every adapter | yes | yes | — |
@@ -3580,11 +3619,20 @@ Other changes:
    lazy streaming on Axum declare the `lazy-streamed-response-passthrough` capability
    required and get a hard build failure today; lifting the limitation is a separate
    future change with its own design + tests.
-7. **Fastly streamed-upload write-phase bound.** The spec treats Fastly's
-   `between-bytes-timeout` as covering both reading from origin and writing to origin
-   (the documented Fastly behaviour). If a future host change relaxes that, the
-   write-phase claim (BoundedCooperative, §4.3) would have to downgrade to BestEffort;
-   the source-stream-yield BestEffort label is unaffected. Track Fastly host docs.
+7. **Fastly streamed-upload write-phase has no SDK-configurable bound.**
+   Fastly's `between_bytes_timeout` is documented as receive-side only — it
+   bounds the gap between bytes received from origin, not the host-side write
+   of guest-supplied bytes to origin (Fastly Backend API docs; round 50). No
+   published Fastly backend-timeout field bounds the guest-to-origin write
+   direction. Streamed-upload write-phase is therefore `BestEffort` on
+   Fastly (alongside the source-stream-yield `BestEffort`); the cooperative
+   `budget.deadline.is_expired()` check **between** chunks is the only
+   adapter-side bound. Apps that need real-time enforcement against a slow
+   origin on the write path either pass a buffered request body (`Body::Once`,
+   no `StreamingBody` involved) or target a different adapter. If a future
+   Fastly platform release adds a documented guest-write timeout, the
+   write-phase claim could upgrade to `BoundedCooperative` — track Fastly
+   host docs.
 8. **Fastly buffered-body-drain serialization in `send_all`.** Harvest reads bodies in
    slot order, so wall-clock = `max(header_arrivals) + Σ buffered_body_drain_times`
    on Fastly vs. `max(header_arrivals + body_drain_times)` on Axum/CF/Spin (§3.3.4).
@@ -4092,7 +4140,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | Review finding | Resolution |
 | --- | --- |
 | Cached Fastly backend reuse skipped identity comparison | §4.3 step 2 now branches on `stored_identity == identity` — match → reuse; mismatch → fail closed with the in-adapter SHA-256-128 collision error. §5.4 row exercises this via an injectable hash collision under `#[cfg(test)]`. The "reuse by name alone" wording is removed |
-| `NameInUse` wording was narrower than Fastly's actual same-name rule | §4.3 step 5 rewritten with the precise Fastly contract (per `BackendBuilder` docs): identical name + identical properties returns `Ok` (re-registration); `NameInUse` only fires for identical name + **conflicting** properties. So a `NameInUse` in step 5 means an external party registered with conflicting properties we can't safely match. Error message updated accordingly |
+| `NameInUse` wording was narrower than Fastly's actual same-name rule | §4.3 step 5 rewritten with the precise Fastly contract (per `BackendBuilder` docs): identical name + identical properties returns `Ok` (re-registration); `NameInUse` only fires for identical name + **conflicting** properties. So a `NameInUse` in step 5 means an external party registered with conflicting properties we can't safely match. Error message updated accordingly. **Superseded by Appendix AY** (round 50): Fastly's actual contract is unconditional session-uniqueness — `NameInUse` carries no property-comparison semantics, and the "identical re-registration returns Ok" carve-out was a false premise. See Appendix AY for the corrected fail-closed protocol |
 | Sub-4 ms bound "≤ ~28 ms" was loose | §3.3.4 + §4.3 + Appendix AI: replaced "≤ ~28 ms" with the strict upper bound `25 + (≤ 3) + (≤ 1) < 29 ms` (the explicit `BATCH_DISPATCH_SLACK_MAX + total_ms + ms_rounding` arithmetic) so the formula and the number agree |
 | Appendix bookkeeping: index said A–AI, file had AJ, and an orphan unheaded round-30 review-table sat after AJ | Removed the orphan round-30 table (the round-30 content is already correctly placed in Appendix AD between AC and AE). Index updated to "A–AJ (and counting)" with the standard self-pointer to the last heading |
 
@@ -4102,7 +4150,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | --- | --- |
 | Fastly single-`send` dispatch slack claimed "structurally 0" but time still passes between `dispatch_budget` and `send_async` | §4.3: the single-`send` paragraph is rewritten to apply the **same `BATCH_DISPATCH_SLACK_MAX` guard** as `send_all` — re-check `Instant::now() - now <= BATCH_DISPATCH_SLACK_MAX` immediately before `send_async`, fail closed on exceedance with the same diagnostic. §3.5.2 footnote 1 single-`send` bullet now says dispatch+headers overshoot ≤ `BATCH_DISPATCH_SLACK_MAX + ms_rounding` instead of zero. §5.4 adds a row that exercises the single-send hook (matching the existing `send_all` injection-hook test) |
 | Axum / Cloudflare arming the timer with a value snapshotted before SDK construction left a construction-time gap | §4.1 step 3/4 split into "construct without arming" and "re-read `budget.deadline.remaining()` immediately before arming reqwest's `.timeout(..)` / `worker::Delay(..)`." Matches Spin's "at the moment the race starts" wording (round 21). The cached after-drain value is no longer reused at arming time; on a 100 ms construction phase the SDK timer now reflects 100 ms less wall-clock, not 100 ms of silent overrun. §4.2 Cloudflare step 3/4 mirrors |
-| Early dynamic-backend prose said "name cannot duplicate another in same session," contradicting the precise later `NameInUse` rule | §4.3 Dynamic-backends paragraph rewritten to match the later collision-protocol contract: identical name + identical properties re-registers (`Ok`); identical name + conflicting properties fails (`NameInUse`). Implementers reading top-to-bottom see one consistent rule, and a forward-pointer to the precise reuse-vs-conflict protocol later in the same section |
+| Early dynamic-backend prose said "name cannot duplicate another in same session," contradicting the precise later `NameInUse` rule | §4.3 Dynamic-backends paragraph rewritten to match the later collision-protocol contract: identical name + identical properties re-registers (`Ok`); identical name + conflicting properties fails (`NameInUse`). Implementers reading top-to-bottom see one consistent rule, and a forward-pointer to the precise reuse-vs-conflict protocol later in the same section. **Superseded by Appendix AY** (round 50): the "name cannot duplicate" wording was the *correct* one all along; the "identical re-registration returns Ok" rewrite was a false premise. The §4.3 paragraph now says session-uniqueness is unconditional and EdgeZero owns the entire uniqueness story at the guest layer via an adapter-local cache. See Appendix AY |
 | Appendix index said A–AJ, file had AK | Index updated to "A–AK (and counting)". Same self-pointer to the last `## Appendix` heading |
 
 ## Appendix AM — Review round 39 resolutions
@@ -4235,3 +4283,13 @@ Rebases the spec onto [`stackpop/edgezero` PR #269](https://github.com/stackpop/
 | **MEDIUM — false claim that `between_bytes_timeout` bounds upload writes.** Spec said Fastly applies `between_bytes_timeout` to both reading from origin **and** writing to origin. Fastly's public Backend API docs describe it as "maximum duration … that Fastly will wait while receiving no data on a download from a backend" — receive-side only. No published Fastly backend-timeout field bounds host-side writes of guest-supplied bytes to origin | §4.3 streamed-upload host-write bullet rewritten. Host write phase downgraded to `BestEffort` (was `BoundedCooperative`). `between_bytes_timeout` cited correctly as receive-side only with a link to the public Backend API docs. Adapter's only recourse on a stalled write is the cooperative `is_expired()` check **between** chunks; mid-write stalls are unbounded. §5.4 row updated to reflect both source-pull and host-write as BestEffort gaps; the "within one between-bytes-timeout" claim removed |
 | **MEDIUM — streamed-upload response overshoot was overstated.** Spec said budget could be exceeded "by up to one first-byte-timeout (for the headers wait) plus one between-bytes-timeout per body-chunk gap" — a per-chunk accumulator. Once the deadline expires, the response wrapper's `is_expired()` check fires after the first post-deadline read returns, not after every chunk. Footnote 1 (single-send Fastly bound) omitted the streamed-upload post-upload first-byte overshoot entirely | §4.3 streamed-upload response-phase paragraph rewritten with a **closed-form bound**: post-deadline overshoot ≤ `first_byte_ms` (headers wait) + one `between_bytes_timeout` (worst-case interval during which the host is mid-read of the *first* body chunk when the wrapper fires) — one-shot, not per-chunk. Footnote 1 single-send section gains a "Streamed-upload-specific overshoot" sentence noting the post-upload `first_byte_ms` overshoot for the tiny-positive-remainder case. New §5.4 test row asserts the closed-form bound and that the wrapper preempts after the first body chunk read returns |
 | **LOW — streamed-response orchestration path lacked an app-facing consuming accessor.** Spec recommended single `send` + app-side orchestration for streamed responses, but `OutboundResponse`'s only body accessor was `body(&self) -> &Body` (non-consuming); the consuming `into_parts(self) -> (StatusCode, HeaderMap, Body)` was labelled adapter-facing | Added **`OutboundResponse::into_body(self) -> Body`** as the explicit app-facing consuming accessor. Rustdoc names it the canonical orchestration path for streamed responses via single `send` + `futures::join_all` on Axum/CF/Spin. §3.1.1 `send_all` rustdoc updated to point at `into_body()` rather than the adapter-facing `into_parts(..)`. The boundary between "app code" and "adapter / response-converter code" is now explicit in the surface |
+
+## Appendix AZ — Review round 51 resolutions (round-50 carry-overs)
+
+| Review finding | Resolution |
+| --- | --- |
+| **HIGH — Fastly dynamic-backend semantics still contradictory.** Round 50 fixed the §4.3 step-5 algorithm (session-uniqueness unconditional, no property-comparison carve-out, fail-closed on external collisions), but the earlier `Dynamic backends` introductory paragraph still preserved the false "identical name + identical properties re-registers / re-uses (returns Ok); same name but conflicting properties fails with NameInUse" wording. Two historical appendix entries also documented the stale carve-out without flagging it as superseded | §4.3 `Dynamic backends` paragraph rewritten in place: session-uniqueness is **unconditional** per the SDK; `NameInUse` carries no property-comparison semantics; the SDK's documented `Backend::from_str(name)` recovery returns a handle without exposing properties; EdgeZero therefore owns the entire uniqueness story at the guest layer via an adapter-local `Mutex<HashMap<String, (BackendIdentity, Backend)>>` cache; identity hashing into the backend name (`ez_{sha256_128(identity)}`) makes distinct identities map to distinct names by construction; a `NameInUse` on a name not in the cache is fail-closed `EdgeError::internal`. Forward-pointer to the §4.3 algorithm later in the section. Two historical appendix entries (Appendix AK round-37, Appendix AK same-section reconciliation entry) tagged with "**Superseded by Appendix AY** (round 50)" forward-pointers so readers don't follow the stale rule |
+| **MEDIUM — Fastly buffered-fallback for lazy passthrough named an unavailable cap and the §5.4 matrix still bucketed Fastly with CF/Spin.** Round 50's Fastly fallback prose said "drain to `Bytes` within `max_response_bytes`," but the spec already states the per-request `max_response_bytes` cap is unavailable at response-converter time — `OutboundResponse` carries only status / headers / body, no cap metadata. Three §5.4 lazy-passthrough rows still listed Fastly alongside CF/Spin (yields-first-bytes, mid-stream abort, buffered-fallback) | Added the adapter-level constant **`FASTLY_RESPONSE_STREAM_BUFFER_BYTES`** (default 16 MiB, mirrors `AXUM_RESPONSE_STREAM_BUFFER_BYTES`) to the Fastly buffered passthrough prose. §3.4.1 streaming-decompressor section regrouped to "**CF / Spin**" with an explicit note that Fastly + Axum are both BestEffort for lazy passthrough (different underlying reasons but the same fallback shape). §5.4 lazy-passthrough rows split into three: (a) CF/Spin lazy yield-first-bytes row (Fastly explicitly excluded); (b) CF/Spin mid-stream abort row (Fastly explicitly excluded — its buffered fallback turns mid-stream errors into a clean 502/504 in the drain); (c) buffered-fallback row covering **Axum and Fastly**, with both adapter-level constants named, the `OutboundResponse` no-cap-metadata constraint stated, and the lazy-passthrough capability-required hard-fail path documented |
+| **MEDIUM — Fastly streamed-upload write-side downgrade only partially applied.** Round 50 corrected one §5.4 row and the §4.3 host-write bullet, but a second §5.4 row ("Stalled streamed-request-body upload, mechanics differ per adapter") still claimed Fastly's `between_bytes_timeout` bounds inter-chunk write gaps, and §8 risk 7 still treated write-side bounding as the documented Fastly behaviour | Both surfaces updated. §5.4 stalled-upload mechanics row rewritten: Fastly's `between_bytes_timeout` is documented as receive-side only — it does **not** bound guest-to-origin writes — so Fastly's write phase is `BestEffort` (no per-chunk-gap claim); the cooperative inter-chunk `is_expired()` check is the only adapter-side bound. §8 risk 7 retitled "Fastly streamed-upload write-phase has no SDK-configurable bound" and rewritten to say streamed-upload write-phase is `BestEffort` alongside the source-stream-yield gap. The "if a future host change relaxes that" footnote is replaced with the symmetric "if a future Fastly release **adds** a documented guest-write timeout, the claim could upgrade." Three surfaces now agree |
+| **MEDIUM — Spin host-write race was mechanically wrong.** §4.4 said "each `OutgoingBody::write` host call is similarly raced against a wasi timer for the remaining deadline." WASI `output-stream` is nonblocking + readiness-polled, not blocking; `write()` itself never waits on host I/O. The implementable pattern is readiness-pollable-vs-timer, then `check_write()` for the permitted byte count, then `write()` within that count | §4.4 host-write race rewritten against the actual WASI contract. New four-step protocol: (a) obtain the stream's `subscribe()` pollable; (b) `futures::select!` the pollable's ready signal against a wasi monotonic-clock timer for `budget.deadline.remaining()`; (c) timer wins → drop the outgoing handle + return `gateway_timeout`; (d) pollable wins → `check_write()` for the permitted byte count + `write()` within that bound, looping until the chunk drains. Explicit clarification that `write()` itself never blocks on host I/O, so the bound is "within one timer-resolution tick of `budget.deadline`," not "during a blocking write call." §5.4 stalled-upload mechanics row updated to reference the readiness-pollable race instead of the implausible blocking-write race |
+| **LOW — typo.** `docsare migrated` in §1.3 non-goals | Fixed: "scaffolding templates, and docs are migrated." |
