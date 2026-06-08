@@ -2,7 +2,7 @@
 
 > **Status:** Draft, revised through review rounds 1–49 (round 49 = URI canonicalization split into request-URI vs manifest-host-entry rule sets, `OutboundDeadlines` enum scope updated to include `send_all` active body-drain, Fastly streamed-upload response timeout corrected to first-byte phase, appendix bookkeeping refreshed) · **Date:** 2026-06-06
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
-> **Driving consumer:** `midbid` (Prebid-style auction server)
+> **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **not yet merged into `main`**. PR #269 introduces the multi-store manifest (`ManifestStores { config, kv, secrets }`), the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, the expanded `AdapterAction` (`AuthLogin` / `AuthLogout` / `AuthStatus` / `Build` / `Deploy` / `Serve`), separate `Adapter::provision(..)` and config-validation hooks, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the new `examples/app-demo/crates/app-demo-cli` integration crate.
 > **Current checkout (pre-#269):** `crates/edgezero-cli/src/args.rs` still has `Command::{Build, Deploy, Dev, New, Serve}`; `crates/edgezero-adapter/src/registry.rs` still has `AdapterAction::{Build, Deploy, Serve}`; `main.rs` still handles `Command::Dev`. **The CLI rows in §3.5.3 / §5.4 / §7 / Appendix AR are contingent on PR #269 landing.** If PR #269 ships in a different shape, the affected rows must be re-rebased; if it never lands, the spec's CLI surface degrades to the current `build` / `serve` / `deploy` / `dev` set plus the `ensure_capabilities` gate applied at each of those four call sites (the round-1–43 wording). Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of PR #269 and lands either way.
 > **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape (showing both the pre-#269 and PR-#269 forms), §5.4 capability test rows mentioning `demo` / `auth` / `provision` / `config push|validate`, and the §7 `edgezero-cli` migration bullet. Earlier appendices that quote `handle_build` / `handle_serve` / `handle_deploy` / `handle_dev` / `edgezero dev` are the round-1–43 historical resolution journal and remain accurate against the current checkout. **Appendix AR is the round-44 rebase snapshot and is now superseded by Appendices AS / AT / AU / AV / AW / AX** (rounds 44–49): AR still describes the gate as "a single `Adapter::execute` dispatch point" — that wording was corrected to "four pre-dispatch gates" in AS, then to "five gate sites" in AU. Treat AR as round-44 history; the §3.5.3 + §7 active text is authoritative.
@@ -12,8 +12,8 @@
 ### 1.1 Goal
 
 Make EdgeZero a production-safe substrate for **outbound HTTP fan-out**: an app must be
-able to issue many independent bidder requests concurrently, enforce per-request and
-whole-auction deadlines, keep memory predictable, and run the *same handler source*
+able to issue many independent target requests concurrently, enforce per-request and
+whole-fan-out batch deadlines, keep memory predictable, and run the *same handler source*
 unchanged on Axum, Cloudflare Workers, Fastly Compute, and Spin.
 
 "Predictable memory" here means: a documented, bounded cost per buffered response and
@@ -22,7 +22,7 @@ It does **not** mean EdgeZero imposes a global allocation ceiling.
 
 ### 1.2 Context
 
-`midbid` already proxies a single outbound request through the current
+Applications today proxy a single outbound request through the current
 `ProxyClient` / `ProxyHandle`. What is missing:
 
 - A first-class, **independently constructed** outbound request type.
@@ -34,8 +34,8 @@ It does **not** mean EdgeZero imposes a global allocation ceiling.
 
 ### 1.3 Non-goals
 
-- No midbid-specific bidder logic in EdgeZero.
-- EdgeZero does not own privacy, OpenRTB, or bidder allowlists. It exposes
+- No consumer-specific target logic in EdgeZero.
+- EdgeZero does not own privacy, the external batch protocol, or target allowlists. It exposes
   `OutboundRequest::uri()` so apps enforce their own allowlist; it never blocks a
   request itself.
 - No new direct dependency on `tokio`, `reqwest`, `fastly`, `worker`, or `spin-sdk` in
@@ -45,7 +45,7 @@ It does **not** mean EdgeZero imposes a global allocation ceiling.
 ### 1.4 Decisions locked before / during review
 
 - **No backward compatibility.** `ProxyClient` is renamed and reshaped in place;
-  `app-demo`, scaffolding templates, docs, and `midbid` are migrated. No deprecated
+  `app-demo`, scaffolding templates, docsare migrated. No deprecated
   aliases.
 - **One portable buffered fan-out primitive.** `send_all` is the only fan-out API
   for buffered request bodies + buffered responses. Its **input/output contract**
@@ -91,7 +91,7 @@ It does **not** mean EdgeZero imposes a global allocation ceiling.
 
 `crates/edgezero-core/src/proxy.rs` is renamed to `crates/edgezero-core/src/outbound.rs`.
 Bodies use the **existing core `Body`** type (`Once(Bytes)` | `Stream(..)`), so a request
-or response may be buffered or streamed. Buffered is the default and midbid's path;
+or response may be buffered or streamed. Buffered is the default;
 streaming is an explicit opt-in that preserves proxy-forwarding.
 
 #### 3.1.1 Adapter-facing trait — two required methods
@@ -156,7 +156,7 @@ pub trait OutboundHttpClient: Send + Sync {
     /// responsible for bounding the number of requests passed in. On Fastly all
     /// requests are in-flight at the host simultaneously to make fan-out work,
     /// so a `max_concurrency` knob would defeat the feature; instead, bound N
-    /// at the application layer (for midbid this is the auction's bidder count).
+    /// at the application layer (typically the fan-out batch's target count).
     ///
     /// **Request bodies MUST be buffered (`Body::Once`).** A `Body::Stream`
     /// request body yields `out[i] = Err(EdgeError::bad_request("send_all
@@ -260,7 +260,7 @@ pub struct OutboundRequest {
     headers: HeaderMap,
     body: Body,                          // buffered or streamed
     timeout: Option<Duration>,           // per-request budget
-    deadline: Option<Deadline>,          // shared absolute cap; copy one value into every bidder request, do not recompute per request (see §3.3.2)
+    deadline: Option<Deadline>,          // shared absolute cap; copy one value into every target request, do not recompute per request (see §3.3.2)
     response_mode: ResponseMode,         // Buffered { max_bytes } (default) | Streamed
     max_request_body_bytes: usize,       // cap when `body` is Body::Stream (default 8 MiB)
 }
@@ -819,7 +819,7 @@ lossiness for headers that matter.
   header name are preserved. Multi-value headers like `set-cookie` therefore keep
   every valid entry even if one duplicate is invalid. The adapter emits a `log::warn!`
   naming each dropped header. The rest of the response is delivered normally so a
-  malformed exotic header cannot poison an otherwise valid auction response.
+  malformed exotic header cannot poison an otherwise valid fan-out batch response.
 
 *Implementation guardrail.* The UTF-8 check uses `std::str::from_utf8(value.as_bytes())`,
 **not** `HeaderValue::to_str()`. `to_str()` is stricter than UTF-8 — it rejects any
@@ -919,14 +919,14 @@ independent futures. Making `send_all` the one primitive hides this entirely.
 contracts for the *headers* phase are identical across all four. The body-drain
 phase is not: Fastly's buffered-body drain runs in harvest order rather than
 concurrently with sibling drains (§3.3.4 "Buffered body drain runs in harvest
-order"). For small bodies (auctions, JSON) the wall-clock difference is negligible;
+order"). For small bodies (fan-out batches, JSON) the wall-clock difference is negligible;
 for large bodies on Fastly, EdgeZero has no API that delivers concurrent large-body
 fan-out — `Streamed` mode defers drain but does not let the app consume chunks
 concurrently across slots either (no guest reactor; §3.2). This is a known
 limitation, not a recommendation.
 
 **Partial failure.** `send_all` returns `Vec<Result<OutboundResponse, EdgeError>>`
-index-aligned with the input. A single bidder timing out or returning a 502 yields
+index-aligned with the input. A single target timing out or returning a 502 yields
 `out[i] = Err(..)` or `out[i] = Ok(non-2xx)` without changing the *type* of any
 other slot's result. Cross-slot **timing** is governed by `send-all-slot-isolation`
 (§3.5.1 footnote 4): `Native` on Axum/CF/Spin, `BestEffort` on Fastly because
@@ -959,7 +959,7 @@ impl Deadline {
     /// **defined constant** clamp (7 days, see below). Bounded far-future clamping,
     /// not "saturate to whatever Instant::MAX happens to be" — `std::time::Instant`
     /// has no `MAX` and platform overflow behaviour differs. The clamp is
-    /// finite and well above any realistic auction/proxy budget, so this never
+    /// finite and well above any realistic fan-out batch/proxy budget, so this never
     /// truncates a legitimate caller and never panics. Adapter boundaries must
     /// not crash the host.
     pub fn after(d: Duration) -> Self;
@@ -980,12 +980,12 @@ impl Deadline {
 pub const DEADLINE_FAR_FUTURE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 ```
 
-#### 3.3.2 How midbid maps OpenRTB timing
+#### 3.3.2 Mapping an external batch deadline to EdgeZero deadlines
 
-| midbid concept | EdgeZero mechanism |
+| External concept | EdgeZero mechanism |
 | --- | --- |
-| OpenRTB `tmax` (whole auction) | Compute `let auction_deadline = Deadline::after(Duration::from_millis(tmax))` **once** at handler entry, then pass that absolute value into every bidder request via `.deadline(auction_deadline)`. `Deadline` is `Copy` and absolute, so all bidders share the same wall-clock cap. Do **not** call `Deadline::after(..)` per bidder — that re-anchors `now` per call and lets later bidders drift past `tmax`. |
-| Per-bidder request timeout | `OutboundRequest::timeout(per_bidder)` |
+| External batch deadline (whole fan-out) | Compute `let batch_deadline = Deadline::after(Duration::from_millis(batch_deadline_ms))` **once** at handler entry, then pass that absolute value into every target request via `.deadline(batch_deadline)`. `Deadline` is `Copy` and absolute, so all targets share the same wall-clock cap. Do **not** call `Deadline::after(..)` per target — that re-anchors `now` per call and lets later targets drift past the batch deadline. |
+| Per-target request timeout | `OutboundRequest::timeout(per_target)` |
 | Effective per-request budget | computed by `dispatch_budget` — see below |
 
 **Effective budget rule (`dispatch_budget(req)`).** Returns a `DispatchBudget` struct
@@ -1007,7 +1007,7 @@ pub struct DispatchBudget {
 /// `Instant::now()` calls produce slightly different `duration` values for the same
 /// shared `Deadline`, which on Fastly would produce different `budget_ms` values
 /// and therefore different dynamic-backend identities for the same host under one
-/// auction deadline (§4.3). `send` (single request) just passes
+/// batch deadline (§4.3). `send` (single request) just passes
 /// `web_time::Instant::now()`.
 pub fn dispatch_budget(
     req: &OutboundRequest,
@@ -1090,11 +1090,11 @@ cannot escape the bound (§3.3.2 step 2 / round 16). For brevity the table write
 | `Some(Duration::MAX)` | `None` | `DEADLINE_FAR_FUTURE` (7 d) | `now + DEADLINE_FAR_FUTURE` |
 | `None` | `Some(d)` 100 years out via `at_instant` | `DEADLINE_FAR_FUTURE` (7 d) | `now + DEADLINE_FAR_FUTURE` |
 
-`.timeout(50ms)` with no auction deadline therefore yields `duration = 50ms` and
+`.timeout(50ms)` with no batch deadline therefore yields `duration = 50ms` and
 `deadline = now + 50ms`, **not** 30 s. The single absolute `deadline` is what Fastly's
 between-chunk checks (§3.3.4) and the streamed-body wrappers in §4.1/§4.2/§4.4 use, so
 per-request `timeout` is honoured across the entire exchange — including the streamed
-body phase — whether or not an auction deadline was provided.
+body phase — whether or not an batch deadline was provided.
 
 "No deadline configured" therefore differs from "deadline configured and expired" —
 the former is bounded by the synthetic 30 s ceiling; the latter is a hard fail at
@@ -1327,8 +1327,8 @@ host-timeout error) at t ≈ 50 ms, but the guest does not see the result until 
   consequence.
 - **Per-slot wall-clock-observed delivery:** bounded by
   `max_over_remaining_slots(effective_at_dispatch)` in the worst case (harvest-order
-  delay). For midbid this is fine because all slots in one auction share the same
-  effective deadline, so the bounds coincide; in heterogeneous-budget scenarios
+  delay). When all slots in one fan-out batch share the same effective
+  deadline the bounds coincide; in heterogeneous-budget scenarios
   apps should be aware that observed completion can be later than per-slot
   completion. The opportunistic `poll()` of later slots after each `wait()`
   (Phase 2 above) reduces this gap in practice but does not eliminate it.
@@ -1347,9 +1347,9 @@ host-timeout error) at t ≈ 50 ms, but the guest does not see the result until 
   for the body phase, results genuinely depend on harvest order. The `send_all`
   contract on Fastly therefore *admits* harvest-order-induced 504s in Buffered mode,
   and the §5.4 test row asserts this explicitly. Concrete contract:
-  - For typical small JSON bodies (auctions, OpenRTB, sub-100 KiB responses) the
+  - For typical small JSON bodies (fan-out batches, the external batch protocol, sub-100 KiB responses) the
     drain times are on the order of a few hostcalls (≤ low single-digit ms) and the
-    summed term is well within any realistic auction `tmax`.
+    summed term is well within any realistic fan-out batch deadline.
   - For large body responses, Fastly `send_all` is **simply suboptimal** compared
     to the other three adapters and there is no current EdgeZero API that recovers
     parallel large-body fan-out on Fastly. `Streamed` mode defers each slot's drain
@@ -1360,7 +1360,7 @@ host-timeout error) at t ≈ 50 ms, but the guest does not see the result until 
     upstreams on Fastly should either (a) target a different adapter for that
     workload, (b) issue requests in a topology that doesn't require parallel
     large-body drains, or (c) wait for the interleaved-drain follow-up in §8 risk 8.
-    midbid is unaffected (auction bodies are small JSON).
+    typical small-body fan-outs are unaffected (response bodies under a few KiB).
 
 The worst-case post-deadline overshoot per slot **once that slot is actively draining**
 is therefore **one between-bytes-timeout interval, which is ≤ `effective_at_dispatch`**.
@@ -1375,7 +1375,7 @@ as `Σᵢ<ₖ drain_timeᵢ + (effective_at_dispatch for slot k)` — and once s
 of `budget.deadline` for that slot.
 
 Apps reasoning about precise wall-clock should treat `effective_at_dispatch` as the
-maximum per-slot *active-drain* overshoot — i.e., the original auction budget is the
+maximum per-slot *active-drain* overshoot — i.e., the original batch budget is the
 bound on each slot's drain phase **in isolation**, not the bound on its observed
 completion time across the whole `send_all`. The `send-all-slot-isolation` capability
 (§3.5.1 footnote 4) is what scopes the cross-slot half: declaring it required gives
@@ -1383,7 +1383,7 @@ the hard build failure on Fastly, signalling that an app needs isolation guarant
 the harvest order does not provide. This is what `BoundedCooperative` means at the
 single-slot level (§3.5.1); the cross-slot harvest-order weakening is the separate
 `BestEffort` `send-all-slot-isolation` story. A peer dribbling bytes still cannot
-blow past `tmax` indefinitely *on its own slot*, but a midbid auction observing total
+blow past the batch deadline indefinitely *on its own slot*, but a fan-out batch observing total
 wall-clock should also account for harvest serialization.
 
 #### 3.3.5 No general-purpose timeout combinator (deliberate)
@@ -1393,7 +1393,7 @@ An earlier draft put a `timeout(deadline, future)` combinator for *arbitrary* fu
 (`tokio` / `worker` / `spin-sdk`), which core may not depend on (§1.3). Core therefore
 ships only the `Deadline` value type; outbound-deadline enforcement lives entirely inside
 adapters (§3.3.4). A general arbitrary-future timeout would require an adapter-injected
-`Timer` trait and a dedicated capability; it is **out of scope** here because midbid's
+`Timer` trait and a dedicated capability; it is **out of scope** here because the fan-out pattern's
 timing needs are fully met by the outbound path. Noted as possible future work.
 
 ### 3.4 Bounded buffering & error mapping
@@ -1579,10 +1579,10 @@ pub fn gateway_timeout(message: impl Into<String>) -> Self;
 | Outbound transport failure (DNS / TLS / connect) | `bad_gateway` | 502 |
 | Outbound response over `max_response_bytes` (decompressed) | `bad_gateway` | 502 |
 | Outbound response body not valid JSON / `json::<T>` called on a streamed body | `bad_gateway` | 502 |
-| Outbound per-request timeout or auction deadline exceeded | `gateway_timeout` | 504 |
+| Outbound per-request timeout or batch deadline exceeded | `gateway_timeout` | 504 |
 | Outbound completed with a non-2xx status | **not an error** — `Ok(OutboundResponse)` | app decides |
 
-The non-2xx rule is load-bearing: a bidder returning 204/400/500 is a normal auction
+The non-2xx rule is load-bearing: a target returning 204/400/500 is a normal fan-out batch
 outcome, not a transport error.
 
 #### 3.4.4 Batch memory model (explicit)
@@ -1637,8 +1637,8 @@ EdgeZero's contract — **persistent** (post-append, retained) vs **transient**
   `max_response_bytesᵢ` denote slot `i`'s buffered request body length and its
   per-request response cap respectively); *transient* adds
   `Σⱼ sizeof(current_chunkⱼ)` over actively-draining slots, source-controlled.
-  For midbid this is intrinsic — `N` is the fixed, configured bidder count and
-  bidder responses are small JSON. The spec deliberately does **not** add a
+  For typical fan-out workloads this is intrinsic — `N` is the fixed, configured target count and
+  target responses are small JSON. The spec deliberately does **not** add a
   `max_concurrency` knob: on Fastly all requests must be in-flight at once for
   fan-out to work, so throttling concurrency would defeat the feature. This
   requirement is documented in the `send_all` rustdoc and in `docs/`. See §8 risk 11
@@ -2055,8 +2055,8 @@ buffered-body drain runs in harvest order (§3.3.4). A slot whose own
 body phase loses isolation. Apps that need cross-slot result isolation declare this
 capability required and get a hard build failure on Fastly per the round-5
 "required + BestEffort = hard fail" rule (§3.5.3); on Axum/CF/Spin where `join_all`
-fans out body drains concurrently, isolation is `Native`. **midbid is unaffected
-because its auction response bodies are expected to be small** (OpenRTB JSON, on
+fans out body drains concurrently, isolation is `Native`. **typical small-body fan-outs are unaffected
+because its fan-out response bodies are expected to be small** (the external batch protocol JSON, on
 the order of a few KiB) — drain times are sub-millisecond hostcalls, so the
 serial-drain wall-clock is negligibly different from concurrent drain and no slot
 is starved of its budget. Sharing the same effective deadline across slots does
@@ -2076,7 +2076,7 @@ per-outbound-request `max_response_bytes` is gone by the time the converter runs
 before constructing the axum response — correct, bounded, but first bytes only flow
 after full collection. Apps that need true lazy streaming on Axum declare this
 capability required and either (a) target a different adapter or (b) wait for a future
-mpsc-bridged implementation. midbid is unaffected (auctions are buffered). See §4.1 and
+mpsc-bridged implementation. Buffered fan-outs are unaffected. See §4.1 and
 §7 for the implementation, §8 for the open mpsc-bridge follow-up.
 
 #### 3.5.3 Build / startup enforcement
@@ -2286,7 +2286,7 @@ fn ensure_capabilities(
 #### 3.5.4 Outbound host plumbing — not policy
 
 `[capabilities.outbound].hosts` is **plumbing**, not a security allowlist (non-goal §1.3).
-Apps still enforce their own bidder allowlist in handler code. Adapter use of `hosts`:
+Apps still enforce their own target allowlist in handler code. Adapter use of `hosts`:
 
 - **Spin** requires `allowed_outbound_hosts` in `spin.toml`. The Spin adapter renders
   each entry per the rules below. (`spin.toml.hbs:13` currently hardcodes
@@ -2464,7 +2464,7 @@ pub enum PollResult { Pending(PendingRequest), Done(Result<Response, SendError>)
 ```
 
 `select` does not report which request completed, so it cannot preserve request↔slot
-identity — and midbid must know which bidder answered. The adapter harvests by **indexed
+identity — and the application must know which target answered. The adapter harvests by **indexed
 slot** with `wait()` / `poll()`:
 
 ```rust
@@ -2494,7 +2494,7 @@ async fn send_all(
     // Single batch-level `now` snapshot — same value passed to every per-slot
     // dispatch_budget so a shared caller Deadline produces the same `duration`
     // and ceiled `budget_ms`, and therefore one dynamic-backend identity per host
-    // in a homogeneous-budget auction (§3.3.2 / §4.3).
+    // in a homogeneous-budget batch (§3.3.2 / §4.3).
     let batch_now = web_time::Instant::now();
 
     // Phase 0 — preflight. send_all rejects streamed REQUEST bodies and streamed
@@ -2626,13 +2626,13 @@ async fn send_all(
   SHA-256 digest, collision-resistant in any realistic deployment (the previous
   64-bit FNV-1a draft was not). The name fits inside Fastly's backend-name length
   limit (`ez_` + 32 hex chars = 35 chars) and is valid for any host. In a
-  homogeneous-budget auction (midbid's case) all slots targeting the same host
+  homogeneous-budget batch all slots targeting the same host
   share one backend — **but only because `send_all` takes a single `now` snapshot
   and passes it to every per-slot `dispatch_budget` call** (§3.3.2). Without that,
   sequential `Instant::now()` per slot would derive slightly different `duration`s
   for the same shared caller `Deadline`, which would produce slightly different
   ceiled `budget_ms` values and therefore different identities for the same host
-  under one auction deadline. The shared-`now` snapshot is a normative requirement
+  under one batch deadline. The shared-`now` snapshot is a normative requirement
   of the `send_all` flow, not an implementation hint. In heterogeneous-budget
   fan-out each distinct budget gets its own backend, by design. Per-handler
   backend count is bounded by `unique(host, port, tls, budget_ms)` tuples; apps
@@ -2644,7 +2644,7 @@ async fn send_all(
   baked into the backend identity is a *bucketed* timeout — not the exact remaining
   wall-clock at the moment the SDK timer is armed. The Fastly host enforces
   `budget_ms` from the moment it sees the request, so a request can in principle
-  complete up to `(now_at_send_async − batch_now) ms` after the absolute auction
+  complete up to `(now_at_send_async − batch_now) ms` after the absolute fan-out batch
   deadline before the host fires its timeout. To keep this slack
   **deterministically bounded** (so `outbound-deadlines = BoundedCooperative` on
   Fastly is actually true, not just usually-tight):
@@ -2672,7 +2672,7 @@ async fn send_all(
   Net guarantee, with the explicit **sub-4 ms branch** broken out separately:
 
   - **`total_ms ≥ 4` (the common case)**: a Fastly slot can complete at most
-    **`BATCH_DISPATCH_SLACK_MAX + ms_rounding`** past the absolute auction
+    **`BATCH_DISPATCH_SLACK_MAX + ms_rounding`** past the absolute fan-out batch
     deadline on the dispatch+headers phase. Because connect and first-byte are
     *separate* host timers (Fastly docs), the budget is split — `connect_ms =
     total_ms / 4`, `first_byte_ms = total_ms - connect_ms` — so their sum equals
@@ -2863,7 +2863,7 @@ async fn send_all(
     waiting. But if the remaining budget is, say, 10 ms while the host's
     `first_byte_timeout` was set to 150 ms at dispatch (3/4 of a 200 ms budget),
     the host will wait up to its own 150 ms for headers even though only 10 ms
-    of auction budget is left; once headers arrive, the response-body phase is
+    of batch budget is left; once headers arrive, the response-body phase is
     likewise bounded by `between_bytes_timeout` per inter-chunk gap (200 ms in
     this example). **Total wall-clock for a single streamed upload + response
     on Fastly can therefore exceed `budget.duration` by up to one
@@ -2903,7 +2903,7 @@ overshoot ≤ one between-bytes-timeout interval.
 
 **Limitation, stated explicitly.** The harvest loop blocks the single-threaded guest in
 `wait()`. This is correct and concurrent (all requests progress at the host in parallel),
-but the guest cannot do other work while blocked — the intended behaviour for an auction.
+but the guest cannot do other work while blocked — the intended behaviour for a fan-out batch.
 `wait()` parks efficiently; there is no busy-polling.
 
 **Service prerequisite — dynamic backends.** Fastly outbound HTTP to arbitrary hosts
@@ -2944,7 +2944,7 @@ service — this distinction is explicit so a green capability check is not misr
   timer for **`budget.deadline.remaining()` at the moment the race starts** —
   *not* the snapshot-time `budget.duration`. The two differ by however long
   preflight + builder construction took since `batch_now`; using `remaining()`
-  pins the SDK timer to the absolute auction deadline, matching Axum/CF (§4.1 /
+  pins the SDK timer to the absolute batch deadline, matching Axum/CF (§4.1 /
   §4.2 step 3). If `remaining()` is `None`, return `gateway_timeout` without
   issuing the request. Single `send` snapshots `now = web_time::Instant::now()`
   inline.
@@ -2968,7 +2968,7 @@ service — this distinction is explicit so a green capability check is not misr
   After upload completion the adapter calls `budget.deadline.remaining()`; if
   `None`, the outgoing handle is dropped and the slot returns `gateway_timeout`
   immediately — no response wait. Otherwise the remaining duration governs the
-  response race, so upload time is included in the auction budget rather than
+  response race, so upload time is included in the batch budget rather than
   added on top.
 - Existing gzip/br decompression is kept; decompressed-byte cap enforced incrementally
   (§3.4.1). `Streamed` mode wraps the response body as `Body::Stream`.
@@ -3059,7 +3059,7 @@ async fn send_all_runs_requests_concurrently() {
 | Compressed body expands past cap → 502 (decompressed count) | yes | yes | yes |
 | Slow streaming body vs. deadline (bounded overshoot) | — | — | yes |
 | Headers arrive, deadline expires during body buffering → 504 | — | — | yes |
-| Per-request timeout / auction deadline exceeded → 504 | logic | — | yes |
+| Per-request timeout / batch deadline exceeded → 504 | logic | — | yes |
 | Partial timeout: one slot 504s, other slots still `Ok` | yes | — | yes |
 | Headers preserved (request and response) | yes | yes | — |
 | Non-2xx returned as `Ok`, not a transport error | yes | yes | — |
@@ -3123,7 +3123,7 @@ async fn send_all_runs_requests_concurrently() {
 | Upload consumes the budget on **Axum** / **Cloudflare** — **adapter mechanics (Tier 2 / Tier 3):** the adapter drains the streamed request body into `Bytes` *before* constructing the platform request, so `budget.deadline.remaining() == None` after the drain → adapter returns `gateway_timeout` **before** constructing/sending the actual `reqwest`/`worker` request. No partial upstream send. Asserted via `crates/edgezero-adapter-{axum,cloudflare}/tests/contract.rs` (Tier 2: inspect the platform-SDK send-call counter on a fake / no-network harness) + Tier 3 against a mock origin (the origin observes zero connections from the timed-out slot) | — | yes | yes |
 | Upload consumes the budget on **Spin** — **adapter mechanics (Tier 2 / Tier 3):** the adapter feeds chunks to the WASI outgoing-body; after the upload completes, `budget.deadline.remaining()` is checked. If exhausted, the response future is dropped → `gateway_timeout`. **Partial upstream send is possible** because chunks were flowing — distinct from Axum / Cloudflare. Asserted via the Spin contract crate (Tier 2: WASI outgoing-body chunk-count observation) + Tier 3 against a mock origin under the real Spin runtime (origin observes the partial upload) | — | yes | yes |
 | Upload consumes the budget on **Fastly** (`send_async_streaming`): dispatch happens **before** chunks flow, so request bytes have already started reaching the upstream by the time the budget is exhausted. Adapter detects `budget.deadline.remaining() == None`, drops the `StreamingBody` and `PendingRequest` without `wait()`, and returns `gateway_timeout`. **Partial upstream send is expected** — the documented Fastly-specific limitation of streamed uploads. The test asserts this contract honestly. **Adapter-specific** — the `send_async_streaming` + `wait()`-drop sequence is Fastly SDK behaviour Tier 1's mock has no analogue for; covered by Tier 2 (Fastly contract crate) and Tier 3 (Viceroy) | — | yes | yes |
-| `auction_deadline = Deadline::after(tmax)` computed once and copied into every bidder request → all bidders share one absolute wall-clock cap (no drift); recomputing `Deadline::after(tmax)` per bidder would let later bidders drift past `tmax` (counter-example test) | yes | — | yes |
+| `batch_deadline = Deadline::after(batch_deadline_ms)` computed once and copied into every target request → all targets share one absolute wall-clock cap (no drift); recomputing `Deadline::after(batch_deadline_ms)` per target would let later targets drift past the batch deadline (counter-example test) | yes | — | yes |
 | Outbound request header from `headers_mut()` containing a non-UTF-8 value is **dropped with `warn!`** by `normalize_for_dispatch` (lossy proxy-forward path) — distinct from `header(..)` which **rejects** with 400 (loud construction path) | yes | yes | — |
 | Adapter response-out converter (`response.rs`) on CF/Fastly/Spin: `OutboundResponse::into_response()` with a streamed body yields first bytes before the upstream stream ends (no buffer-then-return); driven by a `MockOutboundClient`-fed stream in-process, no platform runtime needed | — | yes | yes |
 | Adapter response-out converter on CF/Fastly/Spin: stream errors after headers **abort the downstream response stream** — once headers have been written, HTTP cannot change status to 502/504, so the adapter aborts the chunked body (TCP close on HTTP/1.1, RST_STREAM on HTTP/2) and emits a `log::warn!` naming the originating `EdgeError` variant (`gateway_timeout` or `bad_gateway`). Clients observe an early connection close, not a synthetic 502/504. The originating EdgeError is in the server log | — | yes | yes |
@@ -3133,7 +3133,7 @@ async fn send_all_runs_requests_concurrently() {
 | `OutboundRequest::is_stream_response()` returns `true` for `stream_response()`-marked requests; `send_all` preflight uses this to reject with `bad_request` without consuming, on every adapter | yes | yes | — |
 | `send_all` with `stream_response()` returns per-slot `bad_request` (400) on every adapter; single `send` with the same request succeeds (streamed bodies are only valid via `send`) | yes | yes | — |
 | `[capabilities.outbound].hosts` validation: rejected — empty string, `ftp://x` (bad scheme), `https://` (missing authority), `https://u:p@x` (userinfo), `https://x/p` (path), `https://x?q` (query), `https://x#f` (fragment), `https://x:0` and `https://x:70000` (out-of-range port), `https://x:abc` (non-numeric port). Accepted — `"*"`, `"*.example.com"`, `"x:8443"`, `"https://[::1]"`, `["*", "api.example.com"]`. Manifest load surfaces every error before the build | yes | — | — |
-| `send_all` shared-`now` snapshot: a homogeneous-budget Fastly auction to one host creates **exactly one** dynamic backend (per the §4.3 identity guarantee); replacing `batch_now` with per-slot `Instant::now()` in a test fork creates distinct backends, catching the drift bug. **Asserts Fastly-specific identity tuple including `budget_ms`** — Tier 1's `MockOutboundClient` has no dynamic-backend abstraction, so this row is Tier 2 (Fastly contract crate) + Tier 3 (Viceroy) only | — | yes | yes |
+| `send_all` shared-`now` snapshot: a homogeneous-budget Fastly fan-out batch to one host creates **exactly one** dynamic backend (per the §4.3 identity guarantee); replacing `batch_now` with per-slot `Instant::now()` in a test fork creates distinct backends, catching the drift bug. **Asserts Fastly-specific identity tuple including `budget_ms`** — Tier 1's `MockOutboundClient` has no dynamic-backend abstraction, so this row is Tier 2 (Fastly contract crate) + Tier 3 (Viceroy) only | — | yes | yes |
 | Outbound `Host` header includes the explicit port for non-default-port URIs: `http://localhost:3000` → `Host: localhost:3000`; `https://example.com:8443` → `Host: example.com:8443`; `https://example.com` → `Host: example.com` (no port). Adapters never copy `host` from the inbound `req.headers()` | yes | yes | yes |
 | **Core URI canonicalization → four-value split (Tier 1 half).** The four accessors `backend_target()` / `host_authority()` / `sni_hostname()` / `cert_host()` are tested in `crates/edgezero-core/src/outbound.rs` `#[cfg(test)]` against a matrix of inputs, with per-scheme expectations (no adapter dependency). **HTTPS DNS-host inputs** (`https://example.com`, `https://example.com:443`, `https://example.com:8443`): `backend_target() == "example.com:443"` / `"example.com:443"` / `"example.com:8443"`; `host_authority() == "example.com"` / `"example.com"` / `"example.com:8443"`; `sni_hostname() == Some("example.com")` on all three; `cert_host() == Some("example.com")` on all three. **HTTPS IP-literal inputs** (`https://127.0.0.1`, `https://[::1]:8443`): `sni_hostname() == None` (RFC 6066 §3); `cert_host() == Some("127.0.0.1")` / `Some("::1")` (bracket-stripped). **HTTP DNS-host inputs** (`http://example.com`, `http://example.com:80`, `http://example.com:8443`): `backend_target() == "example.com:80"` / `"example.com:80"` / `"example.com:8443"`; `host_authority() == "example.com"` / `"example.com"` / `"example.com:8443"`; `sni_hostname() == None` (no TLS, no SNI); `cert_host() == None` (no TLS, no certificate). The HTTPS-only `cert_host()` `Some` is the canonical reason an adapter calls `.disable_ssl()` vs `.enable_ssl()` / `.check_certificate(..)`. This is the core-side guarantee the Fastly row below assumes | yes | — | — |
 | **Fastly adapter consumes the four canonical accessors, DNS-name HTTPS path (Tier 2 / Tier 3 half).** For a DNS-name HTTPS host where `req.sni_hostname()` returns `Some(sni)` and `req.cert_host()` returns `Some(cert)`, Fastly dynamic backend construction calls `Backend::builder(name, req.backend_target()).override_host(req.host_authority()).sni_hostname(sni).check_certificate(cert)` (with `sni == cert` because both accessors return the same host string for the DNS-name case). For HTTP (`req.cert_host()` returns `None`), it calls `Backend::builder(name, req.backend_target()).override_host(req.host_authority()).disable_ssl()`. A Tier 2 test (`crates/edgezero-adapter-fastly/tests/contract.rs`, no network — inspects the registered-backend map produced by `FastlyOutboundClient`) and a Tier 3 test (Viceroy round-trip) build `https://example.com:8443` and `http://example.com:8443` and assert: connection target = `example.com:8443` on both; Host = `example.com:8443` on both; SSL enabled with SNI = cert = `example.com` on the first, disabled on the second; identity hashes differ (distinct backends). **DNS-name HTTPS only** — IP-literal HTTPS (where `sni_hostname()` is `None` but `cert_host()` is `Some(ip)`) is the dedicated "Fastly HTTPS to IP literals" row below, which asserts the **distinct** behaviour of skipping `.sni_hostname(..)` while still passing `cert_host()` to `.check_certificate(..)`. **Adapter-specific** — Tier 1's mock has no `Backend::builder` analogue | — | yes | yes |
@@ -3246,7 +3246,7 @@ Other changes:
      moves to `ctx.parts()` / `ctx.parts_mut()` / `ctx.body_kind()` /
      `ctx.body_bytes(max)` / `ctx.json_within(max)` / `ctx.form_within(max)` /
      `ctx.take_body()` / `ctx.into_request()` per §3.4.5.
-- **Consumers** — `examples/app-demo` and `midbid` migrate call sites: rename types,
+- **Consumers** — `examples/app-demo` and downstream consumers migrate call sites: rename types,
   `proxy_handle()` → `http_client()`, adopt `send_all`.
 
 ## 7. File-by-file change summary
@@ -3367,7 +3367,7 @@ Other changes:
     coalescing-to-502, no panic. This is the documented Axum-specific
     limitation: lazy streaming proxy-forward works on Cloudflare, Fastly, and
     Spin; Axum buffers, *but the buffering boundary lets it preserve the
-    correct status code*. For midbid (auction handlers) and most edge-shaped
+    correct status code*. For fan-out handlers and most edge-shaped
     apps this is a non-issue; if true lazy streaming on Axum becomes a
     requirement later, an mpsc bridge is a separate follow-up. Capability text
     and risk section reflect this (see §3.5.2 footnote 3 and §8).
@@ -3450,7 +3450,7 @@ Other changes:
 ## 8. Open questions / risks
 
 1. **`DEFAULT_MAX_RESPONSE_BYTES` = 1 MiB.** Trivially overridable per request via
-   `max_response_bytes`. Confirm the default suits midbid bidder responses.
+   `max_response_bytes`. Confirm the default suits expected target responses.
 2. **Tier 3 CI runtimes.** Viceroy / `workerd` / `spin` jobs add CI cost and
    maintenance. The design degrades safely (Tier 1 + Tier 2 always run); the risk is
    schedule, not correctness.
@@ -3479,7 +3479,7 @@ Other changes:
 8. **Fastly buffered-body-drain serialization in `send_all`.** Harvest reads bodies in
    slot order, so wall-clock = `max(header_arrivals) + Σ buffered_body_drain_times`
    on Fastly vs. `max(header_arrivals + body_drain_times)` on Axum/CF/Spin (§3.3.4).
-   For small JSON bodies (auctions) the difference is negligible; for ≥ few-MiB
+   For small JSON bodies (fan-out batches) the difference is negligible; for ≥ few-MiB
    responses Fastly is suboptimal. **There is no current EdgeZero mitigation** —
    and Streamed mode is not the workaround (it's rejected by `send_all` preflight
    per §3.1.1, and even via single `send` Fastly has no concurrent
@@ -3523,8 +3523,8 @@ Other changes:
     when the upstream's natural chunk size exceeds the constant); or (c) leave
     it source-controlled and document the bound at the adapter level
     (`hyper`'s 16 KiB, WASI's 64 KiB, etc.) as the operational floor. Each
-    option has a perf and lazy-streaming trade-off; deferred until a midbid
-    auction or downstream consumer reports actual OOM behaviour from
+    option has a perf and lazy-streaming trade-off; deferred until a
+    fan-out batch or downstream consumer reports actual OOM behaviour from
     adversarial chunking. The §3.4.1 / §3.4.4 docs already call out the
     caveat so apps aren't surprised.
 
@@ -3668,9 +3668,9 @@ prior entry; the index note here is the disclaimer for the whole history.
 
 | Review finding | Resolution |
 | --- | --- |
-| `dispatch_budget` timeout-only contradiction | §3.3.2 rewritten end-to-end: a single `now` snapshot, candidate **absolute** deadlines (`from_timeout`, `from_caller`, `from_default_only`), effective deadline = min of candidates, duration = `deadline.at - now`. `.timeout(50ms)` with no auction deadline yields `now + 50ms` (not 30 s). Full behaviour table inline |
+| `dispatch_budget` timeout-only contradiction | §3.3.2 rewritten end-to-end: a single `now` snapshot, candidate **absolute** deadlines (`from_timeout`, `from_caller`, `from_default_only`), effective deadline = min of candidates, duration = `deadline.at - now`. `.timeout(50ms)` with no batch deadline yields `now + 50ms` (not 30 s). Full behaviour table inline |
 | Fastly single-`send` streamed request bodies lacked cap/deadline mechanics | §4.3 new bullet — pre-append byte counting against `req.max_request_body_bytes` (over-cap → 400, `StreamingBody` dropped without `finish()`); cooperative between-chunk `budget.deadline.is_expired()` check during upload (stalled → 504, same bounded-cooperative story as the body-read phase); post-upload duration recomputed from `budget.deadline.remaining()` so upload time counts against the budget |
-| Fastly `send_all` wall-clock-observed bound overstated for ordered harvest | §3.3.4 new paragraph distinguishing per-slot **result correctness** (host-side, bounded by the slot's own budget) from per-slot **wall-clock-observed delivery** (bounded by `max_over_remaining_slots(effective_at_dispatch)` because harvest is ordered). For midbid (uniform budget) the bounds coincide; heterogeneous-budget callers are warned |
+| Fastly `send_all` wall-clock-observed bound overstated for ordered harvest | §3.3.4 new paragraph distinguishing per-slot **result correctness** (host-side, bounded by the slot's own budget) from per-slot **wall-clock-observed delivery** (bounded by `max_over_remaining_slots(effective_at_dispatch)` because harvest is ordered). For uniform-budget fan-outs the bounds coincide; heterogeneous-budget callers are warned |
 | `dispatch_budget` could extend an original absolute deadline; `remaining() == None` ambiguity | §3.3.2: single `now` snapshot; expired-deadline check uses `dl.at <= now` directly (no `remaining()` round-trip); duration derived from the chosen absolute deadline and the same `now`, never `Deadline::after(duration)` from a later moment |
 | `OutboundRequest` struct snippet missed `max_request_body_bytes` | §3.1.3 struct now lists the field with its default annotation |
 | Fastly dynamic-backend warning promised but missing from `ensure_capabilities` | §3.5.3: explicit `if adapter_name == "fastly" && caps.required.contains(&Capability::OutboundHttp)` block in the pseudocode that emits the dynamic-backends `log::info!` reminder |
@@ -3695,7 +3695,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | Fastly streamed-response deadline was contradictory | §3.1.3 + §4.3: Fastly now wraps streamed response bodies with a **cooperative deadline-aware stream** that checks `budget.deadline.is_expired()` before each yielded chunk and emits `gateway_timeout` past the deadline. Applies to every consumer — `into_bytes_bounded`, `into_bytes_bounded_until`, `into_response()` proxy passthrough — so the deadline cannot be bypassed by choosing a non-helper consumption path |
 | Fastly streamed-upload BestEffort gap had no capability hook | §3.5.1 + §3.5.2: new `Capability::StreamedUploadDeadlines` enum variant and `streamed-upload-deadlines` matrix row — `Native` on Axum/CF/Spin, `BestEffort` on Fastly. Apps that need real-time enforcement of stalled `stream.next().await` on uploads declare this required and get a hard build failure on Fastly per the round-5 "required + BestEffort = hard fail" rule |
 | `budget.deadline.remaining() == None` after upload was unspecified | §4.1 / §4.2 / §4.3 / §4.4: every adapter explicitly returns `gateway_timeout` *before* constructing/fetching/sending the platform request when the upload consumed the budget |
-| OpenRTB `tmax` mapping could re-anchor per bidder | §3.3.2 row rewritten: compute `auction_deadline = Deadline::after(tmax)` **once** at handler entry, then copy that absolute `Deadline` into every bidder request. The field comment on `OutboundRequest.deadline` (§3.1.3) reinforces the rule. §5.4 has a drift counter-example test |
+| the external batch deadline mapping could re-anchor per target | §3.3.2 row rewritten: compute `batch_deadline = Deadline::after(batch_deadline_ms)` **once** at handler entry, then copy that absolute `Deadline` into every target request. The field comment on `OutboundRequest.deadline` (§3.1.3) reinforces the rule. §5.4 has a drift counter-example test |
 | RequestContext migration still incomplete around `form_within` and sweep | §3.4.2 API block adds `form_within` (default `1 MiB`, same cache semantics); §7 sweep regex extended to include `fn json<` and `fn form<` for definition sites |
 | `Deadline::after` overflow/panic risk | §3.3.1: `Deadline::after(d)` is **saturating** — `Duration::MAX` clamps to the largest representable instant rather than panicking. §5.4 row asserts this |
 | Non-UTF-8 request-header policy was split inconsistently | §3.1.4: split is explicit — `OutboundRequest::header(..)` rejects with `bad_request` at construction (loud), `headers_mut()` / `from_request(..)` paths use `normalize_for_dispatch` which **drops + `warn!`** (lossy — doesn't fail an otherwise-good forward over an exotic header). §5.4 covers both paths |
@@ -3726,7 +3726,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 
 | Review finding | Resolution |
 | --- | --- |
-| Fastly `send_all` buffered body drains serialized | §3.3.4 new bullet + §3.2 "Where 'identical' stops being identical" paragraph: explicit, honest documentation that buffered-body drain on Fastly runs in harvest order, so wall-clock = `max(headers) + Σ body_drain_times` vs. `max(headers + body_drain_times)` on Axum/CF/Spin. Small bodies (auctions) are unaffected; large bodies should switch to `Streamed` mode. §8 risk 8 tracks the future interleaved-chunks enhancement |
+| Fastly `send_all` buffered body drains serialized | §3.3.4 new bullet + §3.2 "Where 'identical' stops being identical" paragraph: explicit, honest documentation that buffered-body drain on Fastly runs in harvest order, so wall-clock = `max(headers) + Σ body_drain_times` vs. `max(headers + body_drain_times)` on Axum/CF/Spin. Small bodies (fan-out batches) are unaffected; large bodies should switch to `Streamed` mode. §8 risk 8 tracks the future interleaved-chunks enhancement |
 | Capability metadata inconsistent ("six" / no Fastly tuple) after adding `LazyStreamedResponsePassthrough` | §4.1 / §4.2 / §4.3 / §4.4 `capability()` lines all rewritten to enumerate the **seven** capabilities explicitly. Fastly's tuple is spelled out: `BoundedCooperative` for outbound-deadlines, `BestEffort` for streamed-upload-deadlines, `Native` for the other five |
 | Axum buffered fallback had no source for cap | §4.1 + §7 + §3.5.2 footnote 3: introduced `AXUM_RESPONSE_STREAM_BUFFER_BYTES` (defined Axum-adapter constant, default 16 MiB). The per-outbound-request `max_response_bytes` is unavailable by the time the response converter runs; the constant is what the converter uses. Over-cap → 502. Apps that need a different ceiling override the constant at adapter init |
 | Streamed error chunks were specified as `EdgeError` but stream is `anyhow::Error` | §7 `src/body.rs` task: **change `Body::Stream`'s error type from `anyhow::Error` to `EdgeError`** so deadline-aware wrappers' `gateway_timeout` chunks survive round-trip without downcasting. In-tree call sites updated mechanically; externally-supplied streams map source errors into `EdgeError::internal(..)` |
@@ -3763,7 +3763,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | Review finding | Resolution |
 | --- | --- |
 | `send_all-slot-isolation` would not deserialize (kebab-case mismatch) | Renamed to `send-all-slot-isolation` everywhere — matrix, footnote, prose, test rows, enum doc. `#[serde(rename_all = "kebab-case")]` now produces the same string the spec uses |
-| Fastly dynamic backend identity omitted timeout settings | §4.3: identity tuple is now `scheme + ":" + host + ":" + port + ":" + tls_mode + ":" + budget_ms` — distinct budgets to the same host get distinct dynamic backends, so a 50 ms slot and a 3 s slot don't silently share one timeout config. Homogeneous-budget auctions (midbid) still share one backend per host. Per Fastly's `BackendBuilder` docs, dynamic backend names cannot duplicate in a session and sameness includes settings — the identity must reflect every setting |
+| Fastly dynamic backend identity omitted timeout settings | §4.3: identity tuple is now `scheme + ":" + host + ":" + port + ":" + tls_mode + ":" + budget_ms` — distinct budgets to the same host get distinct dynamic backends, so a 50 ms slot and a 3 s slot don't silently share one timeout config. Homogeneous-budget fan-out batches still share one backend per host. Per Fastly's `BackendBuilder` docs, dynamic backend names cannot duplicate in a session and sameness includes settings — the identity must reflect every setting |
 | `capability()` tuples missing `send-all-slot-isolation` on every adapter | §4.1 / §4.2 / §4.3 / §4.4 `capability()` lines updated to enumerate **eight** capabilities. Fastly's tuple is `outbound-deadlines = BoundedCooperative`, `send-all-slot-isolation = BestEffort`, `streamed-upload-deadlines = BestEffort`, the rest `Native`. Axum / CF / Spin are `Native` for `send-all-slot-isolation` |
 | Trait `send_all` doc still said "behaves identically across adapters" | §3.1.1 trait rustdoc adds an "Identical scope" paragraph: identical is **input/output contract** (preflight, index alignment, per-slot Ok/Err shape); cross-slot timing is governed by `send-all-slot-isolation`. §3.2 paragraph also rewritten to match |
 | `RequestContext::into_request()` silently returned `Body::empty()` for Poisoned/Draining | §3.4.5: `into_request() -> Result<Request, EdgeError>` is now **fallible**. `Draining` → `internal`; `Poisoned(err)` → `Err(err.clone_as_edge_error())`; only `Taken` returns `Ok(Body::empty())` (the caller already consumed the body explicitly). A poisoned read can no longer silently become an empty proxy-forward |
@@ -3852,7 +3852,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | Fastly backend identity didn't actually pin Host override | §3.1.3 constructors now **canonicalize** the URI: userinfo is **rejected** (`bad_request`) so credentials never end up in `override_host`; default ports (`:443` for https, `:80` for http) are normalised away so `https://example.com` and `https://example.com:443` produce identical `OutboundRequest`s. With canonicalization in place the §4.3 identity tuple `(scheme, host, resolved_port, tls_mode, budget_ms)` is sufficient — the Host override is a deterministic function of those fields, not a separate input. §5.4 adds the two parity tests |
 | §3.3.4 stale `dispatch_budget(req)?` normative prose | The "Fastly precision" paragraph now says `dispatch_budget(req, now)?` with the explicit note: single `send` snapshots `now` inline, `send_all` passes `batch_now`. Matches the code block immediately below |
 | §7 Fastly file summary missing round-25 three-value split | §7 Fastly entry rewritten to spell out the three-value split — `Backend::builder(name, "host:port")` connection target, `.override_host(host_authority)` for the Host header (canonicalized authority, ports preserved when non-default), `.sni_hostname(sni_host).check_certificate(sni_host)` for SNI/cert (host-only). Matches the §3.3.4 sample and §5.4 test row |
-| `send-all-slot-isolation` footnote 4 gave the wrong "midbid unaffected" reason | The shared-deadline reason was a non-sequitur — §3.3.4's harvest-order false 504s can happen even with one deadline. The footnote now says **midbid is unaffected because auction response bodies are expected to be small** (OpenRTB JSON, sub-millisecond drain hostcalls), making the serial-drain wall-clock negligibly different from concurrent |
+| `send-all-slot-isolation` footnote 4 gave the wrong "consumer unaffected" reason | The shared-deadline reason was a non-sequitur — §3.3.4's harvest-order false 504s can happen even with one deadline. The footnote now says **typical small-body fan-outs are unaffected because fan-out response bodies are expected to be small** (the external batch protocol JSON, sub-millisecond drain hostcalls), making the serial-drain wall-clock negligibly different from concurrent |
 | `DEFAULT_*` constants used but not declared in active API snippets | §7: `src/time.rs` summary now lists `pub const DEFAULT_NO_DEADLINE_BUDGET = Duration::from_secs(30)` and `pub const DEADLINE_FAR_FUTURE = Duration::from_secs(7 * 24 * 60 * 60)`. `src/outbound.rs` summary now lists `pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1 MiB` and `pub const DEFAULT_OUTBOUND_REQUEST_BODY_BYTES: usize = 8 MiB`. Implementers have a single place to copy from |
 
 ## Appendix AA — Review round 27 resolutions
@@ -4000,7 +4000,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 | `send_all` rustdoc overpromised isolation | §3.1.1 + §3.2: "without affecting other slots" scoped to **input handling and per-slot Ok/Err type**. Cross-slot timing is explicitly governed by `send-all-slot-isolation` (BestEffort on Fastly because of harvest-order false 504s, §3.3.4). The trait rustdoc now points at the capability for the stricter guarantee |
 | Streamed-upload host-write test row didn't match Axum/CF mechanics | §5.4 row rewritten by adapter: Axum/CF drain `Body::Stream` to `Bytes` *before* constructing the platform request (the relevant stall is source-pull during the drain); Spin has explicit source-pull + host-write races on WASI outgoing-body; Fastly has source-pull (unpreemptable, BestEffort) + bounded-cooperative host-write via between-bytes-timeout. The previous unified "host-write" framing is gone |
 | Stale "before yielding each chunk" / "between chunks" wording for Fastly streamed body | §3.1.3 Fastly bullet updated to the EOF-safe rule — "both before issuing the underlying body read and again after it returns (including the EOF read)." No active normative text still says the older form |
-| Batch memory warning claimed to be in send_all rustdoc but wasn't | §3.1.1 send_all rustdoc gains a **"Memory model"** paragraph: worst-case `Σᵢ request_bodyᵢ.len() + Σᵢ max_response_bytesᵢ`, no global cap on N, app bounds N (especially auctions). Implementers copying the rustdoc into their docs site now see the bound at the API level, not only in §3.4.4 |
+| Batch memory warning claimed to be in send_all rustdoc but wasn't | §3.1.1 send_all rustdoc gains a **"Memory model"** paragraph: worst-case `Σᵢ request_bodyᵢ.len() + Σᵢ max_response_bytesᵢ`, no global cap on N, app bounds N (especially fan-out batches). Implementers copying the rustdoc into their docs site now see the bound at the API level, not only in §3.4.4 |
 | Appendix index said A–AM, file had AN | Index updated to "A–AN (and counting)". Standard self-pointer |
 
 ## Appendix AP — Review round 42 resolutions
