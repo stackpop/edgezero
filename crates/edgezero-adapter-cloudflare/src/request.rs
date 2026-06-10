@@ -117,6 +117,10 @@ impl<'app> CloudflareService<'app> {
         };
         let secrets = match self.secrets {
             SecretSource::Off => None,
+            // Always Some — post-PR-269 fix; `required=false`
+            // (set by `.with_secrets()` without
+            // `.require_secrets()`) no longer suppresses the
+            // handle. See `resolve_secret_handle`.
             SecretSource::On { required } => resolve_secret_handle(&env, required),
         };
         dispatch_with_handles(
@@ -335,11 +339,22 @@ pub(crate) fn resolve_kv_handle(
     }
 }
 
-pub(crate) fn resolve_secret_handle(env: &Env, secrets_required: bool) -> Option<SecretHandle> {
-    if !secrets_required {
-        return None;
-    }
-
+/// Construct the Cloudflare secret-store handle. Called from the
+/// `SecretSource::On { .. }` arm of `dispatch`, so it always builds
+/// the handle — the `_required` parameter is preserved (and ignored)
+/// for symmetry with the kv path's `resolve_kv_handle(_, _, required)`
+/// signature, where `required` decides whether a runtime open
+/// failure is fatal or silently degrades. `CloudflareSecretStore` is
+/// a thin `env`-wrapper whose construction can't fail, so there's
+/// nothing for `required` to gate at handle-construction time —
+/// `_required` is reserved for whichever future per-secret-lookup
+/// availability policy we add.
+///
+/// Pre-fix, this short-circuited to `None` when `!_required`, which
+/// silently swallowed `.with_secrets()` (which sets `required:
+/// false`): handlers ran without a `SecretRegistry` even though the
+/// builder claimed to inject one.
+pub(crate) fn resolve_secret_handle(env: &Env, _required: bool) -> Option<SecretHandle> {
     let secret_store = CloudflareSecretStore::from_env(env.clone());
     Some(SecretHandle::new(Arc::new(secret_store)))
 }

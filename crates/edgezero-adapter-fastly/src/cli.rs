@@ -1,8 +1,9 @@
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -641,19 +642,32 @@ where
     Ok(pushed.len())
 }
 
+/// Shell `fastly config-store-entry create` with the value piped
+/// through stdin instead of `--value=<value>` on argv.
+///
+/// Pre-fix this used `--value=<value>`, which exposed every config
+/// entry's bytes in `ps`/`/proc/<pid>/cmdline` listings AND was
+/// bounded by the host's `ARG_MAX` (4 KiB to 256 KiB depending on
+/// platform — easy to trip with a JSON blob). Fastly CLI 15.x's
+/// `config-store-entry create` accepts `--stdin` to read the
+/// value from stdin instead; switching keeps value bytes out of
+/// argv and lifts the size cap to whatever the operating system's
+/// pipe buffer + the CLI's read accept (megabytes in practice).
 fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(), String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
-    let value_arg = format!("--value={value}");
-    let output = Command::new("fastly")
+    let mut child = Command::new("fastly")
         .args([
             "config-store-entry",
             "create",
             store_arg.as_str(),
             key_arg.as_str(),
-            value_arg.as_str(),
+            "--stdin",
         ])
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
                 format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
@@ -661,11 +675,26 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
                 format!("failed to spawn `fastly`: {err}")
             }
         })?;
+    // Take stdin BEFORE wait_with_output (which consumes child).
+    // A failed write closes the pipe — the CLI will then exit non-
+    // zero and the error path below surfaces stderr.
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
+        stdin
+            .write_all(value.as_bytes())
+            .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait on `fastly`: {err}"))?;
     if output.status.success() {
         return Ok(());
     }
     Err(format!(
-        "`fastly config-store-entry create --store-id={store_id} --key={key} ...` exited with status {}\nstderr: {}",
+        "`fastly config-store-entry create --store-id={store_id} --key={key} --stdin` exited with status {}\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     ))

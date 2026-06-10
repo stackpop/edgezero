@@ -811,10 +811,63 @@ fn validate_store_declaration(declaration: &StoreDeclaration) -> Result<(), Vali
         return Err(error);
     }
 
+    // Enforce a portable segment shape: each id is later used as
+    // - an `EDGEZERO__STORES__<KIND>__<ID>__NAME` env-var path segment
+    //   (`__` is the SEGMENT SEPARATOR, so an id containing `__` would
+    //   make `<ID>__NAME` ambiguous);
+    // - a filename component (e.g. axum's
+    //   `.edgezero/local-config-<id>.json`, so `/` would escape the
+    //   intended directory);
+    // - a registry key and TOML table label.
+    //
+    // Permit only `[A-Za-z0-9_-]` and reject `__` — strict enough to
+    // be safe across all four consumers, loose enough to cover every
+    // id in the scaffold and example suite (`app_config`,
+    // `feature_flags`, `sessions`, …).
+    if let Some(bad) = declaration.ids.iter().find(|id| {
+        let chars_bad = id
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        let double_underscore = id.contains("__");
+        chars_bad || double_underscore
+    }) {
+        let mut error = ValidationError::new("store_id_format");
+        error.message = Some(
+            format!(
+                "`[stores.<kind>].ids` entry `{bad}` is not a portable segment: only ASCII alphanumeric / `_` / `-` are allowed, and `__` (double underscore) is reserved as the `EDGEZERO__STORES__…` env-var separator. Rename it to something like `app_config` / `feature-flags`."
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+
+    // Exact-duplicate check (preserved for the simple case).
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     if let Some(dup) = declaration.ids.iter().find(|id| !seen.insert(id.as_str())) {
         let mut error = ValidationError::new("store_id_duplicate");
         error.message = Some(format!("`[stores.<kind>].ids` contains duplicate id `{dup}`").into());
+        return Err(error);
+    }
+
+    // Case-insensitive duplicate check: env-var lookup
+    // (`EDGEZERO__STORES__<KIND>__<ID>__NAME` with `<ID>` upper-cased)
+    // would alias `foo` and `FOO`, and several downstream consumers
+    // lower-case segments before lookup. Reject ASCII case-only
+    // duplicates so the operator sees a manifest error instead of
+    // silent shadowing at runtime.
+    let mut seen_ci: BTreeSet<String> = BTreeSet::new();
+    if let Some(dup_ci) = declaration
+        .ids
+        .iter()
+        .find(|id| !seen_ci.insert(id.to_ascii_lowercase()))
+    {
+        let mut error = ValidationError::new("store_id_case_duplicate");
+        error.message = Some(
+            format!(
+                "`[stores.<kind>].ids` contains case-insensitive duplicate id `{dup_ci}`; ids must be unique under ASCII case-folding because `EDGEZERO__STORES__<KIND>__<ID>__NAME` env-var lookup upper-cases the id and several downstream consumers lower-case it again. Pick distinct names."
+            )
+            .into(),
+        );
         return Err(error);
     }
 
@@ -1542,6 +1595,74 @@ ids = ["default"]
             err.to_string().contains("duplicate id"),
             "error should mention duplicate, got: {err}"
         );
+    }
+
+    #[test]
+    fn store_declaration_rejects_id_with_path_separator() {
+        // `foo/bar` would let the axum config writer create
+        // `.edgezero/local-config-foo/bar.json`, which traverses
+        // into a subdirectory. Reject at manifest load.
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"foo/bar\"]\n").expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("non-portable id `foo/bar` must fail validation");
+        assert!(
+            err.to_string().contains("portable segment"),
+            "error must explain the segment rule: {err}"
+        );
+    }
+
+    #[test]
+    fn store_declaration_rejects_double_underscore_in_id() {
+        // `foo__bar` would collide with `EDGEZERO__STORES__KV__FOO`
+        // + segment `BAR__NAME` parsing on the env-overlay side.
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"foo__bar\"]\n").expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("`__` is reserved as the env-var segment separator");
+        assert!(
+            err.to_string().contains("`__` (double underscore)"),
+            "error must call out the env-segment separator: {err}"
+        );
+    }
+
+    #[test]
+    fn store_declaration_rejects_case_only_duplicates() {
+        // `foo` and `FOO` upper-case to the same
+        // `EDGEZERO__STORES__KV__FOO` env-var path; reject the
+        // shadow at manifest load instead of letting one silently
+        // win at runtime.
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"foo\", \"FOO\"]\ndefault = \"foo\"\n")
+                .expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("ASCII case-folded duplicates must fail validation");
+        assert!(
+            err.to_string().contains("case-insensitive duplicate"),
+            "error must call out the case-fold collision: {err}"
+        );
+    }
+
+    #[test]
+    fn store_declaration_accepts_portable_alphanumeric_ids() {
+        // Sanity: the new format check doesn't accidentally reject
+        // the canonical scaffold shapes — single underscore, single
+        // hyphen, mixed case, digits.
+        for ids in [
+            "[\"app_config\"]",
+            "[\"feature-flags\"]",
+            "[\"appConfig\"]",
+            "[\"v1\", \"v2\"]\ndefault = \"v1\"",
+        ] {
+            let toml = format!("[stores.kv]\nids = {ids}\n");
+            let manifest: Manifest = toml::from_str(&toml).expect("should parse");
+            manifest
+                .validate()
+                .unwrap_or_else(|err| panic!("portable ids must validate: {ids} -> {err}"));
+        }
     }
 
     #[test]

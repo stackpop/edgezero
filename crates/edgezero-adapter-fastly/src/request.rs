@@ -481,10 +481,20 @@ fn resolve_kv_handle(
     }
 }
 
-fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
-    if !secrets_required {
-        return None;
-    }
+/// Construct the Fastly secret-store handle. Called from the
+/// `SecretSource::On { .. }` arm of `dispatch`, so it always builds
+/// the handle. The `_required` parameter is preserved (and ignored)
+/// for symmetry with the kv path's
+/// `resolve_kv_handle(_, _required)`, where `required` decides
+/// whether a runtime open failure is fatal or silently degrades.
+/// `FastlySecretStore` is a unit struct whose construction can't
+/// fail, so there's nothing for `required` to gate here.
+///
+/// Pre-fix, this short-circuited to `None` when `!_required`, which
+/// silently swallowed `.with_secrets()` (which sets `required:
+/// false`): handlers ran without a `SecretRegistry` even though the
+/// builder claimed to inject one.
+fn resolve_secret_handle(_required: bool) -> Option<SecretHandle> {
     Some(SecretHandle::new(Arc::new(FastlySecretStore)))
 }
 
@@ -624,6 +634,32 @@ mod synthesis_tests {
         assert_eq!(
             secret_reg.default().expect("default bound").store_name(),
             "default"
+        );
+    }
+
+    // Regression for the `.with_secrets()` bug — the pre-fix
+    // `resolve_secret_handle(false)` short-circuited to `None`, so the
+    // documented `.with_secrets().dispatch(...)` path silently ran
+    // handlers without a `SecretRegistry`. After the fix, the handle
+    // is always built when `SecretSource::On` is selected; `_required`
+    // is reserved for whichever future per-secret-lookup availability
+    // policy lands.
+
+    #[test]
+    fn resolve_secret_handle_builds_handle_when_required_false_matches_with_secrets_default() {
+        let handle = resolve_secret_handle(false);
+        assert!(
+            handle.is_some(),
+            "`.with_secrets()` sets required=false; resolve must still build a SecretRegistry"
+        );
+    }
+
+    #[test]
+    fn resolve_secret_handle_builds_handle_when_required_true_matches_require_secrets() {
+        let handle = resolve_secret_handle(true);
+        assert!(
+            handle.is_some(),
+            "`.require_secrets()` sets required=true; resolve must build a SecretRegistry"
         );
     }
 }

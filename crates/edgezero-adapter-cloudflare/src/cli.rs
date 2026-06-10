@@ -225,6 +225,22 @@ impl Adapter for CloudflareCliAdapter {
                 ));
                 continue;
             }
+            // Pre-flight the writeback shape BEFORE shelling
+            // `wrangler kv namespace create`. `read_namespace_id`
+            // tolerates both `[[kv_namespaces]]` (array-of-tables)
+            // and `kv_namespaces = [{ binding = "...", id = "..." }]`
+            // (inline-array) forms, but `upsert_kv_namespace` only
+            // writes back through the array-of-tables shape. Without
+            // this guard, an inline-array manifest passes the
+            // "already provisioned?" probe (because no id is
+            // present), the remote `create` succeeds, and then the
+            // upsert errors out — leaving the freshly-created
+            // namespace orphaned on Cloudflare with no local
+            // writeback to track it.
+            //
+            // Refuse early so the operator fixes the manifest shape
+            // BEFORE any account-side mutation.
+            check_kv_namespaces_writeback_shape(&wrangler_path)?;
             if dry_run {
                 out.push(format!(
                     "would run `wrangler kv namespace create {binding}` and append [[kv_namespaces]] binding = \"{binding}\" to {} (logical id `{logical}`)",
@@ -631,6 +647,42 @@ fn read_namespace_id(path: &Path, binding: &str) -> Result<Option<String>, Strin
         None => None,
     };
     Ok(id)
+}
+
+/// Refuse to provision a new namespace when `wrangler.toml`'s
+/// `kv_namespaces` exists in a form that `upsert_kv_namespace`
+/// can't write back to. Today that means the inline-array form
+/// (`kv_namespaces = [{ binding = "...", id = "..." }]`), which
+/// `read_namespace_id` tolerates but `upsert_kv_namespace`'s
+/// `as_array_of_tables_mut()` rejects. Without this guard, the
+/// orphan-namespace hazard documented in `upsert_kv_namespace`
+/// reappears: `wrangler kv namespace create` succeeds, then
+/// upsert errors out and the new namespace lingers on
+/// Cloudflare with no local writeback to track it. Missing or
+/// array-of-tables forms are OK.
+fn check_kv_namespaces_writeback_shape(path: &Path) -> Result<(), String> {
+    use toml_edit::{DocumentMut, Item, Value};
+
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    match doc.get("kv_namespaces") {
+        None | Some(Item::ArrayOfTables(_)) => Ok(()),
+        Some(Item::Value(Value::Array(_))) => Err(format!(
+            "{}: `kv_namespaces` is declared as an inline array (`kv_namespaces = [{{ binding = \"...\", id = \"...\" }}]`); provision can only write back through the `[[kv_namespaces]]` array-of-tables form. Convert each entry to a `[[kv_namespaces]]` block BEFORE re-running provision; otherwise a successful `wrangler kv namespace create` would leave the new namespace orphaned on Cloudflare with no local entry to track it.",
+            path.display()
+        )),
+        Some(other) => Err(format!(
+            "{}: `kv_namespaces` exists but is neither `[[kv_namespaces]]` (array-of-tables) nor an inline array of `{{ binding, id }}` records; got TOML item of type `{}`. Convert it manually before re-running provision.",
+            path.display(),
+            item_kind(other)
+        )),
+    }
 }
 
 /// One-line label for a `toml_edit::Item` (for diagnostic
@@ -1265,6 +1317,65 @@ id = "00112233445566778899aabbccddeeff"
         assert!(
             after.contains("id = \"00112233445566778899aabbccddeeff\""),
             "id written: {after}"
+        );
+    }
+
+    // ---------- writeback shape pre-check ----------
+
+    #[test]
+    fn check_kv_namespaces_writeback_shape_ok_when_file_missing() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("missing.toml");
+        check_kv_namespaces_writeback_shape(&path)
+            .expect("missing file is permissive (upsert creates it)");
+    }
+
+    #[test]
+    fn check_kv_namespaces_writeback_shape_ok_when_kv_namespaces_absent() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("wrangler.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write wrangler.toml");
+        check_kv_namespaces_writeback_shape(&path).expect("no kv_namespaces => OK");
+    }
+
+    #[test]
+    fn check_kv_namespaces_writeback_shape_ok_when_array_of_tables() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("wrangler.toml");
+        fs::write(
+            &path,
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"local-dev-placeholder\"\n",
+        )
+        .expect("write wrangler.toml");
+        check_kv_namespaces_writeback_shape(&path)
+            .expect("[[kv_namespaces]] is the writeback-supported shape");
+    }
+
+    #[test]
+    fn check_kv_namespaces_writeback_shape_rejects_inline_array_with_actionable_message() {
+        // Regression for the orphan-namespace hazard: pre-fix, a
+        // `kv_namespaces = [{ binding = "sessions" }]` manifest (no
+        // id present) made `read_namespace_id` return None ("not yet
+        // provisioned") so provision shelled `wrangler kv namespace
+        // create` successfully, then `upsert_kv_namespace`'s
+        // `as_array_of_tables_mut()` returned None and the upsert
+        // errored — leaving the freshly-created namespace orphaned
+        // on Cloudflare. The pre-flight rejects the inline-array
+        // shape BEFORE any account-side call.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("wrangler.toml");
+        fs::write(
+            &path,
+            "name = \"demo\"\nkv_namespaces = [{ binding = \"sessions\" }]\n",
+        )
+        .expect("write wrangler.toml");
+        let err = check_kv_namespaces_writeback_shape(&path)
+            .expect_err("inline-array form must be rejected before provision shells out");
+        assert!(
+            err.contains("inline array")
+                && err.contains("[[kv_namespaces]]")
+                && err.contains("orphaned"),
+            "error must name the inline-array form, the supported [[kv_namespaces]] form, AND the orphan hazard so the operator knows what's at stake: {err}"
         );
     }
 
