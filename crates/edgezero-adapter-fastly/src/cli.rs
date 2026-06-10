@@ -234,14 +234,14 @@ impl Adapter for FastlyCliAdapter {
                 let name = store.platform.as_str();
                 if dry_run {
                     out.push(format!(
-                        "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] / [local_server.{kind}_stores.{name}] to {} (logical id `{logical}`)",
+                        "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] to {} (logical id `{logical}`)",
                         fastly_path.display()
                     ));
                     continue;
                 }
                 if setup_block_present(&fastly_path, kind, name)? {
                     out.push(format!(
-                        "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] / [local_server.{kind}_stores.{name}] blocks AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
+                        "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] block AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
                         fastly_path.display()
                     ));
                     continue;
@@ -256,14 +256,42 @@ impl Adapter for FastlyCliAdapter {
                 // stuck.
                 append_fastly_setup(&fastly_path, kind, name).map_err(|err| {
                     format!(
-                        "fastly {kind}-store `{name}` (logical id `{logical}`) was created remotely, but writeback to {path} failed: {err}\n  To recover, either:\n    1. Manually append `[setup.{kind}_stores.{name}]` and `[local_server.{kind}_stores.{name}]` to {path} and re-run, or\n    2. Delete the orphan remote store via `fastly {kind}-store delete --name={name}` and re-run `edgezero provision --adapter fastly`.",
+                        "fastly {kind}-store `{name}` (logical id `{logical}`) was created remotely, but writeback to {path} failed: {err}\n  To recover, either:\n    1. Manually append `[setup.{kind}_stores.{name}]` to {path} and re-run, or\n    2. Delete the orphan remote store via `fastly {kind}-store delete --name={name}` and re-run `edgezero provision --adapter fastly`.",
                         path = fastly_path.display()
                     )
                 })?;
-                out.push(format!(
+                // Fastly's `[setup.<kind>_stores.<name>]` table is
+                // consumed ONLY when `fastly compute deploy` is
+                // creating a NEW service. If `service_id` is
+                // already present in fastly.toml, the service has
+                // been deployed at least once and subsequent
+                // deploys skip `[setup]` entirely — so the store
+                // exists in the account but has no resource link
+                // tying it to a service version, and the running
+                // Compute service can't open it.
+                //
+                // Detect that case and EMIT the exact one-shot
+                // command the operator should run to link the
+                // store. We deliberately don't auto-run it: the
+                // link cones the active version (`--autoclone`),
+                // and silently mutating an already-deployed
+                // service is surprising. The instruction names
+                // both the store-id lookup AND the link command so
+                // the operator can audit before committing.
+                let post_create_note = read_fastly_service_id(&fastly_path)?.map(|svc_id| {
+                    format!(
+                        "  fastly.toml declares `service_id = \"{svc_id}\"`, so this service is already deployed — `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
+                    )
+                });
+                let mut line = format!(
                     "created fastly {kind}-store `{name}` (logical id `{logical}`); appended setup tables to {}",
                     fastly_path.display()
-                ));
+                );
+                if let Some(note) = post_create_note {
+                    line.push('\n');
+                    line.push_str(&note);
+                }
+                out.push(line);
             }
         }
         if out.is_empty() {
@@ -454,22 +482,44 @@ fn looks_like_already_exists(stderr: &str, kind: &str) -> bool {
     lower.contains(&dashed) || lower.contains(&underscored) || lower.contains(&spaced)
 }
 
-/// Probe `fastly.toml` for the existence of BOTH
-/// `[setup.<kind>_stores.<id>]` AND `[local_server.<kind>_stores.<id>]`.
-/// Both are required for a complete provision; checking only `[setup]`
-/// would let a half-edited manifest (e.g. `[setup.*]` present but
-/// `[local_server.*]` missing) slip through as "already provisioned"
-/// and never get repaired. Treats a missing file as "not present" so
-/// the first provision call can create it.
+/// Read the top-level `service_id` from `fastly.toml`. Returns
+/// `Ok(None)` when the file is absent (scaffold state before first
+/// `fastly compute deploy`) or when `service_id` is missing /
+/// empty. Used by `provision` to detect when an already-deployed
+/// service needs a separate resource-link step beyond `[setup]`
+/// (which `compute deploy` only consumes on the FIRST deploy).
+fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let svc = doc
+        .get("service_id")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned)
+        .filter(|s| !s.is_empty());
+    Ok(svc)
+}
+
+/// Probe `fastly.toml` for the existence of `[setup.<kind>_stores.<id>]`.
+/// Treats a missing file as "not present" so the first provision call
+/// can create it.
 ///
-/// Limitation: this only verifies that the two tables EXIST with
-/// the right names. It does not verify their inner shape (no
-/// `format` field probe, no resource-link validation). A manifest
-/// the operator hand-edited into a structurally-correct-but-empty
-/// state will be treated as "already provisioned" and the skip
-/// line will say so. The fastly CLI itself ends up being the
-/// authoritative checker at deploy time; `provision` only owns
-/// the "did `EdgeZero` write these blocks?" question.
+/// Why only `[setup]` (no longer `[local_server]`): an empty
+/// `[local_server.<kind>_stores.<id>]` table doesn't satisfy
+/// fastly's local-server schema — config-stores need
+/// `format = "inline-toml"` + a contents table, kv/secret stores
+/// need a JSON `file = "..."` or an array of `{key, data}` entries.
+/// Writing an empty table makes `fastly compute serve` skip the
+/// declared store or error at startup. `provision`'s job is the
+/// remote / `[setup]` half; local-server stanzas are written by
+/// `edgezero config push --adapter fastly --local`
+/// (config-stores only), and kv/secret local-server seeding is
+/// hand-edited until we add equivalent writers for those kinds.
 fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String> {
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -480,25 +530,25 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
         .parse()
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
     let plural = format!("{kind}_stores");
-    let has = |parent: &str| {
-        doc.get(parent)
-            .and_then(|root| root.get(plural.as_str()))
-            .and_then(|kind_tbl| kind_tbl.get(id))
-            .is_some()
-    };
-    // append_fastly_setup is idempotent per parent: if only one of
-    // the two blocks is present, returning false here lets it run
-    // again and add just the missing block (the present-key check
-    // inside append_fastly_setup skips the one that already exists).
-    Ok(has("setup") && has("local_server"))
+    Ok(doc
+        .get("setup")
+        .and_then(|root| root.get(plural.as_str()))
+        .and_then(|kind_tbl| kind_tbl.get(id))
+        .is_some())
 }
 
-/// Append `[setup.<kind>_stores.<id>]` and
-/// `[local_server.<kind>_stores.<id>]` to `fastly.toml`. Creates
-/// the file (and the parent `[setup]` / `[local_server]` tables)
-/// if absent. Both new blocks are written as empty tables — the
-/// resource-link declaration is enough for `fastly compute deploy`
-/// to honour, and `config push` fills in entries later.
+/// Append `[setup.<kind>_stores.<id>]` to `fastly.toml`. Creates
+/// the file (and the parent `[setup]` table) if absent. The block
+/// is written as an empty table — that's what
+/// `fastly compute deploy` consumes the first time it creates a
+/// service: the resource-link declaration is enough, and the
+/// account-level resource itself is already created in the
+/// preceding `create_fastly_store` shellout.
+///
+/// We DON'T write `[local_server.<kind>_stores.<id>]` here: see
+/// `setup_block_present`'s doc for the schema rationale. The local-
+/// server seeding moved to `config push --local` (config-stores
+/// only), so provision only owns the remote / setup half.
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
     use toml_edit::{table, DocumentMut, Item};
 
@@ -512,26 +562,24 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
 
     let plural = format!("{kind}_stores");
-    for parent in ["setup", "local_server"] {
-        let parent_entry = doc.entry(parent).or_insert_with(table);
-        let parent_tbl = parent_entry.as_table_mut().ok_or_else(|| {
-            format!(
-                "{}: `{parent}` exists but is not a table; refusing to edit in place",
-                path.display()
-            )
-        })?;
-        let kind_entry = parent_tbl
-            .entry(plural.as_str())
-            .or_insert_with(|| Item::Table(toml_edit::Table::new()));
-        let kind_tbl = kind_entry.as_table_mut().ok_or_else(|| {
-            format!(
-                "{}: `{parent}.{plural}` exists but is not a table; refusing to edit in place",
-                path.display()
-            )
-        })?;
-        if !kind_tbl.contains_key(id) {
-            kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
-        }
+    let parent_entry = doc.entry("setup").or_insert_with(table);
+    let parent_tbl = parent_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `setup` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+    let kind_entry = parent_tbl
+        .entry(plural.as_str())
+        .or_insert_with(|| Item::Table(toml_edit::Table::new()));
+    let kind_tbl = kind_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `setup.{plural}` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+    if !kind_tbl.contains_key(id) {
+        kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
     }
 
     fs::write(path, doc.to_string())
@@ -642,26 +690,40 @@ where
     Ok(pushed.len())
 }
 
-/// Shell `fastly config-store-entry create` with the value piped
-/// through stdin instead of `--value=<value>` on argv.
+/// Shell `fastly config-store-entry update --upsert --stdin` with
+/// the value piped through stdin instead of `--value=<value>` on
+/// argv.
 ///
-/// Pre-fix this used `--value=<value>`, which exposed every config
-/// entry's bytes in `ps`/`/proc/<pid>/cmdline` listings AND was
-/// bounded by the host's `ARG_MAX` (4 KiB to 256 KiB depending on
-/// platform — easy to trip with a JSON blob). Fastly CLI 15.x's
-/// `config-store-entry create` accepts `--stdin` to read the
-/// value from stdin instead; switching keeps value bytes out of
-/// argv and lifts the size cap to whatever the operating system's
-/// pipe buffer + the CLI's read accept (megabytes in practice).
+/// Two reasons for this exact invocation:
+///
+/// 1. `--upsert` (vs. the original `create` subcommand): the prior
+///    `create` form errored on any key that already existed in the
+///    config store, which made `config push` non-repeatable —
+///    after the first push, every follow-up push triggered by a
+///    config edit would fail at the first unchanged key.
+///    `update --upsert` is documented as "insert or update", which
+///    matches the convergent semantic the other config-push paths
+///    already have (axum overwrites the JSON, cloudflare's
+///    `wrangler kv bulk put` overwrites, spin's
+///    `cloud key-value set` overwrites).
+///
+/// 2. `--stdin` (vs. `--value=<value>`): `--value=` exposed every
+///    config entry's bytes in `ps`/`/proc/<pid>/cmdline` listings
+///    AND was bounded by the host's `ARG_MAX` (4 KiB to 256 KiB
+///    depending on platform — easy to trip with a JSON blob).
+///    `--stdin` reads the value from stdin instead — keeps value
+///    bytes out of argv and lifts the size cap to whatever the OS
+///    pipe buffer + the CLI's read accept (megabytes in practice).
 fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(), String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
     let mut child = Command::new("fastly")
         .args([
             "config-store-entry",
-            "create",
+            "update",
             store_arg.as_str(),
             key_arg.as_str(),
+            "--upsert",
             "--stdin",
         ])
         .stdin(Stdio::piped())
@@ -694,7 +756,7 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
         return Ok(());
     }
     Err(format!(
-        "`fastly config-store-entry create --store-id={store_id} --key={key} --stdin` exited with status {}\nstderr: {}",
+        "`fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     ))
@@ -1249,20 +1311,22 @@ mod tests {
     }
 
     #[test]
-    fn setup_block_present_false_when_only_setup_or_only_local_server_exists() {
-        // Spec requires BOTH [setup.<kind>_stores.<id>] AND
-        // [local_server.<kind>_stores.<id>] for a fully provisioned
-        // store. A half-edited manifest (e.g. operator hand-added
-        // the [setup.*] block but skipped [local_server.*]) must
-        // return false so the next provision repairs the missing
-        // block; append_fastly_setup is idempotent per parent, so
-        // it skips the present one and writes the missing one.
+    fn setup_block_present_true_when_only_setup_exists() {
+        // Post-F6 (PR #269 round 2): `setup_block_present` only
+        // checks `[setup.<kind>_stores.<id>]`. The pre-fix check
+        // ALSO required `[local_server.<kind>_stores.<id>]`, but
+        // writing an empty `[local_server.*]` table didn't match
+        // fastly's local-server schema (config-stores need
+        // `format` + contents, kv/secret stores need a JSON file
+        // or `{key, data}` entries). Local-server seeding moved
+        // to `config push --adapter fastly --local`, so probe
+        // only cares about `[setup]` now.
         let dir = tempdir().expect("tempdir");
         let only_setup = dir.path().join("only_setup.toml");
         fs::write(&only_setup, "name = \"demo\"\n[setup.kv_stores.sessions]\n").expect("write");
         assert!(
-            !setup_block_present(&only_setup, "kv", TEST_KV_ID).expect("probe"),
-            "[setup.*] alone is not enough -- [local_server.*] also required"
+            setup_block_present(&only_setup, "kv", TEST_KV_ID).expect("probe"),
+            "[setup.*] alone is now sufficient: {only_setup:?}"
         );
 
         let only_local = dir.path().join("only_local.toml");
@@ -1273,14 +1337,14 @@ mod tests {
         .expect("write");
         assert!(
             !setup_block_present(&only_local, "kv", TEST_KV_ID).expect("probe"),
-            "[local_server.*] alone is not enough -- [setup.*] also required"
+            "[local_server.*] alone is NOT a provisioned-setup signal"
         );
     }
 
     // ---------- append_fastly_setup ----------
 
     #[test]
-    fn append_fastly_setup_creates_both_tables_in_minimal_file() {
+    fn append_fastly_setup_creates_setup_table_in_minimal_file() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
@@ -1290,9 +1354,14 @@ mod tests {
             after.contains("[setup.kv_stores.sessions]"),
             "setup table added: {after}"
         );
+        // Post-F6: no `[local_server.*]` write — that empty stanza
+        // didn't satisfy fastly's local-server schema and made
+        // `fastly compute serve` error or skip the store. Local-
+        // server seeding is now `config push --adapter fastly
+        // --local`'s job.
         assert!(
-            after.contains("[local_server.kv_stores.sessions]"),
-            "local_server table added: {after}"
+            !after.contains("[local_server.kv_stores.sessions]"),
+            "[local_server.*] empty table no longer written by provision: {after}"
         );
         assert!(
             after.contains("name = \"demo\""),
@@ -1304,11 +1373,7 @@ mod tests {
     fn append_fastly_setup_appends_alongside_existing_kind_tables() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
-            "[setup.kv_stores.cache]\n[local_server.kv_stores.cache]\n",
-        )
-        .expect("write");
+        fs::write(&path, "[setup.kv_stores.cache]\n").expect("write");
         append_fastly_setup(&path, "kv", TEST_KV_ID).expect("append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
@@ -1325,11 +1390,7 @@ mod tests {
     fn append_fastly_setup_is_idempotent_on_duplicate_id() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
-            "[setup.kv_stores.sessions]\nfoo = \"keep\"\n[local_server.kv_stores.sessions]\n",
-        )
-        .expect("write");
+        fs::write(&path, "[setup.kv_stores.sessions]\nfoo = \"keep\"\n").expect("write");
         append_fastly_setup(&path, "kv", TEST_KV_ID).expect("idempotent append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
@@ -1346,7 +1407,10 @@ mod tests {
         append_fastly_setup(&path, "config", TEST_CONFIG_ID).expect("create");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(after.contains("[setup.config_stores.app_config]"));
-        assert!(after.contains("[local_server.config_stores.app_config]"));
+        assert!(
+            !after.contains("[local_server.config_stores.app_config]"),
+            "[local_server.*] no longer written by provision: {after}"
+        );
     }
 
     #[test]

@@ -827,7 +827,7 @@ fn validate_store_declaration(declaration: &StoreDeclaration) -> Result<(), Vali
     if let Some(bad) = declaration.ids.iter().find(|id| {
         let chars_bad = id
             .chars()
-            .any(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
         let double_underscore = id.contains("__");
         chars_bad || double_underscore
     }) {
