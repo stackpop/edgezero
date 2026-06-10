@@ -10,6 +10,7 @@
 //! the project hasn't seeded any local config yet.
 
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,14 @@ impl AxumConfigStore {
     }
 }
 
+#[async_trait(?Send)]
+impl ConfigStore for AxumConfigStore {
+    #[inline]
+    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        Ok(self.data.get(key).cloned())
+    }
+}
+
 /// Walk up from the process cwd looking for an ancestor that
 /// contains an `edgezero.toml` file (the manifest marker, same
 /// convention cargo uses for `Cargo.toml`). Returns the first
@@ -160,7 +169,7 @@ impl AxumConfigStore {
 /// function so the same discovery rule can be reused by other
 /// runtime helpers in the future.
 fn find_project_root_dir() -> Option<PathBuf> {
-    find_project_root_dir_from(&std::env::current_dir().ok()?)
+    find_project_root_dir_from(&env::current_dir().ok()?)
 }
 
 /// Test-visible inner walk: same behaviour as
@@ -173,14 +182,6 @@ fn find_project_root_dir_from(start: &Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-#[async_trait(?Send)]
-impl ConfigStore for AxumConfigStore {
-    #[inline]
-    async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-        Ok(self.data.get(key).cloned())
-    }
 }
 
 #[cfg(test)]

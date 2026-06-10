@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
@@ -501,7 +501,7 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
         .get("service_id")
         .and_then(|item| item.as_str())
         .map(str::to_owned)
-        .filter(|s| !s.is_empty());
+        .filter(|svc_id| !svc_id.is_empty());
     Ok(svc)
 }
 
@@ -737,18 +737,17 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
                 format!("failed to spawn `fastly`: {err}")
             }
         })?;
-    // Take stdin BEFORE wait_with_output (which consumes child).
-    // A failed write closes the pipe — the CLI will then exit non-
-    // zero and the error path below surfaces stderr.
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
-        stdin
-            .write_all(value.as_bytes())
-            .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))?;
-    }
+    // Move stdin OUT of child via `take` so the ChildStdin drops at
+    // end of scope — that closes the pipe and lets the CLI see EOF.
+    // `child.wait_with_output()` then consumes child cleanly.
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
+    stdin
+        .write_all(value.as_bytes())
+        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))?;
+    drop(stdin);
     let output = child
         .wait_with_output()
         .map_err(|err| format!("failed to wait on `fastly`: {err}"))?;

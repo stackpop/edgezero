@@ -121,7 +121,7 @@ impl<'app> CloudflareService<'app> {
             // (set by `.with_secrets()` without
             // `.require_secrets()`) no longer suppresses the
             // handle. See `resolve_secret_handle`.
-            SecretSource::On { required } => resolve_secret_handle(&env, required),
+            SecretSource::On { required } => Some(resolve_secret_handle(&env, required)),
         };
         dispatch_with_handles(
             self.app,
@@ -354,9 +354,9 @@ pub(crate) fn resolve_kv_handle(
 /// silently swallowed `.with_secrets()` (which sets `required:
 /// false`): handlers ran without a `SecretRegistry` even though the
 /// builder claimed to inject one.
-pub(crate) fn resolve_secret_handle(env: &Env, _required: bool) -> Option<SecretHandle> {
+pub(crate) fn resolve_secret_handle(env: &Env, _required: bool) -> SecretHandle {
     let secret_store = CloudflareSecretStore::from_env(env.clone());
-    Some(SecretHandle::new(Arc::new(secret_store)))
+    SecretHandle::new(Arc::new(secret_store))
 }
 
 fn build_config_registry(

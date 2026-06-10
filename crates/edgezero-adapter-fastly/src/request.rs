@@ -140,7 +140,7 @@ impl<'app> FastlyService<'app> {
         };
         let secrets = match self.secrets {
             SecretSource::Off => None,
-            SecretSource::On { required } => resolve_secret_handle(required),
+            SecretSource::On { required } => Some(resolve_secret_handle(required)),
         };
         dispatch_with_handles(
             self.app,
@@ -482,20 +482,25 @@ fn resolve_kv_handle(
 }
 
 /// Construct the Fastly secret-store handle. Called from the
-/// `SecretSource::On { .. }` arm of `dispatch`, so it always builds
-/// the handle. The `_required` parameter is preserved (and ignored)
-/// for symmetry with the kv path's
-/// `resolve_kv_handle(_, _required)`, where `required` decides
-/// whether a runtime open failure is fatal or silently degrades.
-/// `FastlySecretStore` is a unit struct whose construction can't
-/// fail, so there's nothing for `required` to gate here.
+/// `SecretSource::On { .. }` arm of `dispatch`. The `_required`
+/// parameter is preserved (and ignored) for symmetry with the kv
+/// path's `resolve_kv_handle(_, _required)`, where `required`
+/// decides whether a runtime open failure is fatal or silently
+/// degrades. `FastlySecretStore` is a unit struct whose
+/// construction can't fail, so there's nothing for `required` to
+/// gate here — and `clippy::unnecessary_wraps` would flag an
+/// `Option<SecretHandle>` return on a function that never returns
+/// None. The caller wraps the result in `Some(...)` so the
+/// `SecretSource::Off => None` branch still produces the right
+/// `Option`.
 ///
-/// Pre-fix, this short-circuited to `None` when `!_required`, which
+/// Pre-fix, the return type was `Option<SecretHandle>` and the
+/// body short-circuited to `None` when `!_required`, which
 /// silently swallowed `.with_secrets()` (which sets `required:
 /// false`): handlers ran without a `SecretRegistry` even though the
 /// builder claimed to inject one.
-fn resolve_secret_handle(_required: bool) -> Option<SecretHandle> {
-    Some(SecretHandle::new(Arc::new(FastlySecretStore)))
+fn resolve_secret_handle(_required: bool) -> SecretHandle {
+    SecretHandle::new(Arc::new(FastlySecretStore))
 }
 
 fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl Display) {
@@ -647,19 +652,15 @@ mod synthesis_tests {
 
     #[test]
     fn resolve_secret_handle_builds_handle_when_required_false_matches_with_secrets_default() {
-        let handle = resolve_secret_handle(false);
-        assert!(
-            handle.is_some(),
-            "`.with_secrets()` sets required=false; resolve must still build a SecretRegistry"
-        );
+        // The return type is unconditionally `SecretHandle` (post-
+        // clippy::unnecessary_wraps cleanup); just exercise the
+        // call to lock in that `.with_secrets()`-shaped paths
+        // (required=false) still build a handle without panicking.
+        let _handle = resolve_secret_handle(false);
     }
 
     #[test]
     fn resolve_secret_handle_builds_handle_when_required_true_matches_require_secrets() {
-        let handle = resolve_secret_handle(true);
-        assert!(
-            handle.is_some(),
-            "`.require_secrets()` sets required=true; resolve must build a SecretRegistry"
-        );
+        let _handle = resolve_secret_handle(true);
     }
 }
