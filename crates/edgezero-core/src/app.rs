@@ -196,35 +196,21 @@ mod tests {
 
     struct TestHooks;
 
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test stub — only `routes` is overridden; every other Hooks method intentionally uses its trait default"
+    )]
     impl Hooks for DefaultHooks {
-        fn build_app() -> App {
-            let mut app = App::with_name(Self::routes(), Self::name());
-            Self::configure(&mut app);
-            app
-        }
-
-        fn config_store() -> Option<&'static ConfigStoreMetadata> {
-            None
-        }
-
-        fn configure(_app: &mut App) {}
-
-        fn name() -> &'static str {
-            App::default_name()
-        }
-
         fn routes() -> RouterService {
             RouterService::builder().build()
         }
     }
 
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "test stub — `build_app` intentionally uses the trait default; other methods are overridden for test coverage"
+    )]
     impl Hooks for TestHooks {
-        fn build_app() -> App {
-            let mut app = App::with_name(Self::routes(), Self::name());
-            Self::configure(&mut app);
-            app
-        }
-
         fn config_store() -> Option<&'static ConfigStoreMetadata> {
             static CONFIG_STORE: ConfigStoreMetadata = ConfigStoreMetadata::new(
                 "default-config",

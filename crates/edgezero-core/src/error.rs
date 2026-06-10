@@ -37,6 +37,25 @@ impl EdgeError {
         }
     }
 
+    /// Typed access to the wrapped [`AnyError`] for `EdgeError::Internal`.
+    ///
+    /// Renamed away from `source` to avoid shadowing
+    /// [`std::error::Error::source`] (auto-derived by `thiserror`). The
+    /// trait method returns a `&dyn Error`; this one returns the concrete
+    /// `&anyhow::Error` so callers can downcast.
+    #[must_use]
+    #[inline]
+    pub fn inner(&self) -> Option<&AnyError> {
+        match self {
+            EdgeError::Internal { source } => Some(source),
+            EdgeError::BadRequest { .. }
+            | EdgeError::NotFound { .. }
+            | EdgeError::MethodNotAllowed { .. }
+            | EdgeError::Validation { .. }
+            | EdgeError::ServiceUnavailable { .. } => None,
+        }
+    }
+
     #[inline]
     pub fn internal<E>(error: E) -> Self
     where
@@ -90,27 +109,6 @@ impl EdgeError {
     pub fn service_unavailable<S: Into<String>>(message: S) -> Self {
         EdgeError::ServiceUnavailable {
             message: message.into(),
-        }
-    }
-
-    /// Typed access to the wrapped [`AnyError`] for `EdgeError::Internal`.
-    /// Shadows [`std::error::Error::source`] (auto-derived by `thiserror`)
-    /// intentionally — the trait method returns a `&dyn Error`, this one
-    /// returns the concrete `&anyhow::Error` so callers can downcast.
-    #[expect(
-        clippy::same_name_method,
-        reason = "intentional: typed alternative to the trait-object Error::source"
-    )]
-    #[must_use]
-    #[inline]
-    pub fn source(&self) -> Option<&AnyError> {
-        match self {
-            EdgeError::Internal { source } => Some(source),
-            EdgeError::BadRequest { .. }
-            | EdgeError::NotFound { .. }
-            | EdgeError::MethodNotAllowed { .. }
-            | EdgeError::Validation { .. }
-            | EdgeError::ServiceUnavailable { .. } => None,
         }
     }
 
@@ -209,7 +207,7 @@ mod tests {
         let err = EdgeError::internal(anyhow::anyhow!("boom"));
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message().contains("internal error: boom"));
-        assert!(err.source().is_some());
+        assert!(err.inner().is_some());
     }
 
     #[test]
@@ -278,6 +276,6 @@ mod tests {
         let err = EdgeError::validation("invalid input");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(err.message(), "invalid input");
-        assert!(err.source().is_none());
+        assert!(err.inner().is_none());
     }
 }

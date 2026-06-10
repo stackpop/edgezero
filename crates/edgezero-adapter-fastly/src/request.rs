@@ -186,7 +186,10 @@ fn dispatch_with_handles(
 /// rather than silently degrading.
 ///
 /// # Errors
-/// Returns an error if the named KV store cannot be opened or the underlying handler returns an error.
+/// Returns an error if request conversion, handler dispatch, or response
+/// conversion fails. Also returns an error when `kv_required` is `true` and
+/// the named KV store cannot be opened; if `kv_required` is `false`, missing
+/// stores are logged and dispatched without the KV handle injected.
 #[inline]
 pub fn dispatch_with_kv(
     app: &App,

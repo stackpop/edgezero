@@ -688,8 +688,15 @@ impl From<KvError> for EdgeError {
 
 /// A single page of keys from a KV listing operation.
 ///
+/// **Termination**: callers must use `cursor.is_none()` to determine
+/// completion, **not** `keys.is_empty()`. A page with `keys: vec![]` and
+/// `cursor: Some(_)` is a valid intermediate result — it occurs when a
+/// scan-cap path skips a long run of expired entries; calling
+/// `list_keys_page` again with the returned cursor resumes the listing.
+///
 /// The `cursor` is opaque. Pass it back to `list_keys_page` to continue
-/// listing from the next page. `None` means the current page is the last page.
+/// listing from the next page. `None` means the current page is the last
+/// page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct KvPage {
     pub cursor: Option<String>,
