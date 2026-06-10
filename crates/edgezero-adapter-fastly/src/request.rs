@@ -289,8 +289,9 @@ fn dispatch_with_handles(
 ///
 /// Fastly is `Multi` for all three kinds, so each declared id resolves to
 /// its own platform store via `EDGEZERO__STORES__<KIND>__<ID>__NAME` (or the
-/// id default). KV failures escalate when `kv_required` is set; missing
-/// config / secret stores degrade silently with a one-time warning.
+/// id default). KV failures escalate via [`resolve_kv_handle`]'s
+/// `kv_required=true` path; missing config / secret stores degrade silently
+/// with a one-time warning.
 pub(crate) fn dispatch_with_registries(
     app: &App,
     req: FastlyRequest,
