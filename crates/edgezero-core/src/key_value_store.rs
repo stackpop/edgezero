@@ -433,7 +433,14 @@ impl KvHandle {
         match result.as_ref() {
             Ok(Some(bytes)) => format!("hit=true bytes={}", bytes.len()),
             Ok(None) => "hit=false bytes=0".to_string(),
-            Err(_) => "hit=unknown bytes=unknown".to_string(),
+            Err(_) => String::new(),
+        }
+    }
+
+    fn kv_read_metadata(key_len: usize, result: &Result<Option<Bytes>, KvError>) -> String {
+        match result {
+            Ok(_) => format!("key_len={key_len} {}", Self::kv_hit_metadata(result)),
+            Err(_) => format!("key_len={key_len}"),
         }
     }
 
@@ -447,6 +454,31 @@ impl KvHandle {
         }
     }
 
+    fn kv_exists_metadata(key_len: usize, result: &Result<bool, KvError>) -> String {
+        match result.as_ref() {
+            Ok(exists) => format!("key_len={key_len} exists={exists}"),
+            Err(_) => format!("key_len={key_len}"),
+        }
+    }
+
+    fn kv_list_metadata(
+        prefix_len: usize,
+        cursor_present: bool,
+        limit: usize,
+        result: &Result<KvPage, KvError>,
+    ) -> String {
+        match result.as_ref() {
+            Ok(page) => format!(
+                "prefix_len={prefix_len} cursor_present={cursor_present} limit={limit} count={} next_cursor_present={}",
+                page.keys.len(),
+                page.cursor.is_some()
+            ),
+            Err(_) => {
+                format!("prefix_len={prefix_len} cursor_present={cursor_present} limit={limit}")
+            }
+        }
+    }
+
     // -- Typed helpers (JSON) -----------------------------------------------
 
     /// Get a value by key, deserializing from JSON.
@@ -457,7 +489,7 @@ impl KvHandle {
         let started_at = Self::kv_timing_start();
         let result = self.store.get_bytes(key).await;
         Self::log_kv_timing(started_at, "get", &result, || {
-            format!("key_len={} {}", key.len(), Self::kv_hit_metadata(&result))
+            Self::kv_read_metadata(key.len(), &result)
         });
 
         match result? {
@@ -543,7 +575,7 @@ impl KvHandle {
         let started_at = Self::kv_timing_start();
         let result = self.store.get_bytes(key).await;
         Self::log_kv_timing(started_at, "get_bytes", &result, || {
-            format!("key_len={} {}", key.len(), Self::kv_hit_metadata(&result))
+            Self::kv_read_metadata(key.len(), &result)
         });
         result
     }
@@ -588,11 +620,7 @@ impl KvHandle {
         let started_at = Self::kv_timing_start();
         let result = self.store.exists(key).await;
         Self::log_kv_timing(started_at, "exists", &result, || {
-            let exists = result
-                .as_ref()
-                .map(|exists| exists.to_string())
-                .unwrap_or_else(|_| "unknown".to_string());
-            format!("key_len={} exists={exists}", key.len())
+            Self::kv_exists_metadata(key.len(), &result)
         });
         result
     }
@@ -629,20 +657,7 @@ impl KvHandle {
             .list_keys_page(prefix, decoded_cursor.as_deref(), limit)
             .await;
         Self::log_kv_timing(started_at, "list_keys_page", &result, || {
-            let (count, next_cursor) = result
-                .as_ref()
-                .map(|page| {
-                    (
-                        page.keys.len().to_string(),
-                        page.cursor.is_some().to_string(),
-                    )
-                })
-                .unwrap_or_else(|_| ("unknown".to_string(), "unknown".to_string()));
-            format!(
-                "prefix_len={} cursor_present={} limit={limit} count={count} next_cursor_present={next_cursor}",
-                prefix.len(),
-                cursor.is_some()
-            )
+            Self::kv_list_metadata(prefix.len(), cursor.is_some(), limit, &result)
         });
         let page = result?;
 
@@ -973,6 +988,61 @@ mod tests {
 
     fn handle() -> KvHandle {
         KvHandle::new(Arc::new(MockStore::new()))
+    }
+
+    #[test]
+    fn read_metadata_logs_lengths_not_raw_key_or_value() {
+        let key = "super-secret-token";
+        let value = Bytes::from_static(b"super-secret-value");
+        let result = Ok(Some(value));
+
+        let metadata = KvHandle::kv_read_metadata(key.len(), &result);
+
+        assert_eq!(metadata, "key_len=18 hit=true bytes=18");
+        assert!(!metadata.contains(key));
+        assert!(!metadata.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn error_metadata_omits_unknown_result_fields() {
+        let read_result = Err(KvError::Unavailable);
+        assert_eq!(KvHandle::kv_read_metadata(18, &read_result), "key_len=18");
+
+        let exists_result = Err(KvError::Unavailable);
+        assert_eq!(
+            KvHandle::kv_exists_metadata(18, &exists_result),
+            "key_len=18"
+        );
+
+        let list_result = Err(KvError::Unavailable);
+        assert_eq!(
+            KvHandle::kv_list_metadata(4, true, 100, &list_result),
+            "prefix_len=4 cursor_present=true limit=100"
+        );
+    }
+
+    #[test]
+    fn success_metadata_keeps_stable_field_types() {
+        let read_result = Ok(Some(Bytes::from_static(b"abc")));
+        assert_eq!(
+            KvHandle::kv_read_metadata(1, &read_result),
+            "key_len=1 hit=true bytes=3"
+        );
+
+        let exists_result = Ok(false);
+        assert_eq!(
+            KvHandle::kv_exists_metadata(1, &exists_result),
+            "key_len=1 exists=false"
+        );
+
+        let list_result = Ok(KvPage {
+            keys: vec!["a".to_string(), "b".to_string()],
+            cursor: Some("cursor".to_string()),
+        });
+        assert_eq!(
+            KvHandle::kv_list_metadata(4, false, 100, &list_result),
+            "prefix_len=4 cursor_present=false limit=100 count=2 next_cursor_present=true"
+        );
     }
 
     // -- Raw bytes ----------------------------------------------------------
