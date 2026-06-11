@@ -34,7 +34,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // Declared in `edgezero.toml`? (Catches typos before we try to
     // look the adapter up in the registry.)
     ensure_adapter_defined(&args.adapter, Some(&manifest_loader))?;
-    let adapter_cfg = manifest.adapters.get(&args.adapter).ok_or_else(|| {
+    let (_canonical, adapter_cfg) = manifest.adapter_entry(&args.adapter).ok_or_else(|| {
         format!(
             "adapter `{}` is not declared in {}",
             args.adapter,

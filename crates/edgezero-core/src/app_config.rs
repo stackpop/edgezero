@@ -359,6 +359,29 @@ fn walk_and_overlay(
         return Ok(());
     };
 
+    // Reject keys containing `__` — that's the env-overlay segment
+    // separator, so `foo__bar` (scalar at this level) would alias
+    // `[foo] bar` (nested table reaching the same leaf). Both build
+    // env path `<PREFIX>__FOO__BAR` and a single env var would
+    // ambiguously override both leaves. Catch the source-level
+    // collision instead of trying to disambiguate at overlay time.
+    // Mirrors the manifest-side `store_id_format` rule that rejects
+    // `__` in `[stores.<kind>].ids` for the same reason.
+    for key in table.keys() {
+        if key.contains("__") {
+            return Err(AppConfigError::EnvOverlay {
+                path: path.to_path_buf(),
+                message: format!(
+                    "config key `{key}` contains `__` (double underscore), which is reserved \
+                     as the env-overlay segment separator under prefix `{env_prefix}__…`. A key like \
+                     `foo__bar` would alias the nested `[foo] bar` leaf — a single env var would \
+                     override both. Rename it to a single-underscore form (`foo_bar`) or split it \
+                     into nested tables."
+                ),
+            });
+        }
+    }
+
     // Detect ambiguous sibling-key mappings before applying any
     // overlay so a failure leaves the table untouched.
     let mut segment_owners: HashMap<String, String> = HashMap::new();
@@ -666,6 +689,56 @@ GREETING_A = "upper"
                 assert!(
                     message.contains("rename one to disambiguate"),
                     "explains the remediation: {message}"
+                );
+            }
+            other => panic!("expected EnvOverlay variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_overlay_rejects_scalar_key_containing_double_underscore() {
+        // PR #269 round 4 / F3: `foo__bar` (scalar) and
+        // `[foo] bar` (nested) both build env path
+        // `<PREFIX>__FOO__BAR`. A single env var would
+        // ambiguously override both, so reject at the source.
+        let mut table = parse_root_table(
+            r#"
+foo__bar = "ambiguous"
+"#,
+        );
+        let err = overlay_with_lookup(&mut table, "app-demo", &[])
+            .expect_err("`__` in a config key must error");
+        match err {
+            AppConfigError::EnvOverlay { message, .. } => {
+                assert!(
+                    message.contains("`foo__bar`")
+                        && message.contains("reserved")
+                        && message.contains("env-overlay segment separator"),
+                    "must explain the `__` collision: {message}"
+                );
+            }
+            other => panic!("expected EnvOverlay variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn env_overlay_rejects_double_underscore_in_nested_table_key_too() {
+        // The rule applies at every level, not just the root. A
+        // nested `[outer] inner__key` would alias
+        // `[outer.inner] key` under the same env path.
+        let mut table = parse_root_table(
+            r#"
+[outer]
+inner__key = "x"
+"#,
+        );
+        let err = overlay_with_lookup(&mut table, "app-demo", &[])
+            .expect_err("nested `__` keys must also error");
+        match err {
+            AppConfigError::EnvOverlay { message, .. } => {
+                assert!(
+                    message.contains("`inner__key`"),
+                    "must name the offending nested key: {message}"
                 );
             }
             other => panic!("expected EnvOverlay variant, got {other:?}"),

@@ -84,6 +84,7 @@ impl ManifestLoader {
 }
 
 #[derive(Debug, Deserialize, Validate)]
+#[validate(schema(function = "validate_manifest_adapter_keys_case_unique"))]
 #[expect(
     clippy::partial_pub_fields,
     reason = "deserialized fields are pub for the public API; internal state is private"
@@ -114,6 +115,27 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Look up a `[adapters.<name>]` entry by adapter name, matching
+    /// case-insensitively against the manifest's declared keys.
+    ///
+    /// Returns `(canonical_key, config)` where `canonical_key` is the
+    /// EXACT spelling the operator wrote in `edgezero.toml` — callers
+    /// use it for error messages and downstream lookups so the
+    /// surface presented to the user matches the manifest text.
+    ///
+    /// Case-folded duplicates (e.g. both `[adapters.fastly]` and
+    /// `[adapters.Fastly]` declared) are rejected at manifest load
+    /// time by `validate_manifest_adapter_keys_case_unique`, so this
+    /// helper sees at most one match.
+    #[must_use]
+    #[inline]
+    pub fn adapter_entry(&self, name: &str) -> Option<(&String, &ManifestAdapter)> {
+        let needle = name.to_ascii_lowercase();
+        self.adapters
+            .iter()
+            .find(|(key, _cfg)| key.to_ascii_lowercase() == needle)
+    }
+
     #[must_use]
     #[inline]
     pub fn environment(&self) -> &ManifestEnvironment {
@@ -426,7 +448,17 @@ pub struct ManifestAdapterCommands {
 // ---------------------------------------------------------------------------
 
 /// Top-level `[stores]` section.
+///
+/// `deny_unknown_fields` catches typos like `[stores.secret]` (vs.
+/// the correct `[stores.secrets]`) at manifest load time. Without
+/// it, a typo passes parsing silently — the runtime sees no
+/// declaration for that kind and the app starts without a wired
+/// store. The known declarations (`StoreDeclaration` itself,
+/// adapter sections, etc.) already reject legacy fields below this
+/// level, so adding the rejection HERE seals the only remaining
+/// silent-typo path.
 #[derive(Debug, Default, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ManifestStores {
     #[serde(default)]
@@ -761,6 +793,34 @@ fn validate_manifest_adapter(adapter: &ManifestAdapter) -> Result<(), Validation
             .into(),
         );
         return Err(error);
+    }
+    Ok(())
+}
+
+/// Reject case-fold duplicate `[adapters.*]` keys at manifest load
+/// time so the case-insensitive `adapter_entry` lookup is never
+/// ambiguous.
+///
+/// Pre-fix, an operator could declare BOTH `[adapters.fastly]` AND
+/// `[adapters.Fastly]` in the same manifest. TOML treats them as
+/// distinct keys, and the downstream code's mix of exact-case
+/// `get()` and case-insensitive lookups would resolve them
+/// inconsistently. Catch the collision once, at load time, instead
+/// of leaving every consumer to decide which spelling wins.
+fn validate_manifest_adapter_keys_case_unique(manifest: &Manifest) -> Result<(), ValidationError> {
+    let mut seen_ci: BTreeMap<String, &String> = BTreeMap::new();
+    for key in manifest.adapters.keys() {
+        let folded = key.to_ascii_lowercase();
+        if let Some(prior) = seen_ci.insert(folded.clone(), key) {
+            let mut error = ValidationError::new("adapters_case_duplicate");
+            error.message = Some(
+                format!(
+                    "manifest declares `[adapters.{prior}]` AND `[adapters.{key}]`, which differ only in case; adapter names are looked up case-insensitively at runtime so the two would alias to the same registry entry. Pick one spelling."
+                )
+                .into(),
+            );
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -1594,6 +1654,69 @@ ids = ["default"]
         assert!(
             err.to_string().contains("duplicate id"),
             "error should mention duplicate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_case_fold_duplicate_adapter_keys() {
+        // PR #269 round 4: case-fold dup detection. `[adapters.xenon]`
+        // and `[adapters.Xenon]` are distinct TOML keys but resolve
+        // to the same `adapter_entry` lookup at runtime — reject at
+        // load time so the case-insensitive lookup is never
+        // ambiguous.
+        //
+        // Uses a synthetic adapter name (`xenon`) so the test
+        // exercises the manifest validator without coupling to any
+        // real adapter crate's identity.
+        let manifest: Manifest =
+            toml::from_str("[adapters.xenon]\n[adapters.Xenon]\n").expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("case-fold dup adapter keys must fail validation");
+        assert!(
+            err.to_string().contains("case"),
+            "error must call out the case collision: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_adapter_entry_matches_case_insensitively_returning_canonical_key() {
+        // Lookup helper used everywhere in the CLI: takes a name
+        // and returns the manifest's spelling so error messages
+        // surface the operator's exact text. Confirm the lookup
+        // works for both upper-case AND mixed-case needles
+        // against a lower-case stored key.
+        //
+        // Synthetic adapter name (`xenon`) keeps this manifest-
+        // level test independent of any specific adapter crate.
+        let manifest: Manifest = toml::from_str("[adapters.xenon]\n").expect("should parse");
+        let (upper_match, _ignored_upper) = manifest
+            .adapter_entry("XENON")
+            .expect("uppercase needle must match");
+        assert_eq!(upper_match, "xenon", "returns the manifest's spelling");
+        let (mixed_match, _ignored_mixed) = manifest
+            .adapter_entry("Xenon")
+            .expect("mixed-case needle must match");
+        assert_eq!(mixed_match, "xenon");
+        assert!(
+            manifest.adapter_entry("krypton").is_none(),
+            "absent name returns None"
+        );
+    }
+
+    #[test]
+    fn manifest_stores_rejects_unknown_kind_at_parse_time() {
+        // PR #269 round 4 / F2: `deny_unknown_fields` on
+        // ManifestStores catches typos like `[stores.secret]` (vs
+        // the correct `[stores.secrets]`). Pre-fix, a typo passed
+        // parsing silently and the runtime saw no secrets
+        // declaration.
+        let err = toml::from_str::<Manifest>("[stores.secret]\nids = [\"default\"]\n")
+            .expect_err("unknown `secret` kind must fail at parse time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("secret") && msg.contains("unknown field"),
+            "error must call out the typo: {msg}"
         );
     }
 

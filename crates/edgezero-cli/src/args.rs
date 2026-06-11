@@ -130,7 +130,7 @@ pub struct NewArgs {
 }
 
 /// Arguments for the `provision` command.
-#[derive(clap::Args, Debug, Default)]
+#[derive(clap::Args, Debug)]
 #[non_exhaustive]
 pub struct ProvisionArgs {
     /// Target adapter name.
@@ -145,6 +145,25 @@ pub struct ProvisionArgs {
     pub manifest: PathBuf,
 }
 
+impl Default for ProvisionArgs {
+    /// Match clap's `#[arg(default_value = "edgezero.toml")]` so
+    /// library callers using `ProvisionArgs { adapter: ..,
+    /// ..Default::default() }` get the same `manifest` clap's CLI
+    /// parser would write. Without this manual impl, the derived
+    /// `Default` would set `manifest` to `PathBuf::new()` (empty
+    /// string), and downstream `ManifestLoader::from_path("")` would
+    /// fail with a confusing "is a directory" / "no such file"
+    /// error.
+    #[inline]
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            dry_run: false,
+            manifest: default_manifest_path(),
+        }
+    }
+}
+
 /// Arguments for the `serve` command.
 #[derive(clap::Args, Debug, Default)]
 #[non_exhaustive]
@@ -155,7 +174,7 @@ pub struct ServeArgs {
 }
 
 /// Arguments for the `config push` command.
-#[derive(clap::Args, Debug, Default)]
+#[derive(clap::Args, Debug)]
 #[non_exhaustive]
 pub struct ConfigPushArgs {
     /// Target adapter name.
@@ -204,8 +223,25 @@ pub struct ConfigPushArgs {
     pub store: Option<String>,
 }
 
+impl Default for ConfigPushArgs {
+    /// See `ProvisionArgs::default` — same rationale.
+    #[inline]
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            app_config: None,
+            dry_run: false,
+            local: false,
+            manifest: default_manifest_path(),
+            no_env: false,
+            runtime_config: None,
+            store: None,
+        }
+    }
+}
+
 /// Arguments for the `config validate` command.
-#[derive(clap::Args, Debug, Default)]
+#[derive(clap::Args, Debug)]
 #[non_exhaustive]
 pub struct ConfigValidateArgs {
     /// Path to the typed app-config file (default: `<app_name>.toml`
@@ -226,6 +262,28 @@ pub struct ConfigValidateArgs {
     pub strict: bool,
 }
 
+impl Default for ConfigValidateArgs {
+    /// See `ProvisionArgs::default` — same rationale.
+    #[inline]
+    fn default() -> Self {
+        Self {
+            app_config: None,
+            manifest: default_manifest_path(),
+            no_env: false,
+            strict: false,
+        }
+    }
+}
+
+/// Default `manifest` value shared by all args structs that have
+/// the `#[arg(default_value = "edgezero.toml")]` clap attribute.
+/// Centralised here so the value stays in sync across the clap
+/// attribute (which can only be a literal) and the manual `Default`
+/// impls above.
+fn default_manifest_path() -> PathBuf {
+    PathBuf::from("edgezero.toml")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +300,51 @@ mod tests {
         let args = NewArgs::default();
         assert!(args.name.is_empty());
         assert!(args.dir.is_none());
+    }
+
+    #[test]
+    fn provision_args_default_manifest_matches_clap_default() {
+        // PR #269 round 4 / F4: library callers using
+        // `ProvisionArgs { adapter: "...", ..Default::default() }`
+        // must end up with `manifest = "edgezero.toml"`, matching
+        // what clap writes when no `--manifest` is passed on the
+        // CLI. Pre-fix the derived `Default` produced
+        // `PathBuf::new()` (empty) and `ManifestLoader::from_path("")`
+        // erred with a confusing "no such file" message.
+        let args = ProvisionArgs::default();
+        assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
+        assert!(args.adapter.is_empty());
+        assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn config_push_args_default_manifest_matches_clap_default() {
+        let args = ConfigPushArgs::default();
+        assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
+        assert!(args.adapter.is_empty());
+        assert!(args.app_config.is_none());
+        assert!(!args.dry_run);
+        assert!(!args.local);
+        assert!(!args.no_env);
+        assert!(args.runtime_config.is_none());
+        assert!(args.store.is_none());
+    }
+
+    #[test]
+    fn config_validate_args_default_manifest_matches_clap_default() {
+        let args = ConfigValidateArgs::default();
+        assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
+        assert!(args.app_config.is_none());
+        assert!(!args.no_env);
+        assert!(!args.strict);
+    }
+
+    #[test]
+    fn default_manifest_path_matches_clap_literal() {
+        // Lock the shared helper to the same string the clap
+        // attributes use, so a future bump only needs one site
+        // updated (and this test catches drift if not).
+        assert_eq!(default_manifest_path(), PathBuf::from("edgezero.toml"));
     }
 
     #[test]
@@ -322,8 +425,13 @@ mod tests {
 
     #[test]
     fn config_validate_args_defaults() {
+        // Post-F4 (PR #269 round 4): library callers using
+        // `..Default::default()` now get the same `manifest`
+        // value clap writes when no `--manifest` is passed
+        // (`edgezero.toml`), instead of the empty-PathBuf the
+        // derived `Default` produced pre-fix.
         let args = ConfigValidateArgs::default();
-        assert_eq!(args.manifest, PathBuf::new());
+        assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
         assert!(args.app_config.is_none());
         assert!(!args.strict);
         assert!(!args.no_env);

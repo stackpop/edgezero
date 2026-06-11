@@ -195,7 +195,7 @@ fn ensure_adapter_defined(
     manifest_loader: Option<&ManifestLoader>,
 ) -> Result<(), String> {
     if let Some(loader) = manifest_loader {
-        if loader.manifest().adapters.contains_key(adapter_name) {
+        if loader.manifest().adapter_entry(adapter_name).is_some() {
             return Ok(());
         }
         let available: Vec<String> = loader.manifest().adapters.keys().cloned().collect();

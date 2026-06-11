@@ -68,7 +68,14 @@ case "$ADAPTER" in
     echo "==> Building Spin WASM (wasm32-wasip2)..."
     (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
     echo "==> Starting Spin on port $PORT..."
-    (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && spin up --listen "127.0.0.1:$PORT" 2>&1) &
+    # `--runtime-config-file runtime-config.toml`: the demo's
+    # spin.toml declares non-`default` KV labels (`sessions`,
+    # `cache`) and Spin's runtime only auto-provides the `default`
+    # label. Without the flag, `spin up` aborts with `unknown
+    # key_value_stores label <name>` before the server is ready.
+    (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
+      spin up --listen "127.0.0.1:$PORT" \
+        --runtime-config-file runtime-config.toml 2>&1) &
     SERVER_PID=$!
     ;;
   *)

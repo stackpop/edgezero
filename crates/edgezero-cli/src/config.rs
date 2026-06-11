@@ -278,12 +278,13 @@ fn dispatch_push(
     local: bool,
 ) -> Result<(), String> {
     let manifest = ctx.validation.manifest();
-    let adapter_cfg = manifest.adapters.get(ctx.adapter.name()).ok_or_else(|| {
-        format!(
-            "adapter `{}` vanished from the manifest after lookup",
-            ctx.adapter.name()
-        )
-    })?;
+    let (_canonical, adapter_cfg) =
+        manifest.adapter_entry(ctx.adapter.name()).ok_or_else(|| {
+            format!(
+                "adapter `{}` vanished from the manifest after lookup",
+                ctx.adapter.name()
+            )
+        })?;
     let manifest_root = ctx
         .validation
         .manifest_path
