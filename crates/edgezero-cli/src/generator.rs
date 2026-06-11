@@ -622,7 +622,82 @@ fn build_base_data(
         Value::String(workspace_dep_lines),
     );
 
+    data.insert(
+        "tool_versions_contents".into(),
+        Value::String(build_tool_versions(&artifacts.adapter_ids)),
+    );
+
     data
+}
+
+/// Render the `.tool-versions` body for a scaffolded project,
+/// adapter-aware.
+///
+/// `asdf install` reads this file to pin per-tool versions. Every
+/// generated project gets `rust` pinned (it's a Rust workspace).
+/// Per-adapter pins are added ONLY when the operator selected
+/// that adapter at `edgezero new` time:
+///
+/// - `cloudflare` → `nodejs` (wrangler is a Node binary).
+/// - `fastly` → `fastly` (the Fastly CLI we shell out to for
+///   provision + config push) plus `viceroy` (what
+///   `fastly compute serve` uses for local emulation).
+/// - `spin` → no asdf pin; the Spin CLI is install-flow-managed
+///   (<https://spinframework.dev/install>). A header comment points
+///   the operator at the URL when `spin` is in the adapter set so
+///   they don't wonder why everything else is pinned but spin.
+/// - `axum` → no extra pin (uses the host Rust toolchain only).
+///
+/// Versions are pulled from this repo's own `.tool-versions` (see
+/// the repo root). When we bump those, we bump these.
+fn build_tool_versions(adapter_ids: &[String]) -> String {
+    let has = |id: &str| adapter_ids.iter().any(|adapter| adapter == id);
+    let mut lines: Vec<String> = Vec::new();
+    if has("cloudflare") {
+        lines.push("nodejs 24.12.0".to_owned());
+    }
+    if has("fastly") {
+        lines.push("fastly 15.1.0".to_owned());
+        lines.push("viceroy 0.17.0".to_owned());
+    }
+    lines.push("rust 1.95.0".to_owned());
+    // Sort + dedup so the file is stable regardless of adapter
+    // declaration order (and asdf doesn't care).
+    lines.sort();
+    lines.dedup();
+    let mut body = lines.join("\n");
+    if has("spin") {
+        body.push_str(
+            "\n\n# Spin is not asdf-managed in this scaffold; install via\n# https://spinframework.dev/install\n",
+        );
+    } else {
+        body.push('\n');
+    }
+    body
+}
+
+/// Render the six workspace-root files (Cargo.toml, edgezero.toml,
+/// README.md, .gitignore, clippy.toml, .tool-versions).
+///
+/// Split out of `render_templates` so the parent stays under the
+/// project's `too_many_lines` clippy cap; the order of writes is
+/// not load-bearing — each template is independent.
+fn write_root_files(
+    hbs: &Handlebars,
+    layout: &ProjectLayout,
+    data_value: &Value,
+) -> Result<(), GeneratorError> {
+    for (template, rel) in [
+        ("root_Cargo_toml", "Cargo.toml"),
+        ("root_edgezero_toml", "edgezero.toml"),
+        ("root_README_md", "README.md"),
+        ("root_gitignore", ".gitignore"),
+        ("root_clippy_toml", "clippy.toml"),
+        ("root_tool_versions", ".tool-versions"),
+    ] {
+        write_tmpl(hbs, template, data_value, &layout.out_dir.join(rel))?;
+    }
+    Ok(())
 }
 
 fn render_templates(
@@ -634,36 +709,7 @@ fn render_templates(
     register_templates(&mut hbs);
 
     log::info!("[edgezero] writing workspace files");
-    write_tmpl(
-        &hbs,
-        "root_Cargo_toml",
-        data_value,
-        &layout.out_dir.join("Cargo.toml"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_edgezero_toml",
-        data_value,
-        &layout.out_dir.join("edgezero.toml"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_README_md",
-        data_value,
-        &layout.out_dir.join("README.md"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_gitignore",
-        data_value,
-        &layout.out_dir.join(".gitignore"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_clippy_toml",
-        data_value,
-        &layout.out_dir.join("clippy.toml"),
-    )?;
+    write_root_files(&hbs, layout, data_value)?;
 
     log::info!("[edgezero] writing core crate {}", layout.core_name);
     write_tmpl(
@@ -847,6 +893,117 @@ mod tests {
         }
     }
 
+    // ---------- build_tool_versions ----------
+
+    #[test]
+    fn build_tool_versions_pins_rust_only_with_no_adapters() {
+        // The scaffolder always picks at least axum in practice,
+        // but the empty case is the trust boundary: zero adapters
+        // produces a stable file containing exactly the
+        // rust-toolchain pin and a trailing newline.
+        let out = build_tool_versions(&[]);
+        assert_eq!(out, "rust 1.95.0\n");
+    }
+
+    #[test]
+    fn build_tool_versions_pins_nodejs_when_cloudflare_adapter_selected() {
+        // wrangler is a Node binary; pinning nodejs keeps the
+        // version we tested wrangler against (the same nodejs the
+        // repo's own `.tool-versions` pins).
+        let out = build_tool_versions(&["cloudflare".to_owned()]);
+        assert!(out.contains("nodejs 24.12.0"), "must pin nodejs: {out}");
+        assert!(out.contains("rust 1.95.0"), "always pin rust: {out}");
+        assert!(
+            !out.contains("fastly"),
+            "no fastly pin without fastly adapter: {out}"
+        );
+    }
+
+    #[test]
+    fn build_tool_versions_pins_fastly_and_viceroy_when_fastly_adapter_selected() {
+        // `fastly` for the CLI we shell out to in provision /
+        // config push; `viceroy` for `fastly compute serve`. Both
+        // pins are needed when the operator actually uses the
+        // fastly adapter; we pin them ONLY here so a CF-only
+        // project doesn't end up with a fastly-CLI install
+        // requirement.
+        let out = build_tool_versions(&["fastly".to_owned()]);
+        assert!(out.contains("fastly 15.1.0"), "must pin fastly: {out}");
+        assert!(out.contains("viceroy 0.17.0"), "must pin viceroy: {out}");
+        assert!(out.contains("rust 1.95.0"));
+        assert!(
+            !out.contains("nodejs"),
+            "no nodejs pin without cloudflare adapter: {out}"
+        );
+    }
+
+    #[test]
+    fn build_tool_versions_axum_only_does_not_add_extra_pins() {
+        // Axum runs on the host Rust toolchain, no extra binaries
+        // needed — same as the "no adapters" shape but exercised
+        // through the realistic axum-only case.
+        let out = build_tool_versions(&["axum".to_owned()]);
+        assert_eq!(out, "rust 1.95.0\n");
+    }
+
+    #[test]
+    fn build_tool_versions_spin_adds_install_hint_comment_not_asdf_pin() {
+        // Spin is install-flow-managed (not consistently asdf-
+        // managed in our toolchain), so don't write a brittle pin
+        // we can't honour — explain why with an inline hint so the
+        // operator isn't left guessing.
+        let out = build_tool_versions(&["spin".to_owned()]);
+        assert!(out.contains("rust 1.95.0"));
+        assert!(
+            !out.contains("spin "),
+            "must NOT pin spin via asdf shape: {out}"
+        );
+        assert!(
+            out.contains("spinframework.dev/install"),
+            "must point operators at the spin install URL: {out}"
+        );
+    }
+
+    #[test]
+    fn build_tool_versions_all_four_adapters_combines_pins_deterministically() {
+        // Composite case: the typical generated project has all
+        // four adapters. Output must list each pin exactly once
+        // (no duplicates from accidental double-insertion in the
+        // adapter loop), and be sort-stable so the file doesn't
+        // churn across regenerations.
+        let adapters = vec![
+            "cloudflare".to_owned(),
+            "fastly".to_owned(),
+            "spin".to_owned(),
+            "axum".to_owned(),
+        ];
+        let out = build_tool_versions(&adapters);
+        // Each pin appears exactly once.
+        for pin in [
+            "nodejs 24.12.0",
+            "fastly 15.1.0",
+            "viceroy 0.17.0",
+            "rust 1.95.0",
+        ] {
+            assert_eq!(
+                out.matches(pin).count(),
+                1,
+                "`{pin}` must appear exactly once in: {out}"
+            );
+        }
+        // Spin install hint present.
+        assert!(out.contains("spinframework.dev/install"));
+        // Stable order (alphabetical).
+        let pin_block = out.split("\n\n").next().expect("pin block").to_owned();
+        let lines: Vec<&str> = pin_block.lines().collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            lines, sorted,
+            "pin lines must be sorted so the file is regen-stable: {pin_block}"
+        );
+    }
+
     #[test]
     fn generator_error_format_displays_underlying_fmt_error() {
         // `writeln!`-to-`String` cannot actually fail in production, but the
@@ -886,6 +1043,7 @@ mod tests {
         assert!(project_dir.join("Cargo.toml").exists());
         assert!(project_dir.join("edgezero.toml").exists());
         assert!(project_dir.join(".gitignore").exists());
+        assert!(project_dir.join(".tool-versions").exists());
         assert!(project_dir.join("README.md").exists());
         assert!(project_dir.join("crates/demo-app-core/src/lib.rs").exists());
         assert!(
