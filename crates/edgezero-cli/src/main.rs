@@ -22,17 +22,55 @@ use std::path::PathBuf;
 #[cfg(feature = "cli")]
 use std::process;
 
-/// Initialize a CLI logger that prints messages without timestamps or level
-/// prefixes — the CLI's output IS the user-facing UX, not a debug log.
+/// CLI output logger: prints `record.args()` verbatim with no timestamps,
+/// levels, or module prefixes — the CLI's output IS the user-facing UX, not a
+/// debug log. `info`/`debug`/`trace` go to stdout, `warn`/`error` to stderr.
+#[cfg(feature = "cli")]
+struct CliLogger;
+
+#[cfg(feature = "cli")]
+impl log::Log for CliLogger {
+    #[inline]
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    #[inline]
+    fn flush(&self) {}
+
+    #[inline]
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        match record.level() {
+            log::Level::Error | log::Level::Warn => {
+                #[expect(
+                    clippy::print_stderr,
+                    reason = "CLI UX output goes to stderr for warn/error"
+                )]
+                {
+                    eprintln!("{}", record.args());
+                }
+            }
+            log::Level::Info | log::Level::Debug | log::Level::Trace => {
+                #[expect(
+                    clippy::print_stdout,
+                    reason = "CLI UX output goes to stdout for info/debug/trace"
+                )]
+                {
+                    println!("{}", record.args());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(feature = "cli")]
 fn init_cli_logger() {
-    use log::LevelFilter;
-    use simple_logger::SimpleLogger;
-    let _logger_init = SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .without_timestamps()
-        .with_module_level("edgezero_cli", LevelFilter::Info)
-        .init();
+    static CLI_LOGGER: CliLogger = CliLogger;
+    let _logger_init =
+        log::set_logger(&CLI_LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
 }
 
 #[cfg(feature = "cli")]

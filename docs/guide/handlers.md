@@ -397,7 +397,7 @@ impl IntoResponse for HtmlResponse {
             .status(StatusCode::OK)
             .header("content-type", "text/html; charset=utf-8")
             .body(Body::from(self.0))
-            .map_err(|err| EdgeError::internal(anyhow::anyhow!(err)))
+            .map_err(EdgeError::internal)
     }
 }
 
