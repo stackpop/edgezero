@@ -184,8 +184,11 @@ jobs:
           echo "$install_dir" >> "$GITHUB_PATH"
           export PATH="$install_dir:$PATH"
           version="${{ steps.wasmtime-version.outputs.version }}"
-          if ! command -v wasmtime &>/dev/null \
-              || ! wasmtime --version 2>/dev/null | grep -qF "wasmtime $version"; then
+          # Compare exact versions so a pin like `44.0.1` does not silently
+          # accept `wasmtime 44.0.10` from a stale cache or runner-provided
+          # binary.
+          actual="$(wasmtime --version 2>/dev/null | awk '{print $2}' || true)"
+          if [ "$actual" != "$version" ]; then
             tag="v${version}"
             archive="wasmtime-${tag}-x86_64-linux"
             mkdir -p "$install_dir"
@@ -193,7 +196,8 @@ jobs:
             tar -xJf /tmp/wasmtime.tar.xz -C /tmp
             install -m 0755 "/tmp/${archive}/wasmtime" "$install_dir/wasmtime"
           fi
-          wasmtime --version | grep -qF "wasmtime $version"
+          actual="$(wasmtime --version | awk '{print $2}')"
+          test "$actual" = "$version"
           wasmtime --version
 
       - name: Fetch dependencies (locked)
