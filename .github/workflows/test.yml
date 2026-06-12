@@ -44,7 +44,7 @@ jobs:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
 
       - name: Add wasm targets
-        run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
+        run: rustup target add wasm32-wasip1 wasm32-wasip2 wasm32-unknown-unknown
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
@@ -54,6 +54,23 @@ jobs:
 
       - name: Check feature compilation
         run: cargo check --workspace --all-targets --features "fastly cloudflare spin"
+
+      - name: Verify a generated project compiles
+        run: cargo test -p edgezero-cli --test generated_project_builds -- --ignored
+
+      # `examples/app-demo` is excluded from the root workspace, so
+      # `cargo test --workspace` above does not cover it. Run its own
+      # workspace tests separately. An end-to-end push →
+      # AxumConfigStore → handler roundtrip in
+      # `app-demo-cli/tests/config_flow.rs` exists to be exercised by
+      # THIS step — without it, a regression in the JSON-file contract
+      # between `config push --adapter axum` and
+      # `AxumConfigStore::from_path` would not be caught by CI.
+      # Axum-only path, no live external calls — intentionally kept
+      # off the wasm matrix.
+      - name: Run app-demo workspace tests
+        working-directory: examples/app-demo
+        run: cargo test --workspace --all-targets
 
   adapter-wasm-tests:
     name: ${{ matrix.adapter }} wasm tests
@@ -71,8 +88,8 @@ jobs:
             runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
             runner_value: viceroy run
           - adapter: spin
-            target: wasm32-wasip1
-            runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
+            target: wasm32-wasip2
+            runner_env: CARGO_TARGET_WASM32_WASIP2_RUNNER
             runner_value: wasmtime run
     steps:
       - uses: actions/checkout@v6

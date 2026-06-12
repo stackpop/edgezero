@@ -9,11 +9,11 @@ Production-ready toolkit for portable edge HTTP workloads. Write once, deploy to
 cargo install --path crates/edgezero-cli
 
 # Create a new project
-edgezero-cli new my-app
+edgezero new my-app
 cd my-app
 
-# Start the dev server
-edgezero-cli dev
+# Run it locally on the Axum adapter
+edgezero serve --adapter axum
 
 # Test it
 curl http://127.0.0.1:8787/
@@ -34,7 +34,7 @@ Full documentation is available at **[stackpop.github.io/edgezero](https://stack
 | ------------------ | ------------------------ | ------ |
 | Fastly Compute     | `wasm32-wasip1`          | Stable |
 | Cloudflare Workers | `wasm32-unknown-unknown` | Stable |
-| Fermyon Spin       | `wasm32-wasip1`          | Preview |
+| Fermyon Spin       | `wasm32-wasip2`          | Preview |
 | Axum (Native)      | Host                     | Stable |
 
 ## License

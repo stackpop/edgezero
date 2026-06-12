@@ -77,9 +77,8 @@ Adapters translate between provider-specific types and the portable core model:
 `edgezero-cli` provides the `edgezero` binary:
 
 - **`edgezero new`** - Scaffolds a new project with templates
-- **`edgezero dev`** - Runs the local Axum dev server
 - **`edgezero build`** - Builds for a specific adapter target
-- **`edgezero serve`** - Runs provider-specific local servers (Viceroy, wrangler dev)
+- **`edgezero serve`** - Runs a local server for an adapter (`--adapter axum` for the native server, Viceroy for Fastly, `wrangler dev` for Cloudflare)
 - **`edgezero deploy`** - Deploys to production
 
 ## Data Flow
@@ -120,12 +119,12 @@ Adapters translate between provider-specific types and the portable core model:
 
 Adapter crates use feature flags to gate provider SDKs and CLI integration:
 
-| Feature       | Crate                       | Purpose                                |
-| ------------- | --------------------------- | -------------------------------------- |
-| `fastly`      | edgezero-adapter-fastly     | Fastly SDK integration                 |
-| `cloudflare`  | edgezero-adapter-cloudflare | Workers SDK integration                |
-| `cli`         | adapter crates              | Register adapters and scaffolding data |
-| `dev-example` | edgezero-cli                | Bundled demo app for development       |
+| Feature        | Crate                       | Purpose                                |
+| -------------- | --------------------------- | -------------------------------------- |
+| `fastly`       | edgezero-adapter-fastly     | Fastly SDK integration                 |
+| `cloudflare`   | edgezero-adapter-cloudflare | Workers SDK integration                |
+| `cli`          | adapter crates              | Register adapters and scaffolding data |
+| `demo-example` | edgezero-cli                | Bundled demo app for development       |
 
 ## Next Steps
 

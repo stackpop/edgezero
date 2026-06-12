@@ -1,8 +1,11 @@
+use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
 use futures_util::StreamExt as _;
-use spin_sdk::http as spin_http;
+use spin_sdk::http::{FullBody, Response as SpinResponse};
+
+use crate::SpinFullResponse;
 
 /// Maximum body size (16 MiB) when collecting a streamed body into a buffer.
 /// Prevents unbounded memory growth from malicious or misconfigured upstreams.
@@ -26,6 +29,9 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(bytes) => {
+                        // `usize::saturating_add` keeps the bound check
+                        // honest against pathological inputs without
+                        // triggering arithmetic_side_effects.
                         if collected.len().saturating_add(bytes.len()) > MAX_BODY_SIZE {
                             return Err(EdgeError::internal(anyhow::anyhow!(
                                 "body exceeds maximum size of {MAX_BODY_SIZE} bytes"
@@ -47,27 +53,22 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
 /// byte body. Streaming bodies are collected into a single `Vec<u8>`.
 ///
 /// # Errors
-/// Returns [`EdgeError::internal`] if a streaming chunk read fails or
-/// the buffered body would exceed [`MAX_BODY_SIZE`].
+/// Returns [`EdgeError::internal`] if the response body cannot be collected
+/// (stream error or size cap exceeded) or if the resulting Spin response
+/// cannot be built from the collected bytes.
 #[inline]
-pub async fn from_core_response(response: Response) -> Result<spin_http::Response, EdgeError> {
+pub async fn from_core_response(response: Response) -> Result<SpinFullResponse, EdgeError> {
     let (parts, body) = response.into_parts();
 
-    let mut builder = spin_http::Response::builder();
-    builder.status(parts.status.as_u16());
+    let mut builder = SpinResponse::builder().status(parts.status);
 
-    // Spin's WASI HTTP interface requires string-typed header values,
-    // so non-UTF-8 values cannot be forwarded and are dropped with a warning.
     for (name, value) in &parts.headers {
-        if let Ok(text) = value.to_str() {
-            builder.header(name.as_str(), text);
-        } else {
-            log::warn!("dropping non-UTF-8 response header (Spin WASI limitation): {name}");
-        }
+        builder = builder.header(name, value);
     }
 
-    let body_bytes = collect_body_bytes(body).await?;
+    let collected = collect_body_bytes(body).await?;
 
-    builder.body(body_bytes);
-    Ok(builder.build())
+    builder
+        .body(FullBody::new(Bytes::from(collected)))
+        .map_err(|err| EdgeError::internal(anyhow::anyhow!("failed to build response: {err}")))
 }

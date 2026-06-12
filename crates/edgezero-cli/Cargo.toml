@@ -8,6 +8,10 @@ description = "EdgeZero CLI: build and deploy to multiple edge adapters"
 [lints]
 workspace = true
 
+[[bin]]
+name = "edgezero"
+path = "src/main.rs"
+
 [dependencies]
 edgezero-core = { workspace = true }
 edgezero-adapter = { path = "../edgezero-adapter" }
@@ -25,6 +29,7 @@ simple_logger = { workspace = true }
 serde_json = { workspace = true}
 thiserror = { workspace = true }
 toml = { workspace = true }
+validator = { workspace = true }
 
 [build-dependencies]
 toml = { workspace = true }
@@ -41,4 +46,4 @@ default = [
     "edgezero-adapter-spin",
 ]
 cli = ["dep:clap"]
-dev-example = ["dep:app-demo-core"]
+demo-example = ["dep:app-demo-core", "edgezero-adapter-axum"]

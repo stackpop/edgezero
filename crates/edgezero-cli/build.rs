@@ -7,6 +7,10 @@ use toml::Value;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");
+    // `Cargo.toml` is read below to discover optional adapter dependencies, so
+    // re-run the build script whenever it changes (e.g. when a new adapter is
+    // added or an existing one flips `optional`).
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let manifest_path = manifest_dir.join("Cargo.toml");

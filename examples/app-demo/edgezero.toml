@@ -104,25 +104,20 @@ adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Echo an allowlisted smoke-test secret value (smoke-test only — do not use in production)"
 
 # -- Stores ----------------------------------------------------------------
+#
+# `[stores.<kind>]` declares logical store ids only — the portable fact that
+# this app uses a store. Platform names are resolved at runtime; a store's
+# name defaults to its logical id.
 
 [stores.kv]
-# Uses the default name "EDGEZERO_KV". Uncomment to customise:
-# name = "MY_CUSTOM_KV"
-#
-# Per-adapter overrides:
-# [stores.kv.adapters.cloudflare]
-# name = "CF_KV_BINDING"
+ids = ["sessions", "cache"]
+default = "sessions"
 
-[stores.kv.adapters.spin]
-# Spin's local runtime auto-provisions the "default" label. Custom labels
-# require a Spin runtime config or cloud link.
-name = "default"
+[stores.config]
+ids = ["app_config"]
 
 [stores.secrets]
-# Uses the default name "EDGEZERO_SECRETS".
-# Axum reads secrets from environment variables of the same name.
-# Cloudflare reads from Worker secret bindings (local: .dev.vars).
-# Fastly reads from the declared secret store (local: fastly.toml [local_server.secret_stores]).
+ids = ["default"]
 
 # [environment]
 #
@@ -137,14 +132,6 @@ name = "default"
 # description = "Secret token used when calling the upstream API"
 # adapters = ["axum", "cloudflare", "fastly"]
 # env = "API_TOKEN"
-
-[stores.config]
-name = "app_config"
-
-[stores.config.defaults]
-"feature.new_checkout" = "false"
-"service.timeout_ms" = "1500"
-"greeting" = "hello from config store"
 
 [adapters.axum.adapter]
 crate = "crates/app-demo-adapter-axum"
@@ -207,14 +194,14 @@ crate = "crates/app-demo-adapter-spin"
 manifest = "crates/app-demo-adapter-spin/spin.toml"
 
 [adapters.spin.build]
-target = "wasm32-wasip1"
+target = "wasm32-wasip2"
 profile = "release"
 features = ["spin"]
 
 [adapters.spin.commands]
-build = "cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin"
+build = "cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin"
 deploy = "spin deploy --from crates/app-demo-adapter-spin"
-serve = "spin up --from crates/app-demo-adapter-spin"
+serve = "spin up --from crates/app-demo-adapter-spin --runtime-config-file crates/app-demo-adapter-spin/runtime-config.toml"
 
 [adapters.spin.logging]
 level = "info"

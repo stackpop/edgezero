@@ -17,7 +17,6 @@ const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
 const MAX_BODY_SIZE: usize = 25 * 1024 * 1024;
 // 512 (KV key limit) - 5 (len of "note:") = 507
 const MAX_NOTE_ID_LEN: u64 = 507;
-const SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
 const SMOKE_SECRET_MISSING_NAME: &str = "SMOKE_SECRET_MISSING";
 const SMOKE_SECRET_NAME: &str = "SMOKE_SECRET";
 
@@ -154,14 +153,17 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
         );
     }
 
-    let Some(store) = ctx.config_store() else {
+    // The registry-aware accessor reads the wired `ConfigRegistry`
+    // (adapter dispatchers synthesise one from any legacy bare handle
+    // before reaching the router).
+    let Some(store) = ctx.config_store_default() else {
         return text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "config store is unavailable for this adapter",
         );
     };
 
-    match store.get(&params.name)? {
+    match store.get(&params.name).await? {
         Some(value) => text_response(StatusCode::OK, value),
         None => text_response(
             StatusCode::NOT_FOUND,
@@ -170,9 +172,17 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
     }
 }
 
-/// Increment and return a visit counter stored in KV.
+/// Increment and return a visit counter stored in the `sessions`
+/// KV store. The `[stores.kv]` manifest declares both `sessions`
+/// and `cache` ids; the counter lives in `sessions` because it
+/// tracks per-deployment session-flavoured state — the demo
+/// exercises [`Kv::named`] (not `.default()`) so the multi-store
+/// surface is visible end-to-end.
 #[action]
-pub async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
+pub async fn kv_counter(kv: Kv) -> Result<Response, EdgeError> {
+    let store = kv
+        .named("sessions")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `sessions` is not registered"))?;
     let count: i64 = store
         .read_modify_write("demo:counter", 0_i64, |n| n.wrapping_add(1))
         .await?;
@@ -184,13 +194,19 @@ pub async fn kv_counter(Kv(store): Kv) -> Result<Response, EdgeError> {
         .map_err(EdgeError::internal)
 }
 
-/// Store a note by id (body = note text).
+/// Store a note by id (body = note text) in the `cache` KV store.
+/// Notes are short-lived, cache-flavoured payloads — separate
+/// from the `sessions` store the counter writes to, so the demo
+/// exercises both named ids declared in `[stores.kv]`.
 #[action]
 pub async fn kv_note_put(
-    Kv(store): Kv,
+    kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
     RequestContext(ctx): RequestContext,
 ) -> Result<Response, EdgeError> {
+    let store = kv
+        .named("cache")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
     let body = ctx.into_request().into_body();
     let body_bytes = body.into_bytes_bounded(MAX_BODY_SIZE).await?;
     store
@@ -202,12 +218,15 @@ pub async fn kv_note_put(
         .map_err(EdgeError::internal)
 }
 
-/// Read a note by id.
+/// Read a note by id from the `cache` KV store.
 #[action]
 pub async fn kv_note_get(
-    Kv(store): Kv,
+    kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
+    let store = kv
+        .named("cache")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
     match store.get_bytes(&format!("note:{}", path.id)).await? {
         Some(data) => http::response_builder()
             .status(StatusCode::OK)
@@ -218,12 +237,15 @@ pub async fn kv_note_get(
     }
 }
 
-/// Delete a note by id.
+/// Delete a note by id from the `cache` KV store.
 #[action]
 pub async fn kv_note_delete(
-    Kv(store): Kv,
+    kv: Kv,
     ValidatedPath(path): ValidatedPath<NoteIdPath>,
 ) -> Result<Response, EdgeError> {
+    let store = kv
+        .named("cache")
+        .ok_or_else(|| EdgeError::service_unavailable("KV store `cache` is not registered"))?;
     store.delete(&format!("note:{}", path.id)).await?;
     http::response_builder()
         .status(StatusCode::NO_CONTENT)
@@ -243,7 +265,7 @@ pub async fn kv_note_delete(
 /// Usage: `GET /secrets/echo?name=SMOKE_SECRET`
 #[action]
 pub async fn secrets_echo(
-    Secrets(store): Secrets,
+    secrets: Secrets,
     Query(params): Query<EchoParams>,
 ) -> Result<Text<String>, EdgeError> {
     match params.name.as_str() {
@@ -255,8 +277,14 @@ pub async fn secrets_echo(
         }
     }
 
+    // `BoundSecretStore` is pre-bound to a platform store name by the
+    // adapter (`EDGEZERO__STORES__SECRETS__<ID>__NAME` or the logical id);
+    // the handler passes only the key.
+    let store = secrets
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default secret store registered"))?;
     let value = store
-        .require_str(SECRET_STORE_NAME, &params.name)
+        .require_str(&params.name)
         .await
         .map_err(EdgeError::from)?;
     Ok(Text::new(value))
@@ -276,6 +304,7 @@ mod tests {
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
+    use edgezero_core::store_registry::KvRegistry;
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -291,8 +320,9 @@ mod tests {
 
     struct UnavailableConfigStore;
 
+    #[async_trait::async_trait(?Send)]
     impl ConfigStore for MapConfigStore {
-        fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             Ok(self.0.get(key).cloned())
         }
     }
@@ -368,8 +398,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait(?Send)]
     impl ConfigStore for UnavailableConfigStore {
-        fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
     }
@@ -435,7 +466,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn config_get_resolves_through_registry_when_wired() {
+        // Adapters wire `ConfigRegistry` into request extensions; the
+        // handler must read it via `ctx.config_store_default()` instead of
+        // the legacy single-handle accessor (which would 503).
+        use edgezero_core::store_registry::{ConfigRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+
+        let store = MapConfigStore(
+            [("greeting".to_owned(), "hello from registry".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        let by_id: BTreeMap<String, ConfigStoreHandle> = [(
+            "app_config".to_owned(),
+            ConfigStoreHandle::new(Arc::new(store)),
+        )]
+        .into_iter()
+        .collect();
+        let registry: ConfigRegistry = StoreRegistry::new(by_id, "app_config".to_owned());
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config/greeting")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+        let mut params = HashMap::new();
+        params.insert("name".to_owned(), "greeting".to_owned());
+        let ctx = RequestContext::new(request, PathParams::new(params));
+
+        let response = block_on(config_get(ctx)).expect("handler ok");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .into_bytes()
+                .expect("buffered")
+                .as_ref(),
+            b"hello from registry"
+        );
+    }
+
     fn context_with_config_key(key: &str, entries: &[(&str, &str)]) -> RequestContext {
+        // Hard-cutoff: wire a real `ConfigRegistry`
+        // rather than a bare `ConfigStoreHandle`. The
+        // registry-aware accessor `ctx.config_store_default()`
+        // no longer falls back to a wired bare handle.
+        use edgezero_core::store_registry::{ConfigRegistry, StoreRegistry};
         let mut request = request_builder()
             .method(Method::GET)
             .uri(format!("/config/{key}"))
@@ -447,9 +526,9 @@ mod tests {
                 .map(|&(name, value)| (name.to_owned(), value.to_owned()))
                 .collect(),
         );
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(store)));
+        let handle = ConfigStoreHandle::new(Arc::new(store));
+        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), handle);
+        request.extensions_mut().insert(registry);
         let mut params = HashMap::new();
         params.insert("name".to_owned(), key.to_owned());
         RequestContext::new(request, PathParams::new(params))
@@ -474,25 +553,40 @@ mod tests {
         RequestContext::new(request, PathParams::default())
     }
 
+    /// Build a `KvRegistry` with the two named stores
+    /// (`sessions` + `cache`) the manifest declares, each backed
+    /// by its own `MockKv`. The registry's `Clone` is cheap (each
+    /// `KvHandle` is `Arc`-backed), so a test can share the same
+    /// registry across two contexts to verify cross-request
+    /// persistence — which is what the put-then-get and put-then-
+    /// delete tests need.
     fn context_with_kv(
         path: &str,
         method: Method,
         body: Body,
         params: &[(&str, &str)],
-    ) -> (RequestContext, KvHandle) {
-        let kv = Arc::new(MockKv::new());
-        let handle = KvHandle::new(kv);
+    ) -> (RequestContext, KvRegistry) {
+        use edgezero_core::store_registry::StoreRegistry;
+        let sessions = KvHandle::new(Arc::new(MockKv::new()));
+        let cache = KvHandle::new(Arc::new(MockKv::new()));
+        let by_id: BTreeMap<String, KvHandle> = [
+            ("sessions".to_owned(), sessions),
+            ("cache".to_owned(), cache),
+        ]
+        .into_iter()
+        .collect();
+        let registry: KvRegistry = StoreRegistry::new(by_id, "sessions".to_owned());
         let mut request = request_builder()
             .method(method)
             .uri(path)
             .body(body)
             .expect("request");
-        request.extensions_mut().insert(handle.clone());
+        request.extensions_mut().insert(registry.clone());
         let map = params
             .iter()
             .map(|&(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<HashMap<_, _>>();
-        (RequestContext::new(request, PathParams::new(map)), handle)
+        (RequestContext::new(request, PathParams::new(map)), registry)
     }
 
     fn context_with_params(path: &str, params: &[(&str, &str)]) -> RequestContext {
@@ -509,32 +603,52 @@ mod tests {
     }
 
     fn context_with_secrets(path: &str, query: &str, entries: &[(&str, &str)]) -> RequestContext {
+        // Exercise the production registry path: build a one-id
+        // `SecretRegistry` whose bound platform store name matches the
+        // prefix the `InMemorySecretStore` is keyed under. The handler
+        // uses `secrets.default()?.require_str(key)` against the bound
+        // `default` store; the `InMemorySecretStore` looks up
+        // `"default/<key>"`.
+        use edgezero_core::store_registry::{BoundSecretStore, SecretRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+
+        const PLATFORM_NAME: &str = "default";
         let provider = InMemorySecretStore::new(entries.iter().map(|&(name, value)| {
             (
-                format!("{SECRET_STORE_NAME}/{name}"),
+                format!("{PLATFORM_NAME}/{name}"),
                 bytes::Bytes::from(value.to_owned()),
             )
         }));
         let handle = SecretHandle::new(Arc::new(provider));
+        let bound = BoundSecretStore::new(handle, PLATFORM_NAME.to_owned());
+        let by_id: BTreeMap<String, BoundSecretStore> =
+            [("default".to_owned(), bound)].into_iter().collect();
+        let registry: SecretRegistry = StoreRegistry::new(by_id, "default".to_owned());
         let uri = format!("{path}?{query}");
         let mut request = request_builder()
             .method(Method::GET)
             .uri(uri.as_str())
             .body(Body::empty())
             .expect("request");
-        request.extensions_mut().insert(handle);
+        request.extensions_mut().insert(registry);
         RequestContext::new(request, PathParams::default())
     }
 
     fn context_with_unavailable_config_store(key: &str) -> RequestContext {
+        // Hard-cutoff: same registry wiring as
+        // `context_with_config_key` — wire a one-id
+        // `ConfigRegistry` so the registry-aware accessor
+        // resolves a backend (the `UnavailableConfigStore` then
+        // errors on lookup, which is what the test asserts).
+        use edgezero_core::store_registry::{ConfigRegistry, StoreRegistry};
         let mut request = request_builder()
             .method(Method::GET)
             .uri(format!("/config/{key}"))
             .body(Body::empty())
             .expect("request");
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(UnavailableConfigStore)));
+        let handle = ConfigStoreHandle::new(Arc::new(UnavailableConfigStore));
+        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), handle);
+        request.extensions_mut().insert(registry);
         let mut params = HashMap::new();
         params.insert("name".to_owned(), key.to_owned());
         RequestContext::new(request, PathParams::new(params))
@@ -599,7 +713,7 @@ mod tests {
 
     #[test]
     fn kv_note_delete_returns_no_content() {
-        let (ctx, handle) = context_with_kv(
+        let (ctx, registry) = context_with_kv(
             "/kv/notes/del",
             Method::POST,
             Body::from("to-delete"),
@@ -607,16 +721,19 @@ mod tests {
         );
         block_on(kv_note_put(ctx)).unwrap();
 
-        let (ctx2, _) = {
+        // Reuse the same registry so the delete sees the put's
+        // write — KvHandle is Arc-backed, so cloning the registry
+        // shares the underlying `cache` store across both ctxs.
+        let ctx2 = {
             let mut request = request_builder()
                 .method(Method::DELETE)
                 .uri("/kv/notes/del")
                 .body(Body::empty())
                 .expect("request");
-            request.extensions_mut().insert(handle.clone());
+            request.extensions_mut().insert(registry);
             let mut map = HashMap::new();
             map.insert("id".to_owned(), "del".to_owned());
-            (RequestContext::new(request, PathParams::new(map)), handle)
+            RequestContext::new(request, PathParams::new(map))
         };
         let resp = block_on(kv_note_delete(ctx2)).expect("response");
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
@@ -636,7 +753,7 @@ mod tests {
 
     #[test]
     fn kv_note_put_and_get() {
-        let (ctx, handle) = context_with_kv(
+        let (ctx, registry) = context_with_kv(
             "/kv/notes/abc",
             Method::POST,
             Body::from("hello world"),
@@ -645,19 +762,18 @@ mod tests {
         let put_resp = block_on(kv_note_put(ctx)).expect("response");
         assert_eq!(put_resp.status(), StatusCode::CREATED);
 
-        let (ctx2, _) = {
+        // Same registry → same `cache` store, so the get reads
+        // the value the put just wrote.
+        let ctx2 = {
             let mut request = request_builder()
                 .method(Method::GET)
                 .uri("/kv/notes/abc")
                 .body(Body::empty())
                 .expect("request");
-            request.extensions_mut().insert(handle.clone());
+            request.extensions_mut().insert(registry);
             let mut map = HashMap::new();
             map.insert("id".to_owned(), "abc".to_owned());
-            (
-                RequestContext::new(request, PathParams::new(map)),
-                handle.clone(),
-            )
+            RequestContext::new(request, PathParams::new(map))
         };
         let get_resp = block_on(kv_note_get(ctx2)).expect("response");
         assert_eq!(get_resp.status(), StatusCode::OK);

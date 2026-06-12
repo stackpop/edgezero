@@ -1,23 +1,6 @@
-// In-process unit-style contract tests for the Spin adapter.
-//
-// Despite living in `tests/`, these are NOT integration tests against a
-// real Spin runtime — they exercise the adapter's internal routing,
-// store-injection, and response-conversion logic with hand-rolled
-// fixtures (`FixedConfigStore` / `FixedKvStore` / `FixedSecretStore`)
-// and never construct a `spin_sdk` `IncomingRequest` or invoke
-// `spin_sdk::http::send`. They compile to `wasm32-wasip1` and run
-// under `wasmtime run` only because `spin_sdk` types (and the
-// `from_core_response` API they back) are gated to that target.
-//
-// The compile checks in `store_trait_compile_checks` pin the
-// type-level contract between the adapter's store types and the
-// `KvStore`/`SecretStore` traits so a future Spin SDK type change
-// would fail at compile time. ABI-level coverage against an actual
-// Spin runtime belongs in a separate end-to-end suite.
-//
-// Gating the whole file keeps the host `cargo test`/`clippy` runs
-// consistent across the fastly, cloudflare, and spin adapter
-// contract suites.
+// Adapter contract tests run on the Spin wasm32 target, matching the
+// fastly and cloudflare contract suites. Gating the whole file keeps the
+// host `cargo test`/`clippy` runs consistent across adapters.
 #![cfg(all(feature = "spin", target_arch = "wasm32"))]
 
 // Compile-time check: SpinKvStore and SpinSecretStore implement their
@@ -45,6 +28,7 @@ mod tests {
     mod from_core_response_tests {
         use super::*;
         use edgezero_adapter_spin::response::from_core_response;
+        use http_body_util::BodyExt as _;
 
         #[test]
         fn from_core_response_translates_status_and_headers() {
@@ -57,11 +41,15 @@ mod tests {
 
                 let spin_response = from_core_response(response).await.expect("spin response");
 
-                assert_eq!(*spin_response.status(), 201, "status translated");
-                let header = spin_response
-                    .headers()
-                    .find(|(name, _)| *name == "x-edgezero-res");
-                assert!(header.is_some(), "response header preserved");
+                assert_eq!(
+                    spin_response.status(),
+                    StatusCode::CREATED,
+                    "status translated"
+                );
+                assert!(
+                    spin_response.headers().get("x-edgezero-res").is_some(),
+                    "response header preserved"
+                );
             });
         }
 
@@ -78,12 +66,14 @@ mod tests {
 
                 let spin_response = from_core_response(response).await.expect("spin response");
 
-                assert_eq!(*spin_response.status(), 200, "status translated");
-                assert_eq!(
-                    spin_response.into_body(),
-                    b"chunk-1chunk-2",
-                    "streaming body collected"
-                );
+                assert_eq!(spin_response.status(), StatusCode::OK, "status translated");
+                let body = spin_response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect")
+                    .to_bytes();
+                assert_eq!(body.as_ref(), b"chunk-1chunk-2", "streaming body collected");
             });
         }
 
@@ -97,8 +87,18 @@ mod tests {
 
                 let spin_response = from_core_response(response).await.expect("spin response");
 
-                assert_eq!(*spin_response.status(), 204, "status translated");
-                assert!(spin_response.into_body().is_empty(), "empty body preserved");
+                assert_eq!(
+                    spin_response.status(),
+                    StatusCode::NO_CONTENT,
+                    "status translated"
+                );
+                let body = spin_response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect")
+                    .to_bytes();
+                assert!(body.is_empty(), "empty body preserved");
             });
         }
     }
@@ -114,6 +114,9 @@ mod tests {
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{SecretError, SecretHandle, SecretStore};
+    use edgezero_core::store_registry::{
+        BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
+    };
     use futures::executor::block_on;
     use futures::stream;
     use std::sync::Arc;
@@ -125,8 +128,9 @@ mod tests {
         value: &'static str,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl ConfigStore for FixedConfigStore {
-        fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
+        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
             if key == self.key {
                 Ok(Some(self.value.to_owned()))
             } else {
@@ -239,10 +243,18 @@ mod tests {
         }
 
         async fn config_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-            let value = ctx
-                .config_store()
-                .and_then(|store| store.get("greeting").ok().flatten())
-                .unwrap_or_else(|| "missing".to_owned());
+            // Hard-cutoff: legacy `ctx.config_handle()` is
+            // gone. The dispatch boundary synthesises a one-id
+            // `ConfigRegistry` from the wired handle.
+            let value = match ctx.config_store_default() {
+                Some(store) => store
+                    .get("greeting")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "missing".to_owned()),
+                None => "missing".to_owned(),
+            };
             let response = response_builder()
                 .status(StatusCode::OK)
                 .body(Body::text(value))
@@ -251,7 +263,10 @@ mod tests {
         }
 
         async fn kv_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-            let value = if let Some(handle) = ctx.kv_handle() {
+            // Hard-cutoff: `ctx.kv_handle()` removed —
+            // `kv_store_default()` returns a `BoundKvStore` (alias
+            // for `KvHandle`) with the same `get_bytes` method.
+            let value = if let Some(handle) = ctx.kv_store_default() {
                 match handle.get_bytes("test-key").await {
                     Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
                     Ok(None) => "missing".to_owned(),
@@ -268,8 +283,13 @@ mod tests {
         }
 
         async fn secret_value(ctx: RequestContext) -> Result<Response, EdgeError> {
-            let value = if let Some(handle) = ctx.secret_handle() {
-                match handle.get_bytes("default", "test-secret").await {
+            // Hard-cutoff: `ctx.secret_handle()` removed.
+            // `secret_store_default()` returns a `BoundSecretStore`,
+            // which bundles the platform store name with the handle —
+            // so the lookup is `bound.get_bytes(key)` (single arg),
+            // not `handle.get_bytes(store_name, key)` (two args).
+            let value = if let Some(bound) = ctx.secret_store_default() {
+                match bound.get_bytes("test-secret").await {
                     Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
                     Ok(None) => "missing".to_owned(),
                     Err(_) => "error".to_owned(),
@@ -385,12 +405,18 @@ mod tests {
             .uri("http://example.com/config")
             .body(Body::empty())
             .expect("request");
+        // Mirror the dispatch boundary: the runtime synthesises a one-id
+        // `ConfigRegistry` keyed under `"default"` from the wired handle.
+        // `RequestContext::config_store_default()` reads `ConfigRegistry`
+        // only (hard-cutoff), so inserting a bare handle here would yield
+        // `None` and the handler would return "missing".
+        let handle = ConfigStoreHandle::new(Arc::new(FixedConfigStore {
+            key: "greeting",
+            value: "hello-spin",
+        }));
         request
             .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(FixedConfigStore {
-                key: "greeting",
-                value: "hello-spin",
-            })));
+            .insert(ConfigRegistry::single_id("default".to_owned(), handle));
 
         let response = block_on(app.router().oneshot(request)).expect("response");
 
@@ -410,12 +436,13 @@ mod tests {
             .uri("http://example.com/kv-value")
             .body(Body::empty())
             .expect("request");
+        let handle = KvHandle::new(Arc::new(FixedKvStore {
+            key: "test-key",
+            value: b"kv-payload",
+        }));
         request
             .extensions_mut()
-            .insert(KvHandle::new(Arc::new(FixedKvStore {
-                key: "test-key",
-                value: b"kv-payload",
-            })));
+            .insert(KvRegistry::single_id("default".to_owned(), handle));
 
         let response = block_on(app.router().oneshot(request)).expect("response");
 
@@ -435,12 +462,16 @@ mod tests {
             .uri("http://example.com/secret-value")
             .body(Body::empty())
             .expect("request");
-        request
-            .extensions_mut()
-            .insert(SecretHandle::new(Arc::new(FixedSecretStore {
-                key: "test-secret",
-                value: b"s3cr3t",
-            })));
+        // Secrets registry wraps the handle in a `BoundSecretStore` carrying
+        // the platform store name — mirrors the dispatch-boundary synthesis.
+        let handle = SecretHandle::new(Arc::new(FixedSecretStore {
+            key: "test-secret",
+            value: b"s3cr3t",
+        }));
+        request.extensions_mut().insert(SecretRegistry::single_id(
+            "default".to_owned(),
+            BoundSecretStore::new(handle, "default".to_owned()),
+        ));
 
         let response = block_on(app.router().oneshot(request)).expect("response");
 

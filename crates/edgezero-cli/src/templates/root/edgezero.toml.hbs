@@ -52,6 +52,28 @@ methods = ["GET", "POST"]
 handler = "{{proj_core_mod}}::handlers::proxy_demo"
 adapters = [{{{adapter_list}}}]
 
+# -- Stores ----------------------------------------------------------------
+#
+# `[stores.<kind>]` declares logical store ids only. `default` is required
+# when more than one id is declared; with a single id it resolves to that id.
+#
+# The default scaffold ships with no stores so `edgezero serve --adapter
+# <name>` starts cleanly without per-platform KV / config / secret bindings.
+# The scaffolded `<name>::AppConfig` correspondingly has no `#[secret]` /
+# `#[kv]` fields; uncomment the kinds your handlers will use, then provision
+# the matching platform bindings (see docs/guide/manifest-store-migration.md
+# and the per-adapter guides for the wrangler.toml / spin.toml / fastly.toml
+# entries).
+#
+# [stores.kv]
+# ids = ["app_kv"]
+#
+# [stores.config]
+# ids = ["app_config"]
+#
+# [stores.secrets]
+# ids = ["default"]
+
 # [environment]
 #
 # [[environment.variables]]

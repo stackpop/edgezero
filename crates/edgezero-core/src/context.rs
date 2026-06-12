@@ -1,11 +1,12 @@
 use crate::body::Body;
-use crate::config_store::ConfigStoreHandle;
 use crate::error::EdgeError;
 use crate::http::Request;
-use crate::key_value_store::KvHandle;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
-use crate::secret_store::SecretHandle;
+use crate::store_registry::{
+    BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
+    StoreRegistry,
+};
 use serde::de::DeserializeOwned;
 
 /// Request context exposed to handlers and middleware.
@@ -20,12 +21,29 @@ impl RequestContext {
         self.request.body()
     }
 
+    /// Resolve the [`BoundConfigStore`] for `id`. Strict lookup: when a
+    /// [`ConfigRegistry`] is wired, an unregistered id yields `None`. When
+    /// no registry is wired this returns `None` — adapter dispatchers
+    /// normalise legacy bare-handle inputs to a single-id registry under
+    /// the conventional `"default"` id, so a missing registry is a real
+    /// bug rather than a hand-wired single-handle adapter (spec hard-cutoff).
     #[inline]
-    pub fn config_store(&self) -> Option<ConfigStoreHandle> {
+    pub fn config_store(&self, id: &str) -> Option<BoundConfigStore> {
         self.request
             .extensions()
-            .get::<ConfigStoreHandle>()
-            .cloned()
+            .get::<ConfigRegistry>()
+            .and_then(|registry| registry.named(id))
+    }
+
+    /// Resolve the default [`BoundConfigStore`] — the wired registry's
+    /// declared default id, or `None` when no registry is in extensions.
+    /// See [`Self::config_store`] for the hard-cutoff rationale.
+    #[inline]
+    pub fn config_store_default(&self) -> Option<BoundConfigStore> {
+        self.request
+            .extensions()
+            .get::<ConfigRegistry>()
+            .and_then(StoreRegistry::default)
     }
 
     /// # Errors
@@ -62,10 +80,28 @@ impl RequestContext {
             .map_err(|err| EdgeError::bad_request(format!("invalid JSON payload: {err}")))
     }
 
-    /// Returns the KV store handle if one was configured for this request.
+    /// Resolve the [`BoundKvStore`] for `id`. Strict lookup: when a
+    /// [`KvRegistry`] is wired, an unregistered id yields `None`. When no
+    /// registry is wired this returns `None` — adapter dispatchers
+    /// normalise legacy bare-handle inputs to a single-id registry under
+    /// the conventional `"default"` id (spec hard-cutoff).
     #[inline]
-    pub fn kv_handle(&self) -> Option<KvHandle> {
-        self.request.extensions().get::<KvHandle>().cloned()
+    pub fn kv_store(&self, id: &str) -> Option<BoundKvStore> {
+        self.request
+            .extensions()
+            .get::<KvRegistry>()
+            .and_then(|registry| registry.named(id))
+    }
+
+    /// Resolve the default [`BoundKvStore`] — the wired registry's
+    /// declared default id, or `None` when no registry is in extensions.
+    /// See [`Self::kv_store`] for the hard-cutoff rationale.
+    #[inline]
+    pub fn kv_store_default(&self) -> Option<BoundKvStore> {
+        self.request
+            .extensions()
+            .get::<KvRegistry>()
+            .and_then(StoreRegistry::default)
     }
 
     #[inline]
@@ -120,10 +156,28 @@ impl RequestContext {
         &mut self.request
     }
 
-    /// Returns the secret store handle if one was configured for this request.
+    /// Resolve the [`BoundSecretStore`] for `id`. Strict lookup: when a
+    /// [`SecretRegistry`] is wired, an unregistered id yields `None`.
+    /// When no registry is wired this returns `None` — adapter
+    /// dispatchers normalise legacy bare-handle inputs to a single-id
+    /// registry under the conventional `"default"` id (spec hard-cutoff).
     #[inline]
-    pub fn secret_handle(&self) -> Option<SecretHandle> {
-        self.request.extensions().get::<SecretHandle>().cloned()
+    pub fn secret_store(&self, id: &str) -> Option<BoundSecretStore> {
+        self.request
+            .extensions()
+            .get::<SecretRegistry>()
+            .and_then(|registry| registry.named(id))
+    }
+
+    /// Resolve the default [`BoundSecretStore`] — the wired registry's
+    /// declared default id, or `None` when no registry is in extensions.
+    /// See [`Self::secret_store`] for the hard-cutoff rationale.
+    #[inline]
+    pub fn secret_store_default(&self) -> Option<BoundSecretStore> {
+        self.request
+            .extensions()
+            .get::<SecretRegistry>()
+            .and_then(StoreRegistry::default)
     }
 }
 
@@ -171,43 +225,9 @@ mod tests {
         PathParams::new(inner)
     }
 
-    #[test]
-    fn config_store_is_retrieved_when_present() {
-        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
-        use std::sync::Arc;
-
-        struct FixedStore;
-        impl ConfigStore for FixedStore {
-            fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
-                Ok(Some("value".to_owned()))
-            }
-        }
-
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/config")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(ConfigStoreHandle::new(Arc::new(FixedStore)));
-
-        let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.config_store().is_some());
-        assert_eq!(
-            ctx.config_store()
-                .unwrap()
-                .get("any")
-                .expect("config value"),
-            Some("value".to_owned())
-        );
-    }
-
-    #[test]
-    fn config_store_returns_none_when_absent() {
-        let ctx = ctx("/test", Body::empty(), PathParams::default());
-        assert!(ctx.config_store().is_none());
-    }
+    // `RequestContext::config_handle()` was removed. The
+    // present/absent behaviour is now covered by
+    // `config_store_*` tests against a wired `ConfigRegistry`.
 
     #[test]
     fn form_deserialises_successfully() {
@@ -324,29 +344,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn kv_handle_is_retrieved_when_present() {
-        use crate::key_value_store::{KvHandle, NoopKvStore};
-        use std::sync::Arc;
-
-        let mut request = request_builder()
-            .method(Method::GET)
-            .uri("/kv")
-            .body(Body::empty())
-            .expect("request");
-        request
-            .extensions_mut()
-            .insert(KvHandle::new(Arc::new(NoopKvStore)));
-
-        let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.kv_handle().is_some());
-    }
-
-    #[test]
-    fn kv_handle_returns_none_when_absent() {
-        let ctx = ctx("/test", Body::empty(), PathParams::default());
-        assert!(ctx.kv_handle().is_none());
-    }
+    // `RequestContext::kv_handle()` was removed. The
+    // present/absent behaviour is now covered by `kv_store_*`
+    // tests against a wired `KvRegistry`.
 
     #[test]
     fn path_deserialises_successfully() {
@@ -427,8 +427,164 @@ mod tests {
         assert_eq!(request.uri().path(), "/items/123");
     }
 
+    // `RequestContext::secret_handle()` was removed. The
+    // present/absent behaviour is now covered by `secret_store_*`
+    // tests against a wired `SecretRegistry`.
+
     #[test]
-    fn secret_handle_is_retrieved_when_present() {
+    fn kv_store_resolves_named_handle_from_registry() {
+        use crate::key_value_store::{KvHandle, NoopKvStore};
+        use crate::store_registry::{KvRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let sessions = KvHandle::new(Arc::new(NoopKvStore));
+        let cache = KvHandle::new(Arc::new(NoopKvStore));
+        let by_id: BTreeMap<String, KvHandle> = [
+            ("sessions".to_owned(), sessions),
+            ("cache".to_owned(), cache),
+        ]
+        .into_iter()
+        .collect();
+        let registry: KvRegistry = StoreRegistry::new(by_id, "sessions".to_owned());
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(ctx.kv_store("sessions").is_some());
+        assert!(ctx.kv_store("cache").is_some());
+        assert!(
+            ctx.kv_store("unknown").is_none(),
+            "registry lookups are strict: unknown ids must yield None"
+        );
+        assert!(ctx.kv_store_default().is_some());
+    }
+
+    #[test]
+    fn kv_store_returns_none_when_only_legacy_handle_wired() {
+        // Hard-cutoff: a bare `KvHandle` in extensions
+        // is ignored by the registry-aware accessor. Adapter
+        // dispatchers no longer insert bare handles — they
+        // always synthesise a `KvRegistry` from any wired handle
+        // first — so this code path only fires when a test or
+        // callsite bypasses the dispatcher and inserts a bare
+        // handle directly into extensions. The accessor must
+        // surface that as a missing registry (None) rather than
+        // silently upgrading.
+        use crate::key_value_store::{KvHandle, NoopKvStore};
+        use std::sync::Arc;
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/kv")
+            .body(Body::empty())
+            .expect("request");
+        request
+            .extensions_mut()
+            .insert(KvHandle::new(Arc::new(NoopKvStore)));
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        assert!(
+            ctx.kv_store("anything").is_none(),
+            "registry-aware accessor must not auto-upgrade a bare handle"
+        );
+        assert!(
+            ctx.kv_store_default().is_none(),
+            "registry-aware default accessor must not auto-upgrade a bare handle"
+        );
+    }
+
+    #[test]
+    fn config_store_resolves_named_handle_from_registry() {
+        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+        use crate::store_registry::{ConfigRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        struct FixedStore(&'static str);
+        #[async_trait(?Send)]
+        impl ConfigStore for FixedStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(Some(self.0.to_owned()))
+            }
+        }
+
+        let primary_handle = ConfigStoreHandle::new(Arc::new(FixedStore("primary")));
+        let analytics_handle = ConfigStoreHandle::new(Arc::new(FixedStore("analytics")));
+        let by_id: BTreeMap<String, ConfigStoreHandle> = [
+            ("primary".to_owned(), primary_handle),
+            ("analytics".to_owned(), analytics_handle),
+        ]
+        .into_iter()
+        .collect();
+        let registry: ConfigRegistry = StoreRegistry::new(by_id, "primary".to_owned());
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let resolved = ctx.config_store("analytics").expect("analytics handle");
+        assert_eq!(
+            block_on(resolved.get("key")).expect("config value"),
+            Some("analytics".to_owned())
+        );
+        assert!(ctx.config_store("unknown").is_none());
+        let default = ctx.config_store_default().expect("default handle");
+        assert_eq!(
+            block_on(default.get("key")).expect("default config value"),
+            Some("primary".to_owned())
+        );
+    }
+
+    #[test]
+    fn secret_store_resolves_named_handle_from_registry() {
+        use crate::secret_store::{NoopSecretStore, SecretHandle};
+        use crate::store_registry::{BoundSecretStore, SecretRegistry, StoreRegistry};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        let handle = SecretHandle::new(Arc::new(NoopSecretStore));
+        let by_id: BTreeMap<String, BoundSecretStore> = [(
+            "default".to_owned(),
+            // The registry binds the logical id to the platform store name —
+            // in production that's `EDGEZERO__STORES__SECRETS__DEFAULT__NAME`
+            // resolved against the env (falling back to the logical id).
+            BoundSecretStore::new(handle, "platform-secret-store".to_owned()),
+        )]
+        .into_iter()
+        .collect();
+        let registry: SecretRegistry = StoreRegistry::new(by_id, "default".to_owned());
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/secrets")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let bound = ctx.secret_store("default").expect("default bound store");
+        assert_eq!(bound.store_name(), "platform-secret-store");
+        assert!(ctx.secret_store("unknown").is_none());
+        assert!(ctx.secret_store_default().is_some());
+    }
+
+    #[test]
+    fn secret_store_default_returns_none_when_only_legacy_handle_wired() {
+        // Hard-cutoff: same semantics as
+        // `kv_store_returns_none_when_only_legacy_handle_wired` —
+        // a bare `SecretHandle` in extensions (a state that
+        // only arises if a test bypasses the dispatcher) must
+        // not auto-upgrade into a synthetic registry.
         use crate::secret_store::{NoopSecretStore, SecretHandle};
         use std::sync::Arc;
 
@@ -442,12 +598,9 @@ mod tests {
             .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
-        assert!(ctx.secret_handle().is_some());
-    }
-
-    #[test]
-    fn secret_handle_returns_none_when_absent() {
-        let ctx = ctx("/test", Body::empty(), PathParams::default());
-        assert!(ctx.secret_handle().is_none());
+        assert!(
+            ctx.secret_store_default().is_none(),
+            "registry-aware default accessor must not auto-upgrade a bare handle"
+        );
     }
 }

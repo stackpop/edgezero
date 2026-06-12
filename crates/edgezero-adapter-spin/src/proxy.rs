@@ -1,13 +1,13 @@
 use crate::decompress::decompress_body;
 use crate::response::collect_body_bytes;
 use async_trait::async_trait;
+use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderName, HeaderValue, Method as CoreMethod, StatusCode};
+use edgezero_core::http::{header, HeaderValue};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse, PROXY_HEADER};
-use spin_sdk::http::{
-    send, Method as SpinMethod, Request as SpinRequest, Response as SpinResponse,
-};
+use spin_sdk::http::body::IncomingBodyExt as _;
+use spin_sdk::http::{send, FullBody, Request as SpinRequest};
 
 /// A proxy client that uses Spin's outbound HTTP (`spin_sdk::http::send`)
 /// to forward requests to upstream services.
@@ -19,64 +19,43 @@ impl ProxyClient for SpinProxyClient {
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _extensions) = request.into_parts();
 
-        let mut builder = SpinRequest::builder();
-        builder
-            .method(into_spin_method(&method))
-            .uri(uri.to_string());
+        let mut builder = SpinRequest::builder().method(method).uri(uri.to_string());
 
-        // Spin's WASI HTTP interface requires string-typed header values,
-        // so non-UTF-8 values cannot be forwarded and are dropped with a warning.
         for (name, value) in &headers {
-            if let Ok(text) = value.to_str() {
-                builder.header(name.as_str(), text);
-            } else {
-                log::warn!(
-                    "dropping non-UTF-8 proxy request header (Spin WASI limitation): {name}"
-                );
-            }
+            builder = builder.header(name, value);
         }
 
-        let body_bytes = collect_body_bytes(body).await?;
+        let request_body_bytes = collect_body_bytes(body).await?;
 
-        builder.body(body_bytes);
-        let spin_request = builder.build();
+        let spin_request = builder
+            .body(FullBody::new(Bytes::from(request_body_bytes)))
+            .map_err(|err| {
+                EdgeError::internal(anyhow::anyhow!("failed to build proxy request: {err}"))
+            })?;
 
-        let spin_response: SpinResponse = send(spin_request).await.map_err(|err| {
+        let spin_response = send(spin_request).await.map_err(|err| {
             EdgeError::internal(anyhow::anyhow!("Spin outbound HTTP error: {err}"))
         })?;
 
-        let status = StatusCode::from_u16(*spin_response.status())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let (response_parts, response_body) = spin_response.into_parts();
 
-        // Collect response headers before consuming the body.
-        let mut response_headers = Vec::new();
-        for (name, value) in spin_response.headers() {
-            let Ok(hname) = HeaderName::from_bytes(name.as_bytes()) else {
-                log::warn!("dropping invalid proxy response header name: {name}");
-                continue;
-            };
-            match HeaderValue::from_bytes(value.as_bytes()) {
-                Ok(hval) => response_headers.push((hname, hval)),
-                Err(_) => {
-                    log::warn!("dropping invalid proxy response header value for: {name}");
-                }
-            }
-        }
-
-        // Check Content-Encoding for decompression, matching the
-        // Fastly/Cloudflare adapter contract.
-        let encoding = response_headers
-            .iter()
-            .find(|(name, _)| *name == header::CONTENT_ENCODING)
-            .and_then(|(_, value)| value.to_str().ok())
+        let encoding = response_parts
+            .headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
             .map(str::to_ascii_lowercase);
 
-        let response_body = spin_response.into_body();
-        let decompressed = decompress_body(response_body, encoding.as_deref())?;
-        let mut proxy_response = ProxyResponse::new(status, Body::from(decompressed));
+        let response_body_bytes = response_body.bytes().await.map_err(|err| {
+            EdgeError::internal(anyhow::anyhow!("failed to read proxy response body: {err}"))
+        })?;
+        let decompressed = decompress_body(response_body_bytes.to_vec(), encoding.as_deref())?;
+        let mut proxy_response =
+            ProxyResponse::new(response_parts.status, Body::from(decompressed));
 
-        for (name, value) in response_headers {
-            proxy_response.headers_mut().insert(name, value);
+        for (name, value) in &response_parts.headers {
+            proxy_response
+                .headers_mut()
+                .insert(name.clone(), value.clone());
         }
 
         // Strip encoding headers after decompression so downstream
@@ -89,27 +68,12 @@ impl ProxyClient for SpinProxyClient {
         }
 
         // `HeaderValue::from_static("spin")` is infallible at compile time so
-        // it cannot panic at runtime — the previous `.parse().expect(...)` had
-        // the same effective behaviour but tripped expect_used.
+        // it cannot panic at runtime — replaces the previous
+        // `.parse().expect(...)` which tripped expect_used under restriction.
         proxy_response
             .headers_mut()
             .insert(PROXY_HEADER, HeaderValue::from_static("spin"));
 
         Ok(proxy_response)
-    }
-}
-
-fn into_spin_method(method: &CoreMethod) -> SpinMethod {
-    match method.clone() {
-        CoreMethod::GET => SpinMethod::Get,
-        CoreMethod::POST => SpinMethod::Post,
-        CoreMethod::PUT => SpinMethod::Put,
-        CoreMethod::DELETE => SpinMethod::Delete,
-        CoreMethod::PATCH => SpinMethod::Patch,
-        CoreMethod::HEAD => SpinMethod::Head,
-        CoreMethod::OPTIONS => SpinMethod::Options,
-        CoreMethod::CONNECT => SpinMethod::Connect,
-        CoreMethod::TRACE => SpinMethod::Trace,
-        other => SpinMethod::Other(other.to_string()),
     }
 }

@@ -1,7 +1,9 @@
-use std::env;
 use std::fs;
+#[cfg(test)]
+use std::iter;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
 use std::sync::Arc;
 
 use anyhow::Context as _;
@@ -12,14 +14,18 @@ use tokio::signal;
 use tower::{service_fn, Service as _};
 
 use edgezero_core::addr;
-use edgezero_core::app::{Hooks, AXUM_ADAPTER};
+use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::config_store::ConfigStoreHandle;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::key_value_store::KvHandle;
-use edgezero_core::manifest::{Manifest, ManifestLoader, DEFAULT_KV_STORE_NAME};
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
+use edgezero_core::store_registry::{
+    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+};
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
+use std::collections::BTreeMap;
 
 use crate::config_store::AxumConfigStore;
 use crate::key_value_store::PersistentKvStore;
@@ -51,15 +57,15 @@ impl Default for AxumDevServerConfig {
 
 /// Optional store handles attached to every request processed by the dev server.
 ///
-/// Build with struct init and `..Default::default()` for the fields you do not need:
-///
-/// ```rust,ignore
-/// let stores = Stores { kv: Some(kv_handle), ..Default::default() };
-/// ```
+/// Both single-handle fields and registry fields can be set; the service inserts
+/// whichever are present. Registries take precedence in `RequestContext`.
 #[derive(Default)]
 struct Stores {
+    config_registry: Option<ConfigRegistry>,
     config_store: Option<ConfigStoreHandle>,
     kv: Option<KvHandle>,
+    kv_registry: Option<KvRegistry>,
+    secret_registry: Option<SecretRegistry>,
     secrets: Option<SecretHandle>,
 }
 
@@ -135,6 +141,13 @@ impl AxumDevServer {
 
     #[must_use]
     #[inline]
+    pub fn with_config_registry(mut self, registry: ConfigRegistry) -> Self {
+        self.stores.config_registry = Some(registry);
+        self
+    }
+
+    #[must_use]
+    #[inline]
     pub fn with_config_store(mut self, handle: ConfigStoreHandle) -> Self {
         self.stores.config_store = Some(handle);
         self
@@ -151,6 +164,14 @@ impl AxumDevServer {
         self
     }
 
+    /// Attach an id-keyed KV registry to the dev server.
+    #[must_use]
+    #[inline]
+    pub fn with_kv_registry(mut self, registry: KvRegistry) -> Self {
+        self.stores.kv_registry = Some(registry);
+        self
+    }
+
     /// Attach a secret store to the dev server.
     ///
     /// The handle is shared across all requests, making the `Secrets` extractor
@@ -161,10 +182,18 @@ impl AxumDevServer {
         self.stores.secrets = Some(handle);
         self
     }
+
+    /// Attach an id-keyed secret registry to the dev server.
+    #[must_use]
+    #[inline]
+    pub fn with_secret_registry(mut self, registry: SecretRegistry) -> Self {
+        self.stores.secret_registry = Some(registry);
+        self
+    }
 }
 
-fn kv_init_requirement(manifest: &Manifest) -> KvInitRequirement {
-    if manifest.stores.kv.is_some() {
+fn kv_init_requirement(stores: StoresMetadata) -> KvInitRequirement {
+    if stores.kv.is_some() {
         KvInitRequirement::Required
     } else {
         KvInitRequirement::Optional
@@ -172,10 +201,12 @@ fn kv_init_requirement(manifest: &Manifest) -> KvInitRequirement {
 }
 
 fn kv_store_path(store_name: &str) -> PathBuf {
-    if store_name == DEFAULT_KV_STORE_NAME {
-        return PathBuf::from(".edgezero/kv.redb");
-    }
-
+    // Every declared id gets its own slug-based filename. The
+    // pre-rewrite hard-coded `.edgezero/kv.redb` shortcut for
+    // store_name == "EDGEZERO_KV" is gone -- the runtime no longer
+    // hands out a default name; if you reach here you have a real
+    // declared id and the slug encoding handles every shape
+    // uniformly.
     PathBuf::from(".edgezero").join(format!(
         "kv-{}-{:016x}.redb",
         store_name_slug(store_name),
@@ -248,11 +279,20 @@ async fn serve_with_stores(
 ) -> anyhow::Result<()> {
     let service = {
         let mut service = EdgeZeroAxumService::new(router);
+        if let Some(registry) = stores.config_registry {
+            service = service.with_config_registry(registry);
+        }
         if let Some(handle) = stores.config_store {
             service = service.with_config_store_handle(handle);
         }
+        if let Some(registry) = stores.kv_registry {
+            service = service.with_kv_registry(registry);
+        }
         if let Some(handle) = stores.kv {
             service = service.with_kv_handle(handle);
+        }
+        if let Some(registry) = stores.secret_registry {
+            service = service.with_secret_registry(registry);
         }
         if let Some(handle) = stores.secrets {
             service = service.with_secret_handle(handle);
@@ -280,28 +320,29 @@ async fn serve_with_stores(
     Ok(())
 }
 
+/// Entry point for an Axum dev-server application.
+///
+/// Portable store config is baked into `A` by the `app!` macro; adapter-specific
+/// values (platform store names, bind host/port, logging level) are read at
+/// runtime from `EDGEZERO__*` environment variables. No `edgezero.toml` is
+/// required.
+///
 /// # Errors
 /// Returns an error if the dev server fails to bind or any required store handle cannot be initialised.
 #[inline]
-pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
-    let manifest = ManifestLoader::try_load_from_str(manifest_src)?;
-    let manifest_data = manifest.manifest();
-    let logging = manifest_data.logging_or_default(AXUM_ADAPTER);
-    let kv_init_requirement = kv_init_requirement(manifest_data);
-    let kv_store_name = manifest_data.kv_store_name(AXUM_ADAPTER).to_owned();
-    let kv_path = kv_store_path(&kv_store_name);
-    let has_secret_store = manifest_data.secret_store_enabled("axum");
+pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
+    let env = EnvConfig::from_env();
+    let stores = A::stores();
+    let kv_init_requirement = kv_init_requirement(stores);
 
-    let configured_level: LevelFilter = logging.level.into();
-    let level = if logging.echo_stdout.unwrap_or(true) {
-        configured_level
-    } else {
-        LevelFilter::Off
-    };
+    let level = env
+        .logging_level()
+        .and_then(|raw| LevelFilter::from_str(raw).ok())
+        .unwrap_or(LevelFilter::Info);
 
     let _logger_init = SimpleLogger::new().with_level(level).init();
 
-    let resolution = resolve_addr(manifest_data);
+    let resolution = resolve_addr(&env);
     for warning in &resolution.warnings {
         log::warn!("{warning}");
     }
@@ -325,74 +366,144 @@ pub fn run_app<A: Hooks>(manifest_src: &str) -> anyhow::Result<()> {
         let listener = TokioTcpListener::from_std(std_listener)
             .context("failed to adopt std listener into tokio")?;
 
-        let kv_handle = match kv_handle_from_path(&kv_path) {
-            Ok(handle) => Some(handle),
-            Err(err) => {
-                match kv_init_requirement {
-                    KvInitRequirement::Optional => {
-                        log::warn!(
-                            "KV store '{}' could not be initialized at {}: {}",
-                            kv_store_name,
-                            kv_path.display(),
-                            err
-                        );
-                        None
-                    }
-                    KvInitRequirement::Required => {
-                        return Err(err.context(format!(
-                            "KV store '{}' is explicitly configured for axum but could not be initialized at {}",
-                            kv_store_name,
-                            kv_path.display()
-                        )));
-                    }
-                }
-            }
+        let kv_registry = build_kv_registry(stores.kv, &env, kv_init_requirement)?;
+        let config_registry = build_config_registry(stores.config);
+        let secret_registry = build_secret_registry(stores.secrets, &env);
+
+        let request_stores = Stores {
+            config_registry,
+            kv_registry,
+            secret_registry,
+            ..Stores::default()
         };
-        // Axum always resolves the config store from the manifest only.
-        // Unlike Fastly and Cloudflare, it does not check A::config_store() first.
-        // If a user implements Hooks::config_store() without a [stores.config] section
-        // in edgezero.toml, the override is silently ignored on Axum.
-        if A::config_store().is_some() && manifest_data.stores.config.is_none() {
-            log::warn!("A::config_store() is set but [stores.config] is missing in the manifest. This override is ignored on Axum.");
-        }
-        let config_store_handle = manifest_data.stores.config.as_ref().map(|cfg| {
-            let defaults = cfg.config_store_defaults().clone();
-            let store = AxumConfigStore::from_env(defaults);
-            ConfigStoreHandle::new(Arc::new(store))
-        });
-        let secret = has_secret_store.then(||  { log::info!("Secret store: reading from environment variables"); SecretHandle::new(Arc::new(
-                EnvSecretStore::new(),
-            )) });
-        let stores = Stores {
-            config_store: config_store_handle,
-            kv: kv_handle,
-            secrets: secret,
-        };
-        serve_with_stores(router, listener, true, stores).await
+        serve_with_stores(router, listener, true, request_stores).await
     })
 }
 
-/// Resolve the bind address from environment variables and manifest config.
+/// Build the per-request KV registry from baked store metadata.
 ///
-/// Precedence (highest wins):
-/// 1. `EDGEZERO_HOST` / `EDGEZERO_PORT` environment variables
-/// 2. `[adapters.axum.adapter]` host/port in the manifest
-/// 3. Default: `127.0.0.1:8787`
-pub(crate) fn resolve_addr(manifest: &Manifest) -> addr::BindAddrResolution {
-    let env_host = env::var("EDGEZERO_HOST").ok();
-    let env_port = env::var("EDGEZERO_PORT").ok();
-    resolve_addr_from_parts(manifest, env_host.as_deref(), env_port.as_deref())
+/// Each declared id resolves to a [`PersistentKvStore`] at
+/// `.edgezero/kv-<slug>-<hash>.redb`, where the file name is derived from the
+/// platform store name (`EDGEZERO__STORES__KV__<ID>__NAME` or the id default).
+fn build_kv_registry(
+    kv_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+    init: KvInitRequirement,
+) -> anyhow::Result<Option<KvRegistry>> {
+    let Some(meta) = kv_meta else {
+        return Ok(None);
+    };
+
+    let mut by_id: BTreeMap<String, KvHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let store_name = env.store_name("kv", id);
+        let kv_path = kv_store_path(&store_name);
+        let handle = match kv_handle_from_path(&kv_path) {
+            Ok(handle) => handle,
+            Err(err) => match init {
+                KvInitRequirement::Optional => {
+                    log::warn!(
+                        "KV store '{}' (id `{}`) could not be initialized at {}: {}",
+                        store_name,
+                        id,
+                        kv_path.display(),
+                        err
+                    );
+                    continue;
+                }
+                KvInitRequirement::Required => {
+                    return Err(err.context(format!(
+                        "KV store '{}' (id `{}`) is explicitly configured for axum but could not be initialized at {}",
+                        store_name,
+                        id,
+                        kv_path.display()
+                    )));
+                }
+            },
+        };
+        by_id.insert((*id).to_owned(), handle);
+    }
+
+    let default_id = meta.default.to_owned();
+    if !by_id.contains_key(&default_id) {
+        log::warn!(
+            "KV registry default id `{default_id}` failed to initialize; dropping the KV registry — \
+             handlers will see no KV store"
+        );
+    }
+    Ok(StoreRegistry::from_parts(by_id, default_id))
 }
 
-fn resolve_addr_from_parts(
-    manifest: &Manifest,
-    env_host: Option<&str>,
-    env_port: Option<&str>,
-) -> addr::BindAddrResolution {
-    let adapter = manifest.adapters.get("axum");
-    let config_host = adapter.and_then(|entry| entry.adapter.host.as_deref());
-    let config_port = adapter.and_then(|entry| entry.adapter.port);
-    addr::resolve_bind_addr(env_host, env_port, config_host, config_port)
+/// Build the per-request config registry from the per-id local-file stores.
+///
+/// Each declared id reads `.edgezero/local-config-<id>.json`. A missing
+/// file yields an empty store for that id — the dev server stays usable
+/// before any `config push` has populated the file. A malformed file logs a
+/// warning and the id is dropped from the registry rather than failing
+/// startup, matching the cloudflare config-binding behaviour.
+fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
+    let meta = config_meta?;
+    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    for id in meta.ids {
+        let store = match AxumConfigStore::from_local_file(id) {
+            Ok(store) => store,
+            Err(err) => {
+                log::warn!(
+                    "config store for id `{}` could not be loaded from {}: {}; \
+                     dropping this id from the registry",
+                    id,
+                    AxumConfigStore::local_path(id).display(),
+                    err
+                );
+                continue;
+            }
+        };
+        by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+    }
+    let default_id = meta.default.to_owned();
+    if !by_id.contains_key(&default_id) {
+        log::warn!(
+            "config registry default id `{default_id}` failed to load; dropping the config registry — \
+             handlers will see no config store"
+        );
+    }
+    StoreRegistry::from_parts(by_id, default_id)
+}
+
+/// Build the per-request secret registry. Axum is `Single` for secrets — every
+/// declared id maps to the same env-backed [`EnvSecretStore`]. Each binding
+/// captures the platform store name resolved from
+/// `EDGEZERO__STORES__SECRETS__<ID>__NAME` (defaulting to the logical id);
+/// the axum env-secret backend ignores the name on lookup, so the binding
+/// is observable only via [`BoundSecretStore::store_name`].
+fn build_secret_registry(
+    secret_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Option<SecretRegistry> {
+    let meta = secret_meta?;
+    log::info!("Secret store: reading from environment variables");
+    let handle = SecretHandle::new(Arc::new(EnvSecretStore::new()));
+    let mut by_id: BTreeMap<String, BoundSecretStore> = BTreeMap::new();
+    for id in meta.ids {
+        let store_name = env.store_name("secrets", id);
+        by_id.insert(
+            (*id).to_owned(),
+            BoundSecretStore::new(handle.clone(), store_name),
+        );
+    }
+    // Secret backends are infallible here, so the default id is always
+    // present in `by_id`; `from_parts` keeps the API symmetric with the
+    // KV / config builders without changing observable behaviour.
+    StoreRegistry::from_parts(by_id, meta.default.to_owned())
+}
+
+/// Resolve the bind address from `EDGEZERO__ADAPTER__*` environment config.
+///
+/// Precedence (highest wins):
+/// 1. `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`
+/// 2. Default: `127.0.0.1:8787`
+pub(crate) fn resolve_addr(env: &EnvConfig) -> addr::BindAddrResolution {
+    addr::resolve_bind_addr(env.adapter_host(), env.adapter_port(), None, None)
 }
 
 #[cfg(test)]
@@ -458,34 +569,51 @@ mod tests {
     }
 
     #[test]
-    fn default_store_name_uses_legacy_kv_path() {
-        assert_eq!(
-            kv_store_path(DEFAULT_KV_STORE_NAME),
-            PathBuf::from(".edgezero/kv.redb")
+    fn every_store_name_gets_a_slug_based_path() {
+        // The pre-rewrite shortcut hard-coded `.edgezero/kv.redb`
+        // when the store name equalled the legacy `EDGEZERO_KV`
+        // constant. Hard cutoff: now every name -- including any
+        // historical value an operator might still set -- flows
+        // through the slug+hash encoder, so no name gets a
+        // special shortcut path.
+        let legacy = kv_store_path("EDGEZERO_KV");
+        assert_ne!(
+            legacy,
+            PathBuf::from(".edgezero/kv.redb"),
+            "post-cutoff: the legacy default name no longer gets the bare `kv.redb` shortcut: {legacy:?}"
         );
+        assert!(
+            legacy.to_string_lossy().starts_with(".edgezero/kv-"),
+            "legacy name still gets a slug-based path: {legacy:?}"
+        );
+        let custom = kv_store_path("sessions");
+        assert!(
+            custom.to_string_lossy().contains("sessions"),
+            "regular name gets a slug-based filename: {custom:?}"
+        );
+        assert_ne!(legacy, custom);
     }
 
     #[test]
     fn implicit_default_kv_is_optional() {
-        let manifest = ManifestLoader::load_from_str("");
         assert_eq!(
-            kv_init_requirement(manifest.manifest()),
+            kv_init_requirement(StoresMetadata::default()),
             KvInitRequirement::Optional
         );
     }
 
     #[test]
     fn explicit_kv_config_is_required() {
-        let manifest = ManifestLoader::load_from_str(
-            r#"
-[stores.kv]
-name = "EDGEZERO_KV"
-"#,
-        );
-        assert_eq!(
-            kv_init_requirement(manifest.manifest()),
-            KvInitRequirement::Required
-        );
+        use edgezero_core::app::StoreMetadata;
+
+        let stores = StoresMetadata {
+            kv: Some(StoreMetadata {
+                default: "edgezero_kv",
+                ids: &["edgezero_kv"],
+            }),
+            ..StoresMetadata::default()
+        };
+        assert_eq!(kv_init_requirement(stores), KvInitRequirement::Required);
     }
 
     #[test]
@@ -521,74 +649,39 @@ name = "EDGEZERO_KV"
     }
 
     #[test]
-    fn resolve_addr_defaults_without_manifest_config() {
-        // Note: env var tests use resolve_addr_from_parts to avoid races.
-        let loader = ManifestLoader::load_from_str("");
-        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+    fn resolve_addr_defaults_without_env_config() {
+        let empty: [(&str, &str); 0] = [];
+        let resolution = resolve_addr(&EnvConfig::from_vars(empty));
         assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
         assert!(resolution.warnings.is_empty());
     }
 
     #[test]
-    fn resolve_addr_reads_manifest_host_and_port() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "0.0.0.0"
-port = 3000
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+    fn resolve_addr_reads_env_host_and_port() {
+        let env = EnvConfig::from_vars([
+            ("EDGEZERO__ADAPTER__HOST", "0.0.0.0"),
+            ("EDGEZERO__ADAPTER__PORT", "3000"),
+        ]);
+        let resolution = resolve_addr(&env);
         assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 3000)));
         assert!(resolution.warnings.is_empty());
     }
 
     #[test]
-    fn resolve_addr_env_overrides_manifest() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "127.0.0.1"
-port = 3000
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), Some("4000"));
-        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 4000)));
-        assert!(resolution.warnings.is_empty());
-    }
-
-    #[test]
     fn resolve_addr_partial_env_override() {
-        let manifest = "
-[adapters.axum.adapter]
-port = 5000
-";
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), Some("0.0.0.0"), None);
-        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
+        let env = EnvConfig::from_vars([("EDGEZERO__ADAPTER__HOST", "0.0.0.0")]);
+        let resolution = resolve_addr(&env);
+        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 8787)));
         assert!(resolution.warnings.is_empty());
     }
 
     #[test]
-    fn resolve_addr_invalid_env_falls_back_to_manifest() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "0.0.0.0"
-port = 5000
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), Some("not-an-ip"), Some("abc"));
-        assert_eq!(resolution.addr, SocketAddr::from(([0, 0, 0, 0], 5000)));
-        assert_eq!(resolution.warnings.len(), 2);
-    }
-
-    #[test]
-    fn resolve_addr_invalid_manifest_falls_back_to_default() {
-        let manifest = r#"
-[adapters.axum.adapter]
-host = "localhost"
-port = 0
-"#;
-        let loader = ManifestLoader::load_from_str(manifest);
-        let resolution = resolve_addr_from_parts(loader.manifest(), None, None);
+    fn resolve_addr_invalid_env_falls_back_to_default() {
+        let env = EnvConfig::from_vars([
+            ("EDGEZERO__ADAPTER__HOST", "not-an-ip"),
+            ("EDGEZERO__ADAPTER__PORT", "abc"),
+        ]);
+        let resolution = resolve_addr(&env);
         assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
         assert_eq!(resolution.warnings.len(), 2);
     }
@@ -603,7 +696,6 @@ mod integration_tests {
     use edgezero_core::extractor::Secrets;
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::SecretHandle as CoreSecretHandle;
-    use std::iter;
     use std::time::{Duration, Instant};
     use tokio::task::{spawn_blocking, JoinHandle};
     use tokio::time::sleep;
@@ -780,13 +872,13 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_persists_across_requests() {
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let store = ctx.kv_handle().expect("kv configured");
+            let store = ctx.kv_store_default().expect("kv configured");
             store.put("counter", &42_i32).await?;
             Ok("written")
         }
 
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let store = ctx.kv_handle().expect("kv configured");
+            let store = ctx.kv_store_default().expect("kv configured");
             let val: i32 = store.get_or("counter", 0_i32).await?;
             Ok(val.to_string())
         }
@@ -819,19 +911,19 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_delete_across_requests() {
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             kv.put("temp", &"to_delete").await?;
             Ok("written")
         }
 
         async fn delete_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             kv.delete("temp").await?;
             Ok("deleted")
         }
 
         async fn check_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let exists = kv.exists("temp").await?;
             Ok(format!("exists={exists}"))
         }
@@ -869,7 +961,7 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_update_across_requests() {
         async fn increment_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let val = kv
                 .read_modify_write("counter", 0_i32, |n| n + 1_i32)
                 .await?;
@@ -899,7 +991,7 @@ mod integration_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn kv_store_returns_not_found_gracefully() {
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let val: i32 = kv.get_or("nonexistent", -1_i32).await?;
             Ok(val.to_string())
         }
@@ -928,7 +1020,7 @@ mod integration_tests {
         }
 
         async fn write_handler(ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let profile = UserProfile {
                 name: "Alice".to_owned(),
                 age: 30,
@@ -939,7 +1031,7 @@ mod integration_tests {
         }
 
         async fn read_handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let kv = ctx.kv_handle().expect("kv configured");
+            let kv = ctx.kv_store_default().expect("kv configured");
             let profile: Option<UserProfile> = kv.get("user:alice").await?;
             match profile {
                 Some(found) => Ok(format!("{}:{}", found.name, found.age)),
@@ -999,11 +1091,11 @@ mod integration_tests {
     }
 
     #[action]
-    async fn secret_value_handler(Secrets(store): Secrets) -> Result<String, EdgeError> {
-        store
-            .require_str("test-store", "API_KEY")
-            .await
-            .map_err(EdgeError::from)
+    async fn secret_value_handler(secrets: Secrets) -> Result<String, EdgeError> {
+        let store = secrets
+            .default()
+            .ok_or_else(|| EdgeError::service_unavailable("no default secret store registered"))?;
+        store.require_str("API_KEY").await.map_err(EdgeError::from)
     }
 
     // -----------------------------------------------------------------------
@@ -1018,8 +1110,10 @@ mod integration_tests {
         let router = RouterService::builder()
             .get("/secret", secret_value_handler)
             .build();
-        let store =
-            InMemorySecretStore::new([("test-store/API_KEY", bytes::Bytes::from("s3cr3t"))]);
+        // The legacy single-handle wiring binds under `"default"` (see
+        // `Secrets::from_request` fallback), so the in-memory store is
+        // keyed under that prefix.
+        let store = InMemorySecretStore::new([("default/API_KEY", bytes::Bytes::from("s3cr3t"))]);
         let handle = SecretHandle::new(Arc::new(store));
         let server = start_test_server_with_store_handle(router, Some(handle)).await;
 

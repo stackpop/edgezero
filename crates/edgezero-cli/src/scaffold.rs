@@ -79,6 +79,11 @@ pub fn register_templates(hbs: &mut Handlebars) {
         include_str!("templates/root/clippy.toml.hbs"),
     )
     .expect("compiled-in template is valid");
+    hbs.register_template_string(
+        "root_tool_versions",
+        include_str!("templates/root/tool-versions.hbs"),
+    )
+    .expect("compiled-in template is valid");
     // Core
     hbs.register_template_string(
         "core_Cargo_toml",
@@ -93,6 +98,25 @@ pub fn register_templates(hbs: &mut Handlebars) {
     hbs.register_template_string(
         "core_src_handlers_rs",
         include_str!("templates/core/src/handlers.rs.hbs"),
+    )
+    .expect("compiled-in template is valid");
+    hbs.register_template_string(
+        "core_src_config_rs",
+        include_str!("templates/core/src/config.rs.hbs"),
+    )
+    .expect("compiled-in template is valid");
+    // App-config (`<name>.toml`)
+    hbs.register_template_string("app_name_toml", include_str!("templates/app/name.toml.hbs"))
+        .expect("compiled-in template is valid");
+    // CLI
+    hbs.register_template_string(
+        "cli_Cargo_toml",
+        include_str!("templates/cli/Cargo.toml.hbs"),
+    )
+    .expect("compiled-in template is valid");
+    hbs.register_template_string(
+        "cli_src_main_rs",
+        include_str!("templates/cli/src/main.rs.hbs"),
     )
     .expect("compiled-in template is valid");
     // Adapter-specific templates
@@ -135,6 +159,11 @@ pub fn resolve_dep_line(
         if let Some(rel) = relative_to(workspace_dir, repo_root) {
             let dep_path = Path::new(&rel).join(repo_rel_crate);
             format!("{} = {{ path = \"{}\" }}", crate_name, dep_path.display())
+        } else if let Ok(absolute) = fs::canonicalize(&candidate) {
+            // The output directory is outside the edgezero checkout, so a
+            // relative path cannot be expressed cleanly. Depend on the local
+            // crate by absolute path rather than falling back to Git.
+            format!("{} = {{ path = \"{}\" }}", crate_name, absolute.display())
         } else {
             fallback.to_owned()
         }
@@ -161,21 +190,35 @@ pub fn resolve_dep_line(
     }
 }
 
+/// Normalise an arbitrary project name into a valid Cargo package name.
+///
+/// ASCII letters are lower-cased (so `MyApp` becomes `myapp`, not the
+/// invalid `-y-pp`); `-` and `_` are kept; every other character collapses
+/// to a single `-`. Leading separators are dropped and trailing separators
+/// trimmed, so the result never starts or ends with `-`/`_`. A digit-leading
+/// result is prefixed with `_`, and an empty result falls back to
+/// `edgezero-app`.
 pub fn sanitize_crate_name(input: &str) -> String {
     let mut out = String::new();
-    for (i, ch) in input.chars().enumerate() {
-        let valid = ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-' || ch == '_';
-        if valid {
-            if i == 0 && ch.is_ascii_digit() {
-                out.push('_');
-            }
-            out.push(ch);
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
         } else {
-            out.push('-');
+            // `-`, `_`, and every other invalid character collapse to a
+            // single separator; leading and doubled separators are dropped.
+            let separator = if ch == '_' { '_' } else { '-' };
+            if !out.is_empty() && !out.ends_with(['-', '_']) {
+                out.push(separator);
+            }
         }
+    }
+    while out.ends_with(['-', '_']) {
+        out.pop();
     }
     if out.is_empty() {
         "edgezero-app".to_owned()
+    } else if out.starts_with(|ch: char| ch.is_ascii_digit()) {
+        format!("_{out}")
     } else {
         out
     }
@@ -219,9 +262,14 @@ mod tests {
             "root_README_md",
             "root_gitignore",
             "root_clippy_toml",
+            "root_tool_versions",
             "core_Cargo_toml",
             "core_src_lib_rs",
             "core_src_handlers_rs",
+            "core_src_config_rs",
+            "cli_Cargo_toml",
+            "cli_src_main_rs",
+            "app_name_toml",
         ] {
             assert!(hbs.has_template(name), "missing template {name}");
         }
@@ -235,5 +283,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitize_crate_name_lowercases_mixed_case() {
+        // Regression: uppercase letters were mangled to `-`, producing the
+        // invalid package name `-y-pp` for `MyApp`.
+        assert_eq!(sanitize_crate_name("MyApp"), "myapp");
+        assert_eq!(sanitize_crate_name("My App"), "my-app");
+    }
+
+    #[test]
+    fn sanitize_crate_name_keeps_valid_separators() {
+        assert_eq!(sanitize_crate_name("my-edge-app"), "my-edge-app");
+        assert_eq!(sanitize_crate_name("my_app"), "my_app");
+    }
+
+    #[test]
+    fn sanitize_crate_name_trims_and_collapses_separators() {
+        assert_eq!(sanitize_crate_name("  spaced  "), "spaced");
+        assert_eq!(sanitize_crate_name("a@@@b"), "a-b");
+        assert_eq!(sanitize_crate_name("-leading-"), "leading");
+    }
+
+    #[test]
+    fn sanitize_crate_name_handles_digit_leading_and_empty() {
+        assert_eq!(sanitize_crate_name("123app"), "_123app");
+        assert_eq!(sanitize_crate_name("!!!"), "edgezero-app");
     }
 }
