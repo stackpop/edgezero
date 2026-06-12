@@ -39,9 +39,6 @@ pub struct NewArgs {
     /// Directory to create the app in (default: current dir).
     #[arg(long)]
     pub dir: Option<String>,
-    /// Force using a local path dependency to edgezero-core (if available).
-    #[arg(long)]
-    pub local_core: bool,
     /// App name (e.g., my-edge-app).
     pub name: String,
 }
@@ -86,6 +83,5 @@ mod tests {
         };
         assert_eq!(new_args.name, "demo-app");
         assert!(new_args.dir.is_none());
-        assert!(!new_args.local_core);
     }
 }

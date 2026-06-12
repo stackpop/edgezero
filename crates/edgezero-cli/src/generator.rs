@@ -667,7 +667,6 @@ mod tests {
         let args = NewArgs {
             name: "demo-app".into(),
             dir: Some(temp.path().to_string_lossy().into_owned()),
-            local_core: false,
         };
 
         generate_new(&args).expect("scaffold succeeds");

@@ -24,7 +24,9 @@ use std::process;
 
 /// CLI output logger: prints `record.args()` verbatim with no timestamps,
 /// levels, or module prefixes — the CLI's output IS the user-facing UX, not a
-/// debug log. `info`/`debug`/`trace` go to stdout, `warn`/`error` to stderr.
+/// debug log. `info` goes to stdout; `warn`/`error` go to stderr. `debug` and
+/// `trace` are filtered out by `enabled()` and `LevelFilter::Info`; there is
+/// no verbosity flag yet.
 #[cfg(feature = "cli")]
 struct CliLogger;
 
@@ -53,15 +55,13 @@ impl log::Log for CliLogger {
                     eprintln!("{}", record.args());
                 }
             }
-            log::Level::Info | log::Level::Debug | log::Level::Trace => {
-                #[expect(
-                    clippy::print_stdout,
-                    reason = "CLI UX output goes to stdout for info/debug/trace"
-                )]
+            log::Level::Info => {
+                #[expect(clippy::print_stdout, reason = "CLI UX output goes to stdout for info")]
                 {
                     println!("{}", record.args());
                 }
             }
+            log::Level::Debug | log::Level::Trace => {}
         }
     }
 }
