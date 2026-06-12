@@ -1,4 +1,7 @@
-#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#![cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(dead_code, reason = "Fastly entrypoint is wasm32-only")
+)]
 
 #[cfg(target_arch = "wasm32")]
 use app_demo_core::App;
@@ -11,6 +14,10 @@ pub fn main(req: Request) -> Result<Response, Error> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[expect(
+    clippy::print_stderr,
+    reason = "host stub; the real binary only runs on wasm32-wasip1"
+)]
 fn main() {
     eprintln!("app-demo-adapter-fastly: target wasm32-wasip1 to run on Fastly.");
 }

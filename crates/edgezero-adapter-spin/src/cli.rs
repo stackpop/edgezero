@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,157 +7,14 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
-use edgezero_adapter::{register_adapter, Adapter, AdapterAction};
 use walkdir::WalkDir;
 
-const TARGET_TRIPLE: &str = "wasm32-wasip1";
-
-pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
-    let manifest = find_spin_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "spin manifest has no parent directory".to_string())?;
-    let cargo_manifest = manifest_dir.join("Cargo.toml");
-    let crate_name = read_package_name(&cargo_manifest)?;
-
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            TARGET_TRIPLE,
-            "--manifest-path",
-            cargo_manifest
-                .to_str()
-                .ok_or("invalid Cargo manifest path")?,
-        ])
-        .args(extra_args)
-        .status()
-        .map_err(|e| format!("failed to run cargo build: {e}"))?;
-    if !status.success() {
-        return Err(format!("cargo build failed with status {status}"));
-    }
-
-    let workspace_root = find_workspace_root(manifest_dir);
-    let artifact = locate_artifact(&workspace_root, manifest_dir, &crate_name)?;
-    let pkg_dir = workspace_root.join("pkg");
-    fs::create_dir_all(&pkg_dir)
-        .map_err(|e| format!("failed to create {}: {e}", pkg_dir.display()))?;
-    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
-    fs::copy(&artifact, &dest)
-        .map_err(|e| format!("failed to copy artifact to {}: {e}", dest.display()))?;
-
-    Ok(dest)
-}
-
-pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_spin_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "spin manifest has no parent directory".to_string())?;
-
-    let status = Command::new("spin")
-        .args(["deploy"])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
-    if !status.success() {
-        return Err(format!("spin deploy failed with status {status}"));
-    }
-
-    Ok(())
-}
-
-pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_spin_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "spin manifest has no parent directory".to_string())?;
-
-    let status = Command::new("spin")
-        .args(["up"])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|e| format!("failed to run spin CLI: {e}"))?;
-    if !status.success() {
-        return Err(format!("spin up failed with status {status}"));
-    }
-
-    Ok(())
-}
-
-struct SpinCliAdapter;
-
-static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
-    TemplateRegistration {
-        name: "spin_Cargo_toml",
-        contents: include_str!("templates/Cargo.toml.hbs"),
-    },
-    TemplateRegistration {
-        name: "spin_src_lib_rs",
-        contents: include_str!("templates/src/lib.rs.hbs"),
-    },
-    TemplateRegistration {
-        name: "spin_spin_toml",
-        contents: include_str!("templates/spin.toml.hbs"),
-    },
-];
-
-static SPIN_FILE_SPECS: &[AdapterFileSpec] = &[
-    AdapterFileSpec {
-        template: "spin_Cargo_toml",
-        output: "Cargo.toml",
-    },
-    AdapterFileSpec {
-        template: "spin_src_lib_rs",
-        output: "src/lib.rs",
-    },
-    AdapterFileSpec {
-        template: "spin_spin_toml",
-        output: "spin.toml",
-    },
-];
-
-static SPIN_DEPENDENCIES: &[DependencySpec] = &[
-    DependencySpec {
-        key: "dep_edgezero_core_spin",
-        repo_crate: "crates/edgezero-core",
-        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
-        features: &[],
-    },
-    DependencySpec {
-        key: "dep_edgezero_adapter_spin",
-        repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
-        features: &[],
-    },
-    DependencySpec {
-        key: "dep_edgezero_adapter_spin_wasm",
-        repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
-        features: &["spin"],
-    },
-];
+static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
 
 static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     id: "spin",
@@ -192,34 +50,145 @@ static SPIN_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     run_module: "edgezero_adapter_spin",
 };
 
-static SPIN_ADAPTER: SpinCliAdapter = SpinCliAdapter;
+static SPIN_DEPENDENCIES: &[DependencySpec] = &[
+    DependencySpec {
+        key: "dep_edgezero_core_spin",
+        repo_crate: "crates/edgezero-core",
+        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
+        features: &[],
+    },
+    DependencySpec {
+        key: "dep_edgezero_adapter_spin",
+        repo_crate: "crates/edgezero-adapter-spin",
+        fallback:
+            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
+        features: &[],
+    },
+    DependencySpec {
+        key: "dep_edgezero_adapter_spin_wasm",
+        repo_crate: "crates/edgezero-adapter-spin",
+        fallback:
+            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
+        features: &["spin"],
+    },
+];
+
+static SPIN_FILE_SPECS: &[AdapterFileSpec] = &[
+    AdapterFileSpec {
+        template: "spin_Cargo_toml",
+        output: "Cargo.toml",
+    },
+    AdapterFileSpec {
+        template: "spin_src_lib_rs",
+        output: "src/lib.rs",
+    },
+    AdapterFileSpec {
+        template: "spin_spin_toml",
+        output: "spin.toml",
+    },
+];
+
+static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
+    TemplateRegistration {
+        name: "spin_Cargo_toml",
+        contents: include_str!("templates/Cargo.toml.hbs"),
+    },
+    TemplateRegistration {
+        name: "spin_src_lib_rs",
+        contents: include_str!("templates/src/lib.rs.hbs"),
+    },
+    TemplateRegistration {
+        name: "spin_spin_toml",
+        contents: include_str!("templates/spin.toml.hbs"),
+    },
+];
+
+const TARGET_TRIPLE: &str = "wasm32-wasip1";
+
+struct SpinCliAdapter;
 
 impl Adapter for SpinCliAdapter {
-    fn name(&self) -> &'static str {
-        "spin"
-    }
-
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             AdapterAction::Build => {
                 let artifact = build(args)?;
-                println!("[edgezero] Spin build complete -> {}", artifact.display());
+                log::info!("[edgezero] Spin build complete -> {}", artifact.display());
                 Ok(())
             }
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
+            other => Err(format!("spin adapter does not support {other:?}")),
         }
+    }
+
+    fn name(&self) -> &'static str {
+        "spin"
     }
 }
 
-pub fn register() {
-    register_adapter(&SPIN_ADAPTER);
-    register_adapter_blueprint(&SPIN_BLUEPRINT);
+/// # Errors
+/// Returns an error if the Spin CLI build command fails.
+#[inline]
+pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
+    let manifest =
+        find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
+    let cargo_manifest = manifest_dir.join("Cargo.toml");
+    let crate_name = read_package_name(&cargo_manifest)?;
+
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            TARGET_TRIPLE,
+            "--manifest-path",
+            cargo_manifest
+                .to_str()
+                .ok_or("invalid Cargo manifest path")?,
+        ])
+        .args(extra_args)
+        .status()
+        .map_err(|err| format!("failed to run cargo build: {err}"))?;
+    if !status.success() {
+        return Err(format!("cargo build failed with status {status}"));
+    }
+
+    let workspace_root = find_workspace_root(manifest_dir);
+    let artifact = locate_artifact(&workspace_root, manifest_dir, &crate_name)?;
+    let pkg_dir = workspace_root.join("pkg");
+    fs::create_dir_all(&pkg_dir)
+        .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
+    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
+    fs::copy(&artifact, &dest)
+        .map_err(|err| format!("failed to copy artifact to {}: {err}", dest.display()))?;
+
+    Ok(dest)
 }
 
-#[ctor]
-fn register_ctor() {
-    register();
+/// # Errors
+/// Returns an error if the Spin CLI deploy command fails.
+#[inline]
+pub fn deploy(extra_args: &[String]) -> Result<(), String> {
+    let manifest =
+        find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
+
+    let status = Command::new("spin")
+        .args(["deploy"])
+        .args(extra_args)
+        .current_dir(manifest_dir)
+        .status()
+        .map_err(|err| format!("failed to run spin CLI: {err}"))?;
+    if !status.success() {
+        return Err(format!("spin deploy failed with status {status}"));
+    }
+
+    Ok(())
 }
 
 fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
@@ -235,16 +204,15 @@ fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
-            path.file_name().map(|n| n == "spin.toml").unwrap_or(false)
+            path.file_name().is_some_and(|n| n == "spin.toml")
                 && path
                     .parent()
-                    .map(|dir| dir.join("Cargo.toml").exists())
-                    .unwrap_or(false)
+                    .is_some_and(|dir| dir.join("Cargo.toml").exists())
         })
         .collect();
 
     if candidates.is_empty() {
-        return Err("could not locate spin.toml".to_string());
+        return Err("could not locate spin.toml".to_owned());
     }
 
     candidates.sort_by_key(|path| {
@@ -262,7 +230,7 @@ fn locate_artifact(
 ) -> Result<PathBuf, String> {
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
-    if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
+    if let Some(custom) = env::var_os("CARGO_TARGET_DIR") {
         let candidate = PathBuf::from(custom)
             .join(TARGET_TRIPLE)
             .join("release")
@@ -296,10 +264,64 @@ fn locate_artifact(
     ))
 }
 
+#[inline]
+pub fn register() {
+    register_adapter(&SPIN_ADAPTER);
+    register_adapter_blueprint(&SPIN_BLUEPRINT);
+}
+
+#[ctor(unsafe)]
+fn register_ctor() {
+    register();
+}
+
+/// # Errors
+/// Returns an error if the Spin CLI up command fails.
+#[inline]
+pub fn serve(extra_args: &[String]) -> Result<(), String> {
+    let manifest =
+        find_spin_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "spin manifest has no parent directory".to_owned())?;
+
+    let status = Command::new("spin")
+        .args(["up"])
+        .args(extra_args)
+        .current_dir(manifest_dir)
+        .status()
+        .map_err(|err| format!("failed to run spin CLI: {err}"))?;
+    if !status.success() {
+        return Err(format!("spin up failed with status {status}"));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn finds_closest_manifest_when_multiple_exist() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let first = root.join("crates/first");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
+        fs::write(first.join("spin.toml"), "spin_manifest_version = 2").unwrap();
+
+        let second = root.join("examples/second");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
+        fs::write(second.join("spin.toml"), "spin_manifest_version = 2").unwrap();
+
+        let found = find_spin_manifest(&second).unwrap();
+        assert_eq!(found, second.join("spin.toml"));
+    }
 
     #[test]
     fn finds_manifest_in_current_directory() {
@@ -340,25 +362,5 @@ mod tests {
 
         let located = locate_artifact(workspace, &manifest_dir, "my-cool-crate").unwrap();
         assert_eq!(located, artifact);
-    }
-
-    #[test]
-    fn finds_closest_manifest_when_multiple_exist() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
-
-        let first = root.join("crates/first");
-        fs::create_dir_all(&first).unwrap();
-        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
-        fs::write(first.join("spin.toml"), "spin_manifest_version = 2").unwrap();
-
-        let second = root.join("examples/second");
-        fs::create_dir_all(&second).unwrap();
-        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
-        fs::write(second.join("spin.toml"), "spin_manifest_version = 2").unwrap();
-
-        let found = find_spin_manifest(&second).unwrap();
-        assert_eq!(found, second.join("spin.toml"));
     }
 }

@@ -2,9 +2,13 @@ use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Response, Uri};
 use fastly::Response as FastlyResponse;
-use futures_util::StreamExt;
-use std::io::Write;
+use futures::executor;
+use futures_util::StreamExt as _;
+use std::io::Write as _;
 
+/// # Errors
+/// Returns [`EdgeError::Internal`] if the response body cannot be streamed to the Fastly send-channel.
+#[inline]
 pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeError> {
     let (parts, body) = response.into_parts();
     let mut fastly_response = FastlyResponse::from_status(parts.status.as_u16());
@@ -13,24 +17,24 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
         Body::Once(bytes) => fastly_response.set_body(bytes.to_vec()),
         Body::Stream(mut stream) => {
             let mut fastly_body = fastly::Body::new();
-            while let Some(chunk) = futures::executor::block_on(stream.next()) {
-                let chunk = chunk.map_err(EdgeError::internal)?;
+            while let Some(result) = executor::block_on(stream.next()) {
+                let chunk = result.map_err(EdgeError::internal)?;
                 fastly_body.write_all(&chunk).map_err(EdgeError::internal)?;
             }
             fastly_response.set_body(fastly_body);
         }
     }
 
-    for (name, value) in parts.headers.iter() {
+    for (name, value) in &parts.headers {
         fastly_response.set_header(name.as_str(), value.as_bytes());
     }
 
     Ok(fastly_response)
 }
 
-pub fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {
+pub(crate) fn parse_uri(uri: &str) -> Result<Uri, EdgeError> {
     uri.parse::<Uri>()
-        .map_err(|err| EdgeError::bad_request(format!("invalid request URI: {}", err)))
+        .map_err(|err| EdgeError::bad_request(format!("invalid request URI: {err}")))
 }
 
 #[cfg(test)]

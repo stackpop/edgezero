@@ -9,12 +9,14 @@ pub struct FastlyRequestContext {
 }
 
 impl FastlyRequestContext {
-    pub fn insert(request: &mut Request, context: FastlyRequestContext) {
-        request.extensions_mut().insert(context);
-    }
-
+    #[inline]
     pub fn get(request: &Request) -> Option<&FastlyRequestContext> {
         request.extensions().get::<FastlyRequestContext>()
+    }
+
+    #[inline]
+    pub fn insert(request: &mut Request, context: FastlyRequestContext) {
+        request.extensions_mut().insert(context);
     }
 }
 
@@ -24,7 +26,7 @@ mod tests {
     use edgezero_core::body::Body;
     use edgezero_core::http::request_builder;
     use std::net::IpAddr;
-    use std::str::FromStr;
+    use std::str::FromStr as _;
 
     #[test]
     fn inserts_and_retrieves_client_ip() {

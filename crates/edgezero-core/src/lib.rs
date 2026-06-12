@@ -1,5 +1,14 @@
 //! Core primitives for building portable edge workloads across edge adapters.
 
+// Targets a single line — the proc-macro re-export at the bottom of this
+// file. The `pub_use` lint is module-scoped (cannot be `#[expect]`-ed
+// per-item), and proc-macros must be re-exported here so downstream users
+// depend only on `edgezero-core` (not `edgezero-macros`).
+#![expect(
+    clippy::pub_use,
+    reason = "proc-macros must be re-exported through the parent crate"
+)]
+
 pub mod addr;
 pub mod app;
 pub mod body;
@@ -20,11 +29,4 @@ pub mod response;
 pub mod router;
 pub mod secret_store;
 
-pub use config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
 pub use edgezero_macros::{action, app};
-#[cfg(any(test, feature = "test-utils"))]
-pub use key_value_store::NoopKvStore;
-pub use key_value_store::{KvError, KvHandle, KvPage, KvStore};
-#[cfg(any(test, feature = "test-utils"))]
-pub use secret_store::{InMemorySecretStore, NoopSecretStore};
-pub use secret_store::{SecretError, SecretHandle, SecretStore};

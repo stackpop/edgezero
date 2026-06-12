@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use matchit::Router as PathRouter;
 use serde::Serialize;
@@ -15,9 +16,25 @@ use crate::http::{
 };
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
-use crate::response::IntoResponse;
+use crate::response::IntoResponse as _;
 
 pub const DEFAULT_ROUTE_LISTING_PATH: &str = "/__edgezero/routes";
+
+struct RouteEntry {
+    handler: BoxHandler,
+}
+
+impl Clone for RouteEntry {
+    fn clone(&self) -> Self {
+        Self {
+            handler: Arc::clone(&self.handler),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.handler = Arc::clone(&source.handler);
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct RouteInfo {
@@ -26,17 +43,22 @@ pub struct RouteInfo {
 }
 
 impl RouteInfo {
-    pub fn new(method: Method, path: impl Into<String>) -> Self {
+    #[must_use]
+    #[inline]
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    #[inline]
+    pub fn new<S: Into<String>>(method: Method, path: S) -> Self {
         Self {
             method,
             path: path.into(),
         }
     }
 
-    pub fn method(&self) -> &Method {
-        &self.method
-    }
-
+    #[must_use]
+    #[inline]
     pub fn path(&self) -> &str {
         &self.path
     }
@@ -48,119 +70,74 @@ struct RouteListingEntry {
     path: String,
 }
 
-fn build_listing_response<T: Serialize>(
-    payload: &T,
-    builder: ResponseBuilder,
-) -> Result<Response, EdgeError> {
-    let body = Body::json(payload).map_err(EdgeError::internal)?;
-    let response = builder
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .body(body)
-        .map_err(EdgeError::internal)?;
-    Ok(response)
+enum RouteMatch<'route> {
+    Found(&'route RouteEntry, PathParams),
+    MethodNotAllowed(Vec<Method>),
+    NotFound,
 }
 
 #[derive(Default)]
 pub struct RouterBuilder {
-    routes: HashMap<Method, PathRouter<RouteEntry>>,
     middlewares: Vec<BoxMiddleware>,
     route_info: Vec<RouteInfo>,
     route_listing_path: Option<String>,
+    routes: HashMap<Method, PathRouter<RouteEntry>>,
 }
 
 impl RouterBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn enable_route_listing(self) -> Self {
-        self.enable_route_listing_at(DEFAULT_ROUTE_LISTING_PATH)
-    }
-
-    pub fn enable_route_listing_at<S>(mut self, path: S) -> Self
-    where
-        S: Into<String>,
-    {
-        let path = path.into();
-        assert!(!path.is_empty(), "route listing path cannot be empty");
-        assert!(
-            path.starts_with('/'),
-            "route listing path must begin with '/'"
-        );
-        self.route_listing_path = Some(path);
-        self
-    }
-
-    pub fn route<H>(mut self, path: &str, method: Method, handler: H) -> Self
+    #[expect(
+        clippy::panic,
+        reason = "duplicate route is a build-time programmer error, not a runtime condition"
+    )]
+    fn add_route<H>(&mut self, path: &str, method: Method, handler: H)
     where
         H: IntoHandler,
     {
-        self.add_route(path, method, handler);
-        self
+        let router = self.routes.entry(method.clone()).or_default();
+
+        router
+            .insert(
+                path,
+                RouteEntry {
+                    handler: handler.into_handler(),
+                },
+            )
+            .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
+
+        self.route_info
+            .push(RouteInfo::new(method, path.to_owned()));
     }
 
-    pub fn get<H>(self, path: &str, handler: H) -> Self
-    where
-        H: IntoHandler,
-    {
-        self.route(path, Method::GET, handler)
-    }
-
-    pub fn post<H>(self, path: &str, handler: H) -> Self
-    where
-        H: IntoHandler,
-    {
-        self.route(path, Method::POST, handler)
-    }
-
-    pub fn put<H>(self, path: &str, handler: H) -> Self
-    where
-        H: IntoHandler,
-    {
-        self.route(path, Method::PUT, handler)
-    }
-
-    pub fn delete<H>(self, path: &str, handler: H) -> Self
-    where
-        H: IntoHandler,
-    {
-        self.route(path, Method::DELETE, handler)
-    }
-
-    pub fn middleware<M>(mut self, middleware: M) -> Self
-    where
-        M: Middleware,
-    {
-        self.middlewares.push(Arc::new(middleware));
-        self
-    }
-
-    pub fn middleware_arc(mut self, middleware: BoxMiddleware) -> Self {
-        self.middlewares.push(middleware);
-        self
-    }
-
+    /// # Panics
+    /// Panics if a route is registered for both an explicit path and the route-listing path.
+    /// Both paths are programmer-supplied at build time; a duplicate is a routing-config bug
+    /// that should fail loudly before the binary ever serves traffic.
+    #[expect(
+        clippy::panic,
+        reason = "duplicate route is a build-time programmer error, not a runtime condition"
+    )]
+    #[must_use]
+    #[inline]
     pub fn build(mut self) -> RouterService {
         let listing_path = self.route_listing_path.clone();
 
         let mut route_info = self.route_info.clone();
-        if let Some(ref path) = listing_path {
+        if let Some(path) = &listing_path {
             route_info.push(RouteInfo::new(Method::GET, path.clone()));
         }
 
-        let route_index = Arc::new(route_info);
+        let route_index: Arc<[RouteInfo]> = Arc::from(route_info);
 
         if let Some(path) = listing_path {
-            let index = Arc::clone(&route_index);
+            let outer_index = Arc::clone(&route_index);
             let listing_handler = move |_ctx: RequestContext| {
-                let index = Arc::clone(&index);
+                let inner_index = Arc::clone(&outer_index);
                 async move {
-                    let payload: Vec<RouteListingEntry> = index
+                    let payload: Vec<RouteListingEntry> = inner_index
                         .iter()
                         .map(|route| RouteListingEntry {
-                            method: route.method().as_str().to_string(),
-                            path: route.path().to_string(),
+                            method: route.method().as_str().to_owned(),
+                            path: route.path().to_owned(),
                         })
                         .collect();
 
@@ -177,85 +154,119 @@ impl RouterBuilder {
                         handler: listing_handler.into_handler(),
                     },
                 )
-                .unwrap_or_else(|err| panic!("duplicate route definition for {}: {}", path, err));
+                .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
         }
 
         RouterService::new(self.routes, self.middlewares, route_index)
     }
 
-    fn add_route<H>(&mut self, path: &str, method: Method, handler: H)
+    #[must_use]
+    #[inline]
+    pub fn delete<H>(self, path: &str, handler: H) -> Self
     where
         H: IntoHandler,
     {
-        let router = self.routes.entry(method.clone()).or_default();
-
-        router
-            .insert(
-                path,
-                RouteEntry {
-                    handler: handler.into_handler(),
-                },
-            )
-            .unwrap_or_else(|err| panic!("duplicate route definition for {}: {}", path, err));
-
-        self.route_info
-            .push(RouteInfo::new(method, path.to_string()));
-    }
-}
-
-#[derive(Clone)]
-pub struct RouterService {
-    inner: Arc<RouterInner>,
-}
-
-impl RouterService {
-    fn new(
-        routes: HashMap<Method, PathRouter<RouteEntry>>,
-        middlewares: Vec<BoxMiddleware>,
-        route_index: Arc<Vec<RouteInfo>>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(RouterInner {
-                routes,
-                middlewares,
-                route_index,
-            }),
-        }
+        self.route(path, Method::DELETE, handler)
     }
 
-    pub fn builder() -> RouterBuilder {
-        RouterBuilder::new()
+    #[must_use]
+    #[inline]
+    pub fn enable_route_listing(self) -> Self {
+        self.enable_route_listing_at(DEFAULT_ROUTE_LISTING_PATH)
     }
 
-    pub fn routes(&self) -> Vec<RouteInfo> {
-        (*self.inner.route_index).clone()
+    /// # Panics
+    /// Panics if `path` is empty or does not begin with `/`.
+    #[must_use]
+    #[inline]
+    pub fn enable_route_listing_at<S>(mut self, path: S) -> Self
+    where
+        S: Into<String>,
+    {
+        let route_listing_path = path.into();
+        assert!(
+            !route_listing_path.is_empty(),
+            "route listing path cannot be empty"
+        );
+        assert!(
+            route_listing_path.starts_with('/'),
+            "route listing path must begin with '/'"
+        );
+        self.route_listing_path = Some(route_listing_path);
+        self
     }
 
-    pub async fn oneshot(&self, request: Request) -> Response {
-        let mut service = self.clone();
-        match service.call(request).await {
-            Ok(response) => response,
-            Err(err) => err.into_response(),
-        }
+    #[must_use]
+    #[inline]
+    pub fn get<H>(self, path: &str, handler: H) -> Self
+    where
+        H: IntoHandler,
+    {
+        self.route(path, Method::GET, handler)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn middleware<M>(mut self, middleware: M) -> Self
+    where
+        M: Middleware,
+    {
+        self.middlewares.push(Arc::new(middleware));
+        self
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn middleware_arc(mut self, middleware: BoxMiddleware) -> Self {
+        self.middlewares.push(middleware);
+        self
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn post<H>(self, path: &str, handler: H) -> Self
+    where
+        H: IntoHandler,
+    {
+        self.route(path, Method::POST, handler)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn put<H>(self, path: &str, handler: H) -> Self
+    where
+        H: IntoHandler,
+    {
+        self.route(path, Method::PUT, handler)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn route<H>(mut self, path: &str, method: Method, handler: H) -> Self
+    where
+        H: IntoHandler,
+    {
+        self.add_route(path, method, handler);
+        self
     }
 }
 
 struct RouterInner {
-    routes: HashMap<Method, PathRouter<RouteEntry>>,
     middlewares: Vec<BoxMiddleware>,
-    route_index: Arc<Vec<RouteInfo>>,
-}
-
-enum RouteMatch<'a> {
-    Found(&'a RouteEntry, PathParams),
-    MethodNotAllowed(Vec<Method>),
-    NotFound,
+    route_index: Arc<[RouteInfo]>,
+    routes: HashMap<Method, PathRouter<RouteEntry>>,
 }
 
 impl RouterInner {
     async fn dispatch(&self, request: Request) -> Result<Response, EdgeError> {
         let method = request.method().clone();
-        let path = request.uri().path().to_string();
+        let path = request.uri().path().to_owned();
 
         match self.find_route(&method, &path) {
             RouteMatch::Found(entry, params) => {
@@ -264,7 +275,7 @@ impl RouterInner {
                 next.run(ctx).await
             }
             RouteMatch::MethodNotAllowed(mut allowed) => {
-                allowed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+                allowed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
                 Err(EdgeError::method_not_allowed(&method, &allowed))
             }
             RouteMatch::NotFound => Err(EdgeError::not_found(path)),
@@ -278,19 +289,19 @@ impl RouterInner {
                     matched
                         .params
                         .iter()
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .map(|(key, value)| (key.to_owned(), value.to_owned()))
                         .collect(),
                 );
                 return RouteMatch::Found(matched.value, params);
             }
         }
 
-        let mut allowed = HashSet::new();
-        for (candidate_method, router) in &self.routes {
-            if router.at(path).is_ok() {
-                allowed.insert(candidate_method.clone());
-            }
-        }
+        let allowed: HashSet<Method> = self
+            .routes
+            .iter()
+            .filter(|(_, router)| router.at(path).is_ok())
+            .map(|(candidate_method, _)| candidate_method.clone())
+            .collect();
 
         if allowed.is_empty() {
             RouteMatch::NotFound
@@ -300,34 +311,79 @@ impl RouterInner {
     }
 }
 
+#[derive(Clone)]
+pub struct RouterService {
+    inner: Arc<RouterInner>,
+}
+
 impl Service<Request> for RouterService {
-    type Response = Response;
     type Error = EdgeError;
     type Future = HandlerFuture;
+    type Response = Response;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, request: Request) -> Self::Future {
+    #[inline]
+    fn call(&mut self, req: Request) -> Self::Future {
         let inner = Arc::clone(&self.inner);
-        Box::pin(async move { inner.dispatch(request).await })
+        Box::pin(async move { inner.dispatch(req).await })
+    }
+
+    #[inline]
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 }
 
-struct RouteEntry {
-    handler: BoxHandler,
-}
+impl RouterService {
+    #[must_use]
+    #[inline]
+    pub fn builder() -> RouterBuilder {
+        RouterBuilder::new()
+    }
 
-impl Clone for RouteEntry {
-    fn clone(&self) -> Self {
+    fn new(
+        routes: HashMap<Method, PathRouter<RouteEntry>>,
+        middlewares: Vec<BoxMiddleware>,
+        route_index: Arc<[RouteInfo]>,
+    ) -> Self {
         Self {
-            handler: Arc::clone(&self.handler),
+            inner: Arc::new(RouterInner {
+                middlewares,
+                route_index,
+                routes,
+            }),
         }
     }
+
+    /// # Errors
+    /// Returns [`EdgeError`] if the dispatched handler errors AND the error
+    /// itself fails to render as a response.
+    #[inline]
+    pub async fn oneshot(&self, request: Request) -> Result<Response, EdgeError> {
+        let mut service = self.clone();
+        match service.call(request).await {
+            Ok(response) => Ok(response),
+            Err(err) => err.into_response(),
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn routes(&self) -> Vec<RouteInfo> {
+        self.inner.route_index.to_vec()
+    }
+}
+
+fn build_listing_response<T: Serialize>(
+    payload: &T,
+    builder: ResponseBuilder,
+) -> Result<Response, EdgeError> {
+    let body = Body::json(payload).map_err(EdgeError::internal)?;
+    let response = builder
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(body)
+        .map_err(EdgeError::internal)?;
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -341,17 +397,101 @@ mod tests {
     use crate::response::response_with_body;
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
+    use serde::ser::Error as _;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
     async fn ok_handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
-        Ok(response_with_body(StatusCode::OK, Body::empty()))
+        response_with_body(StatusCode::OK, Body::empty())
     }
 
     #[test]
-    fn route_matches_path_params() {
+    fn builder_accepts_middleware_and_middleware_arc() {
+        struct RecordingMiddleware {
+            log: Arc<Mutex<Vec<&'static str>>>,
+            name: &'static str,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl Middleware for RecordingMiddleware {
+            async fn handle(
+                &self,
+                ctx: RequestContext,
+                next: Next<'_>,
+            ) -> Result<Response, EdgeError> {
+                self.log.lock().unwrap().push(self.name);
+                next.run(ctx).await
+            }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let first = RecordingMiddleware {
+            log: Arc::clone(&log),
+            name: "first",
+        };
+        let second = RecordingMiddleware {
+            log: Arc::clone(&log),
+            name: "second",
+        };
+
+        let service = RouterService::builder()
+            .middleware(first)
+            .middleware_arc({
+                let arc: BoxMiddleware = Arc::new(second);
+                arc
+            })
+            .get("/test", ok_handler)
+            .build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/test")
+            .body(Body::empty())
+            .expect("request");
+        let response = block_on(service.clone().call(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(entries, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn builder_supports_put_and_delete_routes() {
+        let service = RouterService::builder()
+            .put("/items", ok_handler)
+            .delete("/items", ok_handler)
+            .build();
+
+        let put_request = request_builder()
+            .method(Method::PUT)
+            .uri("/items")
+            .body(Body::empty())
+            .expect("request");
+        let put_response = block_on(service.clone().call(put_request)).expect("response");
+        assert_eq!(put_response.status(), StatusCode::OK);
+
+        let delete_request = request_builder()
+            .method(Method::DELETE)
+            .uri("/items")
+            .body(Body::empty())
+            .expect("request");
+        let delete_response = block_on(service.clone().call(delete_request)).expect("response");
+        assert_eq!(delete_response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate route definition")]
+    fn duplicate_route_definition_panics() {
+        let _service = RouterService::builder()
+            .get("/dup", ok_handler)
+            .get("/dup", ok_handler)
+            .build();
+    }
+
+    #[test]
+    fn handler_returns_bad_request_for_invalid_path_params() {
         #[derive(Deserialize)]
         struct Params {
             id: String,
@@ -359,119 +499,60 @@ mod tests {
 
         async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
             let params: Params = ctx.path()?;
-            Ok(format!("hello {}", params.id))
+            let id = params
+                .id
+                .parse::<u32>()
+                .map_err(|_e| EdgeError::bad_request("invalid id"))?;
+            Ok(format!("hello {id}"))
         }
 
-        let service = RouterService::builder().get("/hello/{id}", handler).build();
+        let service = RouterService::builder().get("/items/{id}", handler).build();
+        let ok_request = request_builder()
+            .method(Method::GET)
+            .uri("/items/42")
+            .body(Body::empty())
+            .expect("request");
+        let ok_response = block_on(service.clone().call(ok_request)).expect("response");
+        assert_eq!(ok_response.status(), StatusCode::OK);
+        assert_eq!(
+            ok_response.body().as_bytes().expect("buffered"),
+            b"hello 42"
+        );
 
         let request = request_builder()
             .method(Method::GET)
-            .uri("/hello/world")
+            .uri("/items/abc")
             .body(Body::empty())
             .expect("request");
 
-        let response = block_on(service.clone().call(request)).expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.body().as_bytes(), b"hello world");
+        let error = block_on(service.clone().call(request)).expect_err("error");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
-    fn route_listing_outputs_all_routes() {
-        async fn noop(_ctx: RequestContext) -> Result<(), EdgeError> {
-            Ok(())
-        }
-
-        let service = RouterService::builder()
-            .enable_route_listing()
-            .get("/health", noop)
-            .post("/items", noop)
-            .build();
-
+    fn oneshot_returns_error_response() {
+        let service = RouterService::builder().build();
         let request = request_builder()
             .method(Method::GET)
-            .uri(DEFAULT_ROUTE_LISTING_PATH)
+            .uri("/missing")
             .body(Body::empty())
             .expect("request");
 
-        let response = block_on(service.clone().call(request)).expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 
-        let body = response.body().as_bytes();
-        let payload: Vec<serde_json::Value> = serde_json::from_slice(body).expect("json payload");
-
-        assert!(payload.contains(&json!({
-            "method": "GET",
-            "path": DEFAULT_ROUTE_LISTING_PATH
-        })));
-        assert!(payload.contains(&json!({
-            "method": "GET",
-            "path": "/health"
-        })));
-        assert!(payload.contains(&json!({
-            "method": "POST",
-            "path": "/items"
-        })));
-
-        let routes = service.routes();
-        assert!(routes
-            .iter()
-            .any(|route| route.path() == "/health" && *route.method() == Method::GET));
-
-        let health_request = request_builder()
+    #[test]
+    fn oneshot_returns_success_response() {
+        let service = RouterService::builder().get("/ok", ok_handler).build();
+        let request = request_builder()
             .method(Method::GET)
-            .uri("/health")
+            .uri("/ok")
             .body(Body::empty())
             .expect("request");
-        let health_response = block_on(service.clone().call(health_request)).expect("response");
-        assert_eq!(health_response.status(), StatusCode::NO_CONTENT);
 
-        let items_request = request_builder()
-            .method(Method::POST)
-            .uri("/items")
-            .body(Body::empty())
-            .expect("request");
-        let items_response = block_on(service.clone().call(items_request)).expect("response");
-        assert_eq!(items_response.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[test]
-    fn route_listing_response_handles_json_failure() {
-        struct FailingSerialize;
-
-        impl Serialize for FailingSerialize {
-            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                Err(serde::ser::Error::custom("boom"))
-            }
-        }
-
-        let err = build_listing_response(&FailingSerialize, response_builder())
-            .expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn route_listing_response_handles_builder_failure() {
-        #[derive(Serialize)]
-        struct Payload {
-            ok: bool,
-        }
-
-        let builder = response_builder().header("bad\nname", "value");
-        let err =
-            build_listing_response(&Payload { ok: true }, builder).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate route definition")]
-    fn route_listing_duplicate_path_panics() {
-        RouterService::builder()
-            .enable_route_listing()
-            .get(DEFAULT_ROUTE_LISTING_PATH, ok_handler)
-            .build();
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]
@@ -519,205 +600,6 @@ mod tests {
     }
 
     #[test]
-    fn handler_returns_bad_request_for_invalid_path_params() {
-        #[derive(Deserialize)]
-        struct Params {
-            id: String,
-        }
-
-        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
-            let params: Params = ctx.path()?;
-            let id = params
-                .id
-                .parse::<u32>()
-                .map_err(|_| EdgeError::bad_request("invalid id"))?;
-            Ok(format!("hello {}", id))
-        }
-
-        let service = RouterService::builder().get("/items/{id}", handler).build();
-        let ok_request = request_builder()
-            .method(Method::GET)
-            .uri("/items/42")
-            .body(Body::empty())
-            .expect("request");
-        let ok_response = block_on(service.clone().call(ok_request)).expect("response");
-        assert_eq!(ok_response.status(), StatusCode::OK);
-        assert_eq!(ok_response.body().as_bytes(), b"hello 42");
-
-        let request = request_builder()
-            .method(Method::GET)
-            .uri("/items/abc")
-            .body(Body::empty())
-            .expect("request");
-
-        let error = block_on(service.clone().call(request)).expect_err("error");
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn streams_body_through_router() {
-        use bytes::Bytes;
-        use futures_util::stream;
-        use futures_util::StreamExt;
-
-        async fn handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
-            let chunks = stream::iter(vec![
-                Bytes::from_static(b"chunk-one\n"),
-                Bytes::from_static(b"chunk-two\n"),
-            ]);
-
-            Ok((StatusCode::OK, Body::stream(chunks)).into_response())
-        }
-
-        let service = RouterService::builder().get("/stream", handler).build();
-
-        let request = request_builder()
-            .method(Method::GET)
-            .uri("/stream")
-            .body(Body::empty())
-            .expect("request");
-
-        let response = block_on(service.clone().call(request)).expect("response");
-        let mut stream = response.into_body().into_stream().expect("stream body");
-        let collected = block_on(async {
-            let mut acc = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.expect("chunk");
-                acc.extend_from_slice(&chunk);
-            }
-            acc
-        });
-        assert_eq!(collected, b"chunk-one\nchunk-two\n");
-    }
-
-    #[test]
-    #[should_panic(expected = "route listing path cannot be empty")]
-    fn route_listing_rejects_empty_path() {
-        let _ = RouterService::builder().enable_route_listing_at("");
-    }
-
-    #[test]
-    #[should_panic(expected = "route listing path must begin with '/'")]
-    fn route_listing_rejects_missing_slash() {
-        let _ = RouterService::builder().enable_route_listing_at("routes");
-    }
-
-    #[test]
-    fn builder_supports_put_and_delete_routes() {
-        let service = RouterService::builder()
-            .put("/items", ok_handler)
-            .delete("/items", ok_handler)
-            .build();
-
-        let put_request = request_builder()
-            .method(Method::PUT)
-            .uri("/items")
-            .body(Body::empty())
-            .expect("request");
-        let put_response = block_on(service.clone().call(put_request)).expect("response");
-        assert_eq!(put_response.status(), StatusCode::OK);
-
-        let delete_request = request_builder()
-            .method(Method::DELETE)
-            .uri("/items")
-            .body(Body::empty())
-            .expect("request");
-        let delete_response = block_on(service.clone().call(delete_request)).expect("response");
-        assert_eq!(delete_response.status(), StatusCode::OK);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate route definition")]
-    fn duplicate_route_definition_panics() {
-        RouterService::builder()
-            .get("/dup", ok_handler)
-            .get("/dup", ok_handler)
-            .build();
-    }
-
-    #[test]
-    fn builder_accepts_middleware_and_middleware_arc() {
-        struct RecordingMiddleware {
-            log: Arc<Mutex<Vec<&'static str>>>,
-            name: &'static str,
-        }
-
-        #[async_trait::async_trait(?Send)]
-        impl Middleware for RecordingMiddleware {
-            async fn handle(
-                &self,
-                ctx: RequestContext,
-                next: Next<'_>,
-            ) -> Result<Response, EdgeError> {
-                self.log.lock().unwrap().push(self.name);
-                next.run(ctx).await
-            }
-        }
-
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let first = RecordingMiddleware {
-            log: Arc::clone(&log),
-            name: "first",
-        };
-        let second = RecordingMiddleware {
-            log: Arc::clone(&log),
-            name: "second",
-        };
-
-        let service = RouterService::builder()
-            .middleware(first)
-            .middleware_arc(Arc::new(second) as BoxMiddleware)
-            .get("/test", ok_handler)
-            .build();
-
-        let request = request_builder()
-            .method(Method::GET)
-            .uri("/test")
-            .body(Body::empty())
-            .expect("request");
-        let response = block_on(service.clone().call(request)).expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let entries = log.lock().unwrap().clone();
-        assert_eq!(entries, vec!["first", "second"]);
-    }
-
-    #[test]
-    fn oneshot_returns_success_response() {
-        let service = RouterService::builder().get("/ok", ok_handler).build();
-        let request = request_builder()
-            .method(Method::GET)
-            .uri("/ok")
-            .body(Body::empty())
-            .expect("request");
-
-        let response = block_on(service.oneshot(request));
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[test]
-    fn oneshot_returns_error_response() {
-        let service = RouterService::builder().build();
-        let request = request_builder()
-            .method(Method::GET)
-            .uri("/missing")
-            .body(Body::empty())
-            .expect("request");
-
-        let response = block_on(service.oneshot(request));
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn service_poll_ready_reports_ready() {
-        let mut service = RouterService::builder().build();
-        let waker = noop_waker_ref();
-        let mut cx = Context::from_waker(waker);
-        let ready = Service::<Request>::poll_ready(&mut service, &mut cx);
-        assert!(matches!(ready, Poll::Ready(Ok(()))));
-    }
-
-    #[test]
     fn route_entry_clone_copies_handler() {
         let entry = RouteEntry {
             handler: ok_handler.into_handler(),
@@ -732,5 +614,189 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let response = block_on(cloned.handler.call(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate route definition")]
+    fn route_listing_duplicate_path_panics() {
+        let _service = RouterService::builder()
+            .enable_route_listing()
+            .get(DEFAULT_ROUTE_LISTING_PATH, ok_handler)
+            .build();
+    }
+
+    #[test]
+    fn route_listing_outputs_all_routes() {
+        async fn noop(_ctx: RequestContext) -> Result<(), EdgeError> {
+            Ok(())
+        }
+
+        let service = RouterService::builder()
+            .enable_route_listing()
+            .get("/health", noop)
+            .post("/items", noop)
+            .build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri(DEFAULT_ROUTE_LISTING_PATH)
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.clone().call(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.body().as_bytes().expect("buffered");
+        let payload: Vec<serde_json::Value> = serde_json::from_slice(body).expect("json payload");
+
+        assert!(payload.contains(&json!({
+            "method": "GET",
+            "path": DEFAULT_ROUTE_LISTING_PATH
+        })));
+        assert!(payload.contains(&json!({
+            "method": "GET",
+            "path": "/health"
+        })));
+        assert!(payload.contains(&json!({
+            "method": "POST",
+            "path": "/items"
+        })));
+
+        let routes = service.routes();
+        assert!(routes
+            .iter()
+            .any(|route| route.path() == "/health" && *route.method() == Method::GET));
+
+        let health_request = request_builder()
+            .method(Method::GET)
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request");
+        let health_response = block_on(service.clone().call(health_request)).expect("response");
+        assert_eq!(health_response.status(), StatusCode::NO_CONTENT);
+
+        let items_request = request_builder()
+            .method(Method::POST)
+            .uri("/items")
+            .body(Body::empty())
+            .expect("request");
+        let items_response = block_on(service.clone().call(items_request)).expect("response");
+        assert_eq!(items_response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[test]
+    #[should_panic(expected = "route listing path cannot be empty")]
+    fn route_listing_rejects_empty_path() {
+        let _builder = RouterService::builder().enable_route_listing_at("");
+    }
+
+    #[test]
+    #[should_panic(expected = "route listing path must begin with '/'")]
+    fn route_listing_rejects_missing_slash() {
+        let _builder = RouterService::builder().enable_route_listing_at("routes");
+    }
+
+    #[test]
+    fn route_listing_response_handles_builder_failure() {
+        #[derive(Serialize)]
+        struct Payload {
+            ok: bool,
+        }
+
+        let builder = response_builder().header("bad\nname", "value");
+        let err =
+            build_listing_response(&Payload { ok: true }, builder).expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn route_listing_response_handles_json_failure() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(S::Error::custom("boom"))
+            }
+        }
+
+        let err = build_listing_response(&FailingSerialize, response_builder())
+            .expect_err("expected error");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn route_matches_path_params() {
+        #[derive(Deserialize)]
+        struct Params {
+            id: String,
+        }
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let params: Params = ctx.path()?;
+            Ok(format!("hello {}", params.id))
+        }
+
+        let service = RouterService::builder().get("/hello/{id}", handler).build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/hello/world")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.clone().call(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.body().as_bytes().expect("buffered"),
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn service_poll_ready_reports_ready() {
+        let mut service = RouterService::builder().build();
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+        let ready = Service::<Request>::poll_ready(&mut service, &mut cx);
+        assert!(matches!(ready, Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn streams_body_through_router() {
+        use bytes::Bytes;
+        use futures_util::stream;
+        use futures_util::StreamExt as _;
+
+        async fn handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
+            let chunks = stream::iter(vec![
+                Bytes::from_static(b"chunk-one\n"),
+                Bytes::from_static(b"chunk-two\n"),
+            ]);
+
+            (StatusCode::OK, Body::stream(chunks)).into_response()
+        }
+
+        let service = RouterService::builder().get("/stream", handler).build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/stream")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.clone().call(request)).expect("response");
+        let mut stream = response.into_body().into_stream().expect("stream body");
+        let collected = block_on(async {
+            let mut acc = Vec::new();
+            while let Some(result) = stream.next().await {
+                let chunk = result.expect("chunk");
+                acc.extend_from_slice(&chunk);
+            }
+            acc
+        });
+        assert_eq!(collected, b"chunk-one\nchunk-two\n");
     }
 }

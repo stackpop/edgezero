@@ -5,6 +5,9 @@ version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 
+[lints]
+workspace = true
+
 [features]
 default = []
 cli = [
@@ -34,6 +37,7 @@ log = { workspace = true }
 log-fastly = { workspace = true, optional = true }
 fern = { workspace = true }
 chrono = { workspace = true }
+thiserror = { workspace = true }
 walkdir = { workspace = true, optional = true }
 
 [dev-dependencies]

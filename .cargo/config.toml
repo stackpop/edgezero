@@ -1,0 +1,9 @@
+# Intentionally empty — runners for `wasm32-wasip1` differ per adapter
+# (Viceroy for fastly, Wasmtime for spin) and a single workspace-wide
+# default would silently pick the wrong host ABI for one of them.
+#
+# Per-package configs at `crates/edgezero-adapter-{fastly,spin}/.cargo/`
+# wire up the right runner when cargo is invoked from inside the package
+# directory. For workspace-root invocations, set
+# `CARGO_TARGET_WASM32_WASIP1_RUNNER` explicitly (CI does this in
+# `.github/workflows/test.yml`).

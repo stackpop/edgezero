@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,178 +7,14 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::registry::{register_adapter, Adapter, AdapterAction};
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
     DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
 };
-use edgezero_adapter::{register_adapter, Adapter, AdapterAction};
 use walkdir::WalkDir;
 
-const TARGET_TRIPLE: &str = "wasm32-unknown-unknown";
-
-pub fn build() -> Result<PathBuf, String> {
-    let manifest = find_wrangler_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_string())?;
-    let cargo_manifest = manifest_dir.join("Cargo.toml");
-    let crate_name = read_package_name(&cargo_manifest)?;
-
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            TARGET_TRIPLE,
-            "--manifest-path",
-            cargo_manifest
-                .to_str()
-                .ok_or("invalid Cargo manifest path")?,
-        ])
-        .status()
-        .map_err(|e| format!("failed to run cargo build: {e}"))?;
-    if !status.success() {
-        return Err(format!("cargo build failed with status {status}"));
-    }
-
-    let workspace_root = find_workspace_root(manifest_dir);
-    let artifact = locate_artifact(&workspace_root, manifest_dir, &crate_name)?;
-    let pkg_dir = workspace_root.join("pkg");
-    fs::create_dir_all(&pkg_dir)
-        .map_err(|e| format!("failed to create {}: {e}", pkg_dir.display()))?;
-    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
-    fs::copy(&artifact, &dest)
-        .map_err(|e| format!("failed to copy artifact to {}: {e}", dest.display()))?;
-
-    Ok(dest)
-}
-
-pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_wrangler_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_string())?;
-    let config = manifest
-        .to_str()
-        .ok_or_else(|| "invalid wrangler config path".to_string())?;
-
-    let status = Command::new("wrangler")
-        .args(["deploy", "--config", config])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|e| format!("failed to run wrangler CLI: {e}"))?;
-    if !status.success() {
-        return Err(format!("wrangler deploy failed with status {status}"));
-    }
-
-    Ok(())
-}
-
-pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest = find_wrangler_manifest(
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .as_path(),
-    )?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "wrangler manifest has no parent directory".to_string())?;
-    let config = manifest
-        .to_str()
-        .ok_or_else(|| "invalid wrangler config path".to_string())?;
-
-    let status = Command::new("wrangler")
-        .args(["dev", "--config", config])
-        .args(extra_args)
-        .current_dir(manifest_dir)
-        .status()
-        .map_err(|e| format!("failed to run wrangler CLI: {e}"))?;
-    if !status.success() {
-        return Err(format!("wrangler dev failed with status {status}"));
-    }
-
-    Ok(())
-}
-
-struct CloudflareCliAdapter;
-
-static CLOUDFLARE_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
-    TemplateRegistration {
-        name: "cf_Cargo_toml",
-        contents: include_str!("templates/Cargo.toml.hbs"),
-    },
-    TemplateRegistration {
-        name: "cf_src_lib_rs",
-        contents: include_str!("templates/src/lib.rs.hbs"),
-    },
-    TemplateRegistration {
-        name: "cf_src_main_rs",
-        contents: include_str!("templates/src/main.rs.hbs"),
-    },
-    TemplateRegistration {
-        name: "cf_cargo_config_toml",
-        contents: include_str!("templates/.cargo/config.toml.hbs"),
-    },
-    TemplateRegistration {
-        name: "cf_wrangler_toml",
-        contents: include_str!("templates/wrangler.toml.hbs"),
-    },
-];
-
-static CLOUDFLARE_FILE_SPECS: &[AdapterFileSpec] = &[
-    AdapterFileSpec {
-        template: "cf_Cargo_toml",
-        output: "Cargo.toml",
-    },
-    AdapterFileSpec {
-        template: "cf_src_lib_rs",
-        output: "src/lib.rs",
-    },
-    AdapterFileSpec {
-        template: "cf_src_main_rs",
-        output: "src/main.rs",
-    },
-    AdapterFileSpec {
-        template: "cf_cargo_config_toml",
-        output: ".cargo/config.toml",
-    },
-    AdapterFileSpec {
-        template: "cf_wrangler_toml",
-        output: "wrangler.toml",
-    },
-];
-
-static CLOUDFLARE_DEPENDENCIES: &[DependencySpec] = &[
-    DependencySpec {
-        key: "dep_edgezero_core_cloudflare",
-        repo_crate: "crates/edgezero-core",
-        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
-        features: &[],
-    },
-    DependencySpec {
-        key: "dep_edgezero_adapter_cloudflare",
-        repo_crate: "crates/edgezero-adapter-cloudflare",
-        fallback:
-            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
-        features: &[],
-    },
-    DependencySpec {
-        key: "dep_edgezero_adapter_cloudflare_wasm",
-        repo_crate: "crates/edgezero-adapter-cloudflare",
-        fallback:
-            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
-        features: &["cloudflare"],
-    },
-];
+static CLOUDFLARE_ADAPTER: CloudflareCliAdapter = CloudflareCliAdapter;
 
 static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     id: "cloudflare",
@@ -213,35 +50,164 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
     run_module: "edgezero_adapter_cloudflare",
 };
 
-static CLOUDFLARE_ADAPTER: CloudflareCliAdapter = CloudflareCliAdapter;
+static CLOUDFLARE_DEPENDENCIES: &[DependencySpec] = &[
+    DependencySpec {
+        key: "dep_edgezero_core_cloudflare",
+        repo_crate: "crates/edgezero-core",
+        fallback: "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
+        features: &[],
+    },
+    DependencySpec {
+        key: "dep_edgezero_adapter_cloudflare",
+        repo_crate: "crates/edgezero-adapter-cloudflare",
+        fallback:
+            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
+        features: &[],
+    },
+    DependencySpec {
+        key: "dep_edgezero_adapter_cloudflare_wasm",
+        repo_crate: "crates/edgezero-adapter-cloudflare",
+        fallback:
+            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
+        features: &["cloudflare"],
+    },
+];
+
+static CLOUDFLARE_FILE_SPECS: &[AdapterFileSpec] = &[
+    AdapterFileSpec {
+        template: "cf_Cargo_toml",
+        output: "Cargo.toml",
+    },
+    AdapterFileSpec {
+        template: "cf_src_lib_rs",
+        output: "src/lib.rs",
+    },
+    AdapterFileSpec {
+        template: "cf_src_main_rs",
+        output: "src/main.rs",
+    },
+    AdapterFileSpec {
+        template: "cf_cargo_config_toml",
+        output: ".cargo/config.toml",
+    },
+    AdapterFileSpec {
+        template: "cf_wrangler_toml",
+        output: "wrangler.toml",
+    },
+];
+
+static CLOUDFLARE_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
+    TemplateRegistration {
+        name: "cf_Cargo_toml",
+        contents: include_str!("templates/Cargo.toml.hbs"),
+    },
+    TemplateRegistration {
+        name: "cf_src_lib_rs",
+        contents: include_str!("templates/src/lib.rs.hbs"),
+    },
+    TemplateRegistration {
+        name: "cf_src_main_rs",
+        contents: include_str!("templates/src/main.rs.hbs"),
+    },
+    TemplateRegistration {
+        name: "cf_cargo_config_toml",
+        contents: include_str!("templates/.cargo/config.toml.hbs"),
+    },
+    TemplateRegistration {
+        name: "cf_wrangler_toml",
+        contents: include_str!("templates/wrangler.toml.hbs"),
+    },
+];
+
+const TARGET_TRIPLE: &str = "wasm32-unknown-unknown";
+
+struct CloudflareCliAdapter;
 
 impl Adapter for CloudflareCliAdapter {
-    fn name(&self) -> &'static str {
-        "cloudflare"
-    }
-
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             AdapterAction::Build => build().map(|artifact| {
-                println!(
+                log::info!(
                     "[edgezero] Cloudflare build artifact -> {}",
                     artifact.display()
                 );
             }),
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
+            other => Err(format!("cloudflare adapter does not support {other:?}")),
         }
+    }
+
+    fn name(&self) -> &'static str {
+        "cloudflare"
     }
 }
 
-pub fn register() {
-    register_adapter(&CLOUDFLARE_ADAPTER);
-    register_adapter_blueprint(&CLOUDFLARE_BLUEPRINT);
+/// # Errors
+/// Returns an error if the Cloudflare wrangler build command fails.
+#[inline]
+pub fn build() -> Result<PathBuf, String> {
+    let manifest =
+        find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
+    let cargo_manifest = manifest_dir.join("Cargo.toml");
+    let crate_name = read_package_name(&cargo_manifest)?;
+
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            TARGET_TRIPLE,
+            "--manifest-path",
+            cargo_manifest
+                .to_str()
+                .ok_or("invalid Cargo manifest path")?,
+        ])
+        .status()
+        .map_err(|err| format!("failed to run cargo build: {err}"))?;
+    if !status.success() {
+        return Err(format!("cargo build failed with status {status}"));
+    }
+
+    let workspace_root = find_workspace_root(manifest_dir);
+    let artifact = locate_artifact(&workspace_root, manifest_dir, &crate_name)?;
+    let pkg_dir = workspace_root.join("pkg");
+    fs::create_dir_all(&pkg_dir)
+        .map_err(|err| format!("failed to create {}: {err}", pkg_dir.display()))?;
+    let dest = pkg_dir.join(format!("{}.wasm", crate_name.replace('-', "_")));
+    fs::copy(&artifact, &dest)
+        .map_err(|err| format!("failed to copy artifact to {}: {err}", dest.display()))?;
+
+    Ok(dest)
 }
 
-#[ctor]
-fn register_ctor() {
-    register();
+/// # Errors
+/// Returns an error if the Cloudflare wrangler deploy command fails.
+#[inline]
+pub fn deploy(extra_args: &[String]) -> Result<(), String> {
+    let manifest =
+        find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
+    let config = manifest
+        .to_str()
+        .ok_or_else(|| "invalid wrangler config path".to_owned())?;
+
+    let status = Command::new("wrangler")
+        .args(["deploy", "--config", config])
+        .args(extra_args)
+        .current_dir(manifest_dir)
+        .status()
+        .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
+    if !status.success() {
+        return Err(format!("wrangler deploy failed with status {status}"));
+    }
+
+    Ok(())
 }
 
 fn find_wrangler_manifest(start: &Path) -> Result<PathBuf, String> {
@@ -257,18 +223,15 @@ fn find_wrangler_manifest(start: &Path) -> Result<PathBuf, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
-            path.file_name()
-                .map(|n| n == "wrangler.toml")
-                .unwrap_or(false)
+            path.file_name().is_some_and(|n| n == "wrangler.toml")
                 && path
                     .parent()
-                    .map(|dir| dir.join("Cargo.toml").exists())
-                    .unwrap_or(false)
+                    .is_some_and(|dir| dir.join("Cargo.toml").exists())
         })
         .collect();
 
     if candidates.is_empty() {
-        return Err("could not locate wrangler.toml".to_string());
+        return Err("could not locate wrangler.toml".to_owned());
     }
 
     candidates.sort_by_key(|path| {
@@ -286,7 +249,7 @@ fn locate_artifact(
 ) -> Result<PathBuf, String> {
     let release_name = format!("{}.wasm", crate_name.replace('-', "_"));
 
-    if let Some(custom) = std::env::var_os("CARGO_TARGET_DIR") {
+    if let Some(custom) = env::var_os("CARGO_TARGET_DIR") {
         let candidate = PathBuf::from(custom)
             .join(TARGET_TRIPLE)
             .join("release")
@@ -315,7 +278,43 @@ fn locate_artifact(
     }
 
     Err(format!(
-        "compiled artifact not found for {} (looked in manifest and workspace target directories)",
-        crate_name
+        "compiled artifact not found for {crate_name} (looked in manifest and workspace target directories)"
     ))
+}
+
+#[inline]
+pub fn register() {
+    register_adapter(&CLOUDFLARE_ADAPTER);
+    register_adapter_blueprint(&CLOUDFLARE_BLUEPRINT);
+}
+
+#[ctor(unsafe)]
+fn register_ctor() {
+    register();
+}
+
+/// # Errors
+/// Returns an error if the Cloudflare wrangler dev command fails.
+#[inline]
+pub fn serve(extra_args: &[String]) -> Result<(), String> {
+    let manifest =
+        find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
+    let config = manifest
+        .to_str()
+        .ok_or_else(|| "invalid wrangler config path".to_owned())?;
+
+    let status = Command::new("wrangler")
+        .args(["dev", "--config", config])
+        .args(extra_args)
+        .current_dir(manifest_dir)
+        .status()
+        .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
+    if !status.success() {
+        return Err(format!("wrangler dev failed with status {status}"));
+    }
+
+    Ok(())
 }

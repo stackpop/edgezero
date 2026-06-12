@@ -1,4 +1,4 @@
-//! EdgeZero CLI.
+//! `EdgeZero` CLI.
 
 #[cfg(feature = "cli")]
 mod adapter;
@@ -14,21 +14,77 @@ mod scaffold;
 #[cfg(feature = "cli")]
 use edgezero_core::manifest::ManifestLoader;
 #[cfg(feature = "cli")]
+use std::env;
+#[cfg(feature = "cli")]
 use std::io::ErrorKind;
 #[cfg(feature = "cli")]
 use std::path::PathBuf;
+#[cfg(feature = "cli")]
+use std::process;
+
+/// CLI output logger: prints `record.args()` verbatim with no timestamps,
+/// levels, or module prefixes — the CLI's output IS the user-facing UX, not a
+/// debug log. `info` goes to stdout; `warn`/`error` go to stderr. `debug` and
+/// `trace` are filtered out by `enabled()` and `LevelFilter::Info`; there is
+/// no verbosity flag yet.
+#[cfg(feature = "cli")]
+struct CliLogger;
+
+#[cfg(feature = "cli")]
+impl log::Log for CliLogger {
+    #[inline]
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    #[inline]
+    fn flush(&self) {}
+
+    #[inline]
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        match record.level() {
+            log::Level::Error | log::Level::Warn => {
+                #[expect(
+                    clippy::print_stderr,
+                    reason = "CLI UX output goes to stderr for warn/error"
+                )]
+                {
+                    eprintln!("{}", record.args());
+                }
+            }
+            log::Level::Info => {
+                #[expect(clippy::print_stdout, reason = "CLI UX output goes to stdout for info")]
+                {
+                    println!("{}", record.args());
+                }
+            }
+            log::Level::Debug | log::Level::Trace => {}
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+fn init_cli_logger() {
+    static CLI_LOGGER: CliLogger = CliLogger;
+    let _logger_init =
+        log::set_logger(&CLI_LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
+}
 
 #[cfg(feature = "cli")]
 fn main() {
     use args::{Args, Command};
-    use clap::Parser;
+    use clap::Parser as _;
 
+    init_cli_logger();
     let args = Args::parse();
     match args.cmd {
         Command::New(new_args) => {
-            if let Err(e) = generator::generate_new(new_args) {
-                eprintln!("[edgezero] new error: {e}");
-                std::process::exit(1);
+            if let Err(err) = generator::generate_new(&new_args) {
+                log::error!("[edgezero] new error: {err}");
+                process::exit(1);
             }
         }
         Command::Build {
@@ -36,8 +92,8 @@ fn main() {
             adapter_args,
         } => {
             if let Err(err) = handle_build(&adapter, &adapter_args) {
-                eprintln!("[edgezero] build error: {err}");
-                std::process::exit(1);
+                log::error!("[edgezero] build error: {err}");
+                process::exit(1);
             }
         }
         Command::Deploy {
@@ -45,14 +101,14 @@ fn main() {
             adapter_args,
         } => {
             if let Err(err) = handle_deploy(&adapter, &adapter_args) {
-                eprintln!("[edgezero] deploy error: {err}");
-                std::process::exit(1);
+                log::error!("[edgezero] deploy error: {err}");
+                process::exit(1);
             }
         }
         Command::Serve { adapter } => {
             if let Err(err) = handle_serve(&adapter) {
-                eprintln!("[edgezero] serve error: {err}");
-                std::process::exit(1);
+                log::error!("[edgezero] serve error: {err}");
+                process::exit(1);
             }
         }
         Command::Dev => {
@@ -63,10 +119,10 @@ fn main() {
 
             #[cfg(not(feature = "edgezero-adapter-axum"))]
             {
-                eprintln!(
+                log::error!(
                     "edgezero-cli built without `edgezero-adapter-axum`; rebuild with that feature to use `edgezero dev`."
                 );
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     }
@@ -74,36 +130,40 @@ fn main() {
 
 #[cfg(not(feature = "cli"))]
 fn main() {
-    eprintln!("edgezero-cli built without `cli` feature. Rebuild with `--features cli`.");
+    use log::LevelFilter;
+    use simple_logger::SimpleLogger;
+    let _logger_init = SimpleLogger::new()
+        .with_level(LevelFilter::Error)
+        .without_timestamps()
+        .init();
+    log::error!("edgezero-cli built without `cli` feature. Rebuild with `--features cli`.");
 }
 
 #[cfg(feature = "cli")]
 fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Option<String> {
-    let m = manifest.manifest();
-    if !m.secret_store_enabled(adapter_name) {
+    let manifest_data = manifest.manifest();
+    if !manifest_data.secret_store_enabled(adapter_name) {
         return None;
     }
 
-    let binding_name = m.secret_store_name(adapter_name);
+    // Note: the configured binding identifier is intentionally NOT included in
+    // this log line. CodeQL's `rust/cleartext-logging` rule taints any value
+    // returned by a function whose name contains "secret" (it can't tell
+    // metadata from secret material), and adapters/operators can read the
+    // binding name from their own `edgezero.toml` if they need to verify it.
     let message = match adapter_name {
-        "axum" => format!(
-            "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs (configured store name: '{binding_name}')"
-        ),
-        "cloudflare" => format!(
-            "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler (configured store name: '{binding_name}' is metadata only)"
-        ),
-        _ => format!(
-            "[edgezero] secret store '{binding_name}' enabled for {adapter_name} -- ensure it is provisioned on the target platform"
-        ),
+        "axum" => "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs",
+        "cloudflare" => "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler",
+        _ => "[edgezero] secrets enabled -- ensure the configured secret store is provisioned on the target platform",
     };
 
-    Some(message)
+    Some(message.to_owned())
 }
 
 #[cfg(feature = "cli")]
 fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
     if let Some(message) = store_bindings_message(adapter_name, manifest) {
-        println!("{message}");
+        log::info!("{message}");
     }
 }
 
@@ -111,8 +171,8 @@ fn log_store_bindings(adapter_name: &str, manifest: &ManifestLoader) {
 fn handle_build(adapter_name: &str, adapter_args: &[String]) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
-    if let Some(ref m) = manifest {
-        log_store_bindings(adapter_name, m);
+    if let Some(loader) = &manifest {
+        log_store_bindings(adapter_name, loader);
     }
     adapter::execute(
         adapter_name,
@@ -138,28 +198,22 @@ fn handle_deploy(adapter_name: &str, adapter_args: &[String]) -> Result<(), Stri
 fn handle_serve(adapter_name: &str) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(adapter_name, manifest.as_ref())?;
-    adapter::execute(
-        adapter_name,
-        adapter::Action::Serve,
-        manifest.as_ref(),
-        &[] as &[String],
-    )
+    adapter::execute(adapter_name, adapter::Action::Serve, manifest.as_ref(), &[])
 }
 
 #[cfg(feature = "cli")]
 fn ensure_adapter_defined(
     adapter_name: &str,
-    manifest: Option<&ManifestLoader>,
+    manifest_loader: Option<&ManifestLoader>,
 ) -> Result<(), String> {
-    if let Some(manifest) = manifest {
-        if manifest.manifest().adapters.contains_key(adapter_name) {
+    if let Some(loader) = manifest_loader {
+        if loader.manifest().adapters.contains_key(adapter_name) {
             return Ok(());
         }
-        let available: Vec<String> = manifest.manifest().adapters.keys().cloned().collect();
+        let available: Vec<String> = loader.manifest().adapters.keys().cloned().collect();
         if available.is_empty() {
             Err(format!(
-                "adapter `{}` is not configured in edgezero.toml (no adapters defined)",
-                adapter_name
+                "adapter `{adapter_name}` is not configured in edgezero.toml (no adapters defined)"
             ))
         } else {
             Err(format!(
@@ -175,9 +229,8 @@ fn ensure_adapter_defined(
 
 #[cfg(feature = "cli")]
 fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
-    let path = std::env::var("EDGEZERO_MANIFEST")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("edgezero.toml"));
+    let path = env::var("EDGEZERO_MANIFEST")
+        .map_or_else(|_| PathBuf::from("edgezero.toml"), PathBuf::from);
 
     match ManifestLoader::from_path(&path) {
         Ok(loader) => Ok(Some(loader)),
@@ -186,7 +239,8 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
     }
 }
 
-#[cfg(all(test, feature = "cli"))]
+#[cfg(test)]
+#[cfg(feature = "cli")]
 mod tests {
     use super::*;
     use edgezero_core::manifest::ManifestLoader;
@@ -213,32 +267,32 @@ deploy = "echo deploy"
 serve = "echo serve"
 "#;
 
-    fn manifest_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
-    }
-
     struct EnvOverride {
         key: &'static str,
         original: Option<String>,
     }
 
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                env::set_var(self.key, original);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
     impl EnvOverride {
         fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            let original = env::var(key).ok();
+            env::set_var(key, value);
             Self { key, original }
         }
     }
 
-    impl Drop for EnvOverride {
-        fn drop(&mut self) {
-            if let Some(ref original) = self.original {
-                std::env::set_var(self.key, original);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
+    fn manifest_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     #[test]
@@ -269,7 +323,7 @@ serve = "echo serve"
     #[test]
     fn ensure_adapter_defined_accepts_known_adapter() {
         let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
-        assert!(ensure_adapter_defined("fastly", Some(&loader)).is_ok());
+        ensure_adapter_defined("fastly", Some(&loader)).expect("known adapter");
     }
 
     #[test]
@@ -282,7 +336,7 @@ serve = "echo serve"
 
     #[test]
     fn ensure_adapter_defined_allows_when_manifest_missing() {
-        assert!(ensure_adapter_defined("fastly", None).is_ok());
+        ensure_adapter_defined("fastly", None).expect("manifest missing -> permissive");
     }
 
     #[cfg(not(windows))]
@@ -324,7 +378,7 @@ serve = "echo serve"
     }
 
     #[test]
-    fn secret_store_name_is_readable_from_manifest() {
+    fn secret_store_binding_is_readable_from_manifest() {
         let manifest_with_secrets = r#"
 [app]
 name = "demo-app"
@@ -339,7 +393,10 @@ deploy = "echo deploy"
 serve = "echo serve"
 "#;
         let loader = ManifestLoader::load_from_str(manifest_with_secrets);
-        assert_eq!(loader.manifest().secret_store_name("fastly"), "MY_SECRETS");
+        assert_eq!(
+            loader.manifest().secret_store_binding("fastly"),
+            "MY_SECRETS"
+        );
         assert!(loader.manifest().stores.secrets.is_some());
     }
 
@@ -359,16 +416,16 @@ name = "MY_SECRETS"
         assert!(cloudflare.contains("wrangler"));
 
         let fastly = store_bindings_message("fastly", &loader).expect("fastly message");
-        assert!(fastly.contains("secret store 'MY_SECRETS'"));
+        assert!(fastly.contains("secrets enabled"));
     }
 
     #[test]
     fn store_bindings_message_respects_secret_store_enabled() {
         let loader = ManifestLoader::load_from_str(
-            r#"
+            "
 [stores.secrets]
 enabled = false
-"#,
+",
         );
         assert!(store_bindings_message("fastly", &loader).is_none());
     }

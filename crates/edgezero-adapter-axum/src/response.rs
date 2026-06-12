@@ -1,25 +1,27 @@
 use axum::body::Body as AxumBody;
-use axum::http::{Response, StatusCode};
+use axum::http::header::CONTENT_TYPE;
+use axum::http::{HeaderValue, Response, StatusCode};
 use futures::executor::block_on;
-use futures_util::{pin_mut, StreamExt};
+use futures_util::{pin_mut, StreamExt as _};
 use tracing::error;
 
 use edgezero_core::body::Body;
 use edgezero_core::http::Response as CoreResponse;
 
-/// Convert an EdgeZero response into one consumable by Axum/Hyper.
+/// Convert an `EdgeZero` response into one consumable by Axum/Hyper.
 ///
 /// Streaming responses are collected into an in-memory buffer. While this sacrifices
 /// incremental flushing, it keeps the adapter compatible with the non-`Send` streaming type used by
 /// `edgezero_core::Body` and works well for local development.
+///
+#[inline]
 pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
-    let (parts, body) = response.into_parts();
-    let body = match body {
+    let (parts, core_body) = response.into_parts();
+    let body = match core_body {
         Body::Once(bytes) => AxumBody::from(bytes),
         Body::Stream(stream) => {
             let result = block_on(async {
                 let mut buf = Vec::new();
-                let stream = stream;
                 pin_mut!(stream);
                 while let Some(chunk) = stream.next().await {
                     let bytes = chunk?;
@@ -31,22 +33,25 @@ pub fn into_axum_response(response: CoreResponse) -> Response<AxumBody> {
                 Ok(buf) => AxumBody::from(buf),
                 Err(err) => {
                     error!("streaming response error: {err}");
-                    let body = AxumBody::from("streaming response error");
-                    let mut response = Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(body)
-                        .expect("error response");
-                    response.headers_mut().insert(
-                        axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                    );
-                    return response;
+                    return error_response_500("streaming response error");
                 }
             }
         }
     };
 
     Response::from_parts(parts, body)
+}
+
+/// Build a minimal 500 response without any builder steps that could fail.
+/// Used as a fallback on the request path so we never panic on synthesis.
+fn error_response_500(message: &'static str) -> Response<AxumBody> {
+    let mut response = Response::new(AxumBody::from(message));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -83,9 +88,9 @@ mod tests {
 
         let collected = block_on(async {
             let mut data = Vec::new();
-            let mut stream = axum_response.into_body().into_data_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.expect("chunk");
+            let mut body_stream = axum_response.into_body().into_data_stream();
+            while let Some(result) = body_stream.next().await {
+                let chunk = result.expect("chunk");
                 data.extend_from_slice(&chunk);
             }
             data

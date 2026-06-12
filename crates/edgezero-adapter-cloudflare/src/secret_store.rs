@@ -30,6 +30,8 @@ pub struct CloudflareSecretStore {
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 impl CloudflareSecretStore {
     /// Create a secret store from a cloned `Env`.
+    #[inline]
+    #[must_use]
     pub fn from_env(env: worker::Env) -> Self {
         Self { env }
     }
@@ -38,6 +40,7 @@ impl CloudflareSecretStore {
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl SecretStore for CloudflareSecretStore {
+    #[inline]
     async fn get_bytes(&self, _store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         match self.env.secret(key) {
             Ok(secret) => {

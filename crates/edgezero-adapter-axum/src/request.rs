@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use axum::body::Body as AxumBody;
+use axum::body::{to_bytes, Body as AxumBody};
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::Request;
 use edgezero_core::body::Body;
@@ -12,20 +12,24 @@ use edgezero_core::proxy::ProxyHandle;
 use crate::context::AxumRequestContext;
 use crate::proxy::AxumProxyClient;
 
-/// Convert an Axum/Hyper request into an EdgeZero core request while preserving streaming bodies
+/// Convert an Axum/Hyper request into an `EdgeZero` core request while preserving streaming bodies
 /// and exposing connection metadata through `AxumRequestContext`.
+///
+/// # Errors
+/// Returns an error if a buffered (`application/json`) body cannot be read into memory.
+#[inline]
 pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest, String> {
-    let (parts, body) = request.into_parts();
+    let (parts, axum_body) = request.into_parts();
 
     let body = match parts.headers.get(CONTENT_TYPE) {
         Some(value) if is_json_content_type(value) => {
-            let bytes = axum::body::to_bytes(body, usize::MAX)
+            let bytes = to_bytes(axum_body, usize::MAX)
                 .await
-                .map_err(|e| format!("Failed to convert body into bytes: {e}"))?;
+                .map_err(|err| format!("Failed to convert body into bytes: {err}"))?;
             Body::from_bytes(bytes)
         }
         _ => {
-            let stream = body.into_data_stream();
+            let stream = axum_body.into_data_stream();
             Body::from_stream(stream)
         }
     };
@@ -48,9 +52,11 @@ pub async fn into_core_request(request: Request<AxumBody>) -> Result<CoreRequest
         );
     }
 
+    let proxy_client =
+        AxumProxyClient::try_new().map_err(|err| format!("failed to build proxy client: {err}"))?;
     core_request
         .extensions_mut()
-        .insert(ProxyHandle::with_client(AxumProxyClient::default()));
+        .insert(ProxyHandle::with_client(proxy_client));
 
     Ok(core_request)
 }
@@ -60,12 +66,12 @@ fn is_json_content_type(value: &HeaderValue) -> bool {
         return false;
     };
 
-    let media_type = raw.split(';').next().map(str::trim).unwrap_or("");
+    let media_type = raw.split(';').next().map_or("", str::trim);
     if media_type.eq_ignore_ascii_case("application/json") {
         return true;
     }
 
-    let Some((ty, subtype)) = media_type.split_once('/') else {
+    let Some((ty, raw_subtype)) = media_type.split_once('/') else {
         return false;
     };
 
@@ -73,8 +79,13 @@ fn is_json_content_type(value: &HeaderValue) -> bool {
         return false;
     }
 
-    let subtype = subtype.trim();
-    subtype.len() >= 5 && subtype[subtype.len() - 5..].eq_ignore_ascii_case("+json")
+    let subtype = raw_subtype.trim();
+    let Some(suffix_start) = subtype.len().checked_sub(5) else {
+        return false;
+    };
+    subtype
+        .get(suffix_start..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json"))
 }
 
 #[cfg(test)]
@@ -168,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_json_content_type() {
+    fn json_content_type_detection() {
         assert!(is_json_content_type(&HeaderValue::from_static(
             "application/json"
         )));

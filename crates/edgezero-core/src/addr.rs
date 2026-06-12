@@ -1,12 +1,12 @@
-//! Shared bind-address resolution for EdgeZero dev servers.
+//! Shared bind-address resolution for `EdgeZero` dev servers.
 //!
 //! Centralises the precedence logic (env vars > config > defaults) so that
 //! both the Axum adapter and the CLI dev server produce consistent results.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Default bind host: localhost (`127.0.0.1`).
-pub const DEFAULT_HOST: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+pub const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Default bind port (`8787`).
 pub const DEFAULT_PORT: u16 = 8787;
 
@@ -25,6 +25,8 @@ pub struct BindAddrResolution {
 /// 3. Defaults: `127.0.0.1:8787`
 ///
 /// Invalid values produce warnings and fall back to the next precedence level.
+#[inline]
+#[must_use]
 pub fn resolve_bind_addr(
     env_host: Option<&str>,
     env_port: Option<&str>,
@@ -76,7 +78,7 @@ fn resolve_port(
         match value.parse::<u16>() {
             Ok(0) => warnings.push(
                 "EDGEZERO_PORT=\"0\" is not supported (would bind to a random OS port); falling back"
-                    .to_string(),
+                    .to_owned(),
             ),
             Ok(port) => return port,
             Err(_) => warnings.push(format!(
@@ -85,13 +87,13 @@ fn resolve_port(
         }
     }
 
-    if let Some(0) = config_port {
-        warnings.push(
+    match config_port {
+        Some(0) => warnings.push(
             "configured port=0 is not supported (would bind to a random OS port); falling back"
-                .to_string(),
-        );
-    } else if let Some(port) = config_port {
-        return port;
+                .to_owned(),
+        ),
+        Some(port) => return port,
+        None => {}
     }
 
     DEFAULT_PORT
@@ -112,7 +114,7 @@ mod tests {
     #[test]
     fn config_overrides_defaults() {
         let resolution = resolve_bind_addr(None, None, Some("0.0.0.0"), Some(3000));
-        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(resolution.addr.port(), 3000);
         assert!(resolution.warnings.is_empty());
     }
@@ -121,7 +123,7 @@ mod tests {
     fn env_overrides_config() {
         let resolution =
             resolve_bind_addr(Some("0.0.0.0"), Some("4000"), Some("127.0.0.1"), Some(3000));
-        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(resolution.addr.port(), 4000);
         assert!(resolution.warnings.is_empty());
     }
@@ -129,21 +131,21 @@ mod tests {
     #[test]
     fn partial_env_override_host_only() {
         let resolution = resolve_bind_addr(Some("0.0.0.0"), None, None, Some(5000));
-        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(resolution.addr.port(), 5000);
     }
 
     #[test]
     fn partial_env_override_port_only() {
         let resolution = resolve_bind_addr(None, Some("9000"), Some("0.0.0.0"), None);
-        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(resolution.addr.port(), 9000);
     }
 
     #[test]
     fn invalid_env_host_falls_back_to_config() {
         let resolution = resolve_bind_addr(Some("not-an-ip"), None, Some("0.0.0.0"), None);
-        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert_eq!(resolution.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(resolution.warnings.len(), 1);
         assert!(resolution.warnings[0].contains("EDGEZERO_HOST"));
         assert!(resolution.warnings[0].contains("not a valid IP address"));

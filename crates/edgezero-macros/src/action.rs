@@ -1,13 +1,13 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned, Error, FnArg, ItemFn, Pat, PathArguments, Type};
+use syn::{spanned::Spanned as _, Error, FnArg, ItemFn, Pat, PathArguments, Type};
 
 pub fn expand_action(attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_action_impl(attr.into(), item.into()).into()
+    expand_action_impl(&attr.into(), item.into()).into()
 }
 
-pub(crate) fn expand_action_impl(
-    attr: proc_macro2::TokenStream,
+fn expand_action_impl(
+    attr: &proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     if !attr.is_empty() {
@@ -41,6 +41,12 @@ pub(crate) fn expand_action_impl(
     inner_fn.sig.ident = inner_ident.clone();
     inner_fn.vis = syn::Visibility::Inherited;
     inner_fn.attrs.clear();
+    // `#[action]` requires the user fn to be `async` so we can `.await` it
+    // from the generated outer fn. Some handler bodies have no awaits of
+    // their own — silence `clippy::unused_async` for those.
+    inner_fn
+        .attrs
+        .push(syn::parse_quote!(#[allow(clippy::unused_async)]));
 
     if let Err(err) = normalize_request_context_patterns(&mut inner_fn) {
         return err.to_compile_error();
@@ -53,7 +59,13 @@ pub(crate) fn expand_action_impl(
     for (index, arg) in func.sig.inputs.iter().enumerate() {
         let pat_type = match arg {
             FnArg::Typed(pat_type) => pat_type,
-            FnArg::Receiver(_) => unreachable!(),
+            FnArg::Receiver(receiver) => {
+                return syn::Error::new(
+                    receiver.span(),
+                    "#[action] functions cannot have a `self` receiver",
+                )
+                .to_compile_error();
+            }
         };
 
         let ty = &pat_type.ty;
@@ -128,17 +140,14 @@ fn extract_request_context_binding(pat: &Pat) -> syn::Result<Option<Pat>> {
 }
 
 fn path_is_request_context(path: &syn::Path) -> bool {
-    path.segments
-        .last()
-        .map(|segment| {
-            segment.ident == "RequestContext" && matches!(segment.arguments, PathArguments::None)
-        })
-        .unwrap_or(false)
+    path.segments.last().is_some_and(|segment| {
+        segment.ident == "RequestContext" && matches!(segment.arguments, PathArguments::None)
+    })
 }
 
 fn normalize_request_context_patterns(func: &mut ItemFn) -> Result<(), Error> {
     let mut error: Option<Error> = None;
-    for arg in func.sig.inputs.iter_mut() {
+    for arg in &mut func.sig.inputs {
         if let FnArg::Typed(pat_type) = arg {
             if is_request_context_type(&pat_type.ty) {
                 if let Err(err) = normalize_request_context_pat(&mut pat_type.pat) {
@@ -164,7 +173,7 @@ mod tests {
     use proc_macro2::TokenStream;
     use quote::quote;
 
-    fn render(tokens: TokenStream) -> String {
+    fn render(tokens: &TokenStream) -> String {
         tokens.to_string()
     }
 
@@ -182,8 +191,8 @@ mod tests {
                     .unwrap()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("__demo_inner"));
         assert!(rendered.contains("fn demo"));
         assert!(rendered.contains("responder :: Responder :: respond"));
@@ -194,8 +203,8 @@ mod tests {
         let input = quote! {
             fn invalid() {}
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("must be async"));
     }
 
@@ -206,8 +215,8 @@ mod tests {
                 unimplemented!()
             }
         };
-        let output = expand_action_impl(quote!(path = "/demo"), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&quote!(path = "/demo"), input);
+        let rendered = render(&output);
         assert!(rendered.contains("does not accept arguments"));
     }
 
@@ -218,8 +227,8 @@ mod tests {
                 unimplemented!()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("does not support self receivers"));
     }
 
@@ -239,8 +248,8 @@ mod tests {
                     .unwrap())
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         let collapsed = collapse_whitespace(&rendered);
         assert!(collapsed.contains("__with_ctx_inner(__ctx)"));
     }
@@ -261,8 +270,8 @@ mod tests {
                     .unwrap())
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         let collapsed = collapse_whitespace(&rendered);
         assert!(collapsed.contains("__tuple_ctx_inner(__ctx)"));
     }
@@ -275,8 +284,8 @@ mod tests {
                 second: ::edgezero_core::context::RequestContext,
             ) {}
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("support at most one RequestContext argument"));
     }
 
@@ -289,8 +298,8 @@ mod tests {
                 unimplemented!()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         assert!(rendered.contains("expects exactly one binding"));
     }
 
@@ -307,8 +316,8 @@ mod tests {
                     .unwrap()
             }
         };
-        let output = expand_action_impl(TokenStream::new(), input);
-        let rendered = render(output);
+        let output = expand_action_impl(&TokenStream::new(), input);
+        let rendered = render(&output);
         let collapsed = collapse_whitespace(&rendered);
         assert!(
             collapsed.contains("FromRequest>::from_request"),

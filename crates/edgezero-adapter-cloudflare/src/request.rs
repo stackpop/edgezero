@@ -1,16 +1,20 @@
 use std::collections::BTreeSet;
+use std::fmt::Display;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::config_store::CloudflareConfigStore;
+use crate::context::CloudflareRequestContext;
+use crate::key_value_store::CloudflareKvStore;
 use crate::proxy::CloudflareProxyClient;
 use crate::response::from_core_response;
-use crate::CloudflareRequestContext;
+use crate::secret_store::CloudflareSecretStore;
 use edgezero_core::app::App;
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{request_builder, Method as CoreMethod, Request, Uri};
 use edgezero_core::key_value_store::KvHandle;
+use edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use worker::{
@@ -21,7 +25,7 @@ use worker::{
 ///
 /// If a KV namespace with this binding exists in your `wrangler.toml`,
 /// it will be automatically available to handlers via the `Kv` extractor.
-pub const DEFAULT_KV_BINDING: &str = edgezero_core::manifest::DEFAULT_KV_STORE_NAME;
+pub const DEFAULT_KV_BINDING: &str = DEFAULT_KV_STORE_NAME;
 
 /// Groups the optional per-request store handles injected at dispatch time.
 ///
@@ -32,24 +36,40 @@ pub const DEFAULT_KV_BINDING: &str = edgezero_core::manifest::DEFAULT_KV_STORE_N
 /// ```
 #[derive(Default)]
 pub(crate) struct Stores {
-    pub(crate) config_store: Option<ConfigStoreHandle>,
-    pub(crate) kv: Option<KvHandle>,
-    pub(crate) secrets: Option<SecretHandle>,
+    pub config_store: Option<ConfigStoreHandle>,
+    pub kv: Option<KvHandle>,
+    pub secrets: Option<SecretHandle>,
 }
 
+/// Binding-resolution inputs for [`dispatch_with_bindings`]. Grouped to keep
+/// the dispatch signature within clippy's `too_many_arguments` limit.
+pub(crate) struct RuntimeBindings<'binding> {
+    pub config: Option<&'binding str>,
+    pub kv: &'binding str,
+    pub kv_required: bool,
+    pub secrets_required: bool,
+}
+
+/// Convert a Cloudflare `CfRequest` into an `EdgeZero` core [`Request`].
+///
+/// # Errors
+/// Returns [`EdgeError::bad_request`] if the request URL is invalid or the
+/// URI cannot be parsed, and [`EdgeError::internal`] if the body cannot be
+/// read or the builder rejects the assembled request.
+#[inline]
 pub async fn into_core_request(
     mut req: CfRequest,
     env: Env,
     ctx: Context,
 ) -> Result<Request, EdgeError> {
-    let method = into_core_method(req.method());
+    let method = into_core_method(&req.method());
     let url = req
         .url()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URL: {}", err)))?;
+        .map_err(|err| EdgeError::bad_request(format!("invalid URL: {err}")))?;
     let uri: Uri = url
         .as_str()
         .parse()
-        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {}", err)))?;
+        .map_err(|err| EdgeError::bad_request(format!("invalid URI: {err}")))?;
 
     let mut builder = request_builder().method(method).uri(uri);
     let headers = req.headers();
@@ -85,9 +105,14 @@ pub(crate) async fn dispatch_raw(
 /// Prefer `run_app` or `dispatch_with_config` for normal config-store-aware
 /// dispatch. Use `dispatch_with_config_handle` only when you already have a
 /// prepared `ConfigStoreHandle`.
+///
+/// # Errors
+/// Propagates any error from [`dispatch_raw`]: manifest, KV, dispatch, and
+/// response-translation failures all surface here.
 #[deprecated(
     note = "dispatch() is the low-level manual path and does not inject config-store metadata; prefer run_app(), dispatch_with_config(), or dispatch_with_config_handle()"
 )]
+#[inline]
 pub async fn dispatch(
     app: &App,
     req: CfRequest,
@@ -102,6 +127,12 @@ pub async fn dispatch(
 /// `kv_required` should be `true` when `[stores.kv]` is explicitly present
 /// in the manifest, causing the request to fail if the binding is unavailable
 /// rather than silently degrading.
+///
+/// # Errors
+/// Returns [`WorkerError::RustError`] when `kv_required` is `true` and the
+/// configured binding cannot be opened, or any error propagated from the
+/// inner dispatch and response translation.
+#[inline]
 pub async fn dispatch_with_kv(
     app: &App,
     req: CfRequest,
@@ -131,6 +162,10 @@ pub async fn dispatch_with_kv(
 ///
 /// The KV namespace bound to [`DEFAULT_KV_BINDING`] is also resolved and injected
 /// (non-required: missing bindings are silently skipped).
+///
+/// # Errors
+/// Returns any error propagated from the inner dispatch.
+#[inline]
 pub async fn dispatch_with_config_handle(
     app: &App,
     req: CfRequest,
@@ -161,6 +196,10 @@ pub async fn dispatch_with_config_handle(
 ///
 /// The KV namespace bound to [`DEFAULT_KV_BINDING`] is also resolved and injected
 /// (non-required: missing bindings are silently skipped).
+///
+/// # Errors
+/// Returns any error propagated from the inner dispatch.
+#[inline]
 pub async fn dispatch_with_config(
     app: &App,
     req: CfRequest,
@@ -190,17 +229,14 @@ pub(crate) async fn dispatch_with_bindings(
     req: CfRequest,
     env: Env,
     ctx: Context,
-    config_binding: Option<&str>,
-    kv_binding: &str,
-    kv_required: bool,
-    secrets_required: bool,
+    bindings: RuntimeBindings<'_>,
 ) -> Result<CfResponse, WorkerError> {
-    let config_store_handle = config_binding.and_then(|binding_name| {
+    let config_store_handle = bindings.config.and_then(|binding_name| {
         CloudflareConfigStore::try_new(&env, binding_name)
             .map(|store| ConfigStoreHandle::new(Arc::new(store)))
     });
-    let kv = resolve_kv_handle(&env, kv_binding, kv_required)?;
-    let secrets = resolve_secret_handle(&env, secrets_required);
+    let kv = resolve_kv_handle(&env, bindings.kv, bindings.kv_required)?;
+    let secrets = resolve_secret_handle(&env, bindings.secrets_required);
     dispatch_with_handles(
         app,
         req,
@@ -226,6 +262,10 @@ pub(crate) async fn dispatch_with_bindings(
 ///
 /// The store is only attached when `secrets_required` is `true`.
 /// Individual missing secrets surface as `SecretError::NotFound` at access time.
+///
+/// # Errors
+/// Returns any error propagated from the inner dispatch.
+#[inline]
 pub async fn dispatch_with_secrets(
     app: &App,
     req: CfRequest,
@@ -254,6 +294,12 @@ pub async fn dispatch_with_secrets(
 /// For most applications, prefer [`crate::run_app`] which resolves all stores
 /// from the manifest automatically. Use `dispatch_with_kv_and_secrets` only
 /// when you need direct control over the dispatch lifecycle without a manifest.
+///
+/// # Errors
+/// Returns [`WorkerError::RustError`] when `kv_required` is `true` and the
+/// configured binding cannot be opened, or any error propagated from the
+/// inner dispatch.
+#[inline]
 pub async fn dispatch_with_kv_and_secrets(
     app: &App,
     req: CfRequest,
@@ -288,7 +334,7 @@ pub(crate) async fn dispatch_with_handles(
 ) -> Result<CfResponse, WorkerError> {
     let core_request = into_core_request(req, env, ctx)
         .await
-        .map_err(edge_error_to_worker)?;
+        .map_err(|err| edge_error_to_worker(&err))?;
     dispatch_core_request(app, core_request, stores).await
 }
 
@@ -307,8 +353,11 @@ async fn dispatch_core_request(
         core_request.extensions_mut().insert(handle);
     }
     let svc = app.router().clone();
-    let response = svc.oneshot(core_request).await;
-    from_core_response(response).map_err(edge_error_to_worker)
+    let response = svc
+        .oneshot(core_request)
+        .await
+        .map_err(|err| edge_error_to_worker(&err))?;
+    from_core_response(response).map_err(|err| edge_error_to_worker(&err))
 }
 
 pub(crate) fn resolve_kv_handle(
@@ -316,16 +365,15 @@ pub(crate) fn resolve_kv_handle(
     kv_binding: &str,
     kv_required: bool,
 ) -> Result<Option<KvHandle>, WorkerError> {
-    match crate::key_value_store::CloudflareKvStore::from_env(env, kv_binding) {
-        Ok(store) => Ok(Some(KvHandle::new(std::sync::Arc::new(store)))),
-        Err(e) => {
+    match CloudflareKvStore::from_env(env, kv_binding) {
+        Ok(store) => Ok(Some(KvHandle::new(Arc::new(store)))),
+        Err(err) => {
             if kv_required {
                 return Err(WorkerError::RustError(format!(
-                    "KV binding '{}' is explicitly configured but could not be opened: {}",
-                    kv_binding, e
+                    "KV binding '{kv_binding}' is explicitly configured but could not be opened: {err}"
                 )));
             }
-            warn_missing_kv_binding_once(kv_binding, &e);
+            warn_missing_kv_binding_once(kv_binding, &err);
             Ok(None)
         }
     }
@@ -336,32 +384,32 @@ pub(crate) fn resolve_secret_handle(env: &Env, secrets_required: bool) -> Option
         return None;
     }
 
-    let secret_store = crate::secret_store::CloudflareSecretStore::from_env(env.clone());
-    Some(SecretHandle::new(std::sync::Arc::new(secret_store)))
+    let secret_store = CloudflareSecretStore::from_env(env.clone());
+    Some(SecretHandle::new(Arc::new(secret_store)))
 }
 
-fn edge_error_to_worker(err: EdgeError) -> WorkerError {
+fn edge_error_to_worker(err: &EdgeError) -> WorkerError {
     WorkerError::RustError(err.to_string())
 }
 
-fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl std::fmt::Display) {
+fn warn_missing_kv_binding_once(kv_binding: &str, error: &impl Display) {
     static WARNED_BINDINGS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    let warned_bindings = WARNED_BINDINGS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let warned = WARNED_BINDINGS.get_or_init(|| Mutex::new(BTreeSet::new()));
 
-    match warned_bindings.lock() {
-        Ok(mut warned_bindings) => {
-            if !warned_bindings.insert(kv_binding.to_string()) {
+    match warned.lock() {
+        Ok(mut guard) => {
+            if !guard.insert(kv_binding.to_owned()) {
                 return;
             }
-            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+            log::warn!("KV binding '{kv_binding}' not available: {error}");
         }
         Err(_) => {
-            log::warn!("KV binding '{}' not available: {}", kv_binding, error);
+            log::warn!("KV binding '{kv_binding}' not available: {error}");
         }
     }
 }
 
-fn into_core_method(method: Method) -> CoreMethod {
+fn into_core_method(method: &Method) -> CoreMethod {
     let bytes = method.as_ref().as_bytes();
     CoreMethod::from_bytes(bytes).unwrap_or_else(|_| {
         log::warn!(
@@ -379,15 +427,15 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn into_http_method_maps_known_methods() {
-        assert_eq!(into_core_method(Method::Get), CoreMethod::GET);
-        assert_eq!(into_core_method(Method::Post), CoreMethod::POST);
-        assert_eq!(into_core_method(Method::Put), CoreMethod::PUT);
-        assert_eq!(into_core_method(Method::Delete), CoreMethod::DELETE);
+        assert_eq!(into_core_method(&Method::Get), CoreMethod::GET);
+        assert_eq!(into_core_method(&Method::Post), CoreMethod::POST);
+        assert_eq!(into_core_method(&Method::Put), CoreMethod::PUT);
+        assert_eq!(into_core_method(&Method::Delete), CoreMethod::DELETE);
     }
 
     #[wasm_bindgen_test]
     fn into_http_method_defaults_unknown_to_get() {
-        let method = Method::from("FOO".to_string());
-        assert_eq!(into_core_method(method), CoreMethod::GET);
+        let method = Method::from("FOO".to_owned());
+        assert_eq!(into_core_method(&method), CoreMethod::GET);
     }
 }

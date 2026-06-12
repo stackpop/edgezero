@@ -1,7 +1,7 @@
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
-use futures_util::StreamExt;
+use futures_util::StreamExt as _;
 use spin_sdk::http as spin_http;
 
 /// Maximum body size (16 MiB) when collecting a streamed body into a buffer.
@@ -26,10 +26,9 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        if collected.len() + bytes.len() > MAX_BODY_SIZE {
+                        if collected.len().saturating_add(bytes.len()) > MAX_BODY_SIZE {
                             return Err(EdgeError::internal(anyhow::anyhow!(
-                                "body exceeds maximum size of {} bytes",
-                                MAX_BODY_SIZE
+                                "body exceeds maximum size of {MAX_BODY_SIZE} bytes"
                             )));
                         }
                         collected.extend_from_slice(&bytes);
@@ -42,10 +41,15 @@ pub(crate) async fn collect_body_bytes(body: Body) -> Result<Vec<u8>, EdgeError>
     }
 }
 
-/// Convert an EdgeZero core `Response` into a Spin SDK `Response`.
+/// Convert an `EdgeZero` core `Response` into a Spin SDK `Response`.
 ///
 /// Both `Body::Once` and `Body::Stream` are converted to a buffered
 /// byte body. Streaming bodies are collected into a single `Vec<u8>`.
+///
+/// # Errors
+/// Returns [`EdgeError::internal`] if a streaming chunk read fails or
+/// the buffered body would exceed [`MAX_BODY_SIZE`].
+#[inline]
 pub async fn from_core_response(response: Response) -> Result<spin_http::Response, EdgeError> {
     let (parts, body) = response.into_parts();
 
@@ -54,14 +58,11 @@ pub async fn from_core_response(response: Response) -> Result<spin_http::Respons
 
     // Spin's WASI HTTP interface requires string-typed header values,
     // so non-UTF-8 values cannot be forwarded and are dropped with a warning.
-    for (name, value) in parts.headers.iter() {
-        if let Ok(v) = value.to_str() {
-            builder.header(name.as_str(), v);
+    for (name, value) in &parts.headers {
+        if let Ok(text) = value.to_str() {
+            builder.header(name.as_str(), text);
         } else {
-            log::warn!(
-                "dropping non-UTF-8 response header (Spin WASI limitation): {}",
-                name
-            );
+            log::warn!("dropping non-UTF-8 response header (Spin WASI limitation): {name}");
         }
     }
 

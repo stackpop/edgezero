@@ -38,3 +38,33 @@ worker = { version = "0.8", default-features = false, features = ["http"] }
 debug = 1
 codegen-units = 1
 lto = "fat"
+
+[workspace.lints.clippy]
+# Same strict gate as the main workspace. Allow-list mirrors the parent
+# `Cargo.toml` only where the demo legitimately needs the same exemption —
+# new entries should be added lazily when a real failure surfaces.
+pedantic = { level = "warn", priority = -1 }
+restriction = { level = "deny", priority = -1 }
+
+# Meta — required when enabling `restriction` as a group.
+blanket_clippy_restriction_lints = "allow"
+
+# Documentation — demo is illustrative; private items don't need full docs.
+missing_docs_in_private_items = "allow"
+
+# Style / formatting — match the main workspace's idiomatic-Rust stance.
+implicit_return = "allow"
+question_mark_used = "allow"
+single_call_fn = "allow"
+separated_literal_suffix = "allow"
+
+# API design — `exhaustive_structs` fires once on the unit struct generated
+# by the `app!` macro.
+exhaustive_structs = "allow"
+
+# Imports / paths — demo binaries are std applications, not no_std libraries.
+std_instead_of_alloc = "allow"
+std_instead_of_core = "allow"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

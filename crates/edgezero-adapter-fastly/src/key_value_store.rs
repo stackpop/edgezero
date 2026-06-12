@@ -13,6 +13,8 @@ use bytes::Bytes;
 #[cfg(feature = "fastly")]
 use edgezero_core::key_value_store::{KvError, KvPage, KvStore};
 #[cfg(feature = "fastly")]
+use fastly::kv_store::{KVStore, KVStoreError};
+#[cfg(feature = "fastly")]
 use std::time::Duration;
 
 /// KV store backed by Fastly's KV Store API.
@@ -20,7 +22,7 @@ use std::time::Duration;
 /// Wraps a `fastly::kv_store::KVStore` handle obtained via `KVStore::open(name)`.
 #[cfg(feature = "fastly")]
 pub struct FastlyKvStore {
-    store: fastly::kv_store::KVStore,
+    store: KVStore,
 }
 
 #[cfg(feature = "fastly")]
@@ -28,9 +30,13 @@ impl FastlyKvStore {
     /// Open a Fastly KV Store by name.
     ///
     /// Returns `KvError::Unavailable` if the store does not exist.
+    ///
+    /// # Errors
+    /// Returns [`KvError::Internal`] if the named KV store cannot be opened.
+    #[inline]
     pub fn open(name: &str) -> Result<Self, KvError> {
-        let store = fastly::kv_store::KVStore::open(name)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("failed to open kv store: {e}")))?
+        let store = KVStore::open(name)
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("failed to open kv store: {err}")))?
             .ok_or(KvError::Unavailable)?;
         Ok(Self { store })
     }
@@ -39,23 +45,68 @@ impl FastlyKvStore {
 #[cfg(feature = "fastly")]
 #[async_trait(?Send)]
 impl KvStore for FastlyKvStore {
+    #[inline]
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.store
+            .delete(key)
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("delete failed: {err}")))
+    }
+
+    #[inline]
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        Ok(self.get_bytes(key).await?.is_some())
+    }
+
+    #[inline]
     async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
         match self.store.lookup(key) {
             Ok(mut response) => {
                 let bytes = response.take_body_bytes();
                 Ok(Some(Bytes::from(bytes)))
             }
-            Err(fastly::kv_store::KVStoreError::ItemNotFound) => Ok(None),
-            Err(e) => Err(KvError::Internal(anyhow::anyhow!("lookup failed: {e}"))),
+            Err(KVStoreError::ItemNotFound) => Ok(None),
+            Err(err) => Err(KvError::Internal(anyhow::anyhow!("lookup failed: {err}"))),
         }
     }
 
+    #[inline]
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let limit_u32 = u32::try_from(limit)
+            .map_err(|_e| KvError::Validation("list limit exceeds u32".to_owned()))?;
+
+        let mut request = self.store.build_list().limit(limit_u32);
+
+        if !prefix.is_empty() {
+            request = request.prefix(prefix);
+        }
+        if let Some(token) = cursor.filter(|token| !token.is_empty()) {
+            request = request.cursor(token);
+        }
+
+        let page = request
+            .execute()
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("list failed: {err}")))?;
+        let next_cursor = page.next_cursor().filter(|token| !token.is_empty());
+
+        Ok(KvPage {
+            cursor: next_cursor,
+            keys: page.into_keys(),
+        })
+    }
+
+    #[inline]
     async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
         self.store
             .insert(key, value.as_ref())
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert failed: {e}")))
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("insert failed: {err}")))
     }
 
+    #[inline]
     async fn put_bytes_with_ttl(
         &self,
         key: &str,
@@ -66,42 +117,7 @@ impl KvStore for FastlyKvStore {
             .build_insert()
             .time_to_live(ttl)
             .execute(key, value.as_ref())
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("insert with ttl failed: {e}")))
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), KvError> {
-        self.store
-            .delete(key)
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("delete failed: {e}")))
-    }
-
-    async fn list_keys_page(
-        &self,
-        prefix: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<KvPage, KvError> {
-        let limit = u32::try_from(limit)
-            .map_err(|_| KvError::Validation("list limit exceeds u32".to_string()))?;
-
-        let mut request = self.store.build_list().limit(limit);
-
-        if !prefix.is_empty() {
-            request = request.prefix(prefix);
-        }
-        if let Some(cursor) = cursor.filter(|cursor| !cursor.is_empty()) {
-            request = request.cursor(cursor);
-        }
-
-        let page = request
-            .execute()
-            .map_err(|e| KvError::Internal(anyhow::anyhow!("list failed: {e}")))?;
-        let cursor = page.next_cursor().filter(|cursor| !cursor.is_empty());
-
-        Ok(KvPage {
-            keys: page.into_keys(),
-            cursor,
-        })
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("insert with ttl failed: {err}")))
     }
 }
 

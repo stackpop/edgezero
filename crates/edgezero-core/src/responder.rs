@@ -3,6 +3,8 @@ use crate::http::Response;
 use crate::response::IntoResponse;
 
 pub trait Responder: Sized {
+    /// # Errors
+    /// Returns [`EdgeError`] if the value cannot be turned into a response (e.g., a `Result`'s `Err` variant).
     fn respond(self) -> Result<Response, EdgeError>;
 }
 
@@ -10,8 +12,9 @@ impl<T> Responder for T
 where
     T: IntoResponse,
 {
+    #[inline]
     fn respond(self) -> Result<Response, EdgeError> {
-        Ok(self.into_response())
+        self.into_response()
     }
 }
 
@@ -19,8 +22,9 @@ impl<T> Responder for Result<T, EdgeError>
 where
     T: IntoResponse,
 {
+    #[inline]
     fn respond(self) -> Result<Response, EdgeError> {
-        self.map(IntoResponse::into_response)
+        self.and_then(IntoResponse::into_response)
     }
 }
 
@@ -34,7 +38,7 @@ mod tests {
     fn responder_for_into_response_types() {
         let response = "hello".respond().expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.body().as_bytes(), b"hello");
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"hello");
     }
 
     #[test]

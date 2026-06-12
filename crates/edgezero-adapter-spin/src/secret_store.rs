@@ -4,45 +4,41 @@
 //! The `store_name` parameter is intentionally ignored; provision secrets as
 //! application variables in `spin.toml`.
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use async_trait::async_trait;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use bytes::Bytes;
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::secret_store::{SecretError, SecretStore};
 
 /// Secret store backed by Spin component variables.
 ///
 /// `store_name` is ignored — Spin's variable namespace is flat.
 /// Provision secrets as application variables in `spin.toml`.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinSecretStore;
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl SpinSecretStore {
+    #[inline]
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
 }
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl Default for SpinSecretStore {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
 #[async_trait(?Send)]
 impl SecretStore for SpinSecretStore {
+    #[inline]
     async fn get_bytes(&self, store_name: &str, key: &str) -> Result<Option<Bytes>, SecretError> {
         use spin_sdk::variables;
         if !store_name.is_empty() {
             // Spin's variable namespace is flat; named stores are not supported.
             log::debug!(
-                "SpinSecretStore: store_name {:?} is ignored; \
-                 Spin uses a single flat variable namespace",
-                store_name
+                "SpinSecretStore: store_name {store_name:?} is ignored; \
+                 Spin uses a single flat variable namespace"
             );
         }
         // Spin variable names must be lowercase. Normalise via ascii_lowercase
@@ -57,8 +53,8 @@ impl SecretStore for SpinSecretStore {
             Ok(value) => Ok(Some(Bytes::from(value.into_bytes()))),
             Err(variables::Error::Undefined(_)) => Ok(None),
             Err(variables::Error::InvalidName(msg)) => Err(SecretError::Validation(msg)),
-            Err(e) => Err(SecretError::Internal(anyhow::anyhow!(
-                "secret lookup failed: {e}"
+            Err(err) => Err(SecretError::Internal(anyhow::anyhow!(
+                "secret lookup failed: {err}"
             ))),
         }
     }

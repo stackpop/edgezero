@@ -1,33 +1,36 @@
 use log::LevelFilter;
+use serde::de::Error as DeError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{env, fs, io};
 use validator::{Validate, ValidationError};
+
+pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
+/// Default KV store / binding name used when `[stores.kv]` is omitted.
+pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
+/// Default secret store / binding name used when `[stores.secrets]` is omitted.
+pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
+// Spin config values come from Spin component variables (flat namespace);
+// there is no runtime store-name concept, so adapter-name overrides for spin
+// would be silently ignored. Keep spin out of the allowed set to surface
+// misconfiguration at validation time rather than at runtime.
+const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
 
 pub struct ManifestLoader {
     manifest: Arc<Manifest>,
 }
 
 impl ManifestLoader {
-    pub fn load_from_str(contents: &str) -> Self {
-        let mut manifest: Manifest =
-            toml::from_str(contents).expect("edgezero manifest should be valid");
-        manifest
-            .validate()
-            .expect("edgezero manifest failed validation");
-        manifest.finalize();
-        Self {
-            manifest: Arc::new(manifest),
-        }
-    }
-
+    /// # Errors
+    /// Returns an [`io::Error`] if `path` cannot be read, or the file content cannot be parsed/validated as an `EdgeZero` manifest.
+    #[inline]
     pub fn from_path(path: &Path) -> Result<Self, io::Error> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = fs::read_to_string(path)?;
         let mut manifest: Manifest = toml::from_str(&contents)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let cwd = std::env::current_dir()?;
+        let cwd = env::current_dir()?;
         let root_path = resolve_root_path(path, &cwd);
         manifest.root = Some(root_path);
         manifest
@@ -39,66 +42,88 @@ impl ManifestLoader {
         })
     }
 
+    /// Loads a manifest from a static, compile-time-embedded TOML string
+    /// (typically `include_str!("edgezero.toml")` inside an adapter binary).
+    ///
+    /// # Panics
+    /// Panics if `contents` is not valid TOML or fails validation. Because
+    /// `contents` is baked into the binary at build time, a parse/validation
+    /// failure means the binary itself is malformed — there is no runtime
+    /// recovery path, and surfacing the error as a panic with a clear
+    /// message is the correct behavior. Callers with a fallible input
+    /// source (file paths, network, user input) should use
+    /// [`ManifestLoader::try_load_from_str`] or [`ManifestLoader::from_path`].
+    #[expect(
+        clippy::panic,
+        reason = "load_from_str only consumes binary-embedded manifests; \
+                  a parse error means the binary is corrupt and cannot recover"
+    )]
+    #[must_use]
+    #[inline]
+    pub fn load_from_str(contents: &str) -> Self {
+        Self::try_load_from_str(contents).unwrap_or_else(|err| panic!("invalid manifest: {err}"))
+    }
+
+    #[must_use]
+    #[inline]
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
-}
 
-fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
-    match path.parent() {
-        Some(parent) if parent.as_os_str().is_empty() => cwd.to_path_buf(),
-        Some(parent) if parent.is_relative() => cwd.join(parent),
-        Some(parent) => parent.to_path_buf(),
-        None => cwd.to_path_buf(),
+    /// # Errors
+    /// Returns an [`io::Error`] if `contents` is not valid TOML or fails manifest validation.
+    #[inline]
+    pub fn try_load_from_str(contents: &str) -> Result<Self, io::Error> {
+        let mut manifest: Manifest = toml::from_str(contents)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        manifest
+            .validate()
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        manifest.finalize();
+        Ok(Self {
+            manifest: Arc::new(manifest),
+        })
     }
 }
 
-pub const DEFAULT_CONFIG_STORE_NAME: &str = "EDGEZERO_CONFIG";
-// Spin config values come from Spin component variables (flat namespace);
-// there is no runtime store-name concept, so adapter-name overrides for spin
-// would be silently ignored. Keep spin out of the allowed set to surface
-// misconfiguration at validation time rather than at runtime.
-const SUPPORTED_CONFIG_STORE_ADAPTERS: &[&str] = &["axum", "cloudflare", "fastly"];
-
 #[derive(Debug, Deserialize, Validate)]
+#[expect(
+    clippy::partial_pub_fields,
+    reason = "deserialized fields are pub for the public API; internal state is private"
+)]
 pub struct Manifest {
-    #[serde(default)]
-    #[validate(nested)]
-    pub app: ManifestApp,
-    #[serde(default)]
-    #[validate(nested)]
-    pub triggers: ManifestTriggers,
-    #[serde(default)]
-    #[validate(nested)]
-    pub environment: ManifestEnvironment,
-    #[serde(default)]
-    #[validate(nested)]
-    pub stores: ManifestStores,
     #[serde(default)]
     #[validate(nested)]
     pub adapters: BTreeMap<String, ManifestAdapter>,
     #[serde(default)]
     #[validate(nested)]
+    pub app: ManifestApp,
+    #[serde(default)]
+    #[validate(nested)]
+    pub environment: ManifestEnvironment,
+    #[serde(default)]
+    #[validate(nested)]
     pub logging: ManifestLogging,
     #[serde(skip)]
-    pub(crate) root: Option<PathBuf>,
+    logging_resolved: BTreeMap<String, ResolvedLoggingConfig>,
     #[serde(skip)]
-    pub(crate) logging_resolved: BTreeMap<String, ResolvedLoggingConfig>,
+    root: Option<PathBuf>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub stores: ManifestStores,
+    #[serde(default)]
+    #[validate(nested)]
+    pub triggers: ManifestTriggers,
 }
 
 impl Manifest {
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+    #[must_use]
+    #[inline]
+    pub fn environment(&self) -> &ManifestEnvironment {
+        &self.environment
     }
 
-    pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
-        self.logging_resolved.get(adapter)
-    }
-
-    pub fn logging_or_default(&self, adapter: &str) -> ResolvedLoggingConfig {
-        self.logging_for(adapter).cloned().unwrap_or_default()
-    }
-
+    #[inline]
     pub fn environment_for(&self, adapter: &str) -> ResolvedEnvironment {
         let adapter_lower = adapter.to_ascii_lowercase();
 
@@ -118,77 +143,7 @@ impl Manifest {
             .map(ResolvedEnvironmentBinding::from_manifest)
             .collect();
 
-        ResolvedEnvironment { variables, secrets }
-    }
-
-    pub fn environment(&self) -> &ManifestEnvironment {
-        &self.environment
-    }
-
-    /// Returns the KV store name for a given adapter.
-    ///
-    /// Resolution order:
-    /// 1. Per-adapter override (`[stores.kv.adapters.<adapter>]`)
-    /// 2. Global name (`[stores.kv] name = "..."`)
-    /// 3. Default: `"EDGEZERO_KV"`
-    pub fn kv_store_name(&self, adapter: &str) -> &str {
-        match &self.stores.kv {
-            Some(kv) => {
-                let adapter_lower = adapter.to_ascii_lowercase();
-                if let Some(adapter_cfg) = kv
-                    .adapters
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&adapter_lower))
-                {
-                    return &adapter_cfg.1.name;
-                }
-                &kv.name
-            }
-            None => DEFAULT_KV_STORE_NAME,
-        }
-    }
-
-    /// Returns the secret store name for a given adapter.
-    ///
-    /// Resolution order:
-    /// 1. Per-adapter override (`[stores.secrets.adapters.<adapter>]`)
-    /// 2. Global name (`[stores.secrets] name = "..."`)
-    /// 3. Default: `"EDGEZERO_SECRETS"`
-    pub fn secret_store_name(&self, adapter: &str) -> &str {
-        match &self.stores.secrets {
-            Some(secrets) => {
-                let adapter_lower = adapter.to_ascii_lowercase();
-                if let Some(adapter_cfg) = secrets
-                    .adapters
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&adapter_lower))
-                {
-                    if let Some(name) = adapter_cfg.1.name.as_deref() {
-                        return name;
-                    }
-                }
-                &secrets.name
-            }
-            None => DEFAULT_SECRET_STORE_NAME,
-        }
-    }
-
-    /// Returns whether the secret store should be attached for a given adapter.
-    pub fn secret_store_enabled(&self, adapter: &str) -> bool {
-        match &self.stores.secrets {
-            Some(secrets) => {
-                let adapter_lower = adapter.to_ascii_lowercase();
-                if let Some(adapter_cfg) = secrets
-                    .adapters
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case(&adapter_lower))
-                {
-                    return adapter_cfg.1.enabled;
-                }
-                secrets.enabled
-            }
-            None => false,
-        }
+        ResolvedEnvironment { secrets, variables }
     }
 
     pub(crate) fn finalize(&mut self) {
@@ -211,21 +166,107 @@ impl Manifest {
 
         self.logging_resolved = resolved;
     }
+
+    /// Returns the KV store name for a given adapter.
+    ///
+    /// Resolution order:
+    /// 1. Per-adapter override (`[stores.kv.adapters.<adapter>]`)
+    /// 2. Global name (`[stores.kv] name = "..."`)
+    /// 3. Default: `"EDGEZERO_KV"`
+    #[must_use]
+    #[inline]
+    pub fn kv_store_name(&self, adapter: &str) -> &str {
+        let Some(kv) = self.stores.kv.as_ref() else {
+            return DEFAULT_KV_STORE_NAME;
+        };
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(adapter_cfg) = kv
+            .adapters
+            .iter()
+            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
+        {
+            return &adapter_cfg.1.name;
+        }
+        &kv.name
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn logging_for(&self, adapter: &str) -> Option<&ResolvedLoggingConfig> {
+        self.logging_resolved.get(adapter)
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn logging_or_default(&self, adapter: &str) -> ResolvedLoggingConfig {
+        self.logging_for(adapter).cloned().unwrap_or_default()
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// Returns the secret store binding identifier for a given adapter.
+    ///
+    /// Resolution order:
+    /// 1. Per-adapter override (`[stores.secrets.adapters.<adapter>]`)
+    /// 2. Global name (`[stores.secrets] name = "..."`)
+    /// 3. Default: `"EDGEZERO_SECRETS"`
+    #[must_use]
+    #[inline]
+    pub fn secret_store_binding(&self, adapter: &str) -> &str {
+        let Some(secrets) = self.stores.secrets.as_ref() else {
+            return DEFAULT_SECRET_STORE_NAME;
+        };
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(adapter_cfg) = secrets
+            .adapters
+            .iter()
+            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
+        {
+            if let Some(name) = adapter_cfg.1.name.as_deref() {
+                return name;
+            }
+        }
+        &secrets.name
+    }
+
+    /// Returns whether the secret store should be attached for a given adapter.
+    #[must_use]
+    #[inline]
+    pub fn secret_store_enabled(&self, adapter: &str) -> bool {
+        let Some(secrets) = self.stores.secrets.as_ref() else {
+            return false;
+        };
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(adapter_cfg) = secrets
+            .adapters
+            .iter()
+            .find(|&(name, _)| name.eq_ignore_ascii_case(&adapter_lower))
+        {
+            return adapter_cfg.1.enabled;
+        }
+        secrets.enabled
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestApp {
     #[serde(default)]
-    #[validate(length(min = 1))]
-    pub name: Option<String>,
-    #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub entry: Option<String>,
     #[serde(default)]
     pub middleware: Vec<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestTriggers {
     #[serde(default)]
     #[validate(nested)]
@@ -233,59 +274,67 @@ pub struct ManifestTriggers {
 }
 
 #[derive(Clone, Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestHttpTrigger {
     #[serde(default)]
-    #[validate(length(min = 1))]
-    pub id: Option<String>,
-    #[validate(length(min = 1))]
-    pub path: String,
-    #[serde(default)]
-    #[validate(length(min = 1))]
-    pub handler: Option<String>,
-    #[serde(default)]
-    pub methods: Vec<HttpMethod>,
-    #[serde(default)]
     pub adapters: Vec<String>,
-    #[serde(default)]
-    #[validate(length(min = 1))]
-    pub description: Option<String>,
     #[serde(rename = "body-mode")]
     #[serde(default)]
     pub body_mode: Option<BodyMode>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub description: Option<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub handler: Option<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub methods: Vec<HttpMethod>,
+    #[validate(length(min = 1_u64))]
+    pub path: String,
 }
 
 impl ManifestHttpTrigger {
+    #[inline]
     pub fn methods(&self) -> Vec<&str> {
         if self.methods.is_empty() {
             vec!["GET"]
         } else {
-            self.methods.iter().map(|m| m.as_str()).collect()
+            self.methods
+                .iter()
+                .copied()
+                .map(HttpMethod::as_str)
+                .collect()
         }
     }
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestEnvironment {
     #[serde(default)]
     #[validate(nested)]
-    pub variables: Vec<ManifestBinding>,
+    pub secrets: Vec<ManifestBinding>,
     #[serde(default)]
     #[validate(nested)]
-    pub secrets: Vec<ManifestBinding>,
+    pub variables: Vec<ManifestBinding>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestBinding {
-    #[validate(length(min = 1))]
-    pub name: String,
-    #[serde(default)]
-    #[validate(length(min = 1))]
-    pub description: Option<String>,
     #[serde(default)]
     pub adapters: Vec<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
+    pub description: Option<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
     pub env: Option<String>,
+    #[validate(length(min = 1_u64))]
+    pub name: String,
     #[serde(default)]
     pub value: Option<String>,
 }
@@ -318,19 +367,20 @@ impl ResolvedEnvironmentBinding {
 
 #[derive(Clone, Debug)]
 pub struct ResolvedEnvironmentBinding {
-    pub name: String,
     pub description: Option<String>,
     pub env: String,
+    pub name: String,
     pub value: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedEnvironment {
-    pub variables: Vec<ResolvedEnvironmentBinding>,
     pub secrets: Vec<ResolvedEnvironmentBinding>,
+    pub variables: Vec<ResolvedEnvironmentBinding>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
@@ -347,50 +397,53 @@ pub struct ManifestAdapter {
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapterDefinition {
     #[serde(rename = "crate")]
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub crate_path: Option<String>,
-    #[serde(default)]
-    #[validate(length(min = 1))]
-    pub manifest: Option<String>,
     /// Bind address for the adapter server (e.g. `"0.0.0.0"` or `"127.0.0.1"`).
     ///
     /// Stored as a raw string so validation can be deferred until bind-address
     /// resolution, where environment-variable overrides and fallback behavior
     /// are applied consistently (see [`crate::addr::resolve_bind_addr`]).
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub host: Option<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub manifest: Option<String>,
     /// Port for the adapter server.
     #[serde(default)]
     pub port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapterBuild {
     #[serde(default)]
-    #[validate(length(min = 1))]
-    pub target: Option<String>,
+    pub features: Vec<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub profile: Option<String>,
     #[serde(default)]
-    pub features: Vec<String>,
+    #[validate(length(min = 1_u64))]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestAdapterCommands {
     #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub build: Option<String>,
     #[serde(default)]
-    #[validate(length(min = 1))]
-    pub serve: Option<String>,
-    #[serde(default)]
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub deploy: Option<String>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub serve: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +452,7 @@ pub struct ManifestAdapterCommands {
 
 /// Top-level `[stores]` section.
 #[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestStores {
     #[serde(default)]
     #[validate(nested)]
@@ -413,11 +467,8 @@ pub struct ManifestStores {
 
 /// `[stores.config]` section — provider-neutral config store.
 #[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestConfigStoreConfig {
-    /// Global store/binding name used when no adapter-specific override is set.
-    #[serde(default)]
-    #[validate(length(min = 1))]
-    pub name: Option<String>,
     /// Per-adapter name overrides, keyed by supported lowercase adapter name
     /// (`axum`, `cloudflare`, or `fastly`). Spin config uses component
     /// variables in a flat namespace, so `stores.config.adapters.spin` is
@@ -429,13 +480,342 @@ pub struct ManifestConfigStoreConfig {
     /// Optional default values used for local dev (Axum adapter).
     #[serde(default)]
     pub defaults: BTreeMap<String, String>,
+    /// Global store/binding name used when no adapter-specific override is set.
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub name: Option<String>,
 }
 
 /// `[stores.config.adapters.<adapter>]` override.
 #[derive(Debug, Deserialize, Serialize, Validate)]
+#[non_exhaustive]
 pub struct ManifestConfigAdapterConfig {
-    #[validate(length(min = 1))]
+    #[validate(length(min = 1_u64))]
     pub name: String,
+}
+
+impl ManifestConfigStoreConfig {
+    /// Access the default key-value pairs for local dev.
+    #[must_use]
+    #[inline]
+    pub fn config_store_defaults(&self) -> &BTreeMap<String, String> {
+        &self.defaults
+    }
+
+    /// Resolve the config store name for a given adapter.
+    ///
+    /// Priority: adapter override → global name → `DEFAULT_CONFIG_STORE_NAME`.
+    #[must_use]
+    #[inline]
+    pub fn config_store_name(&self, adapter: &str) -> &str {
+        let adapter_lower = adapter.to_ascii_lowercase();
+        if let Some(override_cfg) = self.adapters.get(&adapter_lower) {
+            return &override_cfg.name;
+        }
+        if let Some(name) = self.name.as_deref() {
+            return name;
+        }
+        DEFAULT_CONFIG_STORE_NAME
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Logging (unchanged)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize, Validate)]
+#[non_exhaustive]
+pub struct ManifestLogging {
+    #[serde(flatten)]
+    #[validate(nested)]
+    pub adapters: BTreeMap<String, ManifestLoggingConfig>,
+}
+
+#[derive(Debug, Default, Deserialize, Clone, Validate)]
+#[non_exhaustive]
+pub struct ManifestLoggingConfig {
+    #[serde(default)]
+    pub echo_stdout: Option<bool>,
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub level: Option<LogLevel>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedLoggingConfig {
+    pub echo_stdout: Option<bool>,
+    pub endpoint: Option<String>,
+    pub level: LogLevel,
+}
+
+impl Default for ResolvedLoggingConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            level: LogLevel::Info,
+            endpoint: None,
+            echo_stdout: None,
+        }
+    }
+}
+
+impl ResolvedLoggingConfig {
+    fn from_manifest(cfg: &ManifestLoggingConfig) -> Self {
+        let mut resolved = Self::default();
+        if let Some(level) = cfg.level {
+            resolved.level = level;
+        }
+        if let Some(endpoint) = cfg.endpoint.as_ref() {
+            resolved.endpoint = Some(endpoint.clone());
+        }
+        if let Some(echo_stdout) = cfg.echo_stdout {
+            resolved.echo_stdout = Some(echo_stdout);
+        }
+        resolved
+    }
+}
+
+impl ManifestLoggingConfig {
+    fn is_specified(&self) -> bool {
+        self.level.is_some() || self.endpoint.is_some() || self.echo_stdout.is_some()
+    }
+}
+
+/// Global KV store configuration.
+#[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
+pub struct ManifestKvConfig {
+    /// Per-adapter name overrides.
+    #[serde(default)]
+    #[validate(nested)]
+    pub adapters: BTreeMap<String, ManifestKvAdapterConfig>,
+
+    /// Store / binding name (default: `"EDGEZERO_KV"`).
+    #[serde(default = "default_kv_name")]
+    #[validate(length(min = 1_u64))]
+    pub name: String,
+}
+
+/// Per-adapter KV binding / store name override.
+#[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
+pub struct ManifestKvAdapterConfig {
+    #[validate(length(min = 1_u64))]
+    pub name: String,
+}
+
+/// Global secret store configuration.
+#[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
+pub struct ManifestSecretsConfig {
+    /// Per-adapter name overrides.
+    #[serde(default)]
+    #[validate(nested)]
+    pub adapters: BTreeMap<String, ManifestSecretsAdapterConfig>,
+
+    /// Whether the secret store is enabled for adapters without overrides.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    /// Store / binding name (default: `"EDGEZERO_SECRETS"`).
+    #[serde(default = "default_secret_name")]
+    #[validate(length(min = 1_u64))]
+    pub name: String,
+}
+
+/// Per-adapter secret store name override.
+#[derive(Debug, Deserialize, Validate)]
+#[non_exhaustive]
+pub struct ManifestSecretsAdapterConfig {
+    /// Whether the secret store is enabled for this adapter.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    /// Optional per-adapter secret store name override.
+    #[serde(default)]
+    #[validate(length(min = 1_u64))]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum HttpMethod {
+    Delete,
+    Get,
+    Head,
+    Options,
+    Patch,
+    Post,
+    Put,
+}
+
+impl HttpMethod {
+    #[must_use]
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delete => "DELETE",
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Patch => "PATCH",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+        }
+    }
+}
+
+// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
+// that defaults to `*place = Self::deserialize(deserializer)?`. For these
+// small Copy/clone enums there is nothing to gain from spelling out an
+// override — the default already does exactly the right thing.
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "default deserialize_in_place is identical to what we would write manually"
+)]
+impl<'de> Deserialize<'de> for HttpMethod {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_uppercase().as_str() {
+            "GET" => Ok(Self::Get),
+            "POST" => Ok(Self::Post),
+            "PUT" => Ok(Self::Put),
+            "DELETE" => Ok(Self::Delete),
+            "PATCH" => Ok(Self::Patch),
+            "OPTIONS" => Ok(Self::Options),
+            "HEAD" => Ok(Self::Head),
+            other => Err(DeError::custom(format!(
+                "unsupported HTTP method `{other}`"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BodyMode {
+    Buffered,
+    Stream,
+}
+
+// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
+// that defaults to `*place = Self::deserialize(deserializer)?`. For these
+// small Copy/clone enums there is nothing to gain from spelling out an
+// override — the default already does exactly the right thing.
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "default deserialize_in_place is identical to what we would write manually"
+)]
+impl<'de> Deserialize<'de> for BodyMode {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "buffered" => Ok(Self::Buffered),
+            "stream" => Ok(Self::Stream),
+            other => Err(DeError::custom(format!("unsupported body mode `{other}`"))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+#[non_exhaustive]
+pub enum LogLevel {
+    Debug,
+    Error,
+    #[default]
+    Info,
+    Off,
+    Trace,
+    Warn,
+}
+
+impl LogLevel {
+    #[must_use]
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl From<LogLevel> for LevelFilter {
+    #[inline]
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Trace => LevelFilter::Trace,
+            LogLevel::Debug => LevelFilter::Debug,
+            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Warn => LevelFilter::Warn,
+            LogLevel::Error => LevelFilter::Error,
+            LogLevel::Off => LevelFilter::Off,
+        }
+    }
+}
+
+// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
+// that defaults to `*place = Self::deserialize(deserializer)?`. For these
+// small Copy/clone enums there is nothing to gain from spelling out an
+// override — the default already does exactly the right thing.
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "default deserialize_in_place is identical to what we would write manually"
+)]
+impl<'de> Deserialize<'de> for LogLevel {
+    #[inline]
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim().to_ascii_lowercase().as_str() {
+            "trace" => Ok(Self::Trace),
+            "debug" => Ok(Self::Debug),
+            "info" => Ok(Self::Info),
+            "warn" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            "off" => Ok(Self::Off),
+            other => Err(DeError::custom(format!(
+                "logging level must be trace, debug, info, warn, error, or off (got `{other}`)"
+            ))),
+        }
+    }
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_kv_name() -> String {
+    DEFAULT_KV_STORE_NAME.to_owned()
+}
+
+fn default_secret_name() -> String {
+    DEFAULT_SECRET_STORE_NAME.to_owned()
+}
+
+fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => cwd.to_path_buf(),
+        Some(parent) if parent.is_relative() => cwd.join(parent),
+        Some(parent) => parent.to_path_buf(),
+        None => cwd.to_path_buf(),
+    }
 }
 
 fn validate_config_store_adapter_keys(
@@ -479,291 +859,11 @@ fn validate_config_store_adapter_keys(
     Err(error)
 }
 
-impl ManifestConfigStoreConfig {
-    /// Resolve the config store name for a given adapter.
-    ///
-    /// Priority: adapter override → global name → `DEFAULT_CONFIG_STORE_NAME`.
-    pub fn config_store_name(&self, adapter: &str) -> &str {
-        let adapter_lower = adapter.to_ascii_lowercase();
-        if let Some(override_cfg) = self.adapters.get(&adapter_lower) {
-            return &override_cfg.name;
-        }
-        if let Some(name) = &self.name {
-            return name.as_str();
-        }
-        DEFAULT_CONFIG_STORE_NAME
-    }
-
-    /// Access the default key-value pairs for local dev.
-    pub fn config_store_defaults(&self) -> &BTreeMap<String, String> {
-        &self.defaults
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Logging (unchanged)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default, Deserialize, Validate)]
-pub struct ManifestLogging {
-    #[serde(flatten)]
-    #[validate(nested)]
-    pub adapters: BTreeMap<String, ManifestLoggingConfig>,
-}
-
-#[derive(Debug, Default, Deserialize, Clone, Validate)]
-pub struct ManifestLoggingConfig {
-    #[serde(default)]
-    pub level: Option<LogLevel>,
-    #[serde(default)]
-    #[validate(length(min = 1))]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub echo_stdout: Option<bool>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ResolvedLoggingConfig {
-    pub level: LogLevel,
-    pub endpoint: Option<String>,
-    pub echo_stdout: Option<bool>,
-}
-
-impl Default for ResolvedLoggingConfig {
-    fn default() -> Self {
-        Self {
-            level: LogLevel::Info,
-            endpoint: None,
-            echo_stdout: None,
-        }
-    }
-}
-
-impl ResolvedLoggingConfig {
-    fn from_manifest(cfg: &ManifestLoggingConfig) -> Self {
-        let mut resolved = Self::default();
-        if let Some(level) = cfg.level {
-            resolved.level = level;
-        }
-        if let Some(endpoint) = &cfg.endpoint {
-            resolved.endpoint = Some(endpoint.clone());
-        }
-        if let Some(echo_stdout) = cfg.echo_stdout {
-            resolved.echo_stdout = Some(echo_stdout);
-        }
-        resolved
-    }
-}
-
-impl ManifestLoggingConfig {
-    fn is_specified(&self) -> bool {
-        self.level.is_some() || self.endpoint.is_some() || self.echo_stdout.is_some()
-    }
-}
-
-/// Default KV store / binding name used when `[stores.kv]` is omitted.
-pub const DEFAULT_KV_STORE_NAME: &str = "EDGEZERO_KV";
-
-fn default_kv_name() -> String {
-    DEFAULT_KV_STORE_NAME.to_string()
-}
-
-/// Default secret store / binding name used when `[stores.secrets]` is omitted.
-pub const DEFAULT_SECRET_STORE_NAME: &str = "EDGEZERO_SECRETS";
-
-fn default_secret_name() -> String {
-    DEFAULT_SECRET_STORE_NAME.to_string()
-}
-
-fn default_enabled() -> bool {
-    true
-}
-
-/// Global KV store configuration.
-#[derive(Debug, Deserialize, Validate)]
-pub struct ManifestKvConfig {
-    /// Store / binding name (default: `"EDGEZERO_KV"`).
-    #[serde(default = "default_kv_name")]
-    #[validate(length(min = 1))]
-    pub name: String,
-
-    /// Per-adapter name overrides.
-    #[serde(default)]
-    #[validate(nested)]
-    pub adapters: BTreeMap<String, ManifestKvAdapterConfig>,
-}
-
-/// Per-adapter KV binding / store name override.
-#[derive(Debug, Deserialize, Validate)]
-pub struct ManifestKvAdapterConfig {
-    #[validate(length(min = 1))]
-    pub name: String,
-}
-
-/// Global secret store configuration.
-#[derive(Debug, Deserialize, Validate)]
-pub struct ManifestSecretsConfig {
-    /// Whether the secret store is enabled for adapters without overrides.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
-    /// Store / binding name (default: `"EDGEZERO_SECRETS"`).
-    #[serde(default = "default_secret_name")]
-    #[validate(length(min = 1))]
-    pub name: String,
-
-    /// Per-adapter name overrides.
-    #[serde(default)]
-    #[validate(nested)]
-    pub adapters: BTreeMap<String, ManifestSecretsAdapterConfig>,
-}
-
-/// Per-adapter secret store name override.
-#[derive(Debug, Deserialize, Validate)]
-pub struct ManifestSecretsAdapterConfig {
-    /// Whether the secret store is enabled for this adapter.
-    #[serde(default = "default_enabled")]
-    pub enabled: bool,
-
-    /// Optional per-adapter secret store name override.
-    #[serde(default)]
-    #[validate(length(min = 1))]
-    pub name: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HttpMethod {
-    Get,
-    Post,
-    Put,
-    Delete,
-    Patch,
-    Options,
-    Head,
-}
-
-impl HttpMethod {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-            Self::Put => "PUT",
-            Self::Delete => "DELETE",
-            Self::Patch => "PATCH",
-            Self::Options => "OPTIONS",
-            Self::Head => "HEAD",
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for HttpMethod {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.trim().to_ascii_uppercase().as_str() {
-            "GET" => Ok(Self::Get),
-            "POST" => Ok(Self::Post),
-            "PUT" => Ok(Self::Put),
-            "DELETE" => Ok(Self::Delete),
-            "PATCH" => Ok(Self::Patch),
-            "OPTIONS" => Ok(Self::Options),
-            "HEAD" => Ok(Self::Head),
-            other => Err(serde::de::Error::custom(format!(
-                "unsupported HTTP method `{}`",
-                other
-            ))),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BodyMode {
-    Buffered,
-    Stream,
-}
-
-impl<'de> Deserialize<'de> for BodyMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.trim().to_ascii_lowercase().as_str() {
-            "buffered" => Ok(Self::Buffered),
-            "stream" => Ok(Self::Stream),
-            other => Err(serde::de::Error::custom(format!(
-                "unsupported body mode `{}`",
-                other
-            ))),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    #[default]
-    Info,
-    Warn,
-    Error,
-    Off,
-}
-
-impl LogLevel {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Trace => "trace",
-            Self::Debug => "debug",
-            Self::Info => "info",
-            Self::Warn => "warn",
-            Self::Error => "error",
-            Self::Off => "off",
-        }
-    }
-}
-
-impl From<LogLevel> for LevelFilter {
-    fn from(level: LogLevel) -> Self {
-        match level {
-            LogLevel::Trace => LevelFilter::Trace,
-            LogLevel::Debug => LevelFilter::Debug,
-            LogLevel::Info => LevelFilter::Info,
-            LogLevel::Warn => LevelFilter::Warn,
-            LogLevel::Error => LevelFilter::Error,
-            LogLevel::Off => LevelFilter::Off,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for LogLevel {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.trim().to_ascii_lowercase().as_str() {
-            "trace" => Ok(Self::Trace),
-            "debug" => Ok(Self::Debug),
-            "info" => Ok(Self::Info),
-            "warn" => Ok(Self::Warn),
-            "error" => Ok(Self::Error),
-            "off" => Ok(Self::Off),
-            other => Err(serde::de::Error::custom(format!(
-                "logging level must be trace, debug, info, warn, error, or off (got `{}`)",
-                other
-            ))),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::path::PathBuf;
+    use std::process;
     use tempfile::{tempdir, tempdir_in, NamedTempFile};
 
     const SAMPLE: &str = r#"
@@ -802,6 +902,37 @@ env = "APP_TOKEN"
     }
 
     #[test]
+    fn try_load_from_str_rejects_invalid_toml() {
+        let err = ManifestLoader::try_load_from_str("not a [valid manifest\n")
+            .err()
+            .expect("expected err");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().to_lowercase().contains("toml")
+                || err.to_string().to_lowercase().contains("expected"),
+            "expected toml-parse error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_load_from_str_rejects_failed_validation() {
+        // `[stores.config]` requires a non-empty `name` when set; an empty
+        // string trips `validator` and surfaces as InvalidData.
+        let err = ManifestLoader::try_load_from_str(
+            r#"
+[app]
+name = "demo"
+
+[stores.config]
+name = ""
+"#,
+        )
+        .err()
+        .expect("expected err");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn environment_resolves_for_adapters() {
         let loader = ManifestLoader::load_from_str(SAMPLE);
         let manifest = loader.manifest();
@@ -837,7 +968,7 @@ env = "APP_TOKEN"
 
     #[test]
     fn manifest_from_path_handles_relative_parent() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let dir = tempdir_in(&cwd).unwrap();
         let path = dir.path().join("edgezero.toml");
         fs::write(&path, "").unwrap();
@@ -850,7 +981,7 @@ env = "APP_TOKEN"
 
     #[test]
     fn manifest_from_path_uses_cwd_for_empty_parent() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let file = NamedTempFile::new_in(&cwd).unwrap();
         fs::write(file.path(), "").unwrap();
         let file_name = file.path().file_name().unwrap();
@@ -862,8 +993,8 @@ env = "APP_TOKEN"
 
     #[test]
     fn manifest_from_path_uses_cwd_when_parent_is_none() {
-        let cwd = std::env::current_dir().unwrap();
-        let file_name = format!("edgezero-test-manifest-{}.toml", std::process::id());
+        let cwd = env::current_dir().unwrap();
+        let file_name = format!("edgezero-test-manifest-{}.toml", process::id());
         let path = cwd.join(&file_name);
         fs::write(&path, "").unwrap();
 
@@ -965,15 +1096,15 @@ path = "/head"
 methods = ["HEAD"]
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http.len(), 7);
-        assert_eq!(m.triggers.http[0].methods(), vec!["GET"]);
-        assert_eq!(m.triggers.http[1].methods(), vec!["POST"]);
-        assert_eq!(m.triggers.http[2].methods(), vec!["PUT"]);
-        assert_eq!(m.triggers.http[3].methods(), vec!["DELETE"]);
-        assert_eq!(m.triggers.http[4].methods(), vec!["PATCH"]);
-        assert_eq!(m.triggers.http[5].methods(), vec!["OPTIONS"]);
-        assert_eq!(m.triggers.http[6].methods(), vec!["HEAD"]);
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http.len(), 7);
+        assert_eq!(mfest.triggers.http[0].methods(), vec!["GET"]);
+        assert_eq!(mfest.triggers.http[1].methods(), vec!["POST"]);
+        assert_eq!(mfest.triggers.http[2].methods(), vec!["PUT"]);
+        assert_eq!(mfest.triggers.http[3].methods(), vec!["DELETE"]);
+        assert_eq!(mfest.triggers.http[4].methods(), vec!["PATCH"]);
+        assert_eq!(mfest.triggers.http[5].methods(), vec!["OPTIONS"]);
+        assert_eq!(mfest.triggers.http[6].methods(), vec!["HEAD"]);
     }
 
     #[test]
@@ -998,8 +1129,8 @@ path = "/test"
 methods = ["get", "Post", "PUT"]
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].methods(), vec!["GET", "POST", "PUT"]);
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].methods(), vec!["GET", "POST", "PUT"]);
     }
 
     #[test]
@@ -1009,8 +1140,8 @@ methods = ["get", "Post", "PUT"]
 path = "/test"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].methods(), vec!["GET"]);
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].methods(), vec!["GET"]);
     }
 
     // BodyMode parsing tests
@@ -1022,8 +1153,8 @@ path = "/test"
 body-mode = "buffered"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].body_mode, Some(BodyMode::Buffered));
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].body_mode, Some(BodyMode::Buffered));
     }
 
     #[test]
@@ -1034,8 +1165,8 @@ path = "/test"
 body-mode = "stream"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.triggers.http[0].body_mode, Some(BodyMode::Stream));
+        let mfest = loader.manifest();
+        assert_eq!(mfest.triggers.http[0].body_mode, Some(BodyMode::Stream));
     }
 
     #[test]
@@ -1075,13 +1206,22 @@ level = "error"
 level = "off"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert_eq!(m.logging_for("adapter1").unwrap().level, LogLevel::Trace);
-        assert_eq!(m.logging_for("adapter2").unwrap().level, LogLevel::Debug);
-        assert_eq!(m.logging_for("adapter3").unwrap().level, LogLevel::Info);
-        assert_eq!(m.logging_for("adapter4").unwrap().level, LogLevel::Warn);
-        assert_eq!(m.logging_for("adapter5").unwrap().level, LogLevel::Error);
-        assert_eq!(m.logging_for("adapter6").unwrap().level, LogLevel::Off);
+        let mfest = loader.manifest();
+        assert_eq!(
+            mfest.logging_for("adapter1").unwrap().level,
+            LogLevel::Trace
+        );
+        assert_eq!(
+            mfest.logging_for("adapter2").unwrap().level,
+            LogLevel::Debug
+        );
+        assert_eq!(mfest.logging_for("adapter3").unwrap().level, LogLevel::Info);
+        assert_eq!(mfest.logging_for("adapter4").unwrap().level, LogLevel::Warn);
+        assert_eq!(
+            mfest.logging_for("adapter5").unwrap().level,
+            LogLevel::Error
+        );
+        assert_eq!(mfest.logging_for("adapter6").unwrap().level, LogLevel::Off);
     }
 
     #[test]
@@ -1123,8 +1263,8 @@ level = "off"
 name = "test"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let logging = m.logging_or_default("unknown");
+        let mfest = loader.manifest();
+        let logging = mfest.logging_or_default("unknown");
         assert_eq!(logging.level, LogLevel::Info);
         assert!(logging.endpoint.is_none());
         assert!(logging.echo_stdout.is_none());
@@ -1149,8 +1289,8 @@ endpoint = "https://logs.example.com"
 echo_stdout = true
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let logging = m.logging_for("axum").unwrap();
+        let mfest = loader.manifest();
+        let logging = mfest.logging_for("axum").unwrap();
         assert_eq!(logging.level, LogLevel::Debug);
         assert_eq!(
             logging.endpoint.as_deref(),
@@ -1167,8 +1307,8 @@ level = "error"
 endpoint = "https://fastly-logs.example.com"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let logging = m.logging_for("fastly").unwrap();
+        let mfest = loader.manifest();
+        let logging = mfest.logging_for("fastly").unwrap();
         assert_eq!(logging.level, LogLevel::Error);
         assert_eq!(
             logging.endpoint.as_deref(),
@@ -1186,8 +1326,8 @@ env = "ACTUAL_ENV_KEY"
 value = "some-value"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let env = m.environment_for("any-adapter");
+        let mfest = loader.manifest();
+        let env = mfest.environment_for("any-adapter");
         assert_eq!(env.variables[0].name, "MY_VAR");
         assert_eq!(env.variables[0].env, "ACTUAL_ENV_KEY");
         assert_eq!(env.variables[0].value.as_deref(), Some("some-value"));
@@ -1201,8 +1341,8 @@ name = "API_KEY"
 value = "secret"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let env = m.environment_for("any-adapter");
+        let mfest = loader.manifest();
+        let env = mfest.environment_for("any-adapter");
         assert_eq!(env.variables[0].name, "API_KEY");
         assert_eq!(env.variables[0].env, "API_KEY");
     }
@@ -1225,17 +1365,17 @@ name = "VAR3"
 value = "v3"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
+        let mfest = loader.manifest();
 
-        let fastly_env = m.environment_for("FASTLY");
+        let fastly_env = mfest.environment_for("FASTLY");
         assert_eq!(fastly_env.variables.len(), 2); // VAR1 and VAR3
-        assert!(fastly_env.variables.iter().any(|v| v.name == "VAR1"));
-        assert!(fastly_env.variables.iter().any(|v| v.name == "VAR3"));
+        assert!(fastly_env.variables.iter().any(|var| var.name == "VAR1"));
+        assert!(fastly_env.variables.iter().any(|var| var.name == "VAR3"));
 
-        let cf_env = m.environment_for("Cloudflare");
+        let cf_env = mfest.environment_for("Cloudflare");
         assert_eq!(cf_env.variables.len(), 2); // VAR2 and VAR3
-        assert!(cf_env.variables.iter().any(|v| v.name == "VAR2"));
-        assert!(cf_env.variables.iter().any(|v| v.name == "VAR3"));
+        assert!(cf_env.variables.iter().any(|var| var.name == "VAR2"));
+        assert!(cf_env.variables.iter().any(|var| var.name == "VAR3"));
     }
 
     #[test]
@@ -1246,8 +1386,8 @@ name = "DB_PASSWORD"
 description = "Database password for production"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let env = m.environment_for("any");
+        let mfest = loader.manifest();
+        let env = mfest.environment_for("any");
         assert_eq!(
             env.secrets[0].description.as_deref(),
             Some("Database password for production")
@@ -1264,8 +1404,8 @@ profile = "release"
 features = ["feature1", "feature2"]
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = m.adapters.get("fastly").unwrap();
+        let mfest = loader.manifest();
+        let adapter = &mfest.adapters["fastly"];
         assert_eq!(adapter.build.target.as_deref(), Some("wasm32-wasip1"));
         assert_eq!(adapter.build.profile.as_deref(), Some("release"));
         assert_eq!(adapter.build.features, vec!["feature1", "feature2"]);
@@ -1280,8 +1420,8 @@ serve = "fastly compute serve"
 deploy = "fastly compute deploy"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = m.adapters.get("fastly").unwrap();
+        let mfest = loader.manifest();
+        let adapter = &mfest.adapters["fastly"];
         assert_eq!(
             adapter.commands.build.as_deref(),
             Some("fastly compute build")
@@ -1304,8 +1444,8 @@ crate = "crates/fastly-adapter"
 manifest = "fastly.toml"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = m.adapters.get("fastly").unwrap();
+        let mfest = loader.manifest();
+        let adapter = &mfest.adapters["fastly"];
         assert_eq!(
             adapter.adapter.crate_path.as_deref(),
             Some("crates/fastly-adapter")
@@ -1318,11 +1458,11 @@ manifest = "fastly.toml"
     fn empty_manifest_has_defaults() {
         let manifest = "";
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        assert!(m.app.name.is_none());
-        assert!(m.app.entry.is_none());
-        assert!(m.triggers.http.is_empty());
-        assert!(m.adapters.is_empty());
+        let mfest = loader.manifest();
+        assert!(mfest.app.name.is_none());
+        assert!(mfest.app.entry.is_none());
+        assert!(mfest.triggers.http.is_empty());
+        assert!(mfest.adapters.is_empty());
     }
 
     #[test]
@@ -1349,8 +1489,8 @@ manifest = "fastly.toml"
         // [stores.config] present but no name and no adapter overrides:
         // config_store_name() must return DEFAULT_CONFIG_STORE_NAME.
         let toml = "[stores.config]\n";
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(
             config.config_store_name("fastly"),
             DEFAULT_CONFIG_STORE_NAME
@@ -1375,8 +1515,8 @@ manifest = "fastly.toml"
 [stores.config]
 name = "app_config"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(config.config_store_name("fastly"), "app_config");
         assert_eq!(config.config_store_name("cloudflare"), "app_config");
         assert_eq!(config.config_store_name("axum"), "app_config");
@@ -1394,8 +1534,8 @@ name = "my-config-link"
 [stores.config.adapters.cloudflare]
 name = "APP_CONFIG_BINDING"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(config.config_store_name("fastly"), "my-config-link");
         assert_eq!(config.config_store_name("cloudflare"), "APP_CONFIG_BINDING");
         assert_eq!(config.config_store_name("axum"), "global_config");
@@ -1407,8 +1547,8 @@ name = "APP_CONFIG_BINDING"
 [stores.config.adapters.fastly]
 name = "fastly-store"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         assert_eq!(config.config_store_name("FASTLY"), "fastly-store");
         assert_eq!(config.config_store_name("Fastly"), "fastly-store");
         assert_eq!(config.config_store_name("fastly"), "fastly-store");
@@ -1465,23 +1605,23 @@ name = "SPIN_CONFIG"
 "feature.checkout" = "true"
 "service.timeout_ms" = "1500"
 "#;
-        let m = ManifestLoader::load_from_str(toml);
-        let config = m.manifest().stores.config.as_ref().unwrap();
+        let mfest = ManifestLoader::load_from_str(toml);
+        let config = mfest.manifest().stores.config.as_ref().unwrap();
         let defaults = config.config_store_defaults();
         assert_eq!(
-            defaults.get("feature.checkout").map(|s| s.as_str()),
+            defaults.get("feature.checkout").map(String::as_str),
             Some("true")
         );
         assert_eq!(
-            defaults.get("service.timeout_ms").map(|s| s.as_str()),
+            defaults.get("service.timeout_ms").map(String::as_str),
             Some("1500")
         );
     }
 
     #[test]
     fn empty_manifest_has_no_config_store() {
-        let m = ManifestLoader::load_from_str("");
-        assert!(m.manifest().stores.config.is_none());
+        let mfest = ManifestLoader::load_from_str("");
+        assert!(mfest.manifest().stores.config.is_none());
     }
 
     #[test]
@@ -1593,39 +1733,39 @@ name = "FASTLY_STORE"
     // -- Secret store config -----------------------------------------------
 
     #[test]
-    fn secret_store_name_defaults_to_constant_when_absent() {
+    fn secret_store_binding_defaults_to_constant_when_absent() {
         let manifest = ManifestLoader::load_from_str("[app]\nname = \"x\"\n");
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             DEFAULT_SECRET_STORE_NAME
         );
     }
 
     #[test]
-    fn secret_store_name_uses_global_name_when_declared() {
+    fn secret_store_binding_uses_global_name_when_declared() {
         let manifest = ManifestLoader::load_from_str("[stores.secrets]\nname = \"MY_SECRETS\"\n");
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             "MY_SECRETS"
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("cloudflare"),
+            manifest.manifest().secret_store_binding("cloudflare"),
             "MY_SECRETS"
         );
     }
 
     #[test]
-    fn secret_store_name_uses_per_adapter_override() {
+    fn secret_store_binding_uses_per_adapter_override() {
         let manifest = ManifestLoader::load_from_str(
             "[stores.secrets]\nname = \"MY_SECRETS\"\n\
              [stores.secrets.adapters.fastly]\nname = \"FASTLY_STORE\"\n",
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             "FASTLY_STORE"
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("cloudflare"),
+            manifest.manifest().secret_store_binding("cloudflare"),
             "MY_SECRETS"
         );
     }
@@ -1675,11 +1815,11 @@ name = "FASTLY_STORE"
         assert!(manifest.manifest().secret_store_enabled("fastly"));
         assert!(!manifest.manifest().secret_store_enabled("cloudflare"));
         assert_eq!(
-            manifest.manifest().secret_store_name("fastly"),
+            manifest.manifest().secret_store_binding("fastly"),
             "FASTLY_STORE"
         );
         assert_eq!(
-            manifest.manifest().secret_store_name("cloudflare"),
+            manifest.manifest().secret_store_binding("cloudflare"),
             DEFAULT_SECRET_STORE_NAME
         );
     }
@@ -1695,8 +1835,8 @@ host = "0.0.0.0"
 port = 3000
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = m.adapters.get("axum").unwrap();
+        let manifest_data = loader.manifest();
+        let adapter = &manifest_data.adapters["axum"];
         assert_eq!(adapter.adapter.host.as_deref(), Some("0.0.0.0"));
         assert_eq!(adapter.adapter.port, Some(3000));
     }
@@ -1708,8 +1848,8 @@ port = 3000
 crate = "crates/axum-adapter"
 "#;
         let loader = ManifestLoader::load_from_str(manifest);
-        let m = loader.manifest();
-        let adapter = m.adapters.get("axum").unwrap();
+        let manifest_data = loader.manifest();
+        let adapter = &manifest_data.adapters["axum"];
         assert!(adapter.adapter.host.is_none());
         assert!(adapter.adapter.port.is_none());
     }

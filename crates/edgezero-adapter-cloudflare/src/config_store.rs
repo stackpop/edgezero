@@ -12,18 +12,31 @@
 //! names are restricted to JavaScript identifier syntax.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use worker::Env;
 
-type ConfigMap = HashMap<String, String>;
 /// Maximum number of distinct binding names to remember in the parse cache.
 ///
 /// A single Worker typically uses one or two config bindings; 64 is a generous
 /// ceiling that bounds isolate memory without any practical limit for real apps.
 /// When the cache is full, the oldest entry is evicted (LRU-style) to make room.
 const CONFIG_CACHE_LIMIT: usize = 64;
+
+type ConfigMap = HashMap<String, String>;
+
+#[derive(Clone)]
+enum CacheEntry {
+    Missing,
+    Present(Arc<ConfigMap>),
+}
+
+#[derive(Default)]
+struct ConfigCache {
+    entries: HashMap<String, CacheEntry>,
+    order: VecDeque<String>,
+}
 
 /// Config store backed by a single Cloudflare JSON string binding.
 ///
@@ -33,30 +46,36 @@ pub struct CloudflareConfigStore {
     data: Arc<ConfigMap>,
 }
 
+impl ConfigCache {
+    fn get(&self, key: &str) -> Option<CacheEntry> {
+        self.entries.get(key).cloned()
+    }
+
+    fn get_or_insert(
+        &mut self,
+        key: &str,
+        entry: CacheEntry,
+        limit: usize,
+    ) -> Option<Arc<ConfigMap>> {
+        if let Some(existing) = self.entries.get(key) {
+            return entry_to_value(existing);
+        }
+
+        if limit > 0 && self.order.len() >= limit {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+
+        let owned_key = key.to_owned();
+        self.order.push_back(owned_key.clone());
+        let resolved = entry_to_value(&entry);
+        self.entries.insert(owned_key, entry);
+        resolved
+    }
+}
+
 impl CloudflareConfigStore {
-    /// Build a store by reading and parsing the JSON binding named `binding_name`.
-    ///
-    /// Returns an empty store (every key returns `None`) if the binding is absent or
-    /// its value is not valid JSON. Missing or invalid bindings are logged at `warn`
-    /// level (once per binding name per isolate lifetime) via the same path as
-    /// [`Self::try_new`], so misconfigured binding names will surface in logs.
-    /// Use [`Self::try_new`] when you need to distinguish a missing/invalid binding
-    /// from a valid but empty config at the call site.
-    pub fn new_or_empty(env: &Env, binding_name: &str) -> Self {
-        Self::try_new(env, binding_name).unwrap_or_else(Self::empty)
-    }
-
-    /// Build a store only when the configured Cloudflare binding exists and parses successfully.
-    ///
-    /// Missing bindings or invalid JSON are treated as configuration problems, logged at warn
-    /// level (once per binding name per isolate lifetime), and return `None` so the adapter
-    /// can skip injecting the handle.
-    pub fn try_new(env: &Env, binding_name: &str) -> Option<Self> {
-        Some(Self {
-            data: lookup_cached(env, binding_name)?,
-        })
-    }
-
     fn empty() -> Self {
         Self {
             data: Arc::new(HashMap::new()),
@@ -69,11 +88,50 @@ impl CloudflareConfigStore {
             data: Arc::new(entries.into_iter().collect()),
         }
     }
+
+    /// Build a store by reading and parsing the JSON binding named `binding_name`.
+    ///
+    /// Returns an empty store (every key returns `None`) if the binding is absent or
+    /// its value is not valid JSON. Missing or invalid bindings are logged at `warn`
+    /// level (once per binding name per isolate lifetime) via the same path as
+    /// [`Self::try_new`], so misconfigured binding names will surface in logs.
+    /// Use [`Self::try_new`] when you need to distinguish a missing/invalid binding
+    /// from a valid but empty config at the call site.
+    #[inline]
+    pub fn new_or_empty(env: &Env, binding_name: &str) -> Self {
+        Self::try_new(env, binding_name).unwrap_or_else(Self::empty)
+    }
+
+    /// Build a store only when the configured Cloudflare binding exists and parses successfully.
+    ///
+    /// Missing bindings or invalid JSON are treated as configuration problems, logged at warn
+    /// level (once per binding name per isolate lifetime), and return `None` so the adapter
+    /// can skip injecting the handle.
+    #[inline]
+    #[must_use]
+    pub fn try_new(env: &Env, binding_name: &str) -> Option<Self> {
+        Some(Self {
+            data: lookup_cached(env, binding_name)?,
+        })
+    }
 }
 
 impl ConfigStore for CloudflareConfigStore {
+    #[inline]
     fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
         Ok(self.data.get(key).cloned())
+    }
+}
+
+fn config_cache() -> &'static Mutex<ConfigCache> {
+    static CACHE: OnceLock<Mutex<ConfigCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ConfigCache::default()))
+}
+
+fn entry_to_value(entry: &CacheEntry) -> Option<Arc<ConfigMap>> {
+    match entry {
+        CacheEntry::Missing => None,
+        CacheEntry::Present(arc) => Some(Arc::clone(arc)),
     }
 }
 
@@ -91,81 +149,39 @@ fn lookup_cached(env: &Env, binding_name: &str) -> Option<Arc<ConfigMap>> {
     // Fast path: already cached.
     if let Some(entry) = config_cache()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .get(binding_name)
     {
-        return entry;
+        return entry_to_value(&entry);
     }
 
     // Cache miss: resolve from the JS env (synchronous interop, safe outside the lock).
-    let resolved = match env.var(binding_name).ok().map(|v| v.to_string()) {
+    let resolved = match env.var(binding_name).ok().map(|value| value.to_string()) {
         None => {
             log::warn!(
-                "configured config store binding '{}' is missing from the Worker environment; skipping config-store injection",
-                binding_name
+                "configured config store binding '{binding_name}' is missing from the Worker environment; skipping config-store injection"
             );
-            None
+            CacheEntry::Missing
         }
         Some(raw) => match serde_json::from_str::<ConfigMap>(&raw) {
-            Ok(data) => Some(Arc::new(data)),
+            Ok(data) => CacheEntry::Present(Arc::new(data)),
             Err(err) => {
                 log::warn!(
-                    "configured config store binding '{}' contains invalid JSON: {}; skipping config-store injection",
-                    binding_name,
-                    err
+                    "configured config store binding '{binding_name}' contains invalid JSON: {err}; skipping config-store injection"
                 );
-                None
+                CacheEntry::Missing
             }
         },
     };
 
-    // Cache the resolved value — including None for missing/invalid bindings.
+    // Cache the resolved value — including Missing for absent/invalid bindings.
     // This is safe because Cloudflare string bindings are immutable within an
     // isolate lifetime: the parsed result for a given binding name never changes,
     // so caching a failed parse prevents redundant warnings on every request.
     config_cache()
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .get_or_insert(binding_name, resolved, CONFIG_CACHE_LIMIT)
-}
-
-fn config_cache() -> &'static Mutex<ConfigCache> {
-    static CACHE: OnceLock<Mutex<ConfigCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(ConfigCache::default()))
-}
-
-#[derive(Default)]
-struct ConfigCache {
-    entries: HashMap<String, Option<Arc<ConfigMap>>>,
-    order: VecDeque<String>,
-}
-
-impl ConfigCache {
-    fn get(&self, key: &str) -> Option<Option<Arc<ConfigMap>>> {
-        self.entries.get(key).cloned()
-    }
-
-    fn get_or_insert(
-        &mut self,
-        key: &str,
-        value: Option<Arc<ConfigMap>>,
-        limit: usize,
-    ) -> Option<Arc<ConfigMap>> {
-        if let Some(existing) = self.entries.get(key) {
-            return existing.clone();
-        }
-
-        if limit > 0 && self.order.len() >= limit {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            }
-        }
-
-        let key = key.to_string();
-        self.order.push_back(key.clone());
-        self.entries.insert(key, value.clone());
-        value
-    }
 }
 
 #[cfg(test)]
@@ -175,8 +191,8 @@ mod tests {
 
     edgezero_core::config_store_contract_tests!(cloudflare_config_store_contract, #[wasm_bindgen_test], {
         CloudflareConfigStore::from_entries([
-            ("contract.key.a".to_string(), "value_a".to_string()),
-            ("contract.key.b".to_string(), "value_b".to_string()),
+            ("contract.key.a".to_owned(), "value_a".to_owned()),
+            ("contract.key.b".to_owned(), "value_b".to_owned()),
         ])
     });
 }

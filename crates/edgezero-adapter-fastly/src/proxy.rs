@@ -5,25 +5,28 @@ use edgezero_core::body::Body;
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{header, HeaderMap, HeaderValue, Method, Uri};
-use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
+use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse, PROXY_HEADER};
 use fastly::{
     error::anyhow, http::body::StreamingBody, Backend, Request as FastlyRequest,
     Response as FastlyResponse,
 };
-use futures_util::stream::{BoxStream, StreamExt};
-use std::io::{self, Write};
+use futures_util::stream::{BoxStream, StreamExt as _};
+use std::io::{self, Write as _};
 use std::time::Duration;
 
 const BACKEND_PREFIX: &str = "edgezero-dynamic-";
+
+type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
 
 pub struct FastlyProxyClient;
 
 #[async_trait(?Send)]
 impl ProxyClient for FastlyProxyClient {
+    #[inline]
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _ext) = request.into_parts();
         let backend_name = ensure_backend(&uri)?;
-        let fastly_request = build_fastly_request(method, &uri, headers)?;
+        let fastly_request = build_fastly_request(method, &uri, &headers);
         let (mut streaming_body, pending_request) = fastly_request
             .send_async_streaming(&backend_name)
             .map_err(EdgeError::internal)?;
@@ -31,24 +34,19 @@ impl ProxyClient for FastlyProxyClient {
         streaming_body.finish().map_err(EdgeError::internal)?;
         let mut fastly_response = pending_request.wait().map_err(EdgeError::internal)?;
 
-        let mut proxy_response = convert_response(&mut fastly_response)?;
-        proxy_response.headers_mut().insert(
-            edgezero_core::proxy::PROXY_HEADER,
-            HeaderValue::from_static("fastly"),
-        );
+        let mut proxy_response = convert_response(&mut fastly_response);
+        proxy_response
+            .headers_mut()
+            .insert(PROXY_HEADER, HeaderValue::from_static("fastly"));
         Ok(proxy_response)
     }
 }
 
-fn build_fastly_request(
-    method: Method,
-    uri: &Uri,
-    headers: HeaderMap,
-) -> Result<FastlyRequest, EdgeError> {
+fn build_fastly_request(method: Method, uri: &Uri, headers: &HeaderMap) -> FastlyRequest {
     let mut fastly_request = FastlyRequest::new(method.clone(), uri.to_string());
     fastly_request.set_method(method);
 
-    for (name, value) in headers.iter() {
+    for (name, value) in headers {
         if name.as_str().eq_ignore_ascii_case("host") {
             continue;
         }
@@ -59,7 +57,101 @@ fn build_fastly_request(
         fastly_request.set_header("Host", host);
     }
 
-    Ok(fastly_request)
+    fastly_request
+}
+
+fn convert_response(fastly_response: &mut FastlyResponse) -> ProxyResponse {
+    let status = fastly_response.get_status();
+    let mut proxy_response = ProxyResponse::new(status, Body::empty());
+
+    for header in fastly_response.get_header_names() {
+        if let Some(value) = fastly_response.get_header(header) {
+            proxy_response.headers_mut().insert(header, value.clone());
+        }
+    }
+
+    let encoding = proxy_response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_ascii_lowercase);
+
+    let body = fastly_response.take_body();
+
+    let chunk_stream = fastly_body_stream(body);
+    let body_stream = transform_stream(chunk_stream, encoding.as_deref());
+    *proxy_response.body_mut() = Body::from_stream(body_stream);
+    if encoding.as_deref() == Some("gzip") || encoding.as_deref() == Some("br") {
+        proxy_response
+            .headers_mut()
+            .remove(header::CONTENT_ENCODING);
+        proxy_response.headers_mut().remove(header::CONTENT_LENGTH);
+    }
+
+    proxy_response
+}
+
+fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
+    let host = uri
+        .host()
+        .ok_or_else(|| EdgeError::bad_request("proxy target must include host"))?;
+
+    let scheme = uri.scheme_str().unwrap_or("https");
+    let is_https = scheme.eq_ignore_ascii_case("https");
+
+    let target_port = match (uri.port_u16(), is_https) {
+        (Some(port), _) => port,
+        (None, true) => 443,
+        (None, false) => 80,
+    };
+
+    let host_with_port = format!("{host}:{target_port}");
+
+    // Human-readable name: backend_{scheme}_{host}_{port} with dots/colons sanitised
+    let name_base = format!("{scheme}_{host}_{target_port}");
+    let backend_name = format!("{}{}", BACKEND_PREFIX, name_base.replace(['.', ':'], "_"));
+
+    let mut builder = Backend::builder(&backend_name, &host_with_port)
+        .override_host(host)
+        .connect_timeout(Duration::from_secs(1))
+        .first_byte_timeout(Duration::from_secs(15))
+        .between_bytes_timeout(Duration::from_secs(10));
+
+    if is_https {
+        builder = builder
+            .enable_ssl()
+            .sni_hostname(host)
+            .check_certificate(host);
+        log::debug!("enable ssl for backend: {backend_name}");
+    }
+
+    match builder.finish() {
+        Ok(_) => {
+            log::debug!("created dynamic backend: {backend_name} -> {host_with_port}");
+            Ok(backend_name)
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("NameInUse") || msg.contains("already in use") {
+                log::debug!("reusing existing dynamic backend: {backend_name}");
+                Ok(backend_name)
+            } else {
+                Err(EdgeError::internal(anyhow!(
+                    "dynamic backend creation failed ({backend_name} -> {host_with_port}): {msg}"
+                )))
+            }
+        }
+    }
+}
+
+fn fastly_body_stream(mut body: fastly::Body) -> ChunkStream {
+    try_stream! {
+        for result in body.read_chunks(8 * 1024) {
+            let chunk = result?;
+            yield chunk;
+        }
+    }
+    .boxed()
 }
 
 async fn forward_request_body(
@@ -75,8 +167,8 @@ async fn forward_request_body(
             }
         }
         Body::Stream(mut stream) => {
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(EdgeError::internal)?;
+            while let Some(result) = stream.next().await {
+                let chunk = result.map_err(EdgeError::internal)?;
                 streaming_body
                     .write_all(&chunk)
                     .map_err(EdgeError::internal)?;
@@ -87,109 +179,6 @@ async fn forward_request_body(
     streaming_body.flush().map_err(EdgeError::internal)?;
 
     Ok(())
-}
-
-fn ensure_backend(uri: &Uri) -> Result<String, EdgeError> {
-    let host = uri
-        .host()
-        .ok_or_else(|| EdgeError::bad_request("proxy target must include host"))?;
-
-    let scheme = uri.scheme_str().unwrap_or("https");
-    let is_https = scheme.eq_ignore_ascii_case("https");
-
-    let target_port = match (uri.port_u16(), is_https) {
-        (Some(p), _) => p,
-        (None, true) => 443,
-        (None, false) => 80,
-    };
-
-    let host_with_port = format!("{}:{}", host, target_port);
-
-    // Human-readable name: backend_{scheme}_{host}_{port} with dots/colons sanitised
-    let name_base = format!("{}_{}_{}", scheme, host, target_port);
-    let backend_name = format!("{}{}", BACKEND_PREFIX, name_base.replace(['.', ':'], "_"));
-
-    let mut builder = Backend::builder(&backend_name, &host_with_port)
-        .override_host(host)
-        .connect_timeout(Duration::from_secs(1))
-        .first_byte_timeout(Duration::from_secs(15))
-        .between_bytes_timeout(Duration::from_secs(10));
-
-    if is_https {
-        builder = builder
-            .enable_ssl()
-            .sni_hostname(host)
-            .check_certificate(host);
-        log::debug!("enable ssl for backend: {}", backend_name);
-    }
-
-    match builder.finish() {
-        Ok(_) => {
-            log::debug!(
-                "created dynamic backend: {} -> {}",
-                backend_name,
-                host_with_port
-            );
-            Ok(backend_name)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("NameInUse") || msg.contains("already in use") {
-                log::debug!("reusing existing dynamic backend: {}", backend_name);
-                Ok(backend_name)
-            } else {
-                Err(EdgeError::internal(anyhow!(
-                    "dynamic backend creation failed ({} -> {}): {}",
-                    backend_name,
-                    host_with_port,
-                    msg
-                )))
-            }
-        }
-    }
-}
-
-fn convert_response(fastly_response: &mut FastlyResponse) -> Result<ProxyResponse, EdgeError> {
-    let status = fastly_response.get_status();
-    let mut proxy_response = ProxyResponse::new(status, Body::empty());
-
-    for header in fastly_response.get_header_names() {
-        if let Some(value) = fastly_response.get_header(header) {
-            proxy_response.headers_mut().insert(header, value.clone());
-        }
-    }
-
-    let encoding = proxy_response
-        .headers()
-        .get(header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_ascii_lowercase());
-
-    let body = fastly_response.take_body();
-
-    let chunk_stream = fastly_body_stream(body);
-    let body_stream = transform_stream(chunk_stream, encoding.as_deref());
-    *proxy_response.body_mut() = Body::from_stream(body_stream);
-    if encoding.as_deref() == Some("gzip") || encoding.as_deref() == Some("br") {
-        proxy_response
-            .headers_mut()
-            .remove(header::CONTENT_ENCODING);
-        proxy_response.headers_mut().remove(header::CONTENT_LENGTH);
-    }
-
-    Ok(proxy_response)
-}
-
-type ChunkStream = BoxStream<'static, Result<Vec<u8>, io::Error>>;
-
-fn fastly_body_stream(mut body: fastly::Body) -> ChunkStream {
-    try_stream! {
-        for chunk in body.read_chunks(8 * 1024) {
-            let chunk = chunk?;
-            yield chunk;
-        }
-    }
-    .boxed()
 }
 
 fn transform_stream(
@@ -209,40 +198,6 @@ mod tests {
     use brotli::CompressorWriter;
     use flate2::{write::GzEncoder, Compression};
     use futures::executor::block_on;
-    use std::io::Write;
-
-    #[test]
-    fn stream_handles_identity_and_gzip() {
-        let mut plain = fastly::Body::new();
-        plain.write_all(b"plain").unwrap();
-        let body = Body::from_stream(transform_stream(fastly_body_stream(plain), None));
-        let collected = collect_body(body);
-        assert_eq!(collected, b"plain");
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(b"hello gzip").unwrap();
-        let compressed = encoder.finish().unwrap();
-        let mut gz_body = fastly::Body::new();
-        gz_body.write_all(&compressed).unwrap();
-        let body = Body::from_stream(transform_stream(fastly_body_stream(gz_body), Some("gzip")));
-        let collected = collect_body(body);
-        assert_eq!(collected, b"hello gzip");
-    }
-
-    #[test]
-    fn stream_handles_brotli() {
-        let mut compressed = Vec::new();
-        {
-            let mut compressor = CompressorWriter::new(&mut compressed, 4096, 5, 21);
-            compressor.write_all(b"hello brotli").unwrap();
-        }
-
-        let mut br_body = fastly::Body::new();
-        br_body.write_all(&compressed).unwrap();
-        let body = Body::from_stream(transform_stream(fastly_body_stream(br_body), Some("br")));
-        let collected = collect_body(body);
-        assert_eq!(collected, b"hello brotli");
-    }
 
     fn collect_body(body: Body) -> Vec<u8> {
         match body {
@@ -255,5 +210,36 @@ mod tests {
                 out
             }),
         }
+    }
+
+    #[test]
+    fn stream_handles_brotli() {
+        let mut compressed = Vec::new();
+        let mut compressor = CompressorWriter::new(&mut compressed, 4096, 5, 21);
+        compressor.write_all(b"hello brotli").unwrap();
+        drop(compressor);
+
+        let mut br_body = fastly::Body::new();
+        br_body.write_all(&compressed).unwrap();
+        let body = Body::from_stream(transform_stream(fastly_body_stream(br_body), Some("br")));
+        let collected = collect_body(body);
+        assert_eq!(collected, b"hello brotli");
+    }
+
+    #[test]
+    fn stream_handles_identity_and_gzip() {
+        let mut plain = fastly::Body::new();
+        plain.write_all(b"plain").unwrap();
+        let plain_body = Body::from_stream(transform_stream(fastly_body_stream(plain), None));
+        assert_eq!(collect_body(plain_body), b"plain");
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"hello gzip").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut gz_body = fastly::Body::new();
+        gz_body.write_all(&compressed).unwrap();
+        let gzip_body =
+            Body::from_stream(transform_stream(fastly_body_stream(gz_body), Some("gzip")));
+        assert_eq!(collect_body(gzip_body), b"hello gzip");
     }
 }

@@ -1,44 +1,100 @@
 use edgezero_adapter::scaffold;
 use handlebars::Handlebars;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
 
+pub struct ResolvedDependency {
+    pub crate_line: String,
+    pub name: String,
+    pub workspace_line: String,
+}
+
+/// Errors produced while scaffolding files for a generated project.
+#[derive(Debug, Error)]
+pub enum ScaffoldError {
+    /// Failed to read or write a path on disk while emitting a template.
+    #[error("scaffold io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The Handlebars renderer rejected the template or its data.
+    #[error("template '{name}' failed to render: {message}")]
+    Render { message: String, name: String },
+}
+
+impl ScaffoldError {
+    pub(crate) fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        ScaffoldError::Io {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+fn crate_name_from_repo_path(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+}
+
+/// Registers all compile-time-embedded templates.
+///
+/// Each `register_template_string` call uses `.expect(..)` because the inputs
+/// are static strings via `include_str!` — failure can only happen if the
+/// template source itself has invalid Handlebars syntax, which is a
+/// build-time programmer error caught the moment the binary is run.
+#[expect(
+    clippy::expect_used,
+    reason = "compile-time-embedded templates: parse failure is a build bug"
+)]
 pub fn register_templates(hbs: &mut Handlebars) {
     // Root
     hbs.register_template_string(
         "root_Cargo_toml",
         include_str!("templates/root/Cargo.toml.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "root_edgezero_toml",
         include_str!("templates/root/edgezero.toml.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "root_README_md",
         include_str!("templates/root/README.md.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "root_gitignore",
         include_str!("templates/root/gitignore.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
+    hbs.register_template_string(
+        "root_clippy_toml",
+        include_str!("templates/root/clippy.toml.hbs"),
+    )
+    .expect("compiled-in template is valid");
     // Core
     hbs.register_template_string(
         "core_Cargo_toml",
         include_str!("templates/core/Cargo.toml.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "core_src_lib_rs",
         include_str!("templates/core/src/lib.rs.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     hbs.register_template_string(
         "core_src_handlers_rs",
         include_str!("templates/core/src/handlers.rs.hbs"),
     )
-    .unwrap();
+    .expect("compiled-in template is valid");
     // Adapter-specific templates
     for adapter in scaffold::registered_blueprints() {
         for template in adapter.template_registrations {
@@ -48,19 +104,61 @@ pub fn register_templates(hbs: &mut Handlebars) {
     }
 }
 
-pub fn write_tmpl(
-    hbs: &handlebars::Handlebars,
-    name: &str,
-    data: &serde_json::Value,
-    out_path: &std::path::Path,
-) -> std::io::Result<()> {
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
+pub fn relative_to(from: &Path, to: &Path) -> Option<String> {
+    let from_abs = fs::canonicalize(from).ok()?;
+    let to_abs = fs::canonicalize(to).ok()?;
+    let suffix = from_abs.strip_prefix(&to_abs).ok()?;
+    let depth = suffix.components().count();
+    if depth == 0 {
+        return Some(".".into());
     }
-    let rendered = hbs
-        .render(name, data)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    std::fs::write(out_path, rendered)
+    let mut ups = String::new();
+    for _ in 0..depth {
+        if !ups.is_empty() {
+            ups.push('/');
+        }
+        ups.push_str("..");
+    }
+    Some(ups)
+}
+
+pub fn resolve_dep_line(
+    workspace_dir: &Path,
+    repo_root: &Path,
+    repo_rel_crate: &str,
+    fallback: &str,
+    features: &[&str],
+) -> ResolvedDependency {
+    let crate_name = crate_name_from_repo_path(repo_rel_crate).to_owned();
+    let candidate = repo_root.join(repo_rel_crate);
+    let workspace_line = if candidate.exists() {
+        if let Some(rel) = relative_to(workspace_dir, repo_root) {
+            let dep_path = Path::new(&rel).join(repo_rel_crate);
+            format!("{} = {{ path = \"{}\" }}", crate_name, dep_path.display())
+        } else {
+            fallback.to_owned()
+        }
+    } else {
+        fallback.to_owned()
+    };
+
+    let feature_fragment = if features.is_empty() {
+        String::new()
+    } else {
+        let joined = features
+            .iter()
+            .map(|feat| format!("\"{feat}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(", features = [{joined}]")
+    };
+    let crate_line = format!("{crate_name} = {{ workspace = true{feature_fragment} }}");
+
+    ResolvedDependency {
+        crate_line,
+        name: crate_name,
+        workspace_line,
+    }
 }
 
 pub fn sanitize_crate_name(input: &str) -> String {
@@ -77,84 +175,32 @@ pub fn sanitize_crate_name(input: &str) -> String {
         }
     }
     if out.is_empty() {
-        "edgezero-app".to_string()
+        "edgezero-app".to_owned()
     } else {
         out
     }
 }
 
-pub struct ResolvedDependency {
-    pub name: String,
-    pub workspace_line: String,
-    pub crate_line: String,
-}
-
-pub fn resolve_dep_line(
-    workspace_dir: &std::path::Path,
-    repo_root: &std::path::Path,
-    repo_rel_crate: &str,
-    fallback: &str,
-    features: &[&str],
-) -> ResolvedDependency {
-    let crate_name = crate_name_from_repo_path(repo_rel_crate).to_string();
-    let candidate = repo_root.join(repo_rel_crate);
-    let workspace_line = if candidate.exists() {
-        if let Some(rel) = relative_to(workspace_dir, repo_root) {
-            let dep_path = std::path::Path::new(&rel).join(repo_rel_crate);
-            format!("{} = {{ path = \"{}\" }}", crate_name, dep_path.display())
-        } else {
-            fallback.to_string()
-        }
-    } else {
-        fallback.to_string()
-    };
-
-    let feature_fragment = if features.is_empty() {
-        String::new()
-    } else {
-        let joined = features
-            .iter()
-            .map(|f| format!("\"{}\"", f))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(", features = [{}]", joined)
-    };
-    let crate_line = format!(
-        "{} = {{ workspace = true{} }}",
-        crate_name, feature_fragment
-    );
-
-    ResolvedDependency {
-        name: crate_name,
-        workspace_line,
-        crate_line,
+/// # Errors
+/// Returns [`ScaffoldError::Io`] if the parent directory cannot be created
+/// or the rendered template cannot be written; [`ScaffoldError::Render`] if
+/// Handlebars rejects the template or its data.
+pub fn write_tmpl(
+    hbs: &handlebars::Handlebars,
+    name: &str,
+    data: &serde_json::Value,
+    out_path: &Path,
+) -> Result<(), ScaffoldError> {
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| ScaffoldError::io(parent, err))?;
     }
-}
-
-fn crate_name_from_repo_path(p: &str) -> &str {
-    std::path::Path::new(p)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(p)
-}
-
-pub fn relative_to(from: &std::path::Path, to: &std::path::Path) -> Option<String> {
-    let from_abs = std::fs::canonicalize(from).ok()?;
-    let to_abs = std::fs::canonicalize(to).ok()?;
-    let suffix = from_abs.strip_prefix(&to_abs).ok()?;
-    let depth = suffix.components().count();
-    if depth == 0 {
-        return Some(".".into());
-    }
-    let mut ups = String::new();
-    for i in 0..depth {
-        let _ = i;
-        if !ups.is_empty() {
-            ups.push('/');
-        }
-        ups.push_str("..");
-    }
-    Some(ups)
+    let rendered = hbs
+        .render(name, data)
+        .map_err(|err| ScaffoldError::Render {
+            message: err.to_string(),
+            name: name.to_owned(),
+        })?;
+    fs::write(out_path, rendered).map_err(|err| ScaffoldError::io(out_path, err))
 }
 
 #[cfg(test)]
@@ -172,6 +218,7 @@ mod tests {
             "root_edgezero_toml",
             "root_README_md",
             "root_gitignore",
+            "root_clippy_toml",
             "core_Cargo_toml",
             "core_src_lib_rs",
             "core_src_handlers_rs",

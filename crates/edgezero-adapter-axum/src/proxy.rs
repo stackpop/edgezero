@@ -5,31 +5,40 @@ use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderName, HeaderValue, Method, StatusCode};
 use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse};
-use futures_util::StreamExt;
+use futures_util::StreamExt as _;
 use reqwest::{header, Client};
 
 pub struct AxumProxyClient {
     client: Client,
 }
 
-impl Default for AxumProxyClient {
-    fn default() -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("reqwest client");
-        Self { client }
+impl AxumProxyClient {
+    /// Construct a proxy client with the workspace-default 30-second timeout.
+    ///
+    /// **Breaking change (pre-1.0):** previously `AxumProxyClient` implemented
+    /// `Default` and panicked if reqwest's TLS backend could not be initialised.
+    /// Construction is now fallible so callers can decide how to handle a
+    /// missing or misconfigured TLS backend.
+    ///
+    /// # Errors
+    /// Returns the underlying [`reqwest::Error`] if `reqwest::Client::builder().build()`
+    /// fails — typically because the TLS backend cannot be initialised on this target.
+    #[inline]
+    pub fn try_new() -> Result<Self, reqwest::Error> {
+        let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
+        Ok(Self { client })
     }
 }
 
 #[async_trait(?Send)]
 impl ProxyClient for AxumProxyClient {
+    #[inline]
     async fn send(&self, request: ProxyRequest) -> Result<ProxyResponse, EdgeError> {
         let (method, uri, headers, body, _extensions) = request.into_parts();
         let reqwest_method = reqwest_method(&method)?;
         let mut builder = self.client.request(reqwest_method, uri.to_string());
 
-        for (name, value) in headers.iter() {
+        for (name, value) in &headers {
             let header_name = header::HeaderName::from_bytes(name.as_str().as_bytes())
                 .map_err(EdgeError::internal)?;
             let header_value =
@@ -41,8 +50,8 @@ impl ProxyClient for AxumProxyClient {
             Body::Once(bytes) => builder.body(bytes.to_vec()),
             Body::Stream(mut stream) => {
                 let mut buf = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(EdgeError::internal)?;
+                while let Some(result) = stream.next().await {
+                    let chunk = result.map_err(EdgeError::internal)?;
                     buf.extend_from_slice(&chunk);
                 }
                 builder.body(buf)
@@ -54,7 +63,7 @@ impl ProxyClient for AxumProxyClient {
             StatusCode::from_u16(response.status().as_u16()).map_err(EdgeError::internal)?;
         let mut proxy_response = ProxyResponse::new(status, Body::empty());
 
-        for (name, value) in response.headers().iter() {
+        for (name, value) in response.headers() {
             let header_name =
                 HeaderName::from_bytes(name.as_str().as_bytes()).map_err(EdgeError::internal)?;
             let header_value =
@@ -78,6 +87,7 @@ fn reqwest_method(method: &Method) -> Result<reqwest::Method, EdgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem;
 
     #[test]
     fn converts_method_to_reqwest() {
@@ -105,18 +115,21 @@ mod tests {
 
     #[test]
     fn default_client_creates_successfully() {
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         // Just verify it builds without panicking
-        assert!(std::mem::size_of_val(&client) > 0);
+        assert!(mem::size_of_val(&client) > 0);
     }
 }
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use axum::{routing::get, routing::post, Router};
+    use axum::body::Bytes as AxumBytes;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::http::{HeaderMap as AxumHeaderMap, StatusCode as AxumStatusCode};
+    use axum::routing::{delete, get, patch, post, put};
+    use axum::Router;
     use edgezero_core::http::Uri;
-    use edgezero_core::proxy::ProxyClient;
     use tokio::net::TcpListener;
 
     async fn start_test_server(router: Router) -> String {
@@ -125,7 +138,7 @@ mod integration_tests {
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        format!("http://{}", addr)
+        format!("http://{addr}")
     }
 
     #[tokio::test]
@@ -133,8 +146,8 @@ mod integration_tests {
         let app = Router::new().route("/test", get(|| async { "hello from server" }));
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/test", base_url).parse().unwrap();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
+        let uri: Uri = format!("{base_url}/test").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -142,17 +155,17 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"hello from server"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 
     #[tokio::test]
     async fn proxy_client_sends_post_with_body() {
-        let app = Router::new().route("/echo", post(|body: axum::body::Bytes| async move { body }));
+        let app = Router::new().route("/echo", post(|body: AxumBytes| async move { body }));
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/echo", base_url).parse().unwrap();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
+        let uri: Uri = format!("{base_url}/echo").parse().unwrap();
         let mut request = ProxyRequest::new(Method::POST, uri);
         *request.body_mut() = Body::from("request body data");
 
@@ -161,7 +174,7 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"request body data"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 
@@ -169,18 +182,18 @@ mod integration_tests {
     async fn proxy_client_forwards_request_headers() {
         let app = Router::new().route(
             "/headers",
-            get(|headers: axum::http::HeaderMap| async move {
+            get(|headers: AxumHeaderMap| async move {
                 headers
                     .get("x-custom-header")
-                    .and_then(|v| v.to_str().ok())
+                    .and_then(|val| val.to_str().ok())
                     .unwrap_or("missing")
-                    .to_string()
+                    .to_owned()
             }),
         );
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/headers", base_url).parse().unwrap();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
+        let uri: Uri = format!("{base_url}/headers").parse().unwrap();
         let mut request = ProxyRequest::new(Method::GET, uri);
         request
             .headers_mut()
@@ -191,7 +204,7 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"custom-value"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 
@@ -199,17 +212,12 @@ mod integration_tests {
     async fn proxy_client_receives_response_headers() {
         let app = Router::new().route(
             "/with-headers",
-            get(|| async {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    "{}",
-                )
-            }),
+            get(|| async { ([(CONTENT_TYPE, "application/json")], "{}") }),
         );
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/with-headers", base_url).parse().unwrap();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
+        let uri: Uri = format!("{base_url}/with-headers").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -218,7 +226,7 @@ mod integration_tests {
         let content_type = response
             .headers()
             .get("content-type")
-            .and_then(|v| v.to_str().ok());
+            .and_then(|val| val.to_str().ok());
         assert_eq!(content_type, Some("application/json"));
     }
 
@@ -227,8 +235,8 @@ mod integration_tests {
         let app = Router::new();
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/nonexistent", base_url).parse().unwrap();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
+        let uri: Uri = format!("{base_url}/nonexistent").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -239,12 +247,12 @@ mod integration_tests {
     async fn proxy_client_handles_500() {
         let app = Router::new().route(
             "/error",
-            get(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error") }),
+            get(|| async { (AxumStatusCode::INTERNAL_SERVER_ERROR, "error") }),
         );
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/error", base_url).parse().unwrap();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
+        let uri: Uri = format!("{base_url}/error").parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
         let response = client.send(request).await.expect("response");
@@ -256,12 +264,12 @@ mod integration_tests {
         let app = Router::new()
             .route("/method", get(|| async { "GET" }))
             .route("/method", post(|| async { "POST" }))
-            .route("/method", axum::routing::put(|| async { "PUT" }))
-            .route("/method", axum::routing::delete(|| async { "DELETE" }))
-            .route("/method", axum::routing::patch(|| async { "PATCH" }));
+            .route("/method", put(|| async { "PUT" }))
+            .route("/method", delete(|| async { "DELETE" }))
+            .route("/method", patch(|| async { "PATCH" }));
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
 
         for (method, expected_body) in [
             (Method::GET, "GET"),
@@ -270,26 +278,28 @@ mod integration_tests {
             (Method::DELETE, "DELETE"),
             (Method::PATCH, "PATCH"),
         ] {
-            let uri: Uri = format!("{}/method", base_url).parse().unwrap();
+            let uri: Uri = format!("{base_url}/method").parse().unwrap();
             let request = ProxyRequest::new(method, uri);
             let response = client.send(request).await.expect("response");
             assert_eq!(response.status(), StatusCode::OK);
             match response.body() {
                 Body::Once(bytes) => assert_eq!(bytes.as_ref(), expected_body.as_bytes()),
-                _ => panic!("expected buffered body"),
+                Body::Stream(_) => panic!("expected buffered body"),
             }
         }
     }
 
     #[tokio::test]
     async fn proxy_client_handles_connection_refused() {
-        let client = AxumProxyClient::default();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
         // Use a port that's unlikely to have anything running
         let uri: Uri = "http://127.0.0.1:1".parse().unwrap();
         let request = ProxyRequest::new(Method::GET, uri);
 
-        let result = client.send(request).await;
-        assert!(result.is_err());
+        client
+            .send(request)
+            .await
+            .expect_err("expected connection refused");
     }
 
     #[tokio::test]
@@ -297,14 +307,11 @@ mod integration_tests {
         use bytes::Bytes;
         use futures::stream;
 
-        let app = Router::new().route(
-            "/stream-echo",
-            post(|body: axum::body::Bytes| async move { body }),
-        );
+        let app = Router::new().route("/stream-echo", post(|body: AxumBytes| async move { body }));
         let base_url = start_test_server(app).await;
 
-        let client = AxumProxyClient::default();
-        let uri: Uri = format!("{}/stream-echo", base_url).parse().unwrap();
+        let client = AxumProxyClient::try_new().expect("reqwest client init");
+        let uri: Uri = format!("{base_url}/stream-echo").parse().unwrap();
         let mut request = ProxyRequest::new(Method::POST, uri);
 
         // Create a streaming body - Body::stream expects Stream<Item = Bytes>
@@ -321,7 +328,7 @@ mod integration_tests {
 
         match response.body() {
             Body::Once(bytes) => assert_eq!(bytes.as_ref(), b"chunk1chunk2chunk3"),
-            _ => panic!("expected buffered body"),
+            Body::Stream(_) => panic!("expected buffered body"),
         }
     }
 }

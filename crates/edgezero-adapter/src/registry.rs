@@ -1,48 +1,48 @@
-use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{LazyLock, PoisonError, RwLock};
 
-/// Actions the EdgeZero CLI can request from an adapter implementation.
+static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Actions the `EdgeZero` CLI can request from an adapter implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AdapterAction {
     Build,
     Deploy,
     Serve,
 }
 
-/// Interface implemented by adapter crates to integrate with the EdgeZero CLI.
+/// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 pub trait Adapter: Sync + Send {
+    /// Execute the requested action with optional adapter-specific args.
+    ///
+    /// # Errors
+    /// Returns an error string if the requested adapter action fails.
+    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+
     /// Name used to reference the adapter (case-insensitive).
     fn name(&self) -> &'static str;
-
-    /// Execute the requested action with optional adapter-specific args.
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
 }
 
-static REGISTRY: Lazy<RwLock<HashMap<String, &'static dyn Adapter>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
-
 /// Registers an adapter so it can be discovered by the CLI.
+#[inline]
 pub fn register_adapter(adapter: &'static dyn Adapter) {
-    let mut registry = REGISTRY
-        .write()
-        .expect("edgezero adapter registry lock poisoned");
+    let mut registry = REGISTRY.write().unwrap_or_else(PoisonError::into_inner);
     registry.insert(adapter.name().to_ascii_lowercase(), adapter);
 }
 
 /// Looks up an adapter by name.
+#[inline]
 pub fn get_adapter(name: &str) -> Option<&'static dyn Adapter> {
-    let registry = REGISTRY
-        .read()
-        .expect("edgezero adapter registry lock poisoned");
+    let registry = REGISTRY.read().unwrap_or_else(PoisonError::into_inner);
     registry.get(&name.to_ascii_lowercase()).copied()
 }
 
 /// Returns the names of all registered adapters.
+#[inline]
 pub fn registered_adapters() -> Vec<String> {
-    let registry = REGISTRY
-        .read()
-        .expect("edgezero adapter registry lock poisoned");
+    let registry = REGISTRY.read().unwrap_or_else(PoisonError::into_inner);
     let mut names: Vec<String> = registry.keys().cloned().collect();
     names.sort();
     names
@@ -51,41 +51,39 @@ pub fn registered_adapters() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use once_cell::sync::Lazy;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
+    static FIRST: TestAdapter = TestAdapter {
+        hit_value: 1,
+        name: "dummy",
+    };
     static HIT: AtomicUsize = AtomicUsize::new(0);
-    static TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+    static OTHER: TestAdapter = TestAdapter {
+        hit_value: 3,
+        name: "other",
+    };
+    static SECOND: TestAdapter = TestAdapter {
+        hit_value: 2,
+        name: "dummy",
+    };
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct TestAdapter {
-        name: &'static str,
         hit_value: usize,
+        name: &'static str,
     }
 
     impl Adapter for TestAdapter {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
         fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
             HIT.store(self.hit_value, Ordering::SeqCst);
             Ok(())
         }
-    }
 
-    static FIRST: TestAdapter = TestAdapter {
-        name: "dummy",
-        hit_value: 1,
-    };
-    static SECOND: TestAdapter = TestAdapter {
-        name: "dummy",
-        hit_value: 2,
-    };
-    static OTHER: TestAdapter = TestAdapter {
-        name: "other",
-        hit_value: 3,
-    };
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
 
     fn reset() {
         let mut registry = super::REGISTRY.write().expect("registry lock");
@@ -125,6 +123,6 @@ mod tests {
         register_adapter(&OTHER);
         register_adapter(&FIRST);
         let adapters = registered_adapters();
-        assert_eq!(adapters, vec!["dummy".to_string(), "other".to_string()]);
+        assert_eq!(adapters, vec!["dummy".to_owned(), "other".to_owned()]);
     }
 }

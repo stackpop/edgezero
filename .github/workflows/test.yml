@@ -18,12 +18,13 @@ jobs:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
+            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
@@ -74,18 +75,19 @@ jobs:
             runner_env: CARGO_TARGET_WASM32_WASIP1_RUNNER
             runner_value: wasmtime run
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
+            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             ~/.wasmtime/bin/
             target/
-          key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.adapter }}-${{ hashFiles('**/Cargo.lock', '.tool-versions') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.adapter }}-
 
@@ -120,36 +122,66 @@ jobs:
           test -n "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # `--force` is required because the cargo cache may restore an existing
+      # `~/.cargo/bin/<binary>` from a prior run, which `cargo install` rejects
+      # by default. Force-overwriting is safe — `--locked` pins the version.
       - name: Install wasm-bindgen test runner
         if: matrix.adapter == 'cloudflare'
-        run: |
-          required="${{ steps.wasm-bindgen-version.outputs.version }}"
-          if ! command -v wasm-bindgen-test-runner &>/dev/null \
-              || ! wasm-bindgen --version 2>/dev/null | grep -q "$required"; then
-            cargo install wasm-bindgen-cli --version "$required" --locked --force
-          fi
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wasm-bindgen-version.outputs.version }}" --locked --force
+
+      - name: Resolve Viceroy version
+        if: matrix.adapter == 'fastly'
+        id: viceroy-version
+        shell: bash
+        run: echo "version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Setup Viceroy
         if: matrix.adapter == 'fastly'
-        env:
-          VICEROY_VERSION: 0.16.5
-        run: |
-          if ! command -v viceroy &>/dev/null \
-              || ! viceroy --version 2>/dev/null | grep -qF "$VICEROY_VERSION"; then
-            cargo install viceroy --version "$VICEROY_VERSION" --locked
-          fi
+        # Version comes from .tool-versions (single source of truth shared with
+        # local dev).
+        run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.version }}" --locked --force
+
+      - name: Resolve Wasmtime version
+        if: matrix.adapter == 'spin'
+        id: wasmtime-version
+        shell: bash
+        run: echo "version=$(grep '^wasmtime ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
       - name: Setup Wasmtime
         if: matrix.adapter == 'spin'
-        env:
-          WASMTIME_VERSION: v44.0.0
+        # Direct GitHub-release tarball install. The official
+        # `https://wasmtime.dev/install.sh` script broke as of
+        # 2026-05-19 (interpolation failure: tried to download
+        # version literal `{`), so we pin via .tool-versions and
+        # land the binary in `~/.wasmtime/bin/` so the cache step
+        # above actually short-circuits the download on subsequent
+        # runs.
+        #
+        # The cache key now hashes `.tool-versions` too, so a
+        # version bump invalidates the cached binary. We also
+        # explicitly compare `wasmtime --version` against the pin
+        # — without that a runner-provided wasmtime or a stale
+        # cache hit would silently shadow the pinned version.
         run: |
-          export PATH="$HOME/.wasmtime/bin:$PATH"
-          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
-          if ! command -v wasmtime &>/dev/null \
-              || ! wasmtime --version 2>/dev/null | grep -qF "${WASMTIME_VERSION#v}"; then
-            curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version "$WASMTIME_VERSION"
+          install_dir="$HOME/.wasmtime/bin"
+          echo "$install_dir" >> "$GITHUB_PATH"
+          export PATH="$install_dir:$PATH"
+          version="${{ steps.wasmtime-version.outputs.version }}"
+          # Compare exact versions so a pin like `44.0.1` does not silently
+          # accept `wasmtime 44.0.10` from a stale cache or runner-provided
+          # binary.
+          actual="$(wasmtime --version 2>/dev/null | awk '{print $2}' || true)"
+          if [ "$actual" != "$version" ]; then
+            tag="v${version}"
+            archive="wasmtime-${tag}-x86_64-linux"
+            mkdir -p "$install_dir"
+            curl -fL "https://github.com/bytecodealliance/wasmtime/releases/download/${tag}/${archive}.tar.xz" -o /tmp/wasmtime.tar.xz
+            tar -xJf /tmp/wasmtime.tar.xz -C /tmp
+            install -m 0755 "/tmp/${archive}/wasmtime" "$install_dir/wasmtime"
           fi
+          actual="$(wasmtime --version | awk '{print $2}')"
+          test "$actual" = "$version"
+          wasmtime --version
 
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked

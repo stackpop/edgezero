@@ -8,6 +8,8 @@ use validator::Validate;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
 use crate::http::HeaderMap;
+use crate::key_value_store::KvHandle;
+use crate::secret_store::SecretHandle;
 
 #[async_trait(?Send)]
 pub trait FromRequest: Sized {
@@ -21,6 +23,7 @@ impl<T> FromRequest for Json<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.json().map(Json)
     }
@@ -29,18 +32,21 @@ where
 impl<T> Deref for Json<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Json<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Json<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -53,6 +59,7 @@ impl<T> FromRequest for ValidatedJson<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Json(value) = Json::<T>::from_request(ctx).await?;
         value
@@ -65,18 +72,21 @@ where
 impl<T> Deref for ValidatedJson<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedJson<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedJson<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -86,6 +96,7 @@ pub struct Headers(pub HeaderMap);
 
 #[async_trait(?Send)]
 impl FromRequest for Headers {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         Ok(Headers(ctx.request().headers().clone()))
     }
@@ -94,18 +105,22 @@ impl FromRequest for Headers {
 impl Deref for Headers {
     type Target = HeaderMap;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl DerefMut for Headers {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl Headers {
+    #[must_use]
+    #[inline]
     pub fn into_inner(self) -> HeaderMap {
         self.0
     }
@@ -126,13 +141,14 @@ pub struct Host(pub String);
 
 #[async_trait(?Send)]
 impl FromRequest for Host {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let headers = ctx.request().headers();
         let host = headers
             .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("localhost")
-            .to_string();
+            .to_owned();
         Ok(Host(host))
     }
 }
@@ -140,12 +156,15 @@ impl FromRequest for Host {
 impl Deref for Host {
     type Target = String;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl Host {
+    #[must_use]
+    #[inline]
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -171,14 +190,15 @@ pub struct ForwardedHost(pub String);
 
 #[async_trait(?Send)]
 impl FromRequest for ForwardedHost {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let headers = ctx.request().headers();
         let host = headers
             .get("x-forwarded-host")
             .or_else(|| headers.get(header::HOST))
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
             .unwrap_or("localhost")
-            .to_string();
+            .to_owned();
         Ok(ForwardedHost(host))
     }
 }
@@ -186,12 +206,15 @@ impl FromRequest for ForwardedHost {
 impl Deref for ForwardedHost {
     type Target = String;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl ForwardedHost {
+    #[must_use]
+    #[inline]
     pub fn into_inner(self) -> String {
         self.0
     }
@@ -204,6 +227,7 @@ impl<T> FromRequest for Query<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.query().map(Query)
     }
@@ -212,18 +236,21 @@ where
 impl<T> Deref for Query<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Query<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Query<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -236,6 +263,7 @@ impl<T> FromRequest for ValidatedQuery<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Query(value) = Query::<T>::from_request(ctx).await?;
         value
@@ -248,18 +276,21 @@ where
 impl<T> Deref for ValidatedQuery<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedQuery<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedQuery<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -272,6 +303,7 @@ impl<T> FromRequest for Path<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.path().map(Path)
     }
@@ -280,18 +312,21 @@ where
 impl<T> Deref for Path<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Path<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Path<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -304,6 +339,7 @@ impl<T> FromRequest for ValidatedPath<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Path(value) = Path::<T>::from_request(ctx).await?;
         value
@@ -316,18 +352,21 @@ where
 impl<T> Deref for ValidatedPath<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedPath<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedPath<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -340,6 +379,7 @@ impl<T> FromRequest for Form<T>
 where
     T: DeserializeOwned + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.form().map(Form)
     }
@@ -348,18 +388,21 @@ where
 impl<T> Deref for Form<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for Form<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> Form<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -372,6 +415,7 @@ impl<T> FromRequest for ValidatedForm<T>
 where
     T: DeserializeOwned + Validate + Send + 'static,
 {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         let Form(value) = Form::<T>::from_request(ctx).await?;
         value
@@ -384,18 +428,21 @@ where
 impl<T> Deref for ValidatedForm<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 impl<T> DerefMut for ValidatedForm<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl<T> ValidatedForm<T> {
+    #[inline]
     pub fn into_inner(self) -> T {
         self.0
     }
@@ -415,10 +462,11 @@ impl<T> ValidatedForm<T> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Kv(pub crate::key_value_store::KvHandle);
+pub struct Kv(pub KvHandle);
 
 #[async_trait(?Send)]
 impl FromRequest for Kv {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         ctx.kv_handle().map(Kv).ok_or_else(|| {
             EdgeError::internal(anyhow::anyhow!(
@@ -428,22 +476,26 @@ impl FromRequest for Kv {
     }
 }
 
-impl std::ops::Deref for Kv {
-    type Target = crate::key_value_store::KvHandle;
+impl Deref for Kv {
+    type Target = KvHandle;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl std::ops::DerefMut for Kv {
+impl DerefMut for Kv {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl Kv {
-    pub fn into_inner(self) -> crate::key_value_store::KvHandle {
+    #[must_use]
+    #[inline]
+    pub fn into_inner(self) -> KvHandle {
         self.0
     }
 }
@@ -461,10 +513,11 @@ impl Kv {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct Secrets(pub crate::secret_store::SecretHandle);
+pub struct Secrets(pub SecretHandle);
 
 #[async_trait(?Send)]
 impl FromRequest for Secrets {
+    #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
         // ctx.secret_handle() returns a handle object, not secret bytes.
         // The error message below contains only store configuration info — no secret values
@@ -477,22 +530,26 @@ impl FromRequest for Secrets {
     }
 }
 
-impl std::ops::Deref for Secrets {
-    type Target = crate::secret_store::SecretHandle;
+impl Deref for Secrets {
+    type Target = SecretHandle;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl std::ops::DerefMut for Secrets {
+impl DerefMut for Secrets {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
 impl Secrets {
-    pub fn into_inner(self) -> crate::secret_store::SecretHandle {
+    #[must_use]
+    #[inline]
+    pub fn into_inner(self) -> SecretHandle {
         self.0
     }
 }
@@ -509,6 +566,53 @@ mod tests {
     use std::collections::HashMap;
     use validator::Validate;
 
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct FormData {
+        age: Option<u32>,
+        username: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct PathPayload {
+        id: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    struct Payload {
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct QueryParams {
+        page: Option<u32>,
+        #[serde(rename = "q")]
+        query_term: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedFormData {
+        #[validate(length(min = 3_u64))]
+        username: String,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, Validate)]
+    struct ValidatedPayload {
+        #[validate(length(min = 1_u64))]
+        name: String,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedPathParams {
+        #[validate(length(min = 1_u64, max = 10_u64))]
+        id: String,
+    }
+
+    #[derive(Debug, Deserialize, Validate)]
+    struct ValidatedQueryParams {
+        #[validate(range(min = 1_u32, max = 100_u32))]
+        page: u32,
+    }
+
     fn ctx(body: Body, params: PathParams) -> RequestContext {
         let request = request_builder()
             .method(Method::POST)
@@ -518,28 +622,32 @@ mod tests {
         RequestContext::new(request, params)
     }
 
+    fn ctx_with_form(body: &str) -> RequestContext {
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body.to_owned()))
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
+    }
+
+    fn ctx_with_query(query: &str) -> RequestContext {
+        let uri = format!("/test?{query}");
+        let request = request_builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        RequestContext::new(request, PathParams::default())
+    }
+
     fn params(values: &[(&str, &str)]) -> PathParams {
         let map = values
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect::<HashMap<_, _>>();
         PathParams::new(map)
-    }
-
-    #[derive(Debug, Deserialize, Serialize, PartialEq)]
-    struct Payload {
-        name: String,
-    }
-
-    #[derive(Debug, Deserialize, Serialize, Validate)]
-    struct ValidatedPayload {
-        #[validate(length(min = 1))]
-        name: String,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct PathPayload {
-        id: String,
     }
 
     #[test]
@@ -564,7 +672,10 @@ mod tests {
 
     #[test]
     fn validated_json_rejects_invalid_payloads() {
-        let body = Body::json(&ValidatedPayload { name: "".into() }).expect("json");
+        let body = Body::json(&ValidatedPayload {
+            name: String::new(),
+        })
+        .expect("json");
         let ctx = ctx(body, PathParams::default());
         let err = block_on(ValidatedJson::<ValidatedPayload>::from_request(&ctx))
             .err()
@@ -587,26 +698,12 @@ mod tests {
             .insert("x-test", HeaderValue::from_static("value"));
         let headers = block_on(Headers::from_request(&ctx)).expect("headers");
         assert_eq!(
-            headers.get("x-test").and_then(|v| v.to_str().ok()).unwrap(),
+            headers
+                .get("x-test")
+                .and_then(|value| value.to_str().ok())
+                .unwrap(),
             "value"
         );
-    }
-
-    // Query extractor tests
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct QueryParams {
-        page: Option<u32>,
-        q: Option<String>,
-    }
-
-    fn ctx_with_query(query: &str) -> RequestContext {
-        let uri = format!("/test?{}", query);
-        let request = request_builder()
-            .method(Method::GET)
-            .uri(uri)
-            .body(Body::empty())
-            .expect("request");
-        RequestContext::new(request, PathParams::default())
     }
 
     #[test]
@@ -614,7 +711,7 @@ mod tests {
         let ctx = ctx_with_query("page=5&q=hello");
         let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
         assert_eq!(query.page, Some(5));
-        assert_eq!(query.q.as_deref(), Some("hello"));
+        assert_eq!(query.query_term.as_deref(), Some("hello"));
     }
 
     #[test]
@@ -622,7 +719,7 @@ mod tests {
         let ctx = ctx_with_query("page=1");
         let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
         assert_eq!(query.page, Some(1));
-        assert_eq!(query.q, None);
+        assert_eq!(query.query_term, None);
     }
 
     #[test]
@@ -635,13 +732,7 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let query = block_on(Query::<QueryParams>::from_request(&ctx)).expect("query");
         assert_eq!(query.page, None);
-        assert_eq!(query.q, None);
-    }
-
-    #[derive(Debug, Deserialize, Validate)]
-    struct ValidatedQueryParams {
-        #[validate(range(min = 1, max = 100))]
-        page: u32,
+        assert_eq!(query.query_term, None);
     }
 
     #[test]
@@ -661,23 +752,6 @@ mod tests {
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    // Form extractor tests
-    fn ctx_with_form(body: &str) -> RequestContext {
-        let request = request_builder()
-            .method(Method::POST)
-            .uri("/test")
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(Body::from(body.to_string()))
-            .expect("request");
-        RequestContext::new(request, PathParams::default())
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct FormData {
-        username: String,
-        age: Option<u32>,
-    }
-
     #[test]
     fn form_extractor_parses_urlencoded_body() {
         let ctx = ctx_with_form("username=alice&age=30");
@@ -694,12 +768,6 @@ mod tests {
         assert_eq!(form.age, None);
     }
 
-    #[derive(Debug, Deserialize, Validate)]
-    struct ValidatedFormData {
-        #[validate(length(min = 3))]
-        username: String,
-    }
-
     #[test]
     fn validated_form_accepts_valid_data() {
         let ctx = ctx_with_form("username=alice");
@@ -714,13 +782,6 @@ mod tests {
             .err()
             .expect("expected validation error");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    // ValidatedPath tests
-    #[derive(Debug, Deserialize, Validate)]
-    struct ValidatedPathParams {
-        #[validate(length(min = 1, max = 10))]
-        id: String,
     }
 
     #[test]
@@ -762,7 +823,7 @@ mod tests {
     fn query_deref_and_into_inner() {
         let query = Query(QueryParams {
             page: Some(1),
-            q: None,
+            query_term: None,
         });
         assert_eq!(query.page, Some(1)); // Deref
         let inner = query.into_inner();
@@ -773,7 +834,7 @@ mod tests {
     fn query_deref_mut() {
         let mut query = Query(QueryParams {
             page: Some(1),
-            q: None,
+            query_term: None,
         });
         query.page = Some(2); // DerefMut
         assert_eq!(query.page, Some(2));
@@ -946,7 +1007,7 @@ mod tests {
 
     #[test]
     fn host_deref_and_into_inner() {
-        let host = Host("example.com".to_string());
+        let host = Host("example.com".to_owned());
         assert_eq!(&*host, "example.com"); // Deref
         let inner = host.into_inner();
         assert_eq!(inner, "example.com");
@@ -1000,7 +1061,7 @@ mod tests {
 
     #[test]
     fn forwarded_host_deref_and_into_inner() {
-        let host = ForwardedHost("example.com".to_string());
+        let host = ForwardedHost("example.com".to_owned());
         assert_eq!(&*host, "example.com"); // Deref
         let inner = host.into_inner();
         assert_eq!(inner, "example.com");
@@ -1023,8 +1084,7 @@ mod tests {
             .insert(KvHandle::new(Arc::new(NoopKvStore)));
 
         let ctx = RequestContext::new(request, PathParams::default());
-        let kv = block_on(Kv::from_request(&ctx));
-        assert!(kv.is_ok());
+        block_on(Kv::from_request(&ctx)).expect("Kv extractor when handle present");
     }
 
     #[test]
@@ -1049,14 +1109,14 @@ mod tests {
         let kv = Kv(handle);
 
         // Debug works
-        let debug = format!("{:?}", kv);
+        let debug = format!("{kv:?}");
         assert!(debug.contains("Kv"));
 
         // Deref works
         let _: &KvHandle = &kv;
 
         // into_inner works
-        let _inner: KvHandle = kv.into_inner();
+        let _inner = kv.into_inner();
     }
 
     // -- Secrets extractor --------------------------------------------------
@@ -1075,8 +1135,7 @@ mod tests {
             .extensions_mut()
             .insert(SecretHandle::new(Arc::new(NoopSecretStore)));
         let ctx = RequestContext::new(request, PathParams::default());
-        let result = block_on(Secrets::from_request(&ctx));
-        assert!(result.is_ok());
+        block_on(Secrets::from_request(&ctx)).expect("Secrets extractor when handle present");
     }
 
     #[test]
