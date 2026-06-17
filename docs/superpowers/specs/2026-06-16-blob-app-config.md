@@ -7,8 +7,8 @@
 
 ## v1 changelog
 
-Initial draft after twenty-two review rounds — one author
-self-review, twenty-one reviewer passes against the current
+Initial draft after twenty-three review rounds — one author
+self-review, twenty-two reviewer passes against the current
 branch's code.
 
 **Self-review (round 1):** canonical-form rules (§4.2), Spin
@@ -1444,6 +1444,69 @@ implementability + phasing for plan-readiness:**
   format docs live in §8.1.1 / §8.1.2 / §8.1.3).
   Both call sites updated to the real subsection
   numbers.
+
+**Reviewer pass (round 23) — phasing honesty + response-
+body test coverage:**
+
+- **§13 phasing honors §10's atomic-cutoff rule.**
+  Round 22 had marked every commit as a "complete
+  slice", but §10.1's no-platform-bridge rule + §10.2's
+  same-commit app-demo migration rule make
+  intermediate cutover commits inherently
+  non-bisectable: a tree with the new runtime but the
+  OLD writer (or vice versa) can't run end-to-end, and
+  the §10.2.1 grep gate would fail in any commit that
+  moves the extractor without migrating app-demo
+  handlers in the same commit. Round-23 reviewer
+  flagged this directly.
+
+  Phasing rewritten into five commits with explicit
+  annotations:
+  - **Complete slice** — bisect-safe.
+  - **Cutover slice** — THE commit that flips the
+    blob model live (new reader + new writer +
+    app-demo migration + grep gate all land
+    together).
+  - **Pre-cutover infrastructure** — adds types /
+    traits with no in-tree caller exercising them
+    yet; behaviour unchanged from `main`.
+  - **Post-cutover additive** — depends on the
+    cutover commit; bisect-safe within the post-
+    cutover range.
+
+  Concrete: Commit A (canonical form), Commit B
+  (bundle of pre-cutover infrastructure: binding +
+  charset + `EnvConfig::store_key` + read trait —
+  none called yet), **Commit C (THE cutover —
+  extractor + push rewrite + app-demo migration +
+  templates + grep gate in one commit)**, Commit D
+  (`config diff` post-cutover), Commit E (docs).
+  Removed the round-22 split of "read trait" and
+  "config push" as separate commits — both fold
+  into Commit C because each one alone leaves an
+  unbisectable intermediate.
+
+- **§12.6.1 added: `kind` strings + `field_path`
+  presence + `Retry-After` policy tests across ALL
+  `EdgeError` variants.** Round-22 test plan only
+  covered the `ConfigOutOfDate` body shape, but
+  §6.3.1 added the `kind: String` field to every
+  variant's response. New §12.6.1 covers:
+  - One fixture per variant asserts
+    `body.error.kind` matches the documented
+    string (table of eight variants).
+  - `field_path` is asserted ABSENT in every
+    non-`ConfigOutOfDate` body (per §6.3.1's
+    "ONLY on `config_out_of_date`" rule).
+  - `Retry-After: 60` asserted PRESENT on
+    `ConfigOutOfDate` and ABSENT on
+    `ServiceUnavailable` (per the §6.3.1 / round-10
+    H-3 narrowing — audit found
+    `ServiceUnavailable` is reused for several
+    non-retryable cases, so the header would
+    mislead clients).
+  - HTTP status codes asserted per the documented
+    variant → status mapping.
 
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
@@ -6328,6 +6391,76 @@ strip or revert the resolution direction:
   fixture). Assert the response carries the
   `Retry-After: 60` header.
 
+#### 12.6.1 `kind` strings on every `EdgeError` variant + header policy (round-23 M-1)
+
+§6.3.1 adds a stable `kind: String` field to the response
+body for EVERY `EdgeError` variant (`bad_request`,
+`internal`, `method_not_allowed`, `not_found`,
+`not_implemented`, `service_unavailable`, `validation`,
+and the new `config_out_of_date`). The earlier test plan
+only asserted the `config_out_of_date` body; this section
+covers the other six and the cross-cutting
+header / field-presence rules so a future refactor can't
+silently drop or rename a `kind` string.
+
+- **Stable `kind` strings.** One fixture per variant
+  that triggers it (e.g. a handler that returns
+  `Err(EdgeError::not_found("…"))` for `not_found`).
+  Render the `Response`. Parse the body as JSON.
+  Assert `body.error.kind` equals the exact string
+  documented in §6.3.1. Variant → expected string:
+
+  | Variant                | Expected `kind` string  |
+  | ---------------------- | ----------------------- |
+  | `BadRequest`           | `"bad_request"`         |
+  | `Internal`             | `"internal"`            |
+  | `MethodNotAllowed`     | `"method_not_allowed"`  |
+  | `NotFound`             | `"not_found"`           |
+  | `NotImplemented`       | `"not_implemented"`     |
+  | `ServiceUnavailable`   | `"service_unavailable"` |
+  | `Validation`           | `"validation"`          |
+  | `ConfigOutOfDate`      | `"config_out_of_date"`  |
+
+- **`field_path` is OMITTED outside `ConfigOutOfDate`.**
+  For each non-`ConfigOutOfDate` variant fixture above,
+  assert `body.error.get("field_path")` is `None` (the
+  field is absent from the JSON, not present with an
+  empty string). Per §6.3.1's "ONLY on
+  `config_out_of_date`" rule.
+
+- **`Retry-After: 60` is PRESENT on `ConfigOutOfDate`
+  ONLY.** Fixture per variant: render the response,
+  assert `response.headers().get("retry-after")`:
+
+  - `ConfigOutOfDate`: `Some("60")`.
+  - `ServiceUnavailable`: `None`. Round-10 H-3 audit
+    found the variant is reused for several
+    non-retryable cases (KV size limit, missing
+    named KV store, missing default secret store);
+    sending the header would mislead clients into a
+    tight retry loop. The §6.3.1 narrowing pins
+    `ServiceUnavailable` to no `Retry-After`.
+  - All other variants: `None`.
+
+- **Status codes match the documented variant → HTTP
+  mapping.** Fixture per variant: assert
+  `response.status()`:
+
+  | Variant                | HTTP status            |
+  | ---------------------- | ---------------------- |
+  | `BadRequest`           | 400                    |
+  | `Internal`             | 500                    |
+  | `MethodNotAllowed`     | 405                    |
+  | `NotFound`             | 404                    |
+  | `NotImplemented`       | 501                    |
+  | `ServiceUnavailable`   | 503                    |
+  | `Validation`           | 422                    |
+  | `ConfigOutOfDate`      | 503                    |
+
+  (The two 503-class variants are deliberately
+  distinguished by the `kind` string + the
+  `Retry-After` header, not the status code.)
+
 ### 12.7 Env-var key override (§5.2)
 
 For each adapter:
@@ -6742,89 +6875,158 @@ skip-on-equal. They're load-bearing parts of the same model
 change.
 
 The PR organises commits by ConcernArea for review readability,
-but ships them together. Round-22 M-2 reviewer flagged earlier
-phasing as not dependency-friendly for a plan: `--key`,
-`diff`, and read-back are load-bearing for skip-on-equal +
-`__KEY`, so splitting them across separate later commits
-makes intermediate slices non-bisectable. The phasing below
-groups dependencies together so each commit is a complete,
-testable review slice; commits that DON'T compile on their
-own are marked explicitly.
+but ships them together. **The cutover from per-leaf reads/writes
+to the blob model lands in ONE commit.** Round-22 attempted to
+mark every commit as a "complete slice"; the round-23 reviewer
+correctly observed that this contradicts §10.1's no-platform-bridge
+rule + §10.2's atomic-app-demo-migration rule. An intermediate
+commit with the new runtime extractor but the OLD per-leaf writer
+(or vice-versa) cannot run end-to-end — there's no blob in the
+store yet for the new reader, OR the new writer's output is
+unreachable by the old reader. Pretending those mid-cutover
+commits are complete slices misleads bisecting reviewers.
 
-Each commit is annotated as either **complete slice** (builds
-+ tests pass on that commit alone) or **incomplete slice — do
-not bisect to this commit** (a structural step that needs the
-next commit to finish a feature). The PR cannot land without
-ALL slices; the annotation just tells reviewers and
-`git bisect` users what to expect.
+Each commit is annotated as one of:
+
+- **Complete slice** — builds + tests pass on this commit
+  alone. Bisect-safe.
+- **Cutover slice** — THE commit that flips the blob model
+  live. End-to-end-testable on its own (the new reader + new
+  writer + app-demo migration land together here).
+- **Pre-cutover infrastructure** — adds new types/traits but
+  no in-tree caller exercises them yet. Builds + tests pass
+  (the new code carries its own unit tests), but the runtime
+  behaviour is unchanged from `main`. Bisect-safe.
+- **Post-cutover additive** — builds on top of the cutover
+  commit; landing it alone (without the cutover) is
+  impossible because it depends on the new types. Bisect-safe
+  once the cutover commit is in the bisect range.
+
+The PR cannot land without ALL six; the annotations tell
+reviewers and `git bisect` users what to expect.
 
 1. **Commit A — Envelope + sha + canonical form
-   (complete slice).** Pure `edgezero-core` work. Adds the
-   `BlobEnvelope` type, `canonical_data_sha256` (the in-tree
-   walker per §4.2 Q1 (b)), the pin test (§4.2), and the
-   unit tests in §12.1.
-2. **Commit B — Manifest store-id charset tightening +
-   `ConfigStoreBinding` + `EnvConfig::store_key`
-   (complete slice).** §5.2 + §5.2.1 + §12.18. Tightens
-   `[stores.*]` ids to `[A-Za-z0-9_]+`; introduces
-   `ConfigStoreBinding { handle, default_key }` on the
-   `ConfigRegistry` value type; adds
-   `EnvConfig::store_key("config", id)` centralised
-   lookup; updates all four adapters'
-   `build_config_registry` to pack the binding. No
-   extractor or CLI changes yet — this is structural so
-   Commit C below can land cleanly. Grouped with B
-   because the extractor reads `binding.default_key`
-   directly; splitting them would force a temporary
-   placeholder key resolution.
-3. **Commit C — `AppConfig<C>` extractor + secret
-   resolution (complete slice).** §3.3. Wires the
-   envelope + binding into the per-adapter
-   `ConfigStore::get` read path. All four adapters'
-   READERS move over; missing-blob maps to
-   `EdgeError::ConfigOutOfDate` per Q3 (d). The
-   §10.2.1 grep gate first runs here (so a regressed
-   handler fails CI as soon as the extractor is
-   available).
-4. **Commit D — `Adapter::read_config_entry` trait +
-   per-adapter impls (complete slice).** §9.0. Read-
-   side parity for `diff` and skip-on-equal. The
-   `ReadConfigEntry::Unsupported` variant for Spin
-   Cloud lands here.
-5. **Commit E — `config push` rewrite + `--key` +
-   inline-diff prompt (complete slice).** §8.2 + §5.4.
-   Single-blob writers per adapter; `--key` override
-   on push (per §5.4 — paired with the `__KEY` runtime
-   override from Commit B so the env path is testable
-   end-to-end); inline-diff prompt uses Commit D's
-   read trait. App-demo migrates in this commit.
-   `--no-diff` / `--yes` / `--dry-run` flags wired
-   per §8.2. The grep gate keeps passing.
-6. **Commit F — `config diff` command +
-   `--exit-code` (complete slice).** §8.1. Adds the
-   diff subcommand reusing the read trait + the
-   diff renderer from Commit E. `--format unified |
+   (complete slice — pre-cutover infrastructure).**
+   Pure `edgezero-core` work. Adds the `BlobEnvelope`
+   type, `canonical_data_sha256` (the in-tree walker
+   per §4.2 Q1 (b)), the pin test (§4.2), and the
+   unit tests in §12.1. No runtime behaviour change;
+   the new types aren't wired anywhere yet.
+
+2. **Commit B — Binding + manifest charset +
+   `EnvConfig::store_key` + read trait
+   (pre-cutover infrastructure).** §5.2 + §5.2.1 +
+   §9.0 + §12.18. Bundles four pieces that share the
+   "add new structure, no in-tree caller exercises
+   it yet" property:
+
+   - Tightens `[stores.*]` ids to `[A-Za-z0-9_]+`
+     (§5.2 / §12.18); manifest validator gains the
+     new error code. Existing in-tree manifests
+     already use underscore-only ids (§10.2's grep
+     recipe verifies), so no in-tree breakage.
+   - Introduces `ConfigStoreBinding { handle,
+     default_key }` on `ConfigRegistry`. `Config::default()`
+     keeps returning `ConfigStoreHandle` (unwraps
+     `binding.handle`) so existing hand-managed
+     callers compile unchanged; the new
+     `default_binding()` accessor is added but no
+     in-tree caller invokes it yet.
+   - Adds `EnvConfig::store_key("config", id)`
+     centralised lookup; the four adapters'
+     `build_config_registry` calls it to pack the
+     binding. Builds clean; the field is unused at
+     runtime because the extractor doesn't read it
+     yet.
+   - Adds `Adapter::read_config_entry` trait + per-
+     adapter impls (including
+     `ReadConfigEntry::Unsupported` for Spin Cloud).
+     No in-tree caller invokes the trait yet.
+
+   Each piece could ship alone; bundling them keeps
+   the cutover commit (C) focused on actual
+   behaviour change.
+
+3. **Commit C — THE ATOMIC CUTOVER (cutover slice).**
+   §3.3 + §8.2 + §10.2 + §10.2.1 + §10.2.2. This is
+   the load-bearing commit; everything it touches has
+   to land together per §10's hard-cutoff rule:
+
+   - `AppConfig<C>` extractor + secret resolution
+     wired into all four adapters' `ConfigStore::get`
+     read path. Missing-blob maps to
+     `EdgeError::ConfigOutOfDate` per Q3 (d).
+   - `config push` rewrite — single-blob writers per
+     adapter (Axum file map / Cloudflare bulk-put /
+     Fastly `--upsert --stdin` / Spin direct-write).
+     `--key` override flag wired here (§5.4 + §3.2.2)
+     so push + the Commit B `__KEY` runtime path are
+     end-to-end testable in this single commit.
+   - `config push` inline-diff prompt + `--no-diff` /
+     `--yes` / `--dry-run` flags (§8.2). Uses the
+     read trait from Commit B.
+   - App-demo migrates (`examples/app-demo/`): the
+     handler files, the source TOML, the per-adapter
+     manifests. Per §10.2's "the same commit"
+     requirement.
+   - Scaffold templates migrate
+     (`crates/edgezero-cli/src/templates/`,
+     `crates/edgezero-adapter-*/src/templates/`). Per
+     §10.2.2.
+   - §10.2.1 grep gate enabled
+     (`scripts/check_no_legacy_typed_reads.sh` runs
+     in CI). It passes because app-demo + scaffold
+     templates are migrated in this same commit.
+
+   Why this is the cutover and not splittable: §10.1
+   forbids the "new runtime, old writer" intermediate
+   state. The runtime extractor expects an envelope;
+   the existing per-leaf writer doesn't produce one;
+   so any commit that lands ONE half leaves
+   intermediate trees that can't run app-demo (no
+   blob for the new reader / the new reader rejects
+   the leaf shape). The grep gate adds another
+   constraint: it would fail in any commit that
+   moves the extractor without migrating app-demo
+   handlers. Landing both halves together is the only
+   path that satisfies §10.
+
+   Acceptance for Commit C alone: `cargo test
+   --workspace` passes; `scripts/smoke_test_config.sh`
+   seeds a blob via `app-demo-cli config push --adapter
+   axum` and the runtime returns the seeded values;
+   §10.2.1 gate passes.
+
+4. **Commit D — `config diff` command (post-cutover
+   additive).** §8.1. Adds the diff subcommand
+   reusing the read trait + the diff renderer from
+   Commit C's push flow. `--format unified |
    structured | json`, `--exit-code` semantics per
    Q10.
-7. **Commit G — Migration guide, smoke scripts,
-   README updates (complete slice).** §10. Updates
-   `docs/`, `scripts/smoke_test_config.sh`, scaffold
-   READMEs.
 
-Removed from the round-21 phasing: a standalone
-"`__KEY` env-var override + `config push --key`"
-commit (Commit F in the old numbering). Both pieces
-now live where they're load-bearing — `__KEY`
-runtime resolution in Commit B (because the binding
-carries it), `--key` push flag in Commit E (because
-push + diff both rely on it).
+5. **Commit E — Migration guide, smoke scripts,
+   README updates (post-cutover additive).** §10
+   migration guide, `scripts/smoke_test_config.sh`
+   updates, scaffold READMEs. Documentation /
+   pipeline polish; landing it alone is impossible
+   (it references Commit C's CLI surface) but it's
+   bisect-safe in the post-C range.
+
+Removed from the round-22 phasing: separate Commits D
+("read trait alone") and E ("config push" alone). Both
+are now folded into Commit C — the read trait gets its
+caller in Commit C, and config push can't ship without
+the runtime extractor accepting the blob it writes.
+Both halves still get full review (the diff is
+inspectable; the PR description points at the
+adapter/extractor pair), but they ship as one commit so
+the bisect line is honest.
 
 Reviewer can read commits in order to follow the
-design from "types + structure" → "extractor" →
-"read trait" → "push + key" → "diff" → "polish".
-The PR cannot land without ALL seven; the reviewer's
-job is to confirm completeness, not to approve a
-subset.
+design from "types" → "infrastructure" → "cutover" →
+"diff" → "docs". The PR cannot land without ALL five;
+the reviewer's job is to confirm completeness, not to
+approve a subset.
 
 ### 13.1 Acceptance gate — no placeholder values in shipped code
 
