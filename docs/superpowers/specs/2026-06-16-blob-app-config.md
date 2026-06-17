@@ -7,8 +7,8 @@
 
 ## v1 changelog
 
-Initial draft after twenty review rounds — one author
-self-review, nineteen reviewer passes against the current
+Initial draft after twenty-one review rounds — one author
+self-review, twenty reviewer passes against the current
 branch's code.
 
 **Self-review (round 1):** canonical-form rules (§4.2), Spin
@@ -1347,6 +1347,42 @@ echo + Spin Cloud CLI surface accuracy:**
   (3) Fermyon Cloud dashboard / HTTP API (out of
   v1 scope). Round-20 reviewer cross-checked
   against the Fermyon command reference.
+
+**Reviewer pass (round 21) — canonicaliser pinned to
+in-tree walker:**
+
+- **Q1 resolved to (b): in-tree hand-rolled
+  walker.** Round-21 reviewer probed
+  `serde_canonical_json` v1.0.0 (the previously
+  surveyed (a) candidate) and found it errors with
+  `Floating point numbers are forbidden` on any
+  finite float. §4.2's numeric-value rules
+  explicitly require finite-`f64` support via
+  `ryu`, so (a) cannot implement the spec unchanged.
+  Q1 marked **resolved to (b)** and §4.2's
+  "Stability across implementations" block
+  rewritten to name the in-tree walker
+  `crates/edgezero-core/src/canonical_form.rs` as
+  the v1 default (no external crate name + version
+  to pin). The walker depends only on `serde_json`
+  + `ryu` + `sha2` — all in-tree already.
+- **§13.1 acceptance gate simplified.** With Q1
+  resolved, the gate no longer needs to accept
+  EITHER an external dep OR an in-tree module —
+  the in-tree module is the only valid form.
+  Rewrote the gate to:
+  1. Refuse the SHA hex placeholder
+     (`…` / `fixed-hex-value`).
+  2. Require the in-tree module file at the
+     documented path.
+  3. Fail loud if a future PR tries to revive
+     `serde_canonical_json` in workspace
+     `Cargo.toml` (defensive — the gate names
+     the Q1 (b) resolution in the error message).
+  The old "exact `=X.Y.Z` pin OR in-tree module"
+  branching is gone; an external dep version pin
+  no longer applies because there is no external
+  dep.
 
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
@@ -3098,46 +3134,57 @@ fn canonical_data_sha256(data: &serde_json::Value) -> String {
 
 **Stability across implementations:**
 
-- The canonical-form implementation crate is pinned to an
-  **exact version** in `[workspace.dependencies]`. The spec
-  intentionally leaves the crate-name + version + pin-hash
-  unfilled here — the IMPLEMENTING PR (per §13) is responsible
-  for picking ONE specific crate version and committing the
-  real expected SHA-256 hex into the spec and the pin test
-  in the same commit. The candidates surveyed during spec
-  authoring were `serde_canonical_json` (matches the rules
-  above mod numeric float rendering) and a hand-rolled
-  ~150-LOC walker over `serde_json::Value` (zero external
-  dep, full control of the float-rendering rule). Either is
-  acceptable; the implementing PR pins one and the
-  envelope's `version: 1` invariant gets its concrete
-  byte-format meaning from that pin. **The placeholder
-  hashes / version strings below MUST be replaced before
-  the implementing PR lands** — leaving them in is a
-  CI-gate violation (§13's acceptance step).
+- **The v1 canonicaliser is a hand-rolled ~150-LOC
+  walker over `serde_json::Value` shipped in
+  `crates/edgezero-core/src/canonical_form.rs` (or
+  `.../canonical_form/mod.rs`).** No external
+  canonicaliser crate. Round-21 reviewer ran a probe
+  against `serde_canonical_json` v1.0.0 and found it
+  REJECTS finite floats (`Floating point numbers are
+  forbidden`); the §4.2 rules explicitly support
+  finite `f64` via `ryu` (see "Numeric values" above),
+  so the external crate cannot implement this spec
+  unchanged. Earlier drafts left the external-vs-
+  hand-rolled choice open to the implementing PR;
+  round-21 pins it to hand-rolled because the
+  candidate external crate is incompatible AND
+  because the hand-rolled walker is short enough
+  (~150 LOC) that the "zero external dep, full
+  control of the float-rendering rule" trade-off wins
+  on its own.
 
   Concrete acceptance criteria for the implementing PR:
 
-  1. EITHER the `[workspace.dependencies]` entry for the
-     canonicaliser pins an exact `=X.Y.Z` (external-crate
-     option), with NO placeholder, OR a hand-rolled
-     module lives at `crates/edgezero-core/src/canonical_form.rs`
-     (or `crates/edgezero-core/src/canonical_form/mod.rs`) —
-     the §13.1 acceptance gate accepts either form. The
-     in-tree path is fixed (the gate has to know where to
-     look) but the implementer picks which of the two
-     options ships.
+  1. The hand-rolled module
+     `crates/edgezero-core/src/canonical_form.rs` (or
+     `.../canonical_form/mod.rs`) exists and exposes
+     `canonical_data_sha256(&serde_json::Value) ->
+     String` matching the §4.2 rules. It depends only
+     on `serde_json` (already in-tree), `ryu` (for
+     finite-float rendering — round-trippable
+     shortest form), and `sha2`.
   2. `canonical_form_pins.rs` test asserts a real
-     64-character hex SHA against the fixture below; the
-     `5d4a0e7f…fixed-hex-value…b9` placeholder is
+     64-character hex SHA against the fixture below;
+     the `5d4a0e7f…fixed-hex-value…b9` placeholder is
      replaced with the actual computed hex.
-  3. A short note in the test file's doc-comment
-     identifies the pinned crate name + version so a
-     future bump request can compare.
+  3. The test file's doc-comment identifies the
+     module as the in-tree v1 canonicaliser (no
+     external crate name to record).
 
-  Patch-version bumps after that pin go through code
-  review (not Dependabot auto-merge) because they change
-  the hash space.
+  Patch-level changes to `ryu` go through code review
+  (not Dependabot auto-merge) because they change the
+  hash space. The walker itself is in-tree, so its
+  behaviour is governed by the repo's code-review
+  process directly.
+
+  Earlier draft surveyed `serde_canonical_json` as a
+  candidate external crate. That candidate is
+  excluded by §4.2's finite-float rule (the crate's
+  `to_string` errors on any finite float). A future
+  external crate that matches §4.2's float rendering
+  could replace the hand-rolled walker behind the
+  same `canonical_data_sha256` signature; until then
+  the in-tree walker is the v1 contract.
 
 - A `canonical_form_pins.rs` test in `edgezero-core` hashes a
   fixed `serde_json::Value` fixture and asserts the hex output
@@ -5663,14 +5710,28 @@ These are decisions I've punted to the reviewer. Each has a
 default I'd ship if the reviewer doesn't redirect — flagged with
 **default:**.
 
-### Q1. SHA-canonicalisation dependency
+### Q1. SHA-canonicalisation dependency — resolved
 
 The canonical form needs stable key ordering for JSON serialisation.
 
-- (a) Pull in `serde_canonical_json` (small crate, ~200 LOC).
-- (b) Write our own canonicaliser (~50 LOC, no new dep).
-- **default:** (a). The dep is small and the spec is publicly
-  documented (JCS-style); rolling our own buys nothing.
+- (a) Pull in `serde_canonical_json`.
+- (b) Write our own canonicaliser (~150 LOC, no new
+  external dep beyond what's in-tree).
+- **Resolved: (b).** Round-21 reviewer probed
+  `serde_canonical_json` v1.0.0 and found it rejects
+  finite floats (`Floating point numbers are
+  forbidden`). §4.2 explicitly requires finite-float
+  support via `ryu` (per the "Numeric values" rule),
+  so (a) cannot implement this spec unchanged. The
+  hand-rolled walker at
+  `crates/edgezero-core/src/canonical_form.rs` is the
+  v1 default — see §4.2's "Stability across
+  implementations" block for the concrete acceptance
+  criteria. Earlier drafts of the spec left this
+  question open; round-21 pinned it to (b) because
+  (a) is incompatible AND the in-tree walker is
+  short enough (~150 LOC) that no external dep is
+  cheaper to maintain.
 
 ### Q2. Diff format
 
@@ -6597,17 +6658,21 @@ completeness, not to approve a subset.
 
 ### 13.1 Acceptance gate — no placeholder values in shipped code
 
-The spec leaves two values intentionally unfilled because
-they depend on the implementing PR's pin decisions:
+The spec leaves one value intentionally unfilled because it
+depends on the implementing PR's actual hashing:
 
-- The canonicaliser crate name + version in
-  `[workspace.dependencies]` (§4.2).
 - The 64-character SHA hex in `canonical_form_pin_v1`
   (§4.2).
 
+(Round-21 Q1 resolution: the canonicaliser is the in-tree
+hand-rolled walker at
+`crates/edgezero-core/src/canonical_form.rs`; there is
+no external crate name + version pin to enforce.)
+
 A CI gate `scripts/check_no_placeholder_pins.sh` runs on
-every PR and greps the canonicaliser pin test file for
-the placeholder markers. The gate is short:
+every PR. It greps the canonicaliser pin test file for
+placeholder markers AND confirms the in-tree walker
+module exists. The gate is short:
 
 ```sh
 #!/usr/bin/env bash
@@ -6615,64 +6680,49 @@ set -euo pipefail
 
 FILE="crates/edgezero-core/tests/canonical_form_pins.rs"
 if [ ! -f "$FILE" ]; then
-  echo "ERROR: $FILE missing — implementing PR didn't write the pin test."
+  echo "ERROR: $FILE missing — implementing PR didn't write the pin test." >&2
   exit 1
 fi
 
-if grep -qE '(…|fixed-hex-value|X\.Y\.Z)' "$FILE"; then
-  echo "ERROR: $FILE still contains placeholder markers" \
-       "(' …', 'fixed-hex-value', or 'X.Y.Z')." >&2
-  echo "Replace each with the real pinned value before merge." >&2
+if grep -qE '(…|fixed-hex-value)' "$FILE"; then
+  echo "ERROR: $FILE still contains placeholder markers" >&2
+  echo "('…' or 'fixed-hex-value'). Replace with the real computed hex." >&2
   exit 1
 fi
 
-# Canonicaliser pin — accept EITHER a workspace dependency
-# (external crate option from §4.2) OR an in-tree hand-rolled
-# module (the second §4.2 option). The check is satisfied by
-# at least one of:
-#
-#   - A `[workspace.dependencies]` entry whose key matches
-#     a known canonicaliser crate name (without the `X.Y.Z`
-#     placeholder version), OR
-#
-#   - The hand-rolled module file at the documented path
-#     `crates/edgezero-core/src/canonical_form.rs` (or
-#     `.../canonical_form/mod.rs`), which the implementing
-#     PR creates when picking the hand-rolled option.
-#
-# The implementing PR picks ONE of the two; the gate accepts
-# either.
-canonicaliser_dep_present=0
-canonicaliser_inhouse_present=0
-
-if grep -qE '^(serde_canonical_json|canonical_form|canonicaliser)' \
-     Cargo.toml 2>/dev/null; then
-  # If the dep is named, also verify it's NOT the X.Y.Z placeholder.
-  if grep -E '^(serde_canonical_json|canonical_form|canonicaliser)' \
-       Cargo.toml | grep -q 'X\.Y\.Z'; then
-    echo "ERROR: canonicaliser dep version is the placeholder 'X.Y.Z'." >&2
-    exit 1
-  fi
-  canonicaliser_dep_present=1
-fi
-
-if [ -f crates/edgezero-core/src/canonical_form.rs ] \
-   || [ -f crates/edgezero-core/src/canonical_form/mod.rs ]; then
-  canonicaliser_inhouse_present=1
-fi
-
-if [ "$canonicaliser_dep_present" -eq 0 ] \
-   && [ "$canonicaliser_inhouse_present" -eq 0 ]; then
-  echo "ERROR: neither a canonicaliser workspace dependency NOR an" >&2
-  echo "in-tree canonical_form module was found. §4.2 requires one." >&2
+# Canonicaliser is in-tree (Q1 (b), §4.2). Confirm the
+# module exists at one of the documented paths. The path
+# is fixed so the gate can find it; the implementer does
+# NOT choose between an external crate and the walker —
+# §4.2's Stability section pins the in-tree walker as
+# the v1 default.
+if [ ! -f crates/edgezero-core/src/canonical_form.rs ] \
+   && [ ! -f crates/edgezero-core/src/canonical_form/mod.rs ]; then
+  echo "ERROR: in-tree canonicaliser module missing. §4.2 requires" >&2
+  echo "crates/edgezero-core/src/canonical_form.rs (or .../mod.rs)." >&2
   exit 1
 fi
 
-echo "OK: no placeholder pins remain."
+# Defensive: an `serde_canonical_json` line in workspace
+# Cargo.toml almost certainly means someone tried to
+# revive the rejected (a) candidate. Q1's resolution
+# explicitly excludes it (probe at v1.0.0 rejected
+# finite floats). Fail loud rather than silently
+# accepting a hybrid.
+if grep -qE '^serde_canonical_json' Cargo.toml 2>/dev/null; then
+  echo "ERROR: serde_canonical_json appears in workspace Cargo.toml." >&2
+  echo "Q1 (b) resolution excludes it — the crate rejects finite floats." >&2
+  echo "Remove the entry; the in-tree walker is the v1 canonicaliser." >&2
+  exit 1
+fi
+
+echo "OK: no placeholder pins remain; canonicaliser is in-tree."
 ```
 
 Wired into `.github/workflows/test.yml` as a step before
 `cargo test`. The gate's purpose is to prevent the spec's
-intentional placeholders from surviving into shipped code
-— a real CI failure is better than a silent merge that
-makes the §4.2 byte-format contract un-testable.
+intentional placeholder (the SHA hex) from surviving into
+shipped code AND to fail loud if a future PR tries to
+revive the rejected `serde_canonical_json` candidate. A
+real CI failure beats a silent merge that makes the §4.2
+byte-format contract un-testable.
