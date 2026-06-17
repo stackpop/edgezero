@@ -1502,6 +1502,33 @@ ConfigStoreBinding {
 Run: `cargo check --workspace --all-targets`
 Expected: clean.
 
+- [ ] **Step 5: Per-adapter `default_key` resolution tests (round-29 M-1).** Each adapter has its own request-context builder; the env-var path needs a test PER adapter to prove the resolved `default_key` actually lands in the binding. Without this, the `EnvConfig::store_key` unit test passes but a regression in an adapter's `build_config_registry` (forgetting to pass `default_key`, falling back to `id.to_owned()`, etc.) would be undetected.
+
+Add one test per adapter under each adapter's existing test module (Axum: `crates/edgezero-adapter-axum/src/request.rs`'s `mod tests`; Cloudflare / Fastly / Spin equivalents):
+
+```rust
+    #[test]
+    fn build_config_registry_packs_resolved_default_key_from_env() {
+        let env = EnvConfig::from_vars([
+            ("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "app_config_staging"),
+        ]);
+        let manifest = manifest_with_config_id("app_config");  // adapter-specific helper
+        let registry = build_config_registry(&manifest, &env, /* adapter-specific args */);
+        let binding = registry.default_ref().expect("binding registered");
+        assert_eq!(binding.default_key, "app_config_staging");
+    }
+
+    #[test]
+    fn build_config_registry_falls_back_to_id_when_env_unset() {
+        let env = EnvConfig::from_vars(std::iter::empty::<(&str, &str)>());
+        let manifest = manifest_with_config_id("app_config");
+        let registry = build_config_registry(&manifest, &env, ...);
+        assert_eq!(registry.default_ref().unwrap().default_key, "app_config");
+    }
+```
+
+These four pairs of tests give §12.7 (env-var key override per adapter) concrete coverage. The earlier "Axum smoke script" mention in E2 stays as the end-to-end behaviour check, but doesn't substitute for the unit-level invariant test the spec asks for at "Set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging` … assert the runtime extractor returns the staging blob's values".
+
 ## Task B8 — `Config` extractor binding accessors + `RequestContext` helpers
 
 **Files:**
@@ -1966,7 +1993,86 @@ For non-Spin adapters:
     }
 ```
 
-For Spin (`crates/edgezero-adapter-spin/src/cli.rs:363`), translate the existing loop from `(field_name, value)` to `entry.field_name` / `entry.key_value`. The store-id-filter is `entry.store_id == "spin"` if we want strict matching; in v1 keep the current behaviour (check all entries) for parity.
+For Spin (`crates/edgezero-adapter-spin/src/cli.rs:363`), translate the existing loop AND replace the `HashSet<String>` collision tracker with a `HashMap<String, &str>` so the collision error message can name BOTH colliding field names per spec §12.16:
+
+```rust
+fn validate_typed_secrets(
+    &self,
+    entries: &[TypedSecretEntry<'_>],
+) -> Result<(), String> {
+    use std::collections::HashMap;
+    // Map lowercased-Spin-variable → original field name. When a
+    // second entry collapses to the same name, the existing entry
+    // tells us which field already claimed it.
+    let mut seen: HashMap<String, &str> = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let spin_var = entry.key_value.to_ascii_lowercase();
+        if !is_valid_spin_key(&spin_var) {
+            let reason = spin_key_rule_violation(&spin_var);
+            return Err(format!(
+                "`#[secret]` field `{field}` value `{value}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Pick a `#[secret]` value that conforms.",
+                field = entry.field_name,
+                value = entry.key_value,
+            ));
+        }
+        if let Some(prev_field) = seen.insert(spin_var.clone(), entry.field_name) {
+            return Err(format!(
+                "Spin variable `{spin_var}` would receive values from BOTH `#[secret]` field `{prev_field}` AND `#[secret]` field `{this_field}`; Spin's flat variable namespace cannot disambiguate them. Pick distinct `#[secret]` values whose lowercased forms differ.",
+                this_field = entry.field_name,
+            ));
+        }
+    }
+    Ok(())
+}
+```
+
+The store-id filter (`entry.store_id == "spin"`) is NOT applied in v1 — current behaviour checks all entries; preserve that.
+
+Tests for §12.16 (round-29 M-2). Add three fixtures under the Spin adapter's existing test module:
+
+```rust
+    #[test]
+    fn collision_error_names_both_field_names_and_lowercased_variable() {
+        // §12.16 case (b): KeyInDefault and KeyInNamedStore that
+        // collide on the lowercased Spin variable.
+        let entries = [
+            TypedSecretEntry::new("default", "one", "Demo_Token"),
+            TypedSecretEntry::new("vault",   "two", "demo_token"),
+        ];
+        let err = SpinAdapter.validate_typed_secrets(&entries).unwrap_err();
+        assert!(err.contains("`one`"), "{err}");
+        assert!(err.contains("`two`"), "{err}");
+        assert!(err.contains("demo_token"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_spin_variable_name_with_hyphen() {
+        // §12.16 case (a): KeyInNamedStore value contains a hyphen,
+        // which is not a valid Spin variable name.
+        let entries = [
+            TypedSecretEntry::new("vault", "api_token", "demo-token"),
+        ];
+        let err = SpinAdapter.validate_typed_secrets(&entries).unwrap_err();
+        assert!(err.contains("`api_token`"));
+        assert!(err.contains("demo-token"));
+        assert!(err.to_lowercase().contains("hyphen") || err.contains("not a valid"));
+    }
+
+    #[test]
+    fn non_spin_adapter_is_exempt_from_collision_check() {
+        // §12.16 case (c): same collision fixture against a manifest
+        // declaring only [adapters.axum] — covered by run_adapter_
+        // typed_checks NOT calling SpinAdapter at all. This is more
+        // naturally a CLI-level integration test, but the adapter
+        // unit test asserts that AxumAdapter::validate_typed_secrets
+        // returns Ok(()) on the same input.
+        let entries = [
+            TypedSecretEntry::new("default", "one", "Demo_Token"),
+            TypedSecretEntry::new("vault",   "two", "demo_token"),
+        ];
+        assert!(AxumAdapter.validate_typed_secrets(&entries).is_ok());
+    }
+```
 
 - [ ] **Step 4: Update the caller in `crates/edgezero-cli/src/config.rs::run_adapter_typed_checks`.**
 
@@ -2265,10 +2371,24 @@ fn read_config_entry(
         )),
         Some(runtime_config::KeyValueBackend::Spin { path }) | None => {
             // Branch 4 (default) or branch 3 → SQLite-direct read.
-            let sqlite_path = path
-                .as_deref()
-                .map(|p| spin_manifest_dir.join(p))
-                .unwrap_or_else(|| spin_manifest_dir.join(".spin").join("sqlite_key_value.db"));
+            // Reuse the WRITER's existing path resolver so the read and
+            // write paths agree exactly for the common edge case of a
+            // relative `path = "x.db"` in a `runtime-config.toml` that
+            // lives in a different directory than the Spin manifest.
+            // Round-28 H-1 sketched `spin_manifest_dir.join(p)`, which
+            // diverges from writer behaviour at
+            // `crates/edgezero-adapter-spin/src/cli/push_sqlite.rs:97`
+            // (the writer anchors relative paths against the
+            // RUNTIME-CONFIG file's directory, not the Spin manifest
+            // directory). Round-29 H-1 reviewer caught the mismatch.
+            let runtime_config_dir = runtime_config_path
+                .parent()
+                .unwrap_or(spin_manifest_dir);
+            let sqlite_path = push_sqlite::resolve_sqlite_path(
+                spin_manifest_dir,
+                runtime_config_dir,
+                path.as_deref(),
+            );
             read_sqlite(&sqlite_path, platform, key)
         }
     }
@@ -2303,7 +2423,13 @@ fn read_sqlite(sqlite_path: &Path, store: &str, key: &str) -> Result<ReadConfigE
 
 This branch logic is intentionally large because spec §9.0 says "read-back uses the same variant as the write path" — silently collapsing all four into "SQLite or Unsupported" would leave Redis/Azure operators with a confusing diff error and would not detect the Fermyon Cloud branch correctly.
 
-- [ ] **Step 5: Add unit tests for each adapter.** For shell-out adapters, mock with a test scaffold that uses a fake `wrangler` / `fastly` script on PATH. For Axum, write a temp file and assert directly. For Spin, exercise each of the four branches with a fixture `runtime-config.toml`.
+- [ ] **Step 5: Add unit tests for each adapter.** For shell-out adapters, mock with a test scaffold that uses a fake `wrangler` / `fastly` script on PATH. For Axum, write a temp file and assert directly. For Spin, exercise each of the four branches with a fixture `runtime-config.toml`. Spin fixtures MUST include the round-29 H-1 path-resolution case:
+
+- **Spin SQLite path resolves against runtime-config dir, not manifest dir.** Fixture: place `spin.toml` at `<tmp>/spin/spin.toml`; place `runtime-config.toml` at `<tmp>/cfg/runtime-config.toml` (a DIFFERENT directory) with `[key_value_store.<label>] type = "spin"`, `path = "session.db"`. Invoke `read_config_entry` with `push_ctx.runtime_config_path = <tmp>/cfg/runtime-config.toml`. Assert the SQLite path resolved to `<tmp>/cfg/session.db` (anchored against the runtime-config file's dir), NOT `<tmp>/spin/session.db`. This proves the writer and read paths agree exactly via the shared `push_sqlite::resolve_sqlite_path` helper.
+
+- **Spin SQLite default path falls back to manifest dir.** Same fixture as above but with NO `path` set on the backend. Assert the SQLite path resolves to `<tmp>/spin/.spin/sqlite_key_value.db` (the writer's default at `push_sqlite.rs:108`).
+
+- **Spin SQLite absolute path is honoured.** Fixture with `path = "/var/lib/myapp/store.db"`. Assert that exact path comes back regardless of any directory.
 
 - [ ] **Step 6: Run.**
 
@@ -3125,11 +3251,19 @@ Expected: pass.
 
 ```toml
 [features]
-nested-app-config-check = ["dep:syn", "dep:walkdir"]
+nested-app-config-check = ["dep:syn", "dep:walkdir", "dep:proc-macro2"]
 
 [dependencies]
 syn = { version = "2", features = ["full", "extra-traits", "visit"], optional = true }
 walkdir = { workspace = true, optional = true }
+# proc-macro2's `span-locations` feature exposes line/column on every
+# Span, which the helper consumes to print `<file>:<line>:<field>`
+# violation lines per spec §10.2.1. Without it, `Span::start()` returns
+# `LineColumn { line: 0, column: 0 }` and the violation messages have
+# no useful anchor — defeating the "implementer can jump to the
+# offending field" property the gate promises. Round-29 M-3 reviewer
+# caught the missing feature.
+proc-macro2 = { version = "1", features = ["span-locations"], optional = true }
 
 [[bin]]
 name = "check_no_nested_app_config"
@@ -3522,7 +3656,7 @@ Mapping spec §s → tasks:
 | §12.3 (per-adapter end-to-end)                  | C2 (writers) + E2 (smoke)                 |
 | §12.4 (migration)                               | E1 (docs)                                 |
 | §12.5 (secret-field model)                      | C1 (extractor tests)                      |
-| §12.7 (env-var key override)                    | B7 (per-key tests) + E2                   |
+| §12.7 (env-var key override)                    | B7 Step 3 (EnvConfig::store_key unit tests) + B7 Step 5 (per-adapter request-context-builder tests proving each adapter packs `default_key` from env) + E2 (end-to-end smoke) |
 | §12.8 (raw-binary stub)                         | C3                                        |
 | §12.9 (downstream CLI wiring)                   | C6 (Push + Validate template wiring) + D2 (Diff template wiring per round-26 phasing carve-out) |
 | §12.10 (Spin Cloud cap)                         | C2 (Spin Cloud writer)                    |

@@ -3402,8 +3402,18 @@ String` matching the §4.2 rules. It depends only
   ```rust
   #[test]
   fn canonical_form_pin_v1() {
+      // Fixture deliberately exercises every §4.2 escape-table branch:
+      // - "héllo"               → multi-byte UTF-8, no escape
+      // - "tab\there"            → \t named escape
+      // - "quote\"backslash\\"   → \" + \\ named escapes
+      // - "newline\nhere"        → \n named escape
+      // - "\u{0001}"             →  generic-control branch
       let data = json!({
-          "greeting": "héllo",        // verbatim bytes; NFC vs NFD encodings hash differently per §4.2
+          "greeting": "héllo",
+          "tab": "tab\there",
+          "quote_backslash": "quote\"backslash\\",
+          "newline": "newline\nhere",
+          "control_char": "\u{0001}",
           "feature": { "new_checkout": true },
           "service": { "timeout_ms": 1500 },
           "ratio": 1.5,
