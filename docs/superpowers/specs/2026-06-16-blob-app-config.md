@@ -1,15 +1,17 @@
 # Blob App Config — Design Spec
 
 **Date:** 2026-06-16
-**Status:** v1 — Draft, pending first review
+**Status:** v1 — Plan-ready (twenty-three reviewer passes complete; reviewer cleared for plan authoring at round 24)
 **Author:** Aram Grigoryan
 **Related branches:** `feature/extensible-cli` (current baseline)
 
 ## v1 changelog
 
-Initial draft after twenty-three review rounds — one author
-self-review, twenty-two reviewer passes against the current
-branch's code.
+Initial draft after twenty-four review rounds — one author
+self-review, twenty-three reviewer passes against the current
+branch's code. Round 24 cleared the spec for plan authoring;
+only doc-hygiene items remained (stale commit counts + the
+Status header).
 
 **Self-review (round 1):** canonical-form rules (§4.2), Spin
 Cloud size/exposure trade-off (§9.4 + Q12), orphan stance
@@ -29,7 +31,8 @@ become stub-pointer subcommands that exit with a typed-CLI
 pointer (round-8 fix); generated downstream CLIs with `C`
 are the real entry point (§3.2.1); `Adapter`
 trait gains `read_config_entry` (§9.0); scope and phasing
-reconciled — one PR, seven commits, atomic landing, no
+reconciled — one PR, five commits (round-23 collapse from
+the earlier seven-commit plan), atomic landing, no
 minimum-cut split (§13); errors use the existing
 `ConfigStoreError::{Internal, InvalidKey, Unavailable}`
 variants with an explicit mapping table to `EdgeError` (§6.3,
@@ -1507,6 +1510,30 @@ body test coverage:**
     mislead clients).
   - HTTP status codes asserted per the documented
     variant → status mapping.
+
+**Reviewer pass (round 24) — doc hygiene; spec cleared
+for plan authoring:**
+
+- **Stale commit counts in §13 + §1 changelog
+  reconciled.** Round-23 collapsed the phasing from
+  seven commits into five, but three call sites still
+  said "ALL six" / "seven commits" / "Stages A-C / D-F":
+  - §13 "land Stages A-C now, do D-F later" rewritten
+    to "land Commits A-B now, do C-E later" (matches
+    the five-commit shape).
+  - §13 "PR cannot land without ALL six" → "ALL five
+    (Commits A–E)" with the explicit lettering.
+  - §1 round-2 changelog reference "one PR, seven
+    commits" updated to "five commits (round-23
+    collapse from the earlier seven-commit plan)" so
+    readers walking the v1 changelog don't trip over
+    the stale number.
+- **Status header updated.** Was "v1 — Draft, pending
+  first review"; the spec has had 23 reviewer passes
+  and round 24 cleared it for plan authoring. Header
+  now reads "v1 — Plan-ready (twenty-three reviewer
+  passes complete; reviewer cleared for plan
+  authoring at round 24)".
 
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
@@ -6867,7 +6894,7 @@ override is exportable from a POSIX shell. Tests assert:
 **One PR, atomic landing.** The blob model is a hard cutoff (§10):
 the runtime stops reading the per-leaf shape AT THE SAME COMMIT
 that the writer stops writing it AND the in-tree consumers move
-over. There is no "land Stages A-C now, do D-F later" path —
+over. There is no "land Commits A-B now, do C-E later" path —
 without `config push --key`, the `__KEY` runtime override is
 useless; without the diff command, the push UX regresses below
 what we ship today; without the read-back trait, push can't
@@ -6902,8 +6929,9 @@ Each commit is annotated as one of:
   impossible because it depends on the new types. Bisect-safe
   once the cutover commit is in the bisect range.
 
-The PR cannot land without ALL six; the annotations tell
-reviewers and `git bisect` users what to expect.
+The PR cannot land without ALL five (Commits A–E); the
+annotations tell reviewers and `git bisect` users what to
+expect.
 
 1. **Commit A — Envelope + sha + canonical form
    (complete slice — pre-cutover infrastructure).**
