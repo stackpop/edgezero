@@ -27,13 +27,13 @@
 
 ## Plan structure (mirrors spec §13)
 
-| Phase | Spec §  | Commit type             | Acceptance                                                                                                                            |
-| ----- | ------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| A     | §4      | Pre-cutover infra       | Canonical form + envelope + non-finite-float check ship in `edgezero-core`. No in-tree caller exercises them yet. Bisect-safe.        |
-| B     | §3, §5, §6.3, §9.0 | Pre-cutover infra       | `ConfigStoreBinding`, `EnvConfig::store_key`, manifest charset, `EdgeError::ConfigOutOfDate`, derive-macro extensions, read trait + per-adapter impls. None called yet. Bisect-safe. |
-| C     | §3.3, §8.2, §10.2, §10.2.1, §10.2.2 | **CUTOVER (not splittable)** | `AppConfig<C>` extractor + `config push` rewrite + app-demo migration + scaffold templates + all three CI gates land together. Spec §10.1 forbids splitting. |
-| D     | §8.1    | Post-cutover additive   | `config diff` command, format renderers, `--exit-code`. Depends on Phase C's read flow + writers.                                     |
-| E     | §10 narrative | Post-cutover docs       | Migration guide, smoke scripts, README updates.                                                                                       |
+| Phase | Spec §                              | Commit type                  | Acceptance                                                                                                                                                                           |
+| ----- | ----------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A     | §4                                  | Pre-cutover infra            | Canonical form + envelope + non-finite-float check ship in `edgezero-core`. No in-tree caller exercises them yet. Bisect-safe.                                                       |
+| B     | §3, §5, §6.3, §9.0                  | Pre-cutover infra            | `ConfigStoreBinding`, `EnvConfig::store_key`, manifest charset, `EdgeError::ConfigOutOfDate`, derive-macro extensions, read trait + per-adapter impls. None called yet. Bisect-safe. |
+| C     | §3.3, §8.2, §10.2, §10.2.1, §10.2.2 | **CUTOVER (not splittable)** | `AppConfig<C>` extractor + `config push` rewrite + app-demo migration + scaffold templates + all three CI gates land together. Spec §10.1 forbids splitting.                         |
+| D     | §8.1                                | Post-cutover additive        | `config diff` command, format renderers, `--exit-code`. Depends on Phase C's read flow + writers.                                                                                    |
+| E     | §10 narrative                       | Post-cutover docs            | Migration guide, smoke scripts, README updates.                                                                                                                                      |
 
 ---
 
@@ -44,9 +44,11 @@
 ## Task A1 — Add `ryu`, `sha2`, `serde_path_to_error` workspace deps
 
 **Files:**
+
 - Modify: `Cargo.toml` (root workspace) — add three entries to `[workspace.dependencies]`.
 
 **Interfaces:**
+
 - Produces: workspace deps `ryu`, `sha2`, `serde_path_to_error` available to per-crate Cargo.toml entries via `{ workspace = true }`.
 
 - [ ] **Step 1: Inspect current `[workspace.dependencies]` block to find the alphabetical insertion point.**
@@ -84,11 +86,13 @@ Expected: builds successfully; new deps are resolved into `Cargo.lock` but not p
 ## Task A2 — `canonical_form` module skeleton + finite-float walker
 
 **Files:**
+
 - Create: `crates/edgezero-core/src/canonical_form.rs`
 - Modify: `crates/edgezero-core/src/lib.rs` — add `pub mod canonical_form;`
 - Modify: `crates/edgezero-core/Cargo.toml` — add `ryu = { workspace = true }` and `sha2 = { workspace = true }`
 
 **Interfaces:**
+
 - Produces: `edgezero_core::canonical_form::canonical_data_sha256(&serde_json::Value) -> String` — lowercase 64-char hex SHA-256 of the canonical form per spec §4.2.
 
 - [ ] **Step 1: Add deps to `crates/edgezero-core/Cargo.toml`.**
@@ -310,9 +314,11 @@ Expected: 4 passes, 0 failures.
 ## Task A3 — Canonical-form pin test fixture
 
 **Files:**
+
 - Create: `crates/edgezero-core/tests/canonical_form_pins.rs`
 
 **Interfaces:**
+
 - Produces: integration test asserting `canonical_data_sha256` against a frozen fixture. The placeholder hex IS allowed at this stage; the §13.1 acceptance gate (Task C7's `scripts/check_no_placeholder_pins.sh`) flags it for replacement in the implementing PR before merge.
 
 - [ ] **Step 1: Write the pin test with a placeholder hex.**
@@ -363,17 +369,19 @@ Expected: PASS.
 ## Task A4 — `BlobEnvelope` type + serde
 
 **Files:**
+
 - Create: `crates/edgezero-core/src/blob_envelope.rs`
 - Modify: `crates/edgezero-core/src/lib.rs` — add `pub mod blob_envelope;`
 
 **Interfaces:**
+
 - Produces: `edgezero_core::blob_envelope::BlobEnvelope { data: serde_json::Value, sha256: String, version: u32, generated_at: String }`. Public methods: `verify(&self) -> Result<(), BlobEnvelopeError>`, `into_data(self) -> serde_json::Value`, and `new(data: serde_json::Value, generated_at: String) -> Self`.
 
 - [ ] **Step 1: Write failing test fixtures for the envelope shape.**
 
 Append to `crates/edgezero-core/src/blob_envelope.rs` (create the file with this content):
 
-```rust
+````rust
 //! Versioned envelope wrapping the canonical-form `data` blob.
 //!
 //! Shape per spec §4.1:
@@ -477,7 +485,7 @@ mod tests {
         parsed.verify().unwrap();
     }
 }
-```
+````
 
 - [ ] **Step 2: Add `pub mod blob_envelope;` to `crates/edgezero-core/src/lib.rs`.**
 
@@ -495,9 +503,11 @@ Expected: 4 passes.
 ## Task A5 — `AppConfigError::InvalidValue` variant + non-finite-float rejection
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/app_config.rs` (add variant near line 90; add walker + env-overlay check; add tests).
 
 **Interfaces:**
+
 - Produces: new variant `AppConfigError::InvalidValue { path: PathBuf, field_path: String, message: String }`. Both load paths (TOML walk + env overlay) raise this when a non-finite float is detected. Existing call sites of `load_app_config*` are unaffected (no breaking change to the public signature).
 
 - [ ] **Step 1: Add the new variant to `AppConfigError`.**
@@ -693,9 +703,11 @@ Expected: all pre-existing tests still pass.
 ## Task A6 — `deserialize_app_config_with_options` entry points + Phase A commit
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/app_config.rs` — add two new top-level functions exposing the deserialise-only path.
 
 **Interfaces:**
+
 - Produces:
   - `pub fn deserialize_app_config<C>(path: &Path, app_name: &str) -> Result<C, AppConfigError> where C: DeserializeOwned + AppConfigMeta`
   - `pub fn deserialize_app_config_with_options<C>(path: &Path, app_name: &str, opts: &AppConfigLoadOptions) -> Result<C, AppConfigError> where C: DeserializeOwned + AppConfigMeta`
@@ -845,9 +857,11 @@ Each task ends with `cargo test --workspace` passing on the commit boundary. Pha
 ## Task B1 — Manifest store-id charset tightening + tests
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/manifest.rs` (the validator at the cited line ~880; tighten character class).
 
 **Interfaces:**
+
 - Produces: tighter `[stores.*]` id validation. Hyphens now rejected with a clear message naming the `EDGEZERO__STORES__<KIND>__<ID>__KEY` export constraint.
 
 - [ ] **Step 1: Write a failing test asserting hyphen rejection.**
@@ -957,10 +971,12 @@ Expected: 3 new tests pass.
 ## Task B2 — `EdgeError::ConfigOutOfDate` variant + two constructors
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/error.rs` (add variant + constructors).
 - Modify: `crates/edgezero-core/Cargo.toml` — add `serde_path_to_error = { workspace = true }`.
 
 **Interfaces:**
+
 - Produces:
   - `EdgeError::ConfigOutOfDate { message: String, field_path: String }`
   - `EdgeError::config_out_of_date(message: impl Into<String>, field_path: impl Into<String>) -> Self`
@@ -1075,10 +1091,12 @@ Expected: pass; no existing test broken (the three exhaustive matches above — 
 ## Task B3 — `EdgeError` response body adds `kind` field + `Retry-After` on `ConfigOutOfDate`
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/error.rs` — extend `IntoResponse` impl.
 - Modify: `crates/edgezero-core/src/error.rs` — add per-variant `kind` constants.
 
 **Interfaces:**
+
 - Produces: response body shape `{ "error": { "status": <u16>, "kind": "<string>", "message": "<…>", "field_path"?: "<…>" } }`. `field_path` ONLY on `ConfigOutOfDate`. `Retry-After: 60` header ONLY on `ConfigOutOfDate`. Per spec §6.3.1.
 
 - [ ] **Step 1: Add a `kind_str` private method per variant.**
@@ -1162,9 +1180,11 @@ Note which tests fail (they're asserting the old `{ status, message }` shape). P
 ## Task B4 — Per-variant `kind` + `Retry-After` tests
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/error.rs` (update existing IntoResponse tests + add new ones per spec §12.6.1).
 
 **Interfaces:**
+
 - Consumes: `EdgeError::kind_str` + `IntoResponse` impl from Task B3.
 
 - [ ] **Step 1: Update existing tests that assert the old body shape.** Find tests asserting `body.error.status` + `body.error.message` only; extend them to also assert `body.error.kind`. Use the table from spec §12.6.1.
@@ -1248,9 +1268,11 @@ Expected: green.
 ## Task B5 — `ConfigStoreBinding` + `ConfigRegistry` type change
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/store_registry.rs` — replace `BoundConfigStore = ConfigStoreHandle` with `ConfigStoreBinding`; change `ConfigRegistry = StoreRegistry<ConfigStoreBinding>`.
 
 **Interfaces:**
+
 - Produces:
   - `pub struct ConfigStoreBinding { pub handle: ConfigStoreHandle, pub default_key: String }` (`#[derive(Clone, Debug)]`).
   - `pub type ConfigRegistry = StoreRegistry<ConfigStoreBinding>`.
@@ -1320,6 +1342,7 @@ Same for `named`:
 - [ ] **Step 5: Fix each adapter's request-context constructor.** Each adapter builds the registry by mapping logical ids to handles; under the new shape, each ID must produce a `ConfigStoreBinding { handle, default_key }`. The `default_key` is `EnvConfig::store_key("config", id)` (added in Task B7). For Task B5 alone, hardcode `default_key: id.to_owned()` temporarily — Task B7 wires the env-var path.
 
 Files to edit (per spec §5.2.1's adapter line references):
+
 - `crates/edgezero-adapter-axum/src/request.rs` (or `context.rs`)
 - `crates/edgezero-adapter-cloudflare/src/request.rs`
 - `crates/edgezero-adapter-fastly/src/request.rs`
@@ -1340,9 +1363,11 @@ Expected: all pre-existing tests pass.
 ## Task B6 — `StoreRegistry::default_ref` / `named_ref`
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/store_registry.rs` — add two ref accessors.
 
 **Interfaces:**
+
 - Produces: `impl<H: Clone> StoreRegistry<H> { fn default_ref(&self) -> Option<&H>; fn named_ref(&self, id: &str) -> Option<&H>; }`.
 
 - [ ] **Step 1: Add the two methods inside the existing `impl<H: Clone> StoreRegistry<H>`.**
@@ -1388,9 +1413,11 @@ Expected: pass.
 ## Task B7 — `EnvConfig::store_key` helper
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/env_config.rs` — add helper mirroring `store_name`.
 
 **Interfaces:**
+
 - Produces: `EnvConfig::store_key(&self, kind: &str, id: &str) -> String`. Falls back to `id` on unset / blank / control-char values, mirroring `store_name`.
 
 - [ ] **Step 1: Add the helper directly under `store_name` (around line 133).**
@@ -1460,10 +1487,12 @@ Expected: clean.
 ## Task B8 — `Config` extractor binding accessors + `RequestContext` helpers
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/extractor.rs` — add `Config::default_binding()` / `Config::named_binding(id)`.
 - Modify: `crates/edgezero-core/src/context.rs` — add `RequestContext::config_store_default_binding()` / `config_store_binding(id)`.
 
 **Interfaces:**
+
 - Produces:
   - `Config::default_binding(&self) -> Option<&ConfigStoreBinding>`
   - `Config::named_binding(&self, id: &str) -> Option<&ConfigStoreBinding>`
@@ -1554,9 +1583,11 @@ Expected: pass.
 ## Task B9 — `validate_excluding_secrets` wrapper
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/app_config.rs` — add the wrapper function next to `AppConfigMeta`.
 
 **Interfaces:**
+
 - Produces: `pub fn validate_excluding_secrets<C: validator::Validate + AppConfigMeta>(cfg: &C) -> Result<(), validator::ValidationErrors>`. Skips per-field validators on every `KeyInDefault` / `KeyInNamedStore` field; keeps validators on `StoreRef` fields (those values don't change at runtime).
 
 - [ ] **Step 1: Add the function.**
@@ -1648,11 +1679,13 @@ Expected: pass.
 ## Task B10 — `#[derive(AppConfig)]` macro: `SecretKind::KeyInNamedStore` + serde-attribute bans
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/app_config.rs` — extend `SecretKind` enum with `KeyInNamedStore { store_ref_field: &'static str }`.
 - Modify: `crates/edgezero-macros/src/app_config.rs` — parse `#[secret(store_ref = "field")]`; enforce skip/skip_if/flatten bans on EVERY field; emit `AppConfigRoot` impl.
 - Modify: `crates/edgezero-core/src/app_config.rs` — add `pub trait AppConfigRoot {}`.
 
 **Interfaces:**
+
 - Produces:
   - `SecretKind::KeyInNamedStore { store_ref_field: &'static str }`.
   - `pub trait AppConfigRoot {}` (open, public).
@@ -1808,12 +1841,14 @@ Expected: pass.
 ## Task B11 — `TypedSecretEntry` + `validate_typed_secrets` trait extension
 
 **Files:**
+
 - Modify: `crates/edgezero-adapter/src/registry.rs` — add `TypedSecretEntry` struct + `new` constructor.
 - Modify: `crates/edgezero-adapter/src/registry.rs` — change `Adapter::validate_typed_secrets` signature to `&[TypedSecretEntry<'_>]`.
 - Modify: `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/cli.rs` — update each impl.
 - Modify: `crates/edgezero-cli/src/config.rs` — update the caller (`run_adapter_typed_checks`) to build the new slice including `KeyInNamedStore` entries.
 
 **Interfaces:**
+
 - Produces:
   - `pub struct TypedSecretEntry<'a> { pub store_id: &'a str, pub field_name: &'a str, pub key_value: &'a str }` (`#[non_exhaustive]`).
   - `impl<'a> TypedSecretEntry<'a> { pub fn new(store_id: &'a str, field_name: &'a str, key_value: &'a str) -> Self }`.
@@ -1907,9 +1942,11 @@ Expected: pass.
 ## Task B12 — `Adapter::read_config_entry` trait + `ReadConfigEntry` enum (writer-signature mirror)
 
 **Files:**
+
 - Modify: `crates/edgezero-adapter/src/registry.rs` — add the enum + two trait methods that mirror `push_config_entries` / `push_config_entries_local` argument-for-argument.
 
 **Interfaces:**
+
 - Produces:
   - `pub enum ReadConfigEntry { Present(String), MissingKey, MissingStore, Unsupported(&'static str) }`.
   - Trait methods `read_config_entry` and `read_config_entry_local` whose parameter lists are byte-for-byte identical to the existing `push_config_entries` / `push_config_entries_local` at `crates/edgezero-adapter/src/registry.rs:277` and `:315`, EXCEPT:
@@ -1996,12 +2033,14 @@ Expected: clean.
 ## Task B13 — Per-adapter `read_config_entry` + `_local` impls
 
 **Files:**
+
 - Modify: `crates/edgezero-adapter-axum/src/cli.rs` — implement both methods (file-map reads).
 - Modify: `crates/edgezero-adapter-cloudflare/src/cli.rs` — `wrangler kv key get --binding <B> <K> --remote` for `read_config_entry`; `--local` for `_local`.
 - Modify: `crates/edgezero-adapter-fastly/src/cli.rs` — `fastly config-store-entry describe --store-id=<id> --key=<key> --json`.
 - Modify: `crates/edgezero-adapter-spin/src/cli.rs` — local: SQLite read via vendored schema; cloud: returns `Unsupported`.
 
 **Interfaces:**
+
 - Consumes: Task B12's trait.
 
 Each adapter has a similar shape. Outline per adapter; flesh out per spec §9.0/9.1-9.4.
@@ -2187,16 +2226,18 @@ Tasks land incrementally locally, but the final commit lumps them all together. 
 ## Task C1 — `AppConfig<C>` extractor (skeleton + envelope + sha + secret walk + deserialise)
 
 **Files:**
+
 - Modify: `crates/edgezero-core/src/extractor.rs` — add `pub struct AppConfig<C>(pub C);` + `impl FromRequest`.
 
 **Interfaces:**
+
 - Produces: `pub struct AppConfig<C>(pub C); impl<C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static> FromRequest for AppConfig<C>`.
 
 - [ ] **Step 1: Write the extractor.**
 
 Append to `crates/edgezero-core/src/extractor.rs`:
 
-```rust
+````rust
 /// Typed app-config extractor. See spec §3.3.3 + §4.3.
 ///
 /// ```ignore
@@ -2342,7 +2383,7 @@ fn map_secret_error(
         )),
     }
 }
-```
+````
 
 Adjust imports at the top of `extractor.rs` to bring in `crate::blob_envelope::BlobEnvelope`, `crate::app_config::{AppConfigMeta, SecretKind}`, `crate::secret_store::SecretError` (referenced via `crate::` because `extractor.rs` is inside `edgezero-core`).
 
@@ -2473,6 +2514,7 @@ Run: `cargo test -p edgezero-core --lib extractor::tests::app_config`
 ## Task C2 — CLI envelope build + per-adapter writer call (NOT per-adapter envelope code)
 
 **Files:**
+
 - Modify: `crates/edgezero-cli/src/config.rs` — `run_config_push_typed` builds ONE `BlobEnvelope`, serialises it, resolves the target key, and calls the EXISTING `adapter.push_config_entries(...)` writer with exactly one `(key, envelope_json)` entry.
 - Modify: each adapter under `crates/edgezero-adapter-*/src/cli.rs` (and `push_sqlite.rs` / `push_cloud.rs` for Spin) ONLY for: (a) any pre-blob-model "flatten + per-leaf loop" preprocessing the writer did, and (b) per-platform cap checks on the single entry. Adapters do NOT touch `BlobEnvelope` — the `(String, String)` writer surface stays exactly as it is at `crates/edgezero-adapter/src/registry.rs:277`.
 
@@ -2560,14 +2602,14 @@ The existing cap check at line 90 (`if pair.len() >= MAX_ARGV_BYTES_PER_INVOCATI
 
 - [ ] **Step 3: Per-adapter writer simplification.** Each adapter's `push_config_entries` impl currently handles the per-leaf model (`for (key, value) in entries { write one }`). Under the blob model the CLI sends ONE entry. The existing loop already handles "one entry" as a degenerate case; minimal code change to most adapters:
 
-| Adapter            | Existing writer call                                                    | Blob-model change |
-| ------------------ | ------------------------------------------------------------------------ | ----------------- |
-| Axum               | inserts each pair into the file map; serialises file at end             | No code change — the one-entry case already works. |
-| Cloudflare         | `wrangler kv bulk put <tempfile> --namespace-id=<id> --remote`           | No code change — the one-entry tempfile is still valid bulk-put input. |
-| Cloudflare local   | `wrangler kv bulk put <tempfile> --binding <BINDING> --local`            | No code change. |
-| Fastly             | per-entry `fastly config-store-entry update --upsert --stdin`           | No code change; the existing loop runs once. Add the cap guard from Step 2. |
-| Spin local         | per-entry SQLite insert                                                 | No code change. |
-| Spin cloud         | chunked `spin cloud key-value set --app <APP> --label <LABEL> <KEY>=<VALUE> [...]` per `push_cloud.rs`'s `write_batch` | **Reuse `write_batch` unchanged with the one-pair vec** (round-26 M-2). The existing diagnostics (auth/link/partial-failure messages at `push_cloud.rs:166`, `:220`, `:235`) stay intact. DO NOT replace `output()` with `status()` — that would regress the actionable error messages. |
+| Adapter          | Existing writer call                                                                                                   | Blob-model change                                                                                                                                                                                                                                                                       |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Axum             | inserts each pair into the file map; serialises file at end                                                            | No code change — the one-entry case already works.                                                                                                                                                                                                                                      |
+| Cloudflare       | `wrangler kv bulk put <tempfile> --namespace-id=<id> --remote`                                                         | No code change — the one-entry tempfile is still valid bulk-put input.                                                                                                                                                                                                                  |
+| Cloudflare local | `wrangler kv bulk put <tempfile> --binding <BINDING> --local`                                                          | No code change.                                                                                                                                                                                                                                                                         |
+| Fastly           | per-entry `fastly config-store-entry update --upsert --stdin`                                                          | No code change; the existing loop runs once. Add the cap guard from Step 2.                                                                                                                                                                                                             |
+| Spin local       | per-entry SQLite insert                                                                                                | No code change.                                                                                                                                                                                                                                                                         |
+| Spin cloud       | chunked `spin cloud key-value set --app <APP> --label <LABEL> <KEY>=<VALUE> [...]` per `push_cloud.rs`'s `write_batch` | **Reuse `write_batch` unchanged with the one-pair vec** (round-26 M-2). The existing diagnostics (auth/link/partial-failure messages at `push_cloud.rs:166`, `:220`, `:235`) stay intact. DO NOT replace `output()` with `status()` — that would regress the actionable error messages. |
 
 - [ ] **Step 4: Per-adapter tests.** For each adapter's existing per-leaf push test, update the input from a multi-entry slice to a single envelope pair. Assert the same writer interaction (shell command shape, file contents, etc.) as the per-leaf test asserted, just with one key.
 
@@ -2582,6 +2624,7 @@ Expected: pass.
 ## Task C3 — `ConfigPushArgs` updates + `ConfigCmd` stub variants
 
 **Files:**
+
 - Modify: `crates/edgezero-cli/src/args.rs` — add `--key`, `--yes`, `--no-diff` to `ConfigPushArgs`; add `ConfigCmdStubArgs`.
 - Modify: `crates/edgezero-cli/src/main.rs` — wire bundled `ConfigCmd` with stub variants + parent `after_help`.
 
@@ -2657,6 +2700,7 @@ In the top-level `Command` enum (typically `args.rs`):
 ## Task C4 — `run_config_push_typed` rewrite + inline-diff prompt
 
 **Files:**
+
 - Modify: `crates/edgezero-cli/src/config.rs` — rewrite `run_config_push_typed` to route through `deserialize_app_config_with_options` + `validate_excluding_secrets` + read-back via `Adapter::read_config_entry` + inline diff prompt.
 
 - [ ] **Step 1: Locate `run_config_push_typed` (around line 186 per spec).** Replace the inline `Validate::validate` call with `validate_excluding_secrets`.
@@ -2720,12 +2764,12 @@ fn require_consent(args: &ConfigPushArgs, read: &ReadConfigEntry) -> Result<(), 
 
 For `ReadConfigEntry::Unsupported` (Spin Cloud), the §8.3 four-branch UX overrides the default flow:
 
-| Caller environment      | Behaviour                                                                                                                              |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Caller environment      | Behaviour                                                                                                                                                                                                                                                                                                  |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--dry-run`             | Exit non-zero with: `config push --dry-run --adapter spin against Spin Cloud is unsupported (no remote read-back; re-run with --local for the on-disk SQLite write or drop --dry-run to write unconditionally with --yes)`. The flag's contract is "show the diff", which is structurally impossible here. |
-| `--yes` (or `-y`) set   | Write unconditionally. No prompt, no diff render. Output: `pushed N entries to Spin Cloud (skip-on-equal unavailable; remote sha not readable)`. |
-| TTY without `--yes`     | Prompt: `cannot read remote on Spin Cloud (no get subcommand); write anyway? [y/N]`. `y` proceeds; `n` exits non-zero.                          |
-| Non-TTY without `--yes` | Exit non-zero: `Spin Cloud read-back unsupported; pass --yes for non-interactive runs (the push writes unconditionally)`.                       |
+| `--yes` (or `-y`) set   | Write unconditionally. No prompt, no diff render. Output: `pushed N entries to Spin Cloud (skip-on-equal unavailable; remote sha not readable)`.                                                                                                                                                           |
+| TTY without `--yes`     | Prompt: `cannot read remote on Spin Cloud (no get subcommand); write anyway? [y/N]`. `y` proceeds; `n` exits non-zero.                                                                                                                                                                                     |
+| Non-TTY without `--yes` | Exit non-zero: `Spin Cloud read-back unsupported; pass --yes for non-interactive runs (the push writes unconditionally)`.                                                                                                                                                                                  |
 
 Sketch:
 
@@ -2765,6 +2809,7 @@ if let ReadConfigEntry::Unsupported(reason) = &remote {
 ## Task C5 — App-demo migration
 
 **Files (all under `examples/app-demo/`):**
+
 - Modify: `examples/app-demo/crates/app-demo-core/src/config.rs` — comments + AppConfig derive checks (the macro reruns).
 - Modify: `examples/app-demo/crates/app-demo-core/src/handlers.rs` — switch to `AppConfig<AppDemoConfig>` extractor; remove hand-managed `config_store_default()?.get(...)` + `secret_store.require_str(...)` paths.
 - Modify: `examples/app-demo/app-demo.toml` — comment updates only (the shape stays the same).
@@ -2786,6 +2831,7 @@ use edgezero_core::extractor::{AppConfig, Headers, Json, Kv, Path, Query, Secret
 ## Task C6 — Scaffold template migrations (Push + Validate only; Diff deferred to Phase D)
 
 **Files:**
+
 - Modify: `crates/edgezero-cli/src/templates/core/src/config.rs.hbs`
 - Modify: `crates/edgezero-cli/src/templates/core/src/handlers.rs.hbs`
 - Modify: `crates/edgezero-cli/src/templates/app/name.toml.hbs`
@@ -2823,6 +2869,7 @@ Expected: pass.
 ## Task C7 — CI gate scripts
 
 **Files:**
+
 - Create: `scripts/check_no_legacy_typed_reads.sh`
 - Create: `scripts/check_no_placeholder_pins.sh`
 - Create: `crates/edgezero-cli/src/bin/check_no_nested_app_config.rs`
@@ -2856,12 +2903,12 @@ required-features = ["nested-app-config-check"]
 - [ ] **Step 6: Wire the three gates into `.github/workflows/test.yml`.** Add three steps before `cargo test`:
 
 ```yaml
-      - name: No placeholder pins
-        run: ./scripts/check_no_placeholder_pins.sh
-      - name: No legacy typed reads
-        run: ./scripts/check_no_legacy_typed_reads.sh
-      - name: Nested AppConfig audit
-        run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
+- name: No placeholder pins
+  run: ./scripts/check_no_placeholder_pins.sh
+- name: No legacy typed reads
+  run: ./scripts/check_no_legacy_typed_reads.sh
+- name: Nested AppConfig audit
+  run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
 ```
 
 - [ ] **Step 7: Run all gates locally.** Expected: pass.
@@ -2949,6 +2996,7 @@ PR replaces the placeholder with the real hex before merge."
 ## Task D1 — `ConfigDiffArgs` + clap wiring
 
 **Files:**
+
 - Modify: `crates/edgezero-cli/src/args.rs` — add `ConfigDiffArgs` per spec §3.2.2.
 
 - [ ] **Step 1: Add the struct.**
@@ -2969,6 +3017,7 @@ pub enum TypedConfigCmd {
 ## Task D2 — `run_config_diff_typed` entry point + format renderers
 
 **Files:**
+
 - Create: `crates/edgezero-cli/src/diff.rs` — three format renderers (`unified`, `structured`, `json`) per spec §8.1.1/8.1.2/8.1.3.
 - Modify: `crates/edgezero-cli/src/config.rs` — add `pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<(), String>`.
 
@@ -3041,16 +3090,19 @@ Phase D of the blob app-config rewrite per spec §8.1.
 ## Task E1 — Migration guide
 
 **Files:**
+
 - Create or expand: `docs/guides/blob-app-config-migration.md` — operator-facing guide per spec §10.
 
 ## Task E2 — Smoke scripts
 
 **Files:**
+
 - Modify: `scripts/smoke_test_config.sh` — seed via `app-demo-cli config push --adapter axum` and assert runtime reads expected values.
 
 ## Task E3 — Top-level README + scaffold README updates
 
 **Files:**
+
 - Modify: `README.md` if app-config shape is described.
 - Modify: scaffold `root/README.md.hbs` if not already done in Phase C.
 
@@ -3088,68 +3140,68 @@ git push origin feature/extensible-cli
 
 Mapping spec §s → tasks:
 
-| Spec §                                            | Task(s)                  |
-| ------------------------------------------------- | ------------------------ |
-| §3.2.1 (bundled binary loses push/diff)           | C3                       |
-| §3.2.2 (CLI args block)                           | C3, D1                   |
-| §3.3 (secret-field Model A)                       | C1                       |
-| §3.3.1.1 (macro metadata API)                     | B10                      |
-| §3.3.1.2 (top-level only)                         | B10 + C7 (gate)          |
-| §3.3.1.3 (serde rename policy)                    | B10                      |
-| §3.3.1.4 (derive-time validation table)           | B10 (trybuild fixtures)  |
-| §3.3.2 (writer behaviour + structural checks)     | B11                      |
-| §3.3.3 (extractor secret walk)                    | C1                       |
-| §3.3.4 (blob layout)                              | C2 (envelope creation)   |
-| §3.3.6 (SecretError → EdgeError mapping)          | C1 (`map_secret_error`)  |
-| §3.3.7 (sha + secret-key interaction)             | A2 + C1                  |
-| §3.3.8 (push vs runtime validation)               | B9 + C4                  |
-| §4.1 (envelope shape)                             | A4                       |
-| §4.2 (canonical form)                             | A2, A3                   |
-| §4.3 (read-side validation)                       | C1                       |
-| §5.1 (default key)                                | C2                       |
-| §5.2 (runtime override + charset)                 | B1, B7                   |
-| §5.2.1 (`ConfigStoreBinding`)                     | B5, B6, B8               |
-| §5.4 (push-side `--key`)                          | C3, C4                   |
-| §6.0 (name `AppConfig<C>`)                        | C1                       |
-| §6.1 (default-key extractor form)                 | C1 (`FromRequest` impl)  |
-| §6.2 (explicit-key `named(key)` form)             | C1 (Step 2 inherent impl) |
-| §6.2.1 (cross-store `from_store(id, key)` form)   | C1 (Step 2 inherent impl) |
-| §6.2.2 (runtime validation)                       | C1 (`cfg.validate()`)    |
-| §6.3 (errors — bullet list)                       | B2, B3, C1               |
-| §6.3.1 (`ConfigOutOfDate` body shape)             | B2, B3, B4               |
-| §6.4 (no caching)                                 | C1 (re-reads every call) |
-| §6.5 (existing `ConfigStore` trait stays)         | (no code work — kept)    |
-| §7.x (SHA discussion)                             | A2 (canonical form)      |
-| §8.1 (config diff)                                | D1, D2                   |
-| §8.2 (config push + consent)                      | C2, C3, C4               |
-| §8.3 (per-adapter read-back / Spin Cloud)         | B13                      |
-| §9.0 (`Adapter::read_config_entry`)               | B12, B13                 |
-| §9.1-9.4 (per-adapter notes)                      | B13, C2                  |
-| §10 (migration)                                   | C5, E1                   |
-| §10.2 (app-demo migration)                        | C5                       |
-| §10.2.1 (CI gates)                                | C7                       |
-| §10.2.2 (scaffold templates)                      | C6                       |
-| §10.3 (manifest charset in scope)                 | B1                       |
-| §12.1 (canonical_form pin)                        | A3                       |
-| §12.6.1 (`kind` strings + headers)                | B4                       |
-| §12.2 (push / diff tests)                         | C4 + D2                  |
-| §12.3 (per-adapter end-to-end)                    | C2 (writers) + E2 (smoke) |
-| §12.4 (migration)                                 | E1 (docs)                |
-| §12.5 (secret-field model)                        | C1 (extractor tests)     |
-| §12.7 (env-var key override)                      | B7 (per-key tests) + E2  |
-| §12.8 (raw-binary stub)                           | C3                       |
-| §12.9 (downstream CLI wiring)                     | C6 (templates)           |
-| §12.10 (Spin Cloud cap)                           | C2 (Spin Cloud writer)   |
-| §12.11 (parser tests)                             | C3 (ConfigPushArgs) + D1 (ConfigDiffArgs) |
-| §12.12 (--store routing)                          | C4 + D2                  |
-| §12.13 (CF local vs remote binding)               | C2 (Cloudflare writer)   |
-| §12.14 (StoreRegistry ref accessors)              | B6                       |
-| §12.15 (raw Config binding accessors)             | B8                       |
-| §12.16 (named-store secret adapter validation)    | B11                      |
-| §12.17 (nested AppConfig fixture)                 | C7 (gate fixtures)       |
-| §12.18 (manifest charset)                         | B1                       |
-| §13 (phasing)                                     | Plan structure mirrors it |
-| §13.1 (placeholder pin gate)                      | C7                       |
+| Spec §                                          | Task(s)                                   |
+| ----------------------------------------------- | ----------------------------------------- |
+| §3.2.1 (bundled binary loses push/diff)         | C3                                        |
+| §3.2.2 (CLI args block)                         | C3, D1                                    |
+| §3.3 (secret-field Model A)                     | C1                                        |
+| §3.3.1.1 (macro metadata API)                   | B10                                       |
+| §3.3.1.2 (top-level only)                       | B10 + C7 (gate)                           |
+| §3.3.1.3 (serde rename policy)                  | B10                                       |
+| §3.3.1.4 (derive-time validation table)         | B10 (trybuild fixtures)                   |
+| §3.3.2 (writer behaviour + structural checks)   | B11                                       |
+| §3.3.3 (extractor secret walk)                  | C1                                        |
+| §3.3.4 (blob layout)                            | C2 (envelope creation)                    |
+| §3.3.6 (SecretError → EdgeError mapping)        | C1 (`map_secret_error`)                   |
+| §3.3.7 (sha + secret-key interaction)           | A2 + C1                                   |
+| §3.3.8 (push vs runtime validation)             | B9 + C4                                   |
+| §4.1 (envelope shape)                           | A4                                        |
+| §4.2 (canonical form)                           | A2, A3                                    |
+| §4.3 (read-side validation)                     | C1                                        |
+| §5.1 (default key)                              | C2                                        |
+| §5.2 (runtime override + charset)               | B1, B7                                    |
+| §5.2.1 (`ConfigStoreBinding`)                   | B5, B6, B8                                |
+| §5.4 (push-side `--key`)                        | C3, C4                                    |
+| §6.0 (name `AppConfig<C>`)                      | C1                                        |
+| §6.1 (default-key extractor form)               | C1 (`FromRequest` impl)                   |
+| §6.2 (explicit-key `named(key)` form)           | C1 (Step 2 inherent impl)                 |
+| §6.2.1 (cross-store `from_store(id, key)` form) | C1 (Step 2 inherent impl)                 |
+| §6.2.2 (runtime validation)                     | C1 (`cfg.validate()`)                     |
+| §6.3 (errors — bullet list)                     | B2, B3, C1                                |
+| §6.3.1 (`ConfigOutOfDate` body shape)           | B2, B3, B4                                |
+| §6.4 (no caching)                               | C1 (re-reads every call)                  |
+| §6.5 (existing `ConfigStore` trait stays)       | (no code work — kept)                     |
+| §7.x (SHA discussion)                           | A2 (canonical form)                       |
+| §8.1 (config diff)                              | D1, D2                                    |
+| §8.2 (config push + consent)                    | C2, C3, C4                                |
+| §8.3 (per-adapter read-back / Spin Cloud)       | B13                                       |
+| §9.0 (`Adapter::read_config_entry`)             | B12, B13                                  |
+| §9.1-9.4 (per-adapter notes)                    | B13, C2                                   |
+| §10 (migration)                                 | C5, E1                                    |
+| §10.2 (app-demo migration)                      | C5                                        |
+| §10.2.1 (CI gates)                              | C7                                        |
+| §10.2.2 (scaffold templates)                    | C6                                        |
+| §10.3 (manifest charset in scope)               | B1                                        |
+| §12.1 (canonical_form pin)                      | A3                                        |
+| §12.6.1 (`kind` strings + headers)              | B4                                        |
+| §12.2 (push / diff tests)                       | C4 + D2                                   |
+| §12.3 (per-adapter end-to-end)                  | C2 (writers) + E2 (smoke)                 |
+| §12.4 (migration)                               | E1 (docs)                                 |
+| §12.5 (secret-field model)                      | C1 (extractor tests)                      |
+| §12.7 (env-var key override)                    | B7 (per-key tests) + E2                   |
+| §12.8 (raw-binary stub)                         | C3                                        |
+| §12.9 (downstream CLI wiring)                   | C6 (templates)                            |
+| §12.10 (Spin Cloud cap)                         | C2 (Spin Cloud writer)                    |
+| §12.11 (parser tests)                           | C3 (ConfigPushArgs) + D1 (ConfigDiffArgs) |
+| §12.12 (--store routing)                        | C4 + D2                                   |
+| §12.13 (CF local vs remote binding)             | C2 (Cloudflare writer)                    |
+| §12.14 (StoreRegistry ref accessors)            | B6                                        |
+| §12.15 (raw Config binding accessors)           | B8                                        |
+| §12.16 (named-store secret adapter validation)  | B11                                       |
+| §12.17 (nested AppConfig fixture)               | C7 (gate fixtures)                        |
+| §12.18 (manifest charset)                       | B1                                        |
+| §13 (phasing)                                   | Plan structure mirrors it                 |
+| §13.1 (placeholder pin gate)                    | C7                                        |
 
 No spec section is unmapped.
 

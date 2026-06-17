@@ -17,9 +17,10 @@ Status header).
 Cloud size/exposure trade-off (§9.4 + Q12), orphan stance
 (§10.5), `AppConfig<C>::from_store` cross-store form (§6.2.1),
 `__KEY` precedence table (§5.2), per-request caching draft (§6.4
-+ Q5), TOCTOU note (§8.1.4), concurrent-push restriction
-(§10.6), rollback workflow (§10.7), grep-based acceptance gate
-(§10.2.1).
+
+- Q5), TOCTOU note (§8.1.4), concurrent-push restriction
+  (§10.6), rollback workflow (§10.7), grep-based acceptance gate
+  (§10.2.1).
 
 **Reviewer pass (round 2):** secret-field model first sketched
 with strip + extractor-time resolution (§3.3); `AppConfig<C>`
@@ -105,7 +106,7 @@ framework-resolved:**
 - **§3.3 rewritten to Model A (framework-resolved).** The
   earlier round-3 design landed at "marker-only": handlers
   resolve secrets explicitly with `secret_store.require_str
-  (&cfg.api_token)`. Round-4 reviewer + project owner
+(&cfg.api_token)`. Round-4 reviewer + project owner
   confirmed the preferred model is "framework-resolved": the
   extractor walks `C::SECRET_FIELDS` after reading the blob
   and BEFORE deserialising into `C`, swapping each
@@ -152,7 +153,7 @@ framework-resolved:**
   `ConfigValidateArgs` / new `ConfigDiffArgs` stay shared.
 - **`from_store` bounds match `named`** —
   `DeserializeOwned + AppConfigMeta + Validate + Send +
-  'static`. `AppConfigMeta` promoted from optional (round-3)
+'static`. `AppConfigMeta` promoted from optional (round-3)
   to required because the secret walk consults
   `SECRET_FIELDS`.
 - **§3.2 "one blob per id" reframed** as "one ACTIVE typed
@@ -171,7 +172,7 @@ framework-resolved:**
   example that contradicted §4.2's type-identity rule.
 - **§10.2 app-demo handler migration** spells out the
   secret-resolution drop: every existing `secret_store
-  (&cfg.vault)?.require_str(&cfg.api_token)` call disappears
+(&cfg.vault)?.require_str(&cfg.api_token)` call disappears
   under Model A.
 
 **Reviewer pass (round 5) — macro / contract precision:**
@@ -191,7 +192,7 @@ framework-resolved:**
 - **§3.3.8 (new) — push vs runtime validation
   semantics.** Documented the rule: push validates
   everything EXCEPT `#[secret]` / `#[secret(store_ref =
-  "...")]` fields; runtime validates everything. Push
+"...")]` fields; runtime validates everything. Push
   consults `SECRET_FIELDS` to skip per-field validators on
   secret-bearing fields. Sketched the
   `validate_excluding_secrets` wrapper. Acknowledged the
@@ -224,7 +225,7 @@ framework-resolved:**
   `spin.toml` / `axum.toml` snippets).
 - **§10.2.1 grep gate scope widened** to include the four
   adapter template trees (`crates/edgezero-adapter-{axum,
-  cloudflare, fastly, spin}/src/templates`), so a
+cloudflare, fastly, spin}/src/templates`), so a
   generated project that still uses the legacy pattern in
   its adapter-side snippets fails CI.
 - **§6.3.1 response-body shape declared precisely.** The
@@ -277,7 +278,7 @@ precision:**
 - **§5.2.1 (new) — concrete carrier for `__KEY` runtime
   resolution.** Replaced today's per-id `ConfigStoreHandle`
   registry entry with a `ConfigStoreBinding { handle,
-  default_key }`. Adapters resolve
+default_key }`. Adapters resolve
   `EDGEZERO__STORES__CONFIG__<ID>__KEY` at registry-build
   time (alongside their existing `__NAME` reads) and pack
   the resolved key into the binding. The extractor reads
@@ -289,7 +290,7 @@ precision:**
   the helper unwraps `binding.handle`.
 - **§3.3.3 extractor sketch rewritten** to match the exact
   `SecretField { name, kind }` / `SecretKind::{KeyInDefault,
-  StoreRef, KeyInNamedStore { store_ref_field }}` API from
+StoreRef, KeyInNamedStore { store_ref_field }}` API from
   §3.3.1.1. Replaced `field.path` / `field.store_ref` with
   `field.name` / pattern-match on `field.kind`. The
   "nested-path handling" claim was removed — §3.3.1.2's
@@ -328,7 +329,7 @@ precision:**
   `SecretError` shapes.** Variants are
   `NotFound { name }` (struct-like), `Unavailable` (unit),
   `Validation(String)` (tuple), `Internal(#[from]
-  anyhow::Error)` (tuple). The earlier sketch
+anyhow::Error)` (tuple). The earlier sketch
   pattern-matched on shapes that don't exist.
 - **§6.3.1 `Retry-After: 60` extended to
   `ServiceUnavailable`** in addition to `ConfigOutOfDate`.
@@ -364,7 +365,7 @@ tightening:**
   implementable.** `validator::ValidationErrors` in 0.20
   does not expose `.remove(field)`; it exposes
   `.errors_mut() -> &mut HashMap<&'static str,
-  ValidationErrorsKind>`. Rewrote the sketch to call
+ValidationErrorsKind>`. Rewrote the sketch to call
   `errors_mut().remove(field.name)` against that map.
   Documented that struct-level `#[validate]` rules live
   under `__all__` and are intentionally left alone (not
@@ -405,10 +406,10 @@ tightening:**
   §12.5's missing-secret-at-extract case.
 - **§12.6 runtime validation assertion shape fixed.**
   Earlier draft asserted a flat `{ status, message,
-  kind: "config_out_of_date" }` body. Updated to the
+kind: "config_out_of_date" }` body. Updated to the
   nested envelope §6.3.1 actually documents:
   `{ "error": { "status": 503, "kind": ..., "message":
-  ..., "field_path": ... } }`. Added explicit assertion
+..., "field_path": ... } }`. Added explicit assertion
   on the `field_path` value naming the offending field.
 - **§6.3.1 `Retry-After: 60` scope made explicit.** The
   earlier line "on BOTH `ConfigOutOfDate` AND
@@ -421,10 +422,11 @@ tightening:**
   Enforced by review, not by the type system; the
   variant's doc-comment captures the rule.
 
-**Reviewer pass (round 8) — implementability + arg surface
-+ enforceability:**
+\*\*Reviewer pass (round 8) — implementability + arg surface
 
-- **§3.3.2 + §3.3.8 reconciled around `config validate`.**
+- enforceability:\*\*
+
+* **§3.3.2 + §3.3.8 reconciled around `config validate`.**
   Round 7 left a contradiction: §3.3.2 said push, diff, AND
   generated `config validate` route through
   `validate_excluding_secrets`, but the §3.3.8 loader split
@@ -437,7 +439,7 @@ tightening:**
   swap has already happened by then). The bundled
   `edgezero config validate` (no `C`) stays on
   `load_app_config_raw`.
-- **§3.3.1.2 nested-`AppConfig` ban made enforceable.**
+* **§3.3.1.2 nested-`AppConfig` ban made enforceable.**
   Round 7 said "top-level only" but the derive macro only
   sees its own struct — a nested type that ALSO derives
   `AppConfig` carries its own `SECRET_FIELDS` that the
@@ -447,7 +449,7 @@ tightening:**
   detects an `AppConfig`-rooted type being used as a
   field type in another `AppConfig`-rooted struct.
   Recursive-metadata path recorded as Q13 in §11 for v2.
-- **§3.2.1 / §3.2.2 raw-binary UX aligned.** Earlier draft
+* **§3.2.1 / §3.2.2 raw-binary UX aligned.** Earlier draft
   said the bundled binary's `edgezero config push` exits
   via clap's default "unrecognized subcommand" (§3.2.2),
   but §3.2.1 promised a pointer message and the §12.8 test
@@ -457,7 +459,7 @@ tightening:**
   the match arms printing the pointer at the typed CLI
   and exiting code 2. §12.8 updated to assert the
   pointer text and `code 2`.
-- **§3.2.2 CLI arg surface filled in.** Earlier draft said
+* **§3.2.2 CLI arg surface filled in.** Earlier draft said
   `ConfigPushArgs` is "unchanged" but the rest of the spec
   required `--key`, `--yes`, `--no-diff`, `--runtime-config`
   for Spin, `--dry-run`. Wrote out the full clap field
@@ -467,15 +469,15 @@ tightening:**
   see round-9 H-1 reconciliation).
   Added an invariants paragraph naming where each flag is
   load-bearing.
-- **§5.2.1 `StoreRegistry` ref accessors specified.**
+* **§5.2.1 `StoreRegistry` ref accessors specified.**
   `default_binding()` / `named_binding(id)` return
   `Option<&ConfigStoreBinding>` but `StoreRegistry<H>`
   exposes only owned-clone accessors today. Added
   `default_ref` / `named_ref` (generic on `H`) to the
   registry. Also annotated `ConfigStoreBinding: Clone +
-  Debug` (required by `StoreRegistry<H: Clone>` bound +
+Debug` (required by `StoreRegistry<H: Clone>` bound +
   the existing `Debug` derive).
-- **§9.2 Cloudflare wrangler command paths pinned.** Spec
+* **§9.2 Cloudflare wrangler command paths pinned.** Spec
   used `wrangler kv get` / `wrangler kv put` (deprecated
   three-segment form); current code uses the four-segment
   `wrangler kv key get` for read-back and the bulk-put
@@ -484,7 +486,7 @@ tightening:**
   rationale at
   `crates/edgezero-adapter-cloudflare/src/cli.rs:289`).
   §8.3 + §9.2 updated to pin both paths.
-- **§3.3.2 adapter typed checks include `KeyInNamedStore`.**
+* **§3.3.2 adapter typed checks include `KeyInNamedStore`.**
   Today `run_adapter_typed_checks` only forwards
   `KeyInDefault` field values to
   `Adapter::validate_typed_secrets` (so Spin's flat-
@@ -493,8 +495,8 @@ tightening:**
   carries the same constraint. The walk now visits
   `KeyInNamedStore` entries and resolves the sibling
   store-ref field; trait grows a third `&str /* store_id
-  */` parameter that non-Spin adapters ignore.
-- **§10.2.2 scaffold `core/src/handlers.rs.hbs`
+*/` parameter that non-Spin adapters ignore.
+* **§10.2.2 scaffold `core/src/handlers.rs.hbs`
   unused-import fixed.** Round 6 added the sample handler
   as a commented block AND said to add a live
   `use edgezero_core::extractor::AppConfig;` at the top —
@@ -663,7 +665,7 @@ sharpening + contract precision:**
   had `Push(ConfigPushArgs)` and `Diff(ConfigDiffArgs)`
   as stub-pointer variants — but those carry
   `--adapter` (required = true), so `edgezero config
-  push` would fail clap's required-arg check BEFORE
+push` would fail clap's required-arg check BEFORE
   the stub body ran, hiding the pointer message.
   Switched both to UNIT variants (`Push,` / `Diff,`)
   so clap accepts the bare subcommand and the match
@@ -672,7 +674,7 @@ sharpening + contract precision:**
 - **§12.16 Spin-secret named-store test rewritten
   against the actual `cli.rs:363` contract.** Round 9
   test invoked `config validate --strict --adapter
-  spin`, but `ConfigValidateArgs` has no `--adapter`
+spin`, but `ConfigValidateArgs` has no `--adapter`
   field — `validate` runs adapter-typed checks across
   every adapter declared in `[adapters.*]`. The test
   also asserted a `[variables]` collision, but Spin's
@@ -806,9 +808,9 @@ gating + UX precision:**
   `edgezero-cli/Cargo.toml` gating optional
   `syn`/`walkdir` deps, with an explicit `[[bin]]`
   entry declaring `required-features =
-  ["nested-app-config-check"]`. CI invokes via
+["nested-app-config-check"]`. CI invokes via
   `cargo run --features nested-app-config-check
-  --bin check_no_nested_app_config -- ...`. The
+--bin check_no_nested_app_config -- ...`. The
   feature keeps `syn` + `walkdir` out of the default
   build entirely.
 - **§3.2.2 + §12.8 stub-pointer surfaces reconciled
@@ -958,7 +960,7 @@ gate accuracy:**
   `examples/app-demo/crates/app-demo-core/src/handlers.rs:8`
   use a grouped extractor import
   (`{Headers, Json, Kv, Path, Query, Secrets,
-  ValidatedPath}`). A correct migration that adds
+ValidatedPath}`). A correct migration that adds
   `AppConfig` to that group would silently fail the
   gate. Switched the grep to match the usage shape
   `AppConfig[<(]` (extractor instantiation in a
@@ -973,7 +975,7 @@ before plan authoring:**
   struct, not after_help.** Round 13 wired the
   §3.2.1 pointer text into clap's `after_help` to
   cover the with-flags case (`edgezero config push
-  --adapter axum`). The round-14 reviewer ran a Clap
+--adapter axum`). The round-14 reviewer ran a Clap
   4.6.x probe and confirmed `after_help` renders on
   `--help` output but NOT on unexpected-flag /
   missing-required-arg parse errors. So the
@@ -1031,7 +1033,7 @@ before plan authoring:**
 - **§8.2 `--no-diff --yes` semantics narrowed.**
   Earlier wording called this "equivalent to the
   pre-rewrite blind push". Reworded: `--no-diff
-  --yes` suppresses the diff RENDER and the prompt
+--yes` suppresses the diff RENDER and the prompt
   ONLY; read-back and skip-on-equal STILL RUN, so a
   no-op push exits early without writing. Exception:
   on `ReadConfigEntry::Unsupported` (Spin Cloud) the
@@ -1046,16 +1048,14 @@ before plan authoring:**
   cap with a 199 KiB success test, but the writer at
   `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`
   already enforces `MAX_ARGV_BYTES_PER_INVOCATION = 96
-  * 1024` per `<KEY>=<VALUE>` pair. Under the blob
-  model the effective cap is
-  `MAX_ARGV_BYTES_PER_INVOCATION - <KEY>.len() - 1`
-  bytes (~95 KiB for the default `app_config` key).
-  The 200 KiB spec wouldn't have matched reality and
-  the 199 KiB test would have failed. v1 inherits
-  the existing cap; the implementing PR only updates
-  the error message to name blob-model workarounds.
-  Q12 wording and §12.10 boundary tests rewritten to
-  use `MAX_ARGV_BYTES_PER_INVOCATION` symbolically.
+  - 1024`per`<KEY>=<VALUE>`pair. Under the blob
+model the effective cap is`MAX_ARGV_BYTES_PER_INVOCATION - <KEY>.len() - 1`bytes (~95 KiB for the default`app_config`key).
+The 200 KiB spec wouldn't have matched reality and
+the 199 KiB test would have failed. v1 inherits
+the existing cap; the implementing PR only updates
+the error message to name blob-model workarounds.
+Q12 wording and §12.10 boundary tests rewritten to
+use`MAX_ARGV_BYTES_PER_INVOCATION` symbolically.
 - **§4.2 non-finite floats rejected at load time.**
   `serde_json::to_value(f64::NAN)` and `f64::INFINITY`
   serialise to JSON `null`, which would collide with
@@ -1076,7 +1076,7 @@ before plan authoring:**
 - **§3.2.2 stub catch-all `trailing` arg marked
   `hide = true`.** A round-15 Clap probe confirmed
   that without the hide flag, `edgezero config push
-  --help` renders `Usage: ... [TRAILING]...` plus an
+--help` renders `Usage: ... [TRAILING]...` plus an
   `Arguments: [TRAILING]...` section — exposing the
   implementation-detail sink. `hide = true` removes
   both surfaces without disabling parsing.
@@ -1117,7 +1117,7 @@ before plan authoring:**
   validator-rule error renderer into a non-
   validator path. Added a NEW variant
   `AppConfigError::InvalidValue { path,
-  field_path, message }`; both load paths (TOML
+field_path, message }`; both load paths (TOML
   walk + env-overlay parse) raise it. §12.1's
   three test families now pattern-match on
   `InvalidValue` and assert `field_path` + a
@@ -1147,15 +1147,15 @@ before plan authoring:**
   they're stubs. Added the parent-level
   `after_help` in §3.2.2's enum sketch; §12.8 now
   asserts the pointer on four surfaces (`config
-  push --help`, `config diff --help`, `config
-  --help`, and explicitly ABSENT from `config
-  validate --help`).
+push --help`, `config diff --help`, `config
+--help`, and explicitly ABSENT from `config
+validate --help`).
 - **§3.2.1 + §3.2.2 ONE canonical pointer
   constant.** §3.2.1's example showed
   `Run <your-app>-cli config push --adapter axum`
   while the §3.2.2 `STUB_POINTER_AFTER_HELP`
   constant said `Run <your-app>-cli config push
-  (or ... diff)`. §12.8 asserts byte-for-byte
+(or ... diff)`. §12.8 asserts byte-for-byte
   equality, so the two would have failed the
   assertion. §3.2.1's reproduction now references
   the constant explicitly and matches it
@@ -1264,7 +1264,7 @@ contract reversals:**
   config", which `ConfigOutOfDate` (503 with
   `Retry-After: 60`) already encodes. The §3.3.3
   extractor sketch's `EdgeError::internal("missing
-  typed app-config blob")` call site changes to
+typed app-config blob")` call site changes to
   `EdgeError::config_out_of_date(...)` with an
   actionable message naming the key + the
   `<app-cli> config push` remediation. (c)
@@ -1290,7 +1290,7 @@ reversal:**
     now reads
     `EdgeError::ConfigOutOfDate` (HTTP 503,
     `Retry-After: 60`, "run `<app-cli> config
-    push`" message) and explicitly references Q3
+push`" message) and explicitly references Q3
     (d) and the §3.3.3 extractor sketch.
   - The mapping table replaces the stale
     `Internal (none) → Internal | 500` row with a
@@ -1323,11 +1323,9 @@ echo + Spin Cloud CLI surface accuracy:**
   "errors on missing key (per Q3 default)". Now
   pattern-matches on
   `EdgeError::ConfigOutOfDate { message,
-  field_path }`, asserts the message contains the
-  literal `key \`<resolved-key>\`` and the
-  `run \`<app-cli> config push\`` remediation, AND
-  renders the `Response` to assert HTTP 503 +
-  `Retry-After: 60` header. Implementers can no
+field_path }`, asserts the message contains the
+  literal `key \`<resolved-key>\``and the`run \`<app-cli> config push\``remediation, AND
+renders the`Response`to assert HTTP 503 +`Retry-After: 60` header. Implementers can no
   longer pick the wrong variant.
 - **§8.3 Spin Cloud read-back wording aligned with
   the Fermyon Cloud command reference.** Earlier
@@ -1340,7 +1338,7 @@ echo + Spin Cloud CLI surface accuracy:**
   is unchanged.
 - **§10.x Spin Cloud cleanup recipe rewritten.**
   Earlier draft had `spin cloud key-value delete
-  --app <APP> --label <LABEL> <KEY>` per leaf —
+--app <APP> --label <LABEL> <KEY>` per leaf —
   that subcommand shape doesn't exist; `delete`
   removes a whole STORE. Replaced with three real
   options: (1) leave orphan leaves (the runtime
@@ -1368,7 +1366,7 @@ in-tree walker:**
   `crates/edgezero-core/src/canonical_form.rs` as
   the v1 default (no external crate name + version
   to pin). The walker depends only on `serde_json`
-  + `ryu` + `sha2` — all in-tree already.
+  - `ryu` + `sha2` — all in-tree already.
 - **§13.1 acceptance gate simplified.** With Q1
   resolved, the gate no longer needs to accept
   EITHER an external dep OR an in-tree module —
@@ -1382,10 +1380,10 @@ in-tree walker:**
      `serde_canonical_json` in workspace
      `Cargo.toml` (defensive — the gate names
      the Q1 (b) resolution in the error message).
-  The old "exact `=X.Y.Z` pin OR in-tree module"
-  branching is gone; an external dep version pin
-  no longer applies because there is no external
-  dep.
+     The old "exact `=X.Y.Z` pin OR in-tree module"
+     branching is gone; an external dep version pin
+     no longer applies because there is no external
+     dep.
 
 **Reviewer pass (round 22) — migration scope +
 implementability + phasing for plan-readiness:**
@@ -1405,14 +1403,14 @@ implementability + phasing for plan-readiness:**
 - **§3.3.3 extractor sketch deserialize call fixed.**
   Earlier sketch used
   `serde_path_to_error::Deserializer::new(data, &mut
-  track)` directly on a `serde_json::Value` — that's
+track)` directly on a `serde_json::Value` — that's
   the wrong shape (the `Deserializer::new` constructor
   takes a `Deserializer`, not a `Value`). The §4.3
   prose already said the correct form
   (`Value::into_deserializer()` +
   `serde_path_to_error::deserialize`). Sketch
   rewritten to match: `use serde::de::IntoDeserializer
-  as _;` + `serde_path_to_error::deserialize(data.into_deserializer())`,
+as _;` + `serde_path_to_error::deserialize(data.into_deserializer())`,
   matching what an implementer would actually write.
 - **Q9 audit log resolved to (c) — out of v1 scope.**
   Earlier default was (a) "structured JSON line on
@@ -1426,22 +1424,22 @@ implementability + phasing for plan-readiness:**
   specifying a full audit-log contract is a separate
   work stream. (a) and (b) tracked as follow-ups for
   when a real audit requirement lands.
-- **§13 commit phasing regrouped for plan-readiness
-  + bisect-friendliness.** Round-22 reviewer flagged
-  that the earlier phasing split `--key`, `diff`, and
-  read-back across separate later commits, making
-  intermediate slices non-bisectable. Phasing
-  rewritten into 7 commits where each one is annotated
-  as **complete slice** (builds + tests pass on that
-  commit alone). Grouping changes: `ConfigStoreBinding`
-  + `EnvConfig::store_key` + manifest-charset tightening
-  land WITH the extractor's binding consumer (Commit B);
-  `--key` push flag lands WITH `config push` rewrite
-  (Commit E); inline-diff prompt lands with push
-  (Commit E, reusing the read trait from Commit D).
-  The standalone "`__KEY` + `config push --key`"
-  commit from the round-21 phasing is gone — its two
-  halves now live where they're load-bearing.
+- \*\*§13 commit phasing regrouped for plan-readiness
+  - bisect-friendliness.** Round-22 reviewer flagged
+    that the earlier phasing split `--key`, `diff`, and
+    read-back across separate later commits, making
+    intermediate slices non-bisectable. Phasing
+    rewritten into 7 commits where each one is annotated
+    as **complete slice\*\* (builds + tests pass on that
+    commit alone). Grouping changes: `ConfigStoreBinding`
+  - `EnvConfig::store_key` + manifest-charset tightening
+    land WITH the extractor's binding consumer (Commit B);
+    `--key` push flag lands WITH `config push` rewrite
+    (Commit E); inline-diff prompt lands with push
+    (Commit E, reusing the read trait from Commit D).
+    The standalone "`__KEY` + `config push --key`"
+    commit from the round-21 phasing is gone — its two
+    halves now live where they're load-bearing.
 - **§8.4 dangling reference fixed.** Two callers
   pointed at a §8.4 that doesn't exist (the diff
   format docs live in §8.1.1 / §8.1.2 / §8.1.3).
@@ -1744,7 +1742,7 @@ validates the manifest + syntactic shape without needing
 Downstream effects:
 
 - The bundled `edgezero` binary no longer exposes `edgezero
-  config push` or `edgezero config diff`. The subcommands are
+config push` or `edgezero config diff`. The subcommands are
   removed AND replaced with stub subcommands whose entire
   body is a clap-level error message pointing at the typed
   path on the generated CLI:
@@ -1777,8 +1775,9 @@ Downstream effects:
   See §3.2.2 for the enum shape — the bundled `ConfigCmd`
   variants list explicitly carries `Push` and `Diff` as
   stub-pointer arms even though only `Validate` does real work.
+
 - Generated downstream CLIs (`my-app-cli config push`, `my-app-
-  cli config diff`) are the only entry points. The scaffold
+cli config diff`) are the only entry points. The scaffold
   templates already wire these via `run_config_push_typed::<C>`
   / `run_config_validate_typed::<C>`; the diff command's typed
   variant gets wired the same way.
@@ -1791,26 +1790,26 @@ Downstream effects:
 
 Today `crates/edgezero-cli/src/args.rs` exposes a shared
 `Command::Config(ConfigCmd)` enum with `ConfigCmd::Push(...)`
-+ `ConfigCmd::Validate(...)` (line 41) used by BOTH the
-bundled `edgezero` binary AND generated downstream CLIs (the
-template's `main.rs.hbs:56` mirrors it). The blob model splits
-this:
 
-- **`ConfigCmd` (bundled binary) carries `Validate` plus
+- `ConfigCmd::Validate(...)` (line 41) used by BOTH the
+  bundled `edgezero` binary AND generated downstream CLIs (the
+  template's `main.rs.hbs:56` mirrors it). The blob model splits
+  this:
+
+* **`ConfigCmd` (bundled binary) carries `Validate` plus
   stub-pointer `Push` and `Diff` variants.** Clap parses
   them so `edgezero config push --help` lists the
   subcommands (otherwise operators get the confusing
   "unrecognized subcommand" message and don't know where to
   look). The match arms for `Push` / `Diff` print the
-  pointer message documented in §3.2.1 and exit with code
-  2. `Validate` does the real work via the raw flow.
-- **`TypedConfigCmd` (new, exported) gains `Push`, `Diff`,
+  pointer message documented in §3.2.1 and exit with code 2. `Validate` does the real work via the raw flow.
+* **`TypedConfigCmd` (new, exported) gains `Push`, `Diff`,
   `Validate`.** The arg structs (`ConfigPushArgs`,
   `ConfigValidateArgs`, new `ConfigDiffArgs`) STAY exported
   from `edgezero_cli::args` so downstream CLIs reuse them
   verbatim. The new enum is what generated CLIs put on their
   own `Command::Config(...)` arm.
-- **Generated CLI templates use `TypedConfigCmd`.** The
+* **Generated CLI templates use `TypedConfigCmd`.** The
   scaffold `main.rs.hbs` `match Command::Config(...)` arm
   expands to handle `Push` (via `run_config_push_typed::<C>`),
   `Diff` (via `run_config_diff_typed::<C>`), and `Validate`
@@ -2181,11 +2180,11 @@ fields in the typed struct; their VALUES at the operator's
 TOML are non-sensitive metadata, distinct from the runtime
 VALUES the handler sees through `cfg.<field>`:
 
-| Attribute                                  | TOML value                          | Runtime value                       |
-| ------------------------------------------ | ----------------------------------- | ----------------------------------- |
-| `#[secret] field: String`                  | secret-store KEY NAME               | resolved secret VALUE               |
-| `#[secret(store_ref = "vault")] field: String` | secret-store KEY NAME           | resolved secret VALUE from `cfg.vault` |
-| `#[secret(store_ref)] vault: String`       | `[stores.secrets].id`               | same id (unchanged)                 |
+| Attribute                                      | TOML value            | Runtime value                          |
+| ---------------------------------------------- | --------------------- | -------------------------------------- |
+| `#[secret] field: String`                      | secret-store KEY NAME | resolved secret VALUE                  |
+| `#[secret(store_ref = "vault")] field: String` | secret-store KEY NAME | resolved secret VALUE from `cfg.vault` |
+| `#[secret(store_ref)] vault: String`           | `[stores.secrets].id` | same id (unchanged)                    |
 
 In app-demo today:
 
@@ -2394,20 +2393,20 @@ checks. Every rule named elsewhere in the spec must
 appear here; if it's not in this table, the macro does
 NOT enforce it.
 
-| Check                                                              | Scope                | Action                          | When introduced     |
-| ------------------------------------------------------------------ | -------------------- | ------------------------------- | ------------------- |
-| `#[secret]` arguments are `[]` or `(store_ref)`                    | per `#[secret]` site | compile_error if other          | existing            |
-| `#[secret(...)]` only on `String` fields                           | per `#[secret]` site | compile_error if other type     | existing            |
-| `#[serde(rename_all)]` on container, IF the struct has any secret field | container       | compile_error                   | existing (per `crates/edgezero-macros/src/app_config.rs:55`) |
-| `#[secret(store_ref = "field")]` accepted                          | per `#[secret]` site | parsed into `KeyInNamedStore`   | **new (v1)**        |
-| `#[secret(store_ref = "field")]` names a sibling field             | per `#[secret]` site | compile_error if not found      | **new (v1)**        |
-| Named sibling has `#[secret(store_ref)]` annotation                | per `#[secret]` site | compile_error if not            | **new (v1)**        |
-| Named sibling is `String`                                          | per `#[secret]` site | compile_error if not            | **new (v1)**        |
-| `#[serde(rename)]` on any `#[secret*]` field                       | per field            | compile_error                   | **new (v1)**        |
-| `#[secret*]` annotations on nested struct fields                   | per field            | compile_error                   | **new (v1)**        |
-| `#[serde(skip_serializing)]` on ANY field of an `AppConfig` struct  | per field (secret OR non-secret) | compile_error      | **new (v1, round-10 H-2)** |
-| `#[serde(skip_serializing_if = "...")]` on ANY field of an `AppConfig` struct | per field   | compile_error                   | **new (v1, round-10 H-2)** |
-| `#[serde(flatten)]` on ANY field of an `AppConfig` struct          | per field            | compile_error                   | **new (v1, round-10 H-2)** |
+| Check                                                                         | Scope                            | Action                        | When introduced                                              |
+| ----------------------------------------------------------------------------- | -------------------------------- | ----------------------------- | ------------------------------------------------------------ |
+| `#[secret]` arguments are `[]` or `(store_ref)`                               | per `#[secret]` site             | compile_error if other        | existing                                                     |
+| `#[secret(...)]` only on `String` fields                                      | per `#[secret]` site             | compile_error if other type   | existing                                                     |
+| `#[serde(rename_all)]` on container, IF the struct has any secret field       | container                        | compile_error                 | existing (per `crates/edgezero-macros/src/app_config.rs:55`) |
+| `#[secret(store_ref = "field")]` accepted                                     | per `#[secret]` site             | parsed into `KeyInNamedStore` | **new (v1)**                                                 |
+| `#[secret(store_ref = "field")]` names a sibling field                        | per `#[secret]` site             | compile_error if not found    | **new (v1)**                                                 |
+| Named sibling has `#[secret(store_ref)]` annotation                           | per `#[secret]` site             | compile_error if not          | **new (v1)**                                                 |
+| Named sibling is `String`                                                     | per `#[secret]` site             | compile_error if not          | **new (v1)**                                                 |
+| `#[serde(rename)]` on any `#[secret*]` field                                  | per field                        | compile_error                 | **new (v1)**                                                 |
+| `#[secret*]` annotations on nested struct fields                              | per field                        | compile_error                 | **new (v1)**                                                 |
+| `#[serde(skip_serializing)]` on ANY field of an `AppConfig` struct            | per field (secret OR non-secret) | compile_error                 | **new (v1, round-10 H-2)**                                   |
+| `#[serde(skip_serializing_if = "...")]` on ANY field of an `AppConfig` struct | per field                        | compile_error                 | **new (v1, round-10 H-2)**                                   |
+| `#[serde(flatten)]` on ANY field of an `AppConfig` struct                     | per field                        | compile_error                 | **new (v1, round-10 H-2)**                                   |
 
 Notes on apparent contradictions resolved here:
 
@@ -2565,6 +2564,7 @@ extends as follows:
   open for v2 additions without a breaking trait rev,
   while letting `edgezero-cli` build the slice from
   outside the `edgezero-adapter` crate.
+
 - Trait doc + implementor docs updated to say "called
   per typed-secret key including `KeyInNamedStore`
   resolutions". Tests added under §12.5 to cover the
@@ -2802,14 +2802,14 @@ into an `EdgeError` variant based on what action the operator
 can take. The mapping below is comprehensive — every
 `SecretError` variant has a documented landing.
 
-| Extractor failure                                 | `SecretError`                       | `EdgeError`              | Why                                                                                                                                                                                |
-| ------------------------------------------------- | ----------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Secret-store ID unknown (no `[stores.secrets].id`) | none — caught before secret call    | `ConfigOutOfDate`        | Manifest declares the wrong store name OR the manifest wasn't redeployed. Re-push fixes it.                                                                                        |
-| Secret key not found in the named store           | `SecretError::NotFound`             | `ConfigOutOfDate`        | Operator forgot to provision the secret value. Re-run secret provisioning.                                                                                                         |
-| Store rejected the key shape (length, charset)    | `SecretError::Validation { .. }`    | `ConfigOutOfDate`        | The blob's key name is invalid for the named store (e.g. Fastly Secret Store keys are constrained). Operator either renames the secret-store key or fixes the `<name>.toml` value. |
-| Secret value is bytes, not UTF-8                  | `SecretError::Internal` (from `require_str`) | `Internal`     | The store CONTAINS the key but the bytes aren't a `String`. Data quality at rest; not deploy-related. Operator audits the secret-store entry directly.                             |
-| Secret store unreachable (transient network)      | `SecretError::Unavailable`          | `ServiceUnavailable`     | A flaky backend is not an out-of-date config — retry is the right response. Surfaces as HTTP 503; per §6.3.1 the `Retry-After: 60` header is NOT set on `ServiceUnavailable` in v1 (audit of existing producers showed too many non-retryable cases reuse the variant). |
-| Any other `SecretError::Internal`                 | `SecretError::Internal`             | `Internal`               | Unexpected store-side failure (an adapter bug, a wire-format change). Pages oncall; not actionable by deploy.                                                                      |
+| Extractor failure                                  | `SecretError`                                | `EdgeError`          | Why                                                                                                                                                                                                                                                                     |
+| -------------------------------------------------- | -------------------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Secret-store ID unknown (no `[stores.secrets].id`) | none — caught before secret call             | `ConfigOutOfDate`    | Manifest declares the wrong store name OR the manifest wasn't redeployed. Re-push fixes it.                                                                                                                                                                             |
+| Secret key not found in the named store            | `SecretError::NotFound`                      | `ConfigOutOfDate`    | Operator forgot to provision the secret value. Re-run secret provisioning.                                                                                                                                                                                              |
+| Store rejected the key shape (length, charset)     | `SecretError::Validation { .. }`             | `ConfigOutOfDate`    | The blob's key name is invalid for the named store (e.g. Fastly Secret Store keys are constrained). Operator either renames the secret-store key or fixes the `<name>.toml` value.                                                                                      |
+| Secret value is bytes, not UTF-8                   | `SecretError::Internal` (from `require_str`) | `Internal`           | The store CONTAINS the key but the bytes aren't a `String`. Data quality at rest; not deploy-related. Operator audits the secret-store entry directly.                                                                                                                  |
+| Secret store unreachable (transient network)       | `SecretError::Unavailable`                   | `ServiceUnavailable` | A flaky backend is not an out-of-date config — retry is the right response. Surfaces as HTTP 503; per §6.3.1 the `Retry-After: 60` header is NOT set on `ServiceUnavailable` in v1 (audit of existing producers showed too many non-retryable cases reuse the variant). |
+| Any other `SecretError::Internal`                  | `SecretError::Internal`                      | `Internal`           | Unexpected store-side failure (an adapter bug, a wire-format change). Pages oncall; not actionable by deploy.                                                                                                                                                           |
 
 The boundary between `ConfigOutOfDate` and `Internal` is:
 **does re-running `<app-cli> config push` (or its sibling
@@ -2991,11 +2991,11 @@ runtime extractor was the "only consumer of
 `load_app_config*`" — that was wrong; the runtime
 extractor doesn't touch TOML on disk at all):
 
-| Caller                                | Source                                                  | Path                                                                                                                       |
-| ------------------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `config push` / `config diff` / generated CLI `config validate` | `<name>.toml` on disk                                   | `deserialize_app_config_with_options(path, app_name, opts)` → `validate_excluding_secrets(&cfg)` → §3.3.2 structural checks |
-| Bundled raw `edgezero config validate`                          | `<name>.toml` on disk                                   | `load_app_config_raw(path, app_name)` (TOML round-trip, no `C`, no validators)                                             |
-| Runtime extractor (`AppConfig<C>`)                              | Envelope JSON STRING from `ConfigStore::get(key)`        | envelope parse → SHA verify → secret walk (per §3.3.3) → `serde_path_to_error::Deserializer` over the JSON `data` field → `Validate::validate(&cfg)`. The runtime path does NOT load TOML and does NOT apply the env overlay; the env overlay is a CLI-side notion that the operator's push run resolved into the blob. |
+| Caller                                                          | Source                                            | Path                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------------------------------------- | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `config push` / `config diff` / generated CLI `config validate` | `<name>.toml` on disk                             | `deserialize_app_config_with_options(path, app_name, opts)` → `validate_excluding_secrets(&cfg)` → §3.3.2 structural checks                                                                                                                                                                                             |
+| Bundled raw `edgezero config validate`                          | `<name>.toml` on disk                             | `load_app_config_raw(path, app_name)` (TOML round-trip, no `C`, no validators)                                                                                                                                                                                                                                          |
+| Runtime extractor (`AppConfig<C>`)                              | Envelope JSON STRING from `ConfigStore::get(key)` | envelope parse → SHA verify → secret walk (per §3.3.3) → `serde_path_to_error::Deserializer` over the JSON `data` field → `Validate::validate(&cfg)`. The runtime path does NOT load TOML and does NOT apply the env overlay; the env overlay is a CLI-side notion that the operator's push run resolved into the blob. |
 
 The CLI paths all share a `build_and_validate<C>` helper
 in `crates/edgezero-cli/src/config.rs` (sketch in §3.3.2).
@@ -3136,6 +3136,7 @@ below so any compliant implementation produces the same bytes.
   a secret field"; that's tracked as a v2 follow-up
   (Q14 in §11). The framework does NOT silently
   normalise.
+
 - **Numeric values:**
   - Integers (`i64` / `u64`): rendered as `<digits>`. No `+`
     sign, no leading zeros (except for `0` itself).
@@ -3149,70 +3150,72 @@ below so any compliant implementation produces the same bytes.
     values and produce false skip-on-equal matches across
     fundamentally different configs.
 
-    **Error variant — new `AppConfigError::InvalidValue`.**
-    The existing `AppConfigError::Validation` variant at
-    `crates/edgezero-core/src/app_config.rs:125` wraps
-    `Box<ValidationErrors>` — that's for
-    `Validate::validate()` rule failures (range / length /
-    regex / custom). Non-finite floats are a load-time
-    structural problem, not a validator-rule failure;
-    constructing a fake `ValidationErrors` with an owned
-    dotted-path key would be awkward AND would let
-    `validator`-shaped error rendering bleed into a
-    non-`validator` error path. The implementing PR adds:
+        **Error variant — new `AppConfigError::InvalidValue`.**
+        The existing `AppConfigError::Validation` variant at
+        `crates/edgezero-core/src/app_config.rs:125` wraps
+        `Box<ValidationErrors>` — that's for
+        `Validate::validate()` rule failures (range / length /
+        regex / custom). Non-finite floats are a load-time
+        structural problem, not a validator-rule failure;
+        constructing a fake `ValidationErrors` with an owned
+        dotted-path key would be awkward AND would let
+        `validator`-shaped error rendering bleed into a
+        non-`validator` error path. The implementing PR adds:
 
-    ```rust
-    #[error("invalid value at {field_path} in {}: {message}", path.display())]
-    InvalidValue {
-        path: PathBuf,
-        /// Dotted path of the offending leaf, e.g.
-        /// `"service.ratio"`. Joined from the env-overlay
-        /// segment stack (`["service", "ratio"]`) so the
-        /// same path format works for both load paths.
-        field_path: String,
-        /// Human-readable reason, e.g. `"non-finite f64
-        /// value `NaN` is not representable in canonical
-        /// form"`.
-        message: String,
-    },
-    ```
+        ```rust
+        #[error("invalid value at {field_path} in {}: {message}", path.display())]
+        InvalidValue {
+            path: PathBuf,
+            /// Dotted path of the offending leaf, e.g.
+            /// `"service.ratio"`. Joined from the env-overlay
+            /// segment stack (`["service", "ratio"]`) so the
+            /// same path format works for both load paths.
+            field_path: String,
+            /// Human-readable reason, e.g. `"non-finite f64
+            /// value `NaN` is not representable in canonical
+            /// form"`.
+            message: String,
+        },
+        ```
 
-    Tests assert the variant + the `field_path` + a
-    substring of `message` (`"NaN"`, `"inf"`, or
-    `"-inf"`); no `ValidationErrors` construction is
-    needed.
+        Tests assert the variant + the `field_path` + a
+        substring of `message` (`"NaN"`, `"inf"`, or
+        `"-inf"`); no `ValidationErrors` construction is
+        needed.
 
-    The check runs in two places to cover both load
-    paths:
-    1. **TOML deserialise.** The loader
-       (`load_app_config_raw_with_options` at
-       `crates/edgezero-core/src/app_config.rs:242`) walks
-       the parsed `toml::Value` tree after env overlay and
-       calls `f64::is_finite()` on every float leaf. The
-       first non-finite hit produces
-       `AppConfigError::InvalidValue { path, field_path,
-       message }`.
+        The check runs in two places to cover both load
+        paths:
+        1. **TOML deserialise.** The loader
+           (`load_app_config_raw_with_options` at
+           `crates/edgezero-core/src/app_config.rs:242`) walks
+           the parsed `toml::Value` tree after env overlay and
+           calls `f64::is_finite()` on every float leaf. The
+           first non-finite hit produces
+           `AppConfigError::InvalidValue { path, field_path,
+
+    message }`.
     2. **Env overlay coercion.** The overlay's float
        parser at
-       `crates/edgezero-core/src/app_config.rs:298` calls
-       `parse::<f64>()` which accepts `nan` / `inf` /
-       `-inf`; the implementing PR adds an
-       `is_finite()` check IMMEDIATELY after the parse,
-       erroring with the same `InvalidValue` variant.
+       `crates/edgezero-core/src/app_config.rs:298`calls
+      `parse::<f64>()`which accepts`nan`/`inf`/
+      `-inf`; the implementing PR adds an
+       `is_finite()`check IMMEDIATELY after the parse,
+       erroring with the same`InvalidValue`variant.
        Without this, an env var
-       `<APP>__FEATURE__RATIO=nan` would silently flow
-       through the overlay AND through `serde_json::to_value`
-       into a `null` in the canonical form.
+      `<APP>**FEATURE**RATIO=nan`would silently flow
+       through the overlay AND through`serde_json::to_value`       into a`null` in the canonical form.
 
-    The rejection happens BEFORE `serde_json::to_value`
-    runs, so the canonicaliser never sees a non-finite
-    float. §12.1 adds tests for both paths (TOML
-    literal, env overlay) per the round-15 B-2 finding +
-    round-16 I-2 concretisation.
+        The rejection happens BEFORE `serde_json::to_value`
+        runs, so the canonicaliser never sees a non-finite
+        float. §12.1 adds tests for both paths (TOML
+        literal, env overlay) per the round-15 B-2 finding +
+        round-16 I-2 concretisation.
+
   - **Type identity matters.** If the source TOML's `1500` is
     typed as `i64` in `AppConfig`, the canonical form is `1500`.
     If typed as `f64`, it's `1500.0`. The runtime's struct
     decides — push and read MUST use the same struct.
+
 - **Booleans:** `true` / `false` lowercase.
 - **`null`:** the literal `null`. Empty `Option<T>` fields
   are written as `null` in canonical form (NOT omitted),
@@ -3284,7 +3287,7 @@ for EACH of the three banned attributes:
 - A struct with `#[serde(skip_serializing)]` on a
   non-secret field.
 - A struct with `#[serde(skip_serializing_if =
-  "Option::is_none")]` on a non-secret field.
+"Option::is_none")]` on a non-secret field.
 - A struct with `#[serde(flatten)]` on a non-secret
   field.
 
@@ -3314,7 +3317,7 @@ fn canonical_data_sha256(data: &serde_json::Value) -> String {
   canonicaliser crate. Round-21 reviewer ran a probe
   against `serde_canonical_json` v1.0.0 and found it
   REJECTS finite floats (`Floating point numbers are
-  forbidden`); the §4.2 rules explicitly support
+forbidden`); the §4.2 rules explicitly support
   finite `f64` via `ryu` (see "Numeric values" above),
   so the external crate cannot implement this spec
   unchanged. Earlier drafts left the external-vs-
@@ -3332,7 +3335,7 @@ fn canonical_data_sha256(data: &serde_json::Value) -> String {
      `crates/edgezero-core/src/canonical_form.rs` (or
      `.../canonical_form/mod.rs`) exists and exposes
      `canonical_data_sha256(&serde_json::Value) ->
-     String` matching the §4.2 rules. It depends only
+String` matching the §4.2 rules. It depends only
      on `serde_json` (already in-tree), `ryu` (for
      finite-float rendering — round-trippable
      shortest form), and `sha2`.
@@ -3393,6 +3396,7 @@ fn canonical_data_sha256(data: &serde_json::Value) -> String {
   fails and the bump turns into a forcing function: either roll
   back, OR bump the envelope `version` field (§4.1) to signal
   to all readers that the canonical-form rule changed.
+
 - The envelope `version` field is co-versioned with the
   canonical-form rules. `version: 1` MEANS the rules above
   PLUS the implementing PR's pinned canonicaliser version.
@@ -3405,12 +3409,12 @@ fn canonical_data_sha256(data: &serde_json::Value) -> String {
 When the runtime reads the blob:
 
 1. Deserialise the envelope into `BlobEnvelope { data, sha256,
-   version, .. }`. Unknown envelope versions error with a
+version, .. }`. Unknown envelope versions error with a
    pointer at the migration guide.
 2. Recompute `canonical_data_sha256(&data)`.
 3. If it doesn't match the stored `sha256`, return
    `ConfigStoreError::internal("blob sha mismatch: stored {hex}
-   != computed {hex}")` (the existing `internal(...)`
+!= computed {hex}")` (the existing `internal(...)`
    constructor at `config_store.rs:180`; see §6.3 for the
    reasoning behind keeping this on `Internal` instead of
    adding a new variant) and DO NOT proceed. The runtime
@@ -3527,12 +3531,12 @@ Examples:
 
 **Precedence table** (highest wins):
 
-| Source                                                       | Effect                                       |
-| ------------------------------------------------------------ | -------------------------------------------- |
+| Source                                                           | Effect                                       |
+| ---------------------------------------------------------------- | -------------------------------------------- |
 | `AppConfig::<C>::named(req, "k")` / `from_store(..., Some("k"))` | Explicit per-call key — wins over everything |
-| `EDGEZERO__STORES__CONFIG__<ID>__KEY=<val>` (non-empty)       | Per-id runtime override                      |
-| `[stores.config].default` mapped to a key                    | Manifest default for the logical id          |
-| (none)                                                       | Use the logical id literal as the key        |
+| `EDGEZERO__STORES__CONFIG__<ID>__KEY=<val>` (non-empty)          | Per-id runtime override                      |
+| `[stores.config].default` mapped to a key                        | Manifest default for the logical id          |
+| (none)                                                           | Use the logical id literal as the key        |
 
 **Whitespace / empty handling.** Matches the existing `__NAME`
 fall-back rule: if the env value is empty, whitespace-only, or
@@ -3755,13 +3759,13 @@ registry()` accessors — currently returns
 `BoundConfigStore` (= `ConfigStoreHandle`) directly. Under
 the binding change:
 
-| Method                       | Before (today)                       | After (this spec)                                                                                                              |
-| ---------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
-| `Config::default()`          | `Option<ConfigStoreHandle>`          | `Option<ConfigStoreHandle>` — unchanged. Internally `self.0.default().map(|b| b.handle)`. Hand-managed `bound.get(...)` works unchanged. |
-| `Config::named(id)`          | `Option<ConfigStoreHandle>`          | `Option<ConfigStoreHandle>` — same unwrap.                                                                                     |
-| `Config::registry()`         | `&StoreRegistry<ConfigStoreHandle>`  | `&StoreRegistry<ConfigStoreBinding>` — **breaking** for any caller that destructured the registry value. Hard cutoff per §1.   |
-| `Config::default_binding()`  | (didn't exist)                       | `Option<&ConfigStoreBinding>` — new accessor for callers that want the resolved `__KEY`.                                       |
-| `Config::named_binding(id)`  | (didn't exist)                       | `Option<&ConfigStoreBinding>` — new accessor (named variant).                                                                  |
+| Method                      | Before (today)                      | After (this spec)                                                                                                            |
+| --------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | --- | ---------------------------------------------------------- |
+| `Config::default()`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — unchanged. Internally `self.0.default().map(                                                   | b   | b.handle)`. Hand-managed `bound.get(...)` works unchanged. |
+| `Config::named(id)`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — same unwrap.                                                                                   |
+| `Config::registry()`        | `&StoreRegistry<ConfigStoreHandle>` | `&StoreRegistry<ConfigStoreBinding>` — **breaking** for any caller that destructured the registry value. Hard cutoff per §1. |
+| `Config::default_binding()` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor for callers that want the resolved `__KEY`.                                     |
+| `Config::named_binding(id)` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor (named variant).                                                                |
 
 `BoundConfigStore` stays as the `ConfigStoreHandle` alias —
 NOT redefined to `ConfigStoreBinding`. That keeps the
@@ -3787,11 +3791,11 @@ The reviewer pointed at three options: env config in request
 extensions, extend `StoreRegistry`, or generate a key
 resolver via the `app!` macro. Trade-offs:
 
-| Option                          | Cost                                                                 | Why rejected                                                                                                                                          |
-| ------------------------------- | -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `EnvConfig` in request extensions | Hot data on every request; lookup cost per extract                   | Re-reads env on every request. Adapters already do this once at startup; duplicating per request wastes work.                                          |
+| Option                              | Cost                                                                  | Why rejected                                                                                                                                           |
+| ----------------------------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `EnvConfig` in request extensions   | Hot data on every request; lookup cost per extract                    | Re-reads env on every request. Adapters already do this once at startup; duplicating per request wastes work.                                          |
 | **Extend `StoreRegistry`** (chosen) | One new field on the registry value; one env lookup per id at startup | Caches the resolution; extractor reads from registry like every other store lookup.                                                                    |
-| `app!` macro emits a const map  | Compile-time const                                                   | Env can't be compile-time. The macro would need to emit a `LazyLock<HashMap>` populated at first request, plus the macro grows runtime-config surface. |
+| `app!` macro emits a const map      | Compile-time const                                                    | Env can't be compile-time. The macro would need to emit a `LazyLock<HashMap>` populated at first request, plus the macro grows runtime-config surface. |
 
 Extending `StoreRegistry` keeps the change localised to the
 adapters' registry-build code + the registry type itself,
@@ -3928,7 +3932,7 @@ where
   because the extractor relies on it).
 - `Validate` (from `validator`) — the extractor calls
   `cfg.validate()` after deserialising. Matches what `config
-  validate --strict` runs at push time, so env-overlay drift
+validate --strict` runs at push time, so env-overlay drift
   (a manifest-side value silently overriding a typed field
   past its declared bounds) becomes a runtime error rather
   than a silent acceptance. See §6.3.1 for the decision.
@@ -4023,18 +4027,17 @@ The extractor surfaces:
   `EdgeError::ConfigOutOfDate` (Q3 (d) per round-18
   M-2, restated here for §6.3 hard-cutoff). HTTP 503
   with `Retry-After: 60`. Message: `missing typed
-  app-config blob at key \`<key>\` — run \`<app-cli>
+app-config blob at key \`<key>\` — run \`<app-cli>
   config push\` for this deploy`. Rationale: a missing
-  typed-app-config blob is operationally
-  indistinguishable from "the operator didn't run
-  `config push` yet" — which is exactly the
-  `ConfigOutOfDate` class ("re-run config push fixes
-  it"). Mapping to `Internal` would page oncall on a
-  push-fixable condition; mapping to `NotFound` (404)
-  would imply the URL is wrong, which it isn't. A
-  future `MaybeAppConfig<C>` → `Option<C>` extractor
-  (Q3 (c)) could remap this for endpoints that want
-  explicit defaults; v1 ships with `ConfigOutOfDate`
+typed-app-config blob is operationally
+indistinguishable from "the operator didn't run
+`config push`yet" — which is exactly the`ConfigOutOfDate`class ("re-run config push fixes
+it"). Mapping to`Internal`would page oncall on a
+push-fixable condition; mapping to`NotFound`(404)
+would imply the URL is wrong, which it isn't. A
+future`MaybeAppConfig<C>`→`Option<C>`extractor
+(Q3 (c)) could remap this for endpoints that want
+explicit defaults; v1 ships with`ConfigOutOfDate`
   and no opt-out.
 
 **Implementation note — `ConfigStoreError` to `EdgeError`
@@ -4042,13 +4045,13 @@ mapping.** `ConfigStoreError` (`config_store.rs:165`) has only
 three variants today: `Internal`, `InvalidKey`, `Unavailable`.
 The extractor maps:
 
-| ConfigStoreError                     | EdgeError              | HTTP | Notes                                                                                                                                                                                                                                       |
-| ------------------------------------ | ---------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Unavailable`                        | `ServiceUnavailable`   | 503  | Transient backend issue.                                                                                                                                                                                                                    |
-| `Internal` (sha mismatch)            | `Internal`             | 500  | Drift or corruption — the stored sha doesn't match canonical recompute.                                                                                                                                                                     |
-| `Internal` (envelope parse failure)  | `Internal`             | 500  | Envelope `version` unrecognised or shape unexpected.                                                                                                                                                                                       |
-| `InvalidKey`                         | `BadRequest`           | 400  | Adapter rejected the key shape.                                                                                                                                                                                                            |
-| _missing key_ (`Ok(None)` from `get`) | `ConfigOutOfDate`      | 503  | NOT a `ConfigStoreError` variant — caught at the extractor's `ok_or_else` after `ConfigStore::get` returns `Ok(None)`. Round-18 M-2 reversal: was `Internal` in earlier drafts; the new mapping matches Q3 (d) + §3.3.3's extractor sketch. |
+| ConfigStoreError                      | EdgeError            | HTTP | Notes                                                                                                                                                                                                                                       |
+| ------------------------------------- | -------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Unavailable`                         | `ServiceUnavailable` | 503  | Transient backend issue.                                                                                                                                                                                                                    |
+| `Internal` (sha mismatch)             | `Internal`           | 500  | Drift or corruption — the stored sha doesn't match canonical recompute.                                                                                                                                                                     |
+| `Internal` (envelope parse failure)   | `Internal`           | 500  | Envelope `version` unrecognised or shape unexpected.                                                                                                                                                                                        |
+| `InvalidKey`                          | `BadRequest`         | 400  | Adapter rejected the key shape.                                                                                                                                                                                                             |
+| _missing key_ (`Ok(None)` from `get`) | `ConfigOutOfDate`    | 503  | NOT a `ConfigStoreError` variant — caught at the extractor's `ok_or_else` after `ConfigStore::get` returns `Ok(None)`. Round-18 M-2 reversal: was `Internal` in earlier drafts; the new mapping matches Q3 (d) + §3.3.3's extractor sketch. |
 
 Plus the new `ConfigOutOfDate` variant `EdgeError` gains as part
 of this work; no new variant on `ConfigStoreError` is needed.
@@ -4125,12 +4128,12 @@ ALREADY used for several non-config-related conditions
 where a tight client retry would be actively harmful or
 just noisy:
 
-| Producer                                                  | Condition                                | Retry-After:60 helpful?                      |
-| --------------------------------------------------------- | ---------------------------------------- | -------------------------------------------- |
-| `crates/edgezero-core/src/error.rs:119`                   | config-store unavailability              | yes — a rolling re-push converges in <60s    |
-| `crates/edgezero-core/src/key_value_store.rs:708`         | KV size / count limit exceeded           | NO — the request keeps failing until the operator drops data; client retry just wastes RPS |
-| `examples/app-demo/crates/app-demo-core/src/handlers.rs:185` | missing NAMED kv store (manifest gap) | NO — the binding is missing; retry won't fix |
-| `examples/app-demo/crates/app-demo-core/src/handlers.rs:285` | missing default secret store          | NO — same: manifest gap, retry won't fix     |
+| Producer                                                     | Condition                             | Retry-After:60 helpful?                                                                    |
+| ------------------------------------------------------------ | ------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `crates/edgezero-core/src/error.rs:119`                      | config-store unavailability           | yes — a rolling re-push converges in <60s                                                  |
+| `crates/edgezero-core/src/key_value_store.rs:708`            | KV size / count limit exceeded        | NO — the request keeps failing until the operator drops data; client retry just wastes RPS |
+| `examples/app-demo/crates/app-demo-core/src/handlers.rs:185` | missing NAMED kv store (manifest gap) | NO — the binding is missing; retry won't fix                                               |
+| `examples/app-demo/crates/app-demo-core/src/handlers.rs:285` | missing default secret store          | NO — same: manifest gap, retry won't fix                                                   |
 
 Adding `Retry-After: 60` to every `ServiceUnavailable`
 would lie to clients in three of four cases. The blob
@@ -4375,7 +4378,7 @@ Behaviour:
    against the resolved values.
 2. Serialise to the canonical `data` form and compute the local sha.
 3. Read the remote blob from the configured `[stores.config]` id
-   + adapter. Extract `sha256` and `data` from the envelope.
+   - adapter. Extract `sha256` and `data` from the envelope.
 4. If local sha == remote sha: print
    `# no changes (sha256 matches: 1f3a…b9)` and exit 0.
 5. Else: compute a structural diff between the two `data` objects
@@ -4433,7 +4436,7 @@ under one parent.
   "removed": {},
   "changed": {
     "feature.new_checkout": { "from": false, "to": true },
-    "service.timeout_ms":   { "from": 1500,  "to": 2000 }
+    "service.timeout_ms": { "from": 1500, "to": 2000 }
   }
 }
 ```
@@ -4508,7 +4511,7 @@ Default flow:
   Read-back + skip-on-equal still run; the prompt is
   only shown if there are changes. Useful when the
   operator already inspected the diff via `config
-  diff`.
+diff`.
 - `--dry-run --yes`: `--dry-run` wins. The diff renders,
   no write happens. `--yes` is a no-op in this
   combination.
@@ -4528,14 +4531,14 @@ push. Per adapter:
   key, return the envelope JSON string. Missing file →
   `MissingStore`. Missing key in present file → `MissingKey`.
 - **Cloudflare**: `wrangler kv key get --binding <BINDING>
-  <KEY> --remote` for read-back. (Note: as of Wrangler 4.x
+<KEY> --remote` for read-back. (Note: as of Wrangler 4.x
   the subcommand path is `wrangler kv key get` /
   `wrangler kv key put` / `wrangler kv key list` — the
   earlier short forms `wrangler kv get` etc. are deprecated.
   Implementation pins the four-segment form.) With
   `--local`, reads from `.wrangler/state` instead. The push
   side keeps the existing `wrangler kv bulk put
-  --namespace-id=<id> --remote` form at
+--namespace-id=<id> --remote` form at
   `crates/edgezero-adapter-cloudflare/src/cli.rs:289` —
   the binding-name-based `kv key get` for read-back is OK
   because read-back is one key at a time, but the push
@@ -4543,7 +4546,7 @@ push. Per adapter:
   pre-resolved namespace id (per `cli.rs:289`'s comment
   about wrangler v4's silent local fallback).
 - **Fastly**: `fastly config-store-entry describe --store-id=<id>
-  --key=<key> --json`. Returns the value as a string field; parse
+--key=<key> --json`. Returns the value as a string field; parse
   to JSON.
 - **Spin (local)**: read directly from
   `<spin.toml dir>/.spin/sqlite_key_value.db` via the vendored
@@ -4579,12 +4582,12 @@ push. Per adapter:
   to four when `--dry-run` was added; the prose count
   is updated accordingly):
 
-  | Caller environment        | Behaviour                                                                                                                              |
-  | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-  | `--dry-run`               | Exit non-zero with: `config push --dry-run --adapter spin against Spin Cloud is unsupported (no remote read-back; re-run with --local for the on-disk SQLite write or drop --dry-run to write unconditionally with --yes)`. The flag's contract is "show the diff", but Spin Cloud has no remote read to compute the diff against; the framework refuses rather than printing a half-truth. |
-  | `--yes` (or `-y`) set     | Write unconditionally. No prompt, no diff render. Output names the skip-on-equal absence.                                              |
-  | TTY without `--yes`       | Prompt with: `cannot read remote on Spin Cloud (no get subcommand); write anyway? [y/N]`. `y` proceeds. `n` exits non-zero.            |
-  | Non-TTY without `--yes`   | Exit non-zero with: `Spin Cloud read-back unsupported; pass --yes for non-interactive runs (the push writes unconditionally)`.         |
+  | Caller environment      | Behaviour                                                                                                                                                                                                                                                                                                                                                                                   |
+  | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `--dry-run`             | Exit non-zero with: `config push --dry-run --adapter spin against Spin Cloud is unsupported (no remote read-back; re-run with --local for the on-disk SQLite write or drop --dry-run to write unconditionally with --yes)`. The flag's contract is "show the diff", but Spin Cloud has no remote read to compute the diff against; the framework refuses rather than printing a half-truth. |
+  | `--yes` (or `-y`) set   | Write unconditionally. No prompt, no diff render. Output names the skip-on-equal absence.                                                                                                                                                                                                                                                                                                   |
+  | TTY without `--yes`     | Prompt with: `cannot read remote on Spin Cloud (no get subcommand); write anyway? [y/N]`. `y` proceeds. `n` exits non-zero.                                                                                                                                                                                                                                                                 |
+  | Non-TTY without `--yes` | Exit non-zero with: `Spin Cloud read-back unsupported; pass --yes for non-interactive runs (the push writes unconditionally)`.                                                                                                                                                                                                                                                              |
 
   This preserves §8.2's invariant that non-TTY pushes
   require explicit confirmation, while letting interactive
@@ -4597,7 +4600,7 @@ push. Per adapter:
   (the `--dry-run` and non-TTY-without-`--yes` branches
   exit non-zero before any write):
   `pushed N entries to Spin Cloud (skip-on-equal unavailable;
-  remote sha not readable)`.
+remote sha not readable)`.
 
   This requires a new `ReadConfigEntry::Unsupported` variant
   on the enum at §9.0; missing this would force adapters to
@@ -4608,7 +4611,7 @@ push. Per adapter:
 
   Follow-up (not v1): wire the Fermyon Cloud HTTP API for
   read-back, OR petition upstream to add `spin cloud
-  key-value get`. Either unblocks Spin Cloud diff +
+key-value get`. Either unblocks Spin Cloud diff +
   skip-on-equal in a future PR.
 
 ## 9. Per-adapter implementation
@@ -4731,7 +4734,7 @@ Missing-remote semantics:
   every local leaf with a `+`.
 - `MissingStore`: same as `MissingKey` but the header line
   ALSO says "store has no matching backend yet — run `edgezero
-  provision --adapter <name>` first if this is the live remote".
+provision --adapter <name>` first if this is the live remote".
 
 `config push` short-circuits the skip-on-equal CHECK
 whenever the read returns anything but `Present` (no remote
@@ -4773,7 +4776,7 @@ parsing inside the adapter.
 
 ```json
 {
-  "app_config":         "{\"data\":{...},\"sha256\":\"1f3a…\",\"version\":1,\"generated_at\":\"2026-06-16T18:42:31Z\"}",
+  "app_config": "{\"data\":{...},\"sha256\":\"1f3a…\",\"version\":1,\"generated_at\":\"2026-06-16T18:42:31Z\"}",
   "app_config_staging": "{\"data\":{...},\"sha256\":\"a472…\",\"version\":1,\"generated_at\":\"2026-06-16T18:51:02Z\"}"
 }
 ```
@@ -4799,7 +4802,7 @@ parsing inside the adapter.
   ```
 
   The string form keeps the per-adapter `ConfigStore::get ->
-  Option<String>` contract intact across all four adapters —
+Option<String>` contract intact across all four adapters —
   storing nested JSON objects would force the Axum store to
   re-serialise on every `get`, AND would require the extractor
   to know Axum's file shape. The string form sidesteps both.
@@ -4807,7 +4810,7 @@ parsing inside the adapter.
 - The existing per-id file path (`local-config-<id>.json`)
   stays — it's per-id, not per-key. Per-key resolution happens
   INSIDE the file. This means `[stores.config].ids = ["a",
-  "b"]` produces TWO files (`local-config-a.json`,
+"b"]` produces TWO files (`local-config-a.json`,
   `local-config-b.json`), each of which can hold multiple
   environment blobs as map entries.
 - File layout: project-root discovery (PR #269 F7) already
@@ -4823,7 +4826,7 @@ parsing inside the adapter.
 ### 9.2 Cloudflare
 
 - Push: serialise envelope → JSON string → `wrangler kv
-  bulk put <tempfile.json> --namespace-id=<id> --remote`
+bulk put <tempfile.json> --namespace-id=<id> --remote`
   (the same form
   `crates/edgezero-adapter-cloudflare/src/cli.rs:289`
   already uses for per-leaf writes; the blob is now ONE
@@ -4839,7 +4842,7 @@ parsing inside the adapter.
 - Runtime: `CloudflareConfigStore::get(key)` returns the JSON
   string; the `AppConfig<C>` extractor parses + verifies.
 - `--local` push: `wrangler kv bulk put <tempfile.json>
-  --binding <BINDING> --local` — lands in
+--binding <BINDING> --local` — lands in
   `.wrangler/state`. Local push deliberately addresses by
   BINDING name (not by namespace id) per
   `crates/edgezero-adapter-cloudflare/src/cli.rs:399`:
@@ -4860,14 +4863,14 @@ parsing inside the adapter.
 
 - Push: serialise envelope → JSON string →
   `fastly config-store-entry update --store-id=<id> --key=<key>
-  --upsert --stdin` (PR #269 round 2 F4 already wired `--upsert
-  --stdin`; we just write one key now).
+--upsert --stdin` (PR #269 round 2 F4 already wired `--upsert
+--stdin`; we just write one key now).
 - Runtime: `FastlyConfigStore::get(key)` returns the JSON value;
   extractor parses.
 - Local server: `[local_server.config_stores.<id>]` now has ONE
   entry — the blob key. PR #269 F6 already moved local-server
   seeding to `config push --local`; this just writes one `key =
-  "<json blob>"` line.
+"<json blob>"` line.
 
 ### 9.4 Spin
 
@@ -4875,7 +4878,7 @@ parsing inside the adapter.
   via the vendored `spin_key_value` schema. One INSERT statement,
   one (store, key) tuple, one VALUE (the JSON blob).
 - Push (Cloud): `spin cloud key-value set --app <APP> --label
-  <LABEL> <KEY>=<JSON>`. Single shellout, no chunking needed (the
+<LABEL> <KEY>=<JSON>`. Single shellout, no chunking needed (the
   chunking was for many `key=value` pairs; we have one).
 
   **Argv exposure trade-off.** Unlike Fastly's
@@ -4892,7 +4895,7 @@ parsing inside the adapter.
     `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`:
     `MAX_ARGV_BYTES_PER_INVOCATION = 96 * 1024` (98 304 bytes).
     The per-pair check is `pair.len() >=
-    MAX_ARGV_BYTES_PER_INVOCATION` where `pair` is
+MAX_ARGV_BYTES_PER_INVOCATION` where `pair` is
     `<KEY>=<VALUE>` — under the blob model the key is the
     logical id (e.g. `app_config`, 10 bytes) plus `=` plus
     the entire envelope JSON string, so the EFFECTIVE blob
@@ -4930,7 +4933,7 @@ parsing inside the adapter.
 
   **Follow-up paths** (not v1):
   - File an upstream Spin issue requesting `spin cloud
-    key-value set --stdin` or `--from-file`.
+key-value set --stdin` or `--from-file`.
   - When/if it lands, switch the writer over and remove the
     size cap.
   - Until then, operators with larger configs can either
@@ -5006,7 +5009,7 @@ files to change:
   secret; the TOML value is the secret-store key name".
 - **Source-of-truth TOML.**
   `examples/app-demo/app-demo.toml` — `api_token =
-  "demo_api_token"` stays as-is (still a secret-store key
+"demo_api_token"` stays as-is (still a secret-store key
   name AT REST). Comments updated to reflect "the loader
   serialises this whole file to a single JSON blob written
   under key `app_config`; at runtime, the framework swaps
@@ -5024,7 +5027,7 @@ files to change:
   2. **Secret resolution drops out of handler code.** The
      current secret-store lookup at `handlers.rs:287`
      (`ctx.secret_store(&cfg.vault)?.require_str
-     (&cfg.api_token)`, plus any sibling call sites) is
+(&cfg.api_token)`, plus any sibling call sites) is
      REMOVED. The handler uses `cfg.api_token` DIRECTLY —
      the framework's secret walk (§3.3.3, §4.3) populated
      it at extract time.
@@ -5035,6 +5038,7 @@ files to change:
   The grep gate (§10.2.1) Patterns 1-3 catch each removal
   category; the positive `AppConfig` import check confirms
   the new extractor wired in.
+
 - **Typed-push tests.**
   `examples/app-demo/crates/app-demo-cli/tests/config_flow.rs`
   (and any sibling test files) — assertions move from "the
@@ -5057,7 +5061,7 @@ files to change:
   (PR #269 F5); that command's writer is what changes shape.
 - **Per-adapter manifests.**
   `examples/app-demo/crates/app-demo-adapter-{fastly,
-  cloudflare, spin}/{fastly,wrangler,spin}.toml` — local-server
+cloudflare, spin}/{fastly,wrangler,spin}.toml` — local-server
   / per-adapter store declarations that hold a snapshot of the
   typed config (Fastly's `[local_server.config_stores]`,
   Spin's `runtime-config.toml`) re-shape to hold the single
@@ -5097,34 +5101,34 @@ files to change:
     `run_config_validate_typed::<C>`. **Implementation
     phasing note (round-26 M-1):** §13's atomic cutover
     commits the runtime extractor + writers + app-demo
-    + scaffold templates together, but `ConfigDiffArgs`
-    + `run_config_diff_typed` are a post-cutover
-    additive (§13 Commit D). To keep the cutover
-    commit's scaffold output compilable, the cutover
-    commit ships the template's `TypedConfigCmd` enum
-    declaring `Push(ConfigPushArgs)` +
-    `Validate(ConfigValidateArgs)` ONLY; the same
-    commit that ships `ConfigDiffArgs` +
-    `run_config_diff_typed` (Commit D) adds the
-    `Diff(ConfigDiffArgs)` variant + dispatch arm to
-    this template. Net effect: a generated project from
-    Commit C has `config push` + `config validate`; a
-    generated project from Commit D adds `config diff`
-    purely additively. The bundled `edgezero` binary's
-    `main.rs` (NOT a template; lives at
-    `crates/edgezero-cli/src/main.rs`) keeps `Push` and
-    `Diff` as STUB-POINTER TUPLE-variant arms whose
-    tuple element is the hidden catch-all
-    `ConfigCmdStubArgs` (per §3.2.2) — the match arms
-    print the typed-CLI pointer and exit 2; the
-    catch-all absorbs whatever flags clap saw, and
-    `after_help` attached to each variant covers the
-    explicit `--help` path. NOT `ConfigPushArgs` /
-    `ConfigDiffArgs` (those are the typed-CLI Args
-    structs). Note that the bundled binary's stub
-    variants stay STABLE across Commit C and Commit D
-    — only the SCAFFOLD template's `TypedConfigCmd`
-    enum grows the new variant in Commit D.
+    - scaffold templates together, but `ConfigDiffArgs`
+    - `run_config_diff_typed` are a post-cutover
+      additive (§13 Commit D). To keep the cutover
+      commit's scaffold output compilable, the cutover
+      commit ships the template's `TypedConfigCmd` enum
+      declaring `Push(ConfigPushArgs)` +
+      `Validate(ConfigValidateArgs)` ONLY; the same
+      commit that ships `ConfigDiffArgs` +
+      `run_config_diff_typed` (Commit D) adds the
+      `Diff(ConfigDiffArgs)` variant + dispatch arm to
+      this template. Net effect: a generated project from
+      Commit C has `config push` + `config validate`; a
+      generated project from Commit D adds `config diff`
+      purely additively. The bundled `edgezero` binary's
+      `main.rs` (NOT a template; lives at
+      `crates/edgezero-cli/src/main.rs`) keeps `Push` and
+      `Diff` as STUB-POINTER TUPLE-variant arms whose
+      tuple element is the hidden catch-all
+      `ConfigCmdStubArgs` (per §3.2.2) — the match arms
+      print the typed-CLI pointer and exit 2; the
+      catch-all absorbs whatever flags clap saw, and
+      `after_help` attached to each variant covers the
+      explicit `--help` path. NOT `ConfigPushArgs` /
+      `ConfigDiffArgs` (those are the typed-CLI Args
+      structs). Note that the bundled binary's stub
+      variants stay STABLE across Commit C and Commit D
+      — only the SCAFFOLD template's `TypedConfigCmd`
+      enum grows the new variant in Commit D.
   - **`root/edgezero.toml.hbs`** — comments around the
     generated `[stores.config]` block call out that the
     config store now carries a single key (default
@@ -5145,7 +5149,7 @@ files to change:
 
   The generated-project compile gate
   (`cargo test -p edgezero-cli --test
-  generated_project_builds -- --ignored`) confirms the
+generated_project_builds -- --ignored`) confirms the
   rendered output still compiles under the new templates.
   The grep gate (§10.2.1) ALSO scopes
   `crates/edgezero-cli/src/templates` and
@@ -5457,7 +5461,7 @@ The gate has two false-positive fixes baked in (both from
 round-6 review):
 
 - **Comment-skip uses `:\s*//` anchor**, not `^\s*//`. `grep
-  -rEn` prefixes every line with `path:line:`, so an `^`
+-rEn` prefixes every line with `path:line:`, so an `^`
   anchor can never see whitespace+`//` — the old filter was
   silently inert. The colon-then-whitespace pattern survives
   the prefix.
@@ -5488,9 +5492,10 @@ introducing the new extractor.
 
 CI wires this as the LAST step in the test workflow, so it
 runs after `cargo test` proves the structural change compiles
-+ tests pass. The pre-PR-#269 review process taught us that
-"did you migrate everything?" is a question the reviewer
-keeps re-asking; this gate answers it deterministically.
+
+- tests pass. The pre-PR-#269 review process taught us that
+  "did you migrate everything?" is a question the reviewer
+  keeps re-asking; this gate answers it deterministically.
 
 ### 10.2.2 Scaffold template changes — concrete content
 
@@ -5754,7 +5759,7 @@ For every `.hbs` file listed above, the implementer asserts:
 2. The grep gate (§10.2.1) finds no legacy patterns in
    the rendered output.
 3. `cargo test -p edgezero-cli --test
-   generated_project_builds -- --ignored` (the existing
+generated_project_builds -- --ignored` (the existing
    end-to-end render-and-build test) passes.
 
 ### 10.3 What does NOT migrate (and what DOES at the manifest level)
@@ -5822,7 +5827,7 @@ ignores them, but they:
 - Count against platform quotas (Cloudflare KV per-namespace
   caps, Fastly Config Store entry counts).
 - Show up in `wrangler kv list` / `fastly config-store-entry
-  list` and confuse operators auditing state.
+list` and confuse operators auditing state.
 - Leak data: a previously-pushed feature flag value lingers
   even after the app version that read it shipped.
 
@@ -5840,16 +5845,16 @@ recipes the operator runs once (manually, after verifying the
 blob is correct):
 
 - **Cloudflare:** `wrangler kv key list --binding <BINDING>
-  --remote` to see what's there, then `wrangler kv key delete
-  --binding <BINDING> --remote <KEY>` per leaf. Easy to
+--remote` to see what's there, then `wrangler kv key delete
+--binding <BINDING> --remote <KEY>` per leaf. Easy to
   script.
 - **Fastly:** `fastly config-store-entry list --store-id=<id>
-  --json | jq` to identify the per-leaf entries, then
+--json | jq` to identify the per-leaf entries, then
   `fastly config-store-entry delete --store-id=<id>
-  --key=<key>` per leaf.
+--key=<key>` per leaf.
 - **Spin (local):** `sqlite3 .spin/sqlite_key_value.db
-  "DELETE FROM spin_key_value WHERE store = '<label>' AND key
-  != 'app_config'"` (substitute the actual default key from
+"DELETE FROM spin_key_value WHERE store = '<label>' AND key
+!= 'app_config'"` (substitute the actual default key from
   §5).
 - **Spin (Cloud): no per-key cleanup through the current
   Spin Cloud CLI.** Per the Fermyon Cloud command
@@ -5866,7 +5871,7 @@ blob is correct):
      `app_config` blob key, so orphan leaves cause
      no incorrect behaviour — just storage waste.
   2. Recreate the store from scratch: `spin cloud
-     key-value delete <STORE>` followed by
+key-value delete <STORE>` followed by
      `spin cloud key-value create <STORE>`, then
      re-run `<app-cli> config push` to seed the
      blob. Loses any other data the store held;
@@ -5879,7 +5884,7 @@ blob is correct):
 
   Earlier draft suggested
   `spin cloud key-value delete --app <APP> --label
-  <LABEL> <KEY>` per leaf — round-20 reviewer
+<LABEL> <KEY>` per leaf — round-20 reviewer
   cross-checked against the Fermyon command
   reference and found that form does NOT exist. The
   recipe above reflects the actual CLI surface.
@@ -5955,7 +5960,7 @@ The canonical form needs stable key ordering for JSON serialisation.
 - **Resolved: (b).** Round-21 reviewer probed
   `serde_canonical_json` v1.0.0 and found it rejects
   finite floats (`Floating point numbers are
-  forbidden`). §4.2 explicitly requires finite-float
+forbidden`). §4.2 explicitly requires finite-float
   support via `ryu` (per the "Numeric values" rule),
   so (a) cannot implement this spec unchanged. The
   hand-rolled walker at
@@ -6001,9 +6006,9 @@ What happens when the store has no entry at the requested key?
   `ConfigOutOfDate` (503 with `Retry-After: 60`)
   already encodes. The §3.3.3 extractor's
   `ok_or_else(|| EdgeError::internal("missing typed
-  app-config blob"))` call site changes to
+app-config blob"))` call site changes to
   `EdgeError::config_out_of_date("missing typed
-  app-config blob at key `<key>` — run `<app-cli>
+app-config blob at key `<key>`— run`<app-cli>
   config push`", String::new())` accordingly. (c) is
   still tracked as a follow-up for endpoints that
   want explicit `Option<C>` semantics.
@@ -6011,7 +6016,7 @@ What happens when the store has no entry at the requested key?
 ### Q4. Envelope `version` storage
 
 - (a) Inside the envelope (as drafted): `{ "data": {…},
-  "sha256": "…", "version": 1 }`. The runtime reads the version,
+"sha256": "…", "version": 1 }`. The runtime reads the version,
   validates the schema, then unwraps `data`.
 - (b) Separate KEY: `app_config__v1`. Per-version blobs.
   Cleaner if we ever need multi-version coexistence; messier
@@ -6031,13 +6036,13 @@ unlock. Re-evaluate after profiling on real workloads.
 
 Per-platform value caps as of v1:
 
-| Adapter    | Platform value cap                                     | Source / notes                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ---------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Axum       | none (local file)                                      | The Axum store is `BTreeMap<String, String>` serialised to a JSON file; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                                |
-| Cloudflare | 25 MiB                                                 | KV per-value limit (`developers.cloudflare.com/kv/platform/limits`).                                                                                                                                                                                                                                                                                                                                                                            |
-| Fastly     | **8 000 characters** (~8 KB UTF-8)                     | Fastly Config Store `item_value` limit per Fastly's published platform docs. The writer uses `fastly config-store-entry update --upsert --stdin` at the Fastly adapter (PR #269 F4) so there's no argv ceiling, but the platform itself rejects values over 8 000 characters. **Earlier drafts cited 64 KiB — that was a documentation error; the round-18 reviewer caught it against the official Fastly Config Store item docs.**             |
-| Spin Cloud | `MAX_ARGV_BYTES_PER_INVOCATION` (`96 * 1024`) per pair | Writer cap at `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`; under the blob model the effective limit is the cap minus `<KEY>=` (per §9.4).                                                                                                                                                                                                                                                                                           |
-| Spin local | sqlite filesystem-bound                                | `<spin.toml dir>/.spin/sqlite_key_value.db`; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                                                           |
+| Adapter    | Platform value cap                                     | Source / notes                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Axum       | none (local file)                                      | The Axum store is `BTreeMap<String, String>` serialised to a JSON file; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                    |
+| Cloudflare | 25 MiB                                                 | KV per-value limit (`developers.cloudflare.com/kv/platform/limits`).                                                                                                                                                                                                                                                                                                                                                                |
+| Fastly     | **8 000 characters** (~8 KB UTF-8)                     | Fastly Config Store `item_value` limit per Fastly's published platform docs. The writer uses `fastly config-store-entry update --upsert --stdin` at the Fastly adapter (PR #269 F4) so there's no argv ceiling, but the platform itself rejects values over 8 000 characters. **Earlier drafts cited 64 KiB — that was a documentation error; the round-18 reviewer caught it against the official Fastly Config Store item docs.** |
+| Spin Cloud | `MAX_ARGV_BYTES_PER_INVOCATION` (`96 * 1024`) per pair | Writer cap at `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`; under the blob model the effective limit is the cap minus `<KEY>=` (per §9.4).                                                                                                                                                                                                                                                                               |
+| Spin local | sqlite filesystem-bound                                | `<spin.toml dir>/.spin/sqlite_key_value.db`; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                                               |
 
 For Fastly specifically:
 
@@ -6260,11 +6265,10 @@ length, charset) on the operator-typed KEY NAME.
     Assert the extractor produces
     `EdgeError::ConfigOutOfDate { message, field_path }`
     where `message` contains the literal `key
-    \`<resolved-key>\`` AND the literal `run
+\`<resolved-key>\``AND the literal`run
     \`<app-cli> config push\``. Render the
-    resulting `Response`; assert HTTP status 503 and
-    the `Retry-After: 60` header is present. NOT
-    `EdgeError::Internal` (the round-18 reversal that
+resulting `Response`; assert HTTP status 503 and
+the `Retry-After: 60`header is present. NOT`EdgeError::Internal` (the round-18 reversal that
     round-19 then propagated through §6.3).
   - `named(key)` reads a different key from the same store.
 - `BlobEnvelope` deserialise:
@@ -6274,7 +6278,7 @@ length, charset) on the operator-typed KEY NAME.
 - **Non-finite floats rejected (round-15 B-2 / round-16
   I-2).** Each fixture asserts the loader returns
   `Err(AppConfigError::InvalidValue { path, field_path,
-  message })` (the variant added per §4.2; NOT the
+message })` (the variant added per §4.2; NOT the
   existing `Validation` variant which wraps
   `validator::ValidationErrors`). Tests pattern-match on
   the variant and assert:
@@ -6294,7 +6298,7 @@ length, charset) on the operator-typed KEY NAME.
      var `<APP_NAME>__SERVICE__RATIO=nan` (and `inf`,
      `-inf`). Run with env overlay ON; assert
      `Err(InvalidValue { field_path: "service.ratio",
-     message: <contains "NaN">, ... })` from the
+message: <contains "NaN">, ... })` from the
      overlay's `parse::<f64>()` + `is_finite()` check.
      With env overlay OFF (`--no-env`), the TOML value
      flows through unchanged and the load succeeds
@@ -6445,7 +6449,7 @@ strip or revert the resolution direction:
 
 - **Validate runs on every extract.** Fixture: a blob that
   serdes cleanly but violates a `#[validate(range(min=1,
-  max=10000))]` rule. Extract. Assert
+max=10000))]` rule. Extract. Assert
   `EdgeError::ConfigOutOfDate` with `field_path` naming the
   offending field.
 - **Validate-OK is the happy path.** Fixture: a blob in
@@ -6455,7 +6459,7 @@ strip or revert the resolution direction:
   `ConfigOutOfDate` response body matches the nested
   envelope documented in §6.3.1 exactly:
   `{ "error": { "status": 503, "kind": "config_out_of_date",
-  "message": "<…>", "field_path": "<dot.path>" } }`. Assert
+"message": "<…>", "field_path": "<dot.path>" } }`. Assert
   the `field_path` value names the offending field (e.g.
   `"feature.new_checkout"` for the §12.6 violation
   fixture). Assert the response carries the
@@ -6480,16 +6484,16 @@ silently drop or rename a `kind` string.
   Assert `body.error.kind` equals the exact string
   documented in §6.3.1. Variant → expected string:
 
-  | Variant                | Expected `kind` string  |
-  | ---------------------- | ----------------------- |
-  | `BadRequest`           | `"bad_request"`         |
-  | `Internal`             | `"internal"`            |
-  | `MethodNotAllowed`     | `"method_not_allowed"`  |
-  | `NotFound`             | `"not_found"`           |
-  | `NotImplemented`       | `"not_implemented"`     |
-  | `ServiceUnavailable`   | `"service_unavailable"` |
-  | `Validation`           | `"validation"`          |
-  | `ConfigOutOfDate`      | `"config_out_of_date"`  |
+  | Variant              | Expected `kind` string  |
+  | -------------------- | ----------------------- |
+  | `BadRequest`         | `"bad_request"`         |
+  | `Internal`           | `"internal"`            |
+  | `MethodNotAllowed`   | `"method_not_allowed"`  |
+  | `NotFound`           | `"not_found"`           |
+  | `NotImplemented`     | `"not_implemented"`     |
+  | `ServiceUnavailable` | `"service_unavailable"` |
+  | `Validation`         | `"validation"`          |
+  | `ConfigOutOfDate`    | `"config_out_of_date"`  |
 
 - **`field_path` is OMITTED outside `ConfigOutOfDate`.**
   For each non-`ConfigOutOfDate` variant fixture above,
@@ -6516,16 +6520,16 @@ silently drop or rename a `kind` string.
   mapping.** Fixture per variant: assert
   `response.status()`:
 
-  | Variant                | HTTP status            |
-  | ---------------------- | ---------------------- |
-  | `BadRequest`           | 400                    |
-  | `Internal`             | 500                    |
-  | `MethodNotAllowed`     | 405                    |
-  | `NotFound`             | 404                    |
-  | `NotImplemented`       | 501                    |
-  | `ServiceUnavailable`   | 503                    |
-  | `Validation`           | 422                    |
-  | `ConfigOutOfDate`      | 503                    |
+  | Variant              | HTTP status |
+  | -------------------- | ----------- |
+  | `BadRequest`         | 400         |
+  | `Internal`           | 500         |
+  | `MethodNotAllowed`   | 405         |
+  | `NotFound`           | 404         |
+  | `NotImplemented`     | 501         |
+  | `ServiceUnavailable` | 503         |
+  | `Validation`         | 422         |
+  | `ConfigOutOfDate`    | 503         |
 
   (The two 503-class variants are deliberately
   distinguished by the `kind` string + the
@@ -6560,13 +6564,13 @@ carry the §3.2.1 pointer text byte-for-byte.
   text comes from the match arm body.
 - **With-flags invocation — match arm (catch-all).**
   `edgezero config push --adapter axum --key staging
-  -- positional` exits with code 2 and the SAME
+-- positional` exits with code 2 and the SAME
   §3.2.1 pointer text. The catch-all
   `ConfigCmdStubArgs.trailing` field absorbs every flag
   / positional / `--`-trailing token, so clap dispatches
   to the match arm rather than producing an "unexpected
   argument" error. Same for `edgezero config diff
-  <anything>`. Round-13 had this path going through
+<anything>`. Round-13 had this path going through
   `after_help`, but a round-14 probe confirmed Clap
   4.6.x does NOT render `after_help` on parse errors;
   the catch-all bypasses that limitation. Assert the
@@ -6602,6 +6606,7 @@ carry the §3.2.1 pointer text byte-for-byte.
   output would leak the internal sink and confuse
   operators; the assertion guards against accidental
   removal of `hide = true`.
+
 - **`edgezero config validate` still works.** Raw +
   typed both preserved per §3.2.1.
 
@@ -6666,11 +6671,11 @@ for the default `app_config` key (10 chars), that's
   covered in §12.3's Fastly-specific size test: a blob
   at ≤ 8 000 characters pushes successfully; a blob at
   > 8 000 characters errors via the
-  Fastly-writer-side pre-platform guard (per Q6) with
-  the restructure-into-multiple-`[stores.config]`-ids
-  remediation message. The §12.10 Spin-Cloud-cap test
-  does NOT exercise the Fastly path — that's §12.3's
-  job.
+  > Fastly-writer-side pre-platform guard (per Q6) with
+  > the restructure-into-multiple-`[stores.config]`-ids
+  > remediation message. The §12.10 Spin-Cloud-cap test
+  > does NOT exercise the Fastly path — that's §12.3's
+  > job.
 
 ### 12.11 CLI parser tests for the canonical flag surface (§3.2.2)
 
@@ -6681,8 +6686,8 @@ silently break the spec's invariants:
 
 - **`ConfigPushArgs` parses all canonical flags.**
   Fixture: `--adapter axum --app-config alt.toml --manifest
-  custom.toml --store other --key staging --no-env --local
-  --runtime-config rt.toml --yes --no-diff --dry-run`.
+custom.toml --store other --key staging --no-env --local
+--runtime-config rt.toml --yes --no-diff --dry-run`.
   Assert every field is populated to the supplied value;
   short `-y` resolves to `yes = true`.
 - **`ConfigDiffArgs` parses all canonical flags.** Same
@@ -6708,6 +6713,7 @@ silently break the spec's invariants:
   Per §3.2.2's `exit_code` doc-comment, the flag only
   changes the "diff present" success branch; real
   errors NEVER exit 0 in either mode.
+
 - **`ConfigValidateArgs` parses `--strict`.** Assert
   `strict: true` after parse.
 - **Default values match `default_manifest_path()`** —
@@ -6737,15 +6743,15 @@ silently break the spec's invariants:
 - **Explicit `--store` overrides default.** Manifest
   declares `ids = ["app_config", "experiments"]`,
   `default = "app_config"`. `config push --adapter axum
-  --store experiments` writes to logical id
+--store experiments` writes to logical id
   `experiments`. Assert the blob lands at the
   `experiments` key, NOT `app_config`.
 - **Unknown `--store` errors clearly.** `--store
-  missing_id` against the same manifest errors with
+missing_id` against the same manifest errors with
   "logical id `missing_id` not declared in
   [stores.config]" and exits non-zero.
 - **`--store` interacts with `--key`.** `--store
-  experiments --key experiments_staging` writes to the
+experiments --key experiments_staging` writes to the
   `experiments` store under the `experiments_staging`
   key — the two flags are independent.
 
@@ -6766,7 +6772,7 @@ silently break the spec's invariants:
 - **Read-back uses `wrangler kv key get`.** Mocked
   invocation; assert the four-segment subcommand path
   is used (not the deprecated three-segment `wrangler
-  kv get`).
+kv get`).
 
 ### 12.14 `StoreRegistry` ref accessors (§5.2.1 M-1)
 
@@ -6823,7 +6829,7 @@ Tests align with that contract:
 
 - **`KeyInNamedStore` value with an invalid Spin name.**
   Fixture: `#[secret(store_ref = "vault")] api_token:
-  String` with `cfg.vault = "default"`,
+String` with `cfg.vault = "default"`,
   `cfg.api_token = "demo-token"` (a dash makes it
   invalid as a Spin variable name). Manifest declares
   `[adapters.spin]`. Run `config validate --strict`.
@@ -6836,7 +6842,7 @@ Tests align with that contract:
   variable name.** Fixture: two secret fields
   `#[secret] one: String = "Demo_Token"` and
   `#[secret(store_ref = "vault")] two: String =
-  "demo_token"`. Both lowercase to `demo_token`.
+"demo_token"`. Both lowercase to `demo_token`.
   Manifest declares `[adapters.spin]`. Assert
   validate rejects with a collision message naming
   BOTH field names AND the colliding lowercased
@@ -6919,11 +6925,11 @@ override is exportable from a POSIX shell. Tests assert:
 
 - **Hyphen in a store id is rejected.** Manifest
   fixture: `[stores.config]
-  ids = ["feature-flags"]
-  default = "feature-flags"`. Run manifest validation;
+ids = ["feature-flags"]
+default = "feature-flags"`. Run manifest validation;
   assert `Err(ValidationError { code: "store_id_format",
-  message: <names "feature-flags" + the env-export
-  constraint>, ... })`. Same for `[stores.kv]` and
+message: <names "feature-flags" + the env-export
+constraint>, ... })`. Same for `[stores.kv]` and
   `[stores.secrets]` (all three kinds share the
   validator).
 - **Underscore-only ids still pass.** Manifest fixture
@@ -6997,7 +7003,7 @@ expect.
      already use underscore-only ids (§10.2's grep
      recipe verifies), so no in-tree breakage.
    - Introduces `ConfigStoreBinding { handle,
-     default_key }` on `ConfigRegistry`. `Config::default()`
+default_key }` on `ConfigRegistry`. `Config::default()`
      keeps returning `ConfigStoreHandle` (unwraps
      `binding.handle`) so existing hand-managed
      callers compile unchanged; the new
@@ -7063,16 +7069,16 @@ expect.
    path that satisfies §10.
 
    Acceptance for Commit C alone: `cargo test
-   --workspace` passes; `scripts/smoke_test_config.sh`
+--workspace` passes; `scripts/smoke_test_config.sh`
    seeds a blob via `app-demo-cli config push --adapter
-   axum` and the runtime returns the seeded values;
+axum` and the runtime returns the seeded values;
    §10.2.1 gate passes.
 
 4. **Commit D — `config diff` command (post-cutover
    additive).** §8.1. Adds the diff subcommand
    reusing the read trait + the diff renderer from
    Commit C's push flow. `--format unified |
-   structured | json`, `--exit-code` semantics per
+structured | json`, `--exit-code` semantics per
    Q10.
 
 5. **Commit E — Migration guide, smoke scripts,
