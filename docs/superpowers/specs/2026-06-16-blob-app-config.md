@@ -7,8 +7,8 @@
 
 ## v1 changelog
 
-Initial draft after eighteen review rounds — one author
-self-review, seventeen reviewer passes against the current
+Initial draft after nineteen review rounds — one author
+self-review, eighteen reviewer passes against the current
 branch's code.
 
 **Self-review (round 1):** canonical-form rules (§4.2), Spin
@@ -1269,6 +1269,36 @@ contract reversals:**
   sensible default) is still tracked as a
   follow-up. The §1 round-2 changelog reference
   updated to record the round-18 reversal.
+
+**Reviewer pass (round 19) — §6.3 catch-up to the Q3
+reversal:**
+
+- **§6.3 missing-blob narrative + mapping table
+  brought into line with §3.3.3 + Q3 (d).** The
+  round-18 reversal updated the extractor sketch
+  (§3.3.3) and the Q3 default to
+  `EdgeError::ConfigOutOfDate`, but the §6.3
+  narrative and the `ConfigStoreError → EdgeError`
+  mapping table at §6.3 still showed the old
+  "Key missing → `Internal`" rule. The round-19
+  reviewer caught this divergence. Fixed:
+
+  - The §6.3 "Key missing from the store" bullet
+    now reads
+    `EdgeError::ConfigOutOfDate` (HTTP 503,
+    `Retry-After: 60`, "run `<app-cli> config
+    push`" message) and explicitly references Q3
+    (d) and the §3.3.3 extractor sketch.
+  - The mapping table replaces the stale
+    `Internal (none) → Internal | 500` row with a
+    "missing key (`Ok(None)` from `get`)" row
+    mapping to `ConfigOutOfDate | 503`, with a
+    Notes column clarifying that this isn't a
+    `ConfigStoreError` variant — it's caught at
+    the extractor's `ok_or_else` after
+    `ConfigStore::get` returns `Ok(None)`. The
+    note explicitly cites round-18 M-2 so a
+    future reader sees the reversal.
 
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
@@ -3715,27 +3745,37 @@ The extractor surfaces:
   envelope parse failure (envelope `version` unrecognised or
   shape unexpected). Maps to HTTP 500. These are genuinely
   unexpected and should page the operator.
-- **Key missing from the store** maps to `EdgeError::Internal`
-  in v1 (NOT `NotFound`). Rationale: a missing typed-app-config
-  blob is operationally indistinguishable from "the operator
-  didn't run `config push` yet" — same actionable response from
-  the operator, same noisy log line. Mapping to 404 would imply
-  the URL is wrong, which it isn't. A future `MaybeAppConfig<C>`
-  → `Option<C>` extractor (Q3) could remap this; v1 ships with
-  `Internal` and no opt-out.
+- **Key missing from the store** (i.e.
+  `ConfigStore::get(key)` returned `Ok(None)`) maps to
+  `EdgeError::ConfigOutOfDate` (Q3 (d) per round-18
+  M-2, restated here for §6.3 hard-cutoff). HTTP 503
+  with `Retry-After: 60`. Message: `missing typed
+  app-config blob at key \`<key>\` — run \`<app-cli>
+  config push\` for this deploy`. Rationale: a missing
+  typed-app-config blob is operationally
+  indistinguishable from "the operator didn't run
+  `config push` yet" — which is exactly the
+  `ConfigOutOfDate` class ("re-run config push fixes
+  it"). Mapping to `Internal` would page oncall on a
+  push-fixable condition; mapping to `NotFound` (404)
+  would imply the URL is wrong, which it isn't. A
+  future `MaybeAppConfig<C>` → `Option<C>` extractor
+  (Q3 (c)) could remap this for endpoints that want
+  explicit defaults; v1 ships with `ConfigOutOfDate`
+  and no opt-out.
 
 **Implementation note — `ConfigStoreError` to `EdgeError`
 mapping.** `ConfigStoreError` (`config_store.rs:165`) has only
 three variants today: `Internal`, `InvalidKey`, `Unavailable`.
 The extractor maps:
 
-| ConfigStoreError    | EdgeError              | HTTP |
-| ------------------- | ---------------------- | ---- |
-| `Unavailable`       | `ServiceUnavailable`   | 503  |
-| `Internal` (sha)    | `Internal`             | 500  |
-| `Internal` (envel.) | `Internal`             | 500  |
-| `Internal` (none)   | `Internal`             | 500  |
-| `InvalidKey`        | `BadRequest`           | 400  |
+| ConfigStoreError                     | EdgeError              | HTTP | Notes                                                                                                                                                                                                                                       |
+| ------------------------------------ | ---------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Unavailable`                        | `ServiceUnavailable`   | 503  | Transient backend issue.                                                                                                                                                                                                                    |
+| `Internal` (sha mismatch)            | `Internal`             | 500  | Drift or corruption — the stored sha doesn't match canonical recompute.                                                                                                                                                                     |
+| `Internal` (envelope parse failure)  | `Internal`             | 500  | Envelope `version` unrecognised or shape unexpected.                                                                                                                                                                                       |
+| `InvalidKey`                         | `BadRequest`           | 400  | Adapter rejected the key shape.                                                                                                                                                                                                            |
+| _missing key_ (`Ok(None)` from `get`) | `ConfigOutOfDate`      | 503  | NOT a `ConfigStoreError` variant — caught at the extractor's `ok_or_else` after `ConfigStore::get` returns `Ok(None)`. Round-18 M-2 reversal: was `Internal` in earlier drafts; the new mapping matches Q3 (d) + §3.3.3's extractor sketch. |
 
 Plus the new `ConfigOutOfDate` variant `EdgeError` gains as part
 of this work; no new variant on `ConfigStoreError` is needed.
