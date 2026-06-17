@@ -2705,11 +2705,31 @@ In the top-level `Command` enum (typically `args.rs`):
 
 - [ ] **Step 1: Locate `run_config_push_typed` (around line 186 per spec).** Replace the inline `Validate::validate` call with `validate_excluding_secrets`.
 
-- [ ] **Step 2: Add the read-back step.** After validation, build a `ReadConfigContext`, call the adapter's `read_config_entry` (or `_local` if `--local`), and compare shas:
+- [ ] **Step 2: Add the read-back step.** After validation, call the adapter's `read_config_entry` (or `_local` if `--local`) with the same parameter list the writer takes (per Task B12's writer-mirror signature), and compare shas:
 
 ```rust
-let read_ctx = ReadConfigContext { ... };
-let remote = adapter.read_config_entry(&read_ctx)?;
+// Resolve the same parameters the writer uses, then call the
+// read-back. Parameter list MATCHES push_config_entries
+// argument-for-argument (Task B12), so reuse the same locals.
+let remote = if args.local {
+    adapter.read_config_entry_local(
+        &manifest_root,
+        adapter_manifest_path,
+        component_selector,
+        &store,
+        &key,
+        &push_ctx,
+    )?
+} else {
+    adapter.read_config_entry(
+        &manifest_root,
+        adapter_manifest_path,
+        component_selector,
+        &store,
+        &key,
+        &push_ctx,
+    )?
+};
 let local_envelope = BlobEnvelope::new(data.clone(), generated_at);
 let local_sha = local_envelope.sha256.clone();
 match remote {
