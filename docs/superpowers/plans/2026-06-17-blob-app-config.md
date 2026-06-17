@@ -208,6 +208,9 @@ fn write_number(out: &mut String, n: &serde_json::Number) {
 }
 
 fn write_string(out: &mut String, s: &str) {
+    // Escape table byte-identical to serde_json::to_string(s)'s
+    // default. Pinned by spec §4.2 — DO NOT change without bumping
+    // BlobEnvelope::version.
     out.push('"');
     for ch in s.chars() {
         match ch {
@@ -216,7 +219,12 @@ fn write_string(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => {
+                // Lowercase hex, 4 digits, zero-padded. Matches
+                // serde_json's `\u00XX` emission for control chars
+                // outside the named-escape set.
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
@@ -336,8 +344,18 @@ use serde_json::json;
 
 #[test]
 fn canonical_form_pin_v1() {
+    // Fixture deliberately exercises every §4.2 escape-table branch:
+    // - "héllo" → multi-byte UTF-8, no escape
+    // - "tab\there" → \t (named escape)
+    // - "quote\"backslash\\" → \" + \\ (named escapes)
+    // - "newline\nhere" → \n (named escape)
+    // - "\u{0001}" →  (generic control char branch)
     let data = json!({
-        "greeting": "héllo",        // verbatim bytes; NFC vs NFD encodings hash differently per §4.2
+        "greeting": "héllo",                  // verbatim UTF-8; NFC vs NFD hash differently per §4.2
+        "tab": "tab\there",                   // \t named escape
+        "quote_backslash": "quote\"backslash\\",  // \" + \\
+        "newline": "newline\nhere",           // \n
+        "control_char": "\u{0001}",           //  generic-control branch
         "feature": { "new_checkout": true },
         "service": { "timeout_ms": 1500 },
         "ratio": 1.5,
@@ -1824,14 +1842,61 @@ Create `crates/edgezero-macros/tests/derive_ui.rs`:
 #[test]
 fn derive_ui() {
     let t = trybuild::TestCases::new();
+    // Authoritative spec §3.3.1.4 table — one compile_fail fixture
+    // per rule:
     t.compile_fail("tests/ui/secret_with_skip_serializing.rs");
+    t.compile_fail("tests/ui/secret_with_skip_serializing_if.rs");
     t.compile_fail("tests/ui/secret_with_flatten.rs");
+    t.compile_fail("tests/ui/secret_with_serde_rename.rs");
+    t.compile_fail("tests/ui/container_serde_rename_all_with_secret.rs");
+    t.compile_fail("tests/ui/secret_on_non_string_field.rs");
     t.compile_fail("tests/ui/key_in_named_store_missing_sibling.rs");
+    // Round-28 M-2 additions:
+    t.compile_fail("tests/ui/key_in_named_store_sibling_not_store_ref.rs");
+    t.compile_fail("tests/ui/key_in_named_store_sibling_not_string.rs");
     t.pass("tests/ui/secret_with_store_ref_named.rs");
 }
 ```
 
 Create the corresponding `.rs` fixtures under `crates/edgezero-macros/tests/ui/`. Each fixture is a 10-15 line struct that exercises one rule. For `compile_fail` fixtures, also create matching `.stderr` files (run `TRYBUILD=overwrite cargo test` once after authoring to generate them).
+
+Concrete fixture sketches for the round-28 M-2 additions:
+
+`tests/ui/key_in_named_store_sibling_not_store_ref.rs`:
+
+```rust
+use edgezero_core::AppConfig;
+use serde::Deserialize;
+
+#[derive(AppConfig, Deserialize)]
+pub struct C {
+    #[secret(store_ref = "vault")]
+    api_token: String,
+    // vault sibling EXISTS but is NOT annotated with #[secret(store_ref)].
+    // Per §3.3.1.4: macro errors with "named sibling has
+    // #[secret(store_ref)] annotation".
+    vault: String,
+}
+```
+
+`tests/ui/key_in_named_store_sibling_not_string.rs`:
+
+```rust
+use edgezero_core::AppConfig;
+use serde::Deserialize;
+
+#[derive(AppConfig, Deserialize)]
+pub struct C {
+    #[secret(store_ref = "vault")]
+    api_token: String,
+    // vault is #[secret(store_ref)] BUT is u32, not String. Per
+    // §3.3.1.4: "named sibling is String — compile_error if not".
+    #[secret(store_ref)]
+    vault: u32,
+}
+```
+
+Note on rename/nested/non-String coverage: `secret_with_serde_rename.rs` covers per-field rename; `container_serde_rename_all_with_secret.rs` covers the container `rename_all`; `secret_on_non_string_field.rs` covers the "scalar-String check" rule from `app_config.rs:140` (rejects `#[secret] feature: FeatureConfig`, the nested-typed case). The nested-`AppConfig`-rooted-as-field rule (§3.3.1.2) is enforced by the §10.2.1 CI gate at Task C7, not by the derive macro — so it's tested at C7's §12.17, NOT here.
 
 - [ ] **Step 7: Run, confirm pass.**
 
@@ -1846,6 +1911,7 @@ Expected: pass.
 - Modify: `crates/edgezero-adapter/src/registry.rs` — change `Adapter::validate_typed_secrets` signature to `&[TypedSecretEntry<'_>]`.
 - Modify: `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/cli.rs` — update each impl.
 - Modify: `crates/edgezero-cli/src/config.rs` — update the caller (`run_adapter_typed_checks`) to build the new slice including `KeyInNamedStore` entries.
+- Modify: `crates/edgezero-cli/src/config.rs::typed_secret_checks` (around line 671 per round-28 L-2) — add an explicit `SecretKind::KeyInNamedStore` arm. The existing exhaustive match only handles `KeyInDefault` and `StoreRef`; adding the third variant to `SecretKind` in Task B10 makes this match non-exhaustive, so `cargo check` will fail until the arm is added. The arm runs the SAME structural check the trait extension does at the manifest level: it verifies that the value of the sibling `store_ref_field` resolves to a declared `[stores.secrets].id`. See spec §3.3.2.
 
 **Interfaces:**
 
@@ -2139,7 +2205,7 @@ fn read_config_entry(
 | 1. **`--local` forces SQLite-direct, regardless of runtime-config backend type** | `push_ctx.local == true`                                                             | `read_config_entry_local`: parse runtime-config to resolve the SQLite path (honour `type = "spin"` `path` override; otherwise default `.spin/sqlite_key_value.db`); read the row at `(store=<platform>, key=<key>)`. `Present(value)` / `MissingKey` per row presence; `MissingStore` if the SQLite file doesn't exist. |
 | 2. **Manifest deploy command targets Fermyon Cloud**                             | `push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)` | `read_config_entry`: returns `Unsupported("Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1")` per §8.3 / §9.4. NO shell-out to `spin cloud key-value list` or similar — that lists stores, not keys (round-20 cleanup recipe). |
 | 3. **`runtime-config.toml` declares a non-Spin backend**                         | `parsed.key_value_stores.get(platform) == Some(Redis { .. } | AzureCosmos | Unknown)` | `read_config_entry`: error with the same message the writer uses at `cli.rs:632-640` ("backend type `redis` for label `<X>` — use `redis-cli GET <key>` or the equivalent; edgezero does not read from this backend").                                                                                                  |
-| 4. **Default — runtime-config absent or `type = "spin"`**                        | Anything else                                                                        | `read_config_entry`: same as branch 1 (SQLite-direct read).                                                                                                                                                                                                                                                              |
+| 4. **Default — `type = "spin"`** (with valid `runtime-config.toml`)              | `parsed.key_value_stores.get(platform) == Some(Spin { .. })` OR backend missing      | `read_config_entry`: SQLite-direct read at `parsed.key_value_stores.get(platform).path` if set, otherwise the Spin default `.spin/sqlite_key_value.db`. **Errors during `runtime_config::read` AND non-default labels missing from `runtime-config.toml` propagate** (no silent `.ok()` fallthrough) — matches writer at `cli.rs:629` + `verify_label_declared` at `cli.rs:653`. Round-28 H-2: silently swallowing a parse error here would let `config diff` succeed against a tree where the writer would have failed. |
 
 Sketch:
 
@@ -2170,9 +2236,18 @@ fn read_config_entry(
         ));
     }
 
-    // Branches 3 + 4: parse runtime-config (if present) and dispatch on backend type.
-    let parsed = runtime_config::read(&runtime_config_path).ok();
-    let backend = parsed.as_ref().and_then(|p| p.key_value_stores.get(platform));
+    // Branches 3 + 4: parse runtime-config (PROPAGATING errors, not
+    // .ok()) and dispatch on backend type. Round-28 H-2 reviewer
+    // flagged the earlier `.ok()` form: it silently swallows
+    // malformed-runtime-config-toml errors and falls through to the
+    // default SQLite branch, which lets `config diff` report a
+    // read result on a tree where the writer would have failed
+    // hard. The writer's behaviour at `cli.rs:629` propagates the
+    // parse error AND calls `verify_label_declared(...)`; the read
+    // path must match parity-for-parity.
+    let parsed = runtime_config::read(&runtime_config_path)?;
+    verify_label_declared(platform, &parsed, &runtime_config_path)?;
+    let backend = parsed.key_value_stores.get(platform);
     match backend {
         Some(runtime_config::KeyValueBackend::Redis { .. }) => Err(format!(
             "label `{platform}` in {} is type `redis`; use `redis-cli GET <key>` to read this store directly. \
@@ -2530,10 +2605,18 @@ async fn extract_from_handle<C>(
 where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
+    // ConfigStoreError → EdgeError uses the existing `impl
+    // From<ConfigStoreError> for EdgeError` at
+    // `crates/edgezero-core/src/error.rs:148`, which maps
+    // Unavailable → ServiceUnavailable (503), InvalidKey →
+    // BadRequest (400), Internal → Internal (500). Per spec §6.3's
+    // mapping table. NEVER `map_err(EdgeError::internal)` here —
+    // that collapses backpressure / bad-key signals into 500s and
+    // dashboards lose the distinction.
     let raw = handle
         .get(key)
         .await
-        .map_err(|e| EdgeError::internal(anyhow::anyhow!(e)))?
+        .map_err(EdgeError::from)?
         .ok_or_else(|| EdgeError::config_out_of_date(
             format!("missing typed app-config blob at key `{key}` — run `<app-cli> config push` for this deploy"),
             String::new(),
@@ -2582,7 +2665,9 @@ where
 
 Per spec §12.1 "AppConfig<C> extractor" bullet list: "`named(key)` reads a different key from the same store" — assert it. Plus add a test for `from_store` reading a non-default `[stores.config]` id.
 
-- [ ] **Step 4: Write a missing-blob test.**
+- [ ] **Step 4: Write four extractor error-path tests covering the full §6.3 mapping table.**
+
+The `ConfigStoreError → EdgeError` path is delegated to the existing `From` impl, but the extractor is the contract surface — tests need to fail loudly if a future refactor accidentally re-introduces `map_err(EdgeError::internal)`.
 
 ```rust
     #[test]
@@ -2596,6 +2681,29 @@ Per spec §12.1 "AppConfig<C> extractor" bullet list: "`named(key)` reads a diff
         // ... build a request context with that store via a binding ...
         // Run extract; assert Err(EdgeError::ConfigOutOfDate { .. }).
         // Assert message contains "missing typed app-config blob" + "run `<app-cli> config push`".
+    }
+
+    #[test]
+    fn app_config_extractor_maps_config_store_unavailable_to_service_unavailable() {
+        // Mock store returning Err(ConfigStoreError::Unavailable { ... }).
+        // Run extract.
+        // Assert Err(EdgeError::ServiceUnavailable { .. }) — NOT
+        // EdgeError::Internal. Per §6.3 mapping table.
+    }
+
+    #[test]
+    fn app_config_extractor_maps_config_store_invalid_key_to_bad_request() {
+        // Mock store returning Err(ConfigStoreError::InvalidKey { ... }).
+        // Run extract.
+        // Assert Err(EdgeError::BadRequest { .. }).
+    }
+
+    #[test]
+    fn app_config_extractor_maps_config_store_internal_to_internal() {
+        // Mock store returning Err(ConfigStoreError::Internal { source }).
+        // Run extract.
+        // Assert Err(EdgeError::Internal { .. }) and that the source
+        // chain still carries the original anyhow::Error.
     }
 ```
 
@@ -2791,7 +2899,30 @@ In the top-level `Command` enum (typically `args.rs`):
 
 - Modify: `crates/edgezero-cli/src/config.rs` — rewrite `run_config_push_typed` to route through `deserialize_app_config_with_options` + `validate_excluding_secrets` + read-back via `Adapter::read_config_entry` + inline diff prompt.
 
-- [ ] **Step 1: Locate `run_config_push_typed` (around line 186 per spec).** Replace the inline `Validate::validate` call with `validate_excluding_secrets`.
+- [ ] **Step 1: Switch the loader path AND the validator (round-28 L-1).** Current `run_config_push_typed` at `crates/edgezero-cli/src/config.rs:205` calls `load_app_config_with_options`, which ALREADY runs `Validate::validate` internally before returning the typed `C` (see `crates/edgezero-core/src/app_config.rs:160`). Just replacing the post-load `Validate::validate` call leaves the FULL validation still running inside the loader, with secret-bearing fields validated against the operator-typed KEY NAMES — which is exactly what §3.3.8's `validate_excluding_secrets` rule exists to prevent.
+
+  Two changes needed:
+
+  1. Replace the `load_app_config_with_options(...)` call with `deserialize_app_config_with_options(...)` (the Phase A A6 entry point). This deserialises typed `C` WITHOUT calling `.validate()`.
+  2. Then explicitly call `validate_excluding_secrets(&cfg)` (Phase B B9) — secret-field validators are skipped per the §3.3.8 rule.
+
+  Before:
+
+  ```rust
+  // pre-cutover (don't ship as-is):
+  let cfg: C = load_app_config_with_options(path, app_name, opts)?;
+  cfg.validate().map_err(...)?;  // double-validation; secret fields validated as key names
+  ```
+
+  After:
+
+  ```rust
+  // post-cutover (this is the §3.3.8 rule):
+  let cfg: C = deserialize_app_config_with_options(path, app_name, opts)?;
+  validate_excluding_secrets(&cfg).map_err(...)?;
+  ```
+
+  Add a per-fixture test that pushes a typed `C` whose `#[secret] api_token` value violates a `#[validate(length(min = 32))]` rule. With the pre-cutover code, the push fails at load time (the key NAME is < 32 chars). With the post-cutover code, the push SUCCEEDS (secret validators are skipped); the runtime extractor later validates the RESOLVED secret value against the same rule.
 
 - [ ] **Step 2: Add the read-back step.** After validation, call the adapter's `read_config_entry` (or `_local` if `--local`) with the same parameter list the writer takes (per Task B12's writer-mirror signature), and compare shas:
 

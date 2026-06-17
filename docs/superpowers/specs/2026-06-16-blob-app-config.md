@@ -3091,6 +3091,36 @@ below so any compliant implementation produces the same bytes.
   stored blob's `data` field always agrees with the
   push-side value byte-for-byte.
 
+  **JSON string escaping is exactly `serde_json::to_string`
+  output** (round-28 M-1 pin). Pinning the escape spelling
+  matters because compliant implementations would otherwise
+  hash differently for the same logical string:
+
+  - `"` → `\"`
+  - `\` → `\\`
+  - `\n` (U+000A) → `\n`
+  - `\r` (U+000D) → `\r`
+  - `\t` (U+0009) → `\t`
+  - `\b` (U+0008) → `\b`
+  - `\f` (U+000C) → `\f`
+  - Any other character with code point ≤ U+001F → `\u00XX`
+    (lowercase hex, 4 digits, zero-padded).
+  - All other code points (including ≥ U+0020 and Unicode
+    characters above ASCII) are emitted as their literal
+    UTF-8 bytes, NOT escaped.
+
+  This is byte-identical to `serde_json::to_string(s)`'s
+  default escape table. The v1 canonicaliser implements
+  the table inline (rather than calling
+  `serde_json::to_string` for each leaf string) so a
+  future `serde_json` MSRV bump doesn't drift the SHA
+  space silently — see the §13.1 acceptance gate. The
+  pin test (§4.2 "Stability across implementations" +
+  §12.1) covers a fixture with quote, backslash,
+  newline, and a U+0001 (a non-`\b`/`\f`/`\n`/`\r`/`\t`
+  control char) to exercise the `\u00XX` branch
+  explicitly.
+
   **Why not NFC.** An earlier draft normalised to NFC at
   push and re-NFC'd at read. Two consequences killed it:
 
