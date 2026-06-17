@@ -1535,6 +1535,28 @@ for plan authoring:**
   passes complete; reviewer cleared for plan
   authoring at round 24)".
 
+**Reviewer pass (round 26) — phasing carve-out for the
+plan author:**
+
+- **§10.2.2 `cli/src/main.rs.hbs` template phasing
+  noted.** Plan author discovered that running the
+  `generated_project_builds` test against the cutover
+  commit (§13 Commit C) would fail if the template's
+  `TypedConfigCmd` enum already declared `Diff` —
+  because `ConfigDiffArgs` + `run_config_diff_typed`
+  don't exist until §13 Commit D. The full target
+  template shape is unchanged; the spec just adds an
+  "Implementation phasing note" explaining that
+  Commit C ships the template's `TypedConfigCmd` enum
+  with `Push` + `Validate` only, and Commit D adds the
+  `Diff` variant + dispatch in the same commit that
+  ships the `Diff` arg struct + entry point. Net
+  effect on the generated project is the same: a
+  user-generated project from the merged PR has all
+  three commands. Bisecting between Commit C and
+  Commit D just sees the `Diff` arm appear when
+  Commit D lands.
+
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
 evolution (`#[serde(default)]`, struct versioning, etc.); the
@@ -5068,20 +5090,41 @@ files to change:
     NAMES in the secret store (the runtime resolves them
     on the fly)".
   - **`cli/src/main.rs.hbs`** — the generated `<name>-cli`
-    main wires the new `TypedConfigCmd` enum per §3.2.2:
-    `Push(...)` → `run_config_push_typed::<C>`,
-    `Diff(...)` → `run_config_diff_typed::<C>` (new),
-    `Validate(...)` → `run_config_validate_typed::<C>`.
-    The bundled `edgezero` binary's `main.rs` (NOT a
-    template; lives at `crates/edgezero-cli/src/main.rs`)
-    keeps `Push` and `Diff` as STUB-POINTER TUPLE-variant
-    arms whose tuple element is the hidden catch-all
+    main wires the new `TypedConfigCmd` enum per §3.2.2.
+    The full target shape is `Push` →
+    `run_config_push_typed::<C>` + `Diff` →
+    `run_config_diff_typed::<C>` (new) + `Validate` →
+    `run_config_validate_typed::<C>`. **Implementation
+    phasing note (round-26 M-1):** §13's atomic cutover
+    commits the runtime extractor + writers + app-demo
+    + scaffold templates together, but `ConfigDiffArgs`
+    + `run_config_diff_typed` are a post-cutover
+    additive (§13 Commit D). To keep the cutover
+    commit's scaffold output compilable, the cutover
+    commit ships the template's `TypedConfigCmd` enum
+    declaring `Push(ConfigPushArgs)` +
+    `Validate(ConfigValidateArgs)` ONLY; the same
+    commit that ships `ConfigDiffArgs` +
+    `run_config_diff_typed` (Commit D) adds the
+    `Diff(ConfigDiffArgs)` variant + dispatch arm to
+    this template. Net effect: a generated project from
+    Commit C has `config push` + `config validate`; a
+    generated project from Commit D adds `config diff`
+    purely additively. The bundled `edgezero` binary's
+    `main.rs` (NOT a template; lives at
+    `crates/edgezero-cli/src/main.rs`) keeps `Push` and
+    `Diff` as STUB-POINTER TUPLE-variant arms whose
+    tuple element is the hidden catch-all
     `ConfigCmdStubArgs` (per §3.2.2) — the match arms
-    print the typed-CLI pointer and exit 2; the catch-all
-    absorbs whatever flags clap saw, and `after_help`
-    attached to each variant covers the explicit `--help`
-    path. NOT `ConfigPushArgs` / `ConfigDiffArgs` (those
-    are the typed-CLI Args structs).
+    print the typed-CLI pointer and exit 2; the
+    catch-all absorbs whatever flags clap saw, and
+    `after_help` attached to each variant covers the
+    explicit `--help` path. NOT `ConfigPushArgs` /
+    `ConfigDiffArgs` (those are the typed-CLI Args
+    structs). Note that the bundled binary's stub
+    variants stay STABLE across Commit C and Commit D
+    — only the SCAFFOLD template's `TypedConfigCmd`
+    enum grows the new variant in Commit D.
   - **`root/edgezero.toml.hbs`** — comments around the
     generated `[stores.config]` block call out that the
     config store now carries a single key (default
