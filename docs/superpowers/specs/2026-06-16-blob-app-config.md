@@ -7,8 +7,8 @@
 
 ## v1 changelog
 
-Initial draft after nineteen review rounds — one author
-self-review, eighteen reviewer passes against the current
+Initial draft after twenty review rounds — one author
+self-review, nineteen reviewer passes against the current
 branch's code.
 
 **Self-review (round 1):** canonical-form rules (§4.2), Spin
@@ -1299,6 +1299,54 @@ reversal:**
     `ConfigStore::get` returns `Ok(None)`. The
     note explicitly cites round-18 M-2 so a
     future reader sees the reversal.
+
+**Reviewer pass (round 20) — remaining missing-blob
+echo + Spin Cloud CLI surface accuracy:**
+
+- **§5.2.1 extractor-consumption sketch caught up
+  with the §6.3 / Q3 (d) rule.** Round 18 / 19
+  updated §3.3.3 and §6.3 to map missing blobs to
+  `ConfigOutOfDate`, but the SECONDARY sketch in
+  §5.2.1 (illustrating
+  `RequestContext::config_store_default_binding`
+  consumption) still mapped `Ok(None)` to
+  `EdgeError::internal("no blob at key ...")`. An
+  implementer following that sketch would have
+  produced a 500 where the spec wanted a 503.
+  Sketch now uses
+  `EdgeError::config_out_of_date(...)` with the
+  same actionable message as §3.3.3.
+- **§12.1 missing-key test made concrete.** Was
+  "errors on missing key (per Q3 default)". Now
+  pattern-matches on
+  `EdgeError::ConfigOutOfDate { message,
+  field_path }`, asserts the message contains the
+  literal `key \`<resolved-key>\`` and the
+  `run \`<app-cli> config push\`` remediation, AND
+  renders the `Response` to assert HTTP 503 +
+  `Retry-After: 60` header. Implementers can no
+  longer pick the wrong variant.
+- **§8.3 Spin Cloud read-back wording aligned with
+  the Fermyon Cloud command reference.** Earlier
+  text said `spin cloud key-value list` "enumerates
+  keys" — per the reference, `list` enumerates
+  STORES, not keys. Reworded to enumerate the full
+  CLI surface (`create` / `delete` / `list` /
+  `rename` / `set`) and clarify that `set` is the
+  only per-key operation. The "no `get`" conclusion
+  is unchanged.
+- **§10.x Spin Cloud cleanup recipe rewritten.**
+  Earlier draft had `spin cloud key-value delete
+  --app <APP> --label <LABEL> <KEY>` per leaf —
+  that subcommand shape doesn't exist; `delete`
+  removes a whole STORE. Replaced with three real
+  options: (1) leave orphan leaves (the runtime
+  only reads the `app_config` blob anyway),
+  (2) `delete` + `create` the store and re-push
+  (only safe if the store is config-dedicated),
+  (3) Fermyon Cloud dashboard / HTTP API (out of
+  v1 scope). Round-20 reviewer cross-checked
+  against the Fermyon command reference.
 
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
@@ -3454,8 +3502,13 @@ where
         .config_store_default_binding()
         .ok_or_else(|| EdgeError::internal("no default config store registered"))?;
     let key = override_key.unwrap_or(&binding.default_key);
+    // Missing blob maps to ConfigOutOfDate per §6.3 / Q3 (d) — a re-run
+    // of `<app-cli> config push` is the actionable response, not a 500.
     let raw = binding.handle.get(key).await? // ConfigStore::get
-        .ok_or_else(|| EdgeError::internal(format!("no blob at key `{key}`")))?;
+        .ok_or_else(|| EdgeError::config_out_of_date(
+            format!("missing typed app-config blob at key `{key}` — run `<app-cli> config push` for this deploy"),
+            String::new(),
+        ))?;
     // ... envelope parse, sha verify, secret walk, deserialise + validate per §4.3
 }
 ```
@@ -4278,8 +4331,12 @@ push. Per adapter:
   reading is symmetric.
 - **Spin (Fermyon Cloud) — DIFF / SKIP-ON-EQUAL UNSUPPORTED IN
   v1.** The Spin CLI's `spin cloud key-value` subcommand set
-  (as of Spin 3.6.x) is `set` / `delete` / `list` — there is
-  no `get` that returns a value. `list` enumerates keys only.
+  (per the Fermyon Cloud command reference) exposes
+  `create` / `delete` / `list` / `rename` / `set` — there
+  is NO `get` that returns a per-key value. Per the same
+  reference, `list` enumerates STORES (not keys), and
+  `delete` deletes a whole STORE (not individual keys);
+  `set` is the only per-key operation shown.
   Implementing read-back via the Fermyon Cloud HTTP API
   directly would require wiring HTTP+auth into the spin
   adapter (a separate work stream — out of scope here).
@@ -5512,8 +5569,38 @@ blob is correct):
   "DELETE FROM spin_key_value WHERE store = '<label>' AND key
   != 'app_config'"` (substitute the actual default key from
   §5).
-- **Spin (Cloud):** `spin cloud key-value delete --app <APP>
-  --label <LABEL> <KEY>` per leaf.
+- **Spin (Cloud): no per-key cleanup through the current
+  Spin Cloud CLI.** Per the Fermyon Cloud command
+  reference, `spin cloud key-value` exposes
+  `create` / `delete` / `list` / `rename` / `set` —
+  `list` enumerates STORES, `delete` removes a STORE,
+  and `set` is the only per-key write; there is no
+  per-key list or delete. Three options for the
+  operator post-migration:
+
+  1. Leave the pre-migration leaf keys in place
+     (they're orphan bytes the runtime no longer
+     reads). The blob-model runtime only reads the
+     `app_config` blob key, so orphan leaves cause
+     no incorrect behaviour — just storage waste.
+  2. Recreate the store from scratch: `spin cloud
+     key-value delete <STORE>` followed by
+     `spin cloud key-value create <STORE>`, then
+     re-run `<app-cli> config push` to seed the
+     blob. Loses any other data the store held;
+     only safe if the store is dedicated to this
+     app's config.
+  3. Use the Fermyon Cloud dashboard / HTTP API
+     (if/when documented) to enumerate + delete
+     individual keys. Out of scope for v1; tracked
+     as a follow-up.
+
+  Earlier draft suggested
+  `spin cloud key-value delete --app <APP> --label
+  <LABEL> <KEY>` per leaf — round-20 reviewer
+  cross-checked against the Fermyon command
+  reference and found that form does NOT exist. The
+  recipe above reflects the actual CLI surface.
 
 The migration guide includes a one-liner that lists the
 expected per-leaf key shapes (it's the result of
@@ -5860,7 +5947,17 @@ length, charset) on the operator-typed KEY NAME.
 - `AppConfig<C>` extractor:
   - Returns the deserialised struct for a valid blob.
   - Errors on sha mismatch (manually-edited blob).
-  - Errors on missing key (per Q3 default).
+  - **Missing key (per Q3 (d) / §6.3 — round-19/20).**
+    Fixture: `ConfigStore::get` returns `Ok(None)`.
+    Assert the extractor produces
+    `EdgeError::ConfigOutOfDate { message, field_path }`
+    where `message` contains the literal `key
+    \`<resolved-key>\`` AND the literal `run
+    \`<app-cli> config push\``. Render the
+    resulting `Response`; assert HTTP status 503 and
+    the `Retry-After: 60` header is present. NOT
+    `EdgeError::Internal` (the round-18 reversal that
+    round-19 then propagated through §6.3).
   - `named(key)` reads a different key from the same store.
 - `BlobEnvelope` deserialise:
   - Rejects unknown envelope `version`.
