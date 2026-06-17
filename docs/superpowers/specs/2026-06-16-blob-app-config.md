@@ -7,8 +7,8 @@
 
 ## v1 changelog
 
-Initial draft after seventeen review rounds — one author
-self-review, sixteen reviewer passes against the current
+Initial draft after eighteen review rounds — one author
+self-review, seventeen reviewer passes against the current
 branch's code.
 
 **Self-review (round 1):** canonical-form rules (§4.2), Spin
@@ -33,8 +33,10 @@ reconciled — one PR, seven commits, atomic landing, no
 minimum-cut split (§13); errors use the existing
 `ConfigStoreError::{Internal, InvalidKey, Unavailable}`
 variants with an explicit mapping table to `EdgeError` (§6.3,
-§4.3); missing-key behaviour picks `EdgeError::Internal` for v1
-with no opt-out (§6.3); extractor module path corrected to
+§4.3); missing-key behaviour originally picked
+`EdgeError::Internal` (round-18 M-2 reversed this to
+`EdgeError::ConfigOutOfDate` — see Q3); extractor module
+path corrected to
 `edgezero_core::extractor::AppConfig` (§6.1); "legacy" phrasing
 dropped from the push flag table (§8.2).
 
@@ -1205,6 +1207,69 @@ before plan authoring:**
 - **Author field filled in.** Header field
   `Author:` no longer says `(TBD)`.
 
+**Reviewer pass (round 18) — adapter-cap corrections +
+contract reversals:**
+
+- **Fastly cap corrected from 64 KiB → 8 000
+  characters.** Reviewer cross-checked against the
+  official Fastly Config Store item docs:
+  `item_value` is capped at 8 000 characters, not
+  64 KiB. The Q6 per-adapter cap table now states
+  8 000 characters with a "round-18 reviewer caught
+  this against the official docs" note; §12.10's
+  "Fastly supports sizes well beyond Spin cap" claim
+  is replaced with the actual relationship (a
+  Spin-boundary blob ~95 KiB DOES exceed Fastly's
+  cap). Added §12.3 Fastly-specific size-cap test
+  asserting the boundary (8 000 OK, 8 001 errors via
+  the writer-side guard). Fastly Q6 (a) gains a
+  pre-platform guard sketch in the Fastly writer
+  that errors before the platform call.
+- **"Split across `[stores.config]` ids" workaround
+  reworded as "restructure into separate typed
+  structs".** The framework does NOT auto-split one
+  `C` across stores —
+  `run_config_push_typed::<C>` writes ONE blob per
+  store, and §3.2 explicitly forbids multi-blob
+  merge. Operators with too-large configs need to
+  RESTRUCTURE their typed `C` into multiple separate
+  types (one per logical surface, e.g.
+  `BillingConfig` / `FeatureConfig`) and wire each
+  through its own `[stores.config]` id with its own
+  `AppConfig<...>` extractor. Updated the wording in
+  Q6 (Fastly), Q12 (Spin Cloud), and §9.4 (Spin
+  Cloud follow-up paths) accordingly.
+- **Parent `Command::Config` `after_help` via the
+  TUPLE variant, not a struct variant.** Round-17's
+  sketch converted `Config(ConfigCmd)` to a struct
+  variant `Config { cmd: ConfigCmd }`, which would
+  force match-arm churn across every existing
+  `Command::Config(...)` site. A round-18 Clap probe
+  confirmed `#[command(subcommand, after_help = ...)]`
+  on the TUPLE variant works identically — clap
+  renders `after_help` on `edgezero config --help`
+  and the `subcommand` attribute keeps the inner
+  `ConfigCmd` dispatch intact. Sketch reverted to
+  the tuple form.
+- **Q3 missing-blob behaviour reversed from
+  `Internal` to `ConfigOutOfDate`.** §6.3's
+  ConfigOutOfDate rationale defines the class as "a
+  re-run of `<app-cli> config push` fixes it" — and
+  a missing blob is exactly that case. Mapping to
+  `Internal` would page oncall (500-class signal)
+  when the actionable response is "push the
+  config", which `ConfigOutOfDate` (503 with
+  `Retry-After: 60`) already encodes. The §3.3.3
+  extractor sketch's `EdgeError::internal("missing
+  typed app-config blob")` call site changes to
+  `EdgeError::config_out_of_date(...)` with an
+  actionable message naming the key + the
+  `<app-cli> config push` remediation. (c)
+  (`MaybeAppConfig<C>` for endpoints with a
+  sensible default) is still tracked as a
+  follow-up. The §1 round-2 changelog reference
+  updated to record the round-18 reversal.
+
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
 evolution (`#[serde(default)]`, struct versioning, etc.); the
@@ -1718,25 +1783,28 @@ pub enum ConfigCmd {
 // render on `edgezero config --help` — clap renders the
 // child `after_help` only when that specific child's
 // `--help` is invoked. To make `edgezero config --help`
-// also surface the pointer, attach it to the parent's
-// `Command::Config` variant declaration in the
-// top-level `Command` enum:
+// also surface the pointer, attach `after_help` AND
+// `subcommand` together on the existing TUPLE variant
+// declaration of `Config(ConfigCmd)` in the top-level
+// `Command` enum:
 //
 //   #[derive(clap::Subcommand)]
 //   pub enum Command {
 //       // ... other subcommands ...
-//       #[command(after_help = STUB_POINTER_AFTER_HELP)]
-//       Config {
-//           #[command(subcommand)]
-//           cmd: ConfigCmd,
-//       },
+//       #[command(subcommand, after_help = STUB_POINTER_AFTER_HELP)]
+//       Config(ConfigCmd),
 //   }
 //
-// This is what makes `edgezero config --help` show the
-// pointer (which §12.8 asserts byte-for-byte against
-// the constant). Without it, the parent help screen
-// would list `push`/`diff` as available subcommands
-// with no hint that they're stubs.
+// Round-18 M-1 caught an earlier sketch that converted
+// `Config(ConfigCmd)` into a struct variant
+// `Config { cmd: ConfigCmd }` — that shape change
+// would force match-arm churn across every existing
+// `Command::Config(...)` site. A round-18 Clap probe
+// confirmed `#[command(subcommand, after_help = ...)]`
+// on the TUPLE variant works the same: clap renders
+// `after_help` on `edgezero config --help`, and the
+// `subcommand` attribute keeps the inner `ConfigCmd`
+// dispatch intact. Keep the tuple form.
 
 // Implementation note: the catch-all carries
 // `trailing_var_arg = true` and `allow_hyphen_values =
@@ -2282,8 +2350,14 @@ where
     C: DeserializeOwned + AppConfigMeta + Validate + Send + 'static,
 {
     // 1. Fetch the envelope JSON string from the adapter via ConfigStore::get.
+    //    Missing blob maps to ConfigOutOfDate (Q3 (d) per round-18 M-2) —
+    //    re-running `<app-cli> config push` resolves the case, which is
+    //    exactly what ConfigOutOfDate means.
     let raw = config_store.get(&resolved_key).await?
-        .ok_or_else(|| EdgeError::internal("missing typed app-config blob"))?;
+        .ok_or_else(|| EdgeError::config_out_of_date(
+            format!("missing typed app-config blob at key `{resolved_key}` — run `<app-cli> config push` for this deploy"),
+            String::new(),
+        ))?;
     let envelope: BlobEnvelope = serde_json::from_str(&raw)?;
     envelope.verify_sha()?;
     let mut data: serde_json::Value = envelope.into_data();
@@ -4542,9 +4616,19 @@ parsing inside the adapter.
     key-value set --stdin` or `--from-file`.
   - When/if it lands, switch the writer over and remove the
     size cap.
-  - Until then, operators with larger configs can either:
-    split across `[stores.config]` ids (the multi-id support
-    PR #269 shipped), OR use a non-Cloud Spin deploy.
+  - Until then, operators with larger configs can either
+    RESTRUCTURE their typed `C` into multiple separate
+    types (one per logical surface — e.g.
+    `BillingConfig`, `FeatureConfig`) and wire each
+    through its own `[stores.config]` id with its own
+    `AppConfig<...>` extractor, OR use a non-Cloud Spin
+    deploy. Round-18 H-1 reframed this from "split
+    across ids" (which the framework does NOT
+    auto-do — `run_config_push_typed::<C>` writes one
+    blob per store, NOT a chunked merge) to
+    "restructure into separate typed structs". §3.2
+    keeps the "no multi-blob merge" stance — splitting
+    is operator-side schema work.
 
 - Runtime: `SpinConfigStore::get(key)` returns the JSON value;
   extractor parses.
@@ -5479,8 +5563,27 @@ What happens when the store has no entry at the requested key?
 - (b) Return `EdgeError::ServiceUnavailable`.
 - (c) Add a sibling extractor `MaybeAppConfig<C>` returning
   `Option<C>` for endpoints that have a sensible default.
-- **default:** (a) for v1; (c) is a follow-up if it turns out
-  to be commonly needed.
+- (d) Return `EdgeError::ConfigOutOfDate` — matches the
+  "re-run `<app-cli> config push` fixes it" rule
+  spelled out for `ConfigOutOfDate` at §6.3.
+- **default:** (d) for v1 (round-18 M-2 reversal of the
+  earlier (a) pick). The §6.3 rationale defines
+  `ConfigOutOfDate` as "the situation a re-run of
+  `<app-cli> config push` resolves" — and a missing
+  blob is squarely in that bucket: the deployed code
+  expects a blob, the store doesn't have one, an
+  operator push fixes it. Mapping this to `Internal`
+  would page oncall (a 500-class signal) when the
+  actionable response is "push the config", which
+  `ConfigOutOfDate` (503 with `Retry-After: 60`)
+  already encodes. The §3.3.3 extractor's
+  `ok_or_else(|| EdgeError::internal("missing typed
+  app-config blob"))` call site changes to
+  `EdgeError::config_out_of_date("missing typed
+  app-config blob at key `<key>` — run `<app-cli>
+  config push`", String::new())` accordingly. (c) is
+  still tracked as a follow-up for endpoints that
+  want explicit `Option<C>` semantics.
 
 ### Q4. Envelope `version` storage
 
@@ -5505,26 +5608,46 @@ unlock. Re-evaluate after profiling on real workloads.
 
 Per-platform value caps as of v1:
 
-| Adapter    | Platform value cap                                     | Source / notes                                                                                                                                                                                                                                                                              |
-| ---------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Axum       | none (local file)                                      | The Axum store is `BTreeMap<String, String>` serialised to a JSON file; cap is filesystem-bound.                                                                                                                                                                                            |
-| Cloudflare | 25 MiB                                                 | KV per-value limit (`developers.cloudflare.com/kv/platform/limits`).                                                                                                                                                                                                                        |
-| Fastly     | 64 KiB                                                 | Config Store entry value limit per Fastly's published platform limits. The historical "8 KiB" figure cited in earlier drafts was the OLD edge-dictionary cap; Config Store is 64 KiB. The current writer uses `fastly config-store-entry update --upsert --stdin` at the Fastly adapter (PR #269 F4) so there's no argv ceiling — the only cap is the platform's. |
-| Spin Cloud | `MAX_ARGV_BYTES_PER_INVOCATION` (`96 * 1024`) per pair | Writer cap at `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`; under the blob model the effective limit is the cap minus `<KEY>=` (per §9.4).                                                                                                                                       |
-| Spin local | sqlite filesystem-bound                                | `<spin.toml dir>/.spin/sqlite_key_value.db`; cap is filesystem-bound.                                                                                                                                                                                                                       |
+| Adapter    | Platform value cap                                     | Source / notes                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Axum       | none (local file)                                      | The Axum store is `BTreeMap<String, String>` serialised to a JSON file; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                                |
+| Cloudflare | 25 MiB                                                 | KV per-value limit (`developers.cloudflare.com/kv/platform/limits`).                                                                                                                                                                                                                                                                                                                                                                            |
+| Fastly     | **8 000 characters** (~8 KB UTF-8)                     | Fastly Config Store `item_value` limit per Fastly's published platform docs. The writer uses `fastly config-store-entry update --upsert --stdin` at the Fastly adapter (PR #269 F4) so there's no argv ceiling, but the platform itself rejects values over 8 000 characters. **Earlier drafts cited 64 KiB — that was a documentation error; the round-18 reviewer caught it against the official Fastly Config Store item docs.**             |
+| Spin Cloud | `MAX_ARGV_BYTES_PER_INVOCATION` (`96 * 1024`) per pair | Writer cap at `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`; under the blob model the effective limit is the cap minus `<KEY>=` (per §9.4).                                                                                                                                                                                                                                                                                           |
+| Spin local | sqlite filesystem-bound                                | `<spin.toml dir>/.spin/sqlite_key_value.db`; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                                                           |
 
 For Fastly specifically:
 
-- (a) Accept the platform cap. Document it. Operators with
-  >64 KiB configs use a different adapter or split the
-  config across `[stores.config]` ids.
+- (a) Accept the platform cap. Document it. Operators
+  with >8 000-character configs need to restructure
+  their typed `C` into separate types per logical
+  surface (e.g. `BillingConfig` / `FeatureConfig`)
+  and wire each through its own
+  `[stores.config]` id with its own
+  `AppConfig<BillingConfig>` / `AppConfig<FeatureConfig>`
+  extractor. The blob model intentionally does NOT
+  auto-split one `C` across ids (see §3.2's "no
+  multi-blob merge" stance and the round-18 H-1
+  reframing); each id holds ONE typed struct. The
+  restructure is operator-side schema work — the
+  framework provides the multi-id machinery, not the
+  split itself.
 - (b) Add a `--chunked` flag that splits a too-big blob
   across N sibling keys (`app_config__1`,
   `app_config__2`, …).
 - **default:** (a). Chunking re-introduces the
   partial-write hazard the blob model exists to avoid.
-  64 KiB is comfortable for almost every app-demo-shaped
-  workload; the rest use Cloudflare / Spin / Axum.
+  8 000 characters is tight for a single struct but
+  workable for app-demo-shaped workloads; operators
+  with substantially larger configs either restructure
+  per (a) or pick Cloudflare / Spin / Axum.
+
+The Fastly writer adds a pre-platform-call guard that
+checks `envelope.len() > 8_000` and errors with an
+actionable message naming the per (a) restructure
+guidance before incurring the platform error. The
+guard mirrors the Spin Cloud cap check (§9.4) but uses
+the Fastly-specific limit.
 
 ### Q7. Diff against `--local` vs remote
 
@@ -5606,8 +5729,9 @@ See §9.4 for context.
   (`MAX_ARGV_BYTES_PER_INVOCATION = 96 * 1024` at
   `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`,
   i.e. ~95 KiB after envelope wrapping + the `<KEY>=`
-  prefix), with an actionable message naming the
-  split-across-`[stores.config]`-ids workaround.
+  prefix), with an actionable message naming the Q6 (a)
+  remediation (restructure `C` into separate types across
+  multiple `[stores.config]` ids; do NOT auto-chunk).
 - (b) Soft-warn but proceed. Operator gets an `E2BIG` from
   Spin's CLI if it actually overflows.
 - (c) Chunk the blob across N sibling keys (recreates the
@@ -5763,6 +5887,25 @@ For each of axum / cloudflare / fastly / spin:
 - The smoke scripts (`scripts/smoke_test_config.sh`) seed via
   the new blob path and assert the runtime returns the seeded
   values.
+
+**Fastly-specific size-cap test (round-18 B-1).** Q6's
+Fastly cap of 8 000 characters is enforced by a writer-
+side guard (per Q6's last paragraph); the test
+exercises both sides of the boundary:
+
+- A blob whose envelope JSON is exactly 8 000
+  characters pushes successfully (no false positive on
+  the boundary). The runtime reads it back and
+  validates.
+- A blob whose envelope JSON is 8 001 characters
+  errors via the Fastly-writer guard before the
+  platform call. Assert exit non-zero and the message
+  names the 8 000-character cap AND the Q6 (a)
+  remediation (restructure into separate `C` types per
+  `[stores.config]` id; do NOT auto-chunk).
+- The guard does NOT fire on the OTHER three adapters
+  at the same blob size — only the Fastly writer
+  enforces this cap.
 
 ### 12.4 Migration
 
@@ -5991,23 +6134,28 @@ for the default `app_config` key (10 chars), that's
   to Spin Cloud exits non-zero with the documented
   "exceeds the 96 KiB safe-argv-per-invocation cap"
   message (extended in the implementing PR to name the
-  blob-model workarounds: split across `[stores.config]`
-  ids, or use `--local`).
+  blob-model remediation: restructure `C` into separate
+  typed structs across multiple `[stores.config]` ids
+  per Q6's (a) guidance, or use `--local`).
 - A blob exactly one byte UNDER the cap (i.e. the
   `<KEY>=<JSON>` pair is
   `MAX_ARGV_BYTES_PER_INVOCATION - 1` bytes) pushes
   successfully (no false positive on the boundary).
 - The Spin-Cloud-specific cap does NOT fire on the other
   three adapters at the SAME blob size — Cloudflare's KV
-  value limit is 25 MiB, Fastly's config-store entry
-  value limit is 64 KiB (well above the
-  `MAX_ARGV_BYTES_PER_INVOCATION` cap once we strip the
-  `<KEY>=` framing), Axum has no transport-side cap.
-  Note: Fastly's 64 KiB platform cap is enforced
-  separately by the Fastly writer; §12.3 covers the
-  Fastly-specific size test (a blob just over 64 KiB
-  errors via the Fastly platform's response, NOT via
-  the Spin-shaped guard).
+  value limit is 25 MiB, Axum has no transport-side cap.
+  Fastly is the EXCEPTION: a Spin-boundary blob
+  (~95 KiB) DOES hit Fastly's tighter 8 000-character
+  Config Store limit (per Q6, round-18 B-1
+  correction). Fastly's separate platform cap is
+  covered in §12.3's Fastly-specific size test: a blob
+  at ≤ 8 000 characters pushes successfully; a blob at
+  > 8 000 characters errors via the
+  Fastly-writer-side pre-platform guard (per Q6) with
+  the restructure-into-multiple-`[stores.config]`-ids
+  remediation message. The §12.10 Spin-Cloud-cap test
+  does NOT exercise the Fastly path — that's §12.3's
+  job.
 
 ### 12.11 CLI parser tests for the canonical flag surface (§3.2.2)
 
