@@ -7,8 +7,8 @@
 
 ## v1 changelog
 
-Initial draft after twenty-one review rounds — one author
-self-review, twenty reviewer passes against the current
+Initial draft after twenty-two review rounds — one author
+self-review, twenty-one reviewer passes against the current
 branch's code.
 
 **Self-review (round 1):** canonical-form rules (§4.2), Spin
@@ -1384,6 +1384,67 @@ in-tree walker:**
   no longer applies because there is no external
   dep.
 
+**Reviewer pass (round 22) — migration scope +
+implementability + phasing for plan-readiness:**
+
+- **§10.3 manifest-schema migration scope corrected.**
+  Earlier wording said the manifest schema was
+  unaffected — but §5.2's hyphen-rejection rule IS a
+  hard-cutoff manifest-schema change. §10.3 now
+  explicitly carves out "manifest schema DOES change in
+  one narrow way" and names the renamed sites
+  operators must touch (`edgezero.toml` `[stores.*]`
+  ids + matching `[adapters.<name>.*]` bindings).
+  §10.2 gains a `grep -RnE` recipe for the
+  implementing PR + operators to audit hyphenated
+  store ids across in-tree manifests, scaffold
+  templates, smoke scripts, and docs.
+- **§3.3.3 extractor sketch deserialize call fixed.**
+  Earlier sketch used
+  `serde_path_to_error::Deserializer::new(data, &mut
+  track)` directly on a `serde_json::Value` — that's
+  the wrong shape (the `Deserializer::new` constructor
+  takes a `Deserializer`, not a `Value`). The §4.3
+  prose already said the correct form
+  (`Value::into_deserializer()` +
+  `serde_path_to_error::deserialize`). Sketch
+  rewritten to match: `use serde::de::IntoDeserializer
+  as _;` + `serde_path_to_error::deserialize(data.into_deserializer())`,
+  matching what an implementer would actually write.
+- **Q9 audit log resolved to (c) — out of v1 scope.**
+  Earlier default was (a) "structured JSON line on
+  push stdout", but §8.2 push flow, §12.2 tests, and
+  §13 commit phasing carried no contract for the JSON
+  shape, output order, skip-on-equal behaviour, or
+  test assertions. Two options to resolve: pin the
+  full contract end-to-end OR drop. Picking drop: the
+  deploy-pipeline layer already has the data, the
+  sha is on push stdout per §8.2's success line, and
+  specifying a full audit-log contract is a separate
+  work stream. (a) and (b) tracked as follow-ups for
+  when a real audit requirement lands.
+- **§13 commit phasing regrouped for plan-readiness
+  + bisect-friendliness.** Round-22 reviewer flagged
+  that the earlier phasing split `--key`, `diff`, and
+  read-back across separate later commits, making
+  intermediate slices non-bisectable. Phasing
+  rewritten into 7 commits where each one is annotated
+  as **complete slice** (builds + tests pass on that
+  commit alone). Grouping changes: `ConfigStoreBinding`
+  + `EnvConfig::store_key` + manifest-charset tightening
+  land WITH the extractor's binding consumer (Commit B);
+  `--key` push flag lands WITH `config push` rewrite
+  (Commit E); inline-diff prompt lands with push
+  (Commit E, reusing the read trait from Commit D).
+  The standalone "`__KEY` + `config push --key`"
+  commit from the round-21 phasing is gone — its two
+  halves now live where they're load-bearing.
+- **§8.4 dangling reference fixed.** Two callers
+  pointed at a §8.4 that doesn't exist (the diff
+  format docs live in §8.1.1 / §8.1.2 / §8.1.3).
+  Both call sites updated to the real subsection
+  numbers.
+
 Stance from initial discussion: **no backward compatibility, no
 migration aid.** Apps are responsible for their own schema
 evolution (`#[serde(default)]`, struct versioning, etc.); the
@@ -1768,7 +1829,8 @@ pub struct ConfigDiffArgs {
     pub runtime_config: Option<PathBuf>,
 
     /// Output format — `unified` (default), `structured`, `json`.
-    /// See §8.4.
+    /// See §8.1.1 / §8.1.2 / §8.1.3 for the format
+    /// specifications.
     #[arg(long, default_value = "unified")]
     pub format: String,
 
@@ -1982,7 +2044,7 @@ Flag-surface invariants the rest of the spec depends on:
   read-back per §9.4 needs the path to the runtime config
   file that has `KEY_VALUE_STORE_TOKEN`).
 - `--format` exists on Diff (unified / structured / json
-  per §8.4).
+  per §8.1.1 / §8.1.2 / §8.1.3).
 - `--exit-code` exists on Diff (CI mode — see Q10).
 - `--dry-run` exists on Push (preview, no write).
 - `--strict` exists on Validate (raw + typed both honor it
@@ -2540,9 +2602,8 @@ where
 
     // 3. Deserialise (through serde_path_to_error so we get
     //    the field-path) + validate.
-    let mut track = serde_path_to_error::Track::new();
-    let de = serde_path_to_error::Deserializer::new(data, &mut track);
-    let cfg: C = C::deserialize(de)
+    use serde::de::IntoDeserializer as _;
+    let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
         .map_err(EdgeError::config_out_of_date_from_serde)?;
     cfg.validate().map_err(|err| {
         EdgeError::config_out_of_date(
@@ -4963,6 +5024,29 @@ files to change:
 The PR's commit message lists every file in this section so the
 reviewer can audit completeness.
 
+**Store-id charset audit (round-22 I-1).** Per §10.3,
+manifest schema does change in ONE narrow way: `[stores.*]`
+ids drop hyphens. Implementer runs this one-liner to
+verify no in-tree manifest, scaffold template, smoke
+script, or doc fixture uses a hyphenated store id, and
+to find every site that needs renaming:
+
+```sh
+# Look for `ids = [..., "x-y", ...]` and `default = "x-y"`
+# style entries with hyphens. False positives are easy to
+# audit by hand.
+grep -RnE '(ids = \[[^\]]*"-?[a-z0-9]+-[a-z0-9]+"|default = "-?[a-z0-9]+-[a-z0-9]+")' \
+  examples/ crates/edgezero-cli/src/templates \
+  crates/edgezero-adapter-*/src/templates docs/ \
+  || echo "OK: no hyphenated store ids found"
+```
+
+App-demo, the four adapter templates, and the migration-
+guide examples should already use underscore-only ids
+(`app_config`, `feature_flags`, `sessions`, …) per the
+existing convention. The grep is a belt-and-suspenders
+check against drift.
+
 ### 10.2.1 Acceptance gate — `verify_no_legacy_typed_reads`
 
 A new `scripts/check_no_legacy_typed_reads.sh` runs in CI on
@@ -5540,17 +5624,35 @@ For every `.hbs` file listed above, the implementer asserts:
    generated_project_builds -- --ignored` (the existing
    end-to-end render-and-build test) passes.
 
-### 10.3 What does NOT migrate
+### 10.3 What does NOT migrate (and what DOES at the manifest level)
 
 - Hand-managed `ConfigStore` entries (the `ConfigStore` trait
   itself stays — it's still useful for ad-hoc raw KV reads
   that aren't the typed app-config).
 - The KV store (`[stores.kv]`). KV is application data, not the
-  typed app-config; its shape doesn't change.
+  typed app-config; its shape STRUCTURE doesn't change —
+  but the store-id charset does, see below.
 - The secret store (`[stores.secrets]`). Secrets stay
-  out-of-blob per §3.2.
-- The manifest itself (`edgezero.toml`). Manifest schema is
-  unaffected.
+  out-of-blob per §3.2 — but the store-id charset
+  changes, see below.
+
+**Manifest schema DOES change in one narrow way:**
+per §5.2, store ids in `[stores.kv]`, `[stores.config]`,
+and `[stores.secrets]` tighten from `[A-Za-z0-9_-]` to
+`[A-Za-z0-9_]+` (hyphens rejected — they break POSIX
+shell `export` of the
+`EDGEZERO__STORES__<KIND>__<ID>__KEY` overrides). This
+is a hard-cutoff manifest-schema change per §1: operators
+with hyphenated store ids (`feature-flags`,
+`session-cache`, …) MUST rename them in `edgezero.toml`
+AND in any matching `[adapters.<name>.*]` binding /
+namespace declarations BEFORE the blob model merges.
+§12.18 covers the validator rejection; the migration
+guide carries a sed/grep recipe in §10.2's bullet list
+so the operator can find every reference in one pass.
+Round-22 reviewer correctly flagged that earlier draft
+wording ("manifest schema unaffected") understated this
+change; the wording is now narrow and accurate.
 
 ### 10.4 No platform-side bridge
 
@@ -5858,7 +5960,7 @@ REMOTE Cloudflare KV?
 - **default:** (a). The existing extractors all live in
   `extractor`; the new one stays alongside.
 
-### Q9. Push-side audit log
+### Q9. Push-side audit log — resolved out of v1 scope
 
 Should `config push` log a structured audit line on every
 successful write (operator user / host, local sha, remote sha,
@@ -5869,10 +5971,22 @@ timestamp, store id, key, adapter)?
 - (b) Yes, written to an opt-in `.edgezero/push-audit.log` per
   project.
 - (c) No, leave to the deploy-pipeline layer.
-- **default:** (a). Cheap to add, useful for compliance, and the
-  JSON line stays out of the operator's terminal flow if they
-  pipe stdout through `jq`. (b) leaks history into the repo; (c)
-  loses the only place EdgeZero knows the local sha for sure.
+- **Resolved: (c) for v1.** Earlier draft defaulted to (a),
+  but the round-22 reviewer correctly observed that §8.2
+  (push flow), §12.2 (push/diff tests), and §13 (commit
+  phasing) carried NO contract for the JSON shape, output
+  order, skip-on-equal behaviour, or test assertions. Two
+  options to resolve: (i) fully specify the audit contract
+  AND wire it into §8.2/§12.2/§13, OR (ii) drop the audit
+  log from v1. Picking (ii) — the deploy-pipeline layer
+  already has all the data (it knows when push ran, what
+  the diff was, what the sha was — the sha is on push
+  stdout already per §8.2's success line "pushed N entries
+  to … (sha=<hex>)"). Specifying a full audit-log contract
+  is a separate work stream; lumping it into v1 widens
+  scope without clear value. (a) and (b) are tracked as
+  follow-ups; when a real audit requirement lands, write
+  it up as its own spec with the contract pinned.
 
 ### Q10. `config diff` exit-code semantics for CI
 
@@ -6628,33 +6742,89 @@ skip-on-equal. They're load-bearing parts of the same model
 change.
 
 The PR organises commits by ConcernArea for review readability,
-but ships them together:
+but ships them together. Round-22 M-2 reviewer flagged earlier
+phasing as not dependency-friendly for a plan: `--key`,
+`diff`, and read-back are load-bearing for skip-on-equal +
+`__KEY`, so splitting them across separate later commits
+makes intermediate slices non-bisectable. The phasing below
+groups dependencies together so each commit is a complete,
+testable review slice; commits that DON'T compile on their
+own are marked explicitly.
 
-1. **Commit A — Envelope + sha + canonical form.** Pure
-   `edgezero-core` work. Adds the `BlobEnvelope` type,
-   `canonical_data_sha256`, the pin test (§4.2), and the unit
-   tests in §12.1.
-2. **Commit B — `AppConfig<C>` extractor + secret resolution
-   (§3.3).** Wires the envelope into the per-adapter
-   `ConfigStore::get` read path. All four adapters' readers
-   move over.
-3. **Commit C — `Adapter::read_config_entry` trait + per-
-   adapter impls (§9.0).** Standalone — landing this commit
-   alone gives `diff` and skip-on-equal something to call.
-4. **Commit D — `config push` rewrite (single-blob writers).**
-   App-demo migrates in this commit; the grep gate (§10.2.1)
-   first runs here.
-5. **Commit E — `config diff` command.** Inline diff in push,
-   --format renderers, --exit-code flag (per Q10).
-6. **Commit F — `__KEY` env-var override + `config push
-   --key`.** Runtime read-side + push-side flag.
-7. **Commit G — Migration guide, smoke scripts, README
-   updates.**
+Each commit is annotated as either **complete slice** (builds
++ tests pass on that commit alone) or **incomplete slice — do
+not bisect to this commit** (a structural step that needs the
+next commit to finish a feature). The PR cannot land without
+ALL slices; the annotation just tells reviewers and
+`git bisect` users what to expect.
 
-Reviewer can read commits in order to follow the design from
-"types" → "extractor" → "push/diff" → "polish". The PR cannot
-land without ALL seven; the reviewer's job is to confirm
-completeness, not to approve a subset.
+1. **Commit A — Envelope + sha + canonical form
+   (complete slice).** Pure `edgezero-core` work. Adds the
+   `BlobEnvelope` type, `canonical_data_sha256` (the in-tree
+   walker per §4.2 Q1 (b)), the pin test (§4.2), and the
+   unit tests in §12.1.
+2. **Commit B — Manifest store-id charset tightening +
+   `ConfigStoreBinding` + `EnvConfig::store_key`
+   (complete slice).** §5.2 + §5.2.1 + §12.18. Tightens
+   `[stores.*]` ids to `[A-Za-z0-9_]+`; introduces
+   `ConfigStoreBinding { handle, default_key }` on the
+   `ConfigRegistry` value type; adds
+   `EnvConfig::store_key("config", id)` centralised
+   lookup; updates all four adapters'
+   `build_config_registry` to pack the binding. No
+   extractor or CLI changes yet — this is structural so
+   Commit C below can land cleanly. Grouped with B
+   because the extractor reads `binding.default_key`
+   directly; splitting them would force a temporary
+   placeholder key resolution.
+3. **Commit C — `AppConfig<C>` extractor + secret
+   resolution (complete slice).** §3.3. Wires the
+   envelope + binding into the per-adapter
+   `ConfigStore::get` read path. All four adapters'
+   READERS move over; missing-blob maps to
+   `EdgeError::ConfigOutOfDate` per Q3 (d). The
+   §10.2.1 grep gate first runs here (so a regressed
+   handler fails CI as soon as the extractor is
+   available).
+4. **Commit D — `Adapter::read_config_entry` trait +
+   per-adapter impls (complete slice).** §9.0. Read-
+   side parity for `diff` and skip-on-equal. The
+   `ReadConfigEntry::Unsupported` variant for Spin
+   Cloud lands here.
+5. **Commit E — `config push` rewrite + `--key` +
+   inline-diff prompt (complete slice).** §8.2 + §5.4.
+   Single-blob writers per adapter; `--key` override
+   on push (per §5.4 — paired with the `__KEY` runtime
+   override from Commit B so the env path is testable
+   end-to-end); inline-diff prompt uses Commit D's
+   read trait. App-demo migrates in this commit.
+   `--no-diff` / `--yes` / `--dry-run` flags wired
+   per §8.2. The grep gate keeps passing.
+6. **Commit F — `config diff` command +
+   `--exit-code` (complete slice).** §8.1. Adds the
+   diff subcommand reusing the read trait + the
+   diff renderer from Commit E. `--format unified |
+   structured | json`, `--exit-code` semantics per
+   Q10.
+7. **Commit G — Migration guide, smoke scripts,
+   README updates (complete slice).** §10. Updates
+   `docs/`, `scripts/smoke_test_config.sh`, scaffold
+   READMEs.
+
+Removed from the round-21 phasing: a standalone
+"`__KEY` env-var override + `config push --key`"
+commit (Commit F in the old numbering). Both pieces
+now live where they're load-bearing — `__KEY`
+runtime resolution in Commit B (because the binding
+carries it), `--key` push flag in Commit E (because
+push + diff both rely on it).
+
+Reviewer can read commits in order to follow the
+design from "types + structure" → "extractor" →
+"read trait" → "push + key" → "diff" → "polish".
+The PR cannot land without ALL seven; the reviewer's
+job is to confirm completeness, not to approve a
+subset.
 
 ### 13.1 Acceptance gate — no placeholder values in shipped code
 
