@@ -4669,9 +4669,14 @@ pub trait Adapter: Sync + Send {
 }
 
 pub enum ReadConfigEntry {
-    /// The store and key both exist; bytes are the raw blob
-    /// envelope JSON. Caller parses + verifies.
-    Present(Vec<u8>),
+    /// The store and key both exist; the inner string is the raw
+    /// blob envelope JSON (the same shape `ConfigStore::get`
+    /// returns at runtime per `crates/edgezero-core/src/config_store.rs:214`).
+    /// Caller parses + verifies. **Round-27 reviewer flagged an
+    /// earlier `Vec<u8>` draft as inconsistent with the rest of
+    /// §9.1-§9.4's per-adapter wording, all of which describes
+    /// string reads; aligned to `String`.**
+    Present(String),
     /// The store exists but no entry sits at this key. Diff
     /// treats this as "every leaf is added".
     MissingKey,
@@ -4727,7 +4732,7 @@ before a local-mode write that lands different bytes.
 
 Missing-remote semantics:
 
-- `Present(bytes)`: diff parses the envelope and produces a
+- `Present(body)`: diff parses the envelope JSON string and produces a
   per-leaf diff vs. local.
 - `MissingKey`: diff prints "no remote at key
   `<key>`; all <N> leaves added" and the unified output shows
@@ -5080,8 +5085,14 @@ cloudflare, spin}/{fastly,wrangler,spin}.toml` — local-server
     drops any `secret_store.require_str(&cfg.<field>)`
     call (was a footgun in earlier scaffolds);
     `cfg.<secret_field>` is used DIRECTLY since the
-    extractor resolved it. Imports add
-    `use edgezero_core::extractor::AppConfig;`.
+    extractor resolved it. Imports add a COMMENTED
+    sample line `// use edgezero_core::extractor::AppConfig;`
+    paired with the commented sample handler block —
+    NOT an active import. Active imports on dead
+    sample code would fail clippy `-D warnings` in the
+    generated project. See §10.2.2's detailed
+    `core/src/handlers.rs.hbs` block for the exact
+    wording.
   - **`core/src/config.rs.hbs`** — generated
     `<NameConfig>` struct field comments call out that
     `#[secret]` field RUNTIME values are resolved

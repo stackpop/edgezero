@@ -6,7 +6,7 @@
 
 **Architecture:** One typed-config struct `C` serialises to a single envelope `{ data, sha256, version, generated_at }` written to one `[stores.config]` key per environment. The runtime reads the envelope, verifies the SHA, swaps `#[secret]` fields with values from `[stores.secrets]`, deserialises through `serde_path_to_error`, validates, and yields `C` to the handler. `config push` writes one blob per adapter; `config diff` compares local vs remote via a new `Adapter::read_config_entry` trait. Hard cutoff per [spec §10](../specs/2026-06-16-blob-app-config.md): no dual-shape parsing, no legacy fallback.
 
-**Tech Stack:** Rust 1.95.0, Cargo workspace (8 crates), `serde_json` + `ryu` + `sha2` for canonicalisation, `serde_path_to_error` for field-path-aware deserialise errors, `validator` 0.20 for runtime validation, `clap` 4.6 for CLI, `syn` 2 + `walkdir` (CI-gate-only feature) for the nested-AppConfig acceptance check. No new runtime deps beyond `ryu`/`sha2`/`serde_path_to_error`.
+**Tech Stack:** Rust 1.95.0, Cargo workspace (8 crates), `serde_json` + `ryu` + `sha2` for canonicalisation, `serde_path_to_error` for field-path-aware deserialise errors, `validator` 0.20 for runtime validation, `clap` 4.6 for CLI, `chrono` 0.4 (ALREADY in workspace deps; new consumer on `edgezero-cli` for the `generated_at` RFC3339 timestamp at push time), `syn` 2 + `walkdir` (CI-gate-only feature) for the nested-AppConfig acceptance check. No new runtime deps beyond `ryu`/`sha2`/`serde_path_to_error`/`chrono` (the last reusing the existing workspace pin).
 
 ## Global Constraints
 
@@ -2132,11 +2132,103 @@ fn read_config_entry(
 
 - [ ] **Step 3: Fastly.** Shell out to `fastly config-store-entry describe --store-id=<id> --key=<key> --json`. Parse JSON, extract `item_value`, return `Present`. Map "not found" stderr to `MissingKey`.
 
-- [ ] **Step 4: Spin local.** Read SQLite via the vendored `spin_key_value` schema (already in the Spin adapter for writes). For `read_config_entry_local`, return `Present` on match.
+- [ ] **Step 4: Spin — mirror the FULL write dispatch.** Spec §9.0 says read-back must use the same variant as the write path. The Spin writer's `dispatch_push` at `crates/edgezero-adapter-spin/src/cli.rs:514` has four branches (per its doc-comment at `cli.rs:498-513`); the read path needs each one:
 
-For `read_config_entry` (cloud), return `Unsupported("Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1")`.
+| Write-side branch                                                                 | Trigger                                                                              | Read-side behaviour                                                                                                |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| 1. **`--local` forces SQLite-direct, regardless of runtime-config backend type** | `push_ctx.local == true`                                                             | `read_config_entry_local`: parse runtime-config to resolve the SQLite path (honour `type = "spin"` `path` override; otherwise default `.spin/sqlite_key_value.db`); read the row at `(store=<platform>, key=<key>)`. `Present(value)` / `MissingKey` per row presence; `MissingStore` if the SQLite file doesn't exist. |
+| 2. **Manifest deploy command targets Fermyon Cloud**                             | `push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)` | `read_config_entry`: returns `Unsupported("Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1")` per §8.3 / §9.4. NO shell-out to `spin cloud key-value list` or similar — that lists stores, not keys (round-20 cleanup recipe). |
+| 3. **`runtime-config.toml` declares a non-Spin backend**                         | `parsed.key_value_stores.get(platform) == Some(Redis { .. } | AzureCosmos | Unknown)` | `read_config_entry`: error with the same message the writer uses at `cli.rs:632-640` ("backend type `redis` for label `<X>` — use `redis-cli GET <key>` or the equivalent; edgezero does not read from this backend").                                                                                                  |
+| 4. **Default — runtime-config absent or `type = "spin"`**                        | Anything else                                                                        | `read_config_entry`: same as branch 1 (SQLite-direct read).                                                                                                                                                                                                                                                              |
 
-- [ ] **Step 5: Add unit tests for each adapter.** For shell-out adapters, mock with a test scaffold that uses a fake `wrangler` / `fastly` script on PATH. For Axum, write a temp file and assert directly.
+Sketch:
+
+```rust
+fn read_config_entry(
+    &self,
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    _component_selector: Option<&str>,
+    store: &ResolvedStoreId,
+    key: &str,
+    push_ctx: &AdapterPushContext<'_>,
+) -> Result<ReadConfigEntry, String> {
+    let platform = store.platform.as_str();
+    let spin_manifest_path = adapter_manifest_path
+        .map(|rel| manifest_root.join(rel))
+        .ok_or_else(|| "[adapters.spin.adapter].manifest must point at spin.toml for config diff".to_owned())?;
+    let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
+    let runtime_config_path = push_ctx.runtime_config_path.map_or_else(
+        || spin_manifest_dir.join("runtime-config.toml"),
+        Path::to_path_buf,
+    );
+
+    // Branch 2: Fermyon Cloud auto-detect via deploy command.
+    if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
+        return Ok(ReadConfigEntry::Unsupported(
+            "Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1"
+        ));
+    }
+
+    // Branches 3 + 4: parse runtime-config (if present) and dispatch on backend type.
+    let parsed = runtime_config::read(&runtime_config_path).ok();
+    let backend = parsed.as_ref().and_then(|p| p.key_value_stores.get(platform));
+    match backend {
+        Some(runtime_config::KeyValueBackend::Redis { .. }) => Err(format!(
+            "label `{platform}` in {} is type `redis`; use `redis-cli GET <key>` to read this store directly. \
+             edgezero does not read from redis backends.",
+            runtime_config_path.display()
+        )),
+        Some(runtime_config::KeyValueBackend::AzureCosmos) => Err(format!(
+            "label `{platform}` in {} is type `azure_cosmos`; use the Azure CosmosDB CLI to read this store. \
+             edgezero does not read from azure_cosmos backends.",
+            runtime_config_path.display()
+        )),
+        Some(runtime_config::KeyValueBackend::Unknown { type_str }) => Err(format!(
+            "label `{platform}` in {} is unknown backend type `{type_str}`; edgezero only reads from `type = \"spin\"` (SQLite) backends.",
+            runtime_config_path.display()
+        )),
+        Some(runtime_config::KeyValueBackend::Spin { path }) | None => {
+            // Branch 4 (default) or branch 3 → SQLite-direct read.
+            let sqlite_path = path
+                .as_deref()
+                .map(|p| spin_manifest_dir.join(p))
+                .unwrap_or_else(|| spin_manifest_dir.join(".spin").join("sqlite_key_value.db"));
+            read_sqlite(&sqlite_path, platform, key)
+        }
+    }
+}
+
+fn read_config_entry_local(
+    &self,
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    component_selector: Option<&str>,
+    store: &ResolvedStoreId,
+    key: &str,
+    push_ctx: &AdapterPushContext<'_>,
+) -> Result<ReadConfigEntry, String> {
+    // Branch 1: --local always SQLite-direct (write-side parallel at cli.rs:565).
+    // Reuse the SQLite reader; ignore Fermyon-Cloud auto-detect.
+    // (Implementation matches the write branch 1 path with adapter-side
+    // verify_label_declared + write_sqlite, but read-side.)
+    ...
+}
+
+fn read_sqlite(sqlite_path: &Path, store: &str, key: &str) -> Result<ReadConfigEntry, String> {
+    if !sqlite_path.exists() {
+        return Ok(ReadConfigEntry::MissingStore);
+    }
+    // Use the vendored spin_key_value schema (same module the writers
+    // use): query `SELECT value FROM spin_key_value WHERE store = ? AND key = ?`.
+    // Return Present / MissingKey based on row presence.
+    ...
+}
+```
+
+This branch logic is intentionally large because spec §9.0 says "read-back uses the same variant as the write path" — silently collapsing all four into "SQLite or Unsupported" would leave Redis/Azure operators with a confusing diff error and would not detect the Fermyon Cloud branch correctly.
+
+- [ ] **Step 5: Add unit tests for each adapter.** For shell-out adapters, mock with a test scaffold that uses a fake `wrangler` / `fastly` script on PATH. For Axum, write a temp file and assert directly. For Spin, exercise each of the four branches with a fixture `runtime-config.toml`.
 
 - [ ] **Step 6: Run.**
 
@@ -2560,21 +2652,17 @@ if args.local {
 }
 ```
 
-`generated_at_rfc3339()` is a small helper in `crates/edgezero-cli/src/config.rs`:
+`generated_at_rfc3339()` is a small helper in `crates/edgezero-cli/src/config.rs`. `chrono = "0.4"` is ALREADY in `[workspace.dependencies]` (`Cargo.toml:33`); add `chrono = { workspace = true }` to `crates/edgezero-cli/Cargo.toml`'s `[dependencies]` and use it directly — no manual formatter needed:
 
 ```rust
 fn generated_at_rfc3339() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Format manually to avoid a chrono / time dep — RFC3339 UTC.
-    // (Inspect existing CLI deps first — if chrono / time / jiff is
-    // already in the lockfile via another consumer, use it.)
-    format_utc(secs)
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 ```
+
+(`to_rfc3339_opts(SecondsFormat::Secs, true)` emits `2026-06-17T18:42:31Z` — RFC3339 UTC with second precision and the trailing `Z`, matching the spec §4.1 example. Deterministic at second granularity means the envelope's `generated_at` only varies across the second boundary, which is fine for the §4.2 SHA contract: `generated_at` is NOT part of the SHA — see §4.1's "Informational only; not part of the sha" bullet.)
+
+The plan's earlier `format_utc` placeholder is gone — round-27 reviewer flagged it as undefined.
 
 - [ ] **Step 2: Per-adapter platform-cap checks.** Adapters that need a pre-platform-call cap check enforce it inside their existing writer. The trait still takes `entries: &[(String, String)]`, so adapter code reads `entries[0].1.len()`:
 
@@ -3013,7 +3101,9 @@ PR replaces the placeholder with the real hex before merge."
 
 **Goal:** Add the `config diff` subcommand on generated CLIs. Reuses Phase C's read trait + envelope decode.
 
-## Task D1 — `ConfigDiffArgs` + clap wiring
+## Task D1 — `ConfigDiffArgs` clap struct (bundled-CLI exports only)
+
+**Scope (round-27 F-4):** D1 owns the `ConfigDiffArgs` clap struct in `crates/edgezero-cli/src/args.rs`. It does NOT touch the bundled binary's enum dispatch (that already has Push/Diff as stub-pointer variants per C3) or the scaffold template's `TypedConfigCmd` (that is owned by D2 Step 4 below).
 
 **Files:**
 
@@ -3021,18 +3111,11 @@ PR replaces the placeholder with the real hex before merge."
 
 - [ ] **Step 1: Add the struct.**
 
-Per spec §3.2.2's args block: `adapter`, `app_config`, `manifest`, `store`, `key`, `no_env`, `local`, `runtime_config`, `format`, `exit_code`.
+Per spec §3.2.2's args block: `adapter`, `app_config`, `manifest`, `store`, `key`, `no_env`, `local`, `runtime_config`, `format`, `exit_code`. The struct is `#[derive(clap::Args, Debug)]`.
 
-- [ ] **Step 2: Add `Diff` variant to `TypedConfigCmd`** (the generated-CLI enum).
+- [ ] **Step 2: Parser-roundtrip tests for the new flags** (per spec §12.11). Cover `--format json`, `--local`, `--store`, `--key`, `--runtime-config`, `--exit-code`. Mirror the existing `ConfigPushArgs` parser tests in `args.rs`.
 
-```rust
-#[derive(clap::Subcommand, Debug)]
-pub enum TypedConfigCmd {
-    Push(ConfigPushArgs),
-    Diff(ConfigDiffArgs),
-    Validate(ConfigValidateArgs),
-}
-```
+(The bundled `ConfigCmd::Diff(ConfigCmdStubArgs)` stub-pointer variant declared in C3 already takes the catch-all `ConfigCmdStubArgs`, NOT this new `ConfigDiffArgs`. The struct introduced here exists for the scaffold template's `TypedConfigCmd::Diff(ConfigDiffArgs)` variant that D2 Step 4 wires.)
 
 ## Task D2 — `run_config_diff_typed` entry point + format renderers
 
@@ -3049,11 +3132,111 @@ For `structured`: per spec §8.1.2 (refer to the spec block — implement verbat
 
 For `json`: per spec §8.1.3.
 
-- [ ] **Step 2: Wire `run_config_diff_typed`.** Steps: deserialise local TOML (deserialise-only + `validate_excluding_secrets`), build envelope, call `adapter.read_config_entry` (or `_local` if `--local`), pick renderer per `--format`, print.
+- [ ] **Step 2: Wire `run_config_diff_typed` with EXPLICIT per-variant handling of the read-back outcome.** Round-27 reviewer flagged the earlier compressed "read → render" wording as under-specified for the four `ReadConfigEntry` cases. Each variant gets its own branch + exit-code tag:
 
-- [ ] **Step 3: Implement `--exit-code` semantics per Q10:**
-  - Without `--exit-code`: always exit 0 on success (no-change OR diff present); errors still exit ≥2.
-  - With `--exit-code`: 0 on no-change, 1 on diff, ≥2 on error.
+```rust
+pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<(), String>
+where
+    C: DeserializeOwned + AppConfigMeta + Validate,
+{
+    // 1. Deserialise local TOML (deserialise-only) + validate_excluding_secrets.
+    let cfg: C = deserialize_app_config_with_options(&app_config_path, &app_name, &load_opts)?;
+    validate_excluding_secrets(&cfg).map_err(|e| format!("local validation failed: {e}"))?;
+
+    // 2. Build the local envelope.
+    let data: serde_json::Value = serde_json::to_value(&cfg)
+        .map_err(|e| format!("failed to serialise local config: {e}"))?;
+    let local_envelope = BlobEnvelope::new(data, generated_at_rfc3339());
+    let local_sha = local_envelope.sha256.clone();
+
+    // 3. Read back from the platform, mirroring the writer's parameter list.
+    let remote = if args.local {
+        adapter.read_config_entry_local(
+            &manifest_root, adapter_manifest_path, component_selector,
+            &store, &key, &push_ctx,
+        )?
+    } else {
+        adapter.read_config_entry(
+            &manifest_root, adapter_manifest_path, component_selector,
+            &store, &key, &push_ctx,
+        )?
+    };
+
+    // 4. Branch per spec §8.1's "Missing-remote semantics" + §9.0
+    //    Unsupported handling. Each branch sets `outcome` so Step 5
+    //    can pick the right exit code.
+    enum DiffOutcome { NoChanges, DiffPresent, RemoteAbsent, Unsupported(&'static str) }
+    let outcome = match remote {
+        ReadConfigEntry::Present(body) => {
+            let remote_envelope: BlobEnvelope = serde_json::from_str(&body)
+                .map_err(|e| format!("remote envelope parse failed: {e}"))?;
+            remote_envelope.verify().map_err(|e| format!("remote envelope verification failed: {e}"))?;
+            if remote_envelope.sha256 == local_sha {
+                println!("# no changes (sha256 matches: {local_sha})");
+                DiffOutcome::NoChanges
+            } else {
+                render_diff(&remote_envelope.data, &local_envelope.data, &remote_envelope.sha256, &local_sha, args.format.as_str())?;
+                DiffOutcome::DiffPresent
+            }
+        }
+        ReadConfigEntry::MissingKey => {
+            println!("# no remote at key `{key}`; all <N> leaves added");
+            render_diff_against_empty(&local_envelope.data, &local_sha, args.format.as_str())?;
+            DiffOutcome::RemoteAbsent
+        }
+        ReadConfigEntry::MissingStore => {
+            eprintln!("# store has no matching backend yet — run `edgezero provision --adapter <name>` first if this is the live remote");
+            render_diff_against_empty(&local_envelope.data, &local_sha, args.format.as_str())?;
+            DiffOutcome::RemoteAbsent
+        }
+        ReadConfigEntry::Unsupported(reason) => {
+            // §8.3 Spin Cloud surface: actionable error pointing the operator
+            // at --local or --yes push, not a half-truth render.
+            eprintln!(
+                "config diff for {} is unsupported ({reason}). Re-run with --local for the on-disk read, \
+                 or push unconditionally with `<app-cli> config push --adapter {} --yes` to update without seeing the diff.",
+                args.adapter, args.adapter,
+            );
+            DiffOutcome::Unsupported(reason)
+        }
+    };
+
+    // 5. Exit-code per Q10 + Step 3 below.
+    apply_exit_code(args.exit_code, outcome)
+}
+```
+
+Helpers: `render_diff` dispatches to the per-format renderers from Step 1; `render_diff_against_empty` renders the local data as if all leaves were added (`+` lines per §8.1.1). `apply_exit_code` does the §3.2.2 doc-comment translation per the table in Step 3.
+
+- [ ] **Step 3: `--exit-code` semantics per Q10 — explicit per-outcome table.**
+
+| Outcome                                    | Without `--exit-code` | With `--exit-code` |
+| ------------------------------------------ | --------------------- | ------------------ |
+| No changes (sha matches)                   | exit 0                | exit 0             |
+| Diff present                               | exit 0                | exit 1             |
+| Remote absent (MissingKey / MissingStore)  | exit 0 (treated as "all leaves added" success) | exit 1 (still a diff present from the operator's POV) |
+| Unsupported (Spin Cloud)                   | exit 2 (the diff is structurally impossible)   | exit 2             |
+| Parse / network / manifest-load error      | exit 2 (always)       | exit 2             |
+
+Code:
+
+```rust
+fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> Result<(), String> {
+    let code = match (exit_code_flag, outcome) {
+        (_, DiffOutcome::Unsupported(_)) => 2,
+        (false, _) => 0,
+        (true, DiffOutcome::NoChanges) => 0,
+        (true, DiffOutcome::DiffPresent | DiffOutcome::RemoteAbsent) => 1,
+    };
+    if code == 0 {
+        Ok(())
+    } else {
+        std::process::exit(code);
+    }
+}
+```
+
+(Errors raised via `Result::Err` propagate to the bundled / generated `main()` which exits ≥2 — that's how the "always non-zero on error" rule from Q10 + the `dry_run` doc-comment is honored. The `apply_exit_code` helper only fires on success branches.)
 
 - [ ] **Step 4: Add `Diff` to the scaffold template's `TypedConfigCmd` enum + dispatch.** Task C6 deliberately deferred this so the Phase C scaffold compiles without `ConfigDiffArgs` existing. In this commit, update `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`:
 
@@ -3210,7 +3393,7 @@ Mapping spec §s → tasks:
 | §12.5 (secret-field model)                      | C1 (extractor tests)                      |
 | §12.7 (env-var key override)                    | B7 (per-key tests) + E2                   |
 | §12.8 (raw-binary stub)                         | C3                                        |
-| §12.9 (downstream CLI wiring)                   | C6 (templates)                            |
+| §12.9 (downstream CLI wiring)                   | C6 (Push + Validate template wiring) + D2 (Diff template wiring per round-26 phasing carve-out) |
 | §12.10 (Spin Cloud cap)                         | C2 (Spin Cloud writer)                    |
 | §12.11 (parser tests)                           | C3 (ConfigPushArgs) + D1 (ConfigDiffArgs) |
 | §12.12 (--store routing)                        | C4 + D2                                   |
