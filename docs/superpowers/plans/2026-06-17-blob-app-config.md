@@ -1357,16 +1357,16 @@ Same for `named`:
     }
 ```
 
-- [ ] **Step 5: Fix each adapter's request-context constructor.** Each adapter builds the registry by mapping logical ids to handles; under the new shape, each ID must produce a `ConfigStoreBinding { handle, default_key }`. The `default_key` is `EnvConfig::store_key("config", id)` (added in Task B7). For Task B5 alone, hardcode `default_key: id.to_owned()` temporarily — Task B7 wires the env-var path.
+- [ ] **Step 5: Fix each adapter's registry builder.** Each adapter maps logical ids to handles; under the new shape, each ID must produce a `ConfigStoreBinding { handle, default_key }`. The `default_key` is `EnvConfig::store_key("config", id)` (added in Task B7). For Task B5 alone, hardcode `default_key: id.to_owned()` temporarily — Task B7 wires the env-var path.
 
-Files to edit (per spec §5.2.1's adapter line references):
+Files to edit (round-30 H-1: Axum's builder is in `dev_server.rs`, NOT `request.rs` — the dev server uses the registry directly, not a per-request context constructor):
 
-- `crates/edgezero-adapter-axum/src/request.rs` (or `context.rs`)
-- `crates/edgezero-adapter-cloudflare/src/request.rs`
-- `crates/edgezero-adapter-fastly/src/request.rs`
-- `crates/edgezero-adapter-spin/src/request.rs`
+- `crates/edgezero-adapter-axum/src/dev_server.rs` — `fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry>` at line 444. **The Axum builder must grow an `&env: &EnvConfig` parameter in Task B7** (it currently doesn't take one); update the single call site at `dev_server.rs:370` to pass the existing in-scope `EnvConfig`.
+- `crates/edgezero-adapter-cloudflare/src/request.rs:362` — `build_config_registry(env, config_meta, env_config)` already takes `env`.
+- `crates/edgezero-adapter-fastly/src/request.rs:382` — `build_config_registry(config_meta, env)` already takes `env`.
+- `crates/edgezero-adapter-spin/src/request.rs:276` — `build_config_registry(config_meta, env)` already takes `env`.
 
-In each, find the registry-builder loop (typically something like `for id in declared_ids { … handle.clone() … }`) and wrap each handle in `ConfigStoreBinding { handle, default_key: id.clone() }`.
+In each, find the registry-builder loop (`for id in meta.ids { … handle … }`) and wrap each handle in `ConfigStoreBinding { handle, default_key: id.clone() }` for Task B5. Task B7 changes the literal `id.clone()` to `env.store_key("config", &id)`.
 
 - [ ] **Step 6: Build, confirm clean.**
 
@@ -1488,7 +1488,7 @@ Expected: pass.
 
 - [ ] **Step 4: Update each adapter's registry-builder (touched in Task B5) to use `env.store_key("config", id)` instead of the hardcoded `id.to_owned()` placeholder.**
 
-For each of the four adapter `request.rs` files:
+For each adapter at the file:line cited in Task B5 Step 5, replace the placeholder `default_key: id.clone()` with `env.store_key("config", &id)`:
 
 ```rust
 ConfigStoreBinding {
@@ -1497,14 +1497,14 @@ ConfigStoreBinding {
 }
 ```
 
-(`env` is the `EnvConfig` instance the request-context builder already has in scope.)
+**Axum-specific (round-30 H-1):** `dev_server.rs:444`'s `build_config_registry` doesn't currently take an `EnvConfig`. This step CHANGES THE SIGNATURE to `fn build_config_registry(config_meta: Option<StoreMetadata>, env: &EnvConfig) -> Option<ConfigRegistry>` and updates the single call site at `dev_server.rs:370` to pass the existing in-scope `EnvConfig` instance (the dev-server entry point already constructs one for the other store registries; thread it through). The other three adapters' builders already take `env` and just need the new argument used inside the loop.
 
 Run: `cargo check --workspace --all-targets`
 Expected: clean.
 
-- [ ] **Step 5: Per-adapter `default_key` resolution tests (round-29 M-1).** Each adapter has its own request-context builder; the env-var path needs a test PER adapter to prove the resolved `default_key` actually lands in the binding. Without this, the `EnvConfig::store_key` unit test passes but a regression in an adapter's `build_config_registry` (forgetting to pass `default_key`, falling back to `id.to_owned()`, etc.) would be undetected.
+- [ ] **Step 5: Per-adapter `default_key` resolution tests (round-29 M-1).** Each adapter has its own registry-builder; the env-var path needs a test PER adapter to prove the resolved `default_key` actually lands in the binding. Without this, the `EnvConfig::store_key` unit test passes but a regression in an adapter's `build_config_registry` (forgetting to pass `default_key`, falling back to `id.to_owned()`, etc.) would be undetected.
 
-Add one test per adapter under each adapter's existing test module (Axum: `crates/edgezero-adapter-axum/src/request.rs`'s `mod tests`; Cloudflare / Fastly / Spin equivalents):
+Add one test per adapter under each adapter's existing test module — Axum tests live under `crates/edgezero-adapter-axum/src/dev_server.rs`'s `mod tests` (round-30 H-1: NOT `request.rs`); Cloudflare / Fastly / Spin under their respective `src/request.rs` `mod tests`:
 
 ```rust
     #[test]
@@ -2039,7 +2039,7 @@ Tests for §12.16 (round-29 M-2). Add three fixtures under the Spin adapter's ex
             TypedSecretEntry::new("default", "one", "Demo_Token"),
             TypedSecretEntry::new("vault",   "two", "demo_token"),
         ];
-        let err = SpinAdapter.validate_typed_secrets(&entries).unwrap_err();
+        let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
         assert!(err.contains("`one`"), "{err}");
         assert!(err.contains("`two`"), "{err}");
         assert!(err.contains("demo_token"), "{err}");
@@ -2052,7 +2052,7 @@ Tests for §12.16 (round-29 M-2). Add three fixtures under the Spin adapter's ex
         let entries = [
             TypedSecretEntry::new("vault", "api_token", "demo-token"),
         ];
-        let err = SpinAdapter.validate_typed_secrets(&entries).unwrap_err();
+        let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
         assert!(err.contains("`api_token`"));
         assert!(err.contains("demo-token"));
         assert!(err.to_lowercase().contains("hyphen") || err.contains("not a valid"));
@@ -2062,15 +2062,15 @@ Tests for §12.16 (round-29 M-2). Add three fixtures under the Spin adapter's ex
     fn non_spin_adapter_is_exempt_from_collision_check() {
         // §12.16 case (c): same collision fixture against a manifest
         // declaring only [adapters.axum] — covered by run_adapter_
-        // typed_checks NOT calling SpinAdapter at all. This is more
+        // typed_checks NOT calling SpinCliAdapter at all. This is more
         // naturally a CLI-level integration test, but the adapter
-        // unit test asserts that AxumAdapter::validate_typed_secrets
+        // unit test asserts that AxumCliAdapter::validate_typed_secrets
         // returns Ok(()) on the same input.
         let entries = [
             TypedSecretEntry::new("default", "one", "Demo_Token"),
             TypedSecretEntry::new("vault",   "two", "demo_token"),
         ];
-        assert!(AxumAdapter.validate_typed_secrets(&entries).is_ok());
+        assert!(AxumCliAdapter.validate_typed_secrets(&entries).is_ok());
     }
 ```
 
@@ -3561,11 +3561,73 @@ Phase D of the blob app-config rewrite per spec §8.1.
 
 - Create or expand: `docs/guides/blob-app-config-migration.md` — operator-facing guide per spec §10.
 
-## Task E2 — Smoke scripts
+## Task E2 — Smoke scripts (per-adapter runtime composition for §12.7)
 
 **Files:**
 
-- Modify: `scripts/smoke_test_config.sh` — seed via `app-demo-cli config push --adapter axum` and assert runtime reads expected values.
+- Modify: `scripts/smoke_test_config.sh` — extend the existing per-adapter loop (which already exercises push for all four adapters) to cover the §12.7 env-var key override case for each adapter that supports remote read-back.
+
+**Round-30 M-1 — per-adapter §12.7 coverage.** Spec §12.7 says "For each adapter: set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging`. Push two distinct blobs: one to `app_config`, one to `app_config_staging`. Assert the runtime extractor returns the staging blob's values (not the default blob's)." The plan satisfies §12.7 in layers:
+
+| Layer                                | Coverage                                                                                                  |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| `EnvConfig::store_key`               | Unit tests in B7 Step 3 (env-set / env-unset / blank / control-char).                                     |
+| Per-adapter registry-builder         | Unit tests in B7 Step 5 — every adapter packs `default_key` from env into the binding.                    |
+| Runtime extractor reads correct blob | E2 smoke script below: pushes BOTH blobs, sets `__KEY`, runs the demo server, hits an endpoint, asserts the staging value comes back. Repeats for each adapter. |
+
+The smoke script's per-adapter block looks like:
+
+```bash
+for adapter in axum cloudflare fastly spin-local; do
+  echo "=== §12.7 env-var KEY override smoke — $adapter ==="
+
+  # 1. Push the default blob.
+  unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
+  echo 'greeting = "default-blob"' > "$tmp/app-demo.toml"
+  app-demo-cli config push --adapter "$adapter" --app-config "$tmp/app-demo.toml" --yes
+
+  # 2. Push the staging blob under app_config_staging.
+  echo 'greeting = "staging-blob"' > "$tmp/app-demo.toml"
+  app-demo-cli config push --adapter "$adapter" --app-config "$tmp/app-demo.toml" --key app_config_staging --yes
+
+  # 3. Boot the runtime with __KEY set, hit the endpoint, assert staging.
+  EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging \
+    run_runtime "$adapter" &
+  rpid=$!
+  trap "kill $rpid 2>/dev/null || true" EXIT
+  wait_for_port
+  result=$(curl -s http://localhost:8080/greeting)
+  kill $rpid; wait $rpid 2>/dev/null || true
+  trap - EXIT
+  assert_eq "$result" "staging-blob" "$adapter: __KEY override staging"
+
+  # 4. Re-boot without __KEY, assert default comes back.
+  unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
+  run_runtime "$adapter" &
+  rpid=$!
+  trap "kill $rpid 2>/dev/null || true" EXIT
+  wait_for_port
+  result=$(curl -s http://localhost:8080/greeting)
+  kill $rpid; wait $rpid 2>/dev/null || true
+  trap - EXIT
+  assert_eq "$result" "default-blob" "$adapter: __KEY unset default"
+done
+```
+
+**Spin Cloud exception.** Spin Cloud's `Unsupported` read-back per spec §8.3 means the smoke script can't `config diff` against Cloud, but the push + extractor path is the same shape; the smoke covers push + runtime extractor on `spin-local` (which exercises the SQLite read path). Per round-29 H-1 fixtures, the SQLite path resolution already has unit-test coverage; the smoke just adds the end-to-end composition check.
+
+For the cloud-only branches (Spin Cloud `Unsupported`), the smoke adds a SEPARATE block that asserts:
+
+```bash
+# Spin Cloud Unsupported: config diff must error with the spec §8.3
+# message; config push with --yes must succeed.
+EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging \
+  app-demo-cli config diff --adapter spin && \
+  fail "expected diff to fail on Spin Cloud Unsupported"
+app-demo-cli config push --adapter spin --key app_config_staging --yes
+```
+
+The smoke runs on a developer laptop with `spin login` already done; CI can skip the Spin Cloud block via `SKIP_SPIN_CLOUD_SMOKE=1`.
 
 ## Task E3 — Top-level README + scaffold README updates
 
