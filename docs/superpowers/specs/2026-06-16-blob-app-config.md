@@ -3729,9 +3729,18 @@ pub fn store_key(&self, kind: &str, id: &str) -> String {
 ```
 
 Each adapter's `build_config_registry` calls
-`env.store_key("config", id)` for every declared id while it's
-already calling `env.store_name("config", id)` — one extra
-line per id, no behaviour duplicated. Tests for the
+`env.store_key("config", id)` for every declared id. For
+Cloudflare / Fastly / Spin the builder already takes an
+`EnvConfig` and calls `env.store_name("config", id)` — adding
+the `store_key` call is one extra line per id, no behaviour
+duplicated. **Axum is the exception** (round-31 M-1): its
+builder at `crates/edgezero-adapter-axum/src/dev_server.rs:444`
+currently takes `Option<StoreMetadata>` with NO `EnvConfig`
+parameter (Axum reads local files by logical id; nothing in
+the existing dev-server path consults env-overrides for the
+config store). The blob model THREADS `env: &EnvConfig`
+through the Axum builder signature so the four adapters
+agree on `default_key` resolution. Tests for the
 blank/whitespace/control fallback rules live alongside
 `env_config`'s existing `store_name` tests; the adapter sites
 just pass-through.
@@ -3744,14 +3753,16 @@ needs the binding pair.
 
 **Adapter responsibilities.** Each adapter's
 `build_config_registry` (or equivalent) calls
-`env.store_key("config", id)` (see the helper above) for
-every declared id while it's already calling
-`env.store_name("config", id)`, and packages
-`(handle, default_key)` into the binding. The four
-adapters update at the lines referenced above; the
-env-var lookup is one line per id inside the existing
-loop, and the blank/control fallback is centralised in
-`EnvConfig` so all four adapters share identical
+`env.store_key("config", id)` for every declared id, and
+packages `(handle, default_key)` into the binding. Cloudflare
+/ Fastly / Spin builders already call
+`env.store_name("config", id)`; Axum's builder grows an
+`env: &EnvConfig` parameter as part of the blob model so it
+can call `store_key` (round-31 M-1). The four adapters update
+at the lines referenced above; the env-var lookup is one line
+per id inside the existing loop, and the blank/control
+fallback is centralised in `EnvConfig` so all four adapters
+share identical
 behaviour.
 
 **Extractor consumption.** The extractor reads through the
@@ -3799,13 +3810,13 @@ registry()` accessors — currently returns
 `BoundConfigStore` (= `ConfigStoreHandle`) directly. Under
 the binding change:
 
-| Method                      | Before (today)                      | After (this spec)                                                                                                            |
-| --------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | --- | ---------------------------------------------------------- |
-| `Config::default()`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — unchanged. Internally `self.0.default().map(                                                   | b   | b.handle)`. Hand-managed `bound.get(...)` works unchanged. |
-| `Config::named(id)`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — same unwrap.                                                                                   |
-| `Config::registry()`        | `&StoreRegistry<ConfigStoreHandle>` | `&StoreRegistry<ConfigStoreBinding>` — **breaking** for any caller that destructured the registry value. Hard cutoff per §1. |
-| `Config::default_binding()` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor for callers that want the resolved `__KEY`.                                     |
-| `Config::named_binding(id)` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor (named variant).                                                                |
+| Method                      | Before (today)                      | After (this spec)                                                                                                                              |
+| --------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Config::default()`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — unchanged. Internally unwraps `binding.handle`. Hand-managed `bound.get(...)` works unchanged.                   |
+| `Config::named(id)`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — same unwrap.                                                                                                     |
+| `Config::registry()`        | `&StoreRegistry<ConfigStoreHandle>` | `&StoreRegistry<ConfigStoreBinding>` — **breaking** for any caller that destructured the registry value. Hard cutoff per §1.                   |
+| `Config::default_binding()` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor for callers that want the resolved `__KEY`.                                                       |
+| `Config::named_binding(id)` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor (named variant).                                                                                  |
 
 `BoundConfigStore` stays as the `ConfigStoreHandle` alias —
 NOT redefined to `ConfigStoreBinding`. That keeps the
@@ -6865,7 +6876,8 @@ declared in the manifest's `[adapters]` table (per
 `crates/edgezero-cli/src/config.rs:611`'s loop). The
 manifest's `[adapters.spin]` table is what activates the
 Spin path; tests below set `[adapters.spin]` and rely on
-the loop to invoke `SpinAdapter::validate_typed_secrets`.
+the loop to invoke `SpinCliAdapter::validate_typed_secrets`
+(per `crates/edgezero-adapter-spin/src/cli.rs:134`).
 
 Spin's `validate_typed_secrets` at
 `crates/edgezero-adapter-spin/src/cli.rs:363` enforces

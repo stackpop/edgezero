@@ -2365,8 +2365,8 @@ fn read_config_entry(
              edgezero does not read from azure_cosmos backends.",
             runtime_config_path.display()
         )),
-        Some(runtime_config::KeyValueBackend::Unknown { type_str }) => Err(format!(
-            "label `{platform}` in {} is unknown backend type `{type_str}`; edgezero only reads from `type = \"spin\"` (SQLite) backends.",
+        Some(runtime_config::KeyValueBackend::Unknown { type_name }) => Err(format!(
+            "label `{platform}` in {} is unknown backend type `{type_name}`; edgezero only reads from `type = \"spin\"` (SQLite) backends.",
             runtime_config_path.display()
         )),
         Some(runtime_config::KeyValueBackend::Spin { path }) | None => {
@@ -3387,7 +3387,26 @@ Per spec §3.2.2's args block: `adapter`, `app_config`, `manifest`, `store`, `ke
 **Files:**
 
 - Create: `crates/edgezero-cli/src/diff.rs` — three format renderers (`unified`, `structured`, `json`) per spec §8.1.1/8.1.2/8.1.3.
-- Modify: `crates/edgezero-cli/src/config.rs` — add `pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<(), String>`.
+- Modify: `crates/edgezero-cli/src/config.rs` — add `pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, String>` returning an exit-code-bearing outcome (NOT `Result<(), String>`). See round-31 H-1.
+- Modify: `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs` — diff dispatch arm handles the `Ok(DiffExit { code })` shape and exits with that code; only `Err(_)` keeps the existing `process::exit(2)` (>=2 invariant per Q10).
+- Modify: `crates/edgezero-cli/src/main.rs` — bundled binary's stub `Diff` arm doesn't need this (it's a stub-pointer per §3.2.1 that exits 2 directly), but a `pub fn run_config_diff_typed` lives in `config.rs` and the bundled binary's `Cmd::Validate` arm already uses the standard `Result<(), String>` → `exit(1)` shape that the rest of the CLI follows. Only the generated CLI's main needs the special diff handling.
+
+**Round-31 H-1: why a typed exit-code outcome.** The spec requires
+real diff errors (parse / network / manifest-load) to exit ≥2
+regardless of `--exit-code`, AND success-branch diff-present to
+exit 1 when `--exit-code` is set. The current bundled main at
+`crates/edgezero-cli/src/main.rs:27` and the scaffold template at
+`crates/edgezero-cli/src/templates/cli/src/main.rs.hbs:83` BOTH
+exit 1 for every `Err(_)` — they can't distinguish "diff
+errored" (≥2) from "command succeeded with diff present" (1
+when `--exit-code` is set). Calling `process::exit(code)` from
+inside `apply_exit_code` papers over the `Result<(), String>`
+return but loses the "errors always non-zero" guarantee because
+the helper's signature lets the caller `?`-propagate or even
+swallow the exit. Returning a typed outcome makes the contract
+explicit at the type level and lets the generated main pick a
+DIFFERENT exit code than the default `exit(1)` it uses for every
+other subcommand.
 
 - [ ] **Step 1: Implement the three renderers.** Each takes two `serde_json::Value` data fields + the local/remote shas + returns a `String` (or writes to stdout).
 
@@ -3400,7 +3419,18 @@ For `json`: per spec §8.1.3.
 - [ ] **Step 2: Wire `run_config_diff_typed` with EXPLICIT per-variant handling of the read-back outcome.** Round-27 reviewer flagged the earlier compressed "read → render" wording as under-specified for the four `ReadConfigEntry` cases. Each variant gets its own branch + exit-code tag:
 
 ```rust
-pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<(), String>
+/// Outcome of a successful `config diff` run. Returned by
+/// `run_config_diff_typed` so the generated CLI's main can pick
+/// the right exit code per Q10. NOT used on the error path —
+/// `Result::Err` bypasses this and the main always exits ≥2.
+pub struct DiffExit {
+    /// 0 (no changes), 1 (diff present, --exit-code set), or 2
+    /// (Unsupported — diff structurally impossible). NEVER >2;
+    /// that's reserved for the Err path in the caller.
+    pub code: i32,
+}
+
+pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, String>
 where
     C: DeserializeOwned + AppConfigMeta + Validate,
 {
@@ -3466,8 +3496,8 @@ where
         }
     };
 
-    // 5. Exit-code per Q10 + Step 3 below.
-    apply_exit_code(args.exit_code, outcome)
+    // 5. Exit-code per Q10 + Step 3 below. Returns Ok(DiffExit { code }).
+    Ok(apply_exit_code(args.exit_code, outcome))
 }
 ```
 
@@ -3486,22 +3516,40 @@ Helpers: `render_diff` dispatches to the per-format renderers from Step 1; `rend
 Code:
 
 ```rust
-fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> Result<(), String> {
+fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
     let code = match (exit_code_flag, outcome) {
         (_, DiffOutcome::Unsupported(_)) => 2,
         (false, _) => 0,
         (true, DiffOutcome::NoChanges) => 0,
         (true, DiffOutcome::DiffPresent | DiffOutcome::RemoteAbsent) => 1,
     };
-    if code == 0 {
-        Ok(())
-    } else {
-        std::process::exit(code);
-    }
+    DiffExit { code }
 }
 ```
 
-(Errors raised via `Result::Err` propagate to the bundled / generated `main()` which exits ≥2 — that's how the "always non-zero on error" rule from Q10 + the `dry_run` doc-comment is honored. The `apply_exit_code` helper only fires on success branches.)
+- [ ] **Step 3a: Scaffold template `Diff` arm exits with the typed code (round-31 H-1).**
+
+`crates/edgezero-cli/src/templates/cli/src/main.rs.hbs` — update the diff dispatch arm so `Ok(DiffExit { code })` calls `process::exit(code)` BEFORE the generic `if let Err(_)` fall-through. Without this, the success-branch `1` becomes a generic `0` (the main has no `if Ok(_)` arm) and the error branch becomes `1` (the generic fall-through).
+
+```rust
+// cli/src/main.rs.hbs (Phase D):
+let result: Result<(), String> = match cli.command {
+    TypedConfigCmd::Push(args) => run_config_push_typed::<{{NameUpperCamel}}Config>(&args),
+    TypedConfigCmd::Diff(args) => match run_config_diff_typed::<{{NameUpperCamel}}Config>(&args) {
+        Ok(DiffExit { code: 0 }) => Ok(()),
+        Ok(DiffExit { code }) => process::exit(code),  // 1 (diff present) or 2 (Unsupported)
+        Err(err) => Err(err),
+    },
+    TypedConfigCmd::Validate(args) => run_config_validate_typed::<{{NameUpperCamel}}Config>(&args),
+};
+if let Err(err) = result {
+    log::error!("[{{name}}] {err}");
+    process::exit(2);  // round-31 H-1: bumped from 1 to 2 so diff
+                       // errors satisfy the spec's ≥2 invariant.
+}
+```
+
+(The generic `exit(2)` bump from the round-26 template's `exit(1)` is intentional — spec §3.2.2's `dry_run` doc-comment and Q10's "errors always ≥2" rule apply ACROSS all subcommands; bumping the fall-through `exit(1)` to `exit(2)` is consistent with that. Existing `push` / `validate` errors are not behaviour-checked against the `1` vs `2` distinction, so the bump is safe.)
 
 - [ ] **Step 4: Add `Diff` to the scaffold template's `TypedConfigCmd` enum + dispatch.** Task C6 deliberately deferred this so the Phase C scaffold compiles without `ConfigDiffArgs` existing. In this commit, update `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`:
 
@@ -3577,18 +3625,35 @@ Phase D of the blob app-config rewrite per spec §8.1.
 
 The smoke script's per-adapter block looks like:
 
+**Round-31 H-2 — adapter names + `--local` flag.** The registered adapter names are `axum`, `cloudflare`, `fastly`, `spin` (NOT `spin-local`; see `crates/edgezero-adapter-spin/src/cli.rs:174`'s `Adapter::name`). Cloudflare/Fastly/Spin's local emulator state is seeded via `config push --local` (`args.rs:190`'s flag doc-comment). Axum's `config push` is always local (the runtime reads from `.edgezero/local-config-<id>.json`); it does NOT take `--local`. The existing smoke script at `scripts/smoke_test_config.sh:8`+`:97` already encodes this; the round-30 loop bundled adapter and flags together as `axum cloudflare fastly spin-local`, which gives the implementer the wrong push command.
+
+Model adapter + flags as a 2-element array per loop iteration:
+
 ```bash
-for adapter in axum cloudflare fastly spin-local; do
-  echo "=== §12.7 env-var KEY override smoke — $adapter ==="
+# (adapter, extra-push-flags) per row. Axum's push is always local
+# (no --local flag); the other three need --local for the local
+# emulator state seed.
+declare -a SUITES=(
+  "axum:"
+  "cloudflare:--local"
+  "fastly:--local"
+  "spin:--local"
+)
+for suite in "${SUITES[@]}"; do
+  adapter="${suite%%:*}"
+  extra_flags="${suite#*:}"
+  echo "=== §12.7 env-var KEY override smoke — $adapter${extra_flags:+ $extra_flags} ==="
 
   # 1. Push the default blob.
   unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
   echo 'greeting = "default-blob"' > "$tmp/app-demo.toml"
-  app-demo-cli config push --adapter "$adapter" --app-config "$tmp/app-demo.toml" --yes
+  app-demo-cli config push --adapter "$adapter" $extra_flags \
+    --app-config "$tmp/app-demo.toml" --yes
 
   # 2. Push the staging blob under app_config_staging.
   echo 'greeting = "staging-blob"' > "$tmp/app-demo.toml"
-  app-demo-cli config push --adapter "$adapter" --app-config "$tmp/app-demo.toml" --key app_config_staging --yes
+  app-demo-cli config push --adapter "$adapter" $extra_flags \
+    --app-config "$tmp/app-demo.toml" --key app_config_staging --yes
 
   # 3. Boot the runtime with __KEY set, hit the endpoint, assert staging.
   EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging \
@@ -3614,7 +3679,9 @@ for adapter in axum cloudflare fastly spin-local; do
 done
 ```
 
-**Spin Cloud exception.** Spin Cloud's `Unsupported` read-back per spec §8.3 means the smoke script can't `config diff` against Cloud, but the push + extractor path is the same shape; the smoke covers push + runtime extractor on `spin-local` (which exercises the SQLite read path). Per round-29 H-1 fixtures, the SQLite path resolution already has unit-test coverage; the smoke just adds the end-to-end composition check.
+(`run_runtime "$adapter"` is a smoke-script helper that boots the appropriate emulator: `cargo run -p edgezero-cli -- serve --adapter axum` for Axum, `wrangler dev --local` for Cloudflare, `viceroy` for Fastly, `spin up` for Spin. The existing smoke script has these helpers; this loop reuses them.)
+
+**Spin Cloud exception.** Spin Cloud's `Unsupported` read-back per spec §8.3 means the smoke script can't `config diff` against Cloud, but the push + extractor path is the same shape; the smoke loop's `spin:--local` row exercises Spin's SQLite read path (per round-29 H-1's path-resolver fixtures, the SQLite resolution already has unit-test coverage; the smoke just adds the end-to-end composition check). The Spin Cloud branch is exercised by the SEPARATE block below.
 
 For the cloud-only branches (Spin Cloud `Unsupported`), the smoke adds a SEPARATE block that asserts:
 
