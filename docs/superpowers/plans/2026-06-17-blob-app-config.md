@@ -3106,8 +3106,35 @@ match remote {
             );
         }
     }
-    ReadConfigEntry::MissingKey | ReadConfigEntry::MissingStore => {
-        // No remote sha to skip against; consent gate (Step 3) still runs.
+    ReadConfigEntry::MissingKey => {
+        // Round-33 H-1: no remote sha to skip against, but the push
+        // still needs to render the diff so the operator sees what's
+        // about to be written. Spec §8.1's missing-remote semantic:
+        // "every leaf is added".
+        if !args.no_diff {
+            println!("# no remote at key `{key}`; all leaves added");
+            print_unified_diff_inline(
+                &serde_json::Value::Object(Default::default()),
+                &local_envelope.data,
+                "(none)",
+                &local_sha,
+            );
+        }
+        // consent gate (Step 3) still runs.
+    }
+    ReadConfigEntry::MissingStore => {
+        // Same as MissingKey, plus a provisioning hint per §8.1.
+        if !args.no_diff {
+            eprintln!("# store has no matching backend yet — run `edgezero provision --adapter <name>` first if this is the live remote");
+            println!("# no remote store; all leaves added");
+            print_unified_diff_inline(
+                &serde_json::Value::Object(Default::default()),
+                &local_envelope.data,
+                "(none)",
+                &local_sha,
+            );
+        }
+        // consent gate (Step 3) still runs.
     }
     ReadConfigEntry::Unsupported(_) => {
         // Adapter can't read back (Spin Cloud per §9.4). The §8.3
@@ -3187,15 +3214,26 @@ if let ReadConfigEntry::Unsupported(reason) = &remote {
 
 - [ ] **Step 5: Define `print_unified_diff_inline` in the cutover commit (round-32 M-1).** C4's `ReadConfigEntry::Present` branch calls this helper at Step 2; the full format-dispatch (`--format unified|structured|json`) lives in Phase D's `diff.rs` module, but Phase C's inline-diff prompt needs ONE minimal renderer to ship. Define it in `crates/edgezero-cli/src/config.rs` next to `run_config_push_typed`:
 
-```rust
 /// Minimal inline unified renderer used by `config push`'s
 /// inline diff prompt. Renders to stdout per spec §8.1.1's
 /// shape (dotted-path key-sorted lines, `-` / `+` markers,
-/// `(added)` / `(removed)` annotations for subtree
-/// transitions). Phase D's `diff.rs` ships the full
-/// `--format` dispatch with `unified` / `structured` /
-/// `json`; this helper is the unified-only subset that push
-/// invokes pre-write.
+/// per-LEAF `(added)` / `(removed)` annotations).
+///
+/// **Round-33 M-1 narrowing.** This helper does NOT roll
+/// added/removed SUBTREES up to a single parent-path block
+/// (the spec's §8.1.1 "Subtree handling" rule says when an
+/// entire subtree appears or disappears, one parent-path
+/// block should print the full subtree value pretty-printed
+/// instead of N per-leaf `(added)` / `(removed)` lines).
+/// Phase C's inline renderer flattens every change to a
+/// per-leaf line — visually equivalent for small diffs, but
+/// noisier when a whole subsection toggles. Phase D's
+/// `diff.rs` ships the subtree-roll-up form behind the
+/// `--format unified` dispatcher; the inline prompt's
+/// noisier-but-correct fallback is acceptable for the
+/// cutover commit. Tests in C4 Step 6 assert PER-LEAF
+/// behaviour (not subtree behaviour); spec §8.1.1's
+/// subtree-roll-up assertion lives in Phase D's tests.
 pub(crate) fn print_unified_diff_inline(
     remote_data: &serde_json::Value,
     local_data: &serde_json::Value,
@@ -3687,17 +3725,37 @@ use edgezero_cli::{run_config_diff_typed, DiffExit};
 
 `DiffExit` is exported from `edgezero-cli`'s crate root in Step 6 below.
 
-- [ ] **Step 5: Module + re-export wiring.** `edgezero-cli/src/lib.rs` (today's re-exports at `crates/edgezero-cli/src/lib.rs:48`) needs four additions so the scaffold's `cli/src/main.rs.hbs` `use edgezero_cli::{run_config_diff_typed, DiffExit};` line compiles:
+- [ ] **Step 5: Module + re-export wiring.** `edgezero-cli/src/lib.rs` (today's re-exports at `crates/edgezero-cli/src/lib.rs:48`) needs four additions so the scaffold's `cli/src/main.rs.hbs` `use edgezero_cli::{run_config_diff_typed, DiffExit};` line compiles. **Every addition must mirror the existing `#[cfg(feature = "cli")]` gating** (round-33 L-2) — `mod adapter`, `mod auth`, `mod config`, the `args` module, and the existing config re-exports at `lib.rs:22-48` are all behind that feature, and a non-CLI consumer of `edgezero-cli` would otherwise pull in the new module unconditionally:
 
 ```rust
-// crates/edgezero-cli/src/lib.rs additions:
-pub mod diff;                       // new module for the renderers
-pub use crate::config::run_config_diff_typed;
-pub use crate::config::DiffExit;
-pub use crate::args::ConfigDiffArgs;
+// crates/edgezero-cli/src/lib.rs additions — MIRROR the existing
+// #[cfg(feature = "cli")] gating at lib.rs:22-48:
+
+#[cfg(feature = "cli")]
+mod diff;  // new module for the renderers (Phase D dispatches
+           // unified / structured / json)
+
+#[cfg(feature = "cli")]
+pub use config::{run_config_diff_typed, DiffExit};
+// Update the existing `pub use config::{run_config_push,
+// run_config_push_typed, run_config_validate,
+// run_config_validate_typed};` block at lib.rs:48 to include
+// run_config_diff_typed + DiffExit in the same braces, matching
+// the cfg-gated alphabetical style. Result:
+//
+//   #[cfg(feature = "cli")]
+//   pub use config::{
+//       run_config_diff_typed, run_config_push, run_config_push_typed,
+//       run_config_validate, run_config_validate_typed, DiffExit,
+//   };
+//
+// `ConfigDiffArgs` is reached via `args::ConfigDiffArgs` like the
+// other Args structs — no new re-export needed; downstream code
+// uses `use edgezero_cli::args::ConfigDiffArgs;` per the existing
+// `pub mod args;` at lib.rs:43.
 ```
 
-(The existing re-export block at line 48 already exposes `run_config_push_typed` / `run_config_validate_typed` and the corresponding `ConfigPushArgs` / `ConfigValidateArgs`; mirror that pattern.)
+(Mirroring the gate matters: without `#[cfg(feature = "cli")]`, the new `mod diff` module is pulled in by every consumer — including the `default-features = false` wasm builds — and the optional `clap` / `serde_json` deps the renderers need would have to leak into the default-build dependency graph.)
 
 - [ ] **Step 6: Per-format tests + per-error-class tests.**
 
@@ -3771,14 +3829,41 @@ for suite in "${SUITES[@]}"; do
   extra_flags="${suite#*:}"
   echo "=== §12.7 env-var KEY override smoke — $adapter${extra_flags:+ $extra_flags} ==="
 
-  # 1. Push the default blob.
+  # 1. Push the default blob. Round-33 M-2: use a full
+  # AppDemoConfig TOML — current AppDemoConfig requires
+  # api_token, feature, greeting, service, AND vault (see
+  # examples/app-demo/crates/app-demo-core/src/config.rs:19).
+  # The smoke varies ONLY `greeting` between the two blobs;
+  # everything else stays constant so the smoke isolates the
+  # __KEY override path without tripping serde's
+  # deny_unknown_fields or validator rules.
   unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
-  echo 'greeting = "default-blob"' > "$tmp/app-demo.toml"
+  cat > "$tmp/app-demo.toml" <<'TOML'
+api_token = "demo_api_token"
+greeting = "default-blob"
+vault = "default"
+
+[feature]
+new_checkout = false
+
+[service]
+timeout_ms = 1500
+TOML
   app-demo-cli config push --adapter "$adapter" $extra_flags \
     --app-config "$tmp/app-demo.toml" --yes
 
   # 2. Push the staging blob under app_config_staging.
-  echo 'greeting = "staging-blob"' > "$tmp/app-demo.toml"
+  cat > "$tmp/app-demo.toml" <<'TOML'
+api_token = "demo_api_token"
+greeting = "staging-blob"
+vault = "default"
+
+[feature]
+new_checkout = false
+
+[service]
+timeout_ms = 1500
+TOML
   app-demo-cli config push --adapter "$adapter" $extra_flags \
     --app-config "$tmp/app-demo.toml" --key app_config_staging --yes
 

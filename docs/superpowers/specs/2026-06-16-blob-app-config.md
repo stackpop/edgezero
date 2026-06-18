@@ -2620,10 +2620,27 @@ Note (round-31/32 H-1): `run_config_diff_typed` returns
 `Result<DiffExit, String>`, NOT `Result<(), String>` — the
 generated CLI's main needs the typed exit code to honor
 Q10's `--exit-code` semantics (0 / 1 / 2) without losing the
-"errors always ≥2" invariant on the `Err` path. See spec
-§3.2.2's `DiffExit` declaration block below and the §10.2.2
-scaffold `main.rs.hbs` Diff arm that pattern-matches
-`Ok(DiffExit { code })` to call `process::exit(code)`.
+"errors always ≥2" invariant on the `Err` path. The
+`DiffExit` type is exported from `edgezero-cli` alongside
+the runners:
+
+```rust
+/// Outcome of a successful `config diff` run. Returned by
+/// `run_config_diff_typed` so the generated CLI's main can
+/// pick the right exit code per Q10. NOT used on the error
+/// path — `Result::Err` bypasses this and the main always
+/// exits ≥2.
+pub struct DiffExit {
+    /// 0 (no changes), 1 (diff present, `--exit-code` set),
+    /// or 2 (Unsupported — diff structurally impossible).
+    /// NEVER >2; that's reserved for the `Err` path in the
+    /// caller.
+    pub code: i32,
+}
+```
+
+The §10.2.2 scaffold `main.rs.hbs` Diff arm pattern-matches
+`Ok(DiffExit { code })` and calls `process::exit(code)`.
 Earlier drafts showed `Result<(), String>` for symmetry with
 the other two runners; that was inadequate to satisfy the
 spec's exit-code table.
