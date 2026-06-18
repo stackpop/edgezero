@@ -2586,10 +2586,63 @@ where
     }
 }
 
+/// Walk `errors` recursively and return the first violating
+/// field's DOTTED PATH (e.g. `"service.timeout_ms"` for an
+/// inner `range` failure on the nested `ServiceConfig`, not
+/// just `"service"`). Round-34 M-1: earlier draft only looked
+/// at top-level keys, which collapsed
+/// `service.timeout_ms` → `"service"` and made
+/// `EdgeError::ConfigOutOfDate.field_path` useless for any
+/// `#[validate(nested)]` failure (which is the common case in
+/// app-demo + scaffold templates).
 fn first_violating_field(errors: &validator::ValidationErrors) -> Option<String> {
-    let mut keys: Vec<&'static str> = errors.errors().keys().copied().collect();
-    keys.sort();
-    keys.first().map(|k| (*k).to_string())
+    fn walk(errors: &validator::ValidationErrors, prefix: &str, out: &mut Option<String>) {
+        if out.is_some() {
+            return;
+        }
+        // Keys are sorted so the chosen path is deterministic across
+        // runs — required for the §6.3.1 contract test.
+        let mut keys: Vec<&'static str> = errors.errors().keys().copied().collect();
+        keys.sort();
+        for key in keys {
+            let path = if prefix.is_empty() {
+                (*key).to_string()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match errors.errors().get(key) {
+                Some(validator::ValidationErrorsKind::Field(_)) => {
+                    *out = Some(path);
+                    return;
+                }
+                Some(validator::ValidationErrorsKind::Struct(inner)) => {
+                    walk(inner, &path, out);
+                    if out.is_some() {
+                        return;
+                    }
+                }
+                Some(validator::ValidationErrorsKind::List(items)) => {
+                    // Items are a BTreeMap<usize, Box<ValidationErrors>>;
+                    // iterate in index order for determinism.
+                    let mut indices: Vec<usize> = items.keys().copied().collect();
+                    indices.sort();
+                    for idx in indices {
+                        if let Some(inner) = items.get(&idx) {
+                            let indexed = format!("{path}[{idx}]");
+                            walk(inner, &indexed, out);
+                            if out.is_some() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    let mut out: Option<String> = None;
+    walk(errors, "", &mut out);
+    out
 }
 
 async fn secret_walk<C>(
@@ -2950,7 +3003,11 @@ Expected: pass.
 - Modify: `crates/edgezero-cli/src/args.rs` — add `--key`, `--yes`, `--no-diff` to `ConfigPushArgs`; add `ConfigCmdStubArgs`.
 - Modify: `crates/edgezero-cli/src/main.rs` — wire bundled `ConfigCmd` with stub variants + parent `after_help`.
 
-- [ ] **Step 1: Extend `ConfigPushArgs`.**
+- [ ] **Step 1: Extend `ConfigPushArgs` AND its hand-rolled `Default` impl.**
+
+`ConfigPushArgs` has a manual `Default` impl at `crates/edgezero-cli/src/args.rs:226` (the `#[non_exhaustive]` attribute on the struct prevents an auto-derived `Default`; per the in-tree `ProvisionArgs::default` rationale at `args.rs:226`'s doc-comment, the manual impl exists so test code in other crates can construct a non-default-but-defaulted instance with `..ConfigPushArgs::default()`). Adding the three new fields means the impl must be extended too — round-34 M-2.
+
+Struct additions:
 
 ```rust
     /// Override the default key — §5.4.
@@ -2962,6 +3019,30 @@ Expected: pass.
     /// Skip the inline diff render.
     #[arg(long)]
     pub no_diff: bool,
+```
+
+`Default` impl additions (insert in alphabetical order next to the existing field initialisers at `args.rs:230-239`):
+
+```rust
+impl Default for ConfigPushArgs {
+    /// See `ProvisionArgs::default` — same rationale.
+    #[inline]
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            app_config: None,
+            dry_run: false,
+            key: None,                                // ← new (round-34 M-2)
+            local: false,
+            manifest: default_manifest_path(),
+            no_diff: false,                           // ← new
+            no_env: false,
+            runtime_config: None,
+            store: None,
+            yes: false,                               // ← new
+        }
+    }
+}
 ```
 
 - [ ] **Step 2: Add `ConfigCmdStubArgs` + `STUB_POINTER_AFTER_HELP` constant.**
@@ -3091,7 +3172,7 @@ match remote {
             .verify()
             .map_err(|e| format!("remote envelope verification failed: {e}"))?;
         if remote_envelope.sha256 == local_sha {
-            println!("# no changes (sha256 matches: {local_sha})");
+            eprintln!("# no changes (sha256 matches: {local_sha})");
             return Ok(());
         }
         // Render diff inline (Phase C cutover ships the minimal
@@ -3112,7 +3193,7 @@ match remote {
         // about to be written. Spec §8.1's missing-remote semantic:
         // "every leaf is added".
         if !args.no_diff {
-            println!("# no remote at key `{key}`; all leaves added");
+            eprintln!("# no remote at key `{key}`; all leaves added");
             print_unified_diff_inline(
                 &serde_json::Value::Object(Default::default()),
                 &local_envelope.data,
@@ -3126,7 +3207,7 @@ match remote {
         // Same as MissingKey, plus a provisioning hint per §8.1.
         if !args.no_diff {
             eprintln!("# store has no matching backend yet — run `edgezero provision --adapter <name>` first if this is the live remote");
-            println!("# no remote store; all leaves added");
+            eprintln!("# no remote store; all leaves added");
             print_unified_diff_inline(
                 &serde_json::Value::Object(Default::default()),
                 &local_envelope.data,
@@ -3234,14 +3315,43 @@ if let ReadConfigEntry::Unsupported(reason) = &remote {
 /// cutover commit. Tests in C4 Step 6 assert PER-LEAF
 /// behaviour (not subtree behaviour); spec §8.1.1's
 /// subtree-roll-up assertion lives in Phase D's tests.
+///
+/// **Stream discipline (round-34).** Diff CONTENT
+/// (`---`/`+++` headers, leaf paths, `-`/`+` lines)
+/// goes to **stdout** via `println!`, so operators can pipe
+/// the diff into `jq` (for `--format json`), `less`, etc.
+/// without log-level prefixes. Informational MESSAGES
+/// (`# no changes`, `# no remote at key X`, the
+/// provisioning hint) go to **stderr** via `eprintln!`, so
+/// they don't pollute the captured diff output. We do NOT
+/// use `log::*` for either — `log::*` routes through
+/// `env_logger` and adds `[INFO …]` prefixes + timestamps
+/// that would corrupt both the human-facing TTY render and
+/// any downstream JSON/diff consumer.
+
+/// Truncate a SHA to 8 characters for display purposes. Returns
+/// the input unchanged when it's already ≤ 8 bytes (e.g. the
+/// `"(none)"` sentinel passed for `MissingKey` / `MissingStore`
+/// where there's no remote SHA at all). Round-34 H-1: the
+/// earlier `&sha[..8]` slice panicked on the `"(none)"` literal
+/// (6 bytes), turning a first-push render into a crash instead
+/// of the all-leaves-added diff spec §8.1 requires.
+fn short_ref(sha: &str) -> &str {
+    if sha.len() <= 8 {
+        sha
+    } else {
+        &sha[..8]
+    }
+}
+
 pub(crate) fn print_unified_diff_inline(
     remote_data: &serde_json::Value,
     local_data: &serde_json::Value,
     remote_sha: &str,
     local_sha: &str,
 ) {
-    println!("--- remote (sha256: {})", &remote_sha[..8]);
-    println!("+++ local  (sha256: {})", &local_sha[..8]);
+    println!("--- remote (sha256: {})", short_ref(remote_sha));
+    println!("+++ local  (sha256: {})", short_ref(local_sha));
     println!();
     let mut leaves: BTreeMap<String, (Option<serde_json::Value>, Option<serde_json::Value>)> =
         BTreeMap::new();
@@ -3505,9 +3615,32 @@ PR replaces the placeholder with the real hex before merge."
 
 - Modify: `crates/edgezero-cli/src/args.rs` — add `ConfigDiffArgs` per spec §3.2.2.
 
-- [ ] **Step 1: Add the struct.**
+- [ ] **Step 1: Add the struct AND a manual `Default` impl (round-34 M-2).**
 
-Per spec §3.2.2's args block: `adapter`, `app_config`, `manifest`, `store`, `key`, `no_env`, `local`, `runtime_config`, `format`, `exit_code`. The struct is `#[derive(clap::Args, Debug)]`.
+Per spec §3.2.2's args block: `adapter`, `app_config`, `manifest`, `store`, `key`, `no_env`, `local`, `runtime_config`, `format`, `exit_code`. The struct is `#[derive(clap::Args, Debug)] #[non_exhaustive]` — the `#[non_exhaustive]` matches the existing `ConfigPushArgs` / `ConfigValidateArgs` pattern at `args.rs:179` + `:246`, and disables the auto-derived `Default`. Add a manual `Default` impl mirroring `ConfigPushArgs::default` at `args.rs:226`:
+
+```rust
+impl Default for ConfigDiffArgs {
+    /// See `ProvisionArgs::default` — same rationale.
+    #[inline]
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            app_config: None,
+            exit_code: false,
+            format: "unified".to_owned(),    // matches the clap `default_value = "unified"`
+            key: None,
+            local: false,
+            manifest: default_manifest_path(),
+            no_env: false,
+            runtime_config: None,
+            store: None,
+        }
+    }
+}
+```
+
+This `Default` impl is needed by the §12.11 parser-roundtrip tests (they construct expected values with `..ConfigDiffArgs::default()` to assert just the changed fields) AND by any downstream caller that uses the struct-update syntax.
 
 - [ ] **Step 2: Parser-roundtrip tests for the new flags** (per spec §12.11). Cover `--format json`, `--local`, `--store`, `--key`, `--runtime-config`, `--exit-code`. Mirror the existing `ConfigPushArgs` parser tests in `args.rs`.
 
@@ -3598,7 +3731,7 @@ where
                 .map_err(|e| format!("remote envelope parse failed: {e}"))?;
             remote_envelope.verify().map_err(|e| format!("remote envelope verification failed: {e}"))?;
             if remote_envelope.sha256 == local_sha {
-                println!("# no changes (sha256 matches: {local_sha})");
+                eprintln!("# no changes (sha256 matches: {local_sha})");
                 DiffOutcome::NoChanges
             } else {
                 render_diff(&remote_envelope.data, &local_envelope.data, &remote_envelope.sha256, &local_sha, args.format.as_str())?;
@@ -3606,7 +3739,7 @@ where
             }
         }
         ReadConfigEntry::MissingKey => {
-            println!("# no remote at key `{key}`; all <N> leaves added");
+            eprintln!("# no remote at key `{key}`; all <N> leaves added");
             render_diff_against_empty(&local_envelope.data, &local_sha, args.format.as_str())?;
             DiffOutcome::RemoteAbsent
         }
