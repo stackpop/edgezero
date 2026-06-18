@@ -3079,15 +3079,31 @@ let local_envelope = BlobEnvelope::new(data.clone(), generated_at);
 let local_sha = local_envelope.sha256.clone();
 match remote {
     ReadConfigEntry::Present(body) => {
-        let remote_envelope: BlobEnvelope = serde_json::from_str(&body)?;
+        // Round-32 H-1: serde_json::Error → String (the function
+        // returns Result<_, String>, so `?` can't auto-convert).
+        // AND verify() BEFORE the sha-compare so a corrupted
+        // remote whose stored sha happens to match the local
+        // sha doesn't silently skip the write. D2 already does
+        // both; C4 must match.
+        let remote_envelope: BlobEnvelope = serde_json::from_str(&body)
+            .map_err(|e| format!("remote envelope parse failed: {e}"))?;
+        remote_envelope
+            .verify()
+            .map_err(|e| format!("remote envelope verification failed: {e}"))?;
         if remote_envelope.sha256 == local_sha {
             println!("# no changes (sha256 matches: {local_sha})");
             return Ok(());
         }
-        // Render diff per §8.1.1 (Phase D ships the formatters; for
-        // Phase C, render a minimal unified diff inline).
+        // Render diff inline (Phase C cutover ships the minimal
+        // unified renderer per Step 6 below; Phase D's `diff`
+        // module ships the full format dispatch).
         if !args.no_diff {
-            print_diff(&remote_envelope.data, &local_envelope.data, &local_sha, &remote_envelope.sha256);
+            print_unified_diff_inline(
+                &remote_envelope.data,
+                &local_envelope.data,
+                &remote_envelope.sha256,
+                &local_sha,
+            );
         }
     }
     ReadConfigEntry::MissingKey | ReadConfigEntry::MissingStore => {
@@ -3169,7 +3185,84 @@ if let ReadConfigEntry::Unsupported(reason) = &remote {
 
 - [ ] **Step 4: Call the adapter's writer (Task C2 work).**
 
-- [ ] **Step 5: Tests.** Cover the §8.2 default rules (skip-on-equal, no-write, consent prompt, `--no-diff`/`--yes` interactions) AND the §8.3 four-branch Spin Cloud UX (dry-run rejection, --yes silent write, TTY prompt, non-TTY error).
+- [ ] **Step 5: Define `print_unified_diff_inline` in the cutover commit (round-32 M-1).** C4's `ReadConfigEntry::Present` branch calls this helper at Step 2; the full format-dispatch (`--format unified|structured|json`) lives in Phase D's `diff.rs` module, but Phase C's inline-diff prompt needs ONE minimal renderer to ship. Define it in `crates/edgezero-cli/src/config.rs` next to `run_config_push_typed`:
+
+```rust
+/// Minimal inline unified renderer used by `config push`'s
+/// inline diff prompt. Renders to stdout per spec §8.1.1's
+/// shape (dotted-path key-sorted lines, `-` / `+` markers,
+/// `(added)` / `(removed)` annotations for subtree
+/// transitions). Phase D's `diff.rs` ships the full
+/// `--format` dispatch with `unified` / `structured` /
+/// `json`; this helper is the unified-only subset that push
+/// invokes pre-write.
+pub(crate) fn print_unified_diff_inline(
+    remote_data: &serde_json::Value,
+    local_data: &serde_json::Value,
+    remote_sha: &str,
+    local_sha: &str,
+) {
+    println!("--- remote (sha256: {})", &remote_sha[..8]);
+    println!("+++ local  (sha256: {})", &local_sha[..8]);
+    println!();
+    let mut leaves: BTreeMap<String, (Option<serde_json::Value>, Option<serde_json::Value>)> =
+        BTreeMap::new();
+    walk_leaves(remote_data, String::new(), &mut |path, val| {
+        leaves.entry(path).or_default().0 = Some(val.clone());
+    });
+    walk_leaves(local_data, String::new(), &mut |path, val| {
+        leaves.entry(path).or_default().1 = Some(val.clone());
+    });
+    for (path, (rem, loc)) in leaves {
+        match (rem, loc) {
+            (Some(r), Some(l)) if r == l => continue,
+            (Some(r), Some(l)) => {
+                println!("{path}");
+                println!("- {r}");
+                println!("+ {l}");
+                println!();
+            }
+            (Some(r), None) => {
+                println!("{path} (removed)");
+                println!("- {r}");
+                println!();
+            }
+            (None, Some(l)) => {
+                println!("{path} (added)");
+                println!("+ {l}");
+                println!();
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+fn walk_leaves<F: FnMut(String, &serde_json::Value)>(
+    value: &serde_json::Value,
+    prefix: String,
+    emit: &mut F,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let next = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                walk_leaves(v, next, emit);
+            }
+        }
+        _ => emit(prefix, value),
+    }
+}
+```
+
+(Arrays are treated as leaves by `walk_leaves` — they're rare in app-config shapes and the inline renderer just prints the whole JSON value, matching the spec §8.1.1 example. Phase D's full renderer handles arrays element-wise if/when an operator needs deeper array diffs.)
+
+Phase D's `diff.rs` will refactor this helper into a `unified` format that the `--format` dispatcher invokes; the signature stays the same so Phase D can either reuse it directly or wrap it.
+
+- [ ] **Step 6: Tests.** Cover the §8.2 default rules (skip-on-equal, no-write, consent prompt, `--no-diff`/`--yes` interactions) AND the §8.3 four-branch Spin Cloud UX (dry-run rejection, --yes silent write, TTY prompt, non-TTY error). Add a focused test for `print_unified_diff_inline` against a 3-leaf fixture asserting the dotted-path ordering + `-`/`+`/`(added)`/`(removed)` markers per spec §8.1.1.
 
 ## Task C5 — App-demo migration
 
@@ -3562,17 +3655,51 @@ pub enum TypedConfigCmd {
     Validate(ConfigValidateArgs),
 }
 
-// ... dispatch:
-match cmd {
-    TypedConfigCmd::Push(args) => run_config_push_typed::<{{NameUpperCamel}}Config>(&args)?,
-    TypedConfigCmd::Diff(args) => run_config_diff_typed::<{{NameUpperCamel}}Config>(&args)?,
-    TypedConfigCmd::Validate(args) => run_config_validate_typed::<{{NameUpperCamel}}Config>(&args)?,
+// ... dispatch. NOTE the Diff arm: run_config_diff_typed returns
+// Result<DiffExit, String> (not Result<(), String>), so we can't
+// use `?` directly — it would propagate `DiffExit` as the Ok type
+// up to the outer `let result: Result<(), String>` binding and
+// fail to compile. Match the Ok shape explicitly and call
+// process::exit(code) for the success-branch non-zero codes.
+let result: Result<(), String> = match cmd {
+    TypedConfigCmd::Push(args) => run_config_push_typed::<{{NameUpperCamel}}Config>(&args),
+    TypedConfigCmd::Diff(args) => match run_config_diff_typed::<{{NameUpperCamel}}Config>(&args) {
+        Ok(DiffExit { code: 0 }) => Ok(()),
+        Ok(DiffExit { code }) => process::exit(code),  // 1 (diff present) or 2 (Unsupported)
+        Err(err) => Err(err),
+    },
+    TypedConfigCmd::Validate(args) => run_config_validate_typed::<{{NameUpperCamel}}Config>(&args),
+};
+if let Err(err) = result {
+    log::error!("[{{name}}] {err}");
+    process::exit(2);  // round-31/32: bumped from 1 so diff errors
+                       // satisfy Q10's "errors always ≥2".
 }
 ```
 
 Re-run `cargo test -p edgezero-cli --test generated_project_builds -- --ignored` to confirm the generated project still compiles with the Diff arm added.
 
-- [ ] **Step 5: Per-format tests + per-error-class tests.**
+Imports the scaffold template needs at the top of `main.rs.hbs`:
+
+```rust
+use edgezero_cli::{run_config_diff_typed, DiffExit};
+```
+
+`DiffExit` is exported from `edgezero-cli`'s crate root in Step 6 below.
+
+- [ ] **Step 5: Module + re-export wiring.** `edgezero-cli/src/lib.rs` (today's re-exports at `crates/edgezero-cli/src/lib.rs:48`) needs four additions so the scaffold's `cli/src/main.rs.hbs` `use edgezero_cli::{run_config_diff_typed, DiffExit};` line compiles:
+
+```rust
+// crates/edgezero-cli/src/lib.rs additions:
+pub mod diff;                       // new module for the renderers
+pub use crate::config::run_config_diff_typed;
+pub use crate::config::DiffExit;
+pub use crate::args::ConfigDiffArgs;
+```
+
+(The existing re-export block at line 48 already exposes `run_config_push_typed` / `run_config_validate_typed` and the corresponding `ConfigPushArgs` / `ConfigValidateArgs`; mirror that pattern.)
+
+- [ ] **Step 6: Per-format tests + per-error-class tests.**
 
 ## Task D3 — Commit Phase D
 

@@ -2611,10 +2611,22 @@ where
 }
 
 pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String> { ... }
-pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<(), String> { ... }
+pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, String> { ... }
 pub fn run_config_validate_typed<C>(args: &ConfigValidateArgs) -> Result<(), String> { ... }
 // all three call build_and_validate(...) at the top
 ```
+
+Note (round-31/32 H-1): `run_config_diff_typed` returns
+`Result<DiffExit, String>`, NOT `Result<(), String>` — the
+generated CLI's main needs the typed exit code to honor
+Q10's `--exit-code` semantics (0 / 1 / 2) without losing the
+"errors always ≥2" invariant on the `Err` path. See spec
+§3.2.2's `DiffExit` declaration block below and the §10.2.2
+scaffold `main.rs.hbs` Diff arm that pattern-matches
+`Ok(DiffExit { code })` to call `process::exit(code)`.
+Earlier drafts showed `Result<(), String>` for symmetry with
+the other two runners; that was inadequate to satisfy the
+spec's exit-code table.
 
 The current `run_config_push_typed` at
 `crates/edgezero-cli/src/config.rs:204` calls
@@ -5754,11 +5766,19 @@ phrasing (no strip under Model A) AND mention the diff:
 **Match arm** (line 69-82) — add the diff branch:
 
 ```rust
-let result = match Args::parse().cmd {
+let result: Result<(), String> = match Args::parse().cmd {
     Cmd::Auth(args) => edgezero_cli::run_auth(&args),
     Cmd::Build(args) => edgezero_cli::run_build(&args),
+    // Diff returns Result<DiffExit, String> so the success branch
+    // can carry an exit code (0 / 1 / 2-for-Unsupported) per Q10.
+    // Errors fall through to the generic `if let Err(_)` block
+    // which exits ≥2. Round-31/32 H-1.
     Cmd::Config({{NameUpperCamel}}ConfigCmd::Diff(args)) => {
-        edgezero_cli::run_config_diff_typed::<{{NameUpperCamel}}Config>(&args)
+        match edgezero_cli::run_config_diff_typed::<{{NameUpperCamel}}Config>(&args) {
+            Ok(edgezero_cli::DiffExit { code: 0 }) => Ok(()),
+            Ok(edgezero_cli::DiffExit { code }) => process::exit(code),
+            Err(err) => Err(err),
+        }
     }
     Cmd::Config({{NameUpperCamel}}ConfigCmd::Push(args)) => {
         edgezero_cli::run_config_push_typed::<{{NameUpperCamel}}Config>(&args)
@@ -5771,6 +5791,11 @@ let result = match Args::parse().cmd {
     Cmd::Provision(args) => edgezero_cli::run_provision(&args),
     Cmd::Serve(args) => edgezero_cli::run_serve(&args),
 };
+if let Err(err) = result {
+    log::error!("[{{name}}] {err}");
+    process::exit(2);  // round-31/32 H-1: bumped from 1 so diff
+                       // errors satisfy Q10's "errors always ≥2".
+}
 ```
 
 #### `root/edgezero.toml.hbs`
