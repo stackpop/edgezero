@@ -4466,39 +4466,56 @@ Behaviour:
 
 #### 8.1.1 `unified` format (default)
 
+Standard text-based unified diff (the `diff -u` / `git diff` shape
+every operator already knows) over the two `data` trees, with both
+sides normalised before diffing. Round-35 decision: use the
+`similar` crate's `TextDiff::from_lines` after rendering each tree
+through a shared `render_for_diff(&serde_json::Value) -> String`
+helper that sorts object keys recursively (UTF-8 byte order,
+matching the canonical SHA's key ordering) then pretty-prints
+with `serde_json::to_string_pretty`. This guarantees that two
+trees with identical content but different source-key order
+produce identical normalised text and thus an empty diff.
+
+Example output (with `context_radius = 3`):
+
 ```
---- remote (sha256: a472…)
-+++ local  (sha256: 1f3a…)
-
-feature.new_checkout
-- false
-+ true
-
-service.timeout_ms
-- 1500
-+ 2000
-
-vault (added)
-+ "default"
-
-nested.subtree (added)
-+ { "alpha": 1, "beta": 2 }
-
-obsolete.feature (removed)
-- "old-value"
+--- remote (sha256: a472xxxx)
++++ local  (sha256: 1f3axxxx)
+@@ -1,9 +1,10 @@
+ {
+   "api_token": "demo_api_token",
+   "feature": {
+-    "new_checkout": false
++    "new_checkout": true
+   },
+   "greeting": "hello",
++  "nested": { "alpha": 1, "beta": 2 },
+   "service": {
+-    "timeout_ms": 1500
++    "timeout_ms": 2000
+   },
+   "vault": "default"
+ }
 ```
 
-Dotted paths in alphabetical order; one block per change.
-**Subtree handling:** when a whole subtree is added or removed in
-one push (the parent key transitions from absent → present or
-vice versa), the diff prints ONE block at the parent path with
-the full subtree value pretty-printed (compact JSON, 2-space
-indent if multi-line). When the parent EXISTS on both sides but
-leaves underneath change, each changed leaf gets its own block —
-no rolled-up "5 leaves changed under `nested`" summary, because
-the dotted-path form is the operator's actionable surface.
+Whole-subtree adds / removes naturally show as multi-line `+` /
+`-` blocks under the parent key (round-33 M-1's "subtree
+roll-up" concern is moot — text diff sees the whole subtree as
+contiguous lines, so additions / removals print once with the
+full indented value). Operators get the familiar git-style
+output without us writing custom subtree-handling code.
 
-The goal is "readable in a git terminal".
+The previous spec draft had a custom per-leaf format
+(`feature.new_checkout\n- false\n+ true`); round-35 reviewer
+asked "are we using a library for diff", and switching to
+`similar`-over-normalised-JSON dropped ~50 LOC of hand-rolled
+rendering for a more familiar output. Operators piping through
+`git diff --color=always | less -R` or similar shell composition
+work unchanged.
+
+The goal is "readable in a git terminal" — the unified format
+literally IS git's diff format.
 
 #### 8.1.2 `structured` format
 

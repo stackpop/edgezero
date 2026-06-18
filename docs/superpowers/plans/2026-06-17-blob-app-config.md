@@ -6,7 +6,7 @@
 
 **Architecture:** One typed-config struct `C` serialises to a single envelope `{ data, sha256, version, generated_at }` written to one `[stores.config]` key per environment. The runtime reads the envelope, verifies the SHA, swaps `#[secret]` fields with values from `[stores.secrets]`, deserialises through `serde_path_to_error`, validates, and yields `C` to the handler. `config push` writes one blob per adapter; `config diff` compares local vs remote via a new `Adapter::read_config_entry` trait. Hard cutoff per [spec §10](../specs/2026-06-16-blob-app-config.md): no dual-shape parsing, no legacy fallback.
 
-**Tech Stack:** Rust 1.95.0, Cargo workspace (8 crates), `serde_json` + `ryu` + `sha2` for canonicalisation, `serde_path_to_error` for field-path-aware deserialise errors, `validator` 0.20 for runtime validation, `clap` 4.6 for CLI, `chrono` 0.4 (ALREADY in workspace deps; new consumer on `edgezero-cli` for the `generated_at` RFC3339 timestamp at push time), `syn` 2 + `walkdir` (CI-gate-only feature) for the nested-AppConfig acceptance check. No new runtime deps beyond `ryu`/`sha2`/`serde_path_to_error`/`chrono` (the last reusing the existing workspace pin).
+**Tech Stack:** Rust 1.95.0, Cargo workspace (8 crates), `serde_json` + `ryu` + `sha2` for canonicalisation, `serde_path_to_error` for field-path-aware deserialise errors, `validator` 0.20 for runtime validation, `clap` 4.6 for CLI, `chrono` 0.4 (ALREADY in workspace deps; new consumer on `edgezero-cli` for the `generated_at` RFC3339 timestamp at push time), `similar` 2 for the `config push` inline diff + `config diff --format unified` text-diff renderer, `syn` 2 + `walkdir` (CI-gate-only feature) for the nested-AppConfig acceptance check. No new runtime deps beyond `ryu`/`sha2`/`serde_path_to_error`/`similar`/`chrono` (the last reusing the existing workspace pin).
 
 ## Global Constraints
 
@@ -41,22 +41,24 @@
 
 **Goal:** Ship the SHA-canonicalisation walker, the `BlobEnvelope` type, and the `AppConfigError::InvalidValue` variant + non-finite-float rejection. The canonicaliser + envelope are new modules with no in-tree caller yet. Task A5's `AppConfigError::InvalidValue` variant + the loader's finite-float walk DO change behaviour the existing typed-push call site (`crates/edgezero-cli/src/config.rs:204`) is exposed to — but the change is purely RESTRICTIVE (a new error variant on input that was previously silently accepted as JSON `null`). Any in-tree TOML / env-overlay fixture that contained `nan` / `inf` would have been hashing as `null` already; the v1 hard cutoff catches that legitimately at the loader boundary. Phase ends with one commit.
 
-## Task A1 — Add `ryu`, `sha2`, `serde_path_to_error` workspace deps
+## Task A1 — Add `ryu`, `sha2`, `serde_path_to_error`, `similar` workspace deps
 
 **Files:**
 
-- Modify: `Cargo.toml` (root workspace) — add three entries to `[workspace.dependencies]`.
+- Modify: `Cargo.toml` (root workspace) — add four entries to `[workspace.dependencies]`.
 
 **Interfaces:**
 
-- Produces: workspace deps `ryu`, `sha2`, `serde_path_to_error` available to per-crate Cargo.toml entries via `{ workspace = true }`.
+- Produces: workspace deps `ryu`, `sha2`, `serde_path_to_error`, `similar` available to per-crate Cargo.toml entries via `{ workspace = true }`.
+
+`similar` is the text-diff library used by Phase C's inline diff renderer + Phase D's `unified` format dispatcher; the structured / json format dispatchers in Phase D still use a hand-rolled per-leaf walker (those want structured per-path data, NOT text diff). Per the round-35 design decision: normalise both JSON values via `render_for_diff` (sort keys recursively + `serde_json::to_string_pretty`), then text-diff with `similar::TextDiff::from_lines`. Output looks like standard git-style unified diff, which every operator already knows.
 
 - [ ] **Step 1: Inspect current `[workspace.dependencies]` block to find the alphabetical insertion point.**
 
-Run: `grep -nE '^(ryu|sha2|serde_path_to_error|sha)' Cargo.toml`
+Run: `grep -nE '^(ryu|sha2|serde_path_to_error|similar|sha)' Cargo.toml`
 Expected: empty output (deps not yet present).
 Run: `grep -nE '^[a-z]' Cargo.toml | head -40`
-Use the alphabetical insertion points for `ryu`, `sha2`, `serde_path_to_error`.
+Use the alphabetical insertion points for `ryu`, `sha2`, `serde_path_to_error`, `similar`.
 
 - [ ] **Step 2: Add `ryu = "1"` in alphabetical order under `[workspace.dependencies]`.**
 
@@ -76,12 +78,18 @@ sha2 = "0.10"
 serde_path_to_error = "0.1"
 ```
 
-- [ ] **Step 5: Verify the workspace builds (no per-crate consumer yet, but the workspace `Cargo.lock` should resolve).**
+- [ ] **Step 5: Add `similar = "2"` in alphabetical order.**
+
+```toml
+similar = "2"
+```
+
+- [ ] **Step 6: Verify the workspace builds (no per-crate consumer yet, but the workspace `Cargo.lock` should resolve).**
 
 Run: `cargo build --workspace`
 Expected: builds successfully; new deps are resolved into `Cargo.lock` but not pulled in.
 
-- [ ] **Step 6: Commit deferred until Task A6** — kept rolling so the workspace deps land in one commit with their first consumer.
+- [ ] **Step 7: Commit deferred until Task A6** — kept rolling so the workspace deps land in one commit with their first consumer.
 
 ## Task A2 — `canonical_form` module skeleton + finite-float walker
 
@@ -3293,49 +3301,19 @@ if let ReadConfigEntry::Unsupported(reason) = &remote {
 
 - [ ] **Step 4: Call the adapter's writer (Task C2 work).**
 
-- [ ] **Step 5: Define `print_unified_diff_inline` in the cutover commit (round-32 M-1).** C4's `ReadConfigEntry::Present` branch calls this helper at Step 2; the full format-dispatch (`--format unified|structured|json`) lives in Phase D's `diff.rs` module, but Phase C's inline-diff prompt needs ONE minimal renderer to ship. Define it in `crates/edgezero-cli/src/config.rs` next to `run_config_push_typed`:
+- [ ] **Step 5: Define `print_unified_diff_inline` using `similar` over normalised JSON.** C4's `ReadConfigEntry::Present` branch calls this helper at Step 2. The cutover commit needs ONE renderer for the inline-diff prompt; Phase D's `diff.rs` reuses the same helper for `--format unified` and adds the structured + json format dispatchers separately.
 
-/// Minimal inline unified renderer used by `config push`'s
-/// inline diff prompt. Renders to stdout per spec §8.1.1's
-/// shape (dotted-path key-sorted lines, `-` / `+` markers,
-/// per-LEAF `(added)` / `(removed)` annotations).
-///
-/// **Round-33 M-1 narrowing.** This helper does NOT roll
-/// added/removed SUBTREES up to a single parent-path block
-/// (the spec's §8.1.1 "Subtree handling" rule says when an
-/// entire subtree appears or disappears, one parent-path
-/// block should print the full subtree value pretty-printed
-/// instead of N per-leaf `(added)` / `(removed)` lines).
-/// Phase C's inline renderer flattens every change to a
-/// per-leaf line — visually equivalent for small diffs, but
-/// noisier when a whole subsection toggles. Phase D's
-/// `diff.rs` ships the subtree-roll-up form behind the
-/// `--format unified` dispatcher; the inline prompt's
-/// noisier-but-correct fallback is acceptable for the
-/// cutover commit. Tests in C4 Step 6 assert PER-LEAF
-/// behaviour (not subtree behaviour); spec §8.1.1's
-/// subtree-roll-up assertion lives in Phase D's tests.
-///
-/// **Stream discipline (round-34).** Diff CONTENT
-/// (`---`/`+++` headers, leaf paths, `-`/`+` lines)
-/// goes to **stdout** via `println!`, so operators can pipe
-/// the diff into `jq` (for `--format json`), `less`, etc.
-/// without log-level prefixes. Informational MESSAGES
-/// (`# no changes`, `# no remote at key X`, the
-/// provisioning hint) go to **stderr** via `eprintln!`, so
-/// they don't pollute the captured diff output. We do NOT
-/// use `log::*` for either — `log::*` routes through
-/// `env_logger` and adds `[INFO …]` prefixes + timestamps
-/// that would corrupt both the human-facing TTY render and
-/// any downstream JSON/diff consumer.
+Round-35 design: instead of hand-rolling a per-leaf walker + renderer, normalise both `serde_json::Value` trees (sort keys + pretty-print) and feed the resulting text to `similar::TextDiff::from_lines`. The output is standard git-style unified diff, which is what the spec §8.1.1 calls for.
 
-/// Truncate a SHA to 8 characters for display purposes. Returns
-/// the input unchanged when it's already ≤ 8 bytes (e.g. the
-/// `"(none)"` sentinel passed for `MissingKey` / `MissingStore`
-/// where there's no remote SHA at all). Round-34 H-1: the
-/// earlier `&sha[..8]` slice panicked on the `"(none)"` literal
-/// (6 bytes), turning a first-push render into a crash instead
-/// of the all-leaves-added diff spec §8.1 requires.
+Add `similar = { workspace = true }` to `crates/edgezero-cli/Cargo.toml`'s `[dependencies]`. Then define the helper in `crates/edgezero-cli/src/config.rs` (the same file that hosts `run_config_push_typed`):
+
+```rust
+use similar::{ChangeTag, TextDiff};
+
+/// Truncate a SHA to 8 characters for display. Returns the input
+/// unchanged when ≤ 8 bytes (the `"(none)"` sentinel used for
+/// `MissingKey` / `MissingStore` is 6 bytes — round-34 H-1
+/// reviewer caught the original `&sha[..8]` panic there).
 fn short_ref(sha: &str) -> &str {
     if sha.len() <= 8 {
         sha
@@ -3344,71 +3322,76 @@ fn short_ref(sha: &str) -> &str {
     }
 }
 
+/// Pretty-print a `serde_json::Value` with object keys sorted
+/// recursively by UTF-8 byte order. Used by the diff renderer
+/// so two trees with identical content but different source-key
+/// order produce identical normalised text (and thus an empty
+/// diff). The sort order matches the canonical-form helper
+/// (`canonical_form::canonical_data_sha256`), so a diff that
+/// shows no changes implies the same SHA.
+pub(crate) fn render_for_diff(value: &serde_json::Value) -> String {
+    let sorted = sort_keys_recursive(value);
+    serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "<unrenderable>".into())
+}
+
+fn sort_keys_recursive(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    match value {
+        Value::Object(map) => {
+            let mut sorted_map = Map::new();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            for k in keys {
+                sorted_map.insert(k.clone(), sort_keys_recursive(&map[k]));
+            }
+            Value::Object(sorted_map)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sort_keys_recursive).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Inline unified diff renderer used by `config push`'s
+/// inline-diff prompt AND by Phase D's `--format unified`
+/// dispatcher. Renders standard git-style unified diff (the
+/// `similar` crate's `unified_diff` output) over the two trees
+/// normalised through `render_for_diff`.
+///
+/// **Stream discipline (round-34).** Diff CONTENT goes to
+/// **stdout** via `print!` so operators can pipe the diff into
+/// `git diff`-style colour wrappers or `less -R` without
+/// log-level prefixes. Informational MESSAGES (`# no changes`,
+/// `# no remote at key X`, the provisioning hint at C4 Step 2)
+/// go to **stderr** via `eprintln!` from the caller. We do
+/// NOT use `log::*` — `env_logger`'s `[INFO …]` prefixes +
+/// timestamps would corrupt both the TTY render and any
+/// downstream parser.
 pub(crate) fn print_unified_diff_inline(
     remote_data: &serde_json::Value,
     local_data: &serde_json::Value,
     remote_sha: &str,
     local_sha: &str,
 ) {
-    println!("--- remote (sha256: {})", short_ref(remote_sha));
-    println!("+++ local  (sha256: {})", short_ref(local_sha));
-    println!();
-    let mut leaves: BTreeMap<String, (Option<serde_json::Value>, Option<serde_json::Value>)> =
-        BTreeMap::new();
-    walk_leaves(remote_data, String::new(), &mut |path, val| {
-        leaves.entry(path).or_default().0 = Some(val.clone());
-    });
-    walk_leaves(local_data, String::new(), &mut |path, val| {
-        leaves.entry(path).or_default().1 = Some(val.clone());
-    });
-    for (path, (rem, loc)) in leaves {
-        match (rem, loc) {
-            (Some(r), Some(l)) if r == l => continue,
-            (Some(r), Some(l)) => {
-                println!("{path}");
-                println!("- {r}");
-                println!("+ {l}");
-                println!();
-            }
-            (Some(r), None) => {
-                println!("{path} (removed)");
-                println!("- {r}");
-                println!();
-            }
-            (None, Some(l)) => {
-                println!("{path} (added)");
-                println!("+ {l}");
-                println!();
-            }
-            (None, None) => {}
-        }
-    }
-}
-
-fn walk_leaves<F: FnMut(String, &serde_json::Value)>(
-    value: &serde_json::Value,
-    prefix: String,
-    emit: &mut F,
-) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (k, v) in map {
-                let next = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{prefix}.{k}")
-                };
-                walk_leaves(v, next, emit);
-            }
-        }
-        _ => emit(prefix, value),
-    }
+    let remote_text = render_for_diff(remote_data);
+    let local_text = render_for_diff(local_data);
+    let diff = TextDiff::from_lines(&remote_text, &local_text);
+    let unified = diff
+        .unified_diff()
+        .header(
+            &format!("remote (sha256: {})", short_ref(remote_sha)),
+            &format!("local  (sha256: {})", short_ref(local_sha)),
+        )
+        .context_radius(3);
+    // `unified_diff()` implements Display; piping through print!
+    // (NOT println!) avoids an extra trailing newline when the
+    // diff already ends with one.
+    print!("{unified}");
 }
 ```
 
-(Arrays are treated as leaves by `walk_leaves` — they're rare in app-config shapes and the inline renderer just prints the whole JSON value, matching the spec §8.1.1 example. Phase D's full renderer handles arrays element-wise if/when an operator needs deeper array diffs.)
+The implementation is roughly 30 LOC (the bulk being `sort_keys_recursive`, which `render_for_diff` reuses for structured / json formats in Phase D too). The hand-rolled `walk_leaves` from earlier drafts is gone for the unified path; Phase D's `structured` and `json` formats will reintroduce a tree walker, but the inline diff doesn't need it.
 
-Phase D's `diff.rs` will refactor this helper into a `unified` format that the `--format` dispatcher invokes; the signature stays the same so Phase D can either reuse it directly or wrap it.
+Phase D's `diff.rs` will call this same `print_unified_diff_inline` for `--format unified` (re-exported under a public alias if needed); the `structured` and `json` dispatchers ship a separate per-leaf walker that produces `Vec<{ path, kind, from?, to? }>` for programmatic consumers.
 
 - [ ] **Step 6: Tests.** Cover the §8.2 default rules (skip-on-equal, no-write, consent prompt, `--no-diff`/`--yes` interactions) AND the §8.3 four-branch Spin Cloud UX (dry-run rejection, --yes silent write, TTY prompt, non-TTY error). Add a focused test for `print_unified_diff_inline` against a 3-leaf fixture asserting the dotted-path ordering + `-`/`+`/`(added)`/`(removed)` markers per spec §8.1.1.
 
@@ -3672,13 +3655,81 @@ explicit at the type level and lets the generated main pick a
 DIFFERENT exit code than the default `exit(1)` it uses for every
 other subcommand.
 
-- [ ] **Step 1: Implement the three renderers.** Each takes two `serde_json::Value` data fields + the local/remote shas + returns a `String` (or writes to stdout).
+- [ ] **Step 1: Implement the three renderers.** Each takes two `serde_json::Value` data fields + the local/remote shas + writes to stdout (the dispatcher itself is `fn(&Value, &Value, &str, &str) -> ()`).
 
-For `unified`: dotted-path key-sorted lines with `-` / `+` per spec §8.1.1.
+For `unified` (round-35): re-export the C4 Step 5 helper. The dispatcher's `unified` branch is literally `print_unified_diff_inline(remote_data, local_data, remote_sha, local_sha)` — same `similar::TextDiff` over `render_for_diff`-normalised JSON, same `context_radius(3)`, same headers. No duplication, no second implementation. The helper already lives in `crates/edgezero-cli/src/config.rs` from C4 Step 5; `diff.rs` imports it (`use crate::config::print_unified_diff_inline;`) and calls it directly.
 
-For `structured`: per spec §8.1.2 (refer to the spec block — implement verbatim).
+For `structured` and `json`: these formats need per-leaf programmatic output (a `Vec<DiffEntry { path: String, kind: Kind, from: Option<Value>, to: Option<Value> }>`), NOT a text diff — operators pipe `--format json` into `jq` for path-keyed lookups, and `--format structured` prints a path-grouped human view. Define a `walk_leaves(value, prefix, &mut emit)` helper inside `diff.rs` (NOT exported from `config.rs` — it's a structured-format implementation detail, separate from the C4-Step-5 unified renderer):
 
-For `json`: per spec §8.1.3.
+```rust
+fn walk_leaves<F: FnMut(String, &serde_json::Value)>(
+    value: &serde_json::Value,
+    prefix: String,
+    emit: &mut F,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            // Sort keys so structured/json output is deterministic — same
+            // ordering rule as `render_for_diff` so a diff with no
+            // differences renders identically across formats.
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            for k in keys {
+                let next = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                walk_leaves(&map[k], next, emit);
+            }
+        }
+        // Arrays are treated as leaves for now — matches the C4 Step 5
+        // behaviour and §8.1's example. If an operator later needs
+        // element-wise array diffs, extend this match arm only.
+        _ => emit(prefix, value),
+    }
+}
+
+fn collect_changes(
+    remote_data: &serde_json::Value,
+    local_data: &serde_json::Value,
+) -> Vec<DiffEntry> {
+    let mut leaves: BTreeMap<String, (Option<serde_json::Value>, Option<serde_json::Value>)> =
+        BTreeMap::new();
+    walk_leaves(remote_data, String::new(), &mut |path, val| {
+        leaves.entry(path).or_default().0 = Some(val.clone());
+    });
+    walk_leaves(local_data, String::new(), &mut |path, val| {
+        leaves.entry(path).or_default().1 = Some(val.clone());
+    });
+    leaves
+        .into_iter()
+        .filter_map(|(path, (rem, loc))| match (rem, loc) {
+            (Some(r), Some(l)) if r == l => None,
+            (Some(r), Some(l)) => Some(DiffEntry { path, kind: DiffKind::Changed, from: Some(r), to: Some(l) }),
+            (Some(r), None) => Some(DiffEntry { path, kind: DiffKind::Removed, from: Some(r), to: None }),
+            (None, Some(l)) => Some(DiffEntry { path, kind: DiffKind::Added, from: None, to: Some(l) }),
+            (None, None) => None,
+        })
+        .collect()
+}
+```
+
+`structured` renderer: spec §8.1.2 verbatim — `collect_changes` → human-readable per-path block list (stdout via `println!`).
+
+`json` renderer: spec §8.1.3 verbatim — `collect_changes` → `serde_json::to_string_pretty(&entries)` with envelope `{"remote_sha":..., "local_sha":..., "changes":[…]}` (stdout via `println!`).
+
+The dispatcher selector — one match expression on `args.format`:
+
+```rust
+match args.format {
+    DiffFormat::Unified => {
+        crate::config::print_unified_diff_inline(remote_data, local_data, remote_sha, local_sha);
+    }
+    DiffFormat::Structured => render_structured(remote_data, local_data, remote_sha, local_sha),
+    DiffFormat::Json => render_json(remote_data, local_data, remote_sha, local_sha),
+}
+```
 
 - [ ] **Step 2: Wire `run_config_diff_typed` with EXPLICIT per-variant handling of the read-back outcome.** Round-27 reviewer flagged the earlier compressed "read → render" wording as under-specified for the four `ReadConfigEntry` cases. Each variant gets its own branch + exit-code tag:
 
