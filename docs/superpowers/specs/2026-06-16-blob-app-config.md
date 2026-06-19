@@ -1285,7 +1285,6 @@ reversal:**
   mapping table at §6.3 still showed the old
   "Key missing → `Internal`" rule. The round-19
   reviewer caught this divergence. Fixed:
-
   - The §6.3 "Key missing from the store" bullet
     now reads
     `EdgeError::ConfigOutOfDate` (HTTP 503,
@@ -2299,7 +2298,6 @@ struct.** Two enforcement layers, in order:
    no struct field whose type is a known `AppConfig`
    root is embedded in another `AppConfig` root.
    Concretely:
-
    - The derive emits `impl AppConfigRoot for C {}`
      against a PUBLIC, UNSEALED marker trait
      `edgezero_core::app_config::AppConfigRoot`. The
@@ -2955,8 +2953,11 @@ fn validate_excluding_secrets<C: Validate + AppConfigMeta>(
 ) -> Result<(), validator::ValidationErrors> {
     let result = cfg.validate();
     let Err(mut errors) = result else { return Ok(()); };
-    // validator 0.20 exposes `errors_mut() -> &mut HashMap<&'static str, ValidationErrorsKind>`
+    // validator 0.20 exposes `errors_mut() -> &mut HashMap<Cow<'static, str>, ValidationErrorsKind>`
     // (no public `remove` method on ValidationErrors itself).
+    // `bag.remove(field.name)` works because `field.name: &'static str` and
+    // `Cow<'static, str>: Borrow<str>` — round-36 H-1 reviewer noted the
+    // earlier comment cited `&'static str` keys (wrong since validator 0.18).
     let bag = errors.errors_mut();
     for field in C::SECRET_FIELDS {
         if matches!(field.kind, SecretKind::StoreRef) {
@@ -3124,7 +3125,6 @@ below so any compliant implementation produces the same bytes.
   output** (round-28 M-1 pin). Pinning the escape spelling
   matters because compliant implementations would otherwise
   hash differently for the same logical string:
-
   - `"` → `\"`
   - `\` → `\\`
   - `\n` (U+000A) → `\n`
@@ -3152,7 +3152,6 @@ below so any compliant implementation produces the same bytes.
 
   **Why not NFC.** An earlier draft normalised to NFC at
   push and re-NFC'd at read. Two consequences killed it:
-
   1. **Stored bytes drift from operator input.** Push
      would mutate operator-typed strings — including
      secret key names — into a normalised form. A secret
@@ -3183,7 +3182,6 @@ below so any compliant implementation produces the same bytes.
   the key name. So an `nfc_only` rule on a `#[secret]`
   field would validate the wrong string at the wrong
   time:
-
   - **At push**: skipped entirely.
   - **At runtime**: applied to the resolved secret
     bytes, not the operator-typed key name.
@@ -3209,71 +3207,58 @@ below so any compliant implementation produces the same bytes.
     values and produce false skip-on-equal matches across
     fundamentally different configs.
 
-        **Error variant — new `AppConfigError::InvalidValue`.**
-        The existing `AppConfigError::Validation` variant at
-        `crates/edgezero-core/src/app_config.rs:125` wraps
-        `Box<ValidationErrors>` — that's for
-        `Validate::validate()` rule failures (range / length /
-        regex / custom). Non-finite floats are a load-time
-        structural problem, not a validator-rule failure;
-        constructing a fake `ValidationErrors` with an owned
-        dotted-path key would be awkward AND would let
-        `validator`-shaped error rendering bleed into a
-        non-`validator` error path. The implementing PR adds:
+    **Error variant — new `AppConfigError::InvalidValue`.** The existing
+    `AppConfigError::Validation` variant at
+    `crates/edgezero-core/src/app_config.rs:125` wraps `Box<ValidationErrors>` —
+    that's for `Validate::validate()` rule failures (range / length / regex /
+    custom). Non-finite floats are a load-time structural problem, not a
+    validator-rule failure; constructing a fake `ValidationErrors` with an
+    owned dotted-path key would be awkward AND would let `validator`-shaped
+    error rendering bleed into a non-`validator` error path. The implementing
+    PR adds:
 
-        ```rust
-        #[error("invalid value at {field_path} in {}: {message}", path.display())]
-        InvalidValue {
-            path: PathBuf,
-            /// Dotted path of the offending leaf, e.g.
-            /// `"service.ratio"`. Joined from the env-overlay
-            /// segment stack (`["service", "ratio"]`) so the
-            /// same path format works for both load paths.
-            field_path: String,
-            /// Human-readable reason, e.g. `"non-finite f64
-            /// value `NaN` is not representable in canonical
-            /// form"`.
-            message: String,
-        },
-        ```
+    ```rust
+    #[error("invalid value at {field_path} in {}: {message}", path.display())]
+    InvalidValue {
+        path: PathBuf,
+        /// Dotted path of the offending leaf, e.g. `"service.ratio"`.
+        /// Joined from the env-overlay segment stack
+        /// (`["service", "ratio"]`) so the same path format works for both
+        /// load paths.
+        field_path: String,
+        /// Human-readable reason, e.g. `"non-finite f64 value NaN is not
+        /// representable in canonical form"`.
+        message: String,
+    },
+    ```
 
-        Tests assert the variant + the `field_path` + a
-        substring of `message` (`"NaN"`, `"inf"`, or
-        `"-inf"`); no `ValidationErrors` construction is
-        needed.
+    Tests assert the variant + the `field_path` + a substring of `message`
+    (`"NaN"`, `"inf"`, or `"-inf"`); no `ValidationErrors` construction is
+    needed.
 
-        The check runs in two places to cover both load
-        paths:
-        1. **TOML deserialise.** The loader
-           (`load_app_config_raw_with_options` at
-           `crates/edgezero-core/src/app_config.rs:242`) walks
-           the parsed `toml::Value` tree after env overlay and
-           calls `f64::is_finite()` on every float leaf. The
-           first non-finite hit produces
-           `AppConfigError::InvalidValue { path, field_path,
+    The check runs in two places to cover both load paths. **TOML
+    deserialise:** the loader (`load_app_config_raw_with_options` at
+    `crates/edgezero-core/src/app_config.rs:242`) walks the parsed
+    `toml::Value` tree after env overlay and calls `f64::is_finite()` on every
+    float leaf. The first non-finite hit produces
+    `AppConfigError::InvalidValue { path, field_path, message }`. **Env
+    overlay coercion:** the overlay's float parser at
+    `crates/edgezero-core/src/app_config.rs:298` calls `parse::<f64>()` which
+    accepts `nan` / `inf` / `-inf`; the implementing PR adds an
+    `is_finite()` check IMMEDIATELY after the parse, erroring with the same
+    `InvalidValue` variant. Without this, an env var
+    `<APP>__FEATURE__RATIO=nan` would silently flow through the overlay AND
+    through `serde_json::to_value` into a `null` in the canonical form.
 
-    message }`.
-    2. **Env overlay coercion.** The overlay's float
-       parser at
-       `crates/edgezero-core/src/app_config.rs:298`calls
-      `parse::<f64>()`which accepts`nan`/`inf`/
-      `-inf`; the implementing PR adds an
-       `is_finite()`check IMMEDIATELY after the parse,
-       erroring with the same`InvalidValue`variant.
-       Without this, an env var
-      `<APP>**FEATURE**RATIO=nan`would silently flow
-       through the overlay AND through`serde_json::to_value`       into a`null` in the canonical form.
+    The rejection happens BEFORE `serde_json::to_value` runs, so the
+    canonicaliser never sees a non-finite float. §12.1 adds tests for both
+    paths (TOML literal, env overlay) per the round-15 B-2 finding + round-16
+    I-2 concretisation.
 
-        The rejection happens BEFORE `serde_json::to_value`
-        runs, so the canonicaliser never sees a non-finite
-        float. §12.1 adds tests for both paths (TOML
-        literal, env overlay) per the round-15 B-2 finding +
-        round-16 I-2 concretisation.
-
-  - **Type identity matters.** If the source TOML's `1500` is
-    typed as `i64` in `AppConfig`, the canonical form is `1500`.
-    If typed as `f64`, it's `1500.0`. The runtime's struct
-    decides — push and read MUST use the same struct.
+  - **Type identity matters.** If the source TOML's `1500` is typed as `i64`
+    in `AppConfig`, the canonical form is `1500`. If typed as `f64`, it's
+    `1500.0`. The runtime's struct decides — push and read MUST use the same
+    struct.
 
 - **Booleans:** `true` / `false` lowercase.
 - **`null`:** the literal `null`. Empty `Option<T>` fields
@@ -3389,7 +3374,6 @@ forbidden`); the §4.2 rules explicitly support
   on its own.
 
   Concrete acceptance criteria for the implementing PR:
-
   1. The hand-rolled module
      `crates/edgezero-core/src/canonical_form.rs` (or
      `.../canonical_form/mod.rs`) exists and exposes
@@ -3839,13 +3823,13 @@ registry()` accessors — currently returns
 `BoundConfigStore` (= `ConfigStoreHandle`) directly. Under
 the binding change:
 
-| Method                      | Before (today)                      | After (this spec)                                                                                                                              |
-| --------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Config::default()`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — unchanged. Internally unwraps `binding.handle`. Hand-managed `bound.get(...)` works unchanged.                   |
-| `Config::named(id)`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — same unwrap.                                                                                                     |
-| `Config::registry()`        | `&StoreRegistry<ConfigStoreHandle>` | `&StoreRegistry<ConfigStoreBinding>` — **breaking** for any caller that destructured the registry value. Hard cutoff per §1.                   |
-| `Config::default_binding()` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor for callers that want the resolved `__KEY`.                                                       |
-| `Config::named_binding(id)` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor (named variant).                                                                                  |
+| Method                      | Before (today)                      | After (this spec)                                                                                                            |
+| --------------------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `Config::default()`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — unchanged. Internally unwraps `binding.handle`. Hand-managed `bound.get(...)` works unchanged. |
+| `Config::named(id)`         | `Option<ConfigStoreHandle>`         | `Option<ConfigStoreHandle>` — same unwrap.                                                                                   |
+| `Config::registry()`        | `&StoreRegistry<ConfigStoreHandle>` | `&StoreRegistry<ConfigStoreBinding>` — **breaking** for any caller that destructured the registry value. Hard cutoff per §1. |
+| `Config::default_binding()` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor for callers that want the resolved `__KEY`.                                     |
+| `Config::named_binding(id)` | (didn't exist)                      | `Option<&ConfigStoreBinding>` — new accessor (named variant).                                                                |
 
 `BoundConfigStore` stays as the `ConfigStoreHandle` alias —
 NOT redefined to `ConfigStoreBinding`. That keeps the
@@ -4988,7 +4972,6 @@ bulk put <tempfile.json> --namespace-id=<id> --remote`
   Cloud's CLI has no documented stdin / file-input form for
   `cloud key-value set` as of Spin 3.6.x. That means the entire
   blob lands on argv, with two consequences:
-
   - The whole config appears in `ps`/`/proc/<pid>/cmdline` of
     the operator's shell during the push.
   - The blob size is bounded by the host's `ARG_MAX` (~256 KiB
@@ -5985,7 +5968,6 @@ blob is correct):
   and `set` is the only per-key write; there is no
   per-key list or delete. Three options for the
   operator post-migration:
-
   1. Leave the pre-migration leaf keys in place
      (they're orphan bytes the runtime no longer
      reads). The blob-model runtime only reads the
@@ -6539,7 +6521,6 @@ strip or revert the resolution direction:
   checks ONLY.** Three sub-tests, each asserting on a
   structural property the validator can verify without
   hitting any secret store:
-
   1. **`[stores.secrets]` declared.** Fixture: typed
      struct has at least one `#[secret]` or
      `#[secret(store_ref*)]` field; manifest omits
@@ -6626,7 +6607,6 @@ silently drop or rename a `kind` string.
 - **`Retry-After: 60` is PRESENT on `ConfigOutOfDate`
   ONLY.** Fixture per variant: render the response,
   assert `response.headers().get("retry-after")`:
-
   - `ConfigOutOfDate`: `Some("60")`.
   - `ServiceUnavailable`: `None`. Round-10 H-3 audit
     found the variant is reused for several
@@ -6824,7 +6804,6 @@ custom.toml --store other --key staging --no-env --local
 - **`config diff` error branches are non-zero
   REGARDLESS of `--exit-code`.** Three fixtures, each
   run with and without `--exit-code`:
-
   1. Remote read returns a network error → exit ≥ 2.
   2. Manifest fails to load (missing
      `edgezero.toml`) → exit ≥ 2.
@@ -7118,7 +7097,6 @@ expect.
    §9.0 + §12.18. Bundles four pieces that share the
    "add new structure, no in-tree caller exercises
    it yet" property:
-
    - Tightens `[stores.*]` ids to `[A-Za-z0-9_]+`
      (§5.2 / §12.18); manifest validator gains the
      new error code. Existing in-tree manifests
@@ -7150,7 +7128,6 @@ default_key }` on `ConfigRegistry`. `Config::default()`
    §3.3 + §8.2 + §10.2 + §10.2.1 + §10.2.2. This is
    the load-bearing commit; everything it touches has
    to land together per §10's hard-cutoff rule:
-
    - `AppConfig<C>` extractor + secret resolution
      wired into all four adapters' `ConfigStore::get`
      read path. Missing-blob maps to

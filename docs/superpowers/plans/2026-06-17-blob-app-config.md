@@ -1660,7 +1660,10 @@ pub fn validate_excluding_secrets<C: validator::Validate + AppConfigMeta>(
     let Err(mut errors) = result else {
         return Ok(());
     };
-    // validator 0.20 exposes errors_mut() -> &mut HashMap<&'static str, ValidationErrorsKind>
+    // validator 0.20 exposes errors_mut() -> &mut HashMap<Cow<'static, str>, ValidationErrorsKind>.
+    // `bag.remove(field.name)` works because `field.name` is `&'static str`
+    // and `Cow<'static, str>: Borrow<str>` (round-36 H-1 reviewer noted
+    // the earlier comment cited the wrong key type — fixed).
     let bag = errors.errors_mut();
     for field in C::SECRET_FIELDS {
         if matches!(field.kind, SecretKind::StoreRef) {
@@ -2314,12 +2317,12 @@ fn read_config_entry(
 
 - [ ] **Step 4: Spin — mirror the FULL write dispatch.** Spec §9.0 says read-back must use the same variant as the write path. The Spin writer's `dispatch_push` at `crates/edgezero-adapter-spin/src/cli.rs:514` has four branches (per its doc-comment at `cli.rs:498-513`); the read path needs each one:
 
-| Write-side branch                                                                 | Trigger                                                                              | Read-side behaviour                                                                                                |
-| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| 1. **`--local` forces SQLite-direct, regardless of runtime-config backend type** | `push_ctx.local == true`                                                             | `read_config_entry_local`: parse runtime-config to resolve the SQLite path (honour `type = "spin"` `path` override; otherwise default `.spin/sqlite_key_value.db`); read the row at `(store=<platform>, key=<key>)`. `Present(value)` / `MissingKey` per row presence; `MissingStore` if the SQLite file doesn't exist. |
-| 2. **Manifest deploy command targets Fermyon Cloud**                             | `push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)` | `read_config_entry`: returns `Unsupported("Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1")` per §8.3 / §9.4. NO shell-out to `spin cloud key-value list` or similar — that lists stores, not keys (round-20 cleanup recipe). |
-| 3. **`runtime-config.toml` declares a non-Spin backend**                         | `parsed.key_value_stores.get(platform) == Some(Redis { .. } | AzureCosmos | Unknown)` | `read_config_entry`: error with the same message the writer uses at `cli.rs:632-640` ("backend type `redis` for label `<X>` — use `redis-cli GET <key>` or the equivalent; edgezero does not read from this backend").                                                                                                  |
-| 4. **Default — `type = "spin"`** (with valid `runtime-config.toml`)              | `parsed.key_value_stores.get(platform) == Some(Spin { .. })` OR backend missing      | `read_config_entry`: SQLite-direct read at `parsed.key_value_stores.get(platform).path` if set, otherwise the Spin default `.spin/sqlite_key_value.db`. **Errors during `runtime_config::read` AND non-default labels missing from `runtime-config.toml` propagate** (no silent `.ok()` fallthrough) — matches writer at `cli.rs:629` + `verify_label_declared` at `cli.rs:653`. Round-28 H-2: silently swallowing a parse error here would let `config diff` succeed against a tree where the writer would have failed. |
+| Write-side branch                                                                | Trigger                                                                                  | Read-side behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. **`--local` forces SQLite-direct, regardless of runtime-config backend type** | `push_ctx.local == true`                                                                 | `read_config_entry_local`: parse runtime-config to resolve the SQLite path (honour `type = "spin"` `path` override; otherwise default `.spin/sqlite_key_value.db`); read the row at `(store=<platform>, key=<key>)`. `Present(value)` / `MissingKey` per row presence; `MissingStore` if the SQLite file doesn't exist.                                                                                                                                                                                                  |
+| 2. **Manifest deploy command targets Fermyon Cloud**                             | `push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)` | `read_config_entry`: returns `Unsupported("Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1")` per §8.3 / §9.4. NO shell-out to `spin cloud key-value list` or similar — that lists stores, not keys (round-20 cleanup recipe).                                                                                                                                                                                                                                                             |
+| 3. **`runtime-config.toml` declares a non-Spin backend**                         | `parsed.key_value_stores.get(platform) == Some(Redis { .. }                              | AzureCosmos                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Unknown)` | `read_config_entry`: error with the same message the writer uses at `cli.rs:632-640` ("backend type `redis` for label `<X>` — use `redis-cli GET <key>` or the equivalent; edgezero does not read from this backend"). |
+| 4. **Default — `type = "spin"`** (with valid `runtime-config.toml`)              | `parsed.key_value_stores.get(platform) == Some(Spin { .. })` OR backend missing          | `read_config_entry`: SQLite-direct read at `parsed.key_value_stores.get(platform).path` if set, otherwise the Spin default `.spin/sqlite_key_value.db`. **Errors during `runtime_config::read` AND non-default labels missing from `runtime-config.toml` propagate** (no silent `.ok()` fallthrough) — matches writer at `cli.rs:629` + `verify_label_declared` at `cli.rs:653`. Round-28 H-2: silently swallowing a parse error here would let `config diff` succeed against a tree where the writer would have failed. |
 
 Sketch:
 
@@ -2609,12 +2612,17 @@ fn first_violating_field(errors: &validator::ValidationErrors) -> Option<String>
             return;
         }
         // Keys are sorted so the chosen path is deterministic across
-        // runs — required for the §6.3.1 contract test.
-        let mut keys: Vec<&'static str> = errors.errors().keys().copied().collect();
+        // runs — required for the §6.3.1 contract test. Validator 0.20
+        // stores keys as `Cow<'static, str>` (NOT `&'static str` — the
+        // type changed in 0.18); `.copied()` won't compile because
+        // `Cow` isn't `Copy`. We borrow each key as `&str` via
+        // `as_ref()` and `HashMap::get` works because `Cow<'static, str>:
+        // Borrow<str>` — round-36 H-1 reviewer caught this.
+        let mut keys: Vec<&str> = errors.errors().keys().map(|k| k.as_ref()).collect();
         keys.sort();
         for key in keys {
             let path = if prefix.is_empty() {
-                (*key).to_string()
+                key.to_string()
             } else {
                 format!("{prefix}.{key}")
             };
@@ -3117,7 +3125,6 @@ In the top-level `Command` enum (typically `args.rs`):
 - [ ] **Step 1: Switch the loader path AND the validator (round-28 L-1).** Current `run_config_push_typed` at `crates/edgezero-cli/src/config.rs:205` calls `load_app_config_with_options`, which ALREADY runs `Validate::validate` internally before returning the typed `C` (see `crates/edgezero-core/src/app_config.rs:160`). Just replacing the post-load `Validate::validate` call leaves the FULL validation still running inside the loader, with secret-bearing fields validated against the operator-typed KEY NAMES — which is exactly what §3.3.8's `validate_excluding_secrets` rule exists to prevent.
 
   Two changes needed:
-
   1. Replace the `load_app_config_with_options(...)` call with `deserialize_app_config_with_options(...)` (the Phase A A6 entry point). This deserialises typed `C` WITHOUT calling `.validate()`.
   2. Then explicitly call `validate_excluding_secrets(&cfg)` (Phase B B9) — secret-field validators are skipped per the §3.3.8 rule.
 
@@ -3299,7 +3306,79 @@ if let ReadConfigEntry::Unsupported(reason) = &remote {
 }
 ```
 
-- [ ] **Step 4: Call the adapter's writer (Task C2 work).**
+- [ ] **Step 3.5: Re-fetch RIGHT BEFORE the write and re-check skip-on-equal (round-36 M-1).** The first read (Step 2) was the snapshot the operator saw and approved. Between consent and write, a concurrent operator can have pushed the same content (or different content); spec §8.1.4 ("TOCTOU note") and §8.2 are explicit that the skip-on-equal CHECK happens "right before the write (re-fetched then)". Without this second read the final write uses the pre-consent snapshot — if a parallel push raced ahead with the same data, we'd still write (no benefit) AND skip-on-equal would silently no-op.
+
+This step ONLY applies when:
+
+- The first read returned `ReadConfigEntry::Present` (there's a remote to compare against — `MissingKey` / `MissingStore` have nothing to re-check, and `Unsupported` can't read at all).
+- `args.dry_run` is false (no write to skip).
+
+Insert AFTER the consent gate (Step 3) and BEFORE the writer call (Step 4):
+
+```rust
+// Round-36 M-1: re-fetch right before the write so the skip-on-equal
+// check is against the CURRENT remote, not the pre-consent snapshot.
+// Only meaningful for adapters that can read back AND when we're
+// about to actually write. Spec §8.1.4 + §8.2.
+if !args.dry_run && matches!(remote, ReadConfigEntry::Present(_)) {
+    let remote_now = if args.local {
+        adapter.read_config_entry_local(
+            &manifest_root,
+            adapter_manifest_path,
+            component_selector,
+            &store,
+            &key,
+            &push_ctx,
+        )?
+    } else {
+        adapter.read_config_entry(
+            &manifest_root,
+            adapter_manifest_path,
+            component_selector,
+            &store,
+            &key,
+            &push_ctx,
+        )?
+    };
+    if let ReadConfigEntry::Present(body_now) = remote_now {
+        let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now)
+            .map_err(|e| format!("post-consent remote envelope parse failed: {e}"))?;
+        remote_now_env
+            .verify()
+            .map_err(|e| format!("post-consent remote envelope verification failed: {e}"))?;
+        if remote_now_env.sha256 == local_sha {
+            // Concurrent push pushed the same content while we waited
+            // for consent. Skip the write.
+            eprintln!(
+                "# concurrent push reached the same state (sha256 matches: {local_sha}); skipping write"
+            );
+            return Ok(());
+        }
+        // Different remote SHA than the one the operator saw at consent.
+        // Note for the operator but proceed — consent was for "apply MY
+        // local". If they want to bail, they can Ctrl-C / re-run; we
+        // already have explicit `Apply changes? [y/N]` consent. We do
+        // NOT re-prompt: that would loop forever on rapid concurrent
+        // pushes, and the operator already said "apply local".
+        if remote_now_env.sha256 != remote_envelope.sha256 {
+            eprintln!(
+                "# warning: remote changed between diff and write (was {} now {}); applying local anyway",
+                short_ref(&remote_envelope.sha256),
+                short_ref(&remote_now_env.sha256),
+            );
+        }
+    }
+    // If `remote_now` transitioned Present → MissingKey/MissingStore
+    // between reads, we just fall through to the write — the post-
+    // consent state has no blob, so writing local is the right outcome.
+}
+```
+
+Tests (alongside C4 Step 6):
+
+- `c4_concurrent_push_with_same_data_skips_write` — first read returns A; consent given; second read returns local_sha (simulating concurrent push of the same data); writer is not called; stderr contains "concurrent push reached the same state".
+- `c4_remote_changed_between_diff_and_write_still_writes` — first read returns A; consent given; second read returns B (≠ local); writer is called; stderr contains "remote changed between diff and write".
+- `c4_dry_run_skips_second_read` — `--dry-run` set; only ONE adapter read happens (the diff-render one); writer is not called. Use a mock adapter that counts `read_config_entry` calls.
 
 - [ ] **Step 5: Define `print_unified_diff_inline` using `similar` over normalised JSON.** C4's `ReadConfigEntry::Present` branch calls this helper at Step 2. The cutover commit needs ONE renderer for the inline-diff prompt; Phase D's `diff.rs` reuses the same helper for `--format unified` and adds the structured + json format dispatchers separately.
 
@@ -3820,13 +3899,13 @@ Helpers: `render_diff` dispatches to the per-format renderers from Step 1; `rend
 
 - [ ] **Step 3: `--exit-code` semantics per Q10 — explicit per-outcome table.**
 
-| Outcome                                    | Without `--exit-code` | With `--exit-code` |
-| ------------------------------------------ | --------------------- | ------------------ |
-| No changes (sha matches)                   | exit 0                | exit 0             |
-| Diff present                               | exit 0                | exit 1             |
-| Remote absent (MissingKey / MissingStore)  | exit 0 (treated as "all leaves added" success) | exit 1 (still a diff present from the operator's POV) |
-| Unsupported (Spin Cloud)                   | exit 2 (the diff is structurally impossible)   | exit 2             |
-| Parse / network / manifest-load error      | exit 2 (always)       | exit 2             |
+| Outcome                                   | Without `--exit-code`                          | With `--exit-code`                                    |
+| ----------------------------------------- | ---------------------------------------------- | ----------------------------------------------------- |
+| No changes (sha matches)                  | exit 0                                         | exit 0                                                |
+| Diff present                              | exit 0                                         | exit 1                                                |
+| Remote absent (MissingKey / MissingStore) | exit 0 (treated as "all leaves added" success) | exit 1 (still a diff present from the operator's POV) |
+| Unsupported (Spin Cloud)                  | exit 2 (the diff is structurally impossible)   | exit 2                                                |
+| Parse / network / manifest-load error     | exit 2 (always)                                | exit 2                                                |
 
 Code:
 
@@ -3986,10 +4065,10 @@ Phase D of the blob app-config rewrite per spec §8.1.
 
 **Round-30 M-1 — per-adapter §12.7 coverage.** Spec §12.7 says "For each adapter: set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging`. Push two distinct blobs: one to `app_config`, one to `app_config_staging`. Assert the runtime extractor returns the staging blob's values (not the default blob's)." The plan satisfies §12.7 in layers:
 
-| Layer                                | Coverage                                                                                                  |
-| ------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| `EnvConfig::store_key`               | Unit tests in B7 Step 3 (env-set / env-unset / blank / control-char).                                     |
-| Per-adapter registry-builder         | Unit tests in B7 Step 5 — every adapter packs `default_key` from env into the binding.                    |
+| Layer                                | Coverage                                                                                                                                                        |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `EnvConfig::store_key`               | Unit tests in B7 Step 3 (env-set / env-unset / blank / control-char).                                                                                           |
+| Per-adapter registry-builder         | Unit tests in B7 Step 5 — every adapter packs `default_key` from env into the binding.                                                                          |
 | Runtime extractor reads correct blob | E2 smoke script below: pushes BOTH blobs, sets `__KEY`, runs the demo server, hits an endpoint, asserts the staging value comes back. Repeats for each adapter. |
 
 The smoke script's per-adapter block looks like:
@@ -4133,68 +4212,68 @@ git push origin feature/extensible-cli
 
 Mapping spec §s → tasks:
 
-| Spec §                                          | Task(s)                                   |
-| ----------------------------------------------- | ----------------------------------------- |
-| §3.2.1 (bundled binary loses push/diff)         | C3                                        |
-| §3.2.2 (CLI args block)                         | C3, D1                                    |
-| §3.3 (secret-field Model A)                     | C1                                        |
-| §3.3.1.1 (macro metadata API)                   | B10                                       |
-| §3.3.1.2 (top-level only)                       | B10 + C7 (gate)                           |
-| §3.3.1.3 (serde rename policy)                  | B10                                       |
-| §3.3.1.4 (derive-time validation table)         | B10 (trybuild fixtures)                   |
-| §3.3.2 (writer behaviour + structural checks)   | B11                                       |
-| §3.3.3 (extractor secret walk)                  | C1                                        |
-| §3.3.4 (blob layout)                            | C2 (envelope creation)                    |
-| §3.3.6 (SecretError → EdgeError mapping)        | C1 (`map_secret_error`)                   |
-| §3.3.7 (sha + secret-key interaction)           | A2 + C1                                   |
-| §3.3.8 (push vs runtime validation)             | B9 + C4                                   |
-| §4.1 (envelope shape)                           | A4                                        |
-| §4.2 (canonical form)                           | A2, A3                                    |
-| §4.3 (read-side validation)                     | C1                                        |
-| §5.1 (default key)                              | C2                                        |
-| §5.2 (runtime override + charset)               | B1, B7                                    |
-| §5.2.1 (`ConfigStoreBinding`)                   | B5, B6, B8                                |
-| §5.4 (push-side `--key`)                        | C3, C4                                    |
-| §6.0 (name `AppConfig<C>`)                      | C1                                        |
-| §6.1 (default-key extractor form)               | C1 (`FromRequest` impl)                   |
-| §6.2 (explicit-key `named(key)` form)           | C1 (Step 2 inherent impl)                 |
-| §6.2.1 (cross-store `from_store(id, key)` form) | C1 (Step 2 inherent impl)                 |
-| §6.2.2 (runtime validation)                     | C1 (`cfg.validate()`)                     |
-| §6.3 (errors — bullet list)                     | B2, B3, C1                                |
-| §6.3.1 (`ConfigOutOfDate` body shape)           | B2, B3, B4                                |
-| §6.4 (no caching)                               | C1 (re-reads every call)                  |
-| §6.5 (existing `ConfigStore` trait stays)       | (no code work — kept)                     |
-| §7.x (SHA discussion)                           | A2 (canonical form)                       |
-| §8.1 (config diff)                              | D1, D2                                    |
-| §8.2 (config push + consent)                    | C2, C3, C4                                |
-| §8.3 (per-adapter read-back / Spin Cloud)       | B13                                       |
-| §9.0 (`Adapter::read_config_entry`)             | B12, B13                                  |
-| §9.1-9.4 (per-adapter notes)                    | B13, C2                                   |
-| §10 (migration)                                 | C5, E1                                    |
-| §10.2 (app-demo migration)                      | C5                                        |
-| §10.2.1 (CI gates)                              | C7                                        |
-| §10.2.2 (scaffold templates)                    | C6                                        |
-| §10.3 (manifest charset in scope)               | B1                                        |
-| §12.1 (canonical_form pin)                      | A3                                        |
-| §12.6.1 (`kind` strings + headers)              | B4                                        |
-| §12.2 (push / diff tests)                       | C4 + D2                                   |
-| §12.3 (per-adapter end-to-end)                  | C2 (writers) + E2 (smoke)                 |
-| §12.4 (migration)                               | E1 (docs)                                 |
-| §12.5 (secret-field model)                      | C1 (extractor tests)                      |
+| Spec §                                          | Task(s)                                                                                                                                                                       |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| §3.2.1 (bundled binary loses push/diff)         | C3                                                                                                                                                                            |
+| §3.2.2 (CLI args block)                         | C3, D1                                                                                                                                                                        |
+| §3.3 (secret-field Model A)                     | C1                                                                                                                                                                            |
+| §3.3.1.1 (macro metadata API)                   | B10                                                                                                                                                                           |
+| §3.3.1.2 (top-level only)                       | B10 + C7 (gate)                                                                                                                                                               |
+| §3.3.1.3 (serde rename policy)                  | B10                                                                                                                                                                           |
+| §3.3.1.4 (derive-time validation table)         | B10 (trybuild fixtures)                                                                                                                                                       |
+| §3.3.2 (writer behaviour + structural checks)   | B11                                                                                                                                                                           |
+| §3.3.3 (extractor secret walk)                  | C1                                                                                                                                                                            |
+| §3.3.4 (blob layout)                            | C2 (envelope creation)                                                                                                                                                        |
+| §3.3.6 (SecretError → EdgeError mapping)        | C1 (`map_secret_error`)                                                                                                                                                       |
+| §3.3.7 (sha + secret-key interaction)           | A2 + C1                                                                                                                                                                       |
+| §3.3.8 (push vs runtime validation)             | B9 + C4                                                                                                                                                                       |
+| §4.1 (envelope shape)                           | A4                                                                                                                                                                            |
+| §4.2 (canonical form)                           | A2, A3                                                                                                                                                                        |
+| §4.3 (read-side validation)                     | C1                                                                                                                                                                            |
+| §5.1 (default key)                              | C2                                                                                                                                                                            |
+| §5.2 (runtime override + charset)               | B1, B7                                                                                                                                                                        |
+| §5.2.1 (`ConfigStoreBinding`)                   | B5, B6, B8                                                                                                                                                                    |
+| §5.4 (push-side `--key`)                        | C3, C4                                                                                                                                                                        |
+| §6.0 (name `AppConfig<C>`)                      | C1                                                                                                                                                                            |
+| §6.1 (default-key extractor form)               | C1 (`FromRequest` impl)                                                                                                                                                       |
+| §6.2 (explicit-key `named(key)` form)           | C1 (Step 2 inherent impl)                                                                                                                                                     |
+| §6.2.1 (cross-store `from_store(id, key)` form) | C1 (Step 2 inherent impl)                                                                                                                                                     |
+| §6.2.2 (runtime validation)                     | C1 (`cfg.validate()`)                                                                                                                                                         |
+| §6.3 (errors — bullet list)                     | B2, B3, C1                                                                                                                                                                    |
+| §6.3.1 (`ConfigOutOfDate` body shape)           | B2, B3, B4                                                                                                                                                                    |
+| §6.4 (no caching)                               | C1 (re-reads every call)                                                                                                                                                      |
+| §6.5 (existing `ConfigStore` trait stays)       | (no code work — kept)                                                                                                                                                         |
+| §7.x (SHA discussion)                           | A2 (canonical form)                                                                                                                                                           |
+| §8.1 (config diff)                              | D1, D2                                                                                                                                                                        |
+| §8.2 (config push + consent)                    | C2, C3, C4                                                                                                                                                                    |
+| §8.3 (per-adapter read-back / Spin Cloud)       | B13                                                                                                                                                                           |
+| §9.0 (`Adapter::read_config_entry`)             | B12, B13                                                                                                                                                                      |
+| §9.1-9.4 (per-adapter notes)                    | B13, C2                                                                                                                                                                       |
+| §10 (migration)                                 | C5, E1                                                                                                                                                                        |
+| §10.2 (app-demo migration)                      | C5                                                                                                                                                                            |
+| §10.2.1 (CI gates)                              | C7                                                                                                                                                                            |
+| §10.2.2 (scaffold templates)                    | C6                                                                                                                                                                            |
+| §10.3 (manifest charset in scope)               | B1                                                                                                                                                                            |
+| §12.1 (canonical_form pin)                      | A3                                                                                                                                                                            |
+| §12.6.1 (`kind` strings + headers)              | B4                                                                                                                                                                            |
+| §12.2 (push / diff tests)                       | C4 + D2                                                                                                                                                                       |
+| §12.3 (per-adapter end-to-end)                  | C2 (writers) + E2 (smoke)                                                                                                                                                     |
+| §12.4 (migration)                               | E1 (docs)                                                                                                                                                                     |
+| §12.5 (secret-field model)                      | C1 (extractor tests)                                                                                                                                                          |
 | §12.7 (env-var key override)                    | B7 Step 3 (EnvConfig::store_key unit tests) + B7 Step 5 (per-adapter request-context-builder tests proving each adapter packs `default_key` from env) + E2 (end-to-end smoke) |
-| §12.8 (raw-binary stub)                         | C3                                        |
-| §12.9 (downstream CLI wiring)                   | C6 (Push + Validate template wiring) + D2 (Diff template wiring per round-26 phasing carve-out) |
-| §12.10 (Spin Cloud cap)                         | C2 (Spin Cloud writer)                    |
-| §12.11 (parser tests)                           | C3 (ConfigPushArgs) + D1 (ConfigDiffArgs) |
-| §12.12 (--store routing)                        | C4 + D2                                   |
-| §12.13 (CF local vs remote binding)             | C2 (Cloudflare writer)                    |
-| §12.14 (StoreRegistry ref accessors)            | B6                                        |
-| §12.15 (raw Config binding accessors)           | B8                                        |
-| §12.16 (named-store secret adapter validation)  | B11                                       |
-| §12.17 (nested AppConfig fixture)               | C7 (gate fixtures)                        |
-| §12.18 (manifest charset)                       | B1                                        |
-| §13 (phasing)                                   | Plan structure mirrors it                 |
-| §13.1 (placeholder pin gate)                    | C7                                        |
+| §12.8 (raw-binary stub)                         | C3                                                                                                                                                                            |
+| §12.9 (downstream CLI wiring)                   | C6 (Push + Validate template wiring) + D2 (Diff template wiring per round-26 phasing carve-out)                                                                               |
+| §12.10 (Spin Cloud cap)                         | C2 (Spin Cloud writer)                                                                                                                                                        |
+| §12.11 (parser tests)                           | C3 (ConfigPushArgs) + D1 (ConfigDiffArgs)                                                                                                                                     |
+| §12.12 (--store routing)                        | C4 + D2                                                                                                                                                                       |
+| §12.13 (CF local vs remote binding)             | C2 (Cloudflare writer)                                                                                                                                                        |
+| §12.14 (StoreRegistry ref accessors)            | B6                                                                                                                                                                            |
+| §12.15 (raw Config binding accessors)           | B8                                                                                                                                                                            |
+| §12.16 (named-store secret adapter validation)  | B11                                                                                                                                                                           |
+| §12.17 (nested AppConfig fixture)               | C7 (gate fixtures)                                                                                                                                                            |
+| §12.18 (manifest charset)                       | B1                                                                                                                                                                            |
+| §13 (phasing)                                   | Plan structure mirrors it                                                                                                                                                     |
+| §13.1 (placeholder pin gate)                    | C7                                                                                                                                                                            |
 
 No spec section is unmapped.
 
