@@ -776,15 +776,29 @@ where
 
 - [ ] **Step 2: Add a test.**
 
+Round-39 L-1 note: this test lives inside `edgezero-core`, but the
+`#[derive(AppConfig)]` macro that emits the `AppConfigMeta` impl
+lives in the `edgezero-macros` crate — and `edgezero-macros` depends
+on `edgezero-core` (not the other way round). Pulling the derive
+into a core unit test would be a dependency cycle, so the fixture
+uses a hand-rolled `AppConfigMeta` impl with an empty
+`SECRET_FIELDS` slice. (The derive coverage lives in
+`edgezero-macros`'s own integration tests + the app-demo's tests.)
+
 ```rust
     #[test]
     fn deserialize_does_not_call_validate() {
         // A struct whose Validate impl always fails — but
         // deserialize_app_config_with_options must NOT call it.
         use validator::ValidationError;
-        #[derive(Deserialize, AppConfigMeta)]
+
+        #[derive(Deserialize)]
         struct Fixture {
             value: i32,
+        }
+        // Hand-rolled AppConfigMeta — see round-39 L-1 note above.
+        impl crate::app_config::AppConfigMeta for Fixture {
+            const SECRET_FIELDS: &'static [crate::app_config::SecretField] = &[];
         }
         impl validator::Validate for Fixture {
             fn validate(&self) -> Result<(), validator::ValidationErrors> {
@@ -793,6 +807,7 @@ where
                 Err(errs)
             }
         }
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.toml");
         std::fs::write(&path, "value = 42\n").unwrap();
@@ -804,17 +819,6 @@ where
         .unwrap();
         assert_eq!(cfg.value, 42);
     }
-```
-
-If `AppConfigMeta` is not yet derivable on a fixture struct (it lives in the macros crate; this is a unit test inside `edgezero-core`), use a hand-rolled impl instead:
-
-```rust
-        struct Fixture {
-            value: i32,
-        }
-        impl crate::app_config::AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [crate::app_config::SecretField] = &[];
-        }
 ```
 
 - [ ] **Step 3: Run, confirm pass.**
@@ -1181,15 +1185,22 @@ impl IntoResponse for EdgeError {
         }
         let body = serde_json::json!({ "error": serde_json::Value::Object(error_obj) });
         let body_bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+        // Round-39 L-2: use the EdgeZero `crate::http` re-export, NOT
+        // direct `http::header::*` paths. Project convention at
+        // crates/edgezero-core/src/error.rs:8 imports through
+        // `crate::http::{header::CONTENT_TYPE, ...}`; new code follows
+        // the same pattern so application code never depends on the
+        // raw `http` crate. Implementation extends the existing `use`
+        // line to also bring in `RETRY_AFTER`.
         let mut response = Response::builder()
             .status(status)
-            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body_bytes))
             .unwrap();
         if matches!(self, EdgeError::ConfigOutOfDate { .. }) {
             response
                 .headers_mut()
-                .insert(http::header::RETRY_AFTER, HeaderValue::from_static("60"));
+                .insert(RETRY_AFTER, HeaderValue::from_static("60"));
         }
         response
     }
@@ -1255,7 +1266,9 @@ Note which tests fail (they're asserting the old `{ status, message }` shape). P
             (EdgeError::config_out_of_date("x", "f"), true),
         ] {
             let response = err.into_response();
-            let header = response.headers().get(http::header::RETRY_AFTER);
+            // Round-39 L-2: same `crate::http` re-export rule as the
+            // production code above — test bodies use the same import.
+            let header = response.headers().get(RETRY_AFTER);
             if expected_retry_after {
                 assert_eq!(header.unwrap().to_str().unwrap(), "60");
             } else {
@@ -4464,10 +4477,4 @@ No spec section is unmapped.
 
 ---
 
-**Plan complete and saved to `docs/superpowers/plans/2026-06-17-blob-app-config.md`. Two execution options:**
-
-**1. Subagent-Driven (recommended)** - I dispatch a fresh subagent per task, review between tasks, fast iteration.
-
-**2. Inline Execution** - Execute tasks in this session using executing-plans, batch execution with checkpoints.
-
-**Which approach?**
+**Execute Phase A first.** The five phases ship in order (A → B → C → D → E) per §13 of the spec; nothing in B can start until A's canonical-form + envelope helpers land, and the C cutover commit is a hard switchover that depends on B's full infrastructure being in place. Round-39 L-3 cleanup: this section previously ended with a planning-mode "Which approach?" prompt left over from the writing-plans skill; the plan is now the saved execution artefact, so the prompt is gone.
