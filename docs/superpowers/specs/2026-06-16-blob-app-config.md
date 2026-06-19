@@ -4466,7 +4466,7 @@ Example output (with `context_radius = 3`):
 ```
 --- remote (sha256: a472xxxx)
 +++ local  (sha256: 1f3axxxx)
-@@ -1,9 +1,10 @@
+@@ -1,11 +1,15 @@
  {
    "api_token": "demo_api_token",
    "feature": {
@@ -4474,7 +4474,10 @@ Example output (with `context_radius = 3`):
 +    "new_checkout": true
    },
    "greeting": "hello",
-+  "nested": { "alpha": 1, "beta": 2 },
++  "nested": {
++    "alpha": 1,
++    "beta": 2
++  },
    "service": {
 -    "timeout_ms": 1500
 +    "timeout_ms": 2000
@@ -4482,6 +4485,14 @@ Example output (with `context_radius = 3`):
    "vault": "default"
  }
 ```
+
+Round-38 L-1 correction: the earlier example showed the added
+`nested` subtree as one line (`+  "nested": { "alpha": 1, "beta":
+2 },`), which contradicted the `serde_json::to_string_pretty`
+contract this section defines. `to_string_pretty` always emits
+multi-line objects with 2-space indent — the spec example now
+reflects that, including the `@@ -1,11 +1,15 @@` hunk header
+that matches the actual line counts.
 
 Whole-subtree adds / removes naturally show as multi-line `+` /
 `-` blocks under the parent key (round-33 M-1's "subtree

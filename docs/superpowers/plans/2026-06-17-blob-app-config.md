@@ -3327,21 +3327,24 @@ if let ReadConfigEntry::Unsupported(reason) = &remote {
 }
 ```
 
-- [ ] **Step 3.5: Re-fetch RIGHT BEFORE the write and re-check skip-on-equal (round-36 M-1).** The first read (Step 2) was the snapshot the operator saw and approved. Between consent and write, a concurrent operator can have pushed the same content (or different content); spec §8.1.4 ("TOCTOU note") and §8.2 are explicit that the skip-on-equal CHECK happens "right before the write (re-fetched then)". Without this second read the final write uses the pre-consent snapshot — if a parallel push raced ahead with the same data, we'd still write (no benefit) AND skip-on-equal would silently no-op.
+- [ ] **Step 3.5: Re-fetch RIGHT BEFORE the write and re-check skip-on-equal (round-36 M-1 + round-38 H-1).** The first read (Step 2) was the snapshot the operator saw and approved. Between consent and write, a concurrent operator can have pushed (or removed) the remote; spec §8.1.4 ("TOCTOU note") and §8.2 are explicit that the skip-on-equal CHECK happens "right before the write (re-fetched then)". Without this second read the final write uses the pre-consent snapshot — if a parallel push raced ahead with the same data, we'd still write (no benefit) AND skip-on-equal would silently no-op.
 
-This step ONLY applies when:
+Round-38 H-1: the re-fetch must run for EVERY read-capable first-read result, not just `Present`. The MissingKey → Present transition is a real race window — operator B pushes between operator A's first read and operator A's consent gate. Without the second read in that path, operator A blindly overwrites B's just-pushed blob, with no skip-on-equal protection and no warning that the remote materialised. So:
 
-- The first read returned `ReadConfigEntry::Present` (there's a remote to compare against — `MissingKey` / `MissingStore` have nothing to re-check, and `Unsupported` can't read at all).
+This step applies when:
+
+- The first read returned anything OTHER than `ReadConfigEntry::Unsupported(_)` (any adapter that CAN read back must re-read; Spin Cloud is the only adapter that can't and skips this step).
 - `args.dry_run` is false (no write to skip).
 
 Insert AFTER the consent gate (Step 3) and BEFORE the writer call (Step 4):
 
 ```rust
-// Round-36 M-1: re-fetch right before the write so the skip-on-equal
-// check is against the CURRENT remote, not the pre-consent snapshot.
-// Only meaningful for adapters that can read back AND when we're
-// about to actually write. Spec §8.1.4 + §8.2.
-if !args.dry_run && matches!(remote, ReadConfigEntry::Present(_)) {
+// Round-36 M-1 / round-38 H-1: re-fetch right before the write so the
+// skip-on-equal check is against the CURRENT remote, not the pre-consent
+// snapshot. Runs for every read-capable first-read result so the
+// MissingKey → Present transition (concurrent push between first read
+// and consent) gets caught too. Spec §8.1.4 + §8.2.
+if !args.dry_run && !matches!(remote, ReadConfigEntry::Unsupported(_)) {
     let remote_now = if args.local {
         adapter.read_config_entry_local(
             &manifest_root,
@@ -3369,35 +3372,58 @@ if !args.dry_run && matches!(remote, ReadConfigEntry::Present(_)) {
             .map_err(|e| format!("post-consent remote envelope verification failed: {e}"))?;
         if remote_now_env.sha256 == local_sha {
             // Concurrent push pushed the same content while we waited
-            // for consent. Skip the write.
+            // for consent. Skip the write. Covers BOTH paths:
+            //   - first read Present, second read Present (same data) —
+            //     a parallel push of identical content.
+            //   - first read MissingKey/MissingStore, second read
+            //     Present (== local) — a concurrent operator pushed our
+            //     exact change; nothing for us to do.
             eprintln!(
                 "# concurrent push reached the same state (sha256 matches: {local_sha}); skipping write"
             );
             return Ok(());
         }
-        // Different remote SHA than the one the operator saw at consent.
-        // Note for the operator but proceed — consent was for "apply MY
-        // local". If they want to bail, they can Ctrl-C / re-run; we
-        // already have explicit `Apply changes? [y/N]` consent. We do
-        // NOT re-prompt: that would loop forever on rapid concurrent
-        // pushes, and the operator already said "apply local".
+        // Remote is Present with a SHA that doesn't match local. Warn
+        // and proceed — consent was for "apply MY local". We do NOT
+        // re-prompt: that would loop on rapid concurrent pushes, and
+        // the operator already said "apply local".
         //
         // Round-37 H-1: compare against `approved_remote_sha` (set in
         // Step 2's `Present` arm) — the inner `remote_envelope` is out
         // of scope here.
+        //
+        // Round-38 H-1: `approved_remote_sha` is `None` when the
+        // first read was MissingKey/MissingStore (no envelope to
+        // approve). In that case the warning frames the transition
+        // as "(none) → <sha>": the operator's diff was the
+        // all-leaves-added view; the remote is now non-empty with
+        // a different SHA than local.
+        let approved_display = approved_remote_sha
+            .as_deref()
+            .map_or("(none)", short_ref);
+        if approved_remote_sha.as_deref() != Some(remote_now_env.sha256.as_str()) {
+            eprintln!(
+                "# warning: remote changed between diff and write (was {} now {}); applying local anyway",
+                approved_display,
+                short_ref(&remote_now_env.sha256),
+            );
+        }
+    } else if matches!(remote, ReadConfigEntry::Present(_)) {
+        // First read Present, second read MissingKey/MissingStore —
+        // the remote disappeared while we waited for consent. Warn
+        // and fall through: the post-consent state has no blob, so
+        // writing local is the right outcome (we're creating, not
+        // overwriting).
         if let Some(ref approved) = approved_remote_sha {
-            if remote_now_env.sha256 != *approved {
-                eprintln!(
-                    "# warning: remote changed between diff and write (was {} now {}); applying local anyway",
-                    short_ref(approved),
-                    short_ref(&remote_now_env.sha256),
-                );
-            }
+            eprintln!(
+                "# warning: remote was removed between diff and write (was {}); creating fresh",
+                short_ref(approved),
+            );
         }
     }
-    // If `remote_now` transitioned Present → MissingKey/MissingStore
-    // between reads, we just fall through to the write — the post-
-    // consent state has no blob, so writing local is the right outcome.
+    // First read MissingKey/MissingStore, second read also
+    // MissingKey/MissingStore — nothing changed, fall through to
+    // write (creating-not-overwriting, no warning needed).
 }
 ```
 
@@ -3406,6 +3432,9 @@ Tests (alongside C4 Step 6):
 - `c4_concurrent_push_with_same_data_skips_write` — first read returns A; consent given; second read returns local_sha (simulating concurrent push of the same data); writer is not called; stderr contains "concurrent push reached the same state".
 - `c4_remote_changed_between_diff_and_write_still_writes` — first read returns A; consent given; second read returns B (≠ local); writer is called; stderr contains "remote changed between diff and write".
 - `c4_dry_run_skips_second_read` — `--dry-run` set; only ONE adapter read happens (the diff-render one); writer is not called. Use a mock adapter that counts `read_config_entry` calls.
+- **Round-38 H-1**: `c4_missing_first_then_concurrent_push_of_local_skips_write` — first read returns `MissingKey`; consent given; second read returns `Present(local_sha)` (a parallel operator just pushed the operator's exact change); writer is NOT called; stderr contains "concurrent push reached the same state". This is the gap the round-38 H-1 finding exposed.
+- **Round-38 H-1**: `c4_missing_first_then_concurrent_push_of_other_warns_and_writes` — first read returns `MissingStore`; consent given; second read returns `Present(B)` with `B != local_sha`; writer IS called; stderr contains "remote changed between diff and write (was (none) now <short_B>)".
+- **Round-38 H-1**: `c4_present_first_then_remote_removed_warns_and_writes` — first read returns `Present(A)`; consent given; second read returns `MissingKey`; writer IS called; stderr contains "remote was removed between diff and write".
 
 - [ ] **Step 5: Define `print_unified_diff_inline` using `similar` over normalised JSON.** C4's `ReadConfigEntry::Present` branch calls this helper at Step 2. The cutover commit needs ONE renderer for the inline-diff prompt; Phase D's `diff.rs` reuses the same helper for `--format unified` and adds the structured + json format dispatchers separately.
 
