@@ -2315,14 +2315,23 @@ fn read_config_entry(
 
 - [ ] **Step 3: Fastly.** Shell out to `fastly config-store-entry describe --store-id=<id> --key=<key> --json`. Parse JSON, extract `item_value`, return `Present`. Map "not found" stderr to `MissingKey`.
 
-- [ ] **Step 4: Spin — mirror the FULL write dispatch.** Spec §9.0 says read-back must use the same variant as the write path. The Spin writer's `dispatch_push` at `crates/edgezero-adapter-spin/src/cli.rs:514` has four branches (per its doc-comment at `cli.rs:498-513`); the read path needs each one:
+- [ ] **Step 4: Spin — mirror the FULL write dispatch.** Spec §9.0 says read-back must use the same variant as the write path. The Spin writer's `dispatch_push` at `crates/edgezero-adapter-spin/src/cli.rs:514` has four branches (per its doc-comment at `cli.rs:498-513`); the read path needs each one. Round-37 M-2: the original markdown table broke rendering because the row-3 Rust OR-pattern `Some(Redis { .. } | AzureCosmos | Unknown)` contains unescaped `|` chars that GFM treats as column separators. Restructured as bullets so the operator sees a coherent four-branch map (and so prettier doesn't re-expand the header separator to match the split).
 
-| Write-side branch                                                                | Trigger                                                                                  | Read-side behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. **`--local` forces SQLite-direct, regardless of runtime-config backend type** | `push_ctx.local == true`                                                                 | `read_config_entry_local`: parse runtime-config to resolve the SQLite path (honour `type = "spin"` `path` override; otherwise default `.spin/sqlite_key_value.db`); read the row at `(store=<platform>, key=<key>)`. `Present(value)` / `MissingKey` per row presence; `MissingStore` if the SQLite file doesn't exist.                                                                                                                                                                                                  |
-| 2. **Manifest deploy command targets Fermyon Cloud**                             | `push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)` | `read_config_entry`: returns `Unsupported("Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1")` per §8.3 / §9.4. NO shell-out to `spin cloud key-value list` or similar — that lists stores, not keys (round-20 cleanup recipe).                                                                                                                                                                                                                                                             |
-| 3. **`runtime-config.toml` declares a non-Spin backend**                         | `parsed.key_value_stores.get(platform) == Some(Redis { .. }                              | AzureCosmos                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | Unknown)` | `read_config_entry`: error with the same message the writer uses at `cli.rs:632-640` ("backend type `redis` for label `<X>` — use `redis-cli GET <key>` or the equivalent; edgezero does not read from this backend"). |
-| 4. **Default — `type = "spin"`** (with valid `runtime-config.toml`)              | `parsed.key_value_stores.get(platform) == Some(Spin { .. })` OR backend missing          | `read_config_entry`: SQLite-direct read at `parsed.key_value_stores.get(platform).path` if set, otherwise the Spin default `.spin/sqlite_key_value.db`. **Errors during `runtime_config::read` AND non-default labels missing from `runtime-config.toml` propagate** (no silent `.ok()` fallthrough) — matches writer at `cli.rs:629` + `verify_label_declared` at `cli.rs:653`. Round-28 H-2: silently swallowing a parse error here would let `config diff` succeed against a tree where the writer would have failed. |
+1. **`--local` forces SQLite-direct, regardless of runtime-config backend type.**
+   - **Trigger:** `push_ctx.local == true`.
+   - **Read-side behaviour:** `read_config_entry_local` parses runtime-config to resolve the SQLite path (honour `type = "spin"` `path` override; otherwise default `.spin/sqlite_key_value.db`); reads the row at `(store=<platform>, key=<key>)`. Returns `Present(value)` / `MissingKey` per row presence; `MissingStore` if the SQLite file doesn't exist.
+
+2. **Manifest deploy command targets Fermyon Cloud.**
+   - **Trigger:** `push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd)`.
+   - **Read-side behaviour:** `read_config_entry` returns `Unsupported("Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1")` per §8.3 / §9.4. NO shell-out to `spin cloud key-value list` or similar — that lists stores, not keys (round-20 cleanup recipe).
+
+3. **`runtime-config.toml` declares a non-Spin backend.**
+   - **Trigger:** `parsed.key_value_stores.get(platform)` matches `Some(Redis { .. })`, `Some(AzureCosmos { .. })`, or `Some(Unknown { .. })`.
+   - **Read-side behaviour:** `read_config_entry` errors with the same message the writer uses at `cli.rs:632-640` (`"backend type `redis`for label`<X>`— use`redis-cli GET <key>` or the equivalent; edgezero does not read from this backend"`).
+
+4. **Default — `type = "spin"`** (with valid `runtime-config.toml`).
+   - **Trigger:** `parsed.key_value_stores.get(platform) == Some(Spin { .. })` OR backend missing.
+   - **Read-side behaviour:** `read_config_entry` SQLite-direct read at `parsed.key_value_stores.get(platform).path` if set, otherwise the Spin default `.spin/sqlite_key_value.db`. **Errors during `runtime_config::read` AND non-default labels missing from `runtime-config.toml` propagate** (no silent `.ok()` fallthrough) — matches writer at `cli.rs:629` + `verify_label_declared` at `cli.rs:653`. Round-28 H-2: silently swallowing a parse error here would let `config diff` succeed against a tree where the writer would have failed.
 
 Sketch:
 
@@ -3173,7 +3182,18 @@ let remote = if args.local {
 };
 let local_envelope = BlobEnvelope::new(data.clone(), generated_at);
 let local_sha = local_envelope.sha256.clone();
-match remote {
+
+// Round-37 H-1: the first-read SHA needs to survive past the
+// match arm so Step 3.5 can compare it to the post-consent
+// re-fetch. Declare it OUTSIDE the match and populate it inside
+// the `Present` arm. Stays `None` for `MissingKey` /
+// `MissingStore` / `Unsupported` — Step 3.5 already skips the
+// re-fetch for those variants via the `matches!(remote,
+// ReadConfigEntry::Present(_))` gate, so an empty Option is
+// fine.
+let mut approved_remote_sha: Option<String> = None;
+
+match &remote {
     ReadConfigEntry::Present(body) => {
         // Round-32 H-1: serde_json::Error → String (the function
         // returns Result<_, String>, so `?` can't auto-convert).
@@ -3181,7 +3201,7 @@ match remote {
         // remote whose stored sha happens to match the local
         // sha doesn't silently skip the write. D2 already does
         // both; C4 must match.
-        let remote_envelope: BlobEnvelope = serde_json::from_str(&body)
+        let remote_envelope: BlobEnvelope = serde_json::from_str(body)
             .map_err(|e| format!("remote envelope parse failed: {e}"))?;
         remote_envelope
             .verify()
@@ -3190,6 +3210,7 @@ match remote {
             eprintln!("# no changes (sha256 matches: {local_sha})");
             return Ok(());
         }
+        approved_remote_sha = Some(remote_envelope.sha256.clone());
         // Render diff inline (Phase C cutover ships the minimal
         // unified renderer per Step 6 below; Phase D's `diff`
         // module ships the full format dispatch).
@@ -3360,12 +3381,18 @@ if !args.dry_run && matches!(remote, ReadConfigEntry::Present(_)) {
         // already have explicit `Apply changes? [y/N]` consent. We do
         // NOT re-prompt: that would loop forever on rapid concurrent
         // pushes, and the operator already said "apply local".
-        if remote_now_env.sha256 != remote_envelope.sha256 {
-            eprintln!(
-                "# warning: remote changed between diff and write (was {} now {}); applying local anyway",
-                short_ref(&remote_envelope.sha256),
-                short_ref(&remote_now_env.sha256),
-            );
+        //
+        // Round-37 H-1: compare against `approved_remote_sha` (set in
+        // Step 2's `Present` arm) — the inner `remote_envelope` is out
+        // of scope here.
+        if let Some(ref approved) = approved_remote_sha {
+            if remote_now_env.sha256 != *approved {
+                eprintln!(
+                    "# warning: remote changed between diff and write (was {} now {}); applying local anyway",
+                    short_ref(approved),
+                    short_ref(&remote_now_env.sha256),
+                );
+            }
         }
     }
     // If `remote_now` transitioned Present → MissingKey/MissingStore
@@ -3387,7 +3414,12 @@ Round-35 design: instead of hand-rolling a per-leaf walker + renderer, normalise
 Add `similar = { workspace = true }` to `crates/edgezero-cli/Cargo.toml`'s `[dependencies]`. Then define the helper in `crates/edgezero-cli/src/config.rs` (the same file that hosts `run_config_push_typed`):
 
 ```rust
-use similar::{ChangeTag, TextDiff};
+// Round-37 L-1: only `TextDiff` is used (the unified-diff path goes
+// through `TextDiff::unified_diff()` directly — `ChangeTag` would
+// be needed only if we manually walked individual edits, which the
+// `similar::TextDiffConfig::unified_diff()` builder already does).
+// Clippy `-D warnings` would reject the unused import.
+use similar::TextDiff;
 
 /// Truncate a SHA to 8 characters for display. Returns the input
 /// unchanged when ≤ 8 bytes (the `"(none)"` sentinel used for
@@ -3472,7 +3504,131 @@ The implementation is roughly 30 LOC (the bulk being `sort_keys_recursive`, whic
 
 Phase D's `diff.rs` will call this same `print_unified_diff_inline` for `--format unified` (re-exported under a public alias if needed); the `structured` and `json` dispatchers ship a separate per-leaf walker that produces `Vec<{ path, kind, from?, to? }>` for programmatic consumers.
 
-- [ ] **Step 6: Tests.** Cover the §8.2 default rules (skip-on-equal, no-write, consent prompt, `--no-diff`/`--yes` interactions) AND the §8.3 four-branch Spin Cloud UX (dry-run rejection, --yes silent write, TTY prompt, non-TTY error). Add a focused test for `print_unified_diff_inline` against a 3-leaf fixture asserting the dotted-path ordering + `-`/`+`/`(added)`/`(removed)` markers per spec §8.1.1.
+- [ ] **Step 6: Tests.** Cover the §8.2 default rules (skip-on-equal, no-write, consent prompt, `--no-diff`/`--yes` interactions) AND the §8.3 four-branch Spin Cloud UX (dry-run rejection, --yes silent write, TTY prompt, non-TTY error).
+
+Add a focused test for `print_unified_diff_inline` against a 3-leaf fixture asserting the standard git-style unified-diff output shape per spec §8.1.1 (round-37 M-1 reviewer caught the earlier dotted-path-ordering assertion — that format was removed in round-35's switch to `similar`):
+
+```rust
+#[test]
+fn print_unified_diff_inline_emits_similar_format() {
+    use serde_json::json;
+    let remote = json!({
+        "feature": { "new_checkout": false },
+        "greeting": "hello",
+        "service": { "timeout_ms": 1500 },
+    });
+    let local = json!({
+        "feature": { "new_checkout": true },
+        "greeting": "hello",
+        "service": { "timeout_ms": 2000 },
+    });
+    let mut buf = Vec::new();
+    // Capture print! output via a writer; the helper writes to
+    // stdout via print!, so the test uses `std::panic::set_hook`-style
+    // redirection OR (preferred) a feature-gated `writeln!`-based
+    // shim defined alongside the helper for testability. The shim
+    // signature is `fn print_unified_diff(remote, local, r_sha,
+    // l_sha, out: &mut impl Write)`; production stdout path passes
+    // `std::io::stdout()`, tests pass `&mut Vec<u8>`.
+    crate::config::print_unified_diff_to_writer(
+        &remote,
+        &local,
+        "aaaaaaaaXX",
+        "bbbbbbbbXX",
+        &mut buf,
+    )
+    .unwrap();
+    let output = String::from_utf8(buf).unwrap();
+    // Headers — first two lines carry the short SHA refs.
+    assert!(output.contains("--- remote (sha256: aaaaaaaa)"));
+    assert!(output.contains("+++ local  (sha256: bbbbbbbb)"));
+    // Hunk header — git-style `@@ -<old_start>,<old_len> +<new_start>,<new_len> @@`.
+    assert!(output.contains("@@ "));
+    // Changed JSON lines — `-` / `+` carry the FULL line including
+    // 2-space pretty indent and trailing comma (or lack thereof).
+    // Tests are tolerant to exact column counts (`assert!(contains)`
+    // not `assert_eq!`) since `similar`'s line-by-line algorithm
+    // groups context differently depending on hunk fanout.
+    assert!(output.contains("-    \"new_checkout\": false"));
+    assert!(output.contains("+    \"new_checkout\": true"));
+    assert!(output.contains("-    \"timeout_ms\": 1500"));
+    assert!(output.contains("+    \"timeout_ms\": 2000"));
+    // Unchanged context — unified-diff prefixes a space; assert at
+    // least one space-prefixed line lands inside the radius=3 window.
+    assert!(output.lines().any(|l| l.starts_with("   \"greeting\":")));
+    // Key ordering — `render_for_diff` sorts keys recursively, so
+    // `feature` appears before `greeting` appears before `service`
+    // in the rendered text. The diff preserves that ordering.
+    let feature_pos = output.find("\"feature\"").unwrap();
+    let greeting_pos = output.find("\"greeting\"").unwrap();
+    let service_pos = output.find("\"service\"").unwrap();
+    assert!(feature_pos < greeting_pos);
+    assert!(greeting_pos < service_pos);
+}
+
+#[test]
+fn print_unified_diff_inline_added_subtree_emits_multiline_block() {
+    use serde_json::json;
+    // Round-33's "subtree handling" rule — an added subtree shows
+    // as a multi-line `+` block, NOT as N per-leaf `(added)` lines.
+    // This is the spec §8.1.1 round-35 design point that drove the
+    // switch to `similar`.
+    let remote = json!({ "greeting": "hello" });
+    let local = json!({
+        "greeting": "hello",
+        "nested": { "alpha": 1, "beta": 2 },
+    });
+    let mut buf = Vec::new();
+    crate::config::print_unified_diff_to_writer(
+        &remote, &local, "aa", "bb", &mut buf,
+    ).unwrap();
+    let output = String::from_utf8(buf).unwrap();
+    // The added subtree shows as ≥ 3 `+` prefixed lines covering the
+    // opening brace, `"alpha"`, `"beta"`, and closing brace.
+    let plus_lines: Vec<&str> = output.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).collect();
+    assert!(plus_lines.len() >= 3, "expected ≥ 3 added lines for the new subtree, got {plus_lines:?}");
+    assert!(plus_lines.iter().any(|l| l.contains("\"nested\"")));
+    assert!(plus_lines.iter().any(|l| l.contains("\"alpha\"")));
+    assert!(plus_lines.iter().any(|l| l.contains("\"beta\"")));
+}
+```
+
+The implication: the `print_unified_diff_inline` helper at Step 5 needs a writer-taking sibling for tests. Update Step 5 to define BOTH:
+
+```rust
+pub(crate) fn print_unified_diff_inline(
+    remote_data: &serde_json::Value,
+    local_data: &serde_json::Value,
+    remote_sha: &str,
+    local_sha: &str,
+) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let _ = print_unified_diff_to_writer(remote_data, local_data, remote_sha, local_sha, &mut stdout);
+}
+
+pub(crate) fn print_unified_diff_to_writer<W: std::io::Write>(
+    remote_data: &serde_json::Value,
+    local_data: &serde_json::Value,
+    remote_sha: &str,
+    local_sha: &str,
+    out: &mut W,
+) -> std::io::Result<()> {
+    let remote_text = render_for_diff(remote_data);
+    let local_text = render_for_diff(local_data);
+    let diff = TextDiff::from_lines(&remote_text, &local_text);
+    let unified = diff
+        .unified_diff()
+        .header(
+            &format!("remote (sha256: {})", short_ref(remote_sha)),
+            &format!("local  (sha256: {})", short_ref(local_sha)),
+        )
+        .context_radius(3);
+    write!(out, "{unified}")
+}
+```
+
+(Step 5's earlier sketch had the inline-print form only; round-37 splits it for testability. The wire-up at Step 2 still calls `print_unified_diff_inline` — the writer-taking form is purely for tests.)
 
 ## Task C5 — App-demo migration
 
