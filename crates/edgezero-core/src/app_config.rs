@@ -104,6 +104,18 @@ pub enum AppConfigError {
     /// etc.
     #[error("env overlay failed for {}: {message}", path.display())]
     EnvOverlay { path: PathBuf, message: String },
+    /// A leaf value failed a structural load-time check (e.g. a
+    /// non-finite `f64`). Distinct from `Validation` because no
+    /// `validator::ValidationErrors` is involved; the loader
+    /// flags this directly.
+    #[error("invalid value at {field_path} in {}: {message}", path.display())]
+    InvalidValue {
+        path: PathBuf,
+        /// Dotted path of the offending leaf, e.g. `"service.ratio"`.
+        field_path: String,
+        /// Human-readable reason, e.g. `"non-finite f64 value `NaN`"`.
+        message: String,
+    },
     /// Failed to read the on-disk file (missing, permission denied,
     /// etc.).
     #[error("failed to read {}: {source}", path.display())]
@@ -225,6 +237,45 @@ pub fn load_app_config_raw(path: &Path, app_name: &str) -> Result<Value, AppConf
     load_app_config_raw_with_options(path, app_name, &AppConfigLoadOptions::default())
 }
 
+/// Like [`load_app_config`] but DOES NOT call `Validate::validate`.
+/// Used by `config push` / `config diff` paths that route through
+/// `validate_excluding_secrets` instead. See spec §3.3.8.
+///
+/// # Errors
+/// See [`AppConfigError`].
+#[inline]
+pub fn deserialize_app_config<C>(path: &Path, app_name: &str) -> Result<C, AppConfigError>
+where
+    C: DeserializeOwned + AppConfigMeta,
+{
+    deserialize_app_config_with_options(path, app_name, &AppConfigLoadOptions::default())
+}
+
+/// [`deserialize_app_config`] with an explicit [`AppConfigLoadOptions`].
+///
+/// # Errors
+/// See [`AppConfigError`].
+#[inline]
+pub fn deserialize_app_config_with_options<C>(
+    path: &Path,
+    app_name: &str,
+    opts: &AppConfigLoadOptions,
+) -> Result<C, AppConfigError>
+where
+    C: DeserializeOwned + AppConfigMeta,
+{
+    let config_table = load_app_config_raw_with_options(path, app_name, opts)?;
+    let typed: C =
+        config_table
+            .try_into()
+            .map_err(|source: TomlDeError| AppConfigError::Deserialize {
+                path: path.to_path_buf(),
+                target_type: any::type_name::<C>(),
+                source: Box::new(source),
+            })?;
+    Ok(typed)
+}
+
 /// [`load_app_config_raw`] with an explicit [`AppConfigLoadOptions`].
 ///
 /// # Errors
@@ -246,7 +297,49 @@ pub fn load_app_config_raw_with_options(
     if opts.env_overlay {
         apply_env_overlay(&mut document, app_name, path)?;
     }
+    check_no_non_finite_floats(path, &document)?;
     Ok(document)
+}
+
+fn check_no_non_finite_floats(path: &Path, value: &Value) -> Result<(), AppConfigError> {
+    let mut stack: Vec<(String, &Value)> = vec![(String::new(), value)];
+    while let Some((prefix, current)) = stack.pop() {
+        match current {
+            Value::Float(fval) => {
+                if !fval.is_finite() {
+                    return Err(AppConfigError::InvalidValue {
+                        path: path.to_path_buf(),
+                        field_path: prefix,
+                        message: format!(
+                            "non-finite f64 value `{fval}` is not representable in canonical form"
+                        ),
+                    });
+                }
+            }
+            Value::Table(table) => {
+                for (key, val) in table {
+                    let next = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    stack.push((next, val));
+                }
+            }
+            Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    let next = if prefix.is_empty() {
+                        format!("[{i}]")
+                    } else {
+                        format!("{prefix}[{i}]")
+                    };
+                    stack.push((next, item));
+                }
+            }
+            Value::String(_) | Value::Integer(_) | Value::Boolean(_) | Value::Datetime(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Apply the `<APP_NAME>__<SECTION>__…__<KEY>` env-var overlay
@@ -264,7 +357,7 @@ fn apply_env_overlay(
 ) -> Result<(), AppConfigError> {
     let prefix = app_name_prefix(app_name);
     let lookup = EnvLookup::from_process_env();
-    walk_and_overlay(config_table, &prefix, &lookup, path)
+    walk_and_overlay(config_table, &prefix, "", &lookup, path)
 }
 
 /// Normalise an app name to the env-var prefix (`<APP_NAME>` form
@@ -287,6 +380,7 @@ fn coerce_env_value(
     existing: &Value,
     raw: &str,
     env_var: &str,
+    field_path: &str,
     path: &Path,
 ) -> Result<Value, AppConfigError> {
     let coerced = match existing {
@@ -295,10 +389,21 @@ fn coerce_env_value(
             .parse::<i64>()
             .map(Value::Integer)
             .map_err(|err| coercion_error(env_var, raw, "integer", &err.to_string(), path))?,
-        Value::Float(_) => raw
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|err| coercion_error(env_var, raw, "float", &err.to_string(), path))?,
+        Value::Float(_) => {
+            let parsed = raw
+                .parse::<f64>()
+                .map_err(|err| coercion_error(env_var, raw, "float", &err.to_string(), path))?;
+            if !parsed.is_finite() {
+                return Err(AppConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    field_path: field_path.to_owned(),
+                    message: format!(
+                        "non-finite f64 value `{parsed}` from env overlay is not representable in canonical form"
+                    ),
+                });
+            }
+            Value::Float(parsed)
+        }
         Value::Boolean(_) => match raw {
             "true" | "1" => Value::Boolean(true),
             "false" | "0" => Value::Boolean(false),
@@ -352,6 +457,7 @@ fn env_segment(field_name: &str) -> String {
 fn walk_and_overlay(
     node: &mut Value,
     env_prefix: &str,
+    field_prefix: &str,
     lookup: &EnvLookup,
     path: &Path,
 ) -> Result<(), AppConfigError> {
@@ -404,11 +510,18 @@ fn walk_and_overlay(
     for key in snapshot {
         let segment = env_segment(&key);
         let next_prefix = format!("{env_prefix}__{segment}");
+        let next_field = if field_prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{field_prefix}.{key}")
+        };
         let Some(value) = table.get_mut(&key) else {
             continue;
         };
         match value {
-            Value::Table(_) => walk_and_overlay(value, &next_prefix, lookup, path)?,
+            Value::Table(_) => {
+                walk_and_overlay(value, &next_prefix, &next_field, lookup, path)?;
+            }
             Value::String(_)
             | Value::Integer(_)
             | Value::Float(_)
@@ -416,7 +529,7 @@ fn walk_and_overlay(
             | Value::Datetime(_)
             | Value::Array(_) => {
                 if let Some(raw) = lookup.get(&next_prefix) {
-                    *value = coerce_env_value(value, raw, &next_prefix, path)?;
+                    *value = coerce_env_value(value, raw, &next_prefix, &next_field, path)?;
                 }
             }
         }
@@ -577,7 +690,13 @@ timeout_ms = 1500
     ) -> Result<(), AppConfigError> {
         let lookup = EnvLookup::from_pairs(pairs.iter().copied());
         let prefix = app_name_prefix(app_name);
-        walk_and_overlay(config_table, &prefix, &lookup, Path::new("fixture.toml"))
+        walk_and_overlay(
+            config_table,
+            &prefix,
+            "",
+            &lookup,
+            Path::new("fixture.toml"),
+        )
     }
 
     #[test]
@@ -803,5 +922,156 @@ greeting = "hello"
         assert_eq!(app_name_prefix("app-demo"), "APP_DEMO");
         assert_eq!(app_name_prefix("my_app"), "MY_APP");
         assert_eq!(app_name_prefix("a-b-c"), "A_B_C");
+    }
+
+    #[test]
+    fn non_finite_rejection_does_not_invoke_canonicaliser() {
+        // Spec §12.1 (line 6408): the canonicaliser MUST NOT run on
+        // non-finite-rejected input. Pins the structural guarantee that
+        // the loader errors BEFORE any code path could canonicalise —
+        // catching the regression where someone adds a "best-effort
+        // hash for diagnostics" call inside the rejection branch.
+        // Counter is thread-local so parallel tests don't race.
+        use crate::canonical_form::test_hooks::CALL_COUNT;
+        use std::cell::Cell;
+        let baseline = CALL_COUNT.with(Cell::get);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.toml");
+        fs::write(&path, "[service]\nratio = nan\n").unwrap();
+        load_app_config_raw_with_options(
+            &path,
+            "test",
+            &AppConfigLoadOptions { env_overlay: false },
+        )
+        .expect_err("nan should be rejected");
+        let after = CALL_COUNT.with(Cell::get);
+        assert_eq!(
+            after, baseline,
+            "canonical_data_sha256 was invoked on this thread during non-finite rejection (baseline {baseline}, after {after})",
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_float_in_toml() {
+        // Spec §12.1 family 1: nan, inf, -inf via TOML literal.
+        // Each rejection produces InvalidValue with field_path="service.ratio"
+        // and a message substring identifying the offending value.
+        let dir = tempfile::tempdir().unwrap();
+        for (literal, expected_substr) in [("nan", "NaN"), ("inf", "inf"), ("-inf", "-inf")] {
+            let path = dir.path().join("app.toml");
+            fs::write(&path, format!("[service]\nratio = {literal}\n")).unwrap();
+            let err = load_app_config_raw_with_options(
+                &path,
+                "test",
+                &AppConfigLoadOptions { env_overlay: false },
+            )
+            .expect_err(&format!("{literal} should be rejected"));
+            match err {
+                AppConfigError::InvalidValue {
+                    field_path,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(
+                        field_path, "service.ratio",
+                        "field_path mismatch for {literal}"
+                    );
+                    assert!(
+                        message.contains(expected_substr),
+                        "message {message:?} should contain {expected_substr:?} for {literal}"
+                    );
+                }
+                other => panic!("expected InvalidValue for {literal}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_float_in_env_overlay() {
+        // Spec §12.1 family 2: nan, inf, -inf via env overlay.
+        // TOML has a finite value; env overlay pulls in the bad value
+        // and the overlay's is_finite() check rejects it with
+        // InvalidValue carrying the same field_path + message contract.
+        let path = Path::new("fixture.toml");
+        let prefix = app_name_prefix("test");
+        for (env_val, expected_substr) in [("nan", "NaN"), ("inf", "inf"), ("-inf", "-inf")] {
+            let lookup = EnvLookup::from_pairs([("TEST__SERVICE__RATIO", env_val)]);
+            let mut table: Value = toml::from_str("[service]\nratio = 1.5\n").unwrap();
+            let err = walk_and_overlay(&mut table, &prefix, "", &lookup, path)
+                .expect_err(&format!("env overlay {env_val} should be rejected"));
+            match err {
+                AppConfigError::InvalidValue {
+                    field_path,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(
+                        field_path, "service.ratio",
+                        "field_path mismatch for env {env_val}"
+                    );
+                    assert!(
+                        message.contains(expected_substr),
+                        "message {message:?} should contain {expected_substr:?} for env {env_val}"
+                    );
+                }
+                other => panic!("expected InvalidValue for env {env_val}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn finite_env_overlay_succeeds() {
+        // Spec §12.1 family 3: TOML 1.5 + env override 2.5 both finite => Ok.
+        // The rule rejects non-finite values, not any specific magnitude.
+        let path = Path::new("fixture.toml");
+        let prefix = app_name_prefix("test");
+        let lookup = EnvLookup::from_pairs([("TEST__SERVICE__RATIO", "2.5")]);
+        let mut table: Value = toml::from_str("[service]\nratio = 1.5\n").unwrap();
+        walk_and_overlay(&mut table, &prefix, "", &lookup, path)
+            .expect("finite overlay should succeed");
+        // Confirm the overlay landed: the table's service.ratio is now 2.5.
+        let actual = table
+            .get("service")
+            .and_then(|svc| svc.get("ratio"))
+            .and_then(Value::as_float)
+            .expect("service.ratio should be a float");
+        assert!(
+            (actual - 2.5_f64).abs() < f64::EPSILON,
+            "expected 2.5, got {actual}"
+        );
+    }
+
+    #[test]
+    fn deserialize_does_not_call_validate() {
+        // A struct whose Validate impl always fails — but
+        // deserialize_app_config_with_options must NOT call it.
+        use validator::ValidationError;
+
+        #[derive(Deserialize)]
+        struct Fixture {
+            value: i32,
+        }
+        // Hand-rolled AppConfigMeta — see round-39 L-1 note above.
+        impl AppConfigMeta for Fixture {
+            const SECRET_FIELDS: &'static [SecretField] = &[];
+        }
+        impl validator::Validate for Fixture {
+            fn validate(&self) -> Result<(), validator::ValidationErrors> {
+                let mut errs = validator::ValidationErrors::new();
+                errs.add("value", ValidationError::new("intentional"));
+                Err(errs)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.toml");
+        fs::write(&path, "value = 42\n").unwrap();
+        let cfg: Fixture = deserialize_app_config_with_options(
+            &path,
+            "test",
+            &AppConfigLoadOptions { env_overlay: false },
+        )
+        .unwrap();
+        assert_eq!(cfg.value, 42);
     }
 }
