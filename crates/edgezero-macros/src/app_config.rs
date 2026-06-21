@@ -5,12 +5,15 @@
 //! emits `impl ::edgezero_core::app_config::AppConfigMeta` with the
 //! `SECRET_FIELDS` array.
 
+use std::collections::{HashMap, HashSet};
+
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Field, Fields, Ident, Meta, Path, Type,
+    parse_macro_input, Attribute, Data, DeriveInput, Expr, ExprLit, Field, Fields, Ident, Lit,
+    Meta, MetaNameValue, Path, Type,
 };
 
 /// Recognised `#[secret(...)]` annotation kinds.
@@ -18,6 +21,12 @@ enum SecretAnnotation {
     /// Plain `#[secret]` — the field value is a key in the resolved
     /// default secret store.
     KeyInDefault,
+    /// `#[secret(store_ref = "field")]` — the field value is a key in the
+    /// named secret store identified by sibling field `store_ref_field`.
+    KeyInNamedStore {
+        /// Name of the sibling `#[secret(store_ref)]` field.
+        store_ref_field: String,
+    },
     /// `#[secret(store_ref)]` — the field value is a `[stores.secrets]`
     /// logical id.
     StoreRef,
@@ -45,6 +54,10 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
     let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
 
     let fields = struct_fields(input)?;
+
+    // Enforce serde skip/flatten bans on EVERY field (not just secret ones).
+    enforce_no_disallowed_serde_attrs_on_all_fields(fields)?;
+
     let mut annotations: Vec<FieldAnnotation> = Vec::new();
     for field in fields {
         if let Some(annotation) = scan_field(field)? {
@@ -63,13 +76,70 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
         enforce_no_container_rename_all(&input.attrs)?;
     }
 
+    // Validate `KeyInNamedStore` sibling references. Build a map of
+    // field-name → annotation so we can verify:
+    //   (a) the named sibling exists,
+    //   (b) the sibling is annotated `#[secret(store_ref)]`,
+    //   (c) the sibling is `String` (already enforced by `scan_field`).
+    {
+        // Set of all struct field names, for a better "field not found" error
+        // when a sibling exists but lacks `#[secret(store_ref)]`.
+        let all_field_names: HashSet<String> = fields
+            .iter()
+            .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+            .collect();
+
+        // Build a set of (name_string → kind_index) for O(1) lookup.
+        let name_to_kind: HashMap<String, &SecretAnnotation> = annotations
+            .iter()
+            .map(|ann| (ann.name.to_string(), &ann.kind))
+            .collect();
+
+        for annotation in &annotations {
+            if let SecretAnnotation::KeyInNamedStore { store_ref_field } = &annotation.kind {
+                match name_to_kind.get(store_ref_field.as_str()) {
+                    None if !all_field_names.contains(store_ref_field.as_str()) => {
+                        return Err(syn::Error::new(
+                            Span::call_site(),
+                            format!(
+                                "`#[secret(store_ref = \"{store_ref_field}\")]` names sibling \
+                                 field `{store_ref_field}` which does not exist on this struct",
+                            ),
+                        ));
+                    }
+                    Some(SecretAnnotation::StoreRef) => {} // correct
+                    None | Some(_) => {
+                        // `None`: field exists in the struct but lacks `#[secret(store_ref)]`.
+                        // `Some(_)`: field has a different `#[secret]` annotation, not `StoreRef`.
+                        return Err(syn::Error::new(
+                            Span::call_site(),
+                            format!(
+                                "`#[secret(store_ref = \"{store_ref_field}\")]` names sibling \
+                                 field `{store_ref_field}` which must be annotated \
+                                 `#[secret(store_ref)]`, but it is not",
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     let entries = annotations.iter().map(|annotation| {
         let name_lit = annotation.name.to_string();
-        let kind_tokens = match annotation.kind {
+        let kind_tokens = match &annotation.kind {
             SecretAnnotation::KeyInDefault => {
                 quote!(::edgezero_core::app_config::SecretKind::KeyInDefault)
             }
-            SecretAnnotation::StoreRef => quote!(::edgezero_core::app_config::SecretKind::StoreRef),
+            SecretAnnotation::StoreRef => {
+                quote!(::edgezero_core::app_config::SecretKind::StoreRef)
+            }
+            SecretAnnotation::KeyInNamedStore { store_ref_field } => {
+                let lit = syn::LitStr::new(store_ref_field, Span::call_site());
+                quote!(::edgezero_core::app_config::SecretKind::KeyInNamedStore {
+                    store_ref_field: #lit
+                })
+            }
         };
         quote! {
             ::edgezero_core::app_config::SecretField {
@@ -87,6 +157,11 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
             const SECRET_FIELDS: &'static [::edgezero_core::app_config::SecretField] =
                 &[#(#entries),*];
         }
+
+        #[automatically_derived]
+        impl #impl_generics ::edgezero_core::app_config::AppConfigRoot
+            for #struct_ident #type_generics #where_clause
+        {}
     })
 }
 
@@ -143,26 +218,38 @@ fn scan_field(field: &Field) -> Result<Option<FieldAnnotation>, syn::Error> {
     Ok(Some(FieldAnnotation { kind, name }))
 }
 
-/// Decode `#[secret]` (`KeyInDefault`) and `#[secret(store_ref)]`
-/// (`StoreRef`). Any other token list is a compile error.
+/// Decode `#[secret]` (`KeyInDefault`), `#[secret(store_ref)]`
+/// (`StoreRef`), and `#[secret(store_ref = "field")]`
+/// (`KeyInNamedStore`). Any other form is a compile error.
 fn parse_secret_kind(attr: &Attribute) -> Result<SecretAnnotation, syn::Error> {
     match &attr.meta {
         Meta::Path(_) => Ok(SecretAnnotation::KeyInDefault),
         Meta::List(list) => {
-            let inner: Path = syn::parse2(list.tokens.clone()).map_err(|_unused| {
-                syn::Error::new_spanned(
-                    &list.tokens,
-                    "`#[secret(...)]` accepts only `store_ref` (e.g. `#[secret(store_ref)]`)",
-                )
-            })?;
-            if inner.is_ident("store_ref") {
-                Ok(SecretAnnotation::StoreRef)
-            } else {
-                Err(syn::Error::new_spanned(
-                    &list.tokens,
-                    "`#[secret(...)]` accepts only `store_ref` (e.g. `#[secret(store_ref)]`)",
-                ))
+            // Try `store_ref = "field"` first (name-value form).
+            if let Ok(nv) = syn::parse2::<MetaNameValue>(list.tokens.clone()) {
+                if nv.path.is_ident("store_ref") {
+                    if let Expr::Lit(ExprLit {
+                        lit: Lit::Str(str_lit),
+                        ..
+                    }) = nv.value
+                    {
+                        return Ok(SecretAnnotation::KeyInNamedStore {
+                            store_ref_field: str_lit.value(),
+                        });
+                    }
+                }
             }
+            // Try bare `store_ref` path.
+            if let Ok(path) = syn::parse2::<Path>(list.tokens.clone()) {
+                if path.is_ident("store_ref") {
+                    return Ok(SecretAnnotation::StoreRef);
+                }
+            }
+            Err(syn::Error::new_spanned(
+                &list.tokens,
+                "`#[secret(...)]` accepts `store_ref` or `store_ref = \"field\"` \
+                 (e.g. `#[secret(store_ref)]` or `#[secret(store_ref = \"vault\")]`)",
+            ))
         }
         Meta::NameValue(_) => Err(syn::Error::new_spanned(
             attr,
@@ -194,6 +281,49 @@ fn is_scalar_string_type(ty: &Type) -> bool {
         }
     }
     false
+}
+
+/// Walk ALL fields of an `AppConfig`-derived struct and reject
+/// `#[serde(skip_serializing)]`, `#[serde(skip_serializing_if = "...")]`,
+/// and `#[serde(flatten)]`. These attributes desync the canonical-form
+/// rules (§4.2) from the serde JSON shape regardless of whether the
+/// field is annotated `#[secret]`.
+fn enforce_no_disallowed_serde_attrs_on_all_fields(
+    fields: &Punctuated<Field, syn::Token![,]>,
+) -> Result<(), syn::Error> {
+    for field in fields {
+        for attr in &field.attrs {
+            if !attr.path().is_ident("serde") {
+                continue;
+            }
+            let mut offending: Option<String> = None;
+            let _parse_result: syn::Result<()> = attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("skip_serializing")
+                    || meta.path.is_ident("skip_serializing_if")
+                    || meta.path.is_ident("flatten")
+                {
+                    offending = Some(
+                        meta.path
+                            .get_ident()
+                            .map_or_else(String::new, ToString::to_string),
+                    );
+                }
+                Ok(())
+            });
+            if let Some(name) = offending {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    format!(
+                        "`#[serde({name})]` is not allowed on fields of an \
+                         `AppConfig`-derived struct (it would desync the \
+                         canonical-form rules in §4.2 from the serde JSON shape). \
+                         If you need a flat layout, define it explicitly.",
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Container-level guard: a struct that carries any `#[secret]` field

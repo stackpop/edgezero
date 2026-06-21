@@ -880,21 +880,22 @@ fn validate_store_declaration(declaration: &StoreDeclaration) -> Result<(), Vali
     //   intended directory);
     // - a registry key and TOML table label.
     //
-    // Permit only `[A-Za-z0-9_-]` and reject `__` — strict enough to
-    // be safe across all four consumers, loose enough to cover every
-    // id in the scaffold and example suite (`app_config`,
-    // `feature_flags`, `sessions`, …).
+    // Permit only `[A-Za-z0-9_]` and reject `__` — strict enough to
+    // be safe across all four consumers and POSIX-shell-exportable so
+    // the `EDGEZERO__STORES__<KIND>__<ID>__KEY` env overrides work.
+    // All ids in the scaffold and example suite already use this form
+    // (`app_config`, `feature_flags`, `sessions`, …).
     if let Some(bad) = declaration.ids.iter().find(|id| {
         let chars_bad = id
             .chars()
-            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
         let double_underscore = id.contains("__");
         chars_bad || double_underscore
     }) {
         let mut error = ValidationError::new("store_id_format");
         error.message = Some(
             format!(
-                "`[stores.<kind>].ids` entry `{bad}` is not a portable segment: only ASCII alphanumeric / `_` / `-` are allowed, and `__` (double underscore) is reserved as the `EDGEZERO__STORES__…` env-var separator. Rename it to something like `app_config` / `feature-flags`."
+                "`[stores.<kind>].ids` entry `{bad}` contains a character outside `[A-Za-z0-9_]`. Store ids must be POSIX-shell-exportable so the `EDGEZERO__STORES__<KIND>__<ID>__NAME` / `__KEY` env overrides work; hyphens and other characters are not permitted. Rename it (e.g. `feature-flags` → `feature_flags`)."
             )
             .into(),
         );
@@ -1731,8 +1732,8 @@ ids = ["default"]
             .validate()
             .expect_err("non-portable id `foo/bar` must fail validation");
         assert!(
-            err.to_string().contains("portable segment"),
-            "error must explain the segment rule: {err}"
+            err.to_string().contains("[A-Za-z0-9_]"),
+            "error must explain the charset rule: {err}"
         );
     }
 
@@ -1746,8 +1747,8 @@ ids = ["default"]
             .validate()
             .expect_err("`__` is reserved as the env-var segment separator");
         assert!(
-            err.to_string().contains("`__` (double underscore)"),
-            "error must call out the env-segment separator: {err}"
+            err.to_string().contains("POSIX") || err.to_string().contains("env"),
+            "error must call out the env-export constraint: {err}"
         );
     }
 
@@ -1772,11 +1773,11 @@ ids = ["default"]
     #[test]
     fn store_declaration_accepts_portable_alphanumeric_ids() {
         // Sanity: the new format check doesn't accidentally reject
-        // the canonical scaffold shapes — single underscore, single
-        // hyphen, mixed case, digits.
+        // the canonical scaffold shapes — single underscore, mixed
+        // case, digits.
         for ids in [
             "[\"app_config\"]",
-            "[\"feature-flags\"]",
+            "[\"feature_flags\"]",
             "[\"appConfig\"]",
             "[\"v1\", \"v2\"]\ndefault = \"v1\"",
         ] {
@@ -1985,5 +1986,61 @@ runtime_threads = 4
             msg.contains("docs/guide/manifest-store-migration.md"),
             "error should reference the migration guide, got: {msg}"
         );
+    }
+
+    #[test]
+    fn rejects_hyphenated_store_id() {
+        let manifest = r#"
+[app]
+name = "demo"
+
+[stores.config]
+ids = ["feature-flags"]
+default = "feature-flags"
+
+[adapters.axum]
+"#;
+        let err = ManifestLoader::try_load_from_str(manifest)
+            .err()
+            .expect("hyphenated store id must fail validation");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("feature-flags"), "{rendered}");
+        assert!(
+            rendered.contains("POSIX") || rendered.contains("env") || rendered.contains("hyphen"),
+            "error should mention the env-export constraint; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn accepts_underscore_only_store_id() {
+        let manifest = r#"
+[app]
+name = "demo"
+
+[stores.config]
+ids = ["feature_flags"]
+default = "feature_flags"
+
+[adapters.axum]
+"#;
+        ManifestLoader::try_load_from_str(manifest)
+            .expect("underscore-only store id must be accepted");
+    }
+
+    #[test]
+    fn rejects_double_underscore_in_store_id() {
+        let manifest = r#"
+[app]
+name = "demo"
+
+[stores.config]
+ids = ["feature__flags"]
+default = "feature__flags"
+
+[adapters.axum]
+"#;
+        ManifestLoader::try_load_from_str(manifest)
+            .err()
+            .expect("double-underscore store id must fail validation");
     }
 }

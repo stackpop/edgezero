@@ -10,7 +10,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
+    ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -164,7 +165,7 @@ enum ConfigStoreLookup {
 // `&[]` for documentation, matching the inherited default.
 #[expect(
     clippy::missing_trait_methods,
-    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `single_store_kinds` IS overridden below (returns `&[]`)."
+    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -396,6 +397,141 @@ impl Adapter for FastlyCliAdapter {
             entries.len(),
             fastly_path.display()
         )])
+    }
+
+    fn read_config_entry(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Shell out to `fastly config-store-entry describe
+        // --store-id=<id> --key=<key> --json`, resolve the store id on
+        // demand via `fastly config-store list --json`, then parse the
+        // JSON response.
+        let name = store.platform.as_str();
+        let store_id = match resolve_remote_config_store_id(name) {
+            Ok(id) => id,
+            Err(err) => {
+                // "not found" from resolve means the store doesn't exist.
+                let lower = err.to_ascii_lowercase();
+                if lower.contains("not found")
+                    || lower.contains("did you run")
+                    || lower.contains("no fastly config-store matches")
+                {
+                    return Ok(ReadConfigEntry::MissingStore);
+                }
+                return Err(err);
+            }
+        };
+        let store_arg = format!("--store-id={store_id}");
+        let key_arg = format!("--key={key}");
+        let output = Command::new("fastly")
+            .args([
+                "config-store-entry",
+                "describe",
+                store_arg.as_str(),
+                key_arg.as_str(),
+                "--json",
+            ])
+            .output()
+            .map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+                } else {
+                    format!("failed to spawn `fastly`: {err}")
+                }
+            })?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Parse the JSON and extract the `item_value` field.
+            let parsed: serde_json::Value =
+                serde_json::from_str(&stdout).map_err(|err| {
+                    format!(
+                        "failed to parse `fastly config-store-entry describe` JSON: {err}\nraw stdout: {stdout}"
+                    )
+                })?;
+            let value = parsed
+                .get("item_value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "`fastly config-store-entry describe` JSON has no string `item_value` field; \
+                         fastly CLI may have changed its output schema. Raw stdout: {stdout}"
+                    )
+                })?;
+            return Ok(ReadConfigEntry::Present(value.to_owned()));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404")
+        {
+            return Ok(ReadConfigEntry::MissingKey);
+        }
+        Err(format!(
+            "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited with status {}\nstderr: {}",
+            output.status,
+            stderr.trim()
+        ))
+    }
+
+    fn read_config_entry_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Read from `[local_server.config_stores.<platform_name>.contents]`
+        // in fastly.toml — the same section `push_config_entries_local` writes.
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.fastly.adapter].manifest must point at fastly.toml for config diff --local"
+                    .to_owned(),
+            );
+        };
+        let fastly_path = manifest_root.join(rel);
+        let name = store.platform.as_str();
+        let raw = match fs::read_to_string(&fastly_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Ok(ReadConfigEntry::MissingStore)
+            }
+            Err(err) => {
+                return Err(format!("failed to read {}: {err}", fastly_path.display()));
+            }
+        };
+        let doc: toml_edit::DocumentMut = raw
+            .parse()
+            .map_err(|err| format!("failed to parse {}: {err}", fastly_path.display()))?;
+        // Probe `[local_server.config_stores.<name>]` — if absent, the store
+        // has not been seeded locally yet.
+        let Some(contents) = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(name))
+            .and_then(|store_tbl| store_tbl.get("contents"))
+        else {
+            return Ok(ReadConfigEntry::MissingStore);
+        };
+        // The contents table is `key = "value"` pairs.
+        match contents.get(key) {
+            Some(item) => {
+                let value = item.as_str().ok_or_else(|| {
+                    format!(
+                        "`[local_server.config_stores.{name}.contents].{key}` in {} is not a string",
+                        fastly_path.display()
+                    )
+                })?;
+                Ok(ReadConfigEntry::Present(value.to_owned()))
+            }
+            None => Ok(ReadConfigEntry::MissingKey),
+        }
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -1034,6 +1170,10 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use edgezero_adapter::cli_support::read_package_name;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     // Shared fixture names. Pinning these as consts (instead of
@@ -1045,6 +1185,41 @@ mod tests {
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
+
+    /// RAII guard: prepends a directory to `$PATH` and restores the original
+    /// value on drop.
+    #[cfg(unix)]
+    struct PathPrepend {
+        original: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl PathPrepend {
+        fn new(extra: &Path) -> Self {
+            let original = env::var_os("PATH");
+            let new_path = match &original {
+                Some(prev) => {
+                    let mut accum = OsString::from(extra);
+                    accum.push(":");
+                    accum.push(prev);
+                    accum
+                }
+                None => OsString::from(extra),
+            };
+            env::set_var("PATH", new_path);
+            Self { original }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathPrepend {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(prev) => env::set_var("PATH", prev),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
 
     #[test]
     fn finds_closest_manifest_when_multiple_exist() {
@@ -1800,6 +1975,385 @@ build = \"cargo build --release\"
         assert!(
             out[0].contains("no config entries"),
             "status line names the no-op: {out:?}"
+        );
+    }
+
+    // ---------- read_config_entry_local ----------
+
+    #[test]
+    fn read_local_returns_missing_store_when_fastly_toml_absent() {
+        let dir = tempdir().expect("tempdir");
+        // No fastly.toml written — file missing.
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("missing file is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "absent fastly.toml => MissingStore"
+        );
+    }
+
+    #[test]
+    fn read_local_returns_missing_store_when_no_local_server_contents() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // fastly.toml exists but has no [local_server.config_stores.*] block.
+        fs::write(&path, "name = \"demo\"\n[setup.config_stores.app_config]\n").expect("write");
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("missing local_server block is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "no local_server stanza => MissingStore"
+        );
+    }
+
+    #[test]
+    fn read_local_returns_missing_key_when_key_absent_from_contents() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Write a local_server block with a different key so the store exists
+        // but the requested key is absent.
+        fs::write(
+            &path,
+            format!(
+                "name = \"demo\"\n\
+                 [local_server.config_stores.{TEST_CONFIG_ID}]\n\
+                 format = \"inline-toml\"\n\
+                 [local_server.config_stores.{TEST_CONFIG_ID}.contents]\n\
+                 other_key = \"other_value\"\n"
+            ),
+        )
+        .expect("write");
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("missing key is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "key absent from contents => MissingKey"
+        );
+    }
+
+    #[test]
+    fn read_local_returns_present_when_key_exists_in_contents() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            format!(
+                "name = \"demo\"\n\
+                 [local_server.config_stores.{TEST_CONFIG_ID}]\n\
+                 format = \"inline-toml\"\n\
+                 [local_server.config_stores.{TEST_CONFIG_ID}.contents]\n\
+                 greeting = \"hello-fastly\"\n"
+            ),
+        )
+        .expect("write");
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("key present");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, "hello-fastly", "value matches what was written");
+    }
+
+    #[test]
+    fn read_local_roundtrips_with_push_local() {
+        // Write via push_config_entries_local, then read via
+        // read_config_entry_local — the two must agree on the value.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let entries = vec![("greeting".to_owned(), "hello-roundtrip".to_owned())];
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("read succeeds");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present after push+read roundtrip");
+        };
+        assert_eq!(value, "hello-roundtrip", "roundtrip value matches");
+    }
+
+    #[test]
+    fn read_local_requires_adapter_manifest_path() {
+        let dir = tempdir().expect("tempdir");
+        let result = FastlyCliAdapter.read_config_entry_local(
+            dir.path(),
+            None, // adapter_manifest_path missing
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("[adapters.fastly.adapter].manifest"),
+                "error names the missing field: {err}"
+            ),
+            Ok(_) => panic!("expected Err when adapter_manifest_path is None"),
+        }
+    }
+
+    // ---------- read_config_entry (fake fastly, remote shell-out) ----------
+
+    /// Build a tempdir containing a `fastly` shim script that:
+    /// - Responds to `config-store list --json` with a store-list JSON containing
+    ///   `TEST_CONFIG_ID` mapped to `store-abc123`.
+    /// - Responds to `config-store-entry describe ...` with `stdout_body` on
+    ///   stdout and `stderr_body` on stderr, exiting with `exit_code`.
+    ///
+    /// Payloads are written to separate sibling files so shell-active chars
+    /// in the content don't get re-interpreted by the script.
+    #[cfg(unix)]
+    fn fake_fastly_returning(
+        stdout_body: &str,
+        stderr_body: &str,
+        exit_code: i32,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("fastly");
+        let stdout_file = dir.path().join("stdout_payload.txt");
+        let stderr_file = dir.path().join("stderr_payload.txt");
+        let list_file = dir.path().join("list_payload.txt");
+        // Store-list JSON: bare array with one entry matching TEST_CONFIG_ID.
+        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        fs::write(&stdout_file, stdout_body).expect("write stdout payload");
+        fs::write(&stderr_file, stderr_body).expect("write stderr payload");
+        fs::write(&list_file, list_json).expect("write list payload");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\ncat '{}' >&2\nexit {exit_code}\n",
+            list_file.display(),
+            stdout_file.display(),
+            stderr_file.display(),
+        );
+        fs::write(&script_path, script).expect("write fastly script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    /// Build a fake `fastly` that logs each argv token (one per line) to
+    /// `out_path`, handles the list call correctly, and exits 0 for both calls.
+    #[cfg(unix)]
+    fn fake_fastly_argv_log(out_path: &Path) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("fastly");
+        let list_file = dir.path().join("list_payload.txt");
+        let entry_file = dir.path().join("entry_payload.txt");
+        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        let entry_json = r#"{"item_value":"logged-value","store_id":"store-abc123"}"#;
+        fs::write(&list_file, list_json).expect("write list payload");
+        fs::write(&entry_file, entry_json).expect("write entry payload");
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+            out_path.display(),
+            list_file.display(),
+            entry_file.display(),
+        );
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    /// Process-wide mutex serialising PATH-mutating tests so parallel
+    /// test threads don't race on the environment variable.
+    #[cfg(unix)]
+    fn path_mutation_guard() -> &'static Mutex<()> {
+        use std::sync::OnceLock;
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_present_on_success() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Fake fastly: list succeeds with app_config → store-abc123;
+        // describe returns valid JSON with item_value.
+        let entry_json = r#"{"item_value":"hello-fastly","store_id":"store-abc123"}"#;
+        let fake = fake_fastly_returning(entry_json, "", 0);
+        let _path = PathPrepend::new(fake.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("fake fastly exit-0 must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, "hello-fastly");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_key_on_not_found_stderr() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // describe exits non-zero with "not found" in stderr → MissingKey.
+        let fake = fake_fastly_returning("", "Error: item not found", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("not-found maps to MissingKey (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "not-found stderr => MissingKey"
+        );
+    }
+
+    /// The Fastly impl distinguishes store-not-found from key-not-found via
+    /// `resolve_remote_config_store_id`: when the list call exits non-zero and
+    /// the error string contains "not found", `read_config_entry` returns
+    /// `MissingStore` without ever calling the describe subcommand.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_store_on_appropriate_stderr() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Script that exits non-zero for the list call so resolve fails with
+        // a "not found" error, causing read_config_entry to return MissingStore.
+        let fake_dir = tempdir().expect("tempdir");
+        let stderr_file = fake_dir.path().join("stderr_payload.txt");
+        fs::write(&stderr_file, "Error: config store not found for service").expect("write stderr");
+        let script_path = fake_dir.path().join("fastly");
+        let script = format!(
+            "#!/bin/sh\ncat '{stderr}' >&2\nexit 1\n",
+            stderr = stderr_file.display(),
+        );
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        let _path = PathPrepend::new(fake_dir.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("list failure with not-found maps to MissingStore (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "list not-found => MissingStore"
+        );
+    }
+
+    /// Verify that `read_config_entry` invokes
+    /// `fastly config-store-entry describe --store-id=<id> --key=<key> --json`
+    /// (after the resolve step that calls `fastly config-store list --json`).
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_invokes_correct_argv() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let fake = fake_fastly_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("argv-log fake must succeed");
+        assert!(
+            matches!(result, ReadConfigEntry::Present(_)),
+            "expected Present from argv-log fake"
+        );
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        // The describe call must include these args (resolve call args
+        // are also captured but we only assert the describe shape here).
+        assert!(
+            captured.contains("config-store-entry"),
+            "must invoke config-store-entry; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("describe"),
+            "must pass describe subcommand; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("--store-id=store-abc123"),
+            "must pass resolved store id; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("--key=greeting"),
+            "must pass --key=<key>; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("--json"),
+            "must pass --json flag; got:\n{captured}"
         );
     }
 }

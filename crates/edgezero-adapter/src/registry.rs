@@ -171,6 +171,50 @@ impl<'ctx> AdapterPushContext<'ctx> {
     }
 }
 
+/// Per-secret-key entry passed to
+/// [`Adapter::validate_typed_secrets`]. `#[non_exhaustive]` for
+/// v2 source-compat; construction goes through `new`.
+#[non_exhaustive]
+pub struct TypedSecretEntry<'entry> {
+    /// Rust struct field name (e.g. `"api_token"`).
+    pub field_name: &'entry str,
+    /// Blob value — i.e. the secret-store KEY NAME.
+    pub key_value: &'entry str,
+    /// Logical secret-store id this key targets.
+    pub store_id: &'entry str,
+}
+
+impl<'entry> TypedSecretEntry<'entry> {
+    /// Construct a new entry from its three components.
+    #[must_use]
+    #[inline]
+    pub fn new(store_id: &'entry str, field_name: &'entry str, key_value: &'entry str) -> Self {
+        Self {
+            field_name,
+            key_value,
+            store_id,
+        }
+    }
+}
+
+/// Outcome of a single-key read. See spec §9.0.
+#[non_exhaustive]
+pub enum ReadConfigEntry {
+    /// The store exists but the key is absent (operator hasn't pushed yet,
+    /// or pushed under a different key).
+    MissingKey,
+    /// The store itself is absent — wrangler.toml has no matching binding,
+    /// fastly.toml has no setup table, axum's local-config-<id>.json file
+    /// doesn't exist yet.
+    MissingStore,
+    /// The remote held the key; the body is the serialised envelope JSON.
+    Present(String),
+    /// The adapter cannot query the backend for this entry — e.g. Spin
+    /// Cloud's CLI exposes no `get`. `&'static str` carries the human-
+    /// readable reason. See spec §8.3 four-branch UX.
+    Unsupported(&'static str),
+}
+
 /// Interface implemented by adapter crates to integrate with the `EdgeZero` CLI.
 ///
 /// The non-`execute` methods carry the adapter's `config validate`
@@ -328,6 +372,58 @@ pub trait Adapter: Sync + Send {
         ))
     }
 
+    /// Single-key read against the LIVE platform. Mirrors
+    /// [`Self::push_config_entries`]'s argument list per spec §9.0 so
+    /// adapters can share helpers (`find_namespace_id` for Cloudflare,
+    /// `resolve_label_for_store` for Spin, etc.).
+    ///
+    /// Default: returns [`ReadConfigEntry::Unsupported`]. Adapters opt
+    /// in by overriding.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if the platform invocation
+    /// itself fails (network error, malformed response, etc.). A missing
+    /// key or store is NOT an error — use the appropriate enum variant.
+    #[inline]
+    fn read_config_entry(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        Ok(ReadConfigEntry::Unsupported(
+            "adapter does not implement remote read-back",
+        ))
+    }
+
+    /// Single-key read against the LOCAL emulator state. Mirrors
+    /// [`Self::push_config_entries_local`].
+    ///
+    /// Default: returns [`ReadConfigEntry::Unsupported`]. Adapters opt
+    /// in by overriding.
+    ///
+    /// # Errors
+    /// Returns a human-readable error string if the local-state read
+    /// itself fails. A missing key or store is NOT an error — use the
+    /// appropriate enum variant.
+    #[inline]
+    fn read_config_entry_local(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        Ok(ReadConfigEntry::Unsupported(
+            "adapter does not implement local read-back",
+        ))
+    }
+
     /// Store kinds for which this adapter is Single-capable per
     /// spec — `--strict` rejects `[stores.<kind>].ids.len() > 1`
     /// when any listed kind matches. Default: `&[]` (Multi for
@@ -378,11 +474,11 @@ pub trait Adapter: Sync + Send {
 
     /// Typed-only check that needs `#[secret]` field values — the
     /// CLI calls this only from the typed validation flow.
-    /// `plain_secrets` carries only `#[secret]` (`KeyInDefault`)
-    /// entries as `(field_name, value)`; `#[secret(store_ref)]`
-    /// values are runtime store ids and never enter the adapter's
-    /// flat variable namespace, so they are excluded by the CLI
-    /// before calling. Default: no-op.
+    /// `entries` carries both `KeyInDefault` and `KeyInNamedStore`
+    /// entries as [`TypedSecretEntry`] values; `StoreRef` values are
+    /// runtime store ids and never enter the adapter's flat variable
+    /// namespace, so they are excluded by the CLI before calling.
+    /// Default: no-op.
     ///
     /// Note: the previous signature took a `_config_keys` parameter
     /// so Spin could detect cross-namespace collision with KV-stored
@@ -398,7 +494,7 @@ pub trait Adapter: Sync + Send {
     /// collapse to the same Spin variable name under the
     /// runtime's canonicalisation.
     #[inline]
-    fn validate_typed_secrets(&self, _plain_secrets: &[(&str, &str)]) -> Result<(), String> {
+    fn validate_typed_secrets(&self, _entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
         Ok(())
     }
 }
@@ -506,5 +602,26 @@ mod tests {
         register_adapter(&FIRST);
         let adapters = registered_adapters();
         assert_eq!(adapters, vec!["dummy".to_owned(), "other".to_owned()]);
+    }
+
+    #[test]
+    fn default_read_config_entry_returns_unsupported() {
+        let root = Path::new("/tmp");
+        let store = ResolvedStoreId::from_logical("app_config");
+        let ctx = AdapterPushContext::new();
+        let result = FIRST
+            .read_config_entry(root, None, None, &store, "greeting", &ctx)
+            .expect("default impl is infallible");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "expected Unsupported variant from default impl"
+        );
+        let local_result = FIRST
+            .read_config_entry_local(root, None, None, &store, "greeting", &ctx)
+            .expect("default local impl is infallible");
+        assert!(
+            matches!(local_result, ReadConfigEntry::Unsupported(_)),
+            "expected Unsupported variant from default local impl"
+        );
     }
 }

@@ -9,7 +9,8 @@ use crate::context::RequestContext;
 use crate::error::EdgeError;
 use crate::http::HeaderMap;
 use crate::store_registry::{
-    BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
+    BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
+    KvRegistry, SecretRegistry,
 };
 
 #[async_trait(?Send)]
@@ -621,7 +622,15 @@ impl Config {
     #[must_use]
     #[inline]
     pub fn default(&self) -> Option<BoundConfigStore> {
-        self.0.default()
+        self.0.default().map(|binding| binding.handle)
+    }
+
+    /// Borrow the default binding (handle + resolved __KEY) without
+    /// cloning. Used by the typed `AppConfig<C>` extractor.
+    #[must_use]
+    #[inline]
+    pub fn default_binding(&self) -> Option<&ConfigStoreBinding> {
+        self.0.default_ref()
     }
 
     /// Resolve the [`BoundConfigStore`] for `id`. Strict lookup — unknown ids
@@ -629,7 +638,14 @@ impl Config {
     #[must_use]
     #[inline]
     pub fn named(&self, id: &str) -> Option<BoundConfigStore> {
-        self.0.named(id)
+        self.0.named(id).map(|binding| binding.handle)
+    }
+
+    /// Borrow a binding by id.
+    #[must_use]
+    #[inline]
+    pub fn named_binding(&self, id: &str) -> Option<&ConfigStoreBinding> {
+        self.0.named_ref(id)
     }
 
     /// Access the underlying registry directly.
@@ -1328,6 +1344,7 @@ mod tests {
     #[test]
     fn config_extractor_resolves_from_registry() {
         use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+        use crate::store_registry::ConfigStoreBinding;
         use std::collections::BTreeMap;
         use std::sync::Arc;
 
@@ -1343,11 +1360,17 @@ mod tests {
             [
                 (
                     "primary".to_owned(),
-                    ConfigStoreHandle::new(Arc::new(FixedStore("primary"))),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::new(Arc::new(FixedStore("primary"))),
+                        default_key: "primary".to_owned(),
+                    },
                 ),
                 (
                     "analytics".to_owned(),
-                    ConfigStoreHandle::new(Arc::new(FixedStore("analytics"))),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::new(Arc::new(FixedStore("analytics"))),
+                        default_key: "analytics".to_owned(),
+                    },
                 ),
             ]
             .into_iter()
@@ -1417,5 +1440,114 @@ mod tests {
         let err = block_on(Config::from_request(&ctx)).expect_err("expected error");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message().contains("check [stores.config]"));
+    }
+
+    // -- Config::default_binding / named_binding (B8) ----------------------
+
+    #[test]
+    fn config_default_binding_returns_resolved_key() {
+        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+        use crate::store_registry::ConfigStoreBinding;
+        use std::sync::Arc;
+
+        struct AnyStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for AnyStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(None)
+            }
+        }
+
+        let binding = ConfigStoreBinding {
+            handle: ConfigStoreHandle::new(Arc::new(AnyStore)),
+            default_key: "app_config_staging".to_owned(),
+        };
+        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), binding);
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let config =
+            block_on(Config::from_request(&ctx)).expect("Config extractor when registry present");
+
+        let def_binding = config.default_binding().expect("default binding");
+        assert_eq!(def_binding.default_key, "app_config_staging");
+    }
+
+    #[test]
+    fn config_default_binding_returns_none_when_not_configured() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+        // extractor itself errors when no registry — confirm it does not panic
+        let result = block_on(Config::from_request(&ctx));
+        assert!(result.is_err(), "no registry -- extractor must error");
+    }
+
+    #[test]
+    fn config_named_binding_returns_binding_for_declared_id() {
+        use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+        use crate::store_registry::ConfigStoreBinding;
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        struct AnyStore;
+        #[async_trait(?Send)]
+        impl ConfigStore for AnyStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(None)
+            }
+        }
+
+        let registry: ConfigRegistry = StoreRegistry::new(
+            [
+                (
+                    "primary".to_owned(),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::new(Arc::new(AnyStore)),
+                        default_key: "primary_key".to_owned(),
+                    },
+                ),
+                (
+                    "secondary".to_owned(),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::new(Arc::new(AnyStore)),
+                        default_key: "secondary_key".to_owned(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "primary".to_owned(),
+        );
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/config")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+
+        let ctx = RequestContext::new(request, PathParams::default());
+        let config =
+            block_on(Config::from_request(&ctx)).expect("Config extractor when registry present");
+
+        let sec = config
+            .named_binding("secondary")
+            .expect("secondary binding");
+        assert_eq!(sec.default_key, "secondary_key");
+
+        assert!(
+            config.named_binding("undeclared").is_none(),
+            "unknown id must yield None"
+        );
     }
 }

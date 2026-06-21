@@ -10,7 +10,9 @@ use edgezero_core::http::StatusCode;
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
-use edgezero_core::store_registry::{BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry};
+use edgezero_core::store_registry::{
+    BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry,
+};
 use tokio::{runtime::Handle, task};
 use tower::Service;
 
@@ -144,9 +146,15 @@ impl Service<Request<AxumBody>> for EdgeZeroAxumService {
         // `secret_handle()` accessors are gone (spec
         // hard-cutoff).
         let config_registry = self.config_registry.clone().or_else(|| {
-            self.config_store_handle
-                .clone()
-                .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+            self.config_store_handle.clone().map(|handle| {
+                ConfigRegistry::single_id(
+                    "default".to_owned(),
+                    ConfigStoreBinding {
+                        handle,
+                        default_key: "default".to_owned(),
+                    },
+                )
+            })
         });
         let kv_registry = self.kv_registry.clone().or_else(|| {
             self.kv_handle

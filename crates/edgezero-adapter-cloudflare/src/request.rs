@@ -12,7 +12,7 @@ use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
-    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+    BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use worker::{
     Context, Env, Error as WorkerError, Method, Request as CfRequest, Response as CfResponse,
@@ -365,11 +365,17 @@ fn build_config_registry(
     env_config: &EnvConfig,
 ) -> Option<ConfigRegistry> {
     let meta = config_meta?;
-    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
-        let binding = env_config.store_name("config", id);
-        if let Some(handle) = open_config_or_warn(env, &binding) {
-            by_id.insert((*id).to_owned(), handle);
+        let binding_name = env_config.store_name("config", id);
+        if let Some(handle) = open_config_or_warn(env, &binding_name) {
+            by_id.insert(
+                (*id).to_owned(),
+                ConfigStoreBinding {
+                    handle,
+                    default_key: env_config.store_key("config", id),
+                },
+            );
         }
     }
     let default_id = meta.default.to_owned();
@@ -502,9 +508,15 @@ fn synthesise_store_registries(
     Option<SecretRegistry>,
 ) {
     let config_registry = stores.config_registry.or_else(|| {
-        stores
-            .config_store
-            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+        stores.config_store.map(|handle| {
+            ConfigRegistry::single_id(
+                "default".to_owned(),
+                ConfigStoreBinding {
+                    handle,
+                    default_key: "default".to_owned(),
+                },
+            )
+        })
     });
     let kv_registry = stores.kv_registry.or_else(|| {
         stores
@@ -669,5 +681,25 @@ mod synthesis_tests {
         let kv_registry = kv.expect("kv registry synthesised");
         assert_eq!(kv_registry.default_id(), "default");
         assert!(kv_registry.named("other").is_none());
+    }
+
+    /// Spec §12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
+    /// must surface as `ConfigStoreBinding.default_key`.
+    ///
+    /// `build_config_registry` requires a live `worker::Env` (Cloudflare
+    /// runtime type) so cannot be unit-tested here; this test exercises the
+    /// env-resolution layer that `build_config_registry` reads from.
+    /// Platform-integration coverage relies on the E2 smoke scripts (Phase E).
+    #[test]
+    fn config_default_key_env_override_resolved() {
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        assert_eq!(
+            env.store_key("config", "app_config"),
+            "app_config_staging",
+            "env override must propagate to the key resolved by build_config_registry"
+        );
     }
 }

@@ -54,10 +54,25 @@ pub enum SecretKind {
     /// `#[secret]` — the field's value is a key in the resolved
     /// default secret store.
     KeyInDefault,
+    /// `#[secret(store_ref = "field")]` — the field's value is a key
+    /// in the named secret store identified by the sibling field
+    /// `store_ref_field`.
+    KeyInNamedStore {
+        /// Name of the sibling `#[secret(store_ref)]` field that
+        /// identifies which `[stores.secrets]` entry to resolve
+        /// against.
+        store_ref_field: &'static str,
+    },
     /// `#[secret(store_ref)]` — the field's value is the logical id
     /// of a `[stores.secrets]` declaration.
     StoreRef,
 }
+
+/// Marker trait emitted by `#[derive(AppConfig)]`. The §10.2.1
+/// Pattern 4 CI gate detects nested AppConfig-rooted structs via
+/// this marker. The trait is intentionally open (NOT sealed) so
+/// the derive macro can implement it from downstream crates.
+pub trait AppConfigRoot {}
 
 /// Options for the app-config loader.
 ///
@@ -172,6 +187,42 @@ impl EnvLookup {
     fn get(&self, key: &str) -> Option<&str> {
         self.vars.get(key).map(String::as_str)
     }
+}
+
+/// Validate `cfg` but SKIP per-field validators on `#[secret]` /
+/// `#[secret(store_ref = "...")]` fields. Used by `config push` /
+/// `config diff` paths where those fields hold operator-typed KEY
+/// NAMES, not the resolved secret values. See spec §3.3.8.
+///
+/// `#[secret(store_ref)]` fields are kept (their value is a store
+/// id, identical at push and runtime).
+///
+/// # Errors
+/// Returns `Err(ValidationErrors)` if any non-secret field fails its
+/// validator. Returns `Ok(())` if only secret-field validators fail.
+#[inline]
+pub fn validate_excluding_secrets<C: validator::Validate + AppConfigMeta>(
+    cfg: &C,
+) -> Result<(), validator::ValidationErrors> {
+    let result = cfg.validate();
+    let Err(mut errors) = result else {
+        return Ok(());
+    };
+    // validator 0.20 exposes errors_mut() -> &mut HashMap<Cow<'static, str>, ValidationErrorsKind>.
+    // `bag.remove(field.name)` works because `field.name` is `&'static str`
+    // and `Cow<'static, str>: Borrow<str>` (round-36 H-1 reviewer noted
+    // the earlier comment cited the wrong key type — fixed).
+    let bag = errors.errors_mut();
+    for field in C::SECRET_FIELDS {
+        if matches!(field.kind, SecretKind::StoreRef) {
+            continue; // store_id field; validator stays
+        }
+        bag.remove(field.name);
+    }
+    if bag.is_empty() {
+        return Ok(());
+    }
+    Err(errors)
 }
 
 /// Load and validate a typed app-config from `<name>.toml`.
@@ -1073,5 +1124,90 @@ greeting = "hello"
         )
         .unwrap();
         assert_eq!(cfg.value, 42);
+    }
+
+    // -- validate_excluding_secrets ----------------------------------------
+
+    #[test]
+    fn validate_excluding_secrets_passes_when_no_secret_fields() {
+        #[derive(Validate)]
+        struct Fixture {
+            #[validate(length(min = 1))]
+            greeting: String,
+        }
+        impl AppConfigMeta for Fixture {
+            const SECRET_FIELDS: &'static [SecretField] = &[];
+        }
+        let cfg = Fixture {
+            greeting: "hello".into(),
+        };
+        validate_excluding_secrets(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_excluding_secrets_skips_secret_field_rules() {
+        #[derive(Validate)]
+        struct Fixture {
+            #[validate(length(min = 32))]
+            api_token: String,
+            #[validate(length(min = 1))]
+            greeting: String,
+        }
+        impl AppConfigMeta for Fixture {
+            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
+                name: "api_token",
+                kind: SecretKind::KeyInDefault,
+            }];
+        }
+        let cfg = Fixture {
+            api_token: "short".into(),
+            greeting: "hi".into(),
+        };
+        // Plain validate fails because api_token < 32 chars.
+        cfg.validate().unwrap_err();
+        // validate_excluding_secrets passes (api_token skipped, greeting OK).
+        validate_excluding_secrets(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_excluding_secrets_keeps_non_secret_failures() {
+        #[derive(Validate)]
+        struct Fixture {
+            #[validate(length(min = 1))]
+            api_token: String,
+            #[validate(length(min = 32))]
+            greeting: String,
+        }
+        impl AppConfigMeta for Fixture {
+            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
+                name: "api_token",
+                kind: SecretKind::KeyInDefault,
+            }];
+        }
+        let cfg = Fixture {
+            api_token: "x".into(),
+            greeting: "short".into(),
+        };
+        validate_excluding_secrets(&cfg).unwrap_err();
+    }
+
+    #[test]
+    fn validate_excluding_secrets_keeps_store_ref_field_validators() {
+        #[derive(Validate)]
+        struct Fixture {
+            #[validate(length(min = 32))]
+            store_id: String,
+        }
+        impl AppConfigMeta for Fixture {
+            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
+                name: "store_id",
+                kind: SecretKind::StoreRef,
+            }];
+        }
+        let cfg = Fixture {
+            store_id: "short".into(),
+        };
+        // StoreRef keeps its validator — short store_id still fails.
+        validate_excluding_secrets(&cfg).unwrap_err();
     }
 }

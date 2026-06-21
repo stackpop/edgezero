@@ -20,7 +20,7 @@
 
 use crate::args::{ConfigPushArgs, ConfigValidateArgs};
 use crate::ensure_adapter_defined;
-use edgezero_adapter::registry::{self as adapter_registry, ResolvedStoreId};
+use edgezero_adapter::registry::{self as adapter_registry, ResolvedStoreId, TypedSecretEntry};
 use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind,
 };
@@ -609,29 +609,45 @@ pub(crate) fn reject_merged_id_collisions(
 }
 
 /// Typed-only adapter dispatch: feed each adapter the `#[secret]`
-/// (`KeyInDefault` only — `#[secret(store_ref)]` values are runtime
-/// store ids, not flat-namespace candidates) so adapters whose
-/// secret store has a flat-namespace constraint (Spin) can detect
-/// within-secrets collisions.
+/// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
+/// runtime store ids, not flat-namespace candidates) so adapters
+/// whose secret store has a flat-namespace constraint (Spin) can
+/// detect within-secrets collisions.
 fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
     let raw_table = ctx
         .raw_config
         .as_table()
         .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
 
-    let mut plain_secrets: Vec<(&str, &str)> = Vec::new();
+    let default_store_id = ctx
+        .manifest()
+        .stores
+        .secrets
+        .as_ref()
+        .map(StoreDeclaration::default_id);
+    let mut entries: Vec<TypedSecretEntry<'_>> = Vec::new();
     for field in C::SECRET_FIELDS {
-        if !matches!(field.kind, SecretKind::KeyInDefault) {
-            continue;
-        }
-        if let Some(value) = raw_table.get(field.name).and_then(Value::as_str) {
-            plain_secrets.push((field.name, value));
+        match field.kind {
+            SecretKind::KeyInDefault => {
+                let opt_value = raw_table.get(field.name).and_then(Value::as_str);
+                if let (Some(key_value), Some(store_id)) = (opt_value, default_store_id) {
+                    entries.push(TypedSecretEntry::new(store_id, field.name, key_value));
+                }
+            }
+            SecretKind::KeyInNamedStore { store_ref_field } => {
+                let opt_store = raw_table.get(store_ref_field).and_then(Value::as_str);
+                let opt_value = raw_table.get(field.name).and_then(Value::as_str);
+                if let (Some(store_id), Some(key_value)) = (opt_store, opt_value) {
+                    entries.push(TypedSecretEntry::new(store_id, field.name, key_value));
+                }
+            }
+            SecretKind::StoreRef => {}
         }
     }
 
     for name in ctx.manifest().adapters.keys() {
         if let Some(adapter) = adapter_registry::get_adapter(name) {
-            adapter.validate_typed_secrets(&plain_secrets)?;
+            adapter.validate_typed_secrets(&entries)?;
         }
     }
     Ok(())
@@ -673,6 +689,19 @@ fn typed_secret_checks<C: AppConfigMeta>(
                 if ctx.manifest().stores.secrets.is_none() {
                     return Err(format!(
                         "{}: `#[secret]` field `{}` requires `[stores.secrets]` to be declared in {}",
+                        ctx.app_config_path.display(),
+                        field.name,
+                        ctx.manifest_path.display()
+                    ));
+                }
+            }
+            SecretKind::KeyInNamedStore { .. } => {
+                // The field value is a key within a named store; the named
+                // store is identified by the sibling `#[secret(store_ref)]`
+                // field. Verify the store section is at least declared.
+                if ctx.manifest().stores.secrets.is_none() {
+                    return Err(format!(
+                        "{}: `#[secret(store_ref = \"...\")]` field `{}` requires `[stores.secrets]` to be declared in {}",
                         ctx.app_config_path.display(),
                         field.name,
                         ctx.manifest_path.display()

@@ -21,7 +21,7 @@ use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::router::RouterService;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
-    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+    BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
@@ -367,7 +367,7 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
             .context("failed to adopt std listener into tokio")?;
 
         let kv_registry = build_kv_registry(stores.kv, &env, kv_init_requirement)?;
-        let config_registry = build_config_registry(stores.config);
+        let config_registry = build_config_registry(stores.config, &env);
         let secret_registry = build_secret_registry(stores.secrets, &env);
 
         let request_stores = Stores {
@@ -441,9 +441,12 @@ fn build_kv_registry(
 /// before any `config push` has populated the file. A malformed file logs a
 /// warning and the id is dropped from the registry rather than failing
 /// startup, matching the cloudflare config-binding behaviour.
-fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigRegistry> {
+fn build_config_registry(
+    config_meta: Option<StoreMetadata>,
+    env: &EnvConfig,
+) -> Option<ConfigRegistry> {
     let meta = config_meta?;
-    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
         let store = match AxumConfigStore::from_local_file(id) {
             Ok(store) => store,
@@ -458,7 +461,13 @@ fn build_config_registry(config_meta: Option<StoreMetadata>) -> Option<ConfigReg
                 continue;
             }
         };
-        by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+        by_id.insert(
+            (*id).to_owned(),
+            ConfigStoreBinding {
+                handle: ConfigStoreHandle::new(Arc::new(store)),
+                default_key: env.store_key("config", id),
+            },
+        );
     }
     let default_id = meta.default.to_owned();
     if !by_id.contains_key(&default_id) {
@@ -684,6 +693,40 @@ mod tests {
         let resolution = resolve_addr(&env);
         assert_eq!(resolution.addr, SocketAddr::from(([127, 0, 0, 1], 8787)));
         assert_eq!(resolution.warnings.len(), 2);
+    }
+
+    /// `build_config_registry` must pack `default_key` from
+    /// `EDGEZERO__STORES__CONFIG__<ID>__KEY` (§12.7).
+    /// A missing local-config file yields an empty store, so the
+    /// binding is still created — this test exercises the key-override
+    /// path without requiring the file to exist.
+    #[test]
+    fn build_config_registry_packs_resolved_default_key_from_env() {
+        use edgezero_core::app::StoreMetadata;
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        let meta = StoreMetadata {
+            default: "app_config",
+            ids: &["app_config"],
+        };
+        let registry = build_config_registry(Some(meta), &env).expect("registry built");
+        let binding = registry.named("app_config").expect("binding registered");
+        assert_eq!(binding.default_key, "app_config_staging");
+    }
+
+    #[test]
+    fn build_config_registry_falls_back_to_id_when_env_key_unset() {
+        use edgezero_core::app::StoreMetadata;
+        let env = EnvConfig::from_vars(iter::empty::<(&str, &str)>());
+        let meta = StoreMetadata {
+            default: "app_config",
+            ids: &["app_config"],
+        };
+        let registry = build_config_registry(Some(meta), &env).expect("registry built");
+        let binding = registry.named("app_config").expect("binding registered");
+        assert_eq!(binding.default_key, "app_config");
     }
 }
 

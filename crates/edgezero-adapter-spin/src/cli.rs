@@ -7,7 +7,6 @@
     reason = "submodule declarations sit between the `use` block and the rest of the file's items by Rust convention; the strict-ordering lint disagrees but no human convention puts `mod` blocks AFTER trait impls"
 )]
 
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +17,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
+    ResolvedStoreId, TypedSecretEntry,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -135,7 +135,7 @@ struct SpinCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation)."
+    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch)."
 )]
 impl Adapter for SpinCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -298,6 +298,157 @@ impl Adapter for SpinCliAdapter {
         )
     }
 
+    fn read_config_entry(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Four-branch dispatch mirroring `dispatch_push`:
+        //
+        // 1. `push_ctx.local` → delegate to `read_config_entry_local`
+        //    (SQLite-direct, same as the `--local` write path).
+        // 2. Deploy command targets Fermyon Cloud → `Unsupported`.
+        //    Fermyon Cloud's `spin cloud key-value list` enumerates
+        //    STORES, not keys; there is no stable per-key get CLI in
+        //    v1 (§8.3 / §9.4 of the spec). NO shell-out.
+        // 3. `runtime-config.toml` declares a non-`spin` backend
+        //    (Redis / AzureCosmos / Unknown) → error naming the backend
+        //    and pointing at its native CLI, matching the writer at
+        //    `cli.rs:639-650`.
+        // 4. Default / `type = "spin"` → SQLite-direct read.
+        //
+        // Round-28 H-2: errors from `runtime_config::read` and from
+        // `verify_label_declared` are PROPAGATED (not swallowed with
+        // `.ok()`). Silently falling through on a malformed
+        // runtime-config would let `config diff` report a result on a
+        // tree where the writer would have errored hard.
+        if push_ctx.local {
+            return self.read_config_entry_local(
+                manifest_root,
+                adapter_manifest_path,
+                component_selector,
+                store,
+                key,
+                push_ctx,
+            );
+        }
+
+        let spin_manifest_path = adapter_manifest_path
+            .map(|rel| manifest_root.join(rel))
+            .ok_or_else(|| {
+                "[adapters.spin.adapter].manifest must point at spin.toml for config diff"
+                    .to_owned()
+            })?;
+        let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
+        let runtime_config_path = push_ctx.runtime_config_path.map_or_else(
+            || spin_manifest_dir.join("runtime-config.toml"),
+            Path::to_path_buf,
+        );
+        let runtime_config_dir = runtime_config_path.parent().unwrap_or(spin_manifest_dir);
+        let platform = store.platform.as_str();
+
+        // Branch 2: Fermyon Cloud auto-detect.
+        if push_cloud::deploy_command_targets_fermyon_cloud(push_ctx.manifest_adapter_deploy_cmd) {
+            return Ok(ReadConfigEntry::Unsupported(
+                "Spin Cloud key-value CLI exposes no `get`; remote read-back unsupported in v1",
+            ));
+        }
+
+        // Branches 3 + 4: parse runtime-config, propagating parse errors
+        // (round-28 H-2), then dispatch on backend type.
+        let parsed = runtime_config::read(&runtime_config_path)?;
+        verify_label_declared(platform, &parsed, &runtime_config_path)?;
+        let backend = parsed.key_value_stores.get(platform);
+        match backend {
+            Some(runtime_config::KeyValueBackend::Redis { url }) => Err(format!(
+                "store `{platform}` is backed by `type = \"redis\"` (url: `{url}`) in {}; \
+                 use `redis-cli -u {url} GET <key>` to read entries from this store. \
+                 edgezero does not read from redis backends.",
+                runtime_config_path.display()
+            )),
+            Some(runtime_config::KeyValueBackend::AzureCosmos) => Err(format!(
+                "store `{platform}` is backed by `type = \"azure_cosmos\"` in {}; \
+                 use the Azure CosmosDB CLI to read this store. \
+                 edgezero does not read from azure_cosmos backends.",
+                runtime_config_path.display()
+            )),
+            Some(runtime_config::KeyValueBackend::Unknown { type_name }) => Err(format!(
+                "store `{platform}` is backed by an unrecognised type `{type_name}` in {}; \
+                 edgezero only reads from `type = \"spin\"` (SQLite) backends.",
+                runtime_config_path.display()
+            )),
+            // Branch 4: `type = "spin"` or missing stanza (default).
+            Some(runtime_config::KeyValueBackend::Spin { path }) => {
+                let db_path = push_sqlite::resolve_sqlite_path(
+                    spin_manifest_dir,
+                    runtime_config_dir,
+                    path.as_deref(),
+                );
+                read_sqlite_entry(&db_path, platform, key)
+            }
+            None => {
+                let db_path =
+                    push_sqlite::resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, None);
+                read_sqlite_entry(&db_path, platform, key)
+            }
+        }
+    }
+
+    fn read_config_entry_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Branch 1: `--local` forces SQLite-direct regardless of the
+        // runtime-config backend type or the Fermyon Cloud auto-detect.
+        // Mirrors the write path at `dispatch_push` branch 1 (cli.rs:572).
+        //
+        // We still enforce that any non-`default` label is declared in
+        // `runtime-config.toml` (same invariant as the writer) so the
+        // read path can't silently succeed on a tree where `spin up`
+        // would error with "unknown key_value_stores label X".
+        //
+        // An explicit `--runtime-config <path>` is honoured for path
+        // resolution; the backend `type` is ignored (SQLite is always
+        // the target for `--local`).
+        let spin_manifest_path = adapter_manifest_path
+            .map(|rel| manifest_root.join(rel))
+            .ok_or_else(|| {
+                "[adapters.spin.adapter].manifest must point at spin.toml for config diff --local"
+                    .to_owned()
+            })?;
+        let spin_manifest_dir = spin_manifest_path.parent().unwrap_or(manifest_root);
+        let runtime_config_path = push_ctx.runtime_config_path.map_or_else(
+            || spin_manifest_dir.join("runtime-config.toml"),
+            Path::to_path_buf,
+        );
+        let runtime_config_dir = runtime_config_path.parent().unwrap_or(spin_manifest_dir);
+        let platform = store.platform.as_str();
+
+        // Parse runtime-config (propagating errors per round-28 H-2).
+        let parsed = runtime_config::read(&runtime_config_path)?;
+        verify_label_declared(platform, &parsed, &runtime_config_path)?;
+
+        // Resolve the SQLite path: honour any explicit `path` in a
+        // `type = "spin"` stanza; fall back to Spin's default otherwise
+        // (matches the write path at dispatch_push branch 1).
+        let explicit_path = match parsed.key_value_stores.get(platform) {
+            Some(runtime_config::KeyValueBackend::Spin { path }) => path.as_deref(),
+            _ => None,
+        };
+        let db_path =
+            push_sqlite::resolve_sqlite_path(spin_manifest_dir, runtime_config_dir, explicit_path);
+        read_sqlite_entry(&db_path, platform, key)
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: Multi for KV AND Config (both label-backed via the
         // Spin KV API since Stage 5 of the spin-kv-config plan).
@@ -360,7 +511,8 @@ impl Adapter for SpinCliAdapter {
         ))
     }
 
-    fn validate_typed_secrets(&self, plain_secrets: &[(&str, &str)]) -> Result<(), String> {
+    fn validate_typed_secrets(&self, entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        use std::collections::HashMap;
         // Stage 5+: KV-backed config no longer shares Spin's flat
         // variable namespace, so config keys are NOT considered here
         // (and the trait dropped the parameter in Stage 6+) — config
@@ -375,18 +527,24 @@ impl Adapter for SpinCliAdapter {
         //   2. no two `#[secret]` values collapse to the same
         //      lowercased Spin variable, since Spin's flat
         //      namespace cannot disambiguate them.
-        let mut seen: HashSet<String> = HashSet::with_capacity(plain_secrets.len());
-        for (field_name, value) in plain_secrets {
-            let spin_var = value.to_ascii_lowercase();
+        // Map lowercased-Spin-variable → original field name. When a
+        // second entry collapses to the same name, the existing entry
+        // tells us which field already claimed it.
+        let mut seen: HashMap<String, &str> = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            let spin_var = entry.key_value.to_ascii_lowercase();
             if !is_valid_spin_key(&spin_var) {
                 let reason = spin_key_rule_violation(&spin_var);
                 return Err(format!(
-                    "`#[secret]` field `{field_name}` value `{value}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Pick a `#[secret]` value that conforms."
+                    "`#[secret]` field `{field}` value `{value}` translates to Spin variable `{spin_var}`, which is not a valid Spin variable name. {reason}. Pick a `#[secret]` value that conforms.",
+                    field = entry.field_name,
+                    value = entry.key_value,
                 ));
             }
-            if !seen.insert(spin_var.clone()) {
+            if let Some(prev_field) = seen.insert(spin_var.clone(), entry.field_name) {
                 return Err(format!(
-                    "Spin variable `{spin_var}` (from `#[secret]` field `{field_name}`) collides with another `#[secret]` value resolving to the same lowercased name; Spin's flat variable namespace cannot disambiguate them"
+                    "Spin variable `{spin_var}` would receive values from BOTH `#[secret]` field `{prev_field}` AND `#[secret]` field `{this_field}`; Spin's flat variable namespace cannot disambiguate them. Pick distinct `#[secret]` values whose lowercased forms differ.",
+                    this_field = entry.field_name,
                 ));
             }
         }
@@ -726,6 +884,53 @@ fn write_sqlite(
         entries.len(),
         db_path.display()
     )])
+}
+
+/// `SQLite`-direct read helper: opens the Spin KV database at `db_path`
+/// and queries `SELECT value FROM spin_key_value WHERE store=$1 AND key=$2`.
+///
+/// Returns:
+/// - `MissingStore` if the database file does not exist (same semantic
+///   as the write path creating it on first write).
+/// - `MissingKey` if the row is absent.
+/// - `Present(value)` on a hit (value decoded from UTF-8 BLOB).
+fn read_sqlite_entry(db_path: &Path, store: &str, key: &str) -> Result<ReadConfigEntry, String> {
+    use rusqlite::{params, Connection, OptionalExtension as _};
+
+    if !db_path.exists() {
+        return Ok(ReadConfigEntry::MissingStore);
+    }
+    let connection = Connection::open(db_path)
+        .map_err(|err| format!("failed to open `{}`: {err}", db_path.display()))?;
+    // Ensure the schema exists so opening a fresh (empty) file doesn't error.
+    connection
+        .execute(push_sqlite::SPIN_KV_CREATE_TABLE, [])
+        .map_err(|err| format!("failed to verify schema in `{}`: {err}", db_path.display()))?;
+    let raw: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT value FROM spin_key_value WHERE store=$1 AND key=$2",
+            params![store, key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| {
+            format!(
+                "failed to query `{}` for store `{store}` key `{key}`: {err}",
+                db_path.display()
+            )
+        })?;
+    match raw {
+        None => Ok(ReadConfigEntry::MissingKey),
+        Some(bytes) => {
+            let value = String::from_utf8(bytes).map_err(|err| {
+                format!(
+                    "value for store `{store}` key `{key}` in `{}` is not valid UTF-8: {err}",
+                    db_path.display()
+                )
+            })?;
+            Ok(ReadConfigEntry::Present(value))
+        }
+    }
 }
 
 /// Resolve which `[component.<id>]` table `provision` should
@@ -1084,7 +1289,11 @@ mod tests {
     #[test]
     fn validate_typed_secrets_passes_with_no_collision() {
         SpinCliAdapter
-            .validate_typed_secrets(&[("api_token", "demo_api_token")])
+            .validate_typed_secrets(&[TypedSecretEntry::new(
+                "default",
+                "api_token",
+                "demo_api_token",
+            )])
             .expect("non-colliding inputs must pass");
     }
 
@@ -1095,7 +1304,7 @@ mod tests {
     #[test]
     fn validate_typed_secrets_rejects_invalid_spin_variable_in_secret_value() {
         let err = SpinCliAdapter
-            .validate_typed_secrets(&[("api_token", "api-token")])
+            .validate_typed_secrets(&[TypedSecretEntry::new("default", "api_token", "api-token")])
             .expect_err("dashed secret value must error");
         assert!(
             // The error must name BOTH the field name (`api_token`,
@@ -1110,16 +1319,79 @@ mod tests {
 
     /// Negative case: a lowercased secret value that happens to
     /// coincide with another lowercased value MUST collide
-    /// (sanity check that the `seen` set still works post-fix).
+    /// (sanity check that the `seen` map still works post-fix).
     #[test]
     fn validate_typed_secrets_detects_collision_between_two_lowercased_secret_values() {
         let err = SpinCliAdapter
-            .validate_typed_secrets(&[("first", "SHARED_NAME"), ("second", "shared_name")])
+            .validate_typed_secrets(&[
+                TypedSecretEntry::new("default", "first", "SHARED_NAME"),
+                TypedSecretEntry::new("default", "second", "shared_name"),
+            ])
             .expect_err("two values lowercasing to the same name must collide");
         assert!(
-            err.contains("shared_name") && err.contains("collides"),
-            "error names the shared canonical name: {err}"
+            err.contains("shared_name") && (err.contains("first") || err.contains("second")),
+            "error names the shared canonical name and at least one field: {err}"
         );
+    }
+
+    // §12.16 — named-store secret adapter validation
+
+    #[test]
+    fn collision_error_names_both_field_names_and_lowercased_variable() {
+        // §12.16 case (b): KeyInDefault and KeyInNamedStore that
+        // collide on the lowercased Spin variable.
+        let entries = [
+            TypedSecretEntry::new("default", "one", "Demo_Token"),
+            TypedSecretEntry::new("vault", "two", "demo_token"),
+        ];
+        let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
+        assert!(err.contains("`one`"), "{err}");
+        assert!(err.contains("`two`"), "{err}");
+        assert!(err.contains("demo_token"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_spin_variable_name_with_hyphen() {
+        // §12.16 case (a): KeyInNamedStore value contains a hyphen,
+        // which is not a valid Spin variable name.
+        let entries = [TypedSecretEntry::new("vault", "api_token", "demo-token")];
+        let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
+        assert!(err.contains("`api_token`"), "{err}");
+        assert!(err.contains("demo-token"), "{err}");
+        assert!(
+            err.to_lowercase().contains("hyphen") || err.contains("not a valid"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn non_spin_adapter_is_exempt_from_collision_check() {
+        // §12.16 case (c): same collision fixture against a manifest
+        // declaring only [adapters.axum] — covered by run_adapter_
+        // typed_checks NOT calling SpinCliAdapter at all. This is more
+        // naturally a CLI-level integration test, but the adapter
+        // unit test asserts that a non-Spin adapter's trait-default
+        // `validate_typed_secrets` returns Ok(()) on the same input.
+        struct StubAdapter;
+        #[expect(
+            clippy::missing_trait_methods,
+            reason = "StubAdapter exercises only the trait default for validate_typed_secrets"
+        )]
+        impl Adapter for StubAdapter {
+            fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+                Ok(())
+            }
+            fn name(&self) -> &'static str {
+                "stub"
+            }
+        }
+        let entries = [
+            TypedSecretEntry::new("default", "one", "Demo_Token"),
+            TypedSecretEntry::new("vault", "two", "demo_token"),
+        ];
+        StubAdapter
+            .validate_typed_secrets(&entries)
+            .expect("non-Spin adapter trait default must return Ok(()) for any entries");
     }
 
     #[test]
@@ -2042,5 +2314,408 @@ mod tests {
         )
         .expect("unrelated label must not block dispatch");
         assert!(out[0].contains("SQLite-backed Spin KV"), "{out:?}");
+    }
+
+    // ---------- read_config_entry / read_config_entry_local ----------
+
+    // Helper: seed a key into the SQLite DB at `db_path` for `store_label`.
+    fn write_kv_entry(db_path: &Path, store_label: &str, key: &str, value: &str) {
+        push_sqlite::write_batch(db_path, store_label, &[(key.to_owned(), value.to_owned())])
+            .expect("seed entry");
+    }
+
+    // Branch 2: Fermyon Cloud auto-detect → Unsupported.
+    #[test]
+    fn read_config_entry_returns_unsupported_for_fermyon_cloud_deploy_cmd() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        let mut ctx = AdapterPushContext::new();
+        ctx.manifest_adapter_deploy_cmd = Some("spin deploy");
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+                "greeting",
+                &ctx,
+            )
+            .expect("cloud branch returns Ok(Unsupported)");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "Fermyon Cloud must return Unsupported"
+        );
+    }
+
+    // Branch 3a: redis backend → error naming the backend.
+    #[test]
+    fn read_config_entry_errors_for_redis_backend() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"redis\"\nurl = \"redis://localhost:6379\"\n",
+        )
+        .expect("write runtime-config");
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter.read_config_entry(
+            dir.path(),
+            Some("spin.toml"),
+            None,
+            &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+            "greeting",
+            &ctx,
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("redis") && err.contains("app_config"),
+                "error names the backend and store: {err}"
+            ),
+            Ok(_) => panic!("expected Err for redis backend"),
+        }
+    }
+
+    // Branch 3b: azure_cosmos backend → error naming the backend.
+    #[test]
+    fn read_config_entry_errors_for_azure_cosmos_backend() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"azure_cosmos\"\n",
+        )
+        .expect("write runtime-config");
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter.read_config_entry(
+            dir.path(),
+            Some("spin.toml"),
+            None,
+            &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+            "greeting",
+            &ctx,
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("azure_cosmos") && err.contains("app_config"),
+                "error names the backend and store: {err}"
+            ),
+            Ok(_) => panic!("expected Err for azure_cosmos backend"),
+        }
+    }
+
+    // Branch 3c: unknown backend → error naming the type.
+    #[test]
+    fn read_config_entry_errors_for_unknown_backend() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"future-backend\"\n",
+        )
+        .expect("write runtime-config");
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter.read_config_entry(
+            dir.path(),
+            Some("spin.toml"),
+            None,
+            &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+            "greeting",
+            &ctx,
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("future-backend"),
+                "error names the unrecognised type: {err}"
+            ),
+            Ok(_) => panic!("expected Err for unknown backend"),
+        }
+    }
+
+    // Branch 4: default `type = "spin"` → SQLite-direct, Present.
+    #[test]
+    fn read_config_entry_returns_present_for_spin_backend() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"spin\"\n",
+        )
+        .expect("write runtime-config");
+        let db_path = dir.path().join(".spin/sqlite_key_value.db");
+        write_kv_entry(&db_path, "app_config", "greeting", "hello-spin");
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+                "greeting",
+                &ctx,
+            )
+            .expect("spin backend read ok");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, "hello-spin");
+    }
+
+    // Branch 4: default label (no runtime-config stanza) → MissingStore
+    // when the database file doesn't exist.
+    #[test]
+    fn read_config_entry_returns_missing_store_when_db_absent() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        // No runtime-config.toml → default label rules apply.
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store("default", "default"),
+                "greeting",
+                &ctx,
+            )
+            .expect("missing db is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "absent SQLite file must yield MissingStore"
+        );
+    }
+
+    // Branch 4: key absent in an existing DB → MissingKey.
+    #[test]
+    fn read_config_entry_returns_missing_key_when_key_absent() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        let db_path = dir.path().join(".spin/sqlite_key_value.db");
+        write_kv_entry(&db_path, "default", "other_key", "v");
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store("default", "default"),
+                "greeting",
+                &ctx,
+            )
+            .expect("missing key is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "absent key must yield MissingKey"
+        );
+    }
+
+    // Round-28 H-2: malformed runtime-config.toml propagates as an error
+    // (not silently swallowed with .ok()).
+    #[test]
+    fn read_config_entry_propagates_malformed_runtime_config_error() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config\ntype = \"spin\"\n", // missing closing `]`
+        )
+        .expect("write bad runtime-config");
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter.read_config_entry(
+            dir.path(),
+            Some("spin.toml"),
+            None,
+            &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+            "greeting",
+            &ctx,
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("failed to parse") || err.contains("runtime-config"),
+                "error names the parse failure: {err}"
+            ),
+            Ok(_) => panic!("expected Err for malformed runtime-config"),
+        }
+    }
+
+    // Branch 1: --local forces SQLite-direct regardless of backend type.
+    #[test]
+    fn read_config_entry_local_reads_sqlite_ignoring_backend_type() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        // Declare a spin backend so label is declared for verify_label_declared.
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"spin\"\n",
+        )
+        .expect("write runtime-config");
+        let db_path = dir.path().join(".spin/sqlite_key_value.db");
+        write_kv_entry(&db_path, "app_config", "mode", "local");
+        let mut ctx = AdapterPushContext::new();
+        ctx.local = true;
+        let result = SpinCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+                "mode",
+                &ctx,
+            )
+            .expect("local read ok");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, "local");
+    }
+
+    // Branch 1 via read_config_entry: push_ctx.local=true delegates to local impl.
+    #[test]
+    fn read_config_entry_with_local_flag_delegates_to_local_impl() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "[key_value_store.app_config]\ntype = \"spin\"\n",
+        )
+        .expect("write runtime-config");
+        let db_path = dir.path().join(".spin/sqlite_key_value.db");
+        write_kv_entry(&db_path, "app_config", "flag", "set");
+        let mut ctx = AdapterPushContext::new();
+        ctx.local = true;
+        // Even though Fermyon Cloud auto-detect would fire via deploy_cmd,
+        // local flag must win.
+        ctx.manifest_adapter_deploy_cmd = Some("spin deploy");
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+                "flag",
+                &ctx,
+            )
+            .expect("local flag wins over cloud detect");
+        assert!(
+            matches!(result, ReadConfigEntry::Present(_)),
+            "local flag + cloud cmd must yield Present (SQLite wins)"
+        );
+    }
+
+    // Round-29 H-1: SQLite path anchors against runtime-config dir, not
+    // spin manifest dir, for relative explicit paths.
+    #[test]
+    fn read_config_entry_sqlite_path_anchors_against_runtime_config_dir() {
+        let dir = tempdir().expect("tempdir");
+        // spin.toml at <tmp>/spin/spin.toml
+        let spin_dir = dir.path().join("spin");
+        fs::create_dir_all(&spin_dir).expect("create spin dir");
+        fs::write(
+            spin_dir.join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        // runtime-config.toml at <tmp>/cfg/runtime-config.toml with
+        // path = "session.db" (relative).
+        let cfg_dir = dir.path().join("cfg");
+        fs::create_dir_all(&cfg_dir).expect("create cfg dir");
+        let runtime_config_path = cfg_dir.join("runtime-config.toml");
+        fs::write(
+            &runtime_config_path,
+            "[key_value_store.app_config]\ntype = \"spin\"\npath = \"session.db\"\n",
+        )
+        .expect("write runtime-config");
+        // Seed the SQLite file at <tmp>/cfg/session.db (NOT spin/session.db).
+        let db_path = cfg_dir.join("session.db");
+        write_kv_entry(&db_path, "app_config", "key1", "val1");
+        let mut ctx = AdapterPushContext::new();
+        ctx.runtime_config_path = Some(&runtime_config_path);
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin/spin.toml"),
+                None,
+                &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+                "key1",
+                &ctx,
+            )
+            .expect("cfg-dir-anchored path read ok");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, "val1", "value from cfg-dir-anchored db");
+    }
+
+    // Round-29 H-1: default path (no explicit path) falls back to spin manifest dir.
+    #[test]
+    fn read_config_entry_sqlite_default_path_anchors_against_spin_manifest_dir() {
+        let dir = tempdir().expect("tempdir");
+        let spin_dir = dir.path().join("spin");
+        fs::create_dir_all(&spin_dir).expect("create spin dir");
+        fs::write(
+            spin_dir.join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let cfg_dir = dir.path().join("cfg");
+        fs::create_dir_all(&cfg_dir).expect("create cfg dir");
+        let runtime_config_path = cfg_dir.join("runtime-config.toml");
+        // No `path` in the stanza → default .spin/sqlite_key_value.db.
+        fs::write(
+            &runtime_config_path,
+            "[key_value_store.app_config]\ntype = \"spin\"\n",
+        )
+        .expect("write runtime-config");
+        // Seed at <tmp>/spin/.spin/sqlite_key_value.db.
+        let db_path = spin_dir.join(".spin/sqlite_key_value.db");
+        write_kv_entry(&db_path, "app_config", "key2", "val2");
+        let mut ctx = AdapterPushContext::new();
+        ctx.runtime_config_path = Some(&runtime_config_path);
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin/spin.toml"),
+                None,
+                &store(TEST_CONFIG_ID, TEST_CONFIG_ID),
+                "key2",
+                &ctx,
+            )
+            .expect("default path read ok");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, "val2", "value from spin-manifest-dir default db");
+    }
+
+    // Round-29 H-1: absolute path is honoured verbatim.
+    #[test]
+    fn read_config_entry_sqlite_absolute_path_honoured() {
+        let dir = tempdir().expect("tempdir");
+        write_minimal_spin_toml(dir.path());
+        // Use a tempfile as the target database with an absolute path.
+        let db_file = tempfile::NamedTempFile::new().expect("tempfile");
+        let db_path = db_file.path().to_path_buf();
+        write_kv_entry(&db_path, "default", "abs_key", "abs_val");
+        let abs_path_str = db_path.to_str().expect("abs path utf8").to_owned();
+        // Write runtime-config with the absolute path.
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            format!("[key_value_store.default]\ntype = \"spin\"\npath = \"{abs_path_str}\"\n"),
+        )
+        .expect("write runtime-config");
+        let ctx = AdapterPushContext::new();
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &store("default", "default"),
+                "abs_key",
+                &ctx,
+            )
+            .expect("absolute path read ok");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, "abs_val");
     }
 }

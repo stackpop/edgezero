@@ -10,7 +10,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
+    ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -132,7 +133,7 @@ struct CloudflareCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
+    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for CloudflareCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -488,6 +489,30 @@ impl Adapter for CloudflareCliAdapter {
         )])
     }
 
+    fn read_config_entry(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        read_wrangler_kv_key(manifest_root, adapter_manifest_path, store, key, "--remote")
+    }
+
+    fn read_config_entry_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        read_wrangler_kv_key(manifest_root, adapter_manifest_path, store, key, "--local")
+    }
+
     fn single_store_kinds(&self) -> &'static [&'static str] {
         //: cloudflare is Multi for KV (KV namespaces) and
         // Config (KV namespaces), Single for Secrets (Worker
@@ -819,6 +844,63 @@ fn bulk_payload(entries: &[(String, String)]) -> Result<String, String> {
         .map_err(|err| format!("failed to serialize wrangler bulk payload: {err}"))
 }
 
+/// Read a single key from a Cloudflare KV namespace by shelling out to
+/// `wrangler kv key get --binding <BINDING> <KEY> <locality>`.
+///
+/// `locality` is either `"--remote"` (live Cloudflare KV) or `"--local"`
+/// (Miniflare `.wrangler/state`). The two read methods on the adapter call
+/// this shared helper with the appropriate flag.
+///
+/// # Mapping to `ReadConfigEntry`
+/// - Success (exit 0) → `Present(stdout)`.
+/// - Exit non-zero, stderr contains "not found" / "does not exist" → `MissingKey`.
+/// - Exit non-zero, stderr mentions "binding" → `MissingStore` (the KV
+///   namespace binding itself doesn't exist in `wrangler.toml`).
+/// - Any other non-zero exit → `Err`.
+fn read_wrangler_kv_key(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    store: &ResolvedStoreId,
+    key: &str,
+    locality: &str,
+) -> Result<ReadConfigEntry, String> {
+    let rel = adapter_manifest_path.ok_or_else(|| {
+        "[adapters.cloudflare.adapter].manifest must point at wrangler.toml for config diff"
+            .to_owned()
+    })?;
+    let wrangler_path = manifest_root.join(rel);
+    let binding = store.platform.as_str();
+    let project_dir = wrangler_path.parent().unwrap_or(manifest_root);
+    let output = Command::new("wrangler")
+        .args(["kv", "key", "get", "--binding", binding, key, locality])
+        .current_dir(project_dir)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`wrangler` not found on PATH; {WRANGLER_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `wrangler`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        let body = String::from_utf8(output.stdout)
+            .map_err(|err| format!("`wrangler kv key get` stdout is not UTF-8: {err}"))?;
+        return Ok(ReadConfigEntry::Present(body));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("not found") || stderr.contains("does not exist") {
+        return Ok(ReadConfigEntry::MissingKey);
+    }
+    if stderr.contains("binding") || stderr.contains("Binding") {
+        return Ok(ReadConfigEntry::MissingStore);
+    }
+    Err(format!(
+        "`wrangler kv key get --binding {binding} {key} {locality}` exited with status {}\nstderr: {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
 /// # Errors
 /// Returns an error if the Cloudflare wrangler build command fails.
 #[inline]
@@ -1031,6 +1113,10 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     // Shared fixture names. Pinning these as consts (instead of
@@ -1044,6 +1130,41 @@ mod tests {
     const TEST_KV_ID_ALT: &str = "cache";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
+
+    /// RAII guard: prepends a directory to `$PATH` and restores the original
+    /// value on drop. Mirrors the `PathPrepend` used in `push_cloud.rs`.
+    #[cfg(unix)]
+    struct PathPrepend {
+        original: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl PathPrepend {
+        fn new(extra: &Path) -> Self {
+            let original = env::var_os("PATH");
+            let new = match &original {
+                Some(prev) => {
+                    let mut accum = OsString::from(extra);
+                    accum.push(":");
+                    accum.push(prev);
+                    accum
+                }
+                None => OsString::from(extra),
+            };
+            env::set_var("PATH", new);
+            Self { original }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathPrepend {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(prev) => env::set_var("PATH", prev),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
 
     // ---------- extract_namespace_id ----------
 
@@ -1809,5 +1930,192 @@ id = "00112233445566778899aabbccddeeff"
                 && out[0].contains("00112233445566778899aabbccddeeff"),
             "status line names empty + namespace id: {out:?}"
         );
+    }
+
+    // ---------- read_config_entry / read_config_entry_local (fake wrangler) ----------
+
+    /// Build a tempdir containing a `wrangler` script that emits fixed stdout /
+    /// stderr and exits with the given code. The files are written to siblings
+    /// of the script so shell-active chars in the payloads don't get
+    /// re-interpreted.
+    #[cfg(unix)]
+    fn fake_wrangler_returning(
+        stdout_body: &str,
+        stderr_body: &str,
+        exit_code: i32,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("wrangler");
+        let stdout_file = dir.path().join("stdout_payload.txt");
+        let stderr_file = dir.path().join("stderr_payload.txt");
+        fs::write(&stdout_file, stdout_body).expect("write stdout payload");
+        fs::write(&stderr_file, stderr_body).expect("write stderr payload");
+        let script = format!(
+            "#!/bin/sh\ncat '{stdout}'\ncat '{stderr}' >&2\nexit {code}\n",
+            stdout = stdout_file.display(),
+            stderr = stderr_file.display(),
+            code = exit_code,
+        );
+        fs::write(&script_path, script).expect("write wrangler script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    /// Build a fake `wrangler` that logs each argv token (one per line) to
+    /// `out_path`, prints a single line of stdout, and exits 0.
+    #[cfg(unix)]
+    fn fake_wrangler_argv_log(out_path: &Path) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("wrangler");
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{out}'; done\nprintf 'val'\n",
+            out = out_path.display(),
+        );
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    /// Process-wide mutex serialising PATH-mutating tests so parallel
+    /// test threads don't race on the environment variable.
+    #[cfg(unix)]
+    fn path_mutation_guard() -> &'static Mutex<()> {
+        use std::sync::{Mutex, OnceLock};
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_present_on_success() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("hello-cloudflare", "", 0);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("wrangler exit-0 must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, "hello-cloudflare");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_key_on_not_found_stderr() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: key not found", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("not-found maps to MissingKey (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "not-found stderr => MissingKey"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_store_on_binding_stderr() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("", "Error: binding APP_CONFIG is not defined", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("binding-error maps to MissingStore (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "binding stderr => MissingStore"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_local_uses_local_flag() {
+        // Verify that read_config_entry_local passes `--local` (not `--remote`)
+        // to wrangler. We capture argv via a fake wrangler and check the args.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let argv_log = project_dir.path().join("argv.txt");
+        let fake = fake_wrangler_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry_local(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read succeeds");
+        assert!(
+            matches!(result, ReadConfigEntry::Present(_)),
+            "expected Present from local read"
+        );
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains("--local"),
+            "read_local must pass --local to wrangler; got argv:\n{captured}"
+        );
+        assert!(
+            !captured.contains("--remote"),
+            "read_local must NOT pass --remote; got argv:\n{captured}"
+        );
+    }
+
+    #[test]
+    fn read_config_entry_requires_adapter_manifest_path() {
+        let dir = tempdir().expect("tempdir");
+        let result = CloudflareCliAdapter.read_config_entry(
+            dir.path(),
+            None,
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("[adapters.cloudflare.adapter].manifest"),
+                "error names the missing field: {err}"
+            ),
+            Ok(_) => panic!("expected Err when adapter_manifest_path is None"),
+        }
     }
 }

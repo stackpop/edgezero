@@ -13,7 +13,7 @@ use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
-    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+    BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
@@ -333,9 +333,15 @@ fn synthesise_store_registries(
     Option<SecretRegistry>,
 ) {
     let config_registry = stores.config_registry.or_else(|| {
-        stores
-            .config_store
-            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+        stores.config_store.map(|handle| {
+            ConfigRegistry::single_id(
+                "default".to_owned(),
+                ConfigStoreBinding {
+                    handle,
+                    default_key: "default".to_owned(),
+                },
+            )
+        })
     });
     let kv_registry = stores.kv_registry.or_else(|| {
         stores
@@ -384,12 +390,18 @@ fn build_config_registry(
     env: &EnvConfig,
 ) -> Option<ConfigRegistry> {
     let meta = config_meta?;
-    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
         let store_name = env.store_name("config", id);
         match FastlyConfigStore::try_open(&store_name) {
             Ok(store) => {
-                by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+                by_id.insert(
+                    (*id).to_owned(),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::new(Arc::new(store)),
+                        default_key: env.store_key("config", id),
+                    },
+                );
             }
             Err(err) => warn_missing_store_once(&store_name, &err.to_string()),
         }
@@ -662,5 +674,26 @@ mod synthesis_tests {
     #[test]
     fn resolve_secret_handle_builds_handle_when_required_true_matches_require_secrets() {
         let _handle = resolve_secret_handle(true);
+    }
+
+    /// Spec §12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
+    /// must surface as `ConfigStoreBinding.default_key`.
+    ///
+    /// `build_config_registry` calls `FastlyConfigStore::try_open` which
+    /// requires live Fastly hostcalls and cannot be unit-tested here; this
+    /// test exercises the env-resolution layer that `build_config_registry`
+    /// reads from. Platform-integration coverage relies on the E2 smoke
+    /// scripts (Phase E).
+    #[test]
+    fn config_default_key_env_override_resolved() {
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        assert_eq!(
+            env.store_key("config", "app_config"),
+            "app_config_staging",
+            "env override must propagate to the key resolved by build_config_registry"
+        );
     }
 }
