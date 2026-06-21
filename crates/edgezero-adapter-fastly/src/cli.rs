@@ -323,6 +323,22 @@ impl Adapter for FastlyCliAdapter {
                 "no config entries to push to fastly config-store `{name}` (logical id `{logical}`)"
             )]);
         }
+        // Blob-model pre-platform-call cap guard. The blob envelope is
+        // one entry whose value is the full envelope JSON string. Fastly
+        // Config Store enforces an 8 000-character limit per entry value.
+        // Surface a clear diagnostic before shelling out so the operator
+        // knows to split the config across multiple [stores.config] ids.
+        for (key, body) in entries {
+            if body.len() > 8_000 {
+                return Err(format!(
+                    "blob at key `{key}` is {} characters; Fastly Config Store \
+                     entry value limit is 8 000 characters. Restructure your \
+                     typed app-config into multiple types and split across \
+                     [stores.config] ids.",
+                    body.len(),
+                ));
+            }
+        }
         if dry_run {
             // List each entry so the operator can verify intent
             // before committing. Matches the spin dry-run preview

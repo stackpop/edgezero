@@ -22,3 +22,22 @@ This workspace demonstrates a multi-target EdgeZero app.
 ## Configuration
 
 Environment variables are declared in `edgezero.toml`. Set `API_BASE_URL` to the upstream origin you want `/proxy/...` to target. Adapter-specific secrets are opt-in: uncomment the `#[secret]` field in `crates/{{proj_core}}/src/config.rs` and the matching `[stores.secrets]` block in `edgezero.toml`, then provide the secret value through the wired backend (Cloudflare Worker secret, Fastly Secret Store, Spin secret variable, ...).
+
+### Typed app config (`{{name}}.toml`)
+
+`{{name}}.toml` maps onto `{{NameUpperCamel}}Config` in
+`crates/{{proj_core}}/src/config.rs`. Handlers receive it via the
+`AppConfig<{{NameUpperCamel}}Config>` extractor — no manual config-store
+or secret-store calls needed. The `{{proj_cli}}` binary wires the typed
+push and validate commands:
+
+```sh
+# Validate the manifest + typed config (including any #[secret] rules):
+cargo run -p {{proj_cli}} -- config validate
+
+# Push `{{name}}.toml` as a signed blob into the adapter's config store:
+cargo run -p {{proj_cli}} -- config push --adapter <axum|cloudflare|fastly|spin>
+```
+
+Uncomment `[stores.config]` in `edgezero.toml` (and the matching
+adapter binding in the per-adapter manifest) before running `config push`.

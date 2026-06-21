@@ -818,6 +818,7 @@ dependencies = [
 name = "edgezero-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "edgezero-adapter",
  "edgezero-adapter-axum",
@@ -830,6 +831,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "similar",
  "simple_logger 5.1.0",
  "thiserror 2.0.18",
  "toml",
@@ -852,9 +854,12 @@ dependencies = [
  "http-body",
  "log",
  "matchit 0.9.1",
+ "ryu",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "serde_urlencoded",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "toml",
  "tower-service",
@@ -2393,6 +2398,12 @@ name = "simd-adler32"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "simple_logger"

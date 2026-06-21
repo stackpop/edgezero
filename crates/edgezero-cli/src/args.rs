@@ -1,6 +1,15 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+/// Shown in `--help` and printed to stderr when the bundled binary
+/// receives a `config push` or `config diff` invocation that requires
+/// a typed app-config struct (`C`).  Downstream CLIs own that struct
+/// and re-expose the real subcommands.
+pub const STUB_POINTER_AFTER_HELP: &str = "\
+This command requires a typed app-config struct (`C`) and runs from your generated downstream \
+CLI, not the bundled `edgezero` binary. Run `<your-app>-cli config push` (or `... diff`) \
+instead. See `<your-app>-cli config push --help`.";
+
 #[derive(Parser, Debug)]
 #[command(name = "edgezero", about = "EdgeZero CLI")]
 pub struct Args {
@@ -17,7 +26,7 @@ pub enum Command {
     /// Build the project for a target edge.
     Build(BuildArgs),
     /// Inspect or mutate the typed `<name>.toml` app config.
-    #[command(subcommand)]
+    #[command(subcommand, after_help = crate::args::STUB_POINTER_AFTER_HELP)]
     Config(ConfigCmd),
     /// Run the bundled `app-demo` example locally (contributor-only).
     #[cfg(feature = "demo-example")]
@@ -35,16 +44,39 @@ pub enum Command {
     Serve(ServeArgs),
 }
 
-/// Subcommands under `edgezero config …`. Carries
-/// `validate` and `push`.
+/// Subcommands under `edgezero config …`.
+///
+/// In the bundled `edgezero` binary, `push` and `diff` are stubs that
+/// print a pointer to the downstream typed CLI and exit 2.  `validate`
+/// is the only subcommand that runs in-band here because it does not
+/// require a typed app-config struct.
 #[derive(Subcommand, Debug)]
 pub enum ConfigCmd {
-    /// Push the typed `<name>.toml` (flattened, secret-stripped) to
-    /// the adapter's config store.
-    Push(ConfigPushArgs),
+    /// Diff the typed `<name>.toml` against the live config store.
+    /// (Bundled `edgezero` stub — see after-help for the typed CLI.)
+    #[command(after_help = STUB_POINTER_AFTER_HELP)]
+    Diff(ConfigCmdStubArgs),
+    /// Push the typed `<name>.toml` as a single blob envelope to the
+    /// adapter's config store. The blob carries every field verbatim
+    /// (per spec §3.3 Model A — `#[secret]` fields store the key NAME,
+    /// resolved at runtime); a SHA over the canonical-form data gates
+    /// drift detection.
+    /// (Bundled `edgezero` stub — see after-help for the typed CLI.)
+    #[command(after_help = STUB_POINTER_AFTER_HELP)]
+    Push(ConfigCmdStubArgs),
     /// Validate `edgezero.toml` and the typed `<name>.toml` against the
     /// manifest / app-config / Spin-key contract.
     Validate(ConfigValidateArgs),
+}
+
+/// Hidden catch-all argument sink for the bundled stub variants of
+/// `config push` and `config diff`.  Absorbs any flags the user types
+/// so clap does not error before we can print the pointer text (§3.2.2).
+#[derive(clap::Args, Debug)]
+pub struct ConfigCmdStubArgs {
+    /// Hidden catch-all sink (see spec §3.2.2).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    pub trailing: Vec<String>,
 }
 
 /// Arguments for the `auth` command.
@@ -174,8 +206,19 @@ pub struct ServeArgs {
 }
 
 /// Arguments for the `config push` command.
+///
+/// Used by downstream typed CLIs that wire
+/// `run_config_push_typed::<C>`.  The bundled `edgezero` binary exposes
+/// a `ConfigCmdStubArgs` catch-all instead and redirects to the typed
+/// CLI at runtime.
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "clap args struct: each bool is a distinct CLI flag \
+              (dry_run, local, no_diff, no_env, yes); a state machine \
+              would be inappropriate here"
+)]
 pub struct ConfigPushArgs {
     /// Target adapter name.
     #[arg(long, required = true)]
@@ -187,6 +230,9 @@ pub struct ConfigPushArgs {
     /// Print the would-be operations without performing them.
     #[arg(long)]
     pub dry_run: bool,
+    /// Override the default key — §5.4.
+    #[arg(long)]
+    pub key: Option<String>,
     /// Push to the adapter's local-emulator state instead of the live
     /// platform. For Fastly this edits `[local_server.config_stores]`
     /// in the adapter's `fastly.toml` (Viceroy reads it on startup);
@@ -202,6 +248,9 @@ pub struct ConfigPushArgs {
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
+    /// Skip the inline diff render.
+    #[arg(long)]
+    pub no_diff: bool,
     /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
     /// typed app-config. The default loads the overlay so the runtime
     /// and the push see the same resolved values.
@@ -221,6 +270,9 @@ pub struct ConfigPushArgs {
     /// `[stores.config].ids` has length 1).
     #[arg(long)]
     pub store: Option<String>,
+    /// Skip the inline diff prompt and write unconditionally.
+    #[arg(long, short)]
+    pub yes: bool,
 }
 
 impl Default for ConfigPushArgs {
@@ -231,11 +283,14 @@ impl Default for ConfigPushArgs {
             adapter: String::new(),
             app_config: None,
             dry_run: false,
+            key: None,
             local: false,
             manifest: default_manifest_path(),
+            no_diff: false,
             no_env: false,
             runtime_config: None,
             store: None,
+            yes: false,
         }
     }
 }
@@ -319,15 +374,23 @@ mod tests {
 
     #[test]
     fn config_push_args_default_manifest_matches_clap_default() {
+        // round-34 M-2: manual Default must stay in sync with every field.
+        // New fields (key, no_diff, yes) were added in C3; if the impl were
+        // to miss any of them the struct would fail to compile due to
+        // #[non_exhaustive] preventing struct-literal construction outside
+        // this crate, and this test confirms Default values are sensible.
         let args = ConfigPushArgs::default();
         assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
         assert!(args.adapter.is_empty());
         assert!(args.app_config.is_none());
         assert!(!args.dry_run);
+        assert!(args.key.is_none());
         assert!(!args.local);
+        assert!(!args.no_diff);
         assert!(!args.no_env);
         assert!(args.runtime_config.is_none());
         assert!(args.store.is_none());
+        assert!(!args.yes);
     }
 
     #[test]
@@ -506,53 +569,90 @@ mod tests {
             .expect_err("`provision` without --adapter must error");
     }
 
+    // ── config push / diff stub tests (§12.8 + §12.11) ──────────────────
+
+    /// Bundled binary: bare `config push` parses to the stub variant.
+    /// The catch-all absorbs nothing; trailing is empty.
     #[test]
-    fn config_push_parses_with_adapter_and_defaults() {
-        let args = Args::try_parse_from(["edgezero", "config", "push", "--adapter", "axum"])
-            .expect("parse config push --adapter axum");
-        let Command::Config(ConfigCmd::Push(push)) = args.cmd else {
+    fn config_push_stub_parses_bare() {
+        let args = Args::try_parse_from(["edgezero", "config", "push"])
+            .expect("config push stub \u{2014} no args required");
+        let Command::Config(ConfigCmd::Push(stub)) = args.cmd else {
             panic!("expected Command::Config(ConfigCmd::Push)");
         };
-        assert_eq!(push.adapter, "axum");
-        assert!(!push.dry_run);
-        assert!(!push.no_env);
-        assert!(push.store.is_none());
-        assert!(push.app_config.is_none());
-        assert_eq!(push.manifest, PathBuf::from("edgezero.toml"));
+        assert!(stub.trailing.is_empty());
     }
 
+    /// Bundled binary: `config push` with flags is absorbed by the
+    /// trailing catch-all and still parses without error.
     #[test]
-    fn config_push_parses_explicit_paths_store_and_flags() {
+    fn config_push_stub_absorbs_flags() {
         let args = Args::try_parse_from([
             "edgezero",
             "config",
             "push",
             "--adapter",
-            "cloudflare",
-            "--manifest",
-            "custom/edgezero.toml",
-            "--app-config",
-            "custom/my-app.toml",
-            "--store",
-            "app_config",
-            "--no-env",
+            "axum",
             "--dry-run",
         ])
-        .expect("parse config push with overrides");
-        let Command::Config(ConfigCmd::Push(push)) = args.cmd else {
+        .expect("config push stub absorbs typed flags");
+        let Command::Config(ConfigCmd::Push(stub)) = args.cmd else {
             panic!("expected Command::Config(ConfigCmd::Push)");
         };
-        assert_eq!(push.adapter, "cloudflare");
-        assert_eq!(push.manifest, PathBuf::from("custom/edgezero.toml"));
-        assert_eq!(push.app_config, Some(PathBuf::from("custom/my-app.toml")));
-        assert_eq!(push.store.as_deref(), Some("app_config"));
-        assert!(push.no_env);
-        assert!(push.dry_run);
+        // The catch-all absorbs unrecognised flags as trailing tokens.
+        assert!(!stub.trailing.is_empty());
+    }
+
+    /// Bundled binary: `config diff` parses to the `Diff` stub variant.
+    #[test]
+    fn config_diff_stub_parses_bare() {
+        let args = Args::try_parse_from(["edgezero", "config", "diff"])
+            .expect("config diff stub \u{2014} no args required");
+        assert!(matches!(args.cmd, Command::Config(ConfigCmd::Diff(_))));
+    }
+
+    /// §12.11 — `ConfigPushArgs` new flags: `--yes` / `-y` / `--no-diff`
+    /// / `--dry-run` parse correctly on the *downstream* typed struct.
+    /// (The bundled binary uses `ConfigCmdStubArgs`; these tests cover the
+    /// struct fields directly via `Default` + mutation, since clap can only
+    /// parse `ConfigPushArgs` when wired as `Push(ConfigPushArgs)` in a
+    /// downstream `ConfigCmd`.)
+    #[test]
+    fn config_push_args_yes_default_is_false() {
+        assert!(!ConfigPushArgs::default().yes);
     }
 
     #[test]
-    fn config_push_requires_adapter() {
-        Args::try_parse_from(["edgezero", "config", "push"])
-            .expect_err("`config push` without --adapter must error");
+    fn config_push_args_no_diff_default_is_false() {
+        assert!(!ConfigPushArgs::default().no_diff);
+    }
+
+    #[test]
+    fn config_push_args_key_default_is_none() {
+        assert!(ConfigPushArgs::default().key.is_none());
+    }
+
+    /// Verify `--help` output for the stub `push` subcommand contains
+    /// the pointer text and does NOT expose `[TRAILING]`.
+    #[test]
+    fn config_push_stub_help_contains_pointer_and_hides_trailing() {
+        use clap::CommandFactory as _;
+        let mut cmd = Args::command();
+        // Walk the subcommand tree to reach `config push`.
+        let mut config_sub = cmd
+            .find_subcommand_mut("config")
+            .expect("config subcommand")
+            .find_subcommand_mut("push")
+            .expect("push subcommand")
+            .clone();
+        let help = config_sub.render_help().to_string();
+        assert!(
+            help.contains("typed app-config struct"),
+            "pointer text missing from push help: {help}"
+        );
+        assert!(
+            !help.contains("[TRAILING]"),
+            "`[TRAILING]` placeholder leaked into push help: {help}"
+        );
     }
 }

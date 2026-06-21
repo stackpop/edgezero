@@ -49,6 +49,15 @@ jobs:
       - name: Fetch dependencies (locked)
         run: cargo fetch --locked
 
+      - name: No placeholder pins
+        run: ./scripts/check_no_placeholder_pins.sh
+
+      - name: No legacy typed reads
+        run: ./scripts/check_no_legacy_typed_reads.sh
+
+      - name: Nested AppConfig audit
+        run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
+
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 

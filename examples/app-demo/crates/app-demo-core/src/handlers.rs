@@ -5,11 +5,13 @@ use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::extractor::{Headers, Json, Kv, Path, Query, Secrets, ValidatedPath};
+use edgezero_core::extractor::{AppConfig, Headers, Json, Kv, Path, Query, Secrets, ValidatedPath};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
 use futures::{stream, StreamExt as _};
+
+use crate::config::AppDemoConfig;
 
 const ALLOWED_CONFIG_KEYS: &[&str] = &["greeting", "feature.new_checkout", "service.timeout_ms"];
 const DEFAULT_PROXY_BASE: &str = "https://httpbin.org";
@@ -172,6 +174,18 @@ pub async fn config_get(RequestContext(ctx): RequestContext) -> Result<Response,
     }
 }
 
+/// Return the greeting from the typed blob config.
+///
+/// Demonstrates the blob-model extractor (`AppConfig<AppDemoConfig>`): the
+/// adapter pushes a signed JSON envelope into the config store via
+/// `app-demo-cli config push`, and the extractor deserialises + secret-walks
+/// it on every request. No manual `config_store_default()` or
+/// `secret_store.require_str()` calls needed.
+#[action]
+pub async fn config_typed(AppConfig(cfg): AppConfig<AppDemoConfig>) -> Result<Response, EdgeError> {
+    text_response(StatusCode::OK, cfg.greeting)
+}
+
 /// Increment and return a visit counter stored in the `sessions`
 /// KV store. The `[stores.kv]` manifest declares both `sessions`
 /// and `cache` ids; the counter lives in `sessions` because it
@@ -304,7 +318,7 @@ mod tests {
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
-    use edgezero_core::store_registry::KvRegistry;
+    use edgezero_core::store_registry::{ConfigStoreBinding, KvRegistry};
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -479,9 +493,12 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let by_id: BTreeMap<String, ConfigStoreHandle> = [(
+        let by_id: BTreeMap<String, ConfigStoreBinding> = [(
             "app_config".to_owned(),
-            ConfigStoreHandle::new(Arc::new(store)),
+            ConfigStoreBinding {
+                handle: ConfigStoreHandle::new(Arc::new(store)),
+                default_key: "app_config".to_owned(),
+            },
         )]
         .into_iter()
         .collect();
@@ -526,8 +543,11 @@ mod tests {
                 .map(|&(name, value)| (name.to_owned(), value.to_owned()))
                 .collect(),
         );
-        let handle = ConfigStoreHandle::new(Arc::new(store));
-        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), handle);
+        let binding = ConfigStoreBinding {
+            handle: ConfigStoreHandle::new(Arc::new(store)),
+            default_key: "app_config".to_owned(),
+        };
+        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), binding);
         request.extensions_mut().insert(registry);
         let mut params = HashMap::new();
         params.insert("name".to_owned(), key.to_owned());
@@ -646,8 +666,11 @@ mod tests {
             .uri(format!("/config/{key}"))
             .body(Body::empty())
             .expect("request");
-        let handle = ConfigStoreHandle::new(Arc::new(UnavailableConfigStore));
-        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), handle);
+        let binding = ConfigStoreBinding {
+            handle: ConfigStoreHandle::new(Arc::new(UnavailableConfigStore)),
+            default_key: "app_config".to_owned(),
+        };
+        let registry: ConfigRegistry = StoreRegistry::single_id("app_config".to_owned(), binding);
         request.extensions_mut().insert(registry);
         let mut params = HashMap::new();
         params.insert("name".to_owned(), key.to_owned());

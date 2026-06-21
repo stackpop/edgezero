@@ -59,6 +59,14 @@ methods = ["GET"]
 handler = "app_demo_core::handlers::config_get"
 adapters = ["axum", "cloudflare", "fastly", "spin"]
 
+[[triggers.http]]
+id = "config_typed"
+path = "/config/typed"
+methods = ["GET"]
+handler = "app_demo_core::handlers::config_typed"
+adapters = ["axum", "cloudflare", "fastly", "spin"]
+description = "Return the greeting from the typed blob config (blob-model demo)"
+
 # -- KV demo routes --------------------------------------------------------
 
 [[triggers.http]]

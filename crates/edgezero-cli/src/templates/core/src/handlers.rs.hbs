@@ -112,6 +112,23 @@ fn proxy_not_available_response() -> Result<Response, EdgeError> {
         .map_err(EdgeError::internal)
 }
 
+// `cfg.api_token` is the RESOLVED secret value (not the
+// key name). The framework's secret walk populated it at
+// extract time; the handler uses it directly. No
+// `secret_store.require_str(...)` call — the framework
+// owns the lookup.
+//
+// #[action]
+// pub async fn upstream() -> Result<Response, EdgeError> {
+//     // Uncomment when AppConfig has `#[secret] api_token`.
+//     // let AppConfig(cfg) = ...; // via extractor injection
+//     // make_upstream_call(&cfg.api_token).await?;
+//     Ok(text("upstream sample"))
+// }
+//
+// // Uncomment together with the `upstream` handler above:
+// use edgezero_core::extractor::AppConfig;
+
 #[cfg(test)]
 mod tests {
     use super::*;

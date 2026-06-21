@@ -17,17 +17,17 @@
 # per the Spin runtime-config docs:
 # https://spinframework.dev/v3/dynamic-configuration#key-value-store-runtime-configuration
 #
-# `edgezero config push --adapter spin` dispatches per-backend:
-# `type = "spin"` writes directly into the local SQLite KV file;
+# `<name>-cli config push --adapter spin` dispatches per-backend:
+# `type = "spin"` writes the typed config as a single JSON blob
+# directly into the local SQLite KV file under the blob key;
 # Fermyon Cloud deploys (auto-detected from
 # `[adapters.spin.commands].deploy = "spin deploy"`) shell out to
-# `spin cloud key-value set --app <APP> --label <LABEL> KEY=VALUE …`
+# `spin cloud key-value set --app <APP> --label <LABEL> <KEY>=<BLOB>`
 # (where `<APP>` is `[application].name` from spin.toml and
-# `<LABEL>` is this stanza's key), batching ≥1000 entries per ≤96
-# KiB shellout. Pre-link the label to a cloud KV store via
-# `spin cloud link key-value --app <APP> --store <STORE> <LABEL>`
-# before the first push. Redis / azure_cosmos / unknown types
-# return a clear error pointing at the backend's native CLI.
+# `<LABEL>` is this stanza's key). Pre-link the label to a cloud KV
+# store via `spin cloud link key-value --app <APP> --store <STORE>
+# <LABEL>` before the first push. Redis / azure_cosmos / unknown
+# types return a clear error pointing at the backend's native CLI.
 
 [key_value_store.app_config]
 type = "spin"

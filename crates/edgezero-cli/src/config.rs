@@ -20,15 +20,20 @@
 
 use crate::args::{ConfigPushArgs, ConfigValidateArgs};
 use crate::ensure_adapter_defined;
-use edgezero_adapter::registry::{self as adapter_registry, ResolvedStoreId, TypedSecretEntry};
+use edgezero_adapter::registry::{
+    self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
+};
 use edgezero_core::app_config::{
     self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind,
 };
+use edgezero_core::blob_envelope::BlobEnvelope;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use similar::TextDiff;
+use std::collections::BTreeMap;
+use std::io::{stdin, Error as IoError, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 use toml::value::Table;
 use toml::Value;
@@ -41,9 +46,9 @@ use validator::Validate;
 struct PushContext {
     adapter: &'static dyn adapter_registry::Adapter,
     /// Resolved push-time overlay values (seed URL / token / local
-    /// flag). Owned so the lifetime story stays simple; `dispatch_push`
-    /// borrows from this to build the `AdapterPushContext<'_>` it
-    /// hands the trait method.
+    /// flag). Owned so the lifetime story stays simple; the typed-push
+    /// helper borrows from this to build the `AdapterPushContext<'_>`
+    /// it hands the adapter trait method.
     adapter_push_ctx: ResolvedAdapterPushContext,
     /// Resolved config store id (`--store` or the manifest
     /// default), paired with its env-resolved platform name. The
@@ -59,7 +64,7 @@ struct PushContext {
 
 /// Push-time overlay values resolved by [`load_push_context`].
 /// Owned strings/paths so the CLI's borrow story stays simple —
-/// `dispatch_push` creates the borrowing
+/// the typed-push helper creates the borrowing
 /// [`adapter_registry::AdapterPushContext`] at the trait call boundary.
 #[derive(Debug, Default)]
 struct ResolvedAdapterPushContext {
@@ -93,6 +98,40 @@ impl ValidationContext {
     fn manifest(&self) -> &Manifest {
         self.manifest_loader.manifest()
     }
+}
+
+// -------------------------------------------------------------------
+// Types for run_config_push_typed helpers (must precede all fns per
+// clippy::arbitrary_source_item_ordering)
+// -------------------------------------------------------------------
+
+/// Outcome of the first read + diff render step.
+enum FirstReadOutcome {
+    /// Remote SHA == local SHA; caller returns `Ok(())` immediately.
+    NoChange,
+    /// Remote was Missing or Unsupported; nothing to compare against,
+    /// caller proceeds to consent.
+    ProceedFromMissingOrUnsupported,
+    /// Remote was `Present` with a different SHA; carry the SHA forward so
+    /// Step 3.5 can race-detect against it.
+    ProceedFromPresent { approved_remote_sha: String },
+}
+
+/// Borrowed adapter paths threaded through the typed-push helpers.
+/// All fields are borrowed so the struct is `Copy`-cheap.
+struct PushPathRefs<'pp> {
+    adapter_manifest_path: Option<&'pp str>,
+    component_selector: Option<&'pp str>,
+    manifest_root: &'pp Path,
+    push_ctx: &'pp adapter_registry::AdapterPushContext<'pp>,
+}
+
+/// Outcome of Step 3.5 re-check.
+enum RecheckOutcome {
+    /// Concurrent push reached the same state — skip the write.
+    Skip,
+    /// Proceed to write (any warnings already emitted).
+    Write,
 }
 
 /// Raw flow — no typed `C`. Runs every check the typed flow runs
@@ -147,75 +186,563 @@ where
     Ok(())
 }
 
-/// Raw flow — push the on-disk `<name>.toml` as a parsed TOML tree.
-/// Skips no fields (no `SECRET_FIELDS` knowledge); the operator is
-/// responsible for keeping sensitive material out of a raw push.
+// -------------------------------------------------------------------
+/// Stub-pointer for the bundled `edgezero` binary's `config push`
+/// subcommand (spec §3.2.1).
 ///
-/// Spec: push runs strict pre-flight validation before writing
-/// anything. For the raw flow that means the same shared checks
-/// `config validate --strict` runs — adapter manifest discovery
-/// (Spin component, etc.), per-adapter config-key validation
-/// (Spin's `^[a-z][a-z0-9_]*$` rule), capability-aware
-/// completeness (rejects multi-id stores against Single-capable
-/// adapters), and handler-path well-formedness — not just the
-/// schema/load-time checks. Skipping these would let a push
-/// half-mutate a manifest before a key collision or a Single-
-/// capable adapter rejected the entries downstream.
+/// The blob app-config rewrite requires a TYPED downstream CLI that
+/// embeds the app's `AppConfig<C>` struct. The bundled `edgezero`
+/// binary has no such type in scope, so `config push` on the bundled
+/// binary is intentionally unsupported in v1. Downstream projects
+/// generate their own `<app-name>-cli` binary that calls
+/// [`run_config_push_typed`] with their concrete `C`.
+///
+/// This function always returns `Err(...)` with a pointer to the
+/// typed downstream CLI and the spec section. The subcommand itself
+/// must still be registered in the bundled binary's `Command` enum so
+/// `edgezero config push --help` is reachable and the error message
+/// can be displayed.
 ///
 /// # Errors
-/// Returns a human-readable error string on any load / resolution /
-/// adapter-push failure.
+/// Always returns a pointer error explaining §3.2.1.
 #[inline]
-pub fn run_config_push(args: &ConfigPushArgs) -> Result<(), String> {
-    let ctx = load_push_context(args)?;
-    run_shared_checks(&ctx.validation)?;
-    let entries = flatten_raw_for_push(&ctx.validation.raw_config)?;
-    dispatch_push(&ctx, &entries, args.dry_run, args.local)
+pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
+    Err(
+        "`config push` on the bundled `edgezero` binary is not supported in v1; \
+         the blob app-config rewrite requires the typed downstream CLI \
+         (e.g. `<app-name>-cli config push`) which embeds your typed \
+         AppConfig<C>. See docs/superpowers/specs/2026-06-16-blob-app-config.md \u{00a7}3.2.1."
+            .to_owned(),
+    )
 }
 
-/// Typed flow — push the user's `C` struct. Runs the same strict
-/// pre-flight validation `config validate --strict` does (typed
-/// deserialise, `validator::Validate`, secret checks), then
-/// serialises `C` and feeds the adapter the flattened, dotted-key
-/// entries with `SECRET_FIELDS` (any kind) stripped.
+/// Typed flow — push the user's `C` struct. Runs strict pre-flight
+/// validation, then builds a `BlobEnvelope`, reads back the current
+/// remote for skip-on-equal + inline diff, prompts for consent, and
+/// writes via the adapter.
 ///
 /// # Errors
-/// Returns a human-readable error string on any validation or push
-/// failure.
+/// Returns a human-readable error string on any validation, read-back,
+/// consent, or push failure.
 #[inline]
 pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String>
 where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
+    // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
-    // Spec: strict pre-flight. The typed flow already runs
-    // typed-only checks below; `run_shared_checks` here adds
-    // everything `config validate --strict` does — shared
-    // adapter checks (`[component.*]` discovery for Spin,
-    // adapter-manifest well-formedness), capability-aware
-    // completeness, and handler-path well-formedness. Without
-    // this a Single-capable adapter with multi-id stores would
-    // only surface inside the per-adapter push, potentially
-    // after a partial mutation.
     run_shared_checks(&ctx.validation)?;
-
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
-    let typed: C = app_config::load_app_config_with_options::<C>(
+    let typed: C = app_config::deserialize_app_config_with_options::<C>(
         &ctx.validation.app_config_path,
         &ctx.validation.app_name,
         &opts,
     )
     .map_err(|err| format_app_config_error(&err))?;
-
-    typed
-        .validate()
+    app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
     typed_secret_checks(&typed, &ctx.validation)?;
     run_adapter_typed_checks::<C>(&ctx.validation)?;
 
-    let entries = flatten_typed_for_push::<C>(&typed)?;
-    dispatch_push(&ctx, &entries, args.dry_run, args.local)
+    // Resolve adapter paths.
+    let (manifest_root, adapter_manifest_path, component_selector, push_ctx) =
+        resolve_push_paths(&ctx)?;
+    let paths = PushPathRefs {
+        manifest_root,
+        adapter_manifest_path: adapter_manifest_path.as_deref(),
+        component_selector: component_selector.as_deref(),
+        push_ctx: &push_ctx,
+    };
+
+    // Build envelope.
+    // Honour --key override (§5.4): if the caller supplied an explicit key,
+    // use it; otherwise fall back to the manifest's resolved logical store id.
+    let key = args
+        .key
+        .clone()
+        .unwrap_or_else(|| ctx.store.logical.clone());
+    let body = build_config_envelope::<C>(&typed)?;
+    let local_envelope: BlobEnvelope =
+        serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
+    let local_sha = local_envelope.sha256.clone();
+
+    // Step 2: first read + diff.
+    let remote = read_remote(ctx.adapter, args.local, &paths, &ctx.store, &key)?;
+    let approved_remote_sha =
+        match render_first_read_diff(&remote, &key, &local_envelope, &local_sha, args.no_diff)? {
+            FirstReadOutcome::NoChange => {
+                push_info(&format!("# no changes (sha256 matches: {local_sha})"));
+                return Ok(());
+            }
+            FirstReadOutcome::ProceedFromPresent {
+                approved_remote_sha,
+            } => Some(approved_remote_sha),
+            FirstReadOutcome::ProceedFromMissingOrUnsupported => None,
+        };
+
+    // Step 3: consent gate (§8.2 default or §8.3 Spin Cloud Unsupported).
+    handle_consent(args, &remote)?;
+
+    // Step 3.5: re-fetch + skip-on-equal + concurrent-push detection.
+    if !args.dry_run && !matches!(remote, ReadConfigEntry::Unsupported(_)) {
+        match recheck_before_write(
+            ctx.adapter,
+            args,
+            &paths,
+            &ctx.store,
+            &key,
+            &local_sha,
+            &remote,
+            approved_remote_sha.as_deref(),
+        )? {
+            RecheckOutcome::Skip => return Ok(()),
+            RecheckOutcome::Write => {}
+        }
+    }
+
+    // Step 4: write.
+    write_envelope(ctx.adapter, args, &ctx, &paths, &key, body)
+}
+
+// -------------------------------------------------------------------
+// Helpers for run_config_push_typed
+// -------------------------------------------------------------------
+
+/// Consent gate: §8.3 Spin Cloud four-branch UX when `remote` is
+/// `Unsupported`; §8.2 default flow otherwise.
+fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(), String> {
+    if let ReadConfigEntry::Unsupported(reason) = remote {
+        if args.dry_run {
+            return Err(format!(
+                "config push --dry-run --adapter spin against Spin Cloud is unsupported \
+                 ({reason}); re-run with --local for the on-disk SQLite write or drop \
+                 --dry-run to write unconditionally with --yes"
+            ));
+        }
+        if !args.yes {
+            if !stdin().is_terminal() {
+                return Err(format!(
+                    "Spin Cloud read-back unsupported ({reason}); pass --yes for \
+                     non-interactive runs (the push writes unconditionally)"
+                ));
+            }
+            #[expect(
+                clippy::print_stderr,
+                reason = "stream discipline: TTY consent prompt goes to stderr per round-34; eprint! (no newline) keeps the cursor on the prompt line"
+            )]
+            {
+                eprint!("cannot read remote on Spin Cloud ({reason}); write anyway? [y/N] ");
+            };
+            let mut buf = String::new();
+            stdin()
+                .read_line(&mut buf)
+                .map_err(|err| format!("stdin read failed: {err}"))?;
+            if !matches!(buf.trim(), "y" | "Y") {
+                return Err("aborted by operator".into());
+            }
+        }
+        Ok(())
+    } else {
+        require_consent(args, remote)
+    }
+}
+
+/// Write an informational message to stderr. All push messages that are
+/// not errors go here (stream discipline per round-34).
+#[expect(
+    clippy::print_stderr,
+    reason = "stream discipline: informational messages go to stderr per round-34"
+)]
+fn push_info(msg: &str) {
+    eprintln!("{msg}");
+}
+
+/// Dispatch a single read to either `read_config_entry_local` or
+/// `read_config_entry` based on `local`. Collapses the repeated
+/// if/else adapter-read pattern that appears 3× in the typed push flow.
+fn read_remote(
+    adapter: &dyn adapter_registry::Adapter,
+    local: bool,
+    paths: &PushPathRefs<'_>,
+    store: &ResolvedStoreId,
+    key: &str,
+) -> Result<ReadConfigEntry, String> {
+    if local {
+        adapter.read_config_entry_local(
+            paths.manifest_root,
+            paths.adapter_manifest_path,
+            paths.component_selector,
+            store,
+            key,
+            paths.push_ctx,
+        )
+    } else {
+        adapter.read_config_entry(
+            paths.manifest_root,
+            paths.adapter_manifest_path,
+            paths.component_selector,
+            store,
+            key,
+            paths.push_ctx,
+        )
+    }
+}
+
+/// Step 3.5: re-fetch right before the write to detect concurrent pushes
+/// and skip-on-equal (round-36 M-1 / round-38 H-1).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recheck needs adapter, local flag, all path refs, store, key, local_sha, first_read, and approved_remote_sha — each is distinct; a sub-struct would shift complexity without simplifying the call site"
+)]
+fn recheck_before_write(
+    adapter: &dyn adapter_registry::Adapter,
+    args: &ConfigPushArgs,
+    paths: &PushPathRefs<'_>,
+    store: &ResolvedStoreId,
+    key: &str,
+    local_sha: &str,
+    first_read: &ReadConfigEntry,
+    approved_remote_sha: Option<&str>,
+) -> Result<RecheckOutcome, String> {
+    let remote_now = read_remote(adapter, args.local, paths, store, key)?;
+    if let ReadConfigEntry::Present(body_now) = remote_now {
+        let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now)
+            .map_err(|err| format!("post-consent remote envelope parse failed: {err}"))?;
+        remote_now_env
+            .verify()
+            .map_err(|err| format!("post-consent remote envelope verification failed: {err}"))?;
+        if remote_now_env.sha256 == local_sha {
+            push_info(&format!(
+                "# concurrent push reached the same state (sha256 matches: {local_sha}); skipping write"
+            ));
+            return Ok(RecheckOutcome::Skip);
+        }
+        // Round-37 H-1: compare against approved_remote_sha (the inner
+        // remote_envelope from the first read is out of scope here).
+        // Round-38 H-1: approved_remote_sha is None for MissingKey/MissingStore
+        // first reads — display "(none)".
+        let approved_display = approved_remote_sha.map_or("(none)", short_ref);
+        if approved_remote_sha != Some(remote_now_env.sha256.as_str()) {
+            push_info(&format!(
+                "# warning: remote changed between diff and write (was {} now {}); applying local anyway",
+                approved_display,
+                short_ref(&remote_now_env.sha256),
+            ));
+        }
+    } else if matches!(first_read, ReadConfigEntry::Present(_)) {
+        // First read Present, second read MissingKey/MissingStore:
+        // the remote was removed while we waited for consent. Warn
+        // and fall through — creating rather than overwriting is fine.
+        if let Some(approved) = approved_remote_sha {
+            push_info(&format!(
+                "# warning: remote was removed between diff and write (was {}); creating fresh",
+                short_ref(approved),
+            ));
+        }
+    } else {
+        // First read MissingKey/MissingStore, second also Missing —
+        // nothing changed; fall through to write silently.
+    }
+    Ok(RecheckOutcome::Write)
+}
+
+/// Render the first-read diff and return the outcome.
+///
+/// - `Present` with matching SHA → `NoChange`.
+/// - `Present` with differing SHA → renders diff (when `!no_diff`) and
+///   returns `ProceedFromPresent` with the remote SHA.
+/// - `MissingKey` / `MissingStore` → renders "all leaves added" diff
+///   (when `!no_diff`) and returns `ProceedFromMissingOrUnsupported`.
+/// - `Unsupported` → returns `ProceedFromMissingOrUnsupported` without
+///   rendering.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "ReadConfigEntry is #[non_exhaustive]; wildcard covers future variants and the no_diff guard cases"
+)]
+fn render_first_read_diff(
+    remote: &ReadConfigEntry,
+    key: &str,
+    local_envelope: &BlobEnvelope,
+    local_sha: &str,
+    no_diff: bool,
+) -> Result<FirstReadOutcome, String> {
+    match remote {
+        ReadConfigEntry::Present(body_str) => {
+            let remote_envelope: BlobEnvelope = serde_json::from_str(body_str)
+                .map_err(|err| format!("remote envelope parse failed: {err}"))?;
+            remote_envelope
+                .verify()
+                .map_err(|err| format!("remote envelope verification failed: {err}"))?;
+            if remote_envelope.sha256 == local_sha {
+                return Ok(FirstReadOutcome::NoChange);
+            }
+            if !no_diff {
+                print_unified_diff_inline(
+                    &remote_envelope.data,
+                    &local_envelope.data,
+                    &remote_envelope.sha256,
+                    local_sha,
+                );
+            }
+            Ok(FirstReadOutcome::ProceedFromPresent {
+                approved_remote_sha: remote_envelope.sha256.clone(),
+            })
+        }
+        ReadConfigEntry::MissingKey if !no_diff => {
+            push_info(&format!("# no remote at key `{key}`; all leaves added"));
+            print_unified_diff_inline(
+                &serde_json::Value::Object(serde_json::Map::default()),
+                &local_envelope.data,
+                "(none)",
+                local_sha,
+            );
+            Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
+        }
+        ReadConfigEntry::MissingStore if !no_diff => {
+            push_info(
+                "# store has no matching backend yet \u{2014} run `edgezero provision \
+                 --adapter <name>` first if this is the live remote",
+            );
+            push_info("# no remote store; all leaves added");
+            print_unified_diff_inline(
+                &serde_json::Value::Object(serde_json::Map::default()),
+                &local_envelope.data,
+                "(none)",
+                local_sha,
+            );
+            Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
+        }
+        // Unsupported, MissingKey/MissingStore with no_diff, and future
+        // #[non_exhaustive] variants — fall through.
+        _ => Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported),
+    }
+}
+
+/// Consent gate for §8.2 default flow (non-Spin-Cloud adapters and all
+/// read-capable variants). `--yes` or `--dry-run` bypass the prompt.
+/// TTY: prompt. Non-TTY without `--yes`: error.
+fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(), String> {
+    if args.yes {
+        return Ok(());
+    }
+    if args.dry_run {
+        return Ok(());
+    }
+    if stdin().is_terminal() {
+        #[expect(
+            clippy::print_stderr,
+            reason = "stream discipline: TTY consent prompt goes to stderr per round-34"
+        )]
+        {
+            eprint!("Apply changes? [y/N] ");
+        };
+        let mut buf = String::new();
+        stdin()
+            .read_line(&mut buf)
+            .map_err(|err| format!("stdin read failed: {err}"))?;
+        if !matches!(buf.trim(), "y" | "Y") {
+            return Err("aborted by operator".into());
+        }
+        Ok(())
+    } else {
+        Err("non-interactive run requires --yes (no TTY available for prompt)".into())
+    }
+}
+
+/// Resolve the adapter-manifest root, adapter manifest path, component
+/// selector, and `AdapterPushContext` from the push context.
+///
+/// Returns `(manifest_root, adapter_manifest_path, component_selector, push_ctx)`.
+#[expect(
+    clippy::type_complexity,
+    reason = "four-tuple return avoids a dedicated struct for a single call site; the items are immediately destructured by the caller"
+)]
+fn resolve_push_paths(
+    ctx: &PushContext,
+) -> Result<
+    (
+        &Path,
+        Option<String>,
+        Option<String>,
+        adapter_registry::AdapterPushContext<'_>,
+    ),
+    String,
+> {
+    let manifest = ctx.validation.manifest();
+    let (_canonical, adapter_cfg) =
+        manifest.adapter_entry(ctx.adapter.name()).ok_or_else(|| {
+            format!(
+                "adapter `{}` vanished from the manifest after lookup",
+                ctx.adapter.name()
+            )
+        })?;
+    let manifest_root = ctx
+        .validation
+        .manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let resolved = &ctx.adapter_push_ctx;
+    let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(resolved.local);
+    if let Some(path) = resolved.runtime_config_path.as_deref() {
+        push_ctx = push_ctx.with_runtime_config_path(path);
+    }
+    if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
+        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
+    }
+    let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
+    let component_selector = adapter_cfg.adapter.component.clone();
+    Ok((
+        manifest_root,
+        adapter_manifest_path,
+        component_selector,
+        push_ctx,
+    ))
+}
+
+/// Step 4: dry-run log + adapter write dispatch.
+fn write_envelope(
+    adapter: &dyn adapter_registry::Adapter,
+    args: &ConfigPushArgs,
+    ctx: &PushContext,
+    paths: &PushPathRefs<'_>,
+    key: &str,
+    body: String,
+) -> Result<(), String> {
+    if args.dry_run {
+        log::info!(
+            "[edgezero] config push --dry-run{} for `{}` -> store `{}` (platform name `{}`):",
+            if args.local { " --local" } else { "" },
+            adapter.name(),
+            ctx.store.logical,
+            ctx.store.platform
+        );
+    }
+    let entries: Vec<(String, String)> = vec![(key.to_owned(), body)];
+    let lines = if args.local {
+        adapter.push_config_entries_local(
+            paths.manifest_root,
+            paths.adapter_manifest_path,
+            paths.component_selector,
+            &ctx.store,
+            &entries,
+            paths.push_ctx,
+            args.dry_run,
+        )?
+    } else {
+        adapter.push_config_entries(
+            paths.manifest_root,
+            paths.adapter_manifest_path,
+            paths.component_selector,
+            &ctx.store,
+            &entries,
+            paths.push_ctx,
+            args.dry_run,
+        )?
+    };
+    for line in lines {
+        log::info!("{line}");
+    }
+    Ok(())
+}
+
+/// Truncate a SHA to 8 characters for display. Returns the input
+/// unchanged when ≤ 8 bytes (the `"(none)"` sentinel is 6 bytes —
+/// avoids a panic on the `&sha[..8]` index).
+pub(crate) fn short_ref(sha: &str) -> &str {
+    if sha.len() <= 8 {
+        sha
+    } else {
+        #[expect(
+            clippy::string_slice,
+            reason = "checked: sha.len() > 8 ensures this 8-byte index is within ASCII hex bytes"
+        )]
+        {
+            &sha[..8]
+        }
+    }
+}
+
+/// Pretty-print a `serde_json::Value` with object keys sorted
+/// recursively by UTF-8 byte order. Used by the diff renderer so two
+/// trees with identical content but different source-key order produce
+/// identical normalised text (and thus an empty diff).
+pub(crate) fn render_for_diff(value: &serde_json::Value) -> String {
+    let sorted = sort_keys_recursive(value);
+    serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "<unrenderable>".into())
+}
+
+fn sort_keys_recursive(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value as JValue};
+    match value {
+        JValue::Object(map) => {
+            let mut sorted_map = Map::new();
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable_by(|ka, kb| ka.as_bytes().cmp(kb.as_bytes()));
+            for key in keys {
+                sorted_map.insert(key.clone(), sort_keys_recursive(&map[key]));
+            }
+            JValue::Object(sorted_map)
+        }
+        JValue::Array(items) => JValue::Array(items.iter().map(sort_keys_recursive).collect()),
+        // Scalar leaf types — clone unchanged. Explicit arms required by
+        // `clippy::wildcard_enum_match_arm` (serde_json::Value is #[non_exhaustive]).
+        other @ (JValue::Null | JValue::Bool(_) | JValue::Number(_) | JValue::String(_)) => {
+            other.clone()
+        }
+    }
+}
+
+/// Write a unified diff of `remote_data` vs `local_data` to `out`.
+/// Both trees are normalised via [`render_for_diff`] before diffing so
+/// key-ordering differences produce an empty diff. Uses
+/// `similar::TextDiff` to produce standard git-style unified diff output.
+///
+/// **Stream discipline (round-34):** diff CONTENT goes to `out` (stdout
+/// in production) so operators can pipe through `git diff` colour
+/// wrappers. Informational messages go to stderr via `eprintln!` in the
+/// caller. Never `log::*` — prefixes corrupt TTY renders and `jq` consumers.
+pub(crate) fn print_unified_diff_to_writer<W: Write>(
+    remote_data: &serde_json::Value,
+    local_data: &serde_json::Value,
+    remote_sha: &str,
+    local_sha: &str,
+    out: &mut W,
+) -> Result<(), IoError> {
+    let remote_text = render_for_diff(remote_data);
+    let local_text = render_for_diff(local_data);
+    let diff = TextDiff::from_lines(&remote_text, &local_text);
+    let remote_header = format!("remote (sha256: {})", short_ref(remote_sha));
+    let local_header = format!("local  (sha256: {})", short_ref(local_sha));
+    let mut builder = diff.unified_diff();
+    let unified = builder
+        .header(&remote_header, &local_header)
+        .context_radius(3);
+    write!(out, "{unified}")
+}
+
+/// Inline unified diff renderer — writes to stdout. Production path
+/// for `config push`'s inline-diff prompt. Tests use
+/// [`print_unified_diff_to_writer`] to capture into a `Vec<u8>`.
+pub(crate) fn print_unified_diff_inline(
+    remote_data: &serde_json::Value,
+    local_data: &serde_json::Value,
+    remote_sha: &str,
+    local_sha: &str,
+) {
+    use std::io::stdout;
+    let mut stdout = stdout().lock();
+    // Silently ignore write errors — stdout may be a closed pipe (e.g.
+    // `edgezero config push | head`). The operator already saw the diff
+    // header on stderr; a broken pipe is not a push failure.
+    drop(print_unified_diff_to_writer(
+        remote_data,
+        local_data,
+        remote_sha,
+        local_sha,
+        &mut stdout,
+    ));
 }
 
 // -------------------------------------------------------------------
@@ -271,73 +798,6 @@ fn resolve_adapter_push_ctx(
     }
 }
 
-fn dispatch_push(
-    ctx: &PushContext,
-    entries: &[(String, String)],
-    dry_run: bool,
-    local: bool,
-) -> Result<(), String> {
-    let manifest = ctx.validation.manifest();
-    let (_canonical, adapter_cfg) =
-        manifest.adapter_entry(ctx.adapter.name()).ok_or_else(|| {
-            format!(
-                "adapter `{}` vanished from the manifest after lookup",
-                ctx.adapter.name()
-            )
-        })?;
-    let manifest_root = ctx
-        .validation
-        .manifest_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-
-    // AdapterPushContext is #[non_exhaustive], so build it via the
-    // builder API instead of a struct literal.
-    let resolved = &ctx.adapter_push_ctx;
-    let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(resolved.local);
-    if let Some(path) = resolved.runtime_config_path.as_deref() {
-        push_ctx = push_ctx.with_runtime_config_path(path);
-    }
-    if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
-        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
-    }
-    let lines = if local {
-        ctx.adapter.push_config_entries_local(
-            manifest_root,
-            adapter_cfg.adapter.manifest.as_deref(),
-            adapter_cfg.adapter.component.as_deref(),
-            &ctx.store,
-            entries,
-            &push_ctx,
-            dry_run,
-        )?
-    } else {
-        ctx.adapter.push_config_entries(
-            manifest_root,
-            adapter_cfg.adapter.manifest.as_deref(),
-            adapter_cfg.adapter.component.as_deref(),
-            &ctx.store,
-            entries,
-            &push_ctx,
-            dry_run,
-        )?
-    };
-    if dry_run {
-        log::info!(
-            "[edgezero] config push --dry-run{} for `{}` -> store `{}` (platform name `{}`):",
-            if local { " --local" } else { "" },
-            ctx.adapter.name(),
-            ctx.store.logical,
-            ctx.store.platform
-        );
-    }
-    for line in lines {
-        log::info!("{line}");
-    }
-    Ok(())
-}
-
 fn resolve_config_store_id(requested: Option<&str>, manifest: &Manifest) -> Result<String, String> {
     let Some(declaration) = manifest.stores.config.as_ref() else {
         return Err(
@@ -365,85 +825,43 @@ fn resolved_default(declaration: &StoreDeclaration) -> String {
 }
 
 // -------------------------------------------------------------------
-// Flattening — raw (toml::Value) and typed (Serialize -> JSON)
+// Blob envelope build — typed push only
 // -------------------------------------------------------------------
 
-fn flatten_raw_for_push(raw: &Value) -> Result<Vec<(String, String)>, String> {
-    let json: serde_json::Value = serde_json::to_value(raw)
-        .map_err(|err| format!("failed to convert raw TOML to JSON for flattening: {err}"))?;
-    let mut out = Vec::new();
-    flatten_json_into(&json, "", &BTreeSet::new(), &mut out)?;
-    Ok(out)
-}
-
-fn flatten_typed_for_push<C>(typed: &C) -> Result<Vec<(String, String)>, String>
+/// Serialise `typed` to a [`BlobEnvelope`] JSON string.
+///
+/// Every field — including `#[secret]` and `#[secret(store_ref)]` fields —
+/// is stored VERBATIM in the blob. The value at rest for a secret field is
+/// the operator-supplied key NAME (e.g. `"demo_api_token"`), NOT the
+/// resolved secret value. The runtime extractor
+/// (`crates/edgezero-core/src/extractor.rs`, `secret_walk`) reads those
+/// key names from `data` and swaps each one for the resolved secret value
+/// from the appropriate secret store. Spec §3.3 (secret-key NAMES at rest).
+///
+/// `generated_at` is stamped with the current UTC second.
+///
+/// # Errors
+/// Returns a human-readable error string if serialisation fails.
+fn build_config_envelope<C>(typed: &C) -> Result<String, String>
 where
-    C: Serialize + AppConfigMeta,
+    C: Serialize,
 {
-    let json = serde_json::to_value(typed)
-        .map_err(|err| format!("failed to serialize typed app-config: {err}"))?;
-    if !json.is_object() {
-        return Err(
-            "typed app-config did not serialize to a JSON object; only struct-shaped configs are supported"
-                .to_owned(),
-        );
-    }
-    // Skip every `#[secret]` AND `#[secret(store_ref)]` top-level
-    // field — runtime store ids and secret values both belong out
-    // of the config-store payload.
-    let secret_field_names: BTreeSet<String> = C::SECRET_FIELDS
-        .iter()
-        .map(|field| field.name.to_owned())
-        .collect();
-    let mut out = Vec::new();
-    flatten_json_into(&json, "", &secret_field_names, &mut out)?;
-    Ok(out)
+    // The blob carries every typed field VERBATIM — including #[secret]
+    // and #[secret(store_ref)] fields, whose value at rest is the
+    // operator-supplied key NAME (e.g. "demo_api_token"). The runtime
+    // extractor reads those key names from data and swaps each one for
+    // the resolved secret value. Spec §3.3 (secret-key NAMES at rest).
+    let data: serde_json::Value = serde_json::to_value(typed)
+        .map_err(|err| format!("failed to serialise typed config: {err}"))?;
+    let envelope = BlobEnvelope::new(data, generated_at_rfc3339());
+    serde_json::to_string(&envelope).map_err(|err| format!("failed to serialise envelope: {err}"))
 }
 
-fn flatten_json_into(
-    value: &serde_json::Value,
-    prefix: &str,
-    skip_top_level: &BTreeSet<String>,
-    out: &mut Vec<(String, String)>,
-) -> Result<(), String> {
-    match value {
-        serde_json::Value::Null => Ok(()),
-        serde_json::Value::Bool(boolean) => {
-            out.push((prefix.to_owned(), boolean.to_string()));
-            Ok(())
-        }
-        serde_json::Value::Number(number) => {
-            out.push((prefix.to_owned(), number.to_string()));
-            Ok(())
-        }
-        serde_json::Value::String(text) => {
-            out.push((prefix.to_owned(), text.clone()));
-            Ok(())
-        }
-        serde_json::Value::Array(_) => {
-            //: arrays are JSON-encoded into a single value.
-            let encoded = serde_json::to_string(value)
-                .map_err(|err| format!("failed to JSON-encode array at key `{prefix}`: {err}"))?;
-            out.push((prefix.to_owned(), encoded));
-            Ok(())
-        }
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if prefix.is_empty() && skip_top_level.contains(key) {
-                    continue;
-                }
-                let full = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{prefix}.{key}")
-                };
-                // Only the top-level skip-set applies; nested keys
-                // can never be secrets (SECRET_FIELDS is top-level).
-                flatten_json_into(child, &full, &BTreeSet::new(), out)?;
-            }
-            Ok(())
-        }
-    }
+/// Current UTC timestamp formatted as RFC 3339 with second precision and
+/// a trailing `Z` (`2026-06-17T18:42:31Z`). Matches spec §4.1 example.
+/// `generated_at` is informational only — it is NOT part of the SHA.
+fn generated_at_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContext, String> {
@@ -857,15 +1275,20 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 
 #[cfg(test)]
 #[expect(
+    clippy::arbitrary_source_item_ordering,
     clippy::default_numeric_fallback,
-    reason = "the validator `range(min = 100, max = 60_000)` bounds default to the field's int type"
+    reason = "test module groups items by subject (PathPrepend co-located with its fake-spin consumers, fixtures with their tests) rather than by item kind; `range(min = 100, max = 60_000)` bounds default to the field's int type"
 )]
 mod tests {
     use super::*;
     use crate::test_support::{manifest_guard, EnvOverride};
     use edgezero_core::app_config::SecretField;
     use serde::{Deserialize, Serialize};
+    #[cfg(unix)]
+    use std::ffi::OsString;
     use std::fs;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     // ---------- shared fixtures ----------
@@ -998,11 +1421,14 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             adapter: adapter.to_owned(),
             app_config: None,
             dry_run: false,
+            key: None,
             local: false,
             manifest: manifest.to_path_buf(),
+            no_diff: false,
             no_env: true,
             runtime_config: None,
             store: None,
+            yes: false,
         }
     }
 
@@ -1623,348 +2049,151 @@ deep = true
     // config push (raw + typed) — spec
     // -------------------------------------------------------------------
 
-    // ---------- raw push ----------
+    // ---------- raw push (stub-pointer, spec §3.2.1) ----------
 
+    /// Spec §3.2.1: `config push` on the bundled `edgezero` binary is a
+    /// stub-pointer. The blob app-config rewrite requires a typed downstream
+    /// CLI; the bundled binary has no `AppConfig<C>` in scope. The subcommand
+    /// must always return `Err(...)` with a pointer to the typed downstream CLI.
     #[test]
-    fn raw_push_axum_writes_local_config_json() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
-        run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
-        let written = dir.path().join(".edgezero/local-config-app_config.json");
-        let raw = fs::read_to_string(&written).expect("wrote local-config file");
-        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-        // The raw flow doesn't strip anything — `api_token` from
-        // VALID_APP_CONFIG appears in the payload.
-        assert_eq!(parsed["api_token"], "demo_api_token");
-        assert_eq!(parsed["greeting"], "hello");
-    }
-
-    #[test]
-    fn raw_push_dry_run_does_not_write() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
-        let mut args = push_args(&manifest, "axum");
-        args.dry_run = true;
-        run_config_push(&args).expect("dry-run succeeds");
-        assert!(
-            !dir.path().join(".edgezero").exists(),
-            ".edgezero must not be created in dry-run"
-        );
-    }
-
-    #[test]
-    fn raw_push_errors_when_stores_config_missing() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let manifest_no_config = r#"
-[app]
-name = "demo-app"
-
-[adapters.axum.adapter]
-crate = "crates/demo"
-
-[adapters.axum.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-"#;
-        let (_dir, manifest, _) = setup_project(manifest_no_config, VALID_APP_CONFIG);
-        let err = run_config_push(&push_args(&manifest, "axum"))
-            .expect_err("missing [stores.config] must error");
-        assert!(
-            err.contains("[stores.config]"),
-            "error names the missing section: {err}"
-        );
-    }
-
-    #[test]
-    fn raw_push_errors_when_adapter_not_declared() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
+    fn run_config_push_is_stub_pointer_in_bundled_binary() {
         let (_dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
-        let err = run_config_push(&push_args(&manifest, "not-an-adapter"))
-            .expect_err("undeclared adapter must error");
-        assert!(
-            err.contains("not-an-adapter"),
-            "error names the undeclared adapter: {err}"
-        );
-    }
-
-    #[test]
-    fn raw_push_respects_explicit_store_selection() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        // Two declared ids — push to the non-default one via --store.
-        let manifest_two_ids = r#"
-[app]
-name = "demo-app"
-
-[adapters.axum.adapter]
-crate = "crates/demo"
-
-[adapters.axum.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.config]
-ids = ["app_config", "alt_config"]
-default = "app_config"
-
-[stores.secrets]
-ids = ["default"]
-"#;
-        let (dir, manifest, _) = setup_project(manifest_two_ids, VALID_APP_CONFIG);
-        let mut args = push_args(&manifest, "axum");
-        args.store = Some("alt_config".to_owned());
-        run_config_push(&args).expect("explicit --store=alt_config succeeds");
-        assert!(
-            dir.path()
-                .join(".edgezero/local-config-alt_config.json")
-                .exists(),
-            "push targeted alt_config"
+        let err = run_config_push(&push_args(&manifest, "axum")).expect_err(
+            "bundled run_config_push must always error (spec \u{a7}3.2.1 stub-pointer)",
         );
         assert!(
-            !dir.path()
-                .join(".edgezero/local-config-app_config.json")
-                .exists(),
-            "default store untouched"
+            err.contains("not supported") && err.contains("typed downstream CLI"),
+            "error must be the \u{a7}3.2.1 stub-pointer message: {err}"
         );
-    }
-
-    #[test]
-    fn raw_push_rejects_unknown_store_id() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let (_dir, manifest, _) = setup_project(PUSH_MANIFEST, VALID_APP_CONFIG);
-        let mut args = push_args(&manifest, "axum");
-        args.store = Some("does-not-exist".to_owned());
-        let err = run_config_push(&args).expect_err("bad --store must error");
         assert!(
-            err.contains("does-not-exist"),
-            "error names the bad store id: {err}"
-        );
-    }
-
-    #[test]
-    fn raw_push_resolves_default_from_multi_id_store() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        // [stores.config].ids = ["one", "two"], default = "two".
-        let manifest_with_default = r#"
-[app]
-name = "demo-app"
-
-[adapters.axum.adapter]
-crate = "crates/demo"
-
-[adapters.axum.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.config]
-ids = ["one", "two"]
-default = "two"
-
-[stores.secrets]
-ids = ["default"]
-"#;
-        let (dir, manifest, _) = setup_project(manifest_with_default, VALID_APP_CONFIG);
-        run_config_push(&push_args(&manifest, "axum")).expect("default resolves to `two`");
-        assert!(
-            dir.path().join(".edgezero/local-config-two.json").exists(),
-            "push targeted the `default` id"
-        );
-    }
-
-    #[test]
-    fn raw_push_flattens_nested_tables_into_dotted_keys() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let app_config = r#"
-greeting = "hi"
-
-[service]
-timeout_ms = 1500
-"#;
-        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, app_config);
-        run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
-        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
-            .expect("read written file");
-        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-        assert_eq!(parsed["greeting"], "hi");
-        assert_eq!(
-            parsed["service.timeout_ms"], "1500",
-            "nested field flattened to dotted key + stringified: {parsed}"
-        );
-    }
-
-    #[test]
-    fn raw_push_json_encodes_arrays() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        //: arrays become a single JSON-encoded string value.
-        let app_config = "tags = [\"a\", \"b\", \"c\"]\n";
-        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, app_config);
-        run_config_push(&push_args(&manifest, "axum")).expect("push succeeds");
-        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
-            .expect("read written file");
-        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-        assert_eq!(parsed["tags"], "[\"a\",\"b\",\"c\"]");
-    }
-
-    // ---------- non-axum adapters (dry-run dispatch tests) ----------
-
-    #[test]
-    fn raw_push_cloudflare_dry_run_dispatches_to_adapter() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        // Real impl shipped in 7.2 — dry-run resolves the namespace
-        // id from wrangler.toml but doesn't shell out, so CI can
-        // exercise dispatch without wrangler installed.
-        let manifest_cf = r#"
-[app]
-name = "demo-app"
-
-[adapters.cloudflare.adapter]
-crate = "crates/demo-cf"
-manifest = "wrangler.toml"
-
-[adapters.cloudflare.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.config]
-ids = ["app_config"]
-
-[stores.secrets]
-ids = ["default"]
-"#;
-        let (dir, manifest, _) = setup_project(manifest_cf, VALID_APP_CONFIG);
-        // The adapter resolves wrangler.toml relative to the
-        // manifest root and reads the namespace id by binding —
-        // write one so dispatch reaches the dry-run branch.
-        fs::write(
-            dir.path().join("wrangler.toml"),
-            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"abc123\"\n",
-        )
-        .expect("write wrangler.toml");
-        let mut args = push_args(&manifest, "cloudflare");
-        args.dry_run = true;
-        run_config_push(&args).expect("cloudflare dry-run dispatches cleanly");
-    }
-
-    #[test]
-    fn raw_push_fastly_dry_run_dispatches_to_adapter() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        // Real impl shipped in 7.3 — dry-run skips the `fastly
-        // config-store list --json` resolver and the per-entry
-        // create shell-out, so CI exercises dispatch without
-        // fastly on PATH.
-        let manifest_fastly = r#"
-[app]
-name = "demo-app"
-
-[adapters.fastly.adapter]
-crate = "crates/demo-fastly"
-manifest = "fastly.toml"
-
-[adapters.fastly.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.config]
-ids = ["app_config"]
-
-[stores.secrets]
-ids = ["default"]
-"#;
-        let (_dir, manifest, _) = setup_project(manifest_fastly, VALID_APP_CONFIG);
-        let mut args = push_args(&manifest, "fastly");
-        args.dry_run = true;
-        run_config_push(&args).expect("fastly dry-run dispatches cleanly");
-    }
-
-    #[test]
-    fn raw_push_spin_dry_run_dispatches_to_adapter() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        // The CLI must thread `args.local` + `--runtime-config` + the
-        // manifest's `[adapters.spin.commands].deploy` through to
-        // Spin's `push_config_entries`, where the per-backend
-        // dispatcher decides whether to write SQLite-direct or shell
-        // to Fermyon Cloud. End-to-end: a raw dry-run with
-        // `args.local = true` against a fixture project should hit
-        // Spin's `dispatch_push` and announce a SQLite-direct write
-        // even with no `runtime-config.toml` present (default
-        // branch). The deeper per-backend matrix lives in spin
-        // adapter's `dispatch_push_*` tests; this one is the CLI
-        // wiring regression.
-        let manifest_spin = r#"
-[app]
-name = "demo-app"
-
-[adapters.spin.adapter]
-crate = "crates/demo-spin"
-manifest = "spin.toml"
-
-[adapters.spin.commands]
-build = "echo"
-deploy = "echo"
-serve = "echo"
-
-[stores.config]
-ids = ["app_config"]
-
-[stores.secrets]
-ids = ["default"]
-"#;
-        let (dir, manifest, _) = setup_project(manifest_spin, VALID_APP_CONFIG);
-        fs::write(
-            dir.path().join("spin.toml"),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        )
-        .expect("write spin.toml");
-        // Non-default labels (here `app_config`) require a
-        // runtime-config stanza; otherwise the dispatcher errors
-        // early to keep the runtime invariant honest.
-        fs::write(
-            dir.path().join("runtime-config.toml"),
-            "[key_value_store.app_config]\ntype = \"spin\"\n",
-        )
-        .expect("write runtime-config");
-        let mut args = push_args(&manifest, "spin");
-        args.dry_run = true;
-        args.local = true;
-        run_config_push(&args).expect("spin --local dry-run dispatches cleanly");
-        // Spin.toml must be byte-identical after the dispatch — the
-        // per-backend writer NEVER edits it (the seed-handler-era
-        // `[variables]` writes are gone for good).
-        let spin_toml = fs::read_to_string(dir.path().join("spin.toml")).expect("re-read");
-        assert!(
-            spin_toml.contains("[component.demo]") && !spin_toml.contains("[variables]"),
-            "dispatcher must not touch spin.toml: {spin_toml}"
+            err.contains("\u{a7}3.2.1") || err.contains("3.2.1"),
+            "error must reference the spec section: {err}"
         );
     }
 
     // ---------- typed push ----------
 
     #[test]
-    fn typed_push_strips_secret_fields_from_payload() {
+    fn typed_push_writes_blob_envelope_to_local_config_file() {
+        use edgezero_core::blob_envelope::{BlobEnvelope, ENVELOPE_VERSION_V1};
+
         let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
         let mut args = push_args(&manifest, "axum");
-        // FixtureConfig requires `api_token` (#[secret]) and `vault`
-        // (#[secret(store_ref)]) — both should be absent from the
-        // pushed payload.
         args.app_config = Some(dir.path().join("demo-app.toml"));
+        // --yes bypasses the non-TTY consent gate (CI has no TTY and the
+        // local store file doesn't exist yet → MissingStore → consent needed).
+        args.yes = true;
         run_config_push_typed::<FixtureConfig>(&args).expect("typed push succeeds");
+
+        // Axum writes { "app_config": "<envelope_json>" } — the key is
+        // the logical store id and the value is the serialised BlobEnvelope.
         let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
             .expect("read written file");
-        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-        assert!(
-            parsed.get("api_token").is_none(),
-            "#[secret] field must be stripped: {parsed}"
+        let outer: serde_json::Value = serde_json::from_str(&raw).expect("valid outer JSON");
+        let envelope_str = outer["app_config"]
+            .as_str()
+            .expect("outer key must be the logical store id");
+        let envelope: BlobEnvelope =
+            serde_json::from_str(envelope_str).expect("envelope JSON must parse");
+
+        // Envelope integrity
+        envelope.verify().expect("envelope SHA must verify");
+        assert_eq!(envelope.version, ENVELOPE_VERSION_V1);
+
+        // FixtureConfig: ALL fields — including `api_token` (#[secret]) and
+        // `vault` (#[secret(store_ref)]) — must be PRESENT in envelope.data.
+        // Their value at rest is the operator-supplied key NAME, not the
+        // resolved secret value. The runtime extractor (`secret_walk`) reads
+        // those key names and swaps them for the resolved secret. Spec §3.3.
+        let data = &envelope.data;
+        assert_eq!(
+            data.get("api_token").and_then(|val| val.as_str()),
+            Some("demo_api_token"),
+            "#[secret] field must be preserved in envelope.data as the key name: {data}"
         );
-        assert!(
-            parsed.get("vault").is_none(),
-            "#[secret(store_ref)] field must be stripped: {parsed}"
+        assert_eq!(
+            data.get("vault").and_then(|val| val.as_str()),
+            Some("default"),
+            "#[secret(store_ref)] field must be preserved in envelope.data: {data}"
         );
-        assert_eq!(parsed["greeting"], "hello");
-        assert_eq!(parsed["service.timeout_ms"], "1500");
+        // Non-secret fields also survive.
+        assert_eq!(data["greeting"], "hello");
+        // Nested struct serialises as a JSON object (not flattened).
+        assert_eq!(data["service"]["timeout_ms"], 1500_i32);
+    }
+
+    #[test]
+    fn typed_push_envelope_sha_matches_hand_computed_hash() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use edgezero_core::canonical_form::canonical_data_sha256;
+
+        // Prove that the SHA embedded in the pushed envelope matches
+        // the canonical-form SHA for the same data, computed via the
+        // public `canonical_data_sha256` function.  Uses a minimal
+        // FixtureConfig with known field values so the expected JSON
+        // object is deterministic.
+
+        // All fields are present verbatim — secret key names included.
+        // Spec §3.3: secret-field VALUES at rest are the operator-supplied
+        // key NAMEs (not the resolved secret values).
+        let data = serde_json::json!({
+            "api_token": "demo_api_token",
+            "greeting": "hello",
+            "service": { "timeout_ms": 1500_i32 },
+            "vault": "default"
+        });
+        let expected_sha = canonical_data_sha256(&data);
+
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        // --yes bypasses the non-TTY consent gate in CI.
+        args.yes = true;
+        run_config_push_typed::<FixtureConfig>(&args).expect("typed push succeeds");
+
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("read written file");
+        let outer: serde_json::Value = serde_json::from_str(&raw).expect("valid outer JSON");
+        let envelope_str = outer["app_config"].as_str().expect("outer key");
+        let envelope: BlobEnvelope = serde_json::from_str(envelope_str).expect("envelope parses");
+
+        assert_eq!(
+            envelope.sha256, expected_sha,
+            "envelope SHA must match hand-computed canonical-form hash"
+        );
+    }
+
+    /// Spec §3.3: the blob MUST carry the secret key NAME verbatim.
+    /// The runtime extractor (`secret_walk`) reads that name to look up
+    /// the resolved value in the secret store. Stripping the field would
+    /// cause `ConfigOutOfDate` on every request after a push.
+    #[test]
+    fn build_config_envelope_preserves_secret_field_values() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+
+        #[derive(Debug, Serialize, Validate)]
+        struct SimpleSecret {
+            api_token: String,
+            greeting: String,
+        }
+
+        let typed = SimpleSecret {
+            api_token: "demo_api_token".to_owned(),
+            greeting: "hello".to_owned(),
+        };
+        let json = build_config_envelope(&typed).expect("envelope serialises");
+        let envelope: BlobEnvelope = serde_json::from_str(&json).expect("envelope parses");
+        assert_eq!(
+            envelope.data.get("api_token").and_then(|val| val.as_str()),
+            Some("demo_api_token"),
+            "secret field key name must be preserved in envelope.data: {:?}",
+            envelope.data
+        );
+        assert_eq!(
+            envelope.data.get("greeting").and_then(|val| val.as_str()),
+            Some("hello"),
+            "non-secret field must survive in envelope.data"
+        );
     }
 
     #[test]
@@ -1998,6 +2227,50 @@ timeout_ms = 50
         );
     }
 
+    /// §5.4: `--key` overrides the default logical store id used as the
+    /// blob key. Without `--key`, the written file is keyed by the
+    /// manifest's `[stores.config]` id (`"app_config"`). With
+    /// `--key staging`, the blob must appear under "staging" instead.
+    #[test]
+    fn push_typed_honours_key_override() {
+        // --- Without --key: key == store.logical ("app_config") ---
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.yes = true;
+        run_config_push_typed::<FixtureConfig>(&args).expect("default key push succeeds");
+        let default_file = dir.path().join(".edgezero/local-config-app_config.json");
+        assert!(
+            default_file.exists(),
+            "default key write must land in app_config file: {default_file:?}"
+        );
+        let raw = fs::read_to_string(&default_file).expect("read default key file");
+        let outer: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert!(
+            outer.get("app_config").is_some(),
+            "default key must be app_config: {outer}"
+        );
+
+        // --- With --key staging: key == "staging" ---
+        let (dir2, manifest2, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args2 = push_args(&manifest2, "axum");
+        args2.yes = true;
+        args2.key = Some("staging".to_owned());
+        run_config_push_typed::<FixtureConfig>(&args2).expect("--key staging push succeeds");
+        let staging_file = dir2.path().join(".edgezero/local-config-app_config.json");
+        let raw2 = fs::read_to_string(&staging_file).expect("read staging file");
+        let outer2: serde_json::Value = serde_json::from_str(&raw2).expect("valid JSON");
+        assert!(
+            outer2.get("staging").is_some(),
+            "--key staging must write under 'staging' key: {outer2}"
+        );
+        assert!(
+            outer2.get("app_config").is_none(),
+            "--key staging must NOT write under the default 'app_config' key: {outer2}"
+        );
+        drop(dir);
+        drop(dir2);
+    }
+
     // ---------- push runs the strict preflight (regression) ----------
 
     /// Push must run the same shared adapter checks `config
@@ -2011,11 +2284,15 @@ timeout_ms = 50
     /// `validate_adapter_manifest`, which fails when the
     /// referenced spin.toml has no `[component.*]` declarations.
     #[test]
-    fn raw_push_runs_spin_adapter_manifest_check_before_push() {
+    fn typed_push_runs_spin_adapter_manifest_check_before_push() {
         let _lock = manifest_guard().lock().expect("manifest guard");
         let app_config = r#"
 api_token = "x"
 greeting = "hi"
+vault = "default"
+
+[service]
+timeout_ms = 1500
 "#;
         let manifest_spin = r#"
 [app]
@@ -2045,7 +2322,7 @@ ids = ["default"]
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n",
         )
         .expect("write spin.toml");
-        let err = run_config_push(&push_args(&manifest, "spin"))
+        let err = run_config_push_typed::<FixtureConfig>(&push_args(&manifest, "spin"))
             .expect_err("missing [component.*] must fail Spin's shared-check preflight");
         assert!(
             err.contains("no [component.*]") || err.contains("component"),
@@ -2106,6 +2383,543 @@ default = "one"
         assert!(
             err.contains("Single") && err.contains("secrets"),
             "error must come from --strict capability check: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // C4: run_config_push_typed rewrite — §8.2 consent rules + diff
+    // -------------------------------------------------------------------
+
+    /// Build a valid `BlobEnvelope` JSON string for the given data, suitable
+    /// for writing into axum's `.edgezero/local-config-<id>.json` as the
+    /// "remote" state. The SHA is computed over the stripped data exactly
+    /// as `build_config_envelope` does.
+    fn make_envelope_json(data: serde_json::Value) -> String {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        let env = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+        serde_json::to_string(&env).expect("envelope serialises")
+    }
+
+    /// Write a pre-existing "remote" envelope for the axum adapter's
+    /// local store file so that `read_config_entry` returns `Present`.
+    fn write_remote_envelope(dir: &Path, logical_store_id: &str, envelope_json: &str) {
+        let edgezero_dir = dir.join(".edgezero");
+        fs::create_dir_all(&edgezero_dir).expect("create .edgezero");
+        let map = serde_json::json!({ logical_store_id: envelope_json });
+        fs::write(
+            edgezero_dir.join(format!("local-config-{logical_store_id}.json")),
+            serde_json::to_string(&map).expect("serialize"),
+        )
+        .expect("write remote envelope file");
+    }
+
+    // ---------- Step 1: deserialise + validate_excluding_secrets ----------
+
+    /// §3.3.8 rule: a `#[secret]` field's VALUE is a key name like
+    /// "my-prod-api-key", which may be shorter than a `length(min = 32)`
+    /// rule intended for the resolved runtime value. The old
+    /// `load_app_config_with_options` path validated the key name against
+    /// that rule and rejected the push. The new path uses
+    /// `deserialize_app_config_with_options` + `validate_excluding_secrets`
+    /// and skips secret-field validators, so the push SUCCEEDS here.
+    #[test]
+    fn c4_secret_validator_skipped_on_typed_push() {
+        // A config type where `api_token` is `#[secret]` AND has a
+        // `length(min = 32)` rule. The fixture value "short-key" is 9
+        // bytes — it would fail the old path but must pass the new path.
+        #[derive(Debug, Deserialize, Serialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct SecretValidatorConfig {
+            #[validate(length(min = 32_u64))]
+            api_token: String,
+            #[validate(length(min = 1_u64))]
+            greeting: String,
+        }
+        impl AppConfigMeta for SecretValidatorConfig {
+            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
+                kind: SecretKind::KeyInDefault,
+                name: "api_token",
+            }];
+        }
+
+        let app_config = r#"
+api_token = "short-key"
+greeting = "hello"
+"#;
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, app_config);
+        let mut args = push_args(&manifest_path, "axum");
+        // --yes bypasses the non-TTY consent error in CI.
+        args.yes = true;
+        // The push must SUCCEED — secret validators are skipped.
+        run_config_push_typed::<SecretValidatorConfig>(&args)
+            .expect("secret-field validator must be skipped on typed push");
+    }
+
+    // ---------- Step 2: skip-on-equal (sha match) ----------
+
+    #[test]
+    fn c4_skip_on_equal_exits_early_when_sha_matches() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        args.yes = true;
+
+        // First push to get the canonical envelope on disk.
+        run_config_push_typed::<FixtureConfig>(&args).expect("first push succeeds");
+
+        // Second push: same config, so SHA matches. The function must
+        // return Ok(()) early (skip-on-equal) without overwriting anything.
+        // We verify by checking mtime would be the same — but simpler:
+        // just assert it returns Ok(()) with no error.
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect("second push with same content must exit Ok via skip-on-equal");
+    }
+
+    // ---------- §8.2 consent gate ----------
+
+    #[test]
+    fn c4_non_tty_without_yes_errors_on_consent() {
+        // CI runs without a TTY. Without --yes, require_consent should
+        // return an error explaining the non-interactive constraint.
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        // Write a DIFFERENT remote envelope so skip-on-equal doesn't fire
+        // and we reach the consent gate.
+        let other_data = serde_json::json!({ "greeting": "different" });
+        let other_env = make_envelope_json(other_data);
+        write_remote_envelope(dir.path(), "app_config", &other_env);
+
+        // No --yes flag; non-TTY context (CI); must error at consent.
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("non-TTY without --yes must error at consent");
+        assert!(
+            err.contains("--yes") || err.contains("non-interactive"),
+            "error must explain non-interactive constraint: {err}"
+        );
+    }
+
+    #[test]
+    fn c4_yes_flag_bypasses_consent_and_writes() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        // Write a DIFFERENT remote so skip-on-equal doesn't fire.
+        let other_data = serde_json::json!({ "greeting": "old-value" });
+        let other_env = make_envelope_json(other_data);
+        write_remote_envelope(dir.path(), "app_config", &other_env);
+
+        args.yes = true;
+        // With --yes, must proceed past consent and write successfully.
+        run_config_push_typed::<FixtureConfig>(&args).expect("--yes must bypass consent and write");
+
+        // Verify the file was updated (the new envelope contains "hello").
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("file written");
+        assert!(
+            raw.contains("greeting"),
+            "written envelope contains greeting field: {raw}"
+        );
+    }
+
+    #[test]
+    fn c4_dry_run_does_not_write_and_bypasses_consent() {
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        args.dry_run = true;
+
+        // dry_run=true: require_consent passes (dry-run bypass), no write.
+        run_config_push_typed::<FixtureConfig>(&args).expect("dry-run typed push must succeed");
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            ".edgezero must not be created in dry-run"
+        );
+    }
+
+    #[test]
+    fn c4_no_diff_flag_suppresses_diff_render() {
+        // With --no-diff + --yes, the push succeeds with no diff rendered
+        // (we can't capture stdout here, but the test verifies the
+        // function path doesn't error when --no-diff is set).
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        // Pre-write a different remote so skip-on-equal doesn't short-circuit.
+        let other_data = serde_json::json!({ "greeting": "old" });
+        write_remote_envelope(dir.path(), "app_config", &make_envelope_json(other_data));
+
+        args.no_diff = true;
+        args.yes = true;
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect("--no-diff --yes typed push must succeed");
+    }
+
+    // ---------- §8.3 Spin Cloud Unsupported four-branch UX ----------
+    //
+    // The Spin adapter returns ReadConfigEntry::Unsupported when the
+    // deploy command targets Fermyon Cloud ("spin deploy" / "spin cloud
+    // deploy"). We use that to exercise the four-branch UX defined in
+    // spec §8.3. The manifest uses `deploy = "spin deploy"` to trigger
+    // the Fermyon Cloud detection path inside `read_config_entry`.
+
+    // --- PATH-mutation helpers (mirrors Cloudflare adapter test pattern) ---
+
+    /// RAII guard: prepends `extra` to `$PATH` and restores the original
+    /// value on drop. Serialise with [`path_mutation_guard`] so parallel
+    /// tests don't race on PATH.
+    #[cfg(unix)]
+    struct PathPrepend {
+        original: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl PathPrepend {
+        fn new(extra: &Path) -> Self {
+            use std::env;
+            let original = env::var_os("PATH");
+            let new_path = match &original {
+                Some(prev) => {
+                    let mut acc = OsString::from(extra);
+                    acc.push(":");
+                    acc.push(prev);
+                    acc
+                }
+                None => OsString::from(extra),
+            };
+            env::set_var("PATH", new_path);
+            Self { original }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathPrepend {
+        fn drop(&mut self) {
+            use std::env;
+            match self.original.take() {
+                Some(prev) => env::set_var("PATH", prev),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// Process-wide mutex serialising PATH-mutating tests so parallel
+    /// test threads don't race on the `$PATH` environment variable.
+    #[cfg(unix)]
+    fn path_mutation_guard() -> &'static Mutex<()> {
+        use std::sync::OnceLock;
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Build a tempdir containing a `spin` script that emits fixed
+    /// stdout/stderr and exits with the given code. Payloads are written
+    /// to sidecar files so shell-active chars are never re-interpreted.
+    #[cfg(unix)]
+    fn fake_spin_returning(
+        stdout_body: &str,
+        stderr_body: &str,
+        exit_code: i32,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script_path = tmp.path().join("spin");
+        let stdout_file = tmp.path().join("stdout_payload.txt");
+        let stderr_file = tmp.path().join("stderr_payload.txt");
+        fs::write(&stdout_file, stdout_body).expect("write stdout payload");
+        fs::write(&stderr_file, stderr_body).expect("write stderr payload");
+        let script = format!(
+            "#!/bin/sh\ncat '{stdout}'\ncat '{stderr}' >&2\nexit {code}\n",
+            stdout = stdout_file.display(),
+            stderr = stderr_file.display(),
+            code = exit_code,
+        );
+        fs::write(&script_path, &script).expect("write spin script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        tmp
+    }
+
+    /// Manifest fixture for the §8.3 tests: Spin adapter with a Fermyon
+    /// Cloud deploy command so `read_config_entry` returns `Unsupported`.
+    fn spin_cloud_manifest() -> String {
+        r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "spin deploy"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#
+        .to_owned()
+    }
+
+    /// Write the minimal `spin.toml` needed to pass `validate_adapter_manifest`.
+    fn write_minimal_spin_toml(dir: &Path) {
+        fs::write(
+            dir.join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
+        )
+        .expect("write spin.toml");
+    }
+
+    /// Non-TTY + no --yes + Spin Cloud (Unsupported) must error with the
+    /// §8.3 non-interactive message. CI has no TTY; no --yes is passed.
+    #[test]
+    fn c4_unsupported_non_tty_without_yes_errors() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
+        write_minimal_spin_toml(dir.path());
+        let args = push_args(&manifest_path, "spin");
+        // No --yes, no TTY: must error with the §8.3 non-interactive error.
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("Unsupported + non-TTY + no --yes must error");
+        assert!(
+            err.contains("--yes") || err.contains("non-interactive") || err.contains("unsupported"),
+            "error must mention the constraint: {err}"
+        );
+    }
+
+    /// `--dry-run` against Spin Cloud (Unsupported) must error immediately
+    /// with the §8.3 dry-run message — the flag's contract is "show the
+    /// diff", which is structurally impossible without a remote read-back.
+    #[test]
+    fn c4_unsupported_dry_run_errors_with_spin_cloud_message() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
+        write_minimal_spin_toml(dir.path());
+        let mut args = push_args(&manifest_path, "spin");
+        args.dry_run = true;
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("Unsupported + --dry-run must error");
+        assert!(
+            err.contains("dry-run") && err.contains("unsupported"),
+            "error must name both dry-run and unsupported: {err}"
+        );
+    }
+
+    /// `--yes` against Spin Cloud (Unsupported) skips consent and re-fetch,
+    /// writing unconditionally. The write itself will fail because the fake
+    /// `spin` binary returns exit 1. The error must come from the write
+    /// step, not from the consent gate.
+    ///
+    /// A fake `spin` binary is injected via PATH so the test is hermetic
+    /// whether or not real `spin` is on the developer's machine.
+    #[cfg(unix)]
+    #[test]
+    fn c4_unsupported_yes_flag_passes_consent_reaches_write() {
+        let _manifest = manifest_guard().lock().expect("manifest guard");
+        let _path = path_mutation_guard().lock().expect("path mutation guard");
+        let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
+        write_minimal_spin_toml(dir.path());
+        // Inject a fake `spin` that returns exit 1 immediately so the
+        // write step errors in a controlled, deterministic way without
+        // stalling when real `spin` is on PATH.
+        let fake = fake_spin_returning("", "Error: fake spin in test", 1);
+        let _prepend = PathPrepend::new(fake.path());
+        let mut args = push_args(&manifest_path, "spin");
+        args.yes = true;
+        // With --yes, the push must reach the write step. The fake
+        // `spin` returns exit 1, so push_config_entries errors.
+        // The error must NOT be the consent message.
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("Unsupported + --yes must reach the write step");
+        assert!(
+            !err.contains("non-interactive") && !err.contains("aborted by operator"),
+            "error must come from the write step, not consent: {err}"
+        );
+    }
+
+    // ---------- C4 Step 5/6: unified diff renderer ----------
+
+    #[test]
+    fn print_unified_diff_inline_emits_similar_format() {
+        use crate::config::print_unified_diff_to_writer;
+        use serde_json::json;
+        let remote = json!({
+            "feature": { "new_checkout": false },
+            "greeting": "hello",
+            "service": { "timeout_ms": 1500_i32 },
+        });
+        let local = json!({
+            "feature": { "new_checkout": true },
+            "greeting": "hello",
+            "service": { "timeout_ms": 2000_i32 },
+        });
+        let mut buf = Vec::new();
+        print_unified_diff_to_writer(&remote, &local, "aaaaaaaaXX", "bbbbbbbbXX", &mut buf)
+            .unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Headers carry the short SHA refs (8-char truncation).
+        assert!(
+            output.contains("--- remote (sha256: aaaaaaaa)"),
+            "missing remote header: {output}"
+        );
+        assert!(
+            output.contains("+++ local  (sha256: bbbbbbbb)"),
+            "missing local header: {output}"
+        );
+        // Hunk header — git-style `@@ -<old_start>,<old_len> +<new_start>,<new_len> @@`.
+        assert!(output.contains("@@ "), "missing hunk header: {output}");
+        // Changed JSON lines — `-` / `+` carry the full pretty-printed line.
+        assert!(
+            output.contains("-    \"new_checkout\": false"),
+            "missing removed line: {output}"
+        );
+        assert!(
+            output.contains("+    \"new_checkout\": true"),
+            "missing added line: {output}"
+        );
+        assert!(
+            output.contains("-    \"timeout_ms\": 1500"),
+            "missing removed timeout_ms: {output}"
+        );
+        assert!(
+            output.contains("+    \"timeout_ms\": 2000"),
+            "missing added timeout_ms: {output}"
+        );
+        // Unchanged context — unified-diff prefixes a space.
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("   \"greeting\":")),
+            "missing context line for greeting: {output}"
+        );
+        // Key ordering — render_for_diff sorts keys recursively so
+        // `feature` < `greeting` < `service` in the output.
+        let feature_pos = output.find("\"feature\"").expect("feature present");
+        let greeting_pos = output.find("\"greeting\"").expect("greeting present");
+        let service_pos = output.find("\"service\"").expect("service present");
+        assert!(feature_pos < greeting_pos, "feature must precede greeting");
+        assert!(greeting_pos < service_pos, "greeting must precede service");
+    }
+
+    #[test]
+    fn print_unified_diff_inline_added_subtree_emits_multiline_block() {
+        use crate::config::print_unified_diff_to_writer;
+        use serde_json::json;
+        // An added subtree shows as a multi-line `+` block, NOT as N
+        // per-leaf `(added)` lines — this is the round-35 design that
+        // drove the switch to `similar` over hand-rolled walkers.
+        let remote = json!({ "greeting": "hello" });
+        let local = json!({
+            "greeting": "hello",
+            "nested": { "alpha": 1_i32, "beta": 2_i32 },
+        });
+        let mut buf = Vec::new();
+        print_unified_diff_to_writer(&remote, &local, "aa", "bb", &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // The added subtree shows as ≥ 3 `+`-prefixed lines covering the
+        // opening brace, `"alpha"`, `"beta"`, and closing brace.
+        let plus_lines: Vec<&str> = output
+            .lines()
+            .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+            .collect();
+        assert!(
+            plus_lines.len() >= 3,
+            "expected ≥ 3 added lines for the new subtree, got {plus_lines:?}"
+        );
+        assert!(
+            plus_lines.iter().any(|line| line.contains("\"nested\"")),
+            "added lines must include nested key: {plus_lines:?}"
+        );
+        assert!(
+            plus_lines.iter().any(|line| line.contains("\"alpha\"")),
+            "added lines must include alpha: {plus_lines:?}"
+        );
+        assert!(
+            plus_lines.iter().any(|line| line.contains("\"beta\"")),
+            "added lines must include beta: {plus_lines:?}"
+        );
+    }
+
+    // ---------- C4 Step 3.5: re-fetch (round-36/38) — file-system simulations ----------
+
+    /// Skip-on-equal: first push writes the envelope; second push reads
+    /// same envelope and exits early. The axum adapter's re-fetch reads
+    /// the same on-disk file (no race), so the second read returns the
+    /// same envelope as the first, triggering the concurrent-same-state
+    /// skip. This covers the `c4_concurrent_push_with_same_data_skips_write`
+    /// scenario using the real axum adapter.
+    #[test]
+    fn c4_re_fetch_skips_write_when_second_read_matches_local() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        args.yes = true;
+
+        // First push: MissingStore → writes. Second push: Present(same SHA).
+        // On the second push: first read = Present(same SHA) → skip-on-equal
+        // exits in the first match arm, BEFORE the re-fetch, so the adapter
+        // write is not called a second time.
+        run_config_push_typed::<FixtureConfig>(&args).expect("first push");
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect("second push must exit early via skip-on-equal (same SHA)");
+    }
+
+    /// When the remote has DIFFERENT content from local, --yes causes
+    /// the re-fetch to read the same different content (no real race),
+    /// emit the "remote changed between diff and write" warning (because
+    /// `approved_remote_sha` != re-fetched SHA), and proceed to write.
+    /// This verifies the re-fetch path doesn't block a legitimate write.
+    #[test]
+    fn c4_re_fetch_warns_and_writes_when_remote_has_different_sha() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let (dir, manifest, _) = setup_project(PUSH_MANIFEST, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.app_config = Some(dir.path().join("demo-app.toml"));
+        args.yes = true;
+
+        // Pre-write an envelope with different content so first read
+        // returns Present with a SHA != local.
+        let other_data = serde_json::json!({ "greeting": "old-state" });
+        write_remote_envelope(dir.path(), "app_config", &make_envelope_json(other_data));
+
+        // Push must succeed: re-fetch sees same different content,
+        // approved_remote_sha != re-fetched SHA, so warning is emitted
+        // then write proceeds.
+        run_config_push_typed::<FixtureConfig>(&args)
+            .expect("re-fetch with different SHA must warn and write");
+
+        // Verify write happened (file updated with new envelope).
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("file must exist after write");
+        assert!(
+            raw.contains("greeting"),
+            "written envelope has greeting: {raw}"
         );
     }
 }

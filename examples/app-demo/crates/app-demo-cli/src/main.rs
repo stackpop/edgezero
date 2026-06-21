@@ -47,8 +47,11 @@ enum Cmd {
 /// default-binary path skips.
 #[derive(Subcommand, Debug)]
 enum AppDemoConfigCmd {
-    /// Push `app-demo.toml` (flattened, secret-stripped) to the
-    /// adapter's config store.
+    /// Push `app-demo.toml` as a single blob envelope to the
+    /// adapter's config store. The blob carries every field verbatim
+    /// (per spec §3.3 Model A — `#[secret]` fields store the key NAME,
+    /// resolved at runtime); a SHA over the canonical-form data gates
+    /// drift detection.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and `app-demo.toml` against the
     /// typed `AppDemoConfig` contract.

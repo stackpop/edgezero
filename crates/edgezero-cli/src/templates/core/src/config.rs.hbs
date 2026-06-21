@@ -31,27 +31,42 @@ pub struct {{NameUpperCamel}}Config {
     pub service: ServiceConfig,
     // `#[secret]` — uncomment when the project declares
     // `[stores.secrets]` in `edgezero.toml` (with at least a
-    // `default` id) and the handler loads the secret bytes at
-    // runtime via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
-    // The value here is the *key* in the default secret store,
-    // NOT the secret bytes; the runtime resolves it through the
-    // wired adapter binding (Cloudflare worker secret, Fastly
-    // secret-store, Spin secret variable, ...). EdgeZero's typed
-    // validator rejects the field unless the secret store is
-    // declared, so this is opt-in to keep the scaffold's `serve`
-    // path runnable out of the box.
+    // `default` id). At rest in `{{name}}.toml`, the value is
+    // the *key name* in the default secret store. At RUNTIME,
+    // the framework swaps it for the resolved secret value
+    // before the handler sees `cfg.api_token`. The handler reads
+    // the secret directly:
+    //
+    //     async fn handler(AppConfig(cfg): AppConfig<{{NameUpperCamel}}Config>) {
+    //         use_token(&cfg.api_token); // already the resolved secret
+    //     }
+    //
+    // `config validate --strict` rejects the field unless
+    // `[stores.secrets]` is declared; this is opt-in to keep the
+    // scaffold's `serve` path runnable out of the box.
     //
     // #[secret]
     // pub api_token: String,
     //
-    // `#[secret(store_ref)]` — uncomment when the project declares
-    // more than one secret store id under `[stores.secrets].ids`.
-    // The value is then the logical id of the secret store to
-    // resolve at runtime via `ctx.secret_store(&cfg.vault)?`.
-    // Single-secret-store projects don't need this.
+    // `#[secret(store_ref)]` — uncomment when the project
+    // declares more than one secret store id under
+    // `[stores.secrets].ids`. The value is the logical id of
+    // the secret store; carried through to `cfg.vault` at
+    // runtime UNCHANGED (no framework swap — this field is a
+    // store pointer, not a secret key).
     //
     // #[secret(store_ref)]
     // pub vault: String,
+    //
+    // `#[secret(store_ref = "vault")]` — uncomment when the
+    // project has multiple secret stores AND you want this
+    // specific secret to come from the store named by
+    // `cfg.vault`. The framework reads `cfg.vault` (which must
+    // itself carry `#[secret(store_ref)]`), opens that secret
+    // store, and looks up the secret-key NAME under it.
+    //
+    // #[secret(store_ref = "vault")]
+    // pub multi_store_api_token: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate)]
