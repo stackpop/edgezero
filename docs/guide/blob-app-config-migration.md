@@ -261,12 +261,12 @@ entries (`feature.new_checkout`, `service.timeout_ms`, etc.) that
 nothing reads. The blob model leaves them inert — they're not
 referenced — but they consume store quota.
 
-| Adapter    | Cleanup command                                                                                                   |
-| ---------- | ----------------------------------------------------------------------------------------------------------------- |
-| Axum       | `rm .edgezero/local-config-*.json` (the blob push writes a fresh file)                                            |
-| Cloudflare | `wrangler kv bulk delete <tempfile.json> --namespace-id=<id> --remote` with the orphan keys listed                |
-| Fastly     | `fastly config-store-entry delete --store-id=<id> --key=<orphan-key>` per key                                     |
-| Spin local | `sqlite3 .spin/sqlite_key_value.db "DELETE FROM spin_key_value WHERE store='<id>' AND key NOT IN ('app_config')"` |
+| Adapter    | Cleanup command                                                                                                                                                                                                                              |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Axum       | `rm .edgezero/local-config-*.json` (the blob push writes a fresh file)                                                                                                                                                                       |
+| Cloudflare | `wrangler kv bulk delete <tempfile.json> --namespace-id=<id> --remote` with the orphan keys listed                                                                                                                                           |
+| Fastly     | `fastly config-store-entry delete --store-id=<id> --key=<orphan-key>` per key                                                                                                                                                                |
+| Spin local | `sqlite3 .spin/sqlite_key_value.db "DELETE FROM spin_key_value WHERE store='<id>' AND key NOT IN ('app_config', 'app_config_staging', ...)"` -- preserve every key your runtime might select via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` |
 
 Listing the orphans before deletion:
 

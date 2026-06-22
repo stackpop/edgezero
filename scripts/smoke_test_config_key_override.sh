@@ -36,9 +36,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
 SERVER_PID=""
-PORT=8765
+# Match the demo's edgezero.toml port (8787) so the runtime and
+# this script speak the same port. Hardcoding a different port
+# previously caused the curl wait to time out while the runtime
+# bound elsewhere; the smoke would then claim a "non-server" pass.
+PORT=8787
 PASS=0
 FAIL=0
+# Per-row backup of files the smoke would otherwise mutate in place
+# in the checked-in app-demo tree. Cleanup restores them on exit.
+declare -a BACKUPS=()
 
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
@@ -47,8 +54,42 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
+  # Restore any fixtures the smoke mutated in place.
+  # Each backup pair is "original_path::backup_path".
+  for pair in "${BACKUPS[@]:-}"; do
+    [ -z "$pair" ] && continue
+    orig="${pair%%::*}"
+    back="${pair##*::}"
+    if [ -f "$back" ]; then
+      mv "$back" "$orig" 2>/dev/null || true
+    elif [ -e "$orig" ] && [ ! -e "$back" ]; then
+      # The smoke created a file the working tree didn't have; remove.
+      rm -f "$orig" 2>/dev/null || true
+    fi
+  done
+  BACKUPS=()
 }
 trap cleanup EXIT INT TERM
+
+# Record a backup of $1 (an in-tree file the smoke is about to mutate)
+# so `cleanup` can restore it.
+backup_in_tree() {
+  local orig="$1"
+  local back
+  back=$(mktemp)
+  if [ -e "$orig" ]; then
+    cp -p "$orig" "$back"
+  else
+    : > "$back"  # marker that the file didn't exist
+  fi
+  BACKUPS+=("${orig}::${back}")
+}
+
+# Bash 3.2-portable upper-case (macOS ships /usr/bin/env bash as 3.2).
+# `${var^^}` is Bash 4+; tr is portable.
+upper() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+}
 
 check() {
   local label="$1" expect="$2" actual="$3"
@@ -115,10 +156,40 @@ timeout_ms = 1500
 TOML
 }
 
+# Build the adapter's runtime artifact if needed. The Fastly and Spin
+# rows boot a wasm binary that has to exist on disk before the
+# emulator starts; a clean checkout has no `target/.../debug/*.wasm`
+# yet, so the boot would fail before the runtime came up.
+ensure_runtime_built() {
+  local adapter="$1"
+  case "$adapter" in
+    axum)
+      # `cargo run -p app-demo-cli -- serve` builds on demand.
+      ;;
+    cloudflare)
+      # `wrangler dev` invokes wrangler's own build pipeline.
+      ;;
+    fastly)
+      (cd "$DEMO_DIR" && cargo build --quiet \
+        --target wasm32-wasip1 \
+        --manifest-path crates/app-demo-adapter-fastly/Cargo.toml \
+        --features fastly) || return 1
+      ;;
+    spin)
+      (cd "$DEMO_DIR" && cargo build --quiet --release \
+        --target wasm32-wasip2 \
+        --manifest-path crates/app-demo-adapter-spin/Cargo.toml \
+        --features spin) || return 1
+      ;;
+  esac
+}
+
 # Boot the right runtime for $1 (adapter name), returning when the
-# greeting endpoint responds 200.
+# greeting endpoint responds 200. All rows bind to $PORT (8787 to
+# match the app-demo edgezero.toml `[adapters.axum.adapter] port`).
 boot_runtime() {
   local adapter="$1"
+  ensure_runtime_built "$adapter" || return 1
   case "$adapter" in
     axum)
       (cd "$DEMO_DIR" && \
@@ -130,11 +201,13 @@ boot_runtime() {
       ;;
     fastly)
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
-        viceroy run -C fastly.toml --addr "127.0.0.1:${PORT}" target/wasm32-wasip1/debug/app_demo_adapter_fastly.wasm 2>&1) &
+        viceroy run -C fastly.toml --addr "127.0.0.1:${PORT}" \
+          target/wasm32-wasip1/debug/app_demo_adapter_fastly.wasm 2>&1) &
       ;;
     spin)
       (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
-        spin up --listen "127.0.0.1:${PORT}" --runtime-config-file runtime-config.toml 2>&1) &
+        spin up --listen "127.0.0.1:${PORT}" \
+          --runtime-config-file runtime-config.toml 2>&1) &
       ;;
     *)
       echo "unknown adapter: $adapter" >&2; return 1 ;;
@@ -159,8 +232,9 @@ for suite in "${SUITES[@]}"; do
   adapter="${suite%%:*}"
   extra="${suite#*:}"
 
-  skip_var="SKIP_${adapter^^}"
-  if [ "${!skip_var:-0}" = "1" ]; then
+  skip_var="SKIP_$(upper "$adapter")"
+  eval "skip_val=\${${skip_var}:-0}"
+  if [ "$skip_val" = "1" ]; then
     printf '\n=== §12.7 __KEY override smoke: %s SKIPPED (%s=1) ===\n' "$adapter" "$skip_var"
     continue
   fi
@@ -168,6 +242,13 @@ for suite in "${SUITES[@]}"; do
   printf '\n=== §12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
+
+  # Back up any tracked fixture the push will mutate in place. For
+  # Fastly that's fastly.toml; gitignored local-state directories
+  # (`.wrangler/`, `.spin/`, `.edgezero/`) are fine to write to.
+  if [ "$adapter" = "fastly" ]; then
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+  fi
 
   # 1. Push the default blob at the default key.
   unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
@@ -208,6 +289,10 @@ else
   printf '\n=== §9.3 Fastly chunk-pointer smoke ===\n'
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
+
+  # The local push rewrites fastly.toml in the checked-in app-demo
+  # tree; back it up so `cleanup` restores it on exit.
+  backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
 
   # Build an oversized greeting (>= 9 000 chars after envelope wrap)
   # so the chunked path fires.
