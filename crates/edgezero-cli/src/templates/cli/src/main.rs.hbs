@@ -1,9 +1,9 @@
-//! {{name}} CLI — built on the `edgezero-cli` library.
+//! {{name}} CLI -- built on the `edgezero-cli` library.
 //!
 //! This binary reuses every built-in `edgezero` command via the
 //! `edgezero_cli` library and is the place to add your own
 //! subcommands. The `Config` arm dispatches the **typed** validate
-//! and push paths, parameterised over `{{NameUpperCamel}}Config` —
+//! and push paths, parameterised over `{{NameUpperCamel}}Config` --
 //! the struct your `{{proj_core}}` crate owns. The default
 //! `edgezero` binary runs the *raw* paths because it has no typed
 //! struct in scope; a downstream CLI like this one upgrades to
@@ -48,7 +48,7 @@ enum Cmd {
 
 /// Mirrors `edgezero_cli::args::ConfigCmd` but dispatches `validate`,
 /// `push`, and `diff` to the **typed** entry points parameterised over
-/// `{{NameUpperCamel}}Config` — the downstream project owns the struct,
+/// `{{NameUpperCamel}}Config` -- the downstream project owns the struct,
 /// so it can enforce the typed deserialise, `validator` rules, and
 /// `#[secret]` / `#[secret(store_ref)]` checks the raw default-binary
 /// path skips.
@@ -60,7 +60,7 @@ enum {{NameUpperCamel}}ConfigCmd {
     Diff(ConfigDiffArgs),
     /// Push `{{name}}.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
-    /// (per spec §3.3 Model A — `#[secret]` fields store the key NAME,
+    /// (per spec §3.3 Model A -- `#[secret]` fields store the key NAME,
     /// resolved at runtime); a SHA over the canonical-form data gates
     /// drift detection.
     Push(ConfigPushArgs),
