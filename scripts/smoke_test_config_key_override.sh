@@ -47,27 +47,41 @@ FAIL=0
 # in the checked-in app-demo tree. Cleanup restores them on exit.
 declare -a BACKUPS=()
 
-cleanup() {
+# Stop the running runtime without touching tracked-fixture backups.
+# Used between staging-blob and default-blob assertions in the same
+# row so the pushed remote state survives a runtime restart.
+stop_server() {
   if [ -n "$SERVER_PID" ]; then
     pkill -P "$SERVER_PID" 2>/dev/null || true
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
-  # Restore any fixtures the smoke mutated in place.
-  # Each backup pair is "original_path::backup_path".
+}
+
+# Restore tracked fixtures the smoke mutated in place. Called once
+# per row AFTER all assertions for that row have finished, and again
+# from the EXIT trap as a safety net.
+restore_backups() {
   for pair in "${BACKUPS[@]:-}"; do
     [ -z "$pair" ] && continue
     orig="${pair%%::*}"
     back="${pair##*::}"
-    if [ -f "$back" ]; then
+    if [ -s "$back" ]; then
       mv "$back" "$orig" 2>/dev/null || true
-    elif [ -e "$orig" ] && [ ! -e "$back" ]; then
-      # The smoke created a file the working tree didn't have; remove.
+    else
+      # Empty marker file = the original didn't exist; remove what
+      # the smoke created.
+      rm -f "$back" 2>/dev/null || true
       rm -f "$orig" 2>/dev/null || true
     fi
   done
   BACKUPS=()
+}
+
+cleanup() {
+  stop_server
+  restore_backups
 }
 trap cleanup EXIT INT TERM
 
@@ -263,18 +277,25 @@ for suite in "${SUITES[@]}"; do
     config push --adapter "$adapter" $extra \
     --app-config "$tmp/app-demo.toml" --key app_config_staging --yes >/dev/null)
 
-  # 3. Boot with __KEY=staging; assert staging.
+  # 3. Boot with __KEY=staging; assert staging. The /config/typed
+  # route is the AppConfig<AppDemoConfig> handler (handlers.rs:185);
+  # the /config/<key> route is the raw config-store map and would
+  # always 404 on the blob model. Only /config/typed proves the
+  # extractor read the right blob.
   EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging \
     boot_runtime "$adapter"
-  result=$(curl -s "http://127.0.0.1:${PORT}/config/greeting")
+  result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
   check "$adapter __KEY override returns staging" "staging-blob" "$result"
-  cleanup
+  # Stop the server BUT keep the pushed blobs in place — restoring
+  # fixtures here would wipe the default blob before step 4 reads it.
+  stop_server
 
   # 4. Reboot without __KEY; assert default.
   unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
   boot_runtime "$adapter"
-  result=$(curl -s "http://127.0.0.1:${PORT}/config/greeting")
+  result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
   check "$adapter __KEY unset returns default" "default-blob" "$result"
+  # Now both assertions are done -- restore tracked fixtures.
   cleanup
 
   rm -rf "$tmp"
@@ -326,7 +347,10 @@ TOML
   fi
 
   boot_runtime fastly
-  result=$(curl -s "http://127.0.0.1:${PORT}/config/greeting")
+  # /config/typed routes through AppConfig<AppDemoConfig> which
+  # invokes the runtime chunk-pointer resolver — proving the
+  # reconstructed envelope flows into the typed extractor.
+  result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
   check_contains "fastly runtime reads reconstructed envelope" "large-fastly-blob" "$result"
   cleanup
 
