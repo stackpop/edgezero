@@ -290,17 +290,16 @@ pub trait Adapter: Sync + Send {
         Ok(Vec::new())
     }
 
-    /// Push resolved config entries into the platform's config
-    /// store backing `store_id`. Returns a list of
-    /// human-readable status lines the CLI logs verbatim.
+    /// Push config entries into the platform's config store backing
+    /// `store_id`. Returns a list of human-readable status lines the
+    /// CLI logs verbatim.
     ///
-    /// `entries` are pre-flattened and pre-stringified by the CLI:
-    /// dotted keys (`service.timeout_ms`) and string values
-    /// (numbers via `to_string`, arrays/maps via `serde_json`,
-    /// `Option::None` already skipped). The CLI also skips
-    /// `SECRET_FIELDS` on the typed path before calling. Any
-    /// per-platform value encoding happens here (e.g. wrangler's
-    /// bulk-put JSON shape).
+    /// Since the blob app-config cutover, `entries` typically carries
+    /// **one entry per push**: `(logical_key, blob_envelope_json)`.
+    /// The value is an opaque JSON string (the serialised
+    /// `BlobEnvelope`) — the adapter writes it as-is without
+    /// per-leaf flattening. No secret stripping or dotted-key
+    /// expansion happens here; the envelope is a single atomic blob.
     ///
     /// `manifest_root`, `adapter_manifest_path`, and
     /// `component_selector` mirror `provision` — each adapter
@@ -334,11 +333,14 @@ pub trait Adapter: Sync + Send {
         ))
     }
 
-    /// Push resolved config entries into the adapter's **local emulator**
-    /// state instead of the live platform — `config push --local`. Used
-    /// when developing against a local runtime (Viceroy for Fastly,
+    /// Push config entries into the adapter's **local emulator** state
+    /// instead of the live platform — `config push --local`. Used when
+    /// developing against a local runtime (Viceroy for Fastly,
     /// `wrangler dev --local` for Cloudflare) where the production
     /// platform CLI doesn't help.
+    ///
+    /// Entry shape mirrors [`Self::push_config_entries`]: typically one
+    /// `(logical_key, blob_envelope_json)` tuple written as-is.
     ///
     /// Arguments + return shape mirror [`Self::push_config_entries`].
     ///

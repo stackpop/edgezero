@@ -18,7 +18,8 @@
 //! env-overlay unless `--no-env` is passed, so the validation sees
 //! the values the runtime would.
 
-use crate::args::{ConfigPushArgs, ConfigValidateArgs};
+use crate::args::{ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat};
+use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
@@ -101,9 +102,41 @@ impl ValidationContext {
 }
 
 // -------------------------------------------------------------------
-// Types for run_config_push_typed helpers (must precede all fns per
-// clippy::arbitrary_source_item_ordering)
+// Types (must precede all fns per clippy::arbitrary_source_item_ordering)
 // -------------------------------------------------------------------
+
+/// Typed exit-code outcome of a successful `config diff` run.
+///
+/// Returned so the generated CLI's main can pick the right exit code
+/// per Q10.  NOT used on the error path — `Result::Err` bypasses this
+/// and the main always exits ≥ 2.
+///
+/// Exit code semantics (Q10):
+/// - `0` — no changes, or `--exit-code` is false.
+/// - `1` — diff present AND `--exit-code` was set (CI gate signal).
+/// - `2` — diff structurally impossible (`Unsupported`).
+#[derive(Debug)]
+pub struct DiffExit {
+    /// 0 (no changes), 1 (diff present with `--exit-code`), or 2 (Unsupported).
+    pub code: i32,
+}
+
+/// Internal outcome of a `config diff` run. Drives `apply_exit_code`.
+/// Variants are alphabetical per `clippy::arbitrary_source_item_ordering`.
+enum DiffOutcome {
+    /// Diff is present (remote != local, or remote absent).
+    DiffPresent,
+    /// SHA matched — no changes.
+    NoChanges,
+    /// Remote was absent (`MissingKey` or `MissingStore`). Treated as
+    /// "all leaves added" — rendered as a diff but reported separately
+    /// so `--exit-code` can still signal "something would change".
+    RemoteAbsent,
+    /// Adapter does not support remote read-back (e.g. Spin Cloud).
+    /// The `reason` string is printed to stderr before this variant is
+    /// constructed, so the field itself is not read here.
+    Unsupported,
+}
 
 /// Outcome of the first read + diff render step.
 enum FirstReadOutcome {
@@ -165,14 +198,20 @@ where
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx)?;
 
-    // Typed deserialise + validator pass. `load_app_config_with_options`
-    // applies the env overlay on its own, so we hand it the raw on-disk
-    // path again rather than threading `ctx.raw_config` through.
+    // Typed deserialise + validate_excluding_secrets (spec §3.3.8: push,
+    // diff, AND typed validate all use deserialize-only +
+    // validate_excluding_secrets; the runtime is the only path that runs
+    // full validate against RESOLVED secret values).
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
-    let typed: C =
-        app_config::load_app_config_with_options::<C>(&ctx.app_config_path, &ctx.app_name, &opts)
-            .map_err(|err| format_app_config_error(&err))?;
+    let typed: C = app_config::deserialize_app_config_with_options::<C>(
+        &ctx.app_config_path,
+        &ctx.app_name,
+        &opts,
+    )
+    .map_err(|err| format_app_config_error(&err))?;
+    app_config::validate_excluding_secrets(&typed)
+        .map_err(|err| format!("typed app-config failed validation: {err}"))?;
 
     typed_secret_checks(&typed, &ctx)?;
     run_adapter_typed_checks::<C>(&ctx)?;
@@ -303,6 +342,228 @@ where
 
     // Step 4: write.
     write_envelope(ctx.adapter, args, &ctx, &paths, &key, body)
+}
+
+// -------------------------------------------------------------------
+// run_config_diff_typed — typed diff entry point (Phase D)
+// -------------------------------------------------------------------
+
+/// Write a diff informational message to stderr (stream discipline per round-34).
+/// All non-error diff messages go here rather than using inline `#[expect]` blocks.
+#[expect(
+    clippy::print_stderr,
+    reason = "stream discipline: informational messages go to stderr per round-34"
+)]
+fn diff_info(msg: &str) {
+    eprintln!("{msg}");
+}
+
+/// Translate an outcome + `--exit-code` flag into a typed exit code
+/// per Q10's table.
+fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
+    let code = match (exit_code_flag, outcome) {
+        (_, DiffOutcome::Unsupported) => 2_i32,
+        (true, DiffOutcome::DiffPresent | DiffOutcome::RemoteAbsent) => 1_i32,
+        // false + any, or true + NoChanges → no signal.
+        _ => 0_i32,
+    };
+    DiffExit { code }
+}
+
+/// Typed diff flow — reads the local `<name>.toml`, builds the local
+/// `BlobEnvelope`, reads back the remote (or local-emulator) entry, and
+/// renders the diff via the selected `--format`.
+///
+/// Returns `Ok(DiffExit { code })` on the success path so the generated
+/// CLI's main can call `process::exit(code)` for the non-zero CI gate
+/// codes.  Returns `Err(String)` on parse / network / manifest-load
+/// errors (the main always exits ≥ 2 for these).
+///
+/// # Errors
+/// Returns a human-readable error string on any load, parse, or
+/// envelope verification failure.
+#[expect(
+    clippy::too_many_lines,
+    reason = "config diff orchestration: 6 sequential steps (load + structural checks, envelope, adapter resolve, paths, read, branch) each with its own error handling — extracting sub-functions would just move the lines without reducing conceptual complexity"
+)]
+#[inline]
+pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, String>
+where
+    C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
+{
+    // Step 1: load + validate (spec §3.3.2: diff runs the same structural
+    // checks as push — validate_excluding_secrets + typed_secret_checks +
+    // adapter_typed_checks; no consent gate, no re-fetch).
+    let validate_args = ConfigValidateArgs {
+        app_config: args.app_config.clone(),
+        manifest: args.manifest.clone(),
+        no_env: args.no_env,
+        strict: false,
+    };
+    let ctx = load_validation_context(&validate_args)?;
+    run_shared_checks(&ctx)?;
+    let mut opts = AppConfigLoadOptions::default();
+    opts.env_overlay = !args.no_env;
+    let typed: C = app_config::deserialize_app_config_with_options::<C>(
+        &ctx.app_config_path,
+        &ctx.app_name,
+        &opts,
+    )
+    .map_err(|err| format_app_config_error(&err))?;
+    app_config::validate_excluding_secrets(&typed)
+        .map_err(|err| format!("local validation failed: {err}"))?;
+    typed_secret_checks(&typed, &ctx)?;
+    run_adapter_typed_checks::<C>(&ctx)?;
+
+    // Step 2: build the local envelope.
+    let local_data: serde_json::Value = serde_json::to_value(&typed)
+        .map_err(|err| format!("failed to serialise local config: {err}"))?;
+    let local_envelope = BlobEnvelope::new(local_data, generated_at_rfc3339());
+    let local_sha = local_envelope.sha256.clone();
+
+    // Step 3: resolve adapter + store + key (mirrors the push flow).
+    ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
+    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
+        format!(
+            "adapter `{}` is declared in {} but not registered in this build",
+            args.adapter,
+            args.manifest.display()
+        )
+    })?;
+    let logical = resolve_config_store_id(args.store.as_deref(), ctx.manifest())?;
+    let env_config = EnvConfig::from_env();
+    let platform = env_config.store_name("config", &logical);
+    let store = ResolvedStoreId::new(logical.clone(), platform);
+    let key = args.key.clone().unwrap_or(logical);
+
+    // Step 4: resolve adapter paths for the read call.
+    let manifest_root = ctx
+        .manifest_path
+        .parent()
+        .filter(|pp| !pp.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let manifest_data = ctx.manifest();
+    let (adapter_manifest_path, component_selector) =
+        if let Some((_canonical, adapter_cfg)) = manifest_data.adapter_entry(&args.adapter) {
+            (
+                adapter_cfg.adapter.manifest.clone(),
+                adapter_cfg.adapter.component.clone(),
+            )
+        } else {
+            (None, None)
+        };
+    let mut push_ctx = adapter_registry::AdapterPushContext::new().with_local(args.local);
+    if let Some(path) = args.runtime_config.as_deref() {
+        push_ctx = push_ctx.with_runtime_config_path(path);
+    }
+    let paths = PushPathRefs {
+        manifest_root,
+        adapter_manifest_path: adapter_manifest_path.as_deref(),
+        component_selector: component_selector.as_deref(),
+        push_ctx: &push_ctx,
+    };
+
+    // Step 5: read the remote entry.
+    let remote = read_remote(adapter, args.local, &paths, &store, &key)?;
+
+    // Step 6: branch per variant, render, determine outcome.
+    let outcome: DiffOutcome = match &remote {
+        ReadConfigEntry::Present(body) => {
+            let remote_envelope: BlobEnvelope = serde_json::from_str(body)
+                .map_err(|err| format!("remote envelope parse failed: {err}"))?;
+            remote_envelope
+                .verify()
+                .map_err(|err| format!("remote envelope verification failed: {err}"))?;
+            if remote_envelope.sha256 == local_sha {
+                diff_info(&format!("# no changes (sha256 matches: {local_sha})"));
+                DiffOutcome::NoChanges
+            } else {
+                dispatch_diff_format(
+                    &remote_envelope.data,
+                    &local_envelope.data,
+                    &remote_envelope.sha256,
+                    &local_sha,
+                    &args.format,
+                );
+                DiffOutcome::DiffPresent
+            }
+        }
+        ReadConfigEntry::MissingKey => {
+            let leaf_count = collect_changes(
+                &serde_json::Value::Object(serde_json::Map::default()),
+                &local_envelope.data,
+            )
+            .len();
+            diff_info(&format!(
+                "# no remote at key `{key}`; all {leaf_count} leaves added"
+            ));
+            dispatch_diff_format(
+                &serde_json::Value::Object(serde_json::Map::default()),
+                &local_envelope.data,
+                "(none)",
+                &local_sha,
+                &args.format,
+            );
+            DiffOutcome::RemoteAbsent
+        }
+        ReadConfigEntry::MissingStore => {
+            let leaf_count = collect_changes(
+                &serde_json::Value::Object(serde_json::Map::default()),
+                &local_envelope.data,
+            )
+            .len();
+            diff_info(&format!(
+                "# store has no matching backend yet \u{2014} run `edgezero provision \
+                 --adapter {}` first if this is the live remote; all {leaf_count} leaves added",
+                args.adapter
+            ));
+            dispatch_diff_format(
+                &serde_json::Value::Object(serde_json::Map::default()),
+                &local_envelope.data,
+                "(none)",
+                &local_sha,
+                &args.format,
+            );
+            DiffOutcome::RemoteAbsent
+        }
+        ReadConfigEntry::Unsupported(reason) => {
+            diff_info(&format!(
+                "config diff for {} is unsupported ({reason}). Re-run with --local for the \
+                 on-disk read, or push unconditionally with `<app-cli> config push \
+                 --adapter {} --yes` to update without seeing the diff.",
+                args.adapter, args.adapter,
+            ));
+            DiffOutcome::Unsupported
+        }
+        // `ReadConfigEntry` is `#[non_exhaustive]`; forward-compat fallback.
+        _ => DiffOutcome::Unsupported,
+    };
+
+    Ok(apply_exit_code(args.exit_code, outcome))
+}
+
+/// Dispatch the diff to the correct renderer based on `format`.
+///
+/// `unified` re-uses `print_unified_diff_inline` from this module (no duplication).
+/// `structured` and `json` delegate to `crate::diff`.
+fn dispatch_diff_format(
+    remote_data: &serde_json::Value,
+    local_data: &serde_json::Value,
+    remote_sha: &str,
+    local_sha: &str,
+    format: &DiffFormat,
+) {
+    match format {
+        DiffFormat::Unified => {
+            print_unified_diff_inline(remote_data, local_data, remote_sha, local_sha);
+        }
+        DiffFormat::Structured => {
+            render_structured(remote_data, local_data, remote_sha, local_sha);
+        }
+        DiffFormat::Json => {
+            render_json(remote_data, local_data, remote_sha, local_sha);
+        }
+    }
 }
 
 // -------------------------------------------------------------------
@@ -1588,6 +1849,52 @@ serve = "echo"
         );
     }
 
+    /// High 2 — spec §3.3.8: typed validate uses `validate_excluding_secrets`,
+    /// so a `#[secret]` field annotated with `length(min = 32)` must NOT
+    /// reject a short key name like `"short_key"` (9 bytes).  The runtime
+    /// resolves it to the real secret value and runs the full validator there.
+    #[test]
+    fn validate_typed_skips_secret_field_validators() {
+        #[derive(Debug, Deserialize, Serialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct SecretValidatorConfig {
+            #[validate(length(min = 32_u64))]
+            api_token: String,
+            #[validate(length(min = 1_u64))]
+            greeting: String,
+        }
+        impl AppConfigMeta for SecretValidatorConfig {
+            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
+                kind: SecretKind::KeyInDefault,
+                name: "api_token",
+            }];
+        }
+
+        let app_config = r#"
+api_token = "short_key"
+greeting = "hello"
+"#;
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, app_config);
+        // "short_key" is 9 chars — would fail length(min=32) on the old full-validate
+        // path but MUST PASS with validate_excluding_secrets.
+        run_config_validate_typed::<SecretValidatorConfig>(&args_for(&manifest_path))
+            .expect("secret-field validator must be skipped on typed validate");
+    }
+
     // ---------- Spin checks ----------
 
     fn spin_manifest(extra_section: &str) -> String {
@@ -2392,8 +2699,9 @@ default = "one"
 
     /// Build a valid `BlobEnvelope` JSON string for the given data, suitable
     /// for writing into axum's `.edgezero/local-config-<id>.json` as the
-    /// "remote" state. The SHA is computed over the stripped data exactly
-    /// as `build_config_envelope` does.
+    /// "remote" state. The SHA is computed over the canonical-form data
+    /// exactly as `build_config_envelope` does — every field (including
+    /// `#[secret]` key NAMES per Model A) is preserved verbatim.
     fn make_envelope_json(data: serde_json::Value) -> String {
         use edgezero_core::blob_envelope::BlobEnvelope;
         let env = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
@@ -2920,6 +3228,138 @@ ids = ["default"]
         assert!(
             raw.contains("greeting"),
             "written envelope has greeting: {raw}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // High — diff runs run_shared_checks (adapter manifest + collision)
+    // -------------------------------------------------------------------
+
+    /// High — spec §3.3.2: `run_config_diff_typed` must run
+    /// `run_shared_checks` (which includes `validate_adapter_manifest`)
+    /// before reaching the remote-read step.  A broken Spin
+    /// `spin.toml` (no `[component.*]` sections) triggers
+    /// `validate_adapter_manifest` inside `run_adapter_shared_checks`,
+    /// which must be caught even on a read-only diff.
+    #[test]
+    fn diff_typed_runs_shared_checks() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let manifest_spin = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (dir, manifest_path, _) = setup_project(manifest_spin, FIXTURE_APP_CONFIG);
+        // spin.toml with ZERO components — Spin's validate_adapter_manifest
+        // must reject before the function reaches the remote-read step.
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n",
+        )
+        .expect("write spin.toml");
+        let diff_args = ConfigDiffArgs {
+            adapter: "spin".to_owned(),
+            app_config: None,
+            exit_code: false,
+            format: DiffFormat::Unified,
+            key: None,
+            local: false,
+            manifest: manifest_path.clone(),
+            no_env: true,
+            runtime_config: None,
+            store: None,
+        };
+        let err = run_config_diff_typed::<FixtureConfig>(&diff_args)
+            .expect_err("missing [component.*] must fail Spin's shared-check preflight in diff");
+        assert!(
+            err.contains("no [component.*]") || err.contains("component"),
+            "error must come from Spin's shared validate_adapter_manifest: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Medium 1 — diff runs typed_secret_checks + adapter_typed_checks
+    // -------------------------------------------------------------------
+
+    /// Medium 1 — spec §3.3.2: `run_config_diff_typed` must run the same
+    /// structural checks as push, including `typed_secret_checks`.  A
+    /// `#[secret]` field that is present but empty must be rejected even
+    /// on a read-only diff operation.
+    #[test]
+    fn diff_typed_rejects_typed_secret_collision() {
+        // Fixture config with a `#[secret]` field.  An EMPTY api_token
+        // triggers `typed_secret_checks`' non-empty guard — this is the
+        // simplest structural error that passes `validate_excluding_secrets`
+        // but must be caught by `typed_secret_checks`.
+        #[derive(Debug, Deserialize, Serialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct DiffSecretConfig {
+            api_token: String,
+            #[validate(length(min = 1_u64))]
+            greeting: String,
+        }
+        impl AppConfigMeta for DiffSecretConfig {
+            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
+                kind: SecretKind::KeyInDefault,
+                name: "api_token",
+            }];
+        }
+
+        let app_config_empty_secret = r#"
+api_token = ""
+greeting = "hello"
+"#;
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, app_config_empty_secret);
+        let diff_args = ConfigDiffArgs {
+            adapter: "axum".to_owned(),
+            app_config: None,
+            exit_code: false,
+            format: DiffFormat::Unified,
+            key: None,
+            local: false,
+            manifest: manifest_path.clone(),
+            no_env: true,
+            runtime_config: None,
+            store: None,
+        };
+        // typed_secret_checks must catch the empty `#[secret]` field
+        // before the function reaches the remote-read step.
+        let err = run_config_diff_typed::<DiffSecretConfig>(&diff_args)
+            .expect_err("empty #[secret] field must be rejected by diff typed_secret_checks");
+        assert!(
+            err.contains("api_token") && err.contains("non-empty"),
+            "error names the empty secret field: {err}"
         );
     }
 }

@@ -28,6 +28,8 @@ mod config;
 #[cfg(all(feature = "cli", feature = "demo-example"))]
 mod demo_server;
 #[cfg(feature = "cli")]
+mod diff;
+#[cfg(feature = "cli")]
 mod generator;
 #[cfg(feature = "cli")]
 mod provision;
@@ -46,7 +48,8 @@ pub mod args;
 pub use auth::run_auth;
 #[cfg(feature = "cli")]
 pub use config::{
-    run_config_push, run_config_push_typed, run_config_validate, run_config_validate_typed,
+    run_config_diff_typed, run_config_push, run_config_push_typed, run_config_validate,
+    run_config_validate_typed, DiffExit,
 };
 #[cfg(feature = "cli")]
 pub use provision::run_provision;

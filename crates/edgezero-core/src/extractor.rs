@@ -755,13 +755,14 @@ where
 ///
 /// # Errors
 ///
-/// - [`EdgeError::ConfigOutOfDate`] — missing blob, SHA mismatch, envelope
-///   parse failure, missing secret key, deserialise failure, or validation
-///   failure on a non-secret field.
+/// - [`EdgeError::ConfigOutOfDate`] — missing blob, missing secret key,
+///   deserialise failure, or validation failure on a non-secret field.
+/// - [`EdgeError::Internal`] — envelope parse failure or SHA mismatch
+///   (envelope integrity failures indicate a corrupt/tampered store entry,
+///   not a stale config — they surface as 500 Internal).
 /// - [`EdgeError::ServiceUnavailable`] — config-store backend temporarily down
 ///   (`ConfigStoreError::Unavailable`).
 /// - [`EdgeError::BadRequest`] — malformed key (`ConfigStoreError::InvalidKey`).
-/// - [`EdgeError::Internal`] — unexpected backend failure or bad envelope.
 async fn extract_from_handle<C>(
     ctx: &RequestContext,
     handle: &ConfigStoreHandle,
@@ -2051,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_returns_config_out_of_date_on_sha_mismatch() {
+    fn app_config_extractor_returns_internal_on_sha_mismatch() {
         struct TamperedStore;
         #[async_trait(?Send)]
         impl ConfigStore for TamperedStore {
@@ -2081,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn app_config_extractor_returns_config_out_of_date_on_bad_envelope_json() {
+    fn app_config_extractor_returns_internal_on_bad_envelope_json() {
         struct GarbageStore;
         #[async_trait(?Send)]
         impl ConfigStore for GarbageStore {
