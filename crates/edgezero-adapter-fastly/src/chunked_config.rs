@@ -21,15 +21,23 @@
 
 use sha2::{Digest as _, Sha256};
 
-/// Per-entry value limit enforced by Fastly Config Store.
+/// Per-entry value limit enforced by Fastly Config Store. Used by the
+/// CLI writer to gate direct-vs-chunked storage; the runtime resolver
+/// reads chunk lengths from the pointer struct, not this constant.
+#[cfg(any(feature = "cli", test))]
 pub(crate) const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 /// Target payload size per chunk (kept under the entry limit to leave
-/// room for the key and any protocol overhead).
+/// room for the key and any protocol overhead). CLI writer only.
+#[cfg(any(feature = "cli", test))]
 pub(crate) const CHUNK_PAYLOAD_TARGET: usize = 7_000;
 /// Infix inserted between the root key and the content-address in a
-/// chunk key: `<root>.__edgezero_chunks.<sha256>.<index>`.
+/// chunk key: `<root>.__edgezero_chunks.<sha256>.<index>`. CLI writer
+/// only; the resolver reads chunk keys from the pointer struct.
+#[cfg(any(feature = "cli", test))]
 pub(crate) const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
-/// `edgezero_kind` discriminant stored in the pointer JSON.
+/// `edgezero_kind` discriminant stored in the pointer JSON. Used by
+/// BOTH the writer (when serialising the pointer) AND the resolver
+/// (when validating the parsed pointer) -- stays unconditional.
 pub(crate) const POINTER_KIND: &str = "fastly_config_chunks";
 
 // ---------------------------------------------------------------------------
@@ -75,6 +83,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Returns an error string if the pointer JSON itself would exceed 8 000
 /// characters (extremely unlikely in practice; recommends restructuring).
+#[cfg(any(feature = "cli", test))]
 pub(crate) fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
@@ -162,7 +171,8 @@ pub(crate) fn prepare_fastly_config_entries(
 
 /// Find the largest byte offset `<= end_raw` that is a valid UTF-8
 /// codepoint boundary within `src`.  `start` is used as a hint so we
-/// don't scan the entire string from zero each time.
+/// don't scan the entire string from zero each time. CLI writer only.
+#[cfg(any(feature = "cli", test))]
 fn find_utf8_boundary(src: &str, start: usize, end_raw: usize) -> usize {
     if end_raw >= src.len() {
         return src.len();
