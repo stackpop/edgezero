@@ -3,6 +3,7 @@
 #[cfg(test)]
 use std::collections::HashMap;
 
+use crate::chunked_config::resolve_fastly_config_value;
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
 use fastly::config_store::{LookupError, OpenError};
@@ -27,6 +28,18 @@ impl FastlyConfigStore {
         }
     }
 
+    /// Synchronous key lookup used by the chunk-pointer resolver callback.
+    /// Returns `Ok(Some(value))`, `Ok(None)` (missing), or `Err(message)`.
+    fn get_sync(&self, key: &str) -> Result<Option<String>, String> {
+        match &self.inner {
+            FastlyConfigStoreBackend::Fastly(inner) => inner
+                .try_get(key)
+                .map_err(|err| format!("config store lookup failed for `{key}`: {err}")),
+            #[cfg(test)]
+            FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(key).cloned()),
+        }
+    }
+
     /// Open a Fastly Config Store by resource link name.
     ///
     /// Returns an error if the configured store cannot be opened.
@@ -45,13 +58,37 @@ impl FastlyConfigStore {
 impl ConfigStore for FastlyConfigStore {
     #[inline]
     async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-        match &self.inner {
+        let root_value = match &self.inner {
             FastlyConfigStoreBackend::Fastly(inner) => {
-                inner.try_get(key).map_err(|err| map_lookup_error(&err))
+                inner.try_get(key).map_err(|err| map_lookup_error(&err))?
             }
             #[cfg(test)]
-            FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(key).cloned()),
-        }
+            FastlyConfigStoreBackend::InMemory(data) => data.get(key).cloned(),
+        };
+        let Some(value) = root_value else {
+            return Ok(None);
+        };
+        // Resolve chunk pointers transparently. Direct BlobEnvelope values
+        // pass through unchanged; pointer values fan out to chunk entries
+        // in the same store. Missing / malformed / hash-mismatched chunks
+        // are corrupt platform state — spec §9.3 (line 6272) calls this an
+        // internal config-store error with re-push remediation, NOT a
+        // transient unavailable. Mapping to `internal` surfaces as HTTP
+        // 500 and pushes operators toward `<app-cli> config push` instead
+        // of waiting for a 503 to clear.
+        let resolved =
+            resolve_fastly_config_value(key, value, |chunk_key| self.get_sync(chunk_key)).map_err(
+                |err| {
+                    log::warn!(
+                        "Fastly config-store chunk resolution failed for `{key}`: {err}. \
+                     Re-run `<app-cli> config push` to repair the store."
+                    );
+                    ConfigStoreError::internal(anyhow::anyhow!(
+                "config store entry is corrupt or incomplete; re-run config push to repair: {err}"
+            ))
+                },
+            )?;
+        Ok(Some(resolved))
     }
 }
 
@@ -95,5 +132,37 @@ mod tests {
     fn key_too_long_maps_to_invalid_key_error() {
         let err = map_lookup_error(&LookupError::KeyTooLong);
         assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
+    }
+
+    /// Spec §9.3 (line 6272): missing chunks, hash mismatches, pointer
+    /// parse failures, and full-envelope mismatches are CORRUPT PLATFORM
+    /// STATE — the runtime returns an internal config-store error with
+    /// re-push remediation, NOT a transient `Unavailable` (which would
+    /// surface as HTTP 503 and invite operators to wait it out).
+    #[test]
+    fn corrupt_chunk_pointer_maps_to_internal_not_unavailable() {
+        use futures::executor::block_on;
+        // A root value that is neither a valid BlobEnvelope nor a valid
+        // FastlyChunkPointer triggers the resolver's "malformed pointer"
+        // path. We do NOT add the chunks the (would-be) pointer expects,
+        // so any chunk fetch would also fail — but the resolver bails
+        // earlier on the parse failure.
+        let store = FastlyConfigStore::from_entries([(
+            "app_config".to_owned(),
+            "not-a-valid-envelope-or-pointer".to_owned(),
+        )]);
+        let err = block_on(store.get("app_config"))
+            .expect_err("corrupt root must map to a ConfigStoreError");
+        assert!(
+            matches!(err, ConfigStoreError::Internal { .. }),
+            "corrupt platform state must be Internal (not Unavailable / not InvalidKey): {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .to_lowercase()
+                .contains("re-run config push")
+                || err.to_string().to_lowercase().contains("corrupt"),
+            "error message must point operators at the remediation: {err}"
+        );
     }
 }

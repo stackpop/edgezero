@@ -2,16 +2,16 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace EdgeZero's per-leaf typed-config storage with a single-key JSON blob per environment, embedding SHA-256 for drift detection, exposing the typed `C` via a new `AppConfig<C>` extractor with framework-resolved `#[secret]` fields, and adding a `config diff` command.
+**Goal:** Replace EdgeZero's per-leaf typed-config storage with a logical root-key JSON blob per environment, embedding SHA-256 for drift detection, exposing the typed `C` via a new `AppConfig<C>` extractor with framework-resolved `#[secret]` fields, and adding a `config diff` command.
 
-**Architecture:** One typed-config struct `C` serialises to a single envelope `{ data, sha256, version, generated_at }` written to one `[stores.config]` key per environment. The runtime reads the envelope, verifies the SHA, swaps `#[secret]` fields with values from `[stores.secrets]`, deserialises through `serde_path_to_error`, validates, and yields `C` to the handler. `config push` writes one blob per adapter; `config diff` compares local vs remote via a new `Adapter::read_config_entry` trait. Hard cutoff per [spec §10](../specs/2026-06-16-blob-app-config.md): no dual-shape parsing, no legacy fallback.
+**Architecture:** One typed-config struct `C` serialises to a single envelope `{ data, sha256, version, generated_at }` addressed by one `[stores.config]` root key per environment. The runtime reads the envelope, verifies the SHA, swaps `#[secret]` fields with values from `[stores.secrets]`, deserialises through `serde_path_to_error`, validates, and yields `C` to the handler. Most adapters store the root as one physical value. Fastly stores oversized envelopes behind the same root key using adapter-private content chunks plus a root pointer written last. `config diff` compares local vs remote via a new `Adapter::read_config_entry` trait. Hard cutoff per [spec §10](../specs/2026-06-16-blob-app-config.md): no legacy per-leaf fallback.
 
 **Tech Stack:** Rust 1.95.0, Cargo workspace (8 crates), `serde_json` + `ryu` + `sha2` for canonicalisation, `serde_path_to_error` for field-path-aware deserialise errors, `validator` 0.20 for runtime validation, `clap` 4.6 for CLI, `chrono` 0.4 (ALREADY in workspace deps; new consumer on `edgezero-cli` for the `generated_at` RFC3339 timestamp at push time), `similar` 2 for the `config push` inline diff + `config diff --format unified` text-diff renderer, `syn` 2 + `walkdir` (CI-gate-only feature) for the nested-AppConfig acceptance check. No new runtime deps beyond `ryu`/`sha2`/`serde_path_to_error`/`similar`/`chrono` (the last reusing the existing workspace pin).
 
 ## Global Constraints
 
 - **Source of truth:** [`docs/superpowers/specs/2026-06-16-blob-app-config.md`](../specs/2026-06-16-blob-app-config.md). Every task numbered below cites the spec section it implements.
-- **Hard cutoff:** no `#[serde(default)]` compat fallback for missing legacy state, no dual-shape parse path, no platform-side bridge. Per spec §1 / §10.1.
+- **Hard cutoff:** no `#[serde(default)]` compat fallback for missing legacy state, no runtime fallback to the old per-leaf app-config shape, no platform-side bridge for legacy state. Fastly's direct-or-pointer storage is a new v1 physical representation for the same blob envelope, not legacy compatibility. Per spec §1 / §10.1.
 - **Atomic cutover:** spec §10.1 + §10.2 require runtime extractor + per-adapter writers + app-demo migration + scaffold templates + CI gate to land in ONE commit (Phase C below). Intermediate trees with new runtime / old writer do NOT compile cleanly because the read-trait-driven inline diff and the gate cross-check would fail. **Bisect-safe annotations** appear in each task heading.
 - **No external canonicaliser crate:** Q1 resolved to (b) per round-21 review. `serde_canonical_json` rejects finite floats; the v1 canonicaliser is a hand-rolled walker in `crates/edgezero-core/src/canonical_form.rs`. Only deps: `serde_json` (already in-tree), `ryu`, `sha2`.
 - **Store-id charset:** spec §5.2 tightens `[stores.*]` ids to `[A-Za-z0-9_]+`. Hyphens are rejected at manifest validation. App-demo and scaffold templates already use underscore-only ids.
@@ -30,7 +30,7 @@
 | Phase | Spec §                              | Commit type                  | Acceptance                                                                                                                                                                           |
 | ----- | ----------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | A     | §4                                  | Pre-cutover infra            | Canonical form + envelope + non-finite-float check ship in `edgezero-core`. No in-tree caller exercises them yet. Bisect-safe.                                                       |
-| B     | §3, §5, §6.3, §9.0                  | Pre-cutover infra            | `ConfigStoreBinding`, `EnvConfig::store_key`, manifest charset, `EdgeError::ConfigOutOfDate`, derive-macro extensions, read trait + per-adapter impls. None called yet. Bisect-safe. |
+| B     | §3, §5, §6.3, §9.0                  | Pre-cutover infra            | `ConfigStoreBinding`, `EnvConfig::store_key`, manifest charset, `EdgeError::ConfigOutOfDate`, derive-macro extensions, read trait + per-adapter impls, and Fastly chunk-pointer helpers. None called yet. Bisect-safe. |
 | C     | §3.3, §8.2, §10.2, §10.2.1, §10.2.2 | **CUTOVER (not splittable)** | `AppConfig<C>` extractor + `config push` rewrite + app-demo migration + scaffold templates + all three CI gates land together. Spec §10.1 forbids splitting.                         |
 | D     | §8.1                                | Post-cutover additive        | `config diff` command, format renderers, `--exit-code`. Depends on Phase C's read flow + writers.                                                                                    |
 | E     | §10 narrative                       | Post-cutover docs            | Migration guide, smoke scripts, README updates.                                                                                                                                      |
@@ -2226,13 +2226,113 @@ pub enum ReadConfigEntry {
 Run: `cargo check --workspace --all-targets`
 Expected: clean.
 
+## Task B12.5 — Fastly chunk-pointer helper (private adapter module)
+
+**Files:**
+
+- Modify: `crates/edgezero-adapter-fastly/Cargo.toml` — add `sha2 = { workspace = true }` if not already present.
+- Create: `crates/edgezero-adapter-fastly/src/chunked_config.rs` — private helper for Fastly oversized app-config values.
+- Modify: `crates/edgezero-adapter-fastly/src/lib.rs` — add `mod chunked_config;`.
+
+**Interfaces:**
+
+- Produces adapter-private helpers:
+  - `prepare_fastly_config_entries(root_key: &str, envelope_json: &str) -> Result<Vec<(String, String)>, String>`
+  - `resolve_fastly_config_value<F>(root_key: &str, root_value: String, fetch: F) -> Result<String, String>`
+  - constants for `FASTLY_CONFIG_ENTRY_LIMIT = 8_000`, chunk key infix `.__edgezero_chunks.`, and pointer kind `fastly_config_chunks`.
+
+The public adapter trait remains unchanged. The CLI still hands Fastly one logical `(key, envelope_json)` entry. Fastly expands that into either one physical direct entry or N chunk entries plus one root pointer internally.
+
+- [ ] **Step 1: Add the Fastly adapter dependency for chunk hashing.**
+
+Add to `crates/edgezero-adapter-fastly/Cargo.toml`:
+
+```toml
+sha2 = { workspace = true }
+```
+
+Use the same lowercase hex formatting style as `edgezero-core`'s canonical SHA code; do not add a separate `hex` crate.
+
+- [ ] **Step 2: Define the pointer schema as a private serde struct.**
+
+```rust
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FastlyChunkPointer {
+    edgezero_kind: String, // must equal "fastly_config_chunks"
+    version: u8,           // v1 only
+    envelope_sha256: String,
+    envelope_len: usize,
+    data_sha256: String,
+    chunks: Vec<FastlyChunkRef>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FastlyChunkRef {
+    key: String,
+    sha256: String,
+    len: usize,
+}
+```
+
+`data_sha256` is copied from the `BlobEnvelope.sha256` field for diagnostics only. `envelope_sha256` is SHA-256 of the full envelope JSON bytes and is the content address used in chunk keys.
+
+- [ ] **Step 3: Implement `prepare_fastly_config_entries`.**
+
+Rules:
+
+1. If `envelope_json.len() <= 8_000`, return `vec![(root_key.to_owned(), envelope_json.to_owned())]`.
+2. Otherwise split `envelope_json.as_bytes()` into UTF-8-safe chunks with target payload `7_000` bytes. Do not cut inside a UTF-8 codepoint.
+3. Chunk keys are `<ROOT_KEY>.__edgezero_chunks.<ENVELOPE_SHA256>.<INDEX>`.
+4. Return chunk entries first, root pointer entry last.
+5. If the root pointer JSON itself exceeds 8,000 characters, return an error before any caller writes platform entries.
+
+The helper owns only entry preparation. It does not shell out and does not write files.
+
+- [ ] **Step 4: Implement `resolve_fastly_config_value`.**
+
+Rules:
+
+1. Try to parse `root_value` as a `BlobEnvelope`. If it parses, verify it. A valid direct envelope returns `root_value`; a parsed envelope with a SHA/version verification failure is an error.
+2. Only when `root_value` does not parse as a `BlobEnvelope`, try to parse it as `FastlyChunkPointer`. Reject unknown `edgezero_kind` / version.
+3. Fetch each chunk by key using the supplied callback.
+4. Verify every chunk length and chunk SHA.
+5. Concatenate chunks in pointer order, verify `envelope_len` and `envelope_sha256`, then return the reconstructed envelope JSON string.
+6. Missing chunks, malformed pointer, hash mismatch, and length mismatch are errors, not missing-root-key results.
+
+The callback shape can be sync for CLI/runtime Fastly because both current backends are sync under the async wrapper:
+
+```rust
+fn resolve_fastly_config_value<F>(
+    root_key: &str,
+    root_value: String,
+    mut fetch: F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<Option<String>, String>,
+```
+
+- [ ] **Step 5: Unit-test the helper without shelling out.**
+
+Required cases:
+
+- Exactly 8,000 chars returns one direct entry.
+- 8,001 chars returns chunks plus root pointer, with the pointer last.
+- Resolver returns direct envelope unchanged.
+- Resolver reconstructs a chunked envelope and verifies it.
+- Missing chunk, chunk hash mismatch, chunk length mismatch, full-envelope hash mismatch, malformed pointer, and pointer-too-large all error with messages naming the root key or chunk key.
+- Chunk splitting preserves UTF-8 for multi-byte characters.
+
+- [ ] **Step 6: Run.**
+
+Run: `cargo test -p edgezero-adapter-fastly chunked_config`
+
 ## Task B13 — Per-adapter `read_config_entry` + `_local` impls
 
 **Files:**
 
 - Modify: `crates/edgezero-adapter-axum/src/cli.rs` — implement both methods (file-map reads).
 - Modify: `crates/edgezero-adapter-cloudflare/src/cli.rs` — `wrangler kv key get --binding <B> <K> --remote` for `read_config_entry`; `--local` for `_local`.
-- Modify: `crates/edgezero-adapter-fastly/src/cli.rs` — `fastly config-store-entry describe --store-id=<id> --key=<key> --json`.
+- Modify: `crates/edgezero-adapter-fastly/src/cli.rs` — `fastly config-store-entry describe --store-id=<id> --key=<key> --json`, then resolve direct-or-pointer values through `chunked_config`.
 - Modify: `crates/edgezero-adapter-spin/src/cli.rs` — local: SQLite read via vendored schema; cloud: returns `Unsupported`.
 
 **Interfaces:**
@@ -2326,7 +2426,22 @@ fn read_config_entry(
 
 `_local` is identical but with `--local` instead of `--remote`.
 
-- [ ] **Step 3: Fastly.** Shell out to `fastly config-store-entry describe --store-id=<id> --key=<key> --json`. Parse JSON, extract `item_value`, return `Present`. Map "not found" stderr to `MissingKey`.
+- [ ] **Step 3: Fastly.** Shell out to `fastly config-store-entry describe --store-id=<id> --key=<key> --json`. Parse JSON, extract `item_value`, then pass it through `chunked_config::resolve_fastly_config_value`.
+
+Remote fetch callback:
+
+- Root read uses the normal `describe --key=<root>` call.
+- If the root value is a pointer, the resolver calls back for each chunk key. Each callback uses the same `describe --store-id=<id> --key=<chunk-key> --json` path and extracts `item_value`.
+- Root "not found" maps to `ReadConfigEntry::MissingKey`.
+- Chunk "not found", malformed chunk output, pointer parse failure, hash mismatch, and length mismatch are `Err(...)`, not `MissingKey`.
+- On success return `ReadConfigEntry::Present(reconstructed_envelope_json)`.
+
+Local fetch callback:
+
+- Read `[local_server.config_stores.<platform>.contents]` from `fastly.toml`.
+- Look up the root key. Missing root key maps to `MissingKey` when the store table exists.
+- If the root value is a pointer, look up each chunk key from the same `contents` table and resolve via the same helper.
+- Chunk keys contain dots; local lookup must use the literal key string, not TOML dotted-path traversal.
 
 - [ ] **Step 4: Spin — mirror the FULL write dispatch.** Spec §9.0 says read-back must use the same variant as the write path. The Spin writer's `dispatch_push` at `crates/edgezero-adapter-spin/src/cli.rs:514` has four branches (per its doc-comment at `cli.rs:498-513`); the read path needs each one. Round-37 M-2: the original markdown table broke rendering because the row-3 Rust OR-pattern `Some(Redis { .. } | AzureCosmos | Unknown)` contains unescaped `|` chars that GFM treats as column separators. Restructured as bullets so the operator sees a coherent four-branch map (and so prettier doesn't re-expand the header separator to match the split).
 
@@ -2456,7 +2571,12 @@ fn read_sqlite(sqlite_path: &Path, store: &str, key: &str) -> Result<ReadConfigE
 
 This branch logic is intentionally large because spec §9.0 says "read-back uses the same variant as the write path" — silently collapsing all four into "SQLite or Unsupported" would leave Redis/Azure operators with a confusing diff error and would not detect the Fermyon Cloud branch correctly.
 
-- [ ] **Step 5: Add unit tests for each adapter.** For shell-out adapters, mock with a test scaffold that uses a fake `wrangler` / `fastly` script on PATH. For Axum, write a temp file and assert directly. For Spin, exercise each of the four branches with a fixture `runtime-config.toml`. Spin fixtures MUST include the round-29 H-1 path-resolution case:
+- [ ] **Step 5: Add unit tests for each adapter.** For shell-out adapters, mock with a test scaffold that uses a fake `wrangler` / `fastly` script on PATH. For Axum, write a temp file and assert directly. For Fastly, cover both direct and chunk-pointer reads. For Spin, exercise each of the four branches with a fixture `runtime-config.toml`. Spin fixtures MUST include the round-29 H-1 path-resolution case:
+
+- **Fastly remote direct read.** Fake `fastly config-store-entry describe` returns `{"item_value":"<normal envelope>"}` for the root key. Assert `ReadConfigEntry::Present(<same envelope>)`.
+- **Fastly remote chunked read.** Fake `fastly` returns a pointer for the root key and chunk values for chunk keys. Assert `ReadConfigEntry::Present(<reconstructed envelope>)`.
+- **Fastly remote chunk missing / corrupt.** Fake `fastly` returns "not found" or a wrong hash for a chunk key. Assert `Err(...)`, not `MissingKey`.
+- **Fastly local chunked read.** Fixture `fastly.toml` contains a root pointer plus literal dotted chunk keys under `[local_server.config_stores.<id>.contents]`. Assert the read reconstructs the envelope and does not interpret dots as nested TOML paths.
 
 - **Spin SQLite path resolves against runtime-config dir, not manifest dir.** Fixture: place `spin.toml` at `<tmp>/spin/spin.toml`; place `runtime-config.toml` at `<tmp>/cfg/runtime-config.toml` (a DIFFERENT directory) with `[key_value_store.<label>] type = "spin"`, `path = "session.db"`. Invoke `read_config_entry` with `push_ctx.runtime_config_path = <tmp>/cfg/runtime-config.toml`. Assert the SQLite path resolved to `<tmp>/cfg/session.db` (anchored against the runtime-config file's dir), NOT `<tmp>/spin/session.db`. This proves the writer and read paths agree exactly via the shared `push_sqlite::resolve_sqlite_path` helper.
 
@@ -2932,10 +3052,11 @@ Run: `cargo test -p edgezero-core --lib extractor::tests::app_config`
 
 **Files:**
 
-- Modify: `crates/edgezero-cli/src/config.rs` — `run_config_push_typed` builds ONE `BlobEnvelope`, serialises it, resolves the target key, and calls the EXISTING `adapter.push_config_entries(...)` writer with exactly one `(key, envelope_json)` entry.
-- Modify: each adapter under `crates/edgezero-adapter-*/src/cli.rs` (and `push_sqlite.rs` / `push_cloud.rs` for Spin) ONLY for: (a) any pre-blob-model "flatten + per-leaf loop" preprocessing the writer did, and (b) per-platform cap checks on the single entry. Adapters do NOT touch `BlobEnvelope` — the `(String, String)` writer surface stays exactly as it is at `crates/edgezero-adapter/src/registry.rs:277`.
+- Modify: `crates/edgezero-cli/src/config.rs` — `run_config_push_typed` builds ONE `BlobEnvelope`, serialises it, resolves the target key, and calls the EXISTING `adapter.push_config_entries(...)` writer with exactly one logical `(key, envelope_json)` entry.
+- Modify: each adapter under `crates/edgezero-adapter-*/src/cli.rs` (and `push_sqlite.rs` / `push_cloud.rs` for Spin) ONLY for: (a) any pre-blob-model "flatten + per-leaf loop" preprocessing the writer did, (b) per-platform cap checks on the single logical entry, and (c) Fastly's adapter-private expansion of an oversized logical entry into physical chunk entries plus a root pointer. Adapters do NOT construct `BlobEnvelope` from `C` — the `(String, String)` writer surface stays exactly as it is at `crates/edgezero-adapter/src/registry.rs:277`.
+- Modify: `crates/edgezero-adapter-fastly/src/config_store.rs` — runtime `FastlyConfigStore::get` resolves direct-or-pointer values through the same Fastly chunk helper.
 
-**Ownership rationale (round-26 H-2):** the existing `push_config_entries` trait method takes `entries: &[(String, String)]` — a sequence of key/value pairs. Adapters don't see `C` or `cfg`. Earlier draft of this task told each adapter to build the envelope from `cfg`, which would have required widening the trait to take `C` (breaking the adapter abstraction) OR duplicating envelope-construction code across all four adapters. The clean ownership: **CLI builds the envelope once, then hands the writer ONE entry: `(resolved_key, envelope_json)`.** Adapters just write what they're handed, exactly like the per-leaf model did.
+**Ownership rationale (round-26 H-2, updated for Fastly chunking):** the existing `push_config_entries` trait method takes `entries: &[(String, String)]` — a sequence of key/value pairs. Adapters don't see `C` or `cfg`. Earlier draft of this task told each adapter to build the envelope from `cfg`, which would have required widening the trait to take `C` (breaking the adapter abstraction) OR duplicating envelope-construction code across all four adapters. The clean ownership remains: **CLI builds the envelope once, then hands the writer ONE logical entry: `(resolved_key, envelope_json)`.** Fastly may expand that one logical entry into multiple physical config-store entries internally; every other adapter writes the logical entry directly.
 
 - [ ] **Step 1: In `run_config_push_typed`, build the envelope after `validate_excluding_secrets`.**
 
@@ -2989,25 +3110,16 @@ fn generated_at_rfc3339() -> String {
 
 The plan's earlier `format_utc` placeholder is gone — round-27 reviewer flagged it as undefined.
 
-- [ ] **Step 2: Per-adapter platform-cap checks.** Adapters that need a pre-platform-call cap check enforce it inside their existing writer. The trait still takes `entries: &[(String, String)]`, so adapter code reads `entries[0].1.len()`:
+- [ ] **Step 2: Per-adapter platform limits and Fastly expansion.** Adapters that need a pre-platform-call cap check enforce it inside their existing writer. Fastly is different: the 8,000-character limit is per physical Config Store entry, so an oversized logical envelope must be expanded through Task B12.5's chunk helper instead of rejected.
 
 For **Fastly** (existing writer at `crates/edgezero-adapter-fastly/src/cli.rs`, the `push_config_entries` impl):
 
-```rust
-// Pre-platform-call guard for the blob model. Each entry is a
-// single envelope JSON string.
-for (key, body) in entries {
-    if body.len() > 8000 {
-        return Err(format!(
-            "blob at key `{key}` is {} characters; Fastly Config Store \
-             entry value limit is 8 000 characters. Restructure your \
-             typed app-config into multiple types and split across \
-             [stores.config] ids.",
-            body.len(),
-        ));
-    }
-}
-```
+- Remove the old `body.len() > 8_000` hard-fail guard.
+- For every logical `(key, envelope_json)` entry, call `chunked_config::prepare_fastly_config_entries(key, envelope_json)?`.
+- Write the returned physical entries in order. The helper returns chunks first and the root pointer last.
+- `dry_run` must not write. It should report whether each logical key would be direct or chunked, plus the physical entry count / chunk count.
+- If the helper errors because the pointer itself would exceed 8,000 characters, surface that error before any platform write.
+- The same preparation must be used by `push_config_entries_local`, writing all physical entries under `[local_server.config_stores.<platform>.contents]`.
 
 For **Spin Cloud** (at `crates/edgezero-adapter-spin/src/cli/push_cloud.rs`):
 
@@ -3020,11 +3132,19 @@ The existing cap check at line 90 (`if pair.len() >= MAX_ARGV_BYTES_PER_INVOCATI
 | Axum             | inserts each pair into the file map; serialises file at end                                                            | No code change — the one-entry case already works.                                                                                                                                                                                                                                      |
 | Cloudflare       | `wrangler kv bulk put <tempfile> --namespace-id=<id> --remote`                                                         | No code change — the one-entry tempfile is still valid bulk-put input.                                                                                                                                                                                                                  |
 | Cloudflare local | `wrangler kv bulk put <tempfile> --binding <BINDING> --local`                                                          | No code change.                                                                                                                                                                                                                                                                         |
-| Fastly           | per-entry `fastly config-store-entry update --upsert --stdin`                                                          | No code change; the existing loop runs once. Add the cap guard from Step 2.                                                                                                                                                                                                             |
+| Fastly           | per-entry `fastly config-store-entry update --upsert --stdin`                                                          | Expand each logical entry through `chunked_config::prepare_fastly_config_entries`; write direct roots directly, or chunk entries followed by the root pointer. Local Fastly push uses the same expansion before writing `fastly.toml`.                                                    |
 | Spin local       | per-entry SQLite insert                                                                                                | No code change.                                                                                                                                                                                                                                                                         |
 | Spin cloud       | chunked `spin cloud key-value set --app <APP> --label <LABEL> <KEY>=<VALUE> [...]` per `push_cloud.rs`'s `write_batch` | **Reuse `write_batch` unchanged with the one-pair vec** (round-26 M-2). The existing diagnostics (auth/link/partial-failure messages at `push_cloud.rs:166`, `:220`, `:235`) stay intact. DO NOT replace `output()` with `status()` — that would regress the actionable error messages. |
 
-- [ ] **Step 4: Per-adapter tests.** For each adapter's existing per-leaf push test, update the input from a multi-entry slice to a single envelope pair. Assert the same writer interaction (shell command shape, file contents, etc.) as the per-leaf test asserted, just with one key.
+- [ ] **Step 4: Per-adapter tests.** For each adapter's existing per-leaf push test, update the input from a multi-entry slice to a single logical envelope pair. Assert the same writer interaction (shell command shape, file contents, etc.) as the per-leaf test asserted, with Fastly-specific additions:
+
+- Fastly direct remote push at exactly 8,000 characters writes one physical root entry.
+- Fastly oversized remote push writes chunk entries first and root pointer last.
+- Fastly remote dry-run reports chunking and performs no shellouts.
+- Fastly local push writes root pointer plus literal dotted chunk keys under `[local_server.config_stores.<id>.contents]`.
+- Fastly local dry-run reports chunking and does not edit `fastly.toml`.
+- Simulated Fastly failure before the pointer write leaves the previous root active; this is tested at helper/writer level by asserting the root write is last.
+- Runtime `FastlyConfigStore::get` resolves a direct value unchanged and reconstructs a pointer value by fetching chunks from the same store.
 
 - [ ] **Step 5: Run.**
 
@@ -3828,11 +3948,12 @@ app-demo handlers in the same commit).
   #[secret(store_ref = \"field\")]), serde_path_to_error
   deserialise, validator::Validate::validate. Missing blob →
   EdgeError::ConfigOutOfDate per Q3 (d).
-- §8.2 config push rewrite: single envelope per [stores.config]
-  key per adapter. Per-adapter writers (Axum file map /
-  Cloudflare bulk put with namespace-id+remote / Fastly
-  --upsert --stdin / Spin direct SQLite / Spin Cloud
-  key-value set). Inline diff prompt + --yes / --no-diff /
+- §8.2 config push rewrite: single logical envelope per
+  [stores.config] root key per adapter. Per-adapter writers
+  (Axum file map / Cloudflare bulk put with namespace-id+remote /
+  Fastly direct-or-chunk-pointer via --upsert --stdin / Spin
+  direct SQLite / Spin Cloud key-value set). Inline diff prompt +
+  --yes / --no-diff /
   --dry-run consent flow per §8.2. --key flag for the per-env
   KEY override paired with __KEY runtime resolution from
   Phase B.
@@ -4354,6 +4475,40 @@ done
 
 (`run_runtime "$adapter"` is a smoke-script helper that boots the appropriate emulator: `cargo run -p edgezero-cli -- serve --adapter axum` for Axum, `wrangler dev --local` for Cloudflare, `viceroy` for Fastly, `spin up` for Spin. The existing smoke script has these helpers; this loop reuses them.)
 
+**Fastly oversized local smoke.** Add one Fastly-only block that forces the chunk-pointer path without hitting remote Fastly:
+
+```bash
+echo "=== Fastly oversized app-config chunk-pointer smoke ==="
+cat > "$tmp/app-demo-large.toml" <<'TOML'
+api_token = "demo_api_token"
+greeting = "large-fastly-blob-<repeat enough text to push the envelope over 8,001 chars>"
+vault = "default"
+
+[feature]
+new_checkout = false
+
+[service]
+timeout_ms = 1500
+TOML
+app-demo-cli config push --adapter fastly --local \
+  --app-config "$tmp/app-demo-large.toml" --yes
+
+# Assert the local fastly.toml has a root pointer and literal dotted chunk keys.
+rg 'edgezero_kind.*fastly_config_chunks' examples/app-demo/crates/app-demo-adapter-fastly/fastly.toml
+rg '__edgezero_chunks\\.' examples/app-demo/crates/app-demo-adapter-fastly/fastly.toml
+
+run_runtime fastly &
+rpid=$!
+trap "kill $rpid 2>/dev/null || true" EXIT
+wait_for_port
+result=$(curl -s http://localhost:8080/greeting)
+kill $rpid; wait $rpid 2>/dev/null || true
+trap - EXIT
+assert_contains "$result" "large-fastly-blob" "fastly chunk-pointer runtime read"
+```
+
+The actual fixture should generate the repeated text programmatically rather than checking in an enormous TOML file. The important assertion is that runtime `FastlyConfigStore::get` follows the pointer and returns the reconstructed normal envelope to the core extractor.
+
 **Spin Cloud exception.** Spin Cloud's `Unsupported` read-back per spec §8.3 means the smoke script can't `config diff` against Cloud, but the push + extractor path is the same shape; the smoke loop's `spin:--local` row exercises Spin's SQLite read path (per round-29 H-1's path-resolver fixtures, the SQLite resolution already has unit-test coverage; the smoke just adds the end-to-end composition check). The Spin Cloud branch is exercised by the SEPARATE block below.
 
 For the cloud-only branches (Spin Cloud `Unsupported`), the smoke adds a SEPARATE block that asserts:
@@ -4389,8 +4544,8 @@ Phase E (post-cutover docs) of the blob app-config rewrite.
 Operator-facing migration guide covering:
 - Why this change (atomic cutover, no compat path).
 - Per-adapter mechanics (Axum file shape, Cloudflare bulk put,
-  Fastly --upsert --stdin, Spin local SQLite, Spin Cloud
-  no-read-back).
+  Fastly direct-or-chunk-pointer storage via --upsert --stdin,
+  Spin local SQLite, Spin Cloud no-read-back).
 - Operator runbook (push, env-var KEY override, secret-store
   pre-provisioning).
 - Cleanup recipes for orphan leaf keys per adapter.

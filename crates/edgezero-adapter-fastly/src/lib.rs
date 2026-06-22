@@ -1,6 +1,7 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
+pub(crate) mod chunked_config;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "fastly")]

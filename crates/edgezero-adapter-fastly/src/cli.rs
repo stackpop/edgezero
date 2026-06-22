@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 
+use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value};
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
@@ -323,42 +324,49 @@ impl Adapter for FastlyCliAdapter {
                 "no config entries to push to fastly config-store `{name}` (logical id `{logical}`)"
             )]);
         }
-        // Blob-model pre-platform-call cap guard. The blob envelope is
-        // one entry whose value is the full envelope JSON string. Fastly
-        // Config Store enforces an 8 000-character limit per entry value.
-        // Surface a clear diagnostic before shelling out so the operator
-        // knows to split the config across multiple [stores.config] ids.
+        // Expand each logical (key, envelope_json) into physical entries
+        // via the chunk-pointer helper. Entries ≤ 8 000 chars go through
+        // as a single direct entry; larger envelopes are split into
+        // content-addressed chunks with a root pointer written LAST.
+        // Collect all physical entries before any writes so pointer-too-
+        // large errors surface before touching the remote store.
+        let mut physical_entries: Vec<(String, String)> = Vec::new();
         for (key, body) in entries {
-            if body.len() > 8_000 {
-                return Err(format!(
-                    "blob at key `{key}` is {} characters; Fastly Config Store \
-                     entry value limit is 8 000 characters. Restructure your \
-                     typed app-config into multiple types and split across \
-                     [stores.config] ids.",
-                    body.len(),
-                ));
-            }
+            let expanded = prepare_fastly_config_entries(key, body)?;
+            physical_entries.extend(expanded);
         }
         if dry_run {
-            // List each entry so the operator can verify intent
-            // before committing. Matches the spin dry-run preview
-            // shape.
+            // Report intent without shelling out. One line per logical key
+            // noting whether it would be direct or chunked, plus chunk count.
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and run `fastly config-store-entry create` for {} entries:",
-                entries.len()
+                "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and push entries:"
             ));
-            for (key, _) in entries {
-                out.push(format!("  would create entry `{key}`"));
+            for (key, body) in entries {
+                let expanded = prepare_fastly_config_entries(key, body)
+                    .unwrap_or_else(|_| vec![(key.clone(), body.clone())]);
+                if expanded.len() == 1 {
+                    out.push(format!(
+                        "  would push `{key}` as direct entry ({}B)",
+                        body.len()
+                    ));
+                } else {
+                    let chunk_count = expanded.len().saturating_sub(1);
+                    out.push(format!(
+                        "  would push `{key}` as chunked ({chunk_count} chunks + 1 pointer, {}B total)",
+                        body.len()
+                    ));
+                }
             }
             return Ok(out);
         }
         let resolved_id = resolve_remote_config_store_id(name)?;
-        push_entries_with_committer(entries, |key, value| {
+        push_entries_with_committer(&physical_entries, |key, value| {
             create_config_store_entry(&resolved_id, key, value)
         })?;
         Ok(vec![format!(
-            "pushed {} entries to fastly config-store `{name}` (logical id `{logical}`, id={resolved_id})",
+            "pushed {} physical entries ({} logical) to fastly config-store `{name}` (logical id `{logical}`, id={resolved_id})",
+            physical_entries.len(),
             entries.len()
         )])
     }
@@ -395,21 +403,40 @@ impl Adapter for FastlyCliAdapter {
                 fastly_path.display()
             )]);
         }
+        // Expand logical entries into physical entries (chunks + pointer).
+        let mut physical_entries: Vec<(String, String)> = Vec::new();
+        for (key, body) in entries {
+            let expanded = prepare_fastly_config_entries(key, body)?;
+            physical_entries.extend(expanded);
+        }
         if dry_run {
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with {} entries:",
+                "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with entries:",
                 fastly_path.display(),
-                entries.len()
             ));
-            for (key, _) in entries {
-                out.push(format!("  would set `{key}`"));
+            for (key, body) in entries {
+                let expanded = prepare_fastly_config_entries(key, body)
+                    .unwrap_or_else(|_| vec![(key.clone(), body.clone())]);
+                if expanded.len() == 1 {
+                    out.push(format!(
+                        "  would set `{key}` as direct entry ({}B)",
+                        body.len()
+                    ));
+                } else {
+                    let chunk_count = expanded.len().saturating_sub(1);
+                    out.push(format!(
+                        "  would set `{key}` as chunked ({chunk_count} chunks + 1 pointer, {}B total)",
+                        body.len()
+                    ));
+                }
             }
             return Ok(out);
         }
-        write_fastly_local_config_store(&fastly_path, name, entries)?;
+        write_fastly_local_config_store(&fastly_path, name, &physical_entries)?;
         Ok(vec![format!(
-            "wrote {} entries to `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`); restart `fastly compute serve` to pick up changes",
+            "wrote {} physical entries ({} logical) to `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`); restart `fastly compute serve` to pick up changes",
+            physical_entries.len(),
             entries.len(),
             fastly_path.display()
         )])
@@ -479,7 +506,13 @@ impl Adapter for FastlyCliAdapter {
                          fastly CLI may have changed its output schema. Raw stdout: {stdout}"
                     )
                 })?;
-            return Ok(ReadConfigEntry::Present(value.to_owned()));
+            // Resolve chunk pointers: if `value` is a direct BlobEnvelope it
+            // passes through unchanged; if it is a chunk pointer the chunks
+            // are fetched from the same store and reconstructed.
+            let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
+                fetch_remote_config_store_entry(&store_id, chunk_key)
+            })?;
+            return Ok(ReadConfigEntry::Present(resolved));
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let lower = stderr.to_ascii_lowercase();
@@ -544,7 +577,23 @@ impl Adapter for FastlyCliAdapter {
                         fastly_path.display()
                     )
                 })?;
-                Ok(ReadConfigEntry::Present(value.to_owned()))
+                // Resolve chunk pointers using the same toml contents table.
+                let resolved =
+                    resolve_fastly_config_value(key, value.to_owned(), |chunk_key| match contents
+                        .get(chunk_key)
+                    {
+                        Some(chunk_item) => {
+                            let chunk_val = chunk_item.as_str().ok_or_else(|| {
+                                format!(
+                                    "chunk key `{chunk_key}` in {} is not a string",
+                                    fastly_path.display()
+                                )
+                            })?;
+                            Ok(Some(chunk_val.to_owned()))
+                        }
+                        None => Ok(None),
+                    })?;
+                Ok(ReadConfigEntry::Present(resolved))
             }
             None => Ok(ReadConfigEntry::MissingKey),
         }
@@ -558,6 +607,70 @@ impl Adapter for FastlyCliAdapter {
         // unlike spin's flat-namespace single-store model.
         &[]
     }
+}
+
+/// Fetch a single entry value from a remote Fastly Config Store entry by
+/// key, using `fastly config-store-entry describe --store-id=<id> --key=<k>
+/// --json`. Used by the chunk-pointer resolver to fan out to chunk entries.
+///
+/// Returns:
+/// - `Ok(Some(value))` when the entry exists.
+/// - `Ok(None)` when the entry is absent (not-found / 404 / does not exist).
+/// - `Err(...)` on adapter or parse errors.
+///
+/// # Errors
+/// Returns an error if `fastly` isn't on `PATH`, spawning fails, the JSON
+/// cannot be parsed, or the CLI exits with an unexpected non-zero status.
+fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<String>, String> {
+    let store_arg = format!("--store-id={store_id}");
+    let key_arg = format!("--key={key}");
+    let output = Command::new("fastly")
+        .args([
+            "config-store-entry",
+            "describe",
+            store_arg.as_str(),
+            key_arg.as_str(),
+            "--json",
+        ])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+            format!(
+                "failed to parse `fastly config-store-entry describe` JSON for chunk \
+                     key `{key}`: {err}\nraw stdout: {stdout}"
+            )
+        })?;
+        let value = parsed
+            .get("item_value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "`fastly config-store-entry describe` JSON has no string `item_value` \
+                     field for chunk key `{key}`; fastly CLI may have changed its output schema. \
+                     Raw stdout: {stdout}"
+                )
+            })?;
+        return Ok(Some(value.to_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404") {
+        return Ok(None);
+    }
+    Err(format!(
+        "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` \
+         exited with status {}\nstderr: {}",
+        output.status,
+        stderr.trim()
+    ))
 }
 
 /// Shell out to `fastly <kind>-store create --name=<platform-name>`. The
@@ -1959,7 +2072,7 @@ build = \"cargo build --release\"
         assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
         assert!(
             out[0].contains("would resolve fastly config-store `app_config`")
-                && out[0].contains("config-store-entry create"),
+                && out[0].contains("push entries"),
             "dry-run header describes the would-be flow: {out:?}"
         );
         assert!(
@@ -2073,19 +2186,27 @@ build = \"cargo build --release\"
 
     #[test]
     fn read_local_returns_present_when_key_exists_in_contents() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(
+        fs::write(&path, "name = \"demo\"\n").expect("write initial toml");
+
+        // Use a valid BlobEnvelope value — the resolver requires BlobEnvelope
+        // or chunk-pointer JSON; raw strings are not accepted post-chunking.
+        let envelope_json = serde_json::to_string(&BlobEnvelope::new(
+            json!({"hello": "fastly"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        write_fastly_local_config_store(
             &path,
-            format!(
-                "name = \"demo\"\n\
-                 [local_server.config_stores.{TEST_CONFIG_ID}]\n\
-                 format = \"inline-toml\"\n\
-                 [local_server.config_stores.{TEST_CONFIG_ID}.contents]\n\
-                 greeting = \"hello-fastly\"\n"
-            ),
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), envelope_json.clone())],
         )
-        .expect("write");
+        .expect("setup write");
+
         let result = FastlyCliAdapter
             .read_config_entry_local(
                 dir.path(),
@@ -2099,17 +2220,29 @@ build = \"cargo build --release\"
         let ReadConfigEntry::Present(value) = result else {
             panic!("expected Present variant");
         };
-        assert_eq!(value, "hello-fastly", "value matches what was written");
+        assert_eq!(value, envelope_json, "value matches what was written");
     }
 
     #[test]
     fn read_local_roundtrips_with_push_local() {
         // Write via push_config_entries_local, then read via
         // read_config_entry_local — the two must agree on the value.
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
-        let entries = vec![("greeting".to_owned(), "hello-roundtrip".to_owned())];
+
+        // push_config_entries_local passes the value through the chunk-pointer
+        // helper which stores it verbatim when ≤ 8 000 chars. The reader then
+        // resolves it through the same resolver that requires BlobEnvelope JSON.
+        let envelope_json = serde_json::to_string(&BlobEnvelope::new(
+            json!({"hello": "roundtrip"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        let entries = vec![("greeting".to_owned(), envelope_json.clone())];
         FastlyCliAdapter
             .push_config_entries_local(
                 dir.path(),
@@ -2134,7 +2267,7 @@ build = \"cargo build --release\"
         let ReadConfigEntry::Present(value) = result else {
             panic!("expected Present after push+read roundtrip");
         };
-        assert_eq!(value, "hello-roundtrip", "roundtrip value matches");
+        assert_eq!(value, envelope_json, "roundtrip value matches");
     }
 
     #[test]
@@ -2201,15 +2334,26 @@ build = \"cargo build --release\"
     /// `out_path`, handles the list call correctly, and exits 0 for both calls.
     #[cfg(unix)]
     fn fake_fastly_argv_log(out_path: &Path) -> tempfile::TempDir {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempdir().expect("tempdir");
         let script_path = dir.path().join("fastly");
         let list_file = dir.path().join("list_payload.txt");
         let entry_file = dir.path().join("entry_payload.txt");
         let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
-        let entry_json = r#"{"item_value":"logged-value","store_id":"store-abc123"}"#;
+        // item_value must be a valid BlobEnvelope JSON so the resolver accepts it.
+        let envelope_json = serde_json::to_string(&BlobEnvelope::new(
+            json!({"v": "logged"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        let entry_json = format!(
+            r#"{{"item_value":{},"store_id":"store-abc123"}}"#,
+            serde_json::to_string(&envelope_json).expect("escape")
+        );
         fs::write(&list_file, list_json).expect("write list payload");
-        fs::write(&entry_file, entry_json).expect("write entry payload");
+        fs::write(&entry_file, &entry_json).expect("write entry payload");
         let script = format!(
             "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
             out_path.display(),
@@ -2235,12 +2379,23 @@ build = \"cargo build --release\"
     #[cfg(unix)]
     #[test]
     fn read_remote_returns_present_on_success() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         // Fake fastly: list succeeds with app_config → store-abc123;
-        // describe returns valid JSON with item_value.
-        let entry_json = r#"{"item_value":"hello-fastly","store_id":"store-abc123"}"#;
-        let fake = fake_fastly_returning(entry_json, "", 0);
+        // describe returns valid JSON with item_value that is a BlobEnvelope.
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            json!({"hello": "fastly"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        let entry_json = format!(
+            r#"{{"item_value":{},"store_id":"store-abc123"}}"#,
+            serde_json::to_string(&envelope).expect("escape")
+        );
+        let fake = fake_fastly_returning(&entry_json, "", 0);
         let _path = PathPrepend::new(fake.path());
         let result = FastlyCliAdapter
             .read_config_entry(
@@ -2255,7 +2410,7 @@ build = \"cargo build --release\"
         let ReadConfigEntry::Present(value) = result else {
             panic!("expected Present");
         };
-        assert_eq!(value, "hello-fastly");
+        assert_eq!(value, envelope);
     }
 
     #[cfg(unix)]
@@ -2370,6 +2525,680 @@ build = \"cargo build --release\"
         assert!(
             captured.contains("--json"),
             "must pass --json flag; got:\n{captured}"
+        );
+    }
+
+    // ---------- chunked push integration tests ----------
+
+    /// Build a valid `BlobEnvelope` JSON string of approximately `target_len` bytes.
+    #[cfg(unix)]
+    fn make_test_envelope(target_len: usize) -> String {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let pad = "x".repeat(target_len.saturating_add(64));
+        let data = json!({ "pad": pad });
+        let raw =
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".into())).unwrap();
+        if raw.len() >= target_len {
+            let overhead = raw.len().saturating_sub(pad.len());
+            let adjusted = "x".repeat(target_len.saturating_sub(overhead));
+            let data2 = json!({ "pad": adjusted });
+            serde_json::to_string(&BlobEnvelope::new(data2, "2026-06-22T00:00:00Z".into())).unwrap()
+        } else {
+            raw
+        }
+    }
+
+    /// Build a fake `fastly` script whose describe response depends on
+    /// the `--key=<k>` argument: `key_responses` maps key names to JSON
+    /// item-value responses. Falls back to exit 1 "not found" for unknown keys.
+    #[cfg(unix)]
+    fn fake_fastly_with_key_dispatch(
+        _dir: &Path,
+        key_responses: &[(String, String)],
+    ) -> tempfile::TempDir {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let fake_dir = tempdir().expect("tempdir");
+        let list_file = fake_dir.path().join("list.json");
+        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        fs::write(&list_file, list_json).expect("write list");
+        // Write each key response to a named file.
+        let mut dispatch_lines = String::new();
+        for (key, response) in key_responses {
+            let resp_file = fake_dir.path().join(format!("resp_{key}.json"));
+            fs::write(&resp_file, response).expect("write resp");
+            // Use exact-match: iterate argv and compare each token literally
+            // so that a root key like "app_config" does NOT match a chunk key
+            // like "app_config.__edgezero_chunks.abc.0".
+            writeln!(
+                dispatch_lines,
+                "  for arg in \"$@\"; do if [ \"$arg\" = \"--key={key}\" ]; then cat '{}'; exit 0; fi; done",
+                resp_file.display()
+            )
+            .expect("write to String is infallible");
+        }
+        // Fallback outputs "not found" so fetch_remote_config_store_entry
+        // maps it to Ok(None) rather than Err.
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\n{dispatch_lines}echo 'Error: item not found' >&2\nexit 1\n",
+            list_file.display()
+        );
+        let script_path = fake_dir.path().join("fastly");
+        fs::write(&script_path, &script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        fake_dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_writes_direct_entry_at_exactly_8000_chars() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let fake = fake_fastly_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        assert_eq!(envelope.len(), FASTLY_CONFIG_ENTRY_LIMIT);
+
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must succeed");
+        // One physical entry written (direct).
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains(&format!("--key={TEST_CONFIG_ID}")),
+            "must write root key directly: {captured}"
+        );
+        assert!(
+            out[0].contains("1 physical entries (1 logical)"),
+            "summary reports 1 physical entry: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_writes_chunks_and_root_pointer_for_8001_chars() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let fake = fake_fastly_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        assert!(envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT);
+
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must succeed");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        // At least one chunk key must appear before the root key.
+        assert!(
+            captured.contains(".__edgezero_chunks."),
+            "chunk keys must be written: {captured}"
+        );
+        // Root pointer must also be written.
+        assert!(
+            captured.contains(&format!("--key={TEST_CONFIG_ID}")),
+            "root pointer must be written: {captured}"
+        );
+        // Root key must be LAST in the log (chunk lines come before it).
+        let root_pos = captured.rfind(&format!("--key={TEST_CONFIG_ID}")).unwrap();
+        let chunk_pos = captured.find(".__edgezero_chunks.").unwrap();
+        assert!(
+            chunk_pos < root_pos,
+            "chunk writes must precede root pointer write: chunk_pos={chunk_pos} root_pos={root_pos}"
+        );
+        assert!(out[0].contains("logical"), "summary line present: {out:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_dry_run_reports_direct_vs_chunked() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+
+        let direct_envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let chunked_envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+
+        let entries = vec![
+            ("cfg_direct".to_owned(), direct_envelope),
+            ("cfg_chunked".to_owned(), chunked_envelope),
+        ];
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run must not error");
+
+        // No shellout happens; output must describe intent.
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("would push `cfg_direct` as direct entry"),
+            "must report direct: {combined}"
+        );
+        assert!(
+            combined.contains("would push `cfg_chunked` as chunked"),
+            "must report chunked: {combined}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_writes_literal_dotted_chunk_keys() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("write");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("local push must succeed");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read back");
+        // Chunk keys contain '.' and must appear as quoted string keys,
+        // not as TOML nested tables (which would look like [table.sub]).
+        assert!(
+            after.contains(".__edgezero_chunks."),
+            "chunk keys written to fastly.toml: {after}"
+        );
+        // Parse with toml_edit and confirm chunk keys are string-keyed entries.
+        let doc: toml_edit::DocumentMut = after.parse().expect("must parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .expect("contents table must exist");
+        // At least one chunk key must be present as a string value (not a table).
+        let has_chunk_string = contents.as_table().is_some_and(|tbl| {
+            tbl.iter()
+                .any(|(key, val)| key.contains(".__edgezero_chunks.") && val.as_value().is_some())
+        });
+        assert!(
+            has_chunk_string,
+            "chunk keys must be literal string-valued entries, not nested tables: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_reports_chunking_and_does_not_edit_fastly_toml() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let original = "name = \"demo\"\n";
+        fs::write(&fastly_toml, original).expect("write");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("local dry-run must not error");
+
+        // File must be untouched.
+        let after = fs::read_to_string(&fastly_toml).expect("read back");
+        assert_eq!(after, original, "dry-run must not edit fastly.toml");
+
+        // Output must describe chunking intent.
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("would set") && combined.contains("chunked"),
+            "must report chunked intent: {combined}"
+        );
+    }
+
+    // ---------- chunked read integration tests ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_resolves_direct_value_unchanged() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = BlobEnvelope::new(json!({"hello": "world"}), "2026-06-22T00:00:00Z".into());
+        let json_str = serde_json::to_string(&envelope).unwrap();
+        let item_json = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(&json_str).unwrap()
+        );
+        let fake = fake_fastly_returning(&item_json, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, json_str, "direct envelope passes through unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_reconstructs_chunked_envelope() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        let (_, pointer_json) = physical.last().unwrap();
+        // Build a key→response map for every physical entry.
+        let mut key_responses: Vec<(String, String)> = Vec::new();
+        for (pk, pv) in &physical {
+            let resp = format!(r#"{{"item_value":{}}}"#, serde_json::to_string(pv).unwrap());
+            key_responses.push((pk.clone(), resp));
+        }
+        // The root key should return the pointer.
+        let ptr_resp = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(pointer_json).unwrap()
+        );
+        key_responses.push((TEST_CONFIG_ID.to_owned(), ptr_resp));
+
+        let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("chunked read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(
+            value, envelope,
+            "reconstructed envelope must equal original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_errors_on_missing_chunk() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        let (_, pointer_json) = physical.last().unwrap();
+        // Only provide the root pointer; omit chunk responses so chunk fetch returns not-found.
+        let ptr_resp = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(pointer_json).unwrap()
+        );
+        let key_responses = vec![(TEST_CONFIG_ID.to_owned(), ptr_resp)];
+        let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            TEST_CONFIG_ID,
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("missing chunk must error")
+        };
+        assert!(
+            err.contains("missing chunk"),
+            "error must mention missing chunk: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_errors_on_corrupt_chunk_hash() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        let (_, pointer_json) = physical.last().unwrap();
+        let mut key_responses: Vec<(String, String)> = Vec::new();
+        // Corrupt first chunk's content.
+        let (first_chunk_key, first_chunk_val) = &physical[0];
+        let corrupted: String = first_chunk_val.chars().map(|_| 'Z').collect();
+        let corrupt_resp = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(&corrupted).unwrap()
+        );
+        key_responses.push((first_chunk_key.clone(), corrupt_resp));
+        // Remaining chunks as normal.
+        for (pk, pv) in physical
+            .iter()
+            .take(physical.len().saturating_sub(1))
+            .skip(1)
+        {
+            key_responses.push((
+                pk.clone(),
+                format!(r#"{{"item_value":{}}}"#, serde_json::to_string(pv).unwrap()),
+            ));
+        }
+        key_responses.push((
+            TEST_CONFIG_ID.to_owned(),
+            format!(
+                r#"{{"item_value":{}}}"#,
+                serde_json::to_string(pointer_json).unwrap()
+            ),
+        ));
+        let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            TEST_CONFIG_ID,
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("corrupt chunk must error")
+        };
+        assert!(
+            err.contains("SHA mismatch") || err.contains("mismatch"),
+            "error must mention hash mismatch: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_errors_on_malformed_pointer() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Root value is JSON but neither a BlobEnvelope nor a valid pointer.
+        let bad_json = r#"{"some_field":"not a pointer or envelope"}"#;
+        let item_json = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(bad_json).unwrap()
+        );
+        let fake = fake_fastly_returning(&item_json, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("malformed pointer must error")
+        };
+        assert!(
+            err.contains("neither a valid BlobEnvelope") || err.contains("chunk pointer"),
+            "error must describe parse failure: {err}"
+        );
+    }
+
+    // ---------- local read integration tests ----------
+
+    #[test]
+    fn read_config_entry_local_resolves_direct_value() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        let envelope = BlobEnvelope::new(json!({"x": 1_i32}), "2026-06-22T00:00:00Z".into());
+        let json_str = serde_json::to_string(&envelope).unwrap();
+        // Write directly as a single entry (not via push_config_entries_local so we
+        // control the exact TOML content).
+        write_fastly_local_config_store(
+            &fastly_toml,
+            TEST_CONFIG_ID,
+            &[("cfg".to_owned(), json_str.clone())],
+        )
+        .expect("write");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, json_str, "direct envelope passes through unchanged");
+    }
+
+    #[test]
+    fn read_config_entry_local_reconstructs_chunked_envelope() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        // Write all physical entries (chunks + pointer) to the local store.
+        write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &physical).expect("write");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("local chunked read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(
+            value, envelope,
+            "reconstructed envelope must equal original"
+        );
+    }
+
+    /// Spec §12.3 + §9.3: a second oversized push must converge the
+    /// runtime on the NEW envelope — chunk keys are content-addressed
+    /// by the full-envelope SHA, so push B writes a new chunk-set and
+    /// installs a new root pointer.
+    ///
+    /// On the LOCAL fastly.toml writer specifically, the per-store block
+    /// is rewritten wholesale (see `write_fastly_local_config_store`'s
+    /// comment: "stale entries don't linger across pushes -- the push is
+    /// the source of truth for the contents"). That's a STRONGER form of
+    /// the spec's "old chunks inert" guarantee — locally they're absent,
+    /// not just unreferenced. The remote Fastly Config Store leaves
+    /// orphan chunks unreferenced (no `delete` shell-out), which
+    /// satisfies the literal "inert" requirement; both representations
+    /// preserve the runtime-correctness property: a read after push B
+    /// reconstructs envelope B, not A.
+    #[cfg(unix)]
+    #[test]
+    fn second_oversized_push_converges_runtime_on_new_envelope() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        // First push: envelope A. Records the chunk-key set so we can
+        // confirm they survive the second push (no garbage collection
+        // in v1 — spec §9.3 + Q6).
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_a.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("first push must succeed");
+
+        let after_a = fs::read_to_string(&fastly_toml).expect("read");
+        let doc_a: toml_edit::DocumentMut = after_a.parse().expect("parse");
+        let contents_a = doc_a
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents table after push A");
+        let chunks_a: Vec<String> = contents_a
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .filter(|key| key.contains(".__edgezero_chunks."))
+            .collect();
+        assert!(
+            !chunks_a.is_empty(),
+            "push A must have produced chunk entries: {after_a}"
+        );
+
+        // Second push: a DIFFERENT oversized envelope B. The
+        // content-addressed chunk keys must shift to B's sha; old
+        // A-chunks may remain in the table (v1 doesn't GC). Build
+        // envelope B with a distinct payload key so its SHA differs
+        // from A's even at the same total length.
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:01Z".to_owned()))
+                .expect("envelope B serialises")
+        };
+        assert_ne!(envelope_a, envelope_b, "test fixtures must differ");
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("second push must succeed");
+
+        let after_b = fs::read_to_string(&fastly_toml).expect("read");
+        let doc_b: toml_edit::DocumentMut = after_b.parse().expect("parse");
+        let contents_b = doc_b
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents table after push B");
+        let chunks_b: Vec<String> = contents_b
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .filter(|key| key.contains(".__edgezero_chunks."))
+            .collect();
+        assert!(
+            !chunks_b.is_empty(),
+            "push B must have produced chunk entries: {after_b}"
+        );
+
+        // Chunk keys are content-addressed by envelope SHA, so the B
+        // set and the A set must not overlap (envelope A and B differ
+        // by construction).
+        for chunk_key in &chunks_a {
+            assert!(
+                !chunks_b.contains(chunk_key),
+                "B's chunk-set must not contain any A-chunk key (chunks are content-addressed by envelope SHA): collided on `{chunk_key}`"
+            );
+        }
+
+        // Runtime-correctness property: a fresh read after push B
+        // reconstructs envelope B (NOT envelope A).
+        let read = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("local read after push B");
+        let ReadConfigEntry::Present(value) = read else {
+            panic!("expected Present after push B");
+        };
+        assert_eq!(
+            value, envelope_b,
+            "read after second push must reconstruct envelope B, not A"
+        );
+        assert_ne!(
+            value, envelope_a,
+            "old envelope A's chunks must be inert -- read must NOT return A"
         );
     }
 }

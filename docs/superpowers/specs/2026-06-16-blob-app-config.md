@@ -1185,8 +1185,11 @@ validate --help`).
   Fastly / Spin Cloud / Spin local) with the
   concrete numbers; §12.10 cross-references
   Fastly's 64 KiB and notes that §12.3 covers
-  the Fastly-specific size-cap test (separate
-  from the Spin-shaped guard).
+  Fastly-specific platform-limit coverage (separate
+  from the Spin-shaped guard). Later round-18 and
+  post-round-18 notes below supersede the 64 KiB number
+  and switch Fastly oversized app-config handling to
+  chunk-pointer storage.
 - **§10.2.2 scaffold gate wording matches the
   script.** §10.2.1's CI script greps for the
   USAGE shape `AppConfig[<(]` (round-13
@@ -1219,29 +1222,22 @@ contract reversals:**
   `item_value` is capped at 8 000 characters, not
   64 KiB. The Q6 per-adapter cap table now states
   8 000 characters with a "round-18 reviewer caught
-  this against the official docs" note; §12.10's
-  "Fastly supports sizes well beyond Spin cap" claim
-  is replaced with the actual relationship (a
-  Spin-boundary blob ~95 KiB DOES exceed Fastly's
-  cap). Added §12.3 Fastly-specific size-cap test
-  asserting the boundary (8 000 OK, 8 001 errors via
-  the writer-side guard). Fastly Q6 (a) gains a
-  pre-platform guard sketch in the Fastly writer
-  that errors before the platform call.
-- **"Split across `[stores.config]` ids" workaround
-  reworded as "restructure into separate typed
-  structs".** The framework does NOT auto-split one
-  `C` across stores —
-  `run_config_push_typed::<C>` writes ONE blob per
-  store, and §3.2 explicitly forbids multi-blob
-  merge. Operators with too-large configs need to
-  RESTRUCTURE their typed `C` into multiple separate
-  types (one per logical surface, e.g.
-  `BillingConfig` / `FeatureConfig`) and wire each
-  through its own `[stores.config]` id with its own
-  `AppConfig<...>` extractor. Updated the wording in
-  Q6 (Fastly), Q12 (Spin Cloud), and §9.4 (Spin
-  Cloud follow-up paths) accordingly.
+  this against the official docs" note.
+- **Post-round-18 Fastly oversized-config decision:
+  use content-addressed chunking with pointer-last
+  commit.** Fastly still has the 8 000-character
+  per-entry platform cap, but the EdgeZero Fastly
+  adapter no longer treats an >8 000-character
+  envelope as an automatic operator schema split.
+  Instead, the Fastly adapter stores the full
+  `BlobEnvelope` behind the same root key using
+  adapter-private chunk entries and a small root
+  pointer written LAST. Core and app code still see
+  one typed `AppConfig<C>`; chunking is a Fastly
+  adapter storage detail. Splitting into multiple
+  typed config structs remains a valid modelling
+  choice, but it is not the default answer to
+  Fastly's value cap.
 - **Parent `Command::Config` `after_help` via the
   TUPLE variant, not a struct variant.** Round-17's
   sketch converted `Config(ConfigCmd)` to a struct
@@ -1566,17 +1562,22 @@ process. §10 is written under this assumption.
 Replace the current key-by-key typed-config storage with a single-key
 JSON blob.
 
-The runtime reads ONE entry per request, deserialises it into the
-app's typed struct, and exposes the struct through an `AppConfig<C>`
-extractor. Pushing the config is one atomic write per environment.
-Comparing local vs. remote state is a structural JSON diff. Drift
-detection rides on an embedded SHA-256.
+The runtime reads ONE logical app-config root per request,
+deserialises it into the app's typed struct, and exposes the struct
+through an `AppConfig<C>` extractor. Most adapters back that logical
+root with one physical entry; Fastly may resolve an oversized root
+through adapter-private chunk entries before handing core the normal
+envelope. Pushing the config is one atomic root update per
+environment. Comparing local vs. remote state is a structural JSON
+diff. Drift detection rides on an embedded SHA-256.
 
 This is a **hard-cutoff redesign** of the typed app-config storage
-layer. **There is no backward compatibility:** no dual-shape
-parsing, no compat shims, no "if you see a flat leaf, treat it as
-v0; if you see an envelope, treat it as v1" fallback. The runtime
-recognises the blob envelope and nothing else.
+layer. **There is no backward compatibility:** no compat shims, no
+"if you see a flat leaf, treat it as v0; if you see an envelope,
+treat it as v1" fallback. The core runtime recognises the blob
+envelope and nothing else. Fastly's direct-or-pointer decode is only
+an adapter-private v1 physical storage representation for that same
+envelope; it is not legacy compatibility.
 
 Every in-tree consumer migrates as part of the work. That
 explicitly includes:
@@ -1606,18 +1607,23 @@ The current model:
 
 Pain points the blob model fixes:
 
-- **Atomicity.** A multi-chunk push (Fastly, Spin Cloud) can land
-  partially under failure — PR #269 round 3 already added a
-  partial-failure diagnostic, but the underlying non-atomicity stays.
-  A single-blob write either succeeds whole or fails whole; the next
-  push retries the whole state.
+- **Atomicity.** The old per-leaf push could land partially under
+  failure — PR #269 round 3 already added a partial-failure
+  diagnostic, but the underlying non-atomicity stayed. The blob model
+  gives every adapter one active root per typed config. Most adapters
+  store that root as one physical value. Fastly stores oversized
+  roots as immutable content chunks plus a root pointer written last,
+  so the active config still flips atomically at the root key.
 - **Argv / size limits.** Per-leaf push has tripped argv-size caps
   (PR #269 F4) and forced `--stdin` plumbing. A single blob ends up
   smaller as a tarred JSON than as N separate `--key=…` argv tokens.
 - **Read amplification.** Today's `Config` requires the handler to
   know the dotted keys to fetch. The struct deserialise happens
   out-of-band (or not at all). A blob gives the handler the typed
-  struct directly — one lookup, one parse, one struct.
+  struct directly — one logical config lookup, one parse, one
+  struct. Fastly's oversized representation may fan that logical
+  lookup out into chunk reads inside the adapter, but the handler and
+  core extractor still see one `AppConfig<C>` read.
 - **Diff-ability.** Per-leaf state has no natural "configuration
   version" to compare against. A blob has a sha; two shas are equal
   or not. The structural diff is well-defined on a single object.
@@ -1645,6 +1651,11 @@ Pain points the blob model fixes:
   (axum / cloudflare / fastly / spin) so push and diff can both
   ask the store "what's currently there?".
 - Per-adapter writer rewrite for the blob shape.
+- Fastly oversized-blob storage: envelopes that exceed Fastly Config
+  Store's 8 000-character per-entry cap are written as
+  content-addressed chunks plus a pointer-last root entry. This is an
+  adapter-private representation; callers still push/read one
+  `AppConfig<C>`.
 - App-demo migration to the new model.
 - Migration guide doc + manifest-migration error pointers updated.
 
@@ -1678,10 +1689,15 @@ Pain points the blob model fixes:
   supported and called out in §5 and §9.1. What's out of scope
   is the SAME runtime reading multiple blobs from the same id
   in one request — there's no "merge two blobs into `cfg`"
-  composition.
-- **Push retry / resume.** Single-blob writes are atomic per
-  shellout. Multi-chunk recovery from PR #269 round 3 stops being
-  relevant for the typed config path.
+  composition. Fastly's chunk entries are exempt from this rule
+  because they are adapter-private storage for ONE logical blob, not
+  app-visible sibling environment blobs.
+- **Generic push retry / resume.** Non-Fastly adapters write one
+  physical value for one logical blob, so PR #269's per-leaf
+  multi-entry recovery path is not used by the typed config path.
+  Fastly's oversized path is idempotent by construction: retry writes
+  the same content-addressed chunks again, then rewrites the same root
+  pointer. There is no separate resumable-push protocol in v1.
 
 ### 3.2.1 Raw CLI path
 
@@ -4638,8 +4654,10 @@ push. Per adapter:
   pre-resolved namespace id (per `cli.rs:289`'s comment
   about wrangler v4's silent local fallback).
 - **Fastly**: `fastly config-store-entry describe --store-id=<id>
---key=<key> --json`. Returns the value as a string field; parse
-  to JSON.
+--key=<key> --json`. The returned `item_value` is either a normal
+  `BlobEnvelope` string or a Fastly chunk pointer. Read-back resolves
+  pointers by fetching/verifying chunks and returns the reconstructed
+  normal `BlobEnvelope` string to the caller.
 - **Spin (local)**: read directly from
   `<spin.toml dir>/.spin/sqlite_key_value.db` via the vendored
   `spin_key_value` schema. We already write through this schema;
@@ -4959,15 +4977,32 @@ bulk put <tempfile.json> --namespace-id=<id> --remote`
 ### 9.3 Fastly
 
 - Push: serialise envelope → JSON string →
-  `fastly config-store-entry update --store-id=<id> --key=<key>
---upsert --stdin` (PR #269 round 2 F4 already wired `--upsert
---stdin`; we just write one key now).
-- Runtime: `FastlyConfigStore::get(key)` returns the JSON value;
-  extractor parses.
+  `fastly config-store-entry update --store-id=<id> --key=<key> --upsert --stdin`
+  (PR #269 round 2 F4 already wired `--upsert --stdin`). If the
+  envelope fits Fastly's 8 000-character
+  `item_value` cap, the writer stores the normal envelope directly
+  at `<key>`.
+- Oversized push: if the envelope is larger than Fastly's per-entry
+  cap, the writer switches to Q6's content-addressed chunk protocol:
+  write all immutable chunk entries first, then write the root
+  pointer at `<key>` last. The root pointer is the only active
+  commit record.
+- Read-back (for diff / skip-on-equal): read `<key>`. If the value
+  is a normal `BlobEnvelope`, return it. If the value is a Fastly
+  chunk pointer, read/verify/concatenate chunks and return the
+  reconstructed normal envelope string. Missing/corrupt chunks are a
+  read error, not "missing key".
+- Runtime: `FastlyConfigStore::get(key)` performs the same
+  direct-or-pointer resolution and returns the normal envelope JSON
+  value; the core extractor does not know whether Fastly used chunks.
 - Local server: `[local_server.config_stores.<id>]` now has ONE
-  entry — the blob key. PR #269 F6 already moved local-server
-  seeding to `config push --local`; this just writes one `key =
-"<json blob>"` line.
+  active root entry — the blob key. PR #269 F6 already moved local-
+  server seeding to `config push --local`. Local seeding must mirror
+  the remote Fastly storage protocol: direct envelope for small
+  values, chunk entries + pointer for oversized values. This prevents
+  `--local` from succeeding with a config that cannot deploy to
+  Fastly. Chunk keys contain dots; the `fastly.toml` writer must store
+  them as literal content keys, not TOML dotted paths.
 
 ### 9.4 Spin
 
@@ -5051,11 +5086,13 @@ key-value set --stdin` or `--from-file`.
 
 ## 10. Migration
 
-Hard cutoff. No compat shims, no dual-shape parsing. **The
-runtime does not parse pre-blob flat-leaf state at all** — it
-deserialises the envelope wrapper and errors if the read returns
-a string that doesn't fit `BlobEnvelope`'s shape. This is by
-design. Hard cutoff means no "two paths to support forever"
+Hard cutoff. No compat shims and no pre-blob flat-leaf parsing.
+**The runtime does not parse pre-blob flat-leaf state at all** — core
+deserialises the envelope wrapper and errors if the adapter returns a
+string that doesn't fit `BlobEnvelope`'s shape. Fastly may first
+resolve a v1 chunk pointer into the normal envelope string; that is
+adapter-private physical storage, not a legacy app-config shape. This
+is by design. Hard cutoff means no "two paths to support forever"
 maintenance tax.
 
 ### 10.1 Top-level migration sequence
@@ -6154,42 +6191,101 @@ Per-platform value caps as of v1:
 | ---------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Axum       | none (local file)                                      | The Axum store is `BTreeMap<String, String>` serialised to a JSON file; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                    |
 | Cloudflare | 25 MiB                                                 | KV per-value limit (`developers.cloudflare.com/kv/platform/limits`).                                                                                                                                                                                                                                                                                                                                                                |
-| Fastly     | **8 000 characters** (~8 KB UTF-8)                     | Fastly Config Store `item_value` limit per Fastly's published platform docs. The writer uses `fastly config-store-entry update --upsert --stdin` at the Fastly adapter (PR #269 F4) so there's no argv ceiling, but the platform itself rejects values over 8 000 characters. **Earlier drafts cited 64 KiB — that was a documentation error; the round-18 reviewer caught it against the official Fastly Config Store item docs.** |
+| Fastly     | **8 000 characters per entry** (~8 KB UTF-8)           | Fastly Config Store `item_value` limit per Fastly's published platform docs. The writer uses `fastly config-store-entry update --upsert --stdin` at the Fastly adapter (PR #269 F4) so there's no argv ceiling, but any single platform entry must stay under 8 000 characters. Oversized logical app-config blobs use the chunk-pointer protocol below. **Earlier drafts cited 64 KiB — that was a documentation error; the round-18 reviewer caught it against the official Fastly Config Store item docs.** |
 | Spin Cloud | `MAX_ARGV_BYTES_PER_INVOCATION` (`96 * 1024`) per pair | Writer cap at `crates/edgezero-adapter-spin/src/cli/push_cloud.rs:46`; under the blob model the effective limit is the cap minus `<KEY>=` (per §9.4).                                                                                                                                                                                                                                                                               |
 | Spin local | sqlite filesystem-bound                                | `<spin.toml dir>/.spin/sqlite_key_value.db`; cap is filesystem-bound.                                                                                                                                                                                                                                                                                                                                                               |
 
 For Fastly specifically:
 
-- (a) Accept the platform cap. Document it. Operators
-  with >8 000-character configs need to restructure
-  their typed `C` into separate types per logical
-  surface (e.g. `BillingConfig` / `FeatureConfig`)
-  and wire each through its own
-  `[stores.config]` id with its own
-  `AppConfig<BillingConfig>` / `AppConfig<FeatureConfig>`
-  extractor. The blob model intentionally does NOT
-  auto-split one `C` across ids (see §3.2's "no
-  multi-blob merge" stance and the round-18 H-1
-  reframing); each id holds ONE typed struct. The
-  restructure is operator-side schema work — the
-  framework provides the multi-id machinery, not the
-  split itself.
-- (b) Add a `--chunked` flag that splits a too-big blob
-  across N sibling keys (`app_config__1`,
-  `app_config__2`, …).
-- **default:** (a). Chunking re-introduces the
-  partial-write hazard the blob model exists to avoid.
-  8 000 characters is tight for a single struct but
-  workable for app-demo-shaped workloads; operators
-  with substantially larger configs either restructure
-  per (a) or pick Cloudflare / Spin / Axum.
+- (a) Accept the platform cap and require operators to
+  restructure their typed `C` into separate logical
+  structs when the envelope exceeds 8 000 characters.
+  This remains a valid schema-design option, but it is
+  not the default Fastly behaviour.
+- (b) Store an oversized logical blob as content-
+  addressed chunk entries plus a small root pointer
+  written LAST. The app-facing model stays one
+  `AppConfig<C>` under one root key; chunk entries are
+  adapter-private implementation detail.
+- **default:** (b). Do NOT add a user-facing
+  `--chunked` flag. The Fastly adapter chooses the
+  direct form or chunked form automatically based on the
+  final envelope size.
 
-The Fastly writer adds a pre-platform-call guard that
-checks `envelope.len() > 8_000` and errors with an
-actionable message naming the per (a) restructure
-guidance before incurring the platform error. The
-guard mirrors the Spin Cloud cap check (§9.4) but uses
-the Fastly-specific limit.
+Fastly write algorithm:
+
+1. Build the normal `BlobEnvelope` JSON string exactly as
+   every other adapter does.
+2. If the envelope fits in one Fastly Config Store
+   `item_value` (`<= 8_000` characters; implementations may
+   use a conservative UTF-8 byte-count check), write it
+   directly at `<KEY>`.
+3. If it does not fit, split the envelope JSON into chunks
+   small enough to leave room under the 8 000-character cap
+   (target chunk payload: 7 000 bytes unless testing proves a
+   tighter bound is needed).
+4. Write each chunk under an immutable content-addressed key:
+   `<KEY>.__edgezero_chunks.<ENVELOPE_SHA256>.<INDEX>`.
+   `<ENVELOPE_SHA256>` is the SHA-256 of the full envelope JSON
+   bytes, not the canonical `data` sha already inside the
+   envelope. Each chunk write is an upsert and is safe to retry.
+5. Write the root `<KEY>` LAST as a pointer JSON document:
+
+   ```json
+   {
+     "edgezero_kind": "fastly_config_chunks",
+     "version": 1,
+     "envelope_sha256": "<sha256 of full envelope json bytes>",
+     "envelope_len": 12345,
+     "data_sha256": "<BlobEnvelope.sha256>",
+     "chunks": [
+       {
+         "key": "app_config.__edgezero_chunks.<sha>.0",
+         "sha256": "<sha256 of chunk bytes>",
+         "len": 7000
+       }
+     ]
+   }
+   ```
+
+Read algorithm:
+
+- Read `<KEY>`.
+- If it parses as a normal `BlobEnvelope`, verify the envelope. A
+  valid direct envelope is returned unchanged; a parsed envelope with
+  a SHA/version verification failure is an error.
+- Only when `<KEY>` does not parse as a `BlobEnvelope`, try parsing it
+  as `edgezero_kind = "fastly_config_chunks"`. Read each listed
+  chunk, verify each chunk hash and length, concatenate in pointer
+  order, verify `envelope_sha256` and `envelope_len`, then return the
+  reconstructed normal `BlobEnvelope` JSON string to the caller. Core
+  extraction, `config diff`, and skip-on-equal still operate on the
+  same `BlobEnvelope` shape as every other adapter.
+
+Failure semantics:
+
+- A failed chunk write before the pointer update leaves the
+  previous root pointer/envelope active.
+- A failed root-pointer write leaves the previous config active;
+  retrying the same push is safe because chunk keys are content-
+  addressed.
+- Missing chunks, chunk-hash mismatches, pointer parse failures,
+  or full-envelope hash mismatches are corrupt platform state.
+  CLI read-back/diff errors must name the root key and the failed
+  chunk. Runtime `FastlyConfigStore::get` returns an internal
+  config-store error with remediation text to re-run
+  `<app-cli> config push`.
+- If the pointer itself would exceed 8 000 characters because the
+  config is extremely large, hard-error before any platform write.
+  The error should recommend modelling the config as multiple typed
+  config structs or using a backend with a larger single-value
+  limit. This is not mathematically unlimited; it removes Fastly's
+  small single-entry cap for normal oversized app configs.
+- Old content-addressed chunks are inert once the root pointer moves
+  away from them. v1 does not need automatic garbage collection for
+  correctness; a future `config gc --adapter fastly` can delete
+  unreferenced `.__edgezero_chunks.` entries if storage hygiene becomes
+  important.
 
 ### Q7. Diff against `--local` vs remote
 
@@ -6451,24 +6547,47 @@ For each of axum / cloudflare / fastly / spin:
   the new blob path and assert the runtime returns the seeded
   values.
 
-**Fastly-specific size-cap test (round-18 B-1).** Q6's
-Fastly cap of 8 000 characters is enforced by a writer-
-side guard (per Q6's last paragraph); the test
-exercises both sides of the boundary:
+**Fastly-specific chunking tests.** Q6's Fastly cap of
+8 000 characters is a per-entry platform limit, not an
+app-level config limit. Tests cover both storage forms:
 
 - A blob whose envelope JSON is exactly 8 000
-  characters pushes successfully (no false positive on
-  the boundary). The runtime reads it back and
-  validates.
-- A blob whose envelope JSON is 8 001 characters
-  errors via the Fastly-writer guard before the
-  platform call. Assert exit non-zero and the message
-  names the 8 000-character cap AND the Q6 (a)
-  remediation (restructure into separate `C` types per
-  `[stores.config]` id; do NOT auto-chunk).
-- The guard does NOT fire on the OTHER three adapters
-  at the same blob size — only the Fastly writer
-  enforces this cap.
+  characters pushes as a direct root value. The runtime
+  reads it back and validates.
+- A blob whose envelope JSON is 8 001 characters pushes
+  via content-addressed chunks plus a root pointer. The
+  root pointer is written LAST. The runtime reads it
+  back through `FastlyConfigStore::get`, reconstructs
+  the normal `BlobEnvelope`, and validates the same
+  typed struct.
+- `config diff --adapter fastly` and push
+  skip-on-equal both read through the same pointer
+  resolver; they compare the reconstructed envelope,
+  not the pointer JSON.
+- A simulated failure before the root pointer write
+  leaves the previous root envelope/pointer active.
+  Retrying the same push is idempotent because chunk
+  keys include the full-envelope SHA.
+- Missing chunk, chunk hash mismatch, full-envelope
+  hash mismatch, and malformed pointer all fail with an
+  actionable error naming the root key. These are
+  corrupt platform state, not "missing key".
+- `config push --adapter fastly --local` mirrors the
+  same direct-or-chunked representation inside
+  `[local_server.config_stores.<id>.contents]`, so local
+  smoke tests exercise the same runtime resolver. Assert
+  dotted chunk keys are written as literal TOML keys, not
+  nested dotted-path tables.
+- A second oversized push leaves old content-addressed
+  chunks inert. Runtime follows only the current root
+  pointer.
+- If the pointer JSON itself would exceed 8 000
+  characters, push hard-errors before any platform
+  write and recommends multiple typed config structs or
+  a larger-value backend.
+- The Fastly chunking path does NOT apply to Axum,
+  Cloudflare, or Spin. Those adapters keep their native
+  storage forms and caps.
 
 ### 12.4 Migration
 
@@ -6776,18 +6895,15 @@ for the default `app_config` key (10 chars), that's
 - The Spin-Cloud-specific cap does NOT fire on the other
   three adapters at the SAME blob size — Cloudflare's KV
   value limit is 25 MiB, Axum has no transport-side cap.
-  Fastly is the EXCEPTION: a Spin-boundary blob
-  (~95 KiB) DOES hit Fastly's tighter 8 000-character
-  Config Store limit (per Q6, round-18 B-1
-  correction). Fastly's separate platform cap is
-  covered in §12.3's Fastly-specific size test: a blob
-  at ≤ 8 000 characters pushes successfully; a blob at
-  > 8 000 characters errors via the
-  > Fastly-writer-side pre-platform guard (per Q6) with
-  > the restructure-into-multiple-`[stores.config]`-ids
-  > remediation message. The §12.10 Spin-Cloud-cap test
-  > does NOT exercise the Fastly path — that's §12.3's
-  > job.
+  Fastly has a tighter per-entry platform cap
+  (8 000 characters), but §12.3 covers the adapter-
+  private chunking path that stores a larger logical
+  envelope as content chunks plus a pointer. A
+  Spin-boundary blob (~95 KiB) should therefore push on
+  Fastly through the chunked path unless the pointer
+  itself would exceed Fastly's per-entry cap. The
+  §12.10 Spin-Cloud-cap test does NOT exercise the
+  Fastly path — that's §12.3's job.
 
 ### 12.11 CLI parser tests for the canonical flag surface (§3.2.2)
 
