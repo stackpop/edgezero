@@ -626,4 +626,24 @@ mod tests {
             "expected Unsupported variant from default local impl"
         );
     }
+
+    #[test]
+    fn push_context_new_is_prod_with_no_paths() {
+        let ctx = AdapterPushContext::new();
+        assert!(!ctx.local);
+        assert_eq!(ctx.manifest_adapter_deploy_cmd, None);
+        assert_eq!(ctx.runtime_config_path, None);
+    }
+
+    #[test]
+    fn push_context_builders_set_each_field() {
+        let path = Path::new("runtime-config.toml");
+        let ctx = AdapterPushContext::new()
+            .with_local(true)
+            .with_manifest_adapter_deploy_cmd("spin cloud deploy")
+            .with_runtime_config_path(path);
+        assert!(ctx.local);
+        assert_eq!(ctx.manifest_adapter_deploy_cmd, Some("spin cloud deploy"));
+        assert_eq!(ctx.runtime_config_path, Some(path));
+    }
 }
