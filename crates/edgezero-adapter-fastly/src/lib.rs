@@ -21,7 +21,7 @@ pub mod response;
 pub mod secret_store;
 
 #[cfg(feature = "fastly")]
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoresMetadata};
 #[cfg(feature = "fastly")]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
@@ -111,8 +111,8 @@ fn logging_from_env(env: &EnvConfig) -> FastlyLogging {
 #[cfg(feature = "fastly")]
 #[inline]
 pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
-    let env = EnvConfig::from_env();
     let stores = A::stores();
+    let env = env_config_from_runtime_dictionary(stores);
     let logging = logging_from_env(&env);
     if logging.use_fastly_logger {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
@@ -120,6 +120,58 @@ pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastl
     }
     let app = A::build_app();
     request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
+}
+
+/// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
+/// Fastly Config Store. Compute@Edge has no process env -- the
+/// `EDGEZERO__*` runtime overrides spec 5.2/5.4 expects must come
+/// from a Config Store the operator pre-populates (locally via
+/// `fastly.toml`'s `[local_server.config_stores.edgezero_runtime_env]`
+/// block; remotely via a `fastly config-store` named `edgezero_runtime_env`).
+///
+/// The Cloudflare adapter does the same thing through `env.var(...)`
+/// (lib.rs:55) -- Workers also have no `std::env`. Mirroring the
+/// approach here closes the spec 12.7 gap where `__KEY` runtime
+/// overrides silently fell back to the binding's default id.
+///
+/// If the store is missing or empty, returns an empty `EnvConfig` --
+/// the rest of the runtime then uses the baked-in defaults (which is
+/// what the pre-fix code did, just without the env-driven override
+/// path the spec promises).
+#[cfg(feature = "fastly")]
+fn env_config_from_runtime_dictionary(stores: StoresMetadata) -> EnvConfig {
+    use fastly::ConfigStore;
+    use std::iter::empty;
+    let Ok(dict) = ConfigStore::try_open("edgezero_runtime_env") else {
+        return EnvConfig::from_vars(empty::<(String, String)>());
+    };
+    let mut keys: Vec<String> = vec![
+        "EDGEZERO__ADAPTER__HOST".to_owned(),
+        "EDGEZERO__ADAPTER__PORT".to_owned(),
+        "EDGEZERO__LOGGING__LEVEL".to_owned(),
+        "EDGEZERO__LOGGING__ENDPOINT".to_owned(),
+        "EDGEZERO__LOGGING__USE_FASTLY_LOGGER".to_owned(),
+        "EDGEZERO__LOGGING__ECHO_STDOUT".to_owned(),
+    ];
+    for (kind, store_meta) in [
+        ("CONFIG", stores.config),
+        ("KV", stores.kv),
+        ("SECRETS", stores.secrets),
+    ] {
+        if let Some(meta) = store_meta {
+            for id in meta.ids {
+                let id_upper = id.to_ascii_uppercase();
+                keys.push(format!("EDGEZERO__STORES__{kind}__{id_upper}__NAME"));
+                if kind == "CONFIG" {
+                    keys.push(format!("EDGEZERO__STORES__{kind}__{id_upper}__KEY"));
+                }
+            }
+        }
+    }
+    let vars = keys
+        .into_iter()
+        .filter_map(|key| dict.get(&key).map(|value| (key, value)));
+    EnvConfig::from_vars(vars)
 }
 
 /// Dispatch with a config store wired explicitly. Use `run_app` for

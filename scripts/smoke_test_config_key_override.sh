@@ -148,6 +148,44 @@ upper() {
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
+# Seed the Fastly local config store `edgezero_runtime_env` with the
+# runtime override env vars. The Fastly Compute@Edge runtime has no
+# process env, so EDGEZERO__* overrides are read from this dedicated
+# Config Store (see env_config_from_runtime_dictionary in
+# crates/edgezero-adapter-fastly/src/lib.rs). $1 is the fastly.toml
+# path; $2 is the per-row __KEY override value (empty -> no override).
+seed_fastly_runtime_env() {
+  local fastly_toml="$1"
+  local key_override="$2"
+  # Strip any prior block we wrote in a previous row -- toml_edit
+  # doesn't support remove-by-prefix from bash, so we re-write the
+  # whole block each time. backup_in_tree already restores the
+  # tracked content on cleanup.
+  python3 - "$fastly_toml" "$key_override" <<'PY'
+import re
+import sys
+path, key_override = sys.argv[1], sys.argv[2]
+with open(path, 'r', encoding='utf-8') as fh:
+    text = fh.read()
+# Drop any prior edgezero_runtime_env block (idempotent across rows).
+pattern = re.compile(
+    r'\n\[local_server\.config_stores\.edgezero_runtime_env\][^\[]*'
+    r'\[local_server\.config_stores\.edgezero_runtime_env\.contents\][^\[]*',
+    re.MULTILINE,
+)
+text = pattern.sub('\n', text)
+if key_override:
+    text += (
+        '\n[local_server.config_stores.edgezero_runtime_env]\n'
+        'format = "inline-toml"\n'
+        '[local_server.config_stores.edgezero_runtime_env.contents]\n'
+        f'EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "{key_override}"\n'
+    )
+with open(path, 'w', encoding='utf-8') as fh:
+    fh.write(text)
+PY
+}
+
 check() {
   local label="$1" expect="$2" actual="$3"
   if [ "$actual" = "$expect" ]; then
@@ -357,6 +395,15 @@ boot_runtime() {
       # target/), and cargo preserves the package name's
       # hyphens in the filename (`app-demo-adapter-fastly.wasm`,
       # not `app_demo_adapter_fastly.wasm`).
+      #
+      # The Fastly Compute@Edge runtime has no process env, so
+      # __KEY overrides come from a Fastly Config Store named
+      # `edgezero_runtime_env`. Seed the local viceroy copy with
+      # whatever shell env override the smoke set so the
+      # staging assertion sees the right binding.
+      local fastly_toml="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+      seed_fastly_runtime_env "$fastly_toml" \
+        "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}"
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
         DEMO_API_TOKEN_SECRET=resolved-token \
         viceroy serve -C fastly.toml --addr "127.0.0.1:${PORT}" \
