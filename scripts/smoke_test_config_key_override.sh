@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# §12.7 + §9.3 + §8.3 multi-adapter smoke:
+# 12.7 + 9.3 + 8.3 multi-adapter smoke:
 #
 # 1. Per-adapter loop:
 #    - Push a "default" blob to the binding's default key (`app_config`).
@@ -18,7 +18,7 @@ set -euo pipefail
 #
 # 3. Spin Cloud Unsupported smoke (gated by SKIP_SPIN_CLOUD_SMOKE=1):
 #    `config diff --adapter spin` against a Cloud-flagged manifest
-#    must return non-zero with the §8.3 message; `config push --yes`
+#    must return non-zero with the 8.3 message; `config push --yes`
 #    against Cloud must succeed unconditionally.
 #
 # Usage:
@@ -49,14 +49,31 @@ declare -a BACKUPS=()
 
 # Stop the running runtime without touching tracked-fixture backups.
 # Used between staging-blob and default-blob assertions in the same
-# row so the pushed remote state survives a runtime restart.
+# row so the pushed remote state survives a runtime restart. Sends
+# SIGTERM, waits up to 5s, then SIGKILLs survivors; finally waits
+# until $PORT is no longer in use so the next boot can re-bind.
 stop_server() {
   if [ -n "$SERVER_PID" ]; then
-    pkill -P "$SERVER_PID" 2>/dev/null || true
-    kill "$SERVER_PID" 2>/dev/null || true
+    pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    local waited=0
+    while [ "$waited" -lt 5 ] && kill -0 "$SERVER_PID" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    pkill -KILL -P "$SERVER_PID" 2>/dev/null || true
+    kill -KILL "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
+  # Wait until the port is free so the next boot doesn't race the
+  # previous server's socket close. Cap at 10s; if it never frees
+  # the next wait_for_port will surface the bind failure.
+  local waited=0
+  while [ "$waited" -lt 10 ] && curl -s -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+  done
 }
 
 # Restore tracked fixtures the smoke mutated in place. Called once
@@ -201,12 +218,25 @@ ensure_runtime_built() {
 # Boot the right runtime for $1 (adapter name), returning when the
 # greeting endpoint responds 200. All rows bind to $PORT (8787 to
 # match the app-demo edgezero.toml `[adapters.axum.adapter] port`).
+#
+# Secret seeding: the typed `/config/typed` endpoint extracts
+# AppConfig<AppDemoConfig>, which secret-walks `api_token =
+# "demo_api_token"` against the default secret store. Axum's
+# EnvSecretStore reads the value from the process env (key ==
+# secret name). Cloudflare / Fastly / Spin have their own
+# per-platform secret stores; if SKIP_<ADAPTER>=1 isn't set,
+# operators must pre-seed those via the platform's own tooling
+# (`wrangler secret put`, `fastly secret-store-entry create`,
+# spin .env). The smoke can't do that portably.
 boot_runtime() {
   local adapter="$1"
   ensure_runtime_built "$adapter" || return 1
   case "$adapter" in
     axum)
-      (cd "$DEMO_DIR" && \
+      # Seed `demo_api_token` so the AppConfig secret walk
+      # resolves; without it, /config/typed returns
+      # ConfigOutOfDate before the assertion can fire.
+      (cd "$DEMO_DIR" && demo_api_token=resolved-token \
         cargo run --quiet -p app-demo-cli -- serve --adapter axum 2>&1) &
       ;;
     cloudflare)
@@ -232,7 +262,7 @@ boot_runtime() {
 
 # (adapter, extra-push-flags) per row. Axum's push is always local
 # (no --local flag); the other three need --local for the local
-# emulator state seed. Round-31 H-2 from the plan.
+# emulator state seed.
 SUITES=(
   "axum:"
   "cloudflare:--local"
@@ -240,7 +270,7 @@ SUITES=(
   "spin:--local"
 )
 
-# -- §12.7: per-adapter __KEY override loop -------------------------------
+# -- 12.7: per-adapter __KEY override loop -------------------------------
 
 for suite in "${SUITES[@]}"; do
   adapter="${suite%%:*}"
@@ -249,11 +279,11 @@ for suite in "${SUITES[@]}"; do
   skip_var="SKIP_$(upper "$adapter")"
   eval "skip_val=\${${skip_var}:-0}"
   if [ "$skip_val" = "1" ]; then
-    printf '\n=== §12.7 __KEY override smoke: %s SKIPPED (%s=1) ===\n' "$adapter" "$skip_var"
+    printf '\n=== 12.7 __KEY override smoke: %s SKIPPED (%s=1) ===\n' "$adapter" "$skip_var"
     continue
   fi
 
-  printf '\n=== §12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
+  printf '\n=== 12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
 
@@ -287,7 +317,7 @@ for suite in "${SUITES[@]}"; do
   result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
   check "$adapter __KEY override returns staging" "staging-blob" "$result"
   # Stop the server BUT keep the pushed blobs in place — restoring
-  # fixtures here would wipe the default blob before step 4 reads it.
+  # fixtures here would wipe the default blob before the next boot reads it.
   stop_server
 
   # 4. Reboot without __KEY; assert default.
@@ -302,12 +332,12 @@ for suite in "${SUITES[@]}"; do
   trap cleanup EXIT INT TERM
 done
 
-# -- §9.3 Fastly oversized envelope smoke ---------------------------------
+# -- 9.3 Fastly oversized envelope smoke ---------------------------------
 
 if [ "${SKIP_FASTLY:-0}" = "1" ]; then
-  printf '\n=== §9.3 Fastly chunk-pointer smoke: SKIPPED (SKIP_FASTLY=1) ===\n'
+  printf '\n=== 9.3 Fastly chunk-pointer smoke: SKIPPED (SKIP_FASTLY=1) ===\n'
 else
-  printf '\n=== §9.3 Fastly chunk-pointer smoke ===\n'
+  printf '\n=== 9.3 Fastly chunk-pointer smoke ===\n'
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
 
@@ -358,12 +388,12 @@ TOML
   trap cleanup EXIT INT TERM
 fi
 
-# -- §8.3 Spin Cloud Unsupported smoke ------------------------------------
+# -- 8.3 Spin Cloud Unsupported smoke ------------------------------------
 
 if [ "${SKIP_SPIN_CLOUD_SMOKE:-0}" = "1" ]; then
-  printf '\n=== §8.3 Spin Cloud Unsupported smoke: SKIPPED (SKIP_SPIN_CLOUD_SMOKE=1) ===\n'
+  printf '\n=== 8.3 Spin Cloud Unsupported smoke: SKIPPED (SKIP_SPIN_CLOUD_SMOKE=1) ===\n'
 else
-  printf '\n=== §8.3 Spin Cloud Unsupported smoke ===\n'
+  printf '\n=== 8.3 Spin Cloud Unsupported smoke ===\n'
   # `config diff` against a Cloud-flagged manifest MUST error.
   if (cd "$DEMO_DIR" && cargo run --quiet -p app-demo-cli -- \
         config diff --adapter spin --format unified >/dev/null 2>&1); then

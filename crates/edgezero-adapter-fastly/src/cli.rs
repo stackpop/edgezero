@@ -892,18 +892,45 @@ fn write_fastly_local_config_store(
         )
     })?;
 
-    // Replace the per-store block wholesale so stale entries don't
-    // linger across pushes (the inverse of provision's "preserve
-    // existing tables" rule -- here the push is the source of truth
-    // for the contents).
-    let mut store_tbl = Table::new();
-    store_tbl.insert("format", toml_edit::value("inline-toml"));
-    let mut contents_tbl = Table::new();
+    // Upsert into the existing per-store contents table so a
+    // `config push --key app_config_staging` does NOT wipe the
+    // previously-pushed `app_config` blob. Spec 12.7 requires
+    // default + staging keys to coexist so the runtime
+    // EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY env var can
+    // switch between them. (Earlier wholesale-replace was a
+    // misread of the "stale entries don't linger" property:
+    // that applies WITHIN a key (old chunks for the same root
+    // become unreferenced when a new chunk-set installs a new
+    // pointer), NOT across sibling keys.)
+    let store_entry = config_stores_tbl.entry(platform_name).or_insert_with(|| {
+        let mut tbl = Table::new();
+        tbl.insert("format", toml_edit::value("inline-toml"));
+        tbl.insert("contents", Item::Table(Table::new()));
+        Item::Table(tbl)
+    });
+    let store_tbl = store_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `local_server.config_stores.{platform_name}` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+    // Ensure the `format` key is present even on a pre-existing
+    // entry that omitted it.
+    if !store_tbl.contains_key("format") {
+        store_tbl.insert("format", toml_edit::value("inline-toml"));
+    }
+    let contents_entry = store_tbl
+        .entry("contents")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let contents_tbl = contents_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `local_server.config_stores.{platform_name}.contents` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
     for (key, value) in entries {
         contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
     }
-    store_tbl.insert("contents", Item::Table(contents_tbl));
-    config_stores_tbl.insert(platform_name, Item::Table(store_tbl));
 
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
@@ -2712,6 +2739,71 @@ build = \"cargo build --release\"
         );
     }
 
+    /// Spec 12.7: pushing two blobs under different root keys
+    /// (e.g. `app_config` + `app_config_staging`) must leave both
+    /// keys readable from the local fastly.toml so the runtime
+    /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` override can
+    /// switch between them. Prior to the upsert fix the second
+    /// push wholesale-replaced the per-store contents table.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_preserves_sibling_keys() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+        let store = ResolvedStoreId::from_logical(TEST_CONFIG_ID);
+        let ctx = AdapterPushContext::new();
+
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &store,
+                &[("app_config".to_owned(), "{\"envelope\":\"A\"}".to_owned())],
+                &ctx,
+                false,
+            )
+            .expect("first push");
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &store,
+                &[(
+                    "app_config_staging".to_owned(),
+                    "{\"envelope\":\"B\"}".to_owned(),
+                )],
+                &ctx,
+                false,
+            )
+            .expect("second push (sibling key)");
+
+        let raw = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = raw.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents after sibling push");
+        let app_config = contents
+            .get("app_config")
+            .and_then(toml_edit::Item::as_str)
+            .expect("default key must survive sibling push");
+        assert_eq!(
+            app_config, "{\"envelope\":\"A\"}",
+            "default key value: {raw}"
+        );
+        let staging = contents
+            .get("app_config_staging")
+            .and_then(toml_edit::Item::as_str)
+            .expect("staging key must be present");
+        assert_eq!(staging, "{\"envelope\":\"B\"}", "staging key value: {raw}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn push_config_entries_local_writes_literal_dotted_chunk_keys() {
@@ -3065,23 +3157,27 @@ build = \"cargo build --release\"
         );
     }
 
-    /// Spec §12.3 + §9.3: a second oversized push must converge the
+    /// Spec 12.3 + 9.3: a second oversized push must converge the
     /// runtime on the NEW envelope — chunk keys are content-addressed
     /// by the full-envelope SHA, so push B writes a new chunk-set and
     /// installs a new root pointer.
     ///
-    /// On the LOCAL fastly.toml writer specifically, the per-store block
-    /// is rewritten wholesale (see `write_fastly_local_config_store`'s
-    /// comment: "stale entries don't linger across pushes -- the push is
-    /// the source of truth for the contents"). That's a STRONGER form of
-    /// the spec's "old chunks inert" guarantee — locally they're absent,
-    /// not just unreferenced. The remote Fastly Config Store leaves
-    /// orphan chunks unreferenced (no `delete` shell-out), which
-    /// satisfies the literal "inert" requirement; both representations
-    /// preserve the runtime-correctness property: a read after push B
-    /// reconstructs envelope B, not A.
+    /// The local fastly.toml writer upserts per-key (so a sibling
+    /// `--key app_config_staging` push leaves `app_config` intact per
+    /// spec 12.7). Within the SAME root key, old chunks for envelope
+    /// A remain in the contents table after envelope B's push — they're
+    /// unreferenced (the root pointer at `app_config` now names B's
+    /// chunks), matching the remote Fastly behaviour where the
+    /// per-entry `update --upsert` shell-out has no atomic-delete
+    /// pairing. The runtime-correctness property holds either way: a
+    /// read after push B follows the active pointer and reconstructs
+    /// envelope B, not A.
     #[cfg(unix)]
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear test scenario: push A, inspect, push B, inspect, read; splitting would obscure the chunk-set comparison"
+    )]
     fn second_oversized_push_converges_runtime_on_new_envelope() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let dir = tempdir().expect("tempdir");
@@ -3090,7 +3186,7 @@ build = \"cargo build --release\"
 
         // First push: envelope A. Records the chunk-key set so we can
         // confirm they survive the second push (no garbage collection
-        // in v1 — spec §9.3 + Q6).
+        // in v1 — spec 9.3 + Q6).
         let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         FastlyCliAdapter
             .push_config_entries_local(
@@ -3168,12 +3264,23 @@ build = \"cargo build --release\"
         );
 
         // Chunk keys are content-addressed by envelope SHA, so the B
-        // set and the A set must not overlap (envelope A and B differ
-        // by construction).
+        // push installs a fresh chunk-set whose keys are all distinct
+        // from A's. Under the upsert semantic the A-chunks remain in
+        // the contents table (no GC in v1); B's chunks are simply added.
+        let new_b_chunks: Vec<&String> = chunks_b
+            .iter()
+            .filter(|key| !chunks_a.contains(*key))
+            .collect();
+        assert!(
+            !new_b_chunks.is_empty(),
+            "push B must have added at least one new content-addressed chunk: A-set={chunks_a:?} B-set={chunks_b:?}"
+        );
+        // Old A-chunks remain in the table (orphan-but-present —
+        // matches the remote Fastly write-only-upsert semantic).
         for chunk_key in &chunks_a {
             assert!(
-                !chunks_b.contains(chunk_key),
-                "B's chunk-set must not contain any A-chunk key (chunks are content-addressed by envelope SHA): collided on `{chunk_key}`"
+                chunks_b.contains(chunk_key),
+                "old A-chunk `{chunk_key}` must remain in the local table after push B (v1 has no GC); B-set={chunks_b:?}"
             );
         }
 

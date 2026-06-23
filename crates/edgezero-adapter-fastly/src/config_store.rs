@@ -71,7 +71,7 @@ impl ConfigStore for FastlyConfigStore {
         // Resolve chunk pointers transparently. Direct BlobEnvelope values
         // pass through unchanged; pointer values fan out to chunk entries
         // in the same store. Missing / malformed / hash-mismatched chunks
-        // are corrupt platform state — spec §9.3 (line 6272) calls this an
+        // are corrupt platform state — spec 9.3 (line 6272) calls this an
         // internal config-store error with re-push remediation, NOT a
         // transient unavailable. Mapping to `internal` surfaces as HTTP
         // 500 and pushes operators toward `<app-cli> config push` instead
@@ -134,7 +134,7 @@ mod tests {
         assert!(matches!(err, ConfigStoreError::InvalidKey { .. }));
     }
 
-    /// Spec §9.3 (line 6272): missing chunks, hash mismatches, pointer
+    /// Spec 9.3 (line 6272): missing chunks, hash mismatches, pointer
     /// parse failures, and full-envelope mismatches are CORRUPT PLATFORM
     /// STATE — the runtime returns an internal config-store error with
     /// re-push remediation, NOT a transient `Unavailable` (which would

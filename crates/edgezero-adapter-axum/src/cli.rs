@@ -233,18 +233,34 @@ impl Adapter for AxumCliAdapter {
         }
         fs::create_dir_all(&local_dir)
             .map_err(|err| format!("failed to create {}: {err}", local_dir.display()))?;
-        let map: BTreeMap<&str, &str> = entries
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
+        // Upsert into any existing map so a `config push --key
+        // app_config_staging` doesn't wipe a previously-pushed
+        // `app_config` blob (spec 12.7 requires default + staging
+        // to coexist for the `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`
+        // override to switch between them). The map is owned (rather
+        // than borrowed) so we can merge old + new without lifetime
+        // surgery on the slice.
+        let mut map: BTreeMap<String, String> = match fs::read_to_string(&target) {
+            Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text).map_err(|err| {
+                format!(
+                    "failed to parse existing {}: {err} (expected a JSON object of key->envelope)",
+                    target.display()
+                )
+            })?,
+            _ => BTreeMap::new(),
+        };
+        for (key, value) in entries {
+            map.insert(key.clone(), value.clone());
+        }
         let json = serde_json::to_string_pretty(&map)
             .map_err(|err| format!("failed to serialize config to JSON: {err}"))?;
         fs::write(&target, json)
             .map_err(|err| format!("failed to write {}: {err}", target.display()))?;
         Ok(vec![format!(
-            "wrote {} entries to {}",
+            "wrote {} entries to {} ({} total keys after upsert)",
             entries.len(),
-            target.display()
+            target.display(),
+            map.len(),
         )])
     }
 
@@ -1389,5 +1405,58 @@ mod tests {
             ),
             Ok(_) => panic!("expected Err for malformed JSON"),
         }
+    }
+
+    /// Spec 12.7: pushing two blobs under different keys (e.g.
+    /// `app_config` + `app_config_staging`) must leave both keys
+    /// readable so the runtime
+    /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` override can
+    /// switch between them. Prior to the upsert fix the second push
+    /// wiped the first by wholesale-rewriting the JSON map.
+    #[test]
+    fn push_config_entries_preserves_sibling_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ResolvedStoreId::from_logical("app_config");
+        let ctx = AdapterPushContext::new();
+
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &store,
+                &[("app_config".to_owned(), "{\"envelope\":\"A\"}".to_owned())],
+                &ctx,
+                false,
+            )
+            .expect("first push");
+        AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &store,
+                &[(
+                    "app_config_staging".to_owned(),
+                    "{\"envelope\":\"B\"}".to_owned(),
+                )],
+                &ctx,
+                false,
+            )
+            .expect("second push (sibling key)");
+
+        let raw = fs::read_to_string(dir.path().join(".edgezero/local-config-app_config.json"))
+            .expect("read");
+        let map: BTreeMap<String, String> = serde_json::from_str(&raw).expect("parse map");
+        assert_eq!(
+            map.get("app_config").map(String::as_str),
+            Some("{\"envelope\":\"A\"}"),
+            "default key must survive sibling push: {raw}"
+        );
+        assert_eq!(
+            map.get("app_config_staging").map(String::as_str),
+            Some("{\"envelope\":\"B\"}"),
+            "staging key must be present: {raw}"
+        );
     }
 }

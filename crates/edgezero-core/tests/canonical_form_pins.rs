@@ -1,6 +1,6 @@
 //! Pin test for the v1 canonical-form rules.
 //!
-//! The SHA below is committed verbatim. Phase C ships
+//! The SHA below is committed verbatim.
 //! `scripts/check_no_placeholder_pins.sh` (per spec section 13.1) which
 //! refuses pin tests carrying unresolved placeholder hex; this file
 //! ships the actual computed value so the gate stays green.
@@ -22,7 +22,7 @@ use serde_json::json;
     reason = "this is an integration test file in tests/"
 )]
 fn canonical_form_pin_v1() {
-    // Fixture deliberately exercises every §4.2 escape-table branch:
+    // Fixture deliberately exercises every 4.2 escape-table branch:
     // - "héllo" → multi-byte UTF-8, no escape
     // - "tab\there" → \t (named escape)
     // - "quote\"backslash\\" → \" + \\ (named escapes)
@@ -32,7 +32,7 @@ fn canonical_form_pin_v1() {
     // - "formfeed\u{000C}" → \f (named escape)
     // - "\u{0001}" →  (generic control char branch)
     let data = json!({
-        "greeting": "héllo",                  // verbatim UTF-8; NFC vs NFD hash differently per §4.2
+        "greeting": "héllo",                  // verbatim UTF-8; NFC vs NFD hash differently per 4.2
         "tab": "tab\there",                   // \t named escape
         "quote_backslash": "quote\"backslash\\",  // \" + \\
         "newline": "newline\nhere",           // \n

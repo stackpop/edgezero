@@ -1,6 +1,6 @@
 //! Versioned envelope wrapping the canonical-form `data` blob.
 //!
-//! Shape per spec §4.1:
+//! Shape per spec 4.1:
 //! ```json
 //! { "data": {...}, "sha256": "<hex>", "version": 1, "generated_at": "<RFC3339 UTC>" }
 //! ```
@@ -119,7 +119,7 @@ mod tests {
 
     #[test]
     fn tolerates_additional_ignored_fields() {
-        // Spec §12.1 forward-compat: an envelope carrying extra fields
+        // Spec 12.1 forward-compat: an envelope carrying extra fields
         // (e.g., a future `signature` envelope add-on) deserialises
         // cleanly without `deny_unknown_fields`. The known fields verify
         // unchanged; the extras are dropped.

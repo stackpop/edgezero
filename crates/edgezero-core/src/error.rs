@@ -215,10 +215,9 @@ impl IntoResponse for EdgeError {
     fn into_response(self) -> Result<Response, EdgeError> {
         let kind = self.kind_str();
         let is_config_out_of_date = matches!(self, EdgeError::ConfigOutOfDate { .. });
-        // Round-Phase-B-review: `ConfigOutOfDate { field_path: String::new(), .. }`
-        // (the missing-blob path Phase C constructs) must OMIT the
-        // `field_path` JSON key entirely, not emit `"field_path": ""`.
-        // Per spec §6.3.1.
+        // `ConfigOutOfDate { field_path: String::new(), .. }` (the missing-blob
+        // path) must OMIT the `field_path` JSON key entirely, not emit
+        // `"field_path": ""`. Per spec 6.3.1.
         let field_path_opt: Option<&str> = match &self {
             EdgeError::ConfigOutOfDate { field_path, .. } if !field_path.is_empty() => {
                 Some(field_path.as_str())
@@ -562,7 +561,7 @@ mod tests {
 
         assert_retry_after!(EdgeError::bad_request("x"), false);
         assert_retry_after!(EdgeError::internal(anyhow::anyhow!("x")), false);
-        // round-10 H-3: ServiceUnavailable is also 503 but must NOT carry Retry-After
+        // ServiceUnavailable is also 503 but must NOT carry Retry-After
         assert_retry_after!(EdgeError::service_unavailable("x"), false);
         assert_retry_after!(EdgeError::config_out_of_date("x", "f"), true);
     }
@@ -584,10 +583,10 @@ mod tests {
         );
 
         // Phase-B-review Important: empty `field_path` must OMIT the
-        // key entirely, not emit `"field_path": ""`. Phase C's missing-
-        // blob path constructs `ConfigOutOfDate { field_path:
-        // String::new(), .. }` and the spec §6.3.1 response shape says
-        // omit when no field is anchored.
+        // key entirely, not emit `"field_path": ""`. The missing-blob path
+        // constructs `ConfigOutOfDate { field_path: String::new(), .. }`
+        // and the spec 6.3.1 response shape says omit when no field
+        // is anchored.
         let empty_cod_err = EdgeError::config_out_of_date("no remote blob", "");
         let empty_cod_body = parse_body(empty_cod_err.into_response().expect("response"));
         assert!(

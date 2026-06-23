@@ -25,7 +25,7 @@ pub struct AppDemoConfig {
     pub api_token: String,
 
     /// Feature-flag sub-table. Under the blob app-config model
-    /// (spec §3.3) `config push` writes ONE envelope per
+    /// (spec 3.3) `config push` writes ONE envelope per
     /// `[stores.config]` key whose `data` carries this whole tree
     /// verbatim — `feature.new_checkout` lands as nested JSON, not
     /// as a dotted-key leaf. The `AppConfig<AppDemoConfig>` extractor

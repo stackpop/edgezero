@@ -60,7 +60,7 @@ enum AppDemoConfigCmd {
     Diff(ConfigDiffArgs),
     /// Push `app-demo.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
-    /// (per spec §3.3 Model A — `#[secret]` fields store the key NAME,
+    /// (per spec 3.3 Model A — `#[secret]` fields store the key NAME,
     /// resolved at runtime); a SHA over the canonical-form data gates
     /// drift detection.
     Push(ConfigPushArgs),
@@ -100,9 +100,8 @@ fn main() {
     };
     if let Err(err) = result {
         log::error!("[app-demo] {err}");
-        // Round-31 H-1: bumped from 1 to 2 so diff errors satisfy Q10's
-        // "errors always ≥ 2" rule. Push / validate errors are not
-        // behaviour-checked against the 1 vs 2 distinction; the bump is safe.
+        // Exit 2 for all errors so diff errors satisfy Q10's "errors always ≥ 2" rule.
+        // Push / validate errors are not behaviour-checked against the 1 vs 2 distinction.
         process::exit(2);
     }
 }

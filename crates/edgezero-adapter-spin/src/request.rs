@@ -485,13 +485,13 @@ mod synthesis_tests {
         );
     }
 
-    /// Spec §12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
+    /// Spec 12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
     /// must surface as `ConfigStoreBinding.default_key`.
     ///
     /// `build_config_registry` calls `SpinConfigStore::open` which requires
     /// the Spin executor and cannot be unit-tested here; this test exercises
     /// the env-resolution layer that `build_config_registry` reads from.
-    /// Platform-integration coverage relies on the E2 smoke scripts (Phase E).
+    /// Platform-integration coverage relies on the E2 smoke scripts.
     #[test]
     fn config_default_key_env_override_resolved() {
         let env = EnvConfig::from_vars([(

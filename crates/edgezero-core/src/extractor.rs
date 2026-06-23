@@ -481,7 +481,7 @@ pub struct Kv(KvRegistry);
 impl FromRequest for Kv {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        // Spec hard-cutoff (§ intro): no backward compatibility for
+        // Spec hard-cutoff ( intro): no backward compatibility for
         // the pre-rewrite runtime store API. Pre-Stage-9.3 this
         // extractor silently synthesised a one-id registry from a
         // lone `ctx.kv_handle()` when no `KvRegistry` was wired,
@@ -669,10 +669,10 @@ impl Config {
 // reachable from the extractor path.
 
 // ---------------------------------------------------------------------------
-// AppConfig<C> — typed app-config extractor (spec §3.3, §3.3.3, §4.3)
+// AppConfig<C> — typed app-config extractor (spec 3.3, 3.3.3, 4.3)
 // ---------------------------------------------------------------------------
 
-/// Typed app-config extractor. See spec §3.3.3 + §4.3.
+/// Typed app-config extractor. See spec 3.3.3 + 4.3.
 ///
 /// ```ignore
 /// #[action]
@@ -709,7 +709,7 @@ where
 {
     /// Read the typed config from a NON-default config store.
     /// `key = None` falls back to that store's `binding.default_key`.
-    /// Returns the inner `C` directly per spec §6.2.1.
+    /// Returns the inner `C` directly per spec 6.2.1.
     ///
     /// # Errors
     /// See `extract_from_handle`.
@@ -730,7 +730,7 @@ where
 
     /// Read the typed config from the default store under an
     /// EXPLICIT key (instead of the binding's `default_key`).
-    /// Returns the inner `C` directly per spec §6.2 — handlers
+    /// Returns the inner `C` directly per spec 6.2 — handlers
     /// usually destructure the `FromRequest` extractor; the inherent
     /// methods exist for call sites that need a different key or
     /// store and prefer the bare `C` over wrapping/unwrapping.
@@ -798,16 +798,16 @@ where
         EdgeError::internal(anyhow::anyhow!("envelope verification failed: {err}"))
     })?;
     let mut data = envelope.into_data();
-    // Secret walk per spec §3.3.3.
+    // Secret walk per spec 3.3.3.
     secret_walk::<C>(ctx, &mut data).await?;
     // Deserialise via serde_path_to_error so failures carry a dotted
-    // field path for ConfigOutOfDate per spec §4.3.
+    // field path for ConfigOutOfDate per spec 4.3.
     let cfg: C = serde_path_to_error::deserialize(data.into_deserializer())
         .map_err(|err| EdgeError::config_out_of_date_from_serde(&err))?;
     // RUNTIME uses cfg.validate(): after secret_walk the fields hold
     // RESOLVED values, so every validator rule — including those on
     // secret fields (e.g. length/regex on the actual token value) —
-    // MUST run. Spec §3.3.8 split: PUSH skips secret-field validators
+    // MUST run. Spec 3.3.8 split: PUSH skips secret-field validators
     // (via validate_excluding_secrets) because the value at push time
     // is a key NAME; RUNTIME runs cfg.validate() because the value is
     // now the resolved secret.
@@ -920,8 +920,8 @@ fn map_secret_error(
 /// Walk `errors` recursively and return the first violating field's DOTTED
 /// PATH (e.g. `"service.timeout_ms"` for a nested failure).
 ///
-/// Keys are sorted for determinism across runs — required for the §6.3.1
-/// contract test. Round-34 M-1: earlier draft only looked at top-level keys,
+/// Keys are sorted for determinism across runs — required for the 6.3.1
+/// contract test. An earlier draft only looked at top-level keys,
 /// collapsing nested paths like `service.timeout_ms` to `"service"`.
 fn first_violating_field(errors: &validator::ValidationErrors) -> Option<String> {
     fn walk(errors: &validator::ValidationErrors, prefix: &str, out: &mut Option<String>) {
@@ -2309,9 +2309,9 @@ mod tests {
         );
     }
 
-    // -- Runtime validation of resolved secret values (spec §3.3.8) -----------
+    // -- Runtime validation of resolved secret values (spec 3.3.8) -----------
 
-    /// Spec §3.3.8: RUNTIME runs `cfg.validate()` after `secret_walk` so that
+    /// Spec 3.3.8: RUNTIME runs `cfg.validate()` after `secret_walk` so that
     /// validators on secret fields run against the RESOLVED value, not the
     /// key name. A key name that is too short must still pass push (validator
     /// skipped), but a resolved secret that satisfies the rule must pass here.
@@ -2354,7 +2354,7 @@ mod tests {
         assert_eq!(cfg.api_token, resolved_value);
     }
 
-    /// Spec §3.3.8: a resolved secret that FAILS a validator on the secret
+    /// Spec 3.3.8: a resolved secret that FAILS a validator on the secret
     /// field must produce `ConfigOutOfDate` — the runtime runs the full validator.
     #[test]
     fn runtime_rejects_resolved_secret_failing_validator() {

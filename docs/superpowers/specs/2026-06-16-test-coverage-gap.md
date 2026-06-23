@@ -215,12 +215,14 @@ mod tests {
     #[test]
     fn call_propagates_handler_error() {
         async fn boom(_ctx: RequestContext) -> Result<&'static str, EdgeError> {
-            Err(EdgeError::internal("boom"))
+            // `EdgeError::internal` takes `E: Into<anyhow::Error>`; a bare
+            // `&str` does NOT satisfy that bound, so wrap with `anyhow!`.
+            Err(EdgeError::internal(anyhow::anyhow!("boom")))
         }
         let handler = boom.into_handler();
-        // `Response` is `http::Response<Body>` and `Body` does not impl
-        // `Debug`, so `Result::expect_err` (which needs `T: Debug`) will
-        // not compile — match instead.
+        // `block_on(...).expect_err(...)` would also compile (`Body` does
+        // impl `Debug`), but `match` reads clearer for panic-on-`Ok` and
+        // avoids depending on that impl.
         let error = match block_on(handler.call(ctx())) {
             Ok(_) => panic!("expected error"),
             Err(error) => error,

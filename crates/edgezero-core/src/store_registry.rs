@@ -15,7 +15,7 @@
 //! KV handles are already bound to a single backing store by construction,
 //! so [`BoundKvStore`] is just the existing handle type. Config uses
 //! [`ConfigStoreBinding`], which pairs a [`ConfigStoreHandle`] with the
-//! default lookup key for that binding (see spec §5.2.1). [`BoundSecretStore`]
+//! default lookup key for that binding (see spec 5.2.1). [`BoundSecretStore`]
 //! is a real wrapper because the underlying [`SecretHandle::get_bytes`] takes
 //! a `store_name` argument — the registry captures the per-id platform name
 //! (resolved from `EDGEZERO__STORES__SECRETS__<ID>__NAME`) so handlers can
@@ -40,7 +40,7 @@ pub type BoundConfigStore = ConfigStoreHandle;
 /// extractor calls `get(...)` on, plus the key the extractor
 /// looks up by default. The `default_key` is computed by
 /// adapters from `EnvConfig::store_key("config", id)`. See spec
-/// §5.2.1.
+/// 5.2.1.
 #[derive(Clone, Debug)]
 pub struct ConfigStoreBinding {
     /// The default key this binding resolves when no key is specified.

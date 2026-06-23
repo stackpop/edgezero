@@ -696,7 +696,7 @@ mod tests {
     }
 
     /// `build_config_registry` must pack `default_key` from
-    /// `EDGEZERO__STORES__CONFIG__<ID>__KEY` (§12.7).
+    /// `EDGEZERO__STORES__CONFIG__<ID>__KEY` (12.7).
     /// A missing local-config file yields an empty store, so the
     /// binding is still created — this test exercises the key-override
     /// path without requiring the file to exist.
