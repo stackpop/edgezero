@@ -314,9 +314,12 @@ impl Adapter for FastlyCliAdapter {
     ) -> Result<Vec<String>, String> {
         // Resolve the platform config-store id on demand via
         // `fastly config-store list --json` (matched by name =
-        // `store.platform`), then `fastly config-store-entry create
-        // --store-id=<id> --key=<k> --value=<v>` per key. Keys
-        // arrive pre-flattened from the CLI (dotted form).
+        // `store.platform`), then `fastly config-store-entry update
+        // --store-id=<id> --key=<k> --upsert --stdin` per physical
+        // entry. Entries are logical blob-envelope entries from
+        // the CLI (one (key, envelope_json) per push); oversized
+        // Fastly values are expanded below into chunk entries plus
+        // a root pointer by `chunked_config::prepare_fastly_config_entries`.
         let logical = store.logical.as_str();
         let name = store.platform.as_str();
         if entries.is_empty() {
