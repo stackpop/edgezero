@@ -223,4 +223,18 @@ mod tests {
         let found = find_manifest_upwards(&child, "demo.toml").expect("manifest");
         assert_eq!(found, root.join("demo.toml"));
     }
+
+    #[test]
+    fn run_native_cli_missing_program_surfaces_install_hint() {
+        let err = run_native_cli("edgezero-no-such-program-xyz", &[], "install the thing")
+            .expect_err("missing program must error");
+        assert!(err.contains("install the thing"), "got: {err}");
+    }
+
+    #[test]
+    fn run_native_cli_nonzero_exit_is_error() {
+        // `false` exits non-zero on every supported CI host (unix/macOS).
+        let err = run_native_cli("false", &[], "hint").expect_err("non-zero exit must error");
+        assert!(!err.is_empty());
+    }
 }

@@ -409,7 +409,10 @@ git commit -m "test(adapter): cover AdapterPushContext builder"
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test -p edgezero-adapter run_native_cli`
+Run: `cargo test -p edgezero-adapter --features cli run_native_cli` — the
+`cli_support` module is `#[cfg(feature = "cli")]`, so a scoped `-p` run
+needs the feature explicitly (the workspace test enables it via feature
+unification).
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
