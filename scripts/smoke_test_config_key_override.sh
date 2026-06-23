@@ -288,36 +288,11 @@ TOML
       return 0
       ;;
     spin)
-      # The Spin fixture's spin.toml declares the `api_token`
-      # variable (the schema field name) but the runtime secret
-      # walk asks for the blob's VALUE -- `demo_api_token`. Patch
-      # the fixture in place so both the [variables] block and
-      # the [component.app-demo.variables] map expose
-      # `demo_api_token` for the smoke's lifetime. The caller
-      # backs spin.toml up so cleanup restores the original.
-      local spin_toml="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-      # Insert demo_api_token into the application [variables] block,
-      # and downgrade api_token from `required = true` to a default
-      # so spin up can start without the obsolete variable being
-      # satisfied (the AppDemoConfig field name doesn't match the
-      # blob's secret-key NAME, which is what the smoke actually
-      # exercises). Mirror the same edits in the component variables
-      # map.
-      awk '
-        /^api_token = \{ required = true, secret = true \}$/ && !patched_var_api {
-          print "api_token = { default = \"\", secret = true }"
-          print "demo_api_token = { required = true, secret = true }"
-          patched_var_api = 1
-          next
-        }
-        /^api_token = "\{\{ api_token \}\}"$/ && !patched_comp {
-          print
-          print "demo_api_token = \"{{ demo_api_token }}\""
-          patched_comp = 1
-          next
-        }
-        { print }
-      ' "$spin_toml" > "$spin_toml.tmp" && mv "$spin_toml.tmp" "$spin_toml"
+      # spin.toml's [variables] block now declares
+      # `demo_api_token` directly (matches the blob's
+      # secret-key NAME per Model A). boot_runtime sets
+      # SPIN_VARIABLE_DEMO_API_TOKEN inline -- nothing to seed
+      # on disk.
       return 0
       ;;
     *)
@@ -376,10 +351,16 @@ boot_runtime() {
       # populate the `demo_api_token` secret-store entry seeded
       # by seed_secret_for_adapter. viceroy 0.17+ uses `serve`
       # for the long-running HTTP path (`run` was renamed).
+      #
+      # The wasm artifact lives in the app-demo workspace's
+      # shared target dir (not the adapter crate's local
+      # target/), and cargo preserves the package name's
+      # hyphens in the filename (`app-demo-adapter-fastly.wasm`,
+      # not `app_demo_adapter_fastly.wasm`).
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
         DEMO_API_TOKEN_SECRET=resolved-token \
         viceroy serve -C fastly.toml --addr "127.0.0.1:${PORT}" \
-          target/wasm32-wasip1/debug/app_demo_adapter_fastly.wasm 2>&1) &
+          "$DEMO_DIR/target/wasm32-wasip1/debug/app-demo-adapter-fastly.wasm" 2>&1) &
       ;;
     spin)
       # spin reads variables from the app manifest; the demo wires
@@ -420,6 +401,25 @@ for suite in "${SUITES[@]}"; do
     continue
   fi
 
+  # Spin compatibility pre-check: spin-sdk ~6 imports
+  # wasi:http/types@0.3.0-rc-2026-03-15 which Spin < 3.7 does
+  # not provide. Auto-skip the row with a clear note rather
+  # than fail in the wasm linker; operators can install 3.7+
+  # and re-run.
+  if [ "$adapter" = "spin" ]; then
+    if ! command -v spin >/dev/null 2>&1; then
+      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (spin CLI not on PATH) ===\n'
+      continue
+    fi
+    spin_ver=$(spin --version 2>/dev/null | awk '{print $2}' | head -1)
+    # Extract MAJOR.MINOR portion, drop pre-release suffix.
+    spin_minor=$(printf '%s' "$spin_ver" | awk -F'.' '{printf "%d%02d", $1, $2}')
+    if [ -n "$spin_minor" ] && [ "$spin_minor" -lt 307 ]; then
+      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (CLI %s; need >= 3.7 for spin-sdk 6 wasi:http 0.3) ===\n' "$spin_ver"
+      continue
+    fi
+  fi
+
   printf '\n=== 12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
@@ -435,9 +435,9 @@ for suite in "${SUITES[@]}"; do
   if [ "$adapter" = "cloudflare" ]; then
     backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
   fi
-  if [ "$adapter" = "spin" ]; then
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-  fi
+  # Spin no longer needs spin.toml backup-restore: the fixture's
+  # [variables] declares demo_api_token directly so the smoke
+  # doesn't mutate it.
 
   # Reset the adapter's local emulator state so the smoke starts
   # from a known-clean cutover state. The blob-model push read-back
