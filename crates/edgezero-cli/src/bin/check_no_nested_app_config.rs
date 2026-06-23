@@ -351,3 +351,54 @@ fn main() {
 
     println!("check_no_nested_app_config: OK");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn known(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn ty(src: &str) -> Type {
+        syn::parse_str(src).expect("type parse")
+    }
+
+    #[test]
+    fn struct_derives_app_config_detects_path_suffixed_derive() {
+        let item: syn::ItemStruct =
+            syn::parse_str("#[derive(Debug, edgezero_core::AppConfig)] struct C { x: u8 }")
+                .expect("struct parse");
+        assert!(struct_derives_app_config(&item));
+    }
+
+    #[test]
+    fn struct_derives_app_config_false_without_it() {
+        let item: syn::ItemStruct =
+            syn::parse_str("#[derive(Debug)] struct C { x: u8 }").expect("struct parse");
+        assert!(!struct_derives_app_config(&item));
+    }
+
+    #[test]
+    fn type_contains_app_config_unwraps_nested_wrappers() {
+        let set = known(&["ChildConfig"]);
+        assert_eq!(
+            type_contains_app_config_struct(&ty("ChildConfig"), &set),
+            Some("ChildConfig".to_string())
+        );
+        assert_eq!(
+            type_contains_app_config_struct(&ty("Option<Vec<Box<ChildConfig>>>"), &set),
+            Some("ChildConfig".to_string())
+        );
+    }
+
+    #[test]
+    fn type_contains_app_config_none_for_unrelated_types() {
+        let set = known(&["ChildConfig"]);
+        assert_eq!(type_contains_app_config_struct(&ty("String"), &set), None);
+        assert_eq!(
+            type_contains_app_config_struct(&ty("Vec<String>"), &set),
+            None
+        );
+    }
+}
