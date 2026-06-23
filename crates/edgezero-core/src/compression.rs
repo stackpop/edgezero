@@ -107,4 +107,26 @@ mod tests {
 
         assert_eq!(decoded, b"hello brotli");
     }
+
+    #[test]
+    fn decode_gzip_stream_surfaces_error_on_invalid_input() {
+        let garbage = b"this is definitely not a gzip member".to_vec();
+        let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(garbage)]);
+        let result =
+            block_on(async { decode_gzip_stream(stream).try_collect::<Vec<Bytes>>().await });
+        assert!(result.is_err(), "invalid gzip must decode to an error");
+    }
+
+    #[test]
+    fn decode_brotli_stream_surfaces_error_on_invalid_input() {
+        // A high-bit-set lead byte is not a valid brotli stream prefix.
+        let garbage = vec![0xFFu8; 64];
+        let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(garbage)]);
+        let result = block_on(async {
+            decode_brotli_stream(stream)
+                .try_collect::<Vec<Bytes>>()
+                .await
+        });
+        assert!(result.is_err(), "invalid brotli must decode to an error");
+    }
 }
