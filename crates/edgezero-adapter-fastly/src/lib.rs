@@ -143,6 +143,20 @@ fn env_config_from_runtime_dictionary(stores: StoresMetadata) -> EnvConfig {
     use fastly::ConfigStore;
     use std::iter::empty;
     let Ok(dict) = ConfigStore::try_open("edgezero_runtime_env") else {
+        // The store is optional -- a clean cutover deploy with all
+        // baked-in defaults works without it. But the absence means
+        // EDGEZERO__* runtime overrides (spec 5.4 __KEY, spec 5.2
+        // __NAME) will silently fall back to baked defaults. Log
+        // once at request time so operators can spot the gap in
+        // their Fastly logs and run `edgezero provision --adapter fastly`
+        // to create the store.
+        log::warn!(
+            "Fastly Config Store `edgezero_runtime_env` not found; \
+             EDGEZERO__* runtime overrides will use baked-in defaults. \
+             Run `edgezero provision --adapter fastly` to create the store, \
+             then populate per-environment override keys with \
+             `fastly config-store-entry update --upsert`."
+        );
         return EnvConfig::from_vars(empty::<(String, String)>());
     };
     let mut keys: Vec<String> = vec![

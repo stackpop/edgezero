@@ -296,6 +296,41 @@ impl Adapter for FastlyCliAdapter {
                 out.push(line);
             }
         }
+        // EdgeZero runtime overrides live in a dedicated Fastly Config
+        // Store named `edgezero_runtime_env`. Compute@Edge has no
+        // process env, so `EDGEZERO__STORES__CONFIG__<ID>__KEY` and
+        // similar overrides have to come from a platform Config Store
+        // the runtime opens by name (see
+        // `env_config_from_runtime_dictionary` in lib.rs). Provision
+        // owns the store creation alongside the operator's declared
+        // stores so the runtime override path is wired correctly out
+        // of the box; if the store already appears in
+        // `[setup.config_stores.edgezero_runtime_env]`, skip.
+        let runtime_env_kind = "config";
+        let runtime_env_name = "edgezero_runtime_env";
+        if dry_run {
+            out.push(format!(
+                "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
+                fastly_path.display()
+            ));
+        } else if !setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
+            create_fastly_store(runtime_env_kind, runtime_env_name)?;
+            append_fastly_setup(&fastly_path, runtime_env_kind, runtime_env_name).map_err(
+                |err| {
+                    format!(
+                        "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
+                        path = fastly_path.display()
+                    )
+                },
+            )?;
+            out.push(format!(
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store); appended setup tables to {}\n  Populate per-environment override keys with:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=app_config_staging --upsert",
+                fastly_path.display()
+            ));
+        } else {
+            // Already declared; nothing to do.
+        }
+
         if out.is_empty() {
             out.push("fastly has no declared stores to provision".to_owned());
         }
@@ -1898,11 +1933,15 @@ build = \"cargo build --release\"
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret = 3 status lines.
-        assert_eq!(out.len(), 3);
+        // 1 KV + 1 config + 1 secret + 1 runtime-env = 4 status lines.
+        assert_eq!(out.len(), 4);
         assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
         assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
+        assert!(
+            out[3].contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
+            "runtime-env store row: {out:?}",
+        );
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
@@ -1930,7 +1969,14 @@ build = \"cargo build --release\"
     fn provision_with_no_declared_stores_says_so() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write");
+        // Pre-populate the runtime-env block so the provision flow's
+        // unconditional runtime-env step skips (otherwise it would
+        // shell out to real `fastly` to create the store).
+        fs::write(
+            &path,
+            "name = \"demo\"\n[setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
         let stores = ProvisionStores {
             config: &[],
             kv: &[],
@@ -1953,7 +1999,8 @@ build = \"cargo build --release\"
         let path = dir.path().join("fastly.toml");
         fs::write(
             &path,
-            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
+            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
         )
         .expect("write");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
