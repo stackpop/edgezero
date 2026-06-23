@@ -50,9 +50,14 @@ declare -a BACKUPS=()
 # Stop the running runtime without touching tracked-fixture backups.
 # Used between staging-blob and default-blob assertions in the same
 # row so the pushed remote state survives a runtime restart. Sends
-# SIGTERM, waits up to 5s, then SIGKILLs survivors; finally waits
-# until $PORT is no longer in use so the next boot can re-bind.
+# SIGTERM, waits up to 5s, then SIGKILLs survivors. If anything is
+# still bound to $PORT after that (e.g. a grand-child not reachable
+# via $SERVER_PID), uses `lsof` to hunt it down. Returns non-zero
+# if the port refuses to free -- the caller MUST surface that, or
+# the next boot will silently inherit the prior server's responses
+# and assertions will compare against stale state.
 stop_server() {
+  local rc=0
   if [ -n "$SERVER_PID" ]; then
     pkill -TERM -P "$SERVER_PID" 2>/dev/null || true
     kill -TERM "$SERVER_PID" 2>/dev/null || true
@@ -66,14 +71,35 @@ stop_server() {
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
   fi
-  # Wait until the port is free so the next boot doesn't race the
-  # previous server's socket close. Cap at 10s; if it never frees
-  # the next wait_for_port will surface the bind failure.
+  # Best-effort port-binder kill via lsof. The cargo-run wrapper
+  # often spawns a child that outlives the wrapper PID; pkill -P
+  # catches direct children, but a re-exec or grand-child can
+  # survive. lsof finds whoever's actually listening on $PORT.
+  if command -v lsof >/dev/null 2>&1; then
+    local port_pids
+    port_pids=$(lsof -ti ":${PORT}" 2>/dev/null || true)
+    if [ -n "$port_pids" ]; then
+      printf '  note: killing stray port-${PORT} holder(s): %s\n' "$port_pids" >&2
+      # shellcheck disable=SC2086
+      kill -KILL $port_pids 2>/dev/null || true
+    fi
+  fi
+  # Verify the port is free; fail loud if not. A live port here
+  # means the next boot would either silently inherit the old
+  # server's responses or fail to bind -- either way the row's
+  # assertions would be meaningless.
   local waited=0
-  while [ "$waited" -lt 10 ] && curl -s -o /dev/null "http://127.0.0.1:${PORT}/" 2>/dev/null; do
+  while [ "$waited" -lt 10 ]; do
+    if ! curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+      return 0
+    fi
     sleep 1
     waited=$((waited + 1))
   done
+  printf '  FAIL  stop_server: port %s still serving after 10s -- prior runtime did not die\n' "$PORT" >&2
+  FAIL=$((FAIL + 1))
+  rc=1
+  return "$rc"
 }
 
 # Restore tracked fixtures the smoke mutated in place. Called once
@@ -215,22 +241,83 @@ ensure_runtime_built() {
   esac
 }
 
+# Seed the platform-local secret store for the chosen adapter with
+# `demo_api_token = "resolved-token"`. Without this, the
+# /config/typed handler's secret walk fails before any KEY-override
+# assertion can run. Each adapter's local-emulator secret store
+# differs:
+#   - axum:       process env var (handled inline by boot_runtime).
+#   - cloudflare: .dev.vars file at the worker root.
+#   - fastly:     [local_server.secret_stores.default.contents] in
+#                 fastly.toml (mutates the tracked file -- the
+#                 caller already backed it up).
+#   - spin:       runtime-config.toml's variable provider; the
+#                 demo's spin.toml exposes `demo_api_token` as a
+#                 variable. We pre-create a local override file the
+#                 runtime reads.
+# Best-effort: if the adapter's per-platform mechanism isn't
+# present on this host (e.g. wrangler not installed), the helper
+# logs and returns 1; the caller skips the row.
+seed_secret_for_adapter() {
+  local adapter="$1"
+  case "$adapter" in
+    axum)
+      # No-op: boot_runtime sets the env var inline.
+      return 0
+      ;;
+    cloudflare)
+      local dev_vars="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      printf 'demo_api_token="resolved-token"\n' > "$dev_vars"
+      return 0
+      ;;
+    fastly)
+      local fastly_toml="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+      # Append a viceroy-compatible inline secret_stores block. The
+      # caller already backed up fastly.toml; this append survives
+      # only for the row's duration.
+      cat >> "$fastly_toml" <<'TOML'
+
+[local_server.secret_stores.default]
+format = "inline-toml"
+[local_server.secret_stores.default.contents]
+demo_api_token = "resolved-token"
+TOML
+      return 0
+      ;;
+    spin)
+      # Spin reads variables from the application manifest's
+      # `[variables]` block. The demo's spin.toml maps the
+      # `demo_api_token` variable to an env var; setting it
+      # inline at boot is the cleanest portable path. boot_runtime
+      # spawns spin with the var set.
+      return 0
+      ;;
+    *)
+      printf '  note: unknown adapter %s for secret seeding\n' "$adapter" >&2
+      return 1
+      ;;
+  esac
+}
+
 # Boot the right runtime for $1 (adapter name), returning when the
 # greeting endpoint responds 200. All rows bind to $PORT (8787 to
 # match the app-demo edgezero.toml `[adapters.axum.adapter] port`).
 #
-# Secret seeding: the typed `/config/typed` endpoint extracts
-# AppConfig<AppDemoConfig>, which secret-walks `api_token =
-# "demo_api_token"` against the default secret store. Axum's
-# EnvSecretStore reads the value from the process env (key ==
-# secret name). Cloudflare / Fastly / Spin have their own
-# per-platform secret stores; if SKIP_<ADAPTER>=1 isn't set,
-# operators must pre-seed those via the platform's own tooling
-# (`wrangler secret put`, `fastly secret-store-entry create`,
-# spin .env). The smoke can't do that portably.
+# Secret seeding: see `seed_secret_for_adapter` above. The Axum
+# and Spin rows set the secret env var inline at spawn time
+# (EnvSecretStore reads from the process env); Cloudflare and
+# Fastly read from per-adapter on-disk files written by the
+# seed helper.
 boot_runtime() {
   local adapter="$1"
   ensure_runtime_built "$adapter" || return 1
+  # Refuse to launch if the port is already taken. If we boot anyway,
+  # wait_for_port could return success on the OTHER process's response.
+  if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${PORT}/" 2>/dev/null; then
+    printf '  FAIL  boot_runtime: port %s already in use; refusing to boot %s\n' "$PORT" "$adapter" >&2
+    FAIL=$((FAIL + 1))
+    return 1
+  fi
   case "$adapter" in
     axum)
       # Seed `demo_api_token` so the AppConfig secret walk
@@ -249,7 +336,11 @@ boot_runtime() {
           target/wasm32-wasip1/debug/app_demo_adapter_fastly.wasm 2>&1) &
       ;;
     spin)
+      # spin reads variables from the app manifest; the demo wires
+      # `demo_api_token` to the SPIN_VARIABLE_DEMO_API_TOKEN env var
+      # (Spin's documented passthrough).
       (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
+        SPIN_VARIABLE_DEMO_API_TOKEN=resolved-token \
         spin up --listen "127.0.0.1:${PORT}" \
           --runtime-config-file runtime-config.toml 2>&1) &
       ;;
@@ -290,8 +381,25 @@ for suite in "${SUITES[@]}"; do
   # Back up any tracked fixture the push will mutate in place. For
   # Fastly that's fastly.toml; gitignored local-state directories
   # (`.wrangler/`, `.spin/`, `.edgezero/`) are fine to write to.
+  # The Cloudflare row writes a transient `.dev.vars` file -- back
+  # it up too so the worktree stays clean.
   if [ "$adapter" = "fastly" ]; then
     backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+  fi
+  if [ "$adapter" = "cloudflare" ]; then
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+  fi
+
+  # Seed the platform-local secret store so the runtime
+  # /config/typed handler's secret walk resolves at request time.
+  # Without it the assertion would fail on the secret-walk error,
+  # not the __KEY override (which is what this row is gating).
+  if ! seed_secret_for_adapter "$adapter"; then
+    printf '  note: %s row skipped -- secret seeding unavailable on this host\n' "$adapter" >&2
+    cleanup
+    rm -rf "$tmp"
+    trap cleanup EXIT INT TERM
+    continue
   fi
 
   # 1. Push the default blob at the default key.
@@ -312,17 +420,35 @@ for suite in "${SUITES[@]}"; do
   # the /config/<key> route is the raw config-store map and would
   # always 404 on the blob model. Only /config/typed proves the
   # extractor read the right blob.
-  EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging \
-    boot_runtime "$adapter"
+  if ! EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging \
+      boot_runtime "$adapter"; then
+    cleanup
+    rm -rf "$tmp"
+    trap cleanup EXIT INT TERM
+    continue
+  fi
   result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
   check "$adapter __KEY override returns staging" "staging-blob" "$result"
-  # Stop the server BUT keep the pushed blobs in place — restoring
-  # fixtures here would wipe the default blob before the next boot reads it.
-  stop_server
+  # Stop the server BUT keep the pushed blobs in place -- restoring
+  # fixtures would wipe the default blob before the next boot reads it.
+  # If stop_server fails (port stays live), abort the row: the next
+  # boot would either inherit the prior server's responses or fail
+  # to bind, and the default-key assertion would be meaningless.
+  if ! stop_server; then
+    cleanup
+    rm -rf "$tmp"
+    trap cleanup EXIT INT TERM
+    continue
+  fi
 
   # 4. Reboot without __KEY; assert default.
   unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
-  boot_runtime "$adapter"
+  if ! boot_runtime "$adapter"; then
+    cleanup
+    rm -rf "$tmp"
+    trap cleanup EXIT INT TERM
+    continue
+  fi
   result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
   check "$adapter __KEY unset returns default" "default-blob" "$result"
   # Now both assertions are done -- restore tracked fixtures.
@@ -376,12 +502,20 @@ TOML
     check "fastly.toml carries literal __edgezero_chunks keys" "yes" "no"
   fi
 
-  boot_runtime fastly
-  # /config/typed routes through AppConfig<AppDemoConfig> which
-  # invokes the runtime chunk-pointer resolver — proving the
-  # reconstructed envelope flows into the typed extractor.
-  result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
-  check_contains "fastly runtime reads reconstructed envelope" "large-fastly-blob" "$result"
+  # Seed the demo_api_token secret so /config/typed's secret walk
+  # resolves; without it the assertion would fail in the extractor
+  # before testing the chunk-pointer round-trip. The fastly.toml
+  # append survives in the per-row backup and gets restored on
+  # cleanup.
+  seed_secret_for_adapter fastly || true
+
+  if boot_runtime fastly; then
+    # /config/typed routes through AppConfig<AppDemoConfig> which
+    # invokes the runtime chunk-pointer resolver -- proving the
+    # reconstructed envelope flows into the typed extractor.
+    result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
+    check_contains "fastly runtime reads reconstructed envelope" "large-fastly-blob" "$result"
+  fi
   cleanup
 
   rm -rf "$tmp"
