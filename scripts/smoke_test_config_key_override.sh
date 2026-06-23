@@ -79,7 +79,7 @@ stop_server() {
     local port_pids
     port_pids=$(lsof -ti ":${PORT}" 2>/dev/null || true)
     if [ -n "$port_pids" ]; then
-      printf '  note: killing stray port-${PORT} holder(s): %s\n' "$port_pids" >&2
+      printf '  note: killing stray port-%s holder(s): %s\n' "$PORT" "$port_pids" >&2
       # shellcheck disable=SC2086
       kill -KILL $port_pids 2>/dev/null || true
     fi
@@ -272,24 +272,47 @@ seed_secret_for_adapter() {
       ;;
     fastly)
       local fastly_toml="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
-      # Append a viceroy-compatible inline secret_stores block. The
-      # caller already backed up fastly.toml; this append survives
-      # only for the row's duration.
+      # The fixture's [local_server.secret_stores.default] is an
+      # array-of-tables (each entry exposes one key + the env var
+      # to read its value from). Append a second entry rather than
+      # opening a normal-table block at the same path; mixing the
+      # two forms is a TOML parse error. Viceroy reads
+      # `demo_api_token`'s value from $DEMO_API_TOKEN_SECRET, which
+      # boot_runtime exports inline.
       cat >> "$fastly_toml" <<'TOML'
 
-[local_server.secret_stores.default]
-format = "inline-toml"
-[local_server.secret_stores.default.contents]
-demo_api_token = "resolved-token"
+[[local_server.secret_stores.default]]
+key = "demo_api_token"
+env = "DEMO_API_TOKEN_SECRET"
 TOML
       return 0
       ;;
     spin)
-      # Spin reads variables from the application manifest's
-      # `[variables]` block. The demo's spin.toml maps the
-      # `demo_api_token` variable to an env var; setting it
-      # inline at boot is the cleanest portable path. boot_runtime
-      # spawns spin with the var set.
+      # The Spin fixture's spin.toml declares the `api_token`
+      # variable (the schema field name) but the runtime secret
+      # walk asks for the blob's VALUE -- `demo_api_token`. Patch
+      # the fixture in place so both the [variables] block and
+      # the [component.app-demo.variables] map expose
+      # `demo_api_token` for the smoke's lifetime. The caller
+      # backs spin.toml up so cleanup restores the original.
+      local spin_toml="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
+      # Insert demo_api_token into the application [variables] block.
+      # Use awk to add the new line right after `api_token = ...`.
+      awk '
+        /^api_token = / && !patched_vars {
+          print
+          print "demo_api_token = { required = true, secret = true }"
+          patched_vars = 1
+          next
+        }
+        /^api_token = "\{\{ api_token \}\}"/ && !patched_comp {
+          print
+          print "demo_api_token = \"{{ demo_api_token }}\""
+          patched_comp = 1
+          next
+        }
+        { print }
+      ' "$spin_toml" > "$spin_toml.tmp" && mv "$spin_toml.tmp" "$spin_toml"
       return 0
       ;;
     *)
@@ -331,7 +354,11 @@ boot_runtime() {
         wrangler dev --local --port "$PORT" 2>&1) &
       ;;
     fastly)
+      # DEMO_API_TOKEN_SECRET is the env var viceroy reads to
+      # populate the `demo_api_token` secret-store entry seeded
+      # by seed_secret_for_adapter.
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
+        DEMO_API_TOKEN_SECRET=resolved-token \
         viceroy run -C fastly.toml --addr "127.0.0.1:${PORT}" \
           target/wasm32-wasip1/debug/app_demo_adapter_fastly.wasm 2>&1) &
       ;;
@@ -388,6 +415,9 @@ for suite in "${SUITES[@]}"; do
   fi
   if [ "$adapter" = "cloudflare" ]; then
     backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+  fi
+  if [ "$adapter" = "spin" ]; then
+    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
   fi
 
   # Seed the platform-local secret store so the runtime
