@@ -235,12 +235,11 @@ mod tests {
             Err(EdgeError::internal(anyhow::anyhow!("boom")))
         }
         let handler = boom.into_handler();
-        // `block_on(...).expect_err(...)` would also compile (`Body` does
-        // impl `Debug`), but `match` reads clearer for panic-on-`Ok` and
-        // avoids depending on that impl.
-        let error = match block_on(handler.call(ctx())) {
-            Ok(_) => panic!("expected error"),
-            Err(error) => error,
+        // `let...else` (clippy `manual_let_else` requires it over `match`
+        // here). `expect_err` would also compile — `Body` does impl
+        // `Debug` — but this avoids depending on that.
+        let Err(error) = block_on(handler.call(ctx())) else {
+            panic!("expected error");
         };
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -278,7 +277,7 @@ mod tests {
     use std::collections::HashSet;
 
     fn known(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| (*s).to_string()).collect()
+        names.iter().map(|name| String::from(*name)).collect()
     }
 
     fn ty(src: &str) -> syn::Type {
@@ -304,12 +303,12 @@ mod tests {
     fn type_contains_app_config_unwraps_nested_wrappers() {
         let set = known(&["ChildConfig"]);
         assert_eq!(
-            type_contains_app_config_struct(&ty("ChildConfig"), &set),
-            Some("ChildConfig".to_string())
+            type_contains_app_config_struct(&ty("ChildConfig"), &set).as_deref(),
+            Some("ChildConfig")
         );
         assert_eq!(
-            type_contains_app_config_struct(&ty("Option<Vec<Box<ChildConfig>>>"), &set),
-            Some("ChildConfig".to_string())
+            type_contains_app_config_struct(&ty("Option<Vec<Box<ChildConfig>>>"), &set).as_deref(),
+            Some("ChildConfig")
         );
     }
 
@@ -445,7 +444,7 @@ git commit -m "test(adapter): cover run_native_cli not-found and non-zero-exit p
     #[test]
     fn decode_brotli_stream_surfaces_error_on_invalid_input() {
         // A high-bit-set lead byte is not a valid brotli stream prefix.
-        let garbage = vec![0xFFu8; 64];
+        let garbage = vec![0xFF_u8; 64];
         let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(garbage)]);
         let result = block_on(async {
             decode_brotli_stream(stream).try_collect::<Vec<Bytes>>().await

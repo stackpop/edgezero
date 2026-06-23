@@ -357,7 +357,7 @@ mod tests {
     use super::*;
 
     fn known(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| (*s).to_string()).collect()
+        names.iter().map(|name| String::from(*name)).collect()
     }
 
     fn ty(src: &str) -> Type {
@@ -383,12 +383,12 @@ mod tests {
     fn type_contains_app_config_unwraps_nested_wrappers() {
         let set = known(&["ChildConfig"]);
         assert_eq!(
-            type_contains_app_config_struct(&ty("ChildConfig"), &set),
-            Some("ChildConfig".to_string())
+            type_contains_app_config_struct(&ty("ChildConfig"), &set).as_deref(),
+            Some("ChildConfig")
         );
         assert_eq!(
-            type_contains_app_config_struct(&ty("Option<Vec<Box<ChildConfig>>>"), &set),
-            Some("ChildConfig".to_string())
+            type_contains_app_config_struct(&ty("Option<Vec<Box<ChildConfig>>>"), &set).as_deref(),
+            Some("ChildConfig")
         );
     }
 

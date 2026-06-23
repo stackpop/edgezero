@@ -74,9 +74,8 @@ mod tests {
             Err(EdgeError::internal(anyhow::anyhow!("boom")))
         }
         let handler = boom.into_handler();
-        let error = match block_on(handler.call(ctx())) {
-            Ok(_) => panic!("expected error"),
-            Err(error) => error,
+        let Err(error) = block_on(handler.call(ctx())) else {
+            panic!("expected error");
         };
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }

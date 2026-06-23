@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn decode_brotli_stream_surfaces_error_on_invalid_input() {
         // A high-bit-set lead byte is not a valid brotli stream prefix.
-        let garbage = vec![0xFFu8; 64];
+        let garbage = vec![0xFF_u8; 64];
         let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(garbage)]);
         let result = block_on(async {
             decode_brotli_stream(stream)
