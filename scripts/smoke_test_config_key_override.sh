@@ -425,7 +425,9 @@ for suite in "${SUITES[@]}"; do
   # Without it the assertion would fail on the secret-walk error,
   # not the __KEY override (which is what this row is gating).
   if ! seed_secret_for_adapter "$adapter"; then
-    printf '  note: %s row skipped -- secret seeding unavailable on this host\n' "$adapter" >&2
+    printf '  FAIL  %s row: secret seeding failed (set SKIP_%s=1 to skip explicitly)\n' \
+      "$adapter" "$(upper "$adapter")" >&2
+    FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
     trap cleanup EXIT INT TERM
@@ -452,6 +454,8 @@ for suite in "${SUITES[@]}"; do
   # extractor read the right blob.
   if ! EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging \
       boot_runtime "$adapter"; then
+    printf '  FAIL  %s row: runtime failed to boot (staging step)\n' "$adapter" >&2
+    FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
     trap cleanup EXIT INT TERM
@@ -465,6 +469,8 @@ for suite in "${SUITES[@]}"; do
   # boot would either inherit the prior server's responses or fail
   # to bind, and the default-key assertion would be meaningless.
   if ! stop_server; then
+    # stop_server already incremented FAIL with the port-still-live
+    # diagnostic; just abort the row.
     cleanup
     rm -rf "$tmp"
     trap cleanup EXIT INT TERM
@@ -474,6 +480,8 @@ for suite in "${SUITES[@]}"; do
   # 4. Reboot without __KEY; assert default.
   unset EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
   if ! boot_runtime "$adapter"; then
+    printf '  FAIL  %s row: runtime failed to boot (default step)\n' "$adapter" >&2
+    FAIL=$((FAIL + 1))
     cleanup
     rm -rf "$tmp"
     trap cleanup EXIT INT TERM
@@ -545,6 +553,9 @@ TOML
     # reconstructed envelope flows into the typed extractor.
     result=$(curl -s "http://127.0.0.1:${PORT}/config/typed")
     check_contains "fastly runtime reads reconstructed envelope" "large-fastly-blob" "$result"
+  else
+    printf '  FAIL  fastly chunk-pointer smoke: runtime failed to boot\n' >&2
+    FAIL=$((FAIL + 1))
   fi
   cleanup
 
