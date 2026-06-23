@@ -1,4 +1,4 @@
-//! `check_no_nested_app_config` — CI audit binary (spec §10.2.1).
+//! `check_no_nested_app_config` — CI audit binary (spec 10.2.1).
 //!
 //! Detects `AppConfig`-derived structs used as fields inside other
 //! `AppConfig`-derived structs. The check operates at the AST level

@@ -197,7 +197,7 @@ impl<'entry> TypedSecretEntry<'entry> {
     }
 }
 
-/// Outcome of a single-key read. See spec §9.0.
+/// Outcome of a single-key read. See spec 9.0.
 #[non_exhaustive]
 pub enum ReadConfigEntry {
     /// The store exists but the key is absent (operator hasn't pushed yet,
@@ -211,7 +211,7 @@ pub enum ReadConfigEntry {
     Present(String),
     /// The adapter cannot query the backend for this entry — e.g. Spin
     /// Cloud's CLI exposes no `get`. `&'static str` carries the human-
-    /// readable reason. See spec §8.3 four-branch UX.
+    /// readable reason. See spec 8.3 four-branch UX.
     Unsupported(&'static str),
 }
 
@@ -375,7 +375,7 @@ pub trait Adapter: Sync + Send {
     }
 
     /// Single-key read against the LIVE platform. Mirrors
-    /// [`Self::push_config_entries`]'s argument list per spec §9.0 so
+    /// [`Self::push_config_entries`]'s argument list per spec 9.0 so
     /// adapters can share helpers (`find_namespace_id` for Cloudflare,
     /// `resolve_label_for_store` for Spin, etc.).
     ///

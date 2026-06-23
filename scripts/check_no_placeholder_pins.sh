@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# check_no_placeholder_pins.sh — CI gate per spec §13.1
+# check_no_placeholder_pins.sh — CI gate per spec 13.1
 #
 # Refuses pin tests (files whose path contains "pin") that still carry
-# unresolved placeholder hex values.  The Phase A round-2 review replaced
-# all placeholder strings with the real computed SHA, so this gate should
-# pass against the current tree.
+# unresolved placeholder hex values.  All placeholder strings have been
+# replaced with the real computed SHA, so this gate should pass against
+# the current tree.
 #
 # Placeholder patterns caught:
 #   …                      — ellipsis (Unicode U+2026 or literal "...")

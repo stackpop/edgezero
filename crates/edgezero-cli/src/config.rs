@@ -146,7 +146,7 @@ enum FirstReadOutcome {
     /// caller proceeds to consent.
     ProceedFromMissingOrUnsupported,
     /// Remote was `Present` with a different SHA; carry the SHA forward so
-    /// Step 3.5 can race-detect against it.
+    /// The pre-write re-fetch can race-detect against it.
     ProceedFromPresent { approved_remote_sha: String },
 }
 
@@ -159,7 +159,7 @@ struct PushPathRefs<'pp> {
     push_ctx: &'pp adapter_registry::AdapterPushContext<'pp>,
 }
 
-/// Outcome of Step 3.5 re-check.
+/// Outcome of the pre-write re-check.
 enum RecheckOutcome {
     /// Concurrent push reached the same state — skip the write.
     Skip,
@@ -198,7 +198,7 @@ where
     let ctx = load_validation_context(args)?;
     run_shared_checks(&ctx)?;
 
-    // Typed deserialise + validate_excluding_secrets (spec §3.3.8: push,
+    // Typed deserialise + validate_excluding_secrets (spec 3.3.8: push,
     // diff, AND typed validate all use deserialize-only +
     // validate_excluding_secrets; the runtime is the only path that runs
     // full validate against RESOLVED secret values).
@@ -227,7 +227,7 @@ where
 
 // -------------------------------------------------------------------
 /// Stub-pointer for the bundled `edgezero` binary's `config push`
-/// subcommand (spec §3.2.1).
+/// subcommand (spec 3.2.1).
 ///
 /// The blob app-config rewrite requires a TYPED downstream CLI that
 /// embeds the app's `AppConfig<C>` struct. The bundled `edgezero`
@@ -243,7 +243,7 @@ where
 /// can be displayed.
 ///
 /// # Errors
-/// Always returns a pointer error explaining §3.2.1.
+/// Always returns a pointer error explaining 3.2.1.
 #[inline]
 pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
     Err(
@@ -295,7 +295,7 @@ where
     };
 
     // Build envelope.
-    // Honour --key override (§5.4): if the caller supplied an explicit key,
+    // Honour --key override (5.4): if the caller supplied an explicit key,
     // use it; otherwise fall back to the manifest's resolved logical store id.
     let key = args
         .key
@@ -306,7 +306,7 @@ where
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
     let local_sha = local_envelope.sha256.clone();
 
-    // Step 2: first read + diff.
+    // First read + diff.
     let remote = read_remote(ctx.adapter, args.local, &paths, &ctx.store, &key)?;
     let approved_remote_sha =
         match render_first_read_diff(&remote, &key, &local_envelope, &local_sha, args.no_diff)? {
@@ -320,10 +320,10 @@ where
             FirstReadOutcome::ProceedFromMissingOrUnsupported => None,
         };
 
-    // Step 3: consent gate (§8.2 default or §8.3 Spin Cloud Unsupported).
+    // Consent gate (8.2 default or 8.3 Spin Cloud Unsupported).
     handle_consent(args, &remote)?;
 
-    // Step 3.5: re-fetch + skip-on-equal + concurrent-push detection.
+    // Pre-write re-fetch + skip-on-equal + concurrent-push detection.
     if !args.dry_run && !matches!(remote, ReadConfigEntry::Unsupported(_)) {
         match recheck_before_write(
             ctx.adapter,
@@ -340,19 +340,19 @@ where
         }
     }
 
-    // Step 4: write.
+    // Write.
     write_envelope(ctx.adapter, args, &ctx, &paths, &key, body)
 }
 
 // -------------------------------------------------------------------
-// run_config_diff_typed — typed diff entry point (Phase D)
+// run_config_diff_typed — typed diff entry point
 // -------------------------------------------------------------------
 
-/// Write a diff informational message to stderr (stream discipline per round-34).
+/// Write a diff informational message to stderr.
 /// All non-error diff messages go here rather than using inline `#[expect]` blocks.
 #[expect(
     clippy::print_stderr,
-    reason = "stream discipline: informational messages go to stderr per round-34"
+    reason = "stream discipline: informational messages go to stderr, never stdout"
 )]
 fn diff_info(msg: &str) {
     eprintln!("{msg}");
@@ -391,7 +391,7 @@ pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, Strin
 where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
-    // Step 1: load + validate (spec §3.3.2: diff runs the same structural
+    // Load + validate (spec 3.3.2: diff runs the same structural
     // checks as push — validate_excluding_secrets + typed_secret_checks +
     // adapter_typed_checks; no consent gate, no re-fetch).
     let validate_args = ConfigValidateArgs {
@@ -415,13 +415,13 @@ where
     typed_secret_checks(&typed, &ctx)?;
     run_adapter_typed_checks::<C>(&ctx)?;
 
-    // Step 2: build the local envelope.
+    // Build the local envelope.
     let local_data: serde_json::Value = serde_json::to_value(&typed)
         .map_err(|err| format!("failed to serialise local config: {err}"))?;
     let local_envelope = BlobEnvelope::new(local_data, generated_at_rfc3339());
     let local_sha = local_envelope.sha256.clone();
 
-    // Step 3: resolve adapter + store + key (mirrors the push flow).
+    // Resolve adapter + store + key (mirrors the push flow).
     ensure_adapter_defined(&args.adapter, Some(&ctx.manifest_loader))?;
     let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
         format!(
@@ -436,7 +436,7 @@ where
     let store = ResolvedStoreId::new(logical.clone(), platform);
     let key = args.key.clone().unwrap_or(logical);
 
-    // Step 4: resolve adapter paths for the read call.
+    // Resolve adapter paths for the read call.
     let manifest_root = ctx
         .manifest_path
         .parent()
@@ -463,10 +463,10 @@ where
         push_ctx: &push_ctx,
     };
 
-    // Step 5: read the remote entry.
+    // Read the remote entry.
     let remote = read_remote(adapter, args.local, &paths, &store, &key)?;
 
-    // Step 6: branch per variant, render, determine outcome.
+    // Branch per variant, render, determine outcome.
     let outcome: DiffOutcome = match &remote {
         ReadConfigEntry::Present(body) => {
             let remote_envelope: BlobEnvelope = serde_json::from_str(body)
@@ -570,8 +570,8 @@ fn dispatch_diff_format(
 // Helpers for run_config_push_typed
 // -------------------------------------------------------------------
 
-/// Consent gate: §8.3 Spin Cloud four-branch UX when `remote` is
-/// `Unsupported`; §8.2 default flow otherwise.
+/// Consent gate: 8.3 Spin Cloud four-branch UX when `remote` is
+/// `Unsupported`; 8.2 default flow otherwise.
 fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(), String> {
     if let ReadConfigEntry::Unsupported(reason) = remote {
         if args.dry_run {
@@ -590,7 +590,7 @@ fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(),
             }
             #[expect(
                 clippy::print_stderr,
-                reason = "stream discipline: TTY consent prompt goes to stderr per round-34; eprint! (no newline) keeps the cursor on the prompt line"
+                reason = "stream discipline: TTY consent prompt goes to stderr; eprint! (no newline) keeps the cursor on the prompt line"
             )]
             {
                 eprint!("cannot read remote on Spin Cloud ({reason}); write anyway? [y/N] ");
@@ -610,10 +610,10 @@ fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(),
 }
 
 /// Write an informational message to stderr. All push messages that are
-/// not errors go here (stream discipline per round-34).
+/// not errors go here.
 #[expect(
     clippy::print_stderr,
-    reason = "stream discipline: informational messages go to stderr per round-34"
+    reason = "stream discipline: informational messages go to stderr, never stdout"
 )]
 fn push_info(msg: &str) {
     eprintln!("{msg}");
@@ -650,8 +650,8 @@ fn read_remote(
     }
 }
 
-/// Step 3.5: re-fetch right before the write to detect concurrent pushes
-/// and skip-on-equal (round-36 M-1 / round-38 H-1).
+/// Re-fetch right before the write to detect concurrent pushes
+/// and skip-on-equal.
 #[expect(
     clippy::too_many_arguments,
     reason = "recheck needs adapter, local flag, all path refs, store, key, local_sha, first_read, and approved_remote_sha — each is distinct; a sub-struct would shift complexity without simplifying the call site"
@@ -679,9 +679,9 @@ fn recheck_before_write(
             ));
             return Ok(RecheckOutcome::Skip);
         }
-        // Round-37 H-1: compare against approved_remote_sha (the inner
-        // remote_envelope from the first read is out of scope here).
-        // Round-38 H-1: approved_remote_sha is None for MissingKey/MissingStore
+        // Compare against approved_remote_sha (the inner remote_envelope
+        // from the first read is out of scope here).
+        // approved_remote_sha is None for MissingKey/MissingStore
         // first reads — display "(none)".
         let approved_display = approved_remote_sha.map_or("(none)", short_ref);
         if approved_remote_sha != Some(remote_now_env.sha256.as_str()) {
@@ -780,7 +780,7 @@ fn render_first_read_diff(
     }
 }
 
-/// Consent gate for §8.2 default flow (non-Spin-Cloud adapters and all
+/// Consent gate for 8.2 default flow (non-Spin-Cloud adapters and all
 /// read-capable variants). `--yes` or `--dry-run` bypass the prompt.
 /// TTY: prompt. Non-TTY without `--yes`: error.
 fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(), String> {
@@ -793,7 +793,7 @@ fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(),
     if stdin().is_terminal() {
         #[expect(
             clippy::print_stderr,
-            reason = "stream discipline: TTY consent prompt goes to stderr per round-34"
+            reason = "stream discipline: TTY consent prompt goes to stderr"
         )]
         {
             eprint!("Apply changes? [y/N] ");
@@ -862,7 +862,7 @@ fn resolve_push_paths(
     ))
 }
 
-/// Step 4: dry-run log + adapter write dispatch.
+/// Dry-run log + adapter write dispatch.
 fn write_envelope(
     adapter: &dyn adapter_registry::Adapter,
     args: &ConfigPushArgs,
@@ -960,7 +960,7 @@ fn sort_keys_recursive(value: &serde_json::Value) -> serde_json::Value {
 /// key-ordering differences produce an empty diff. Uses
 /// `similar::TextDiff` to produce standard git-style unified diff output.
 ///
-/// **Stream discipline (round-34):** diff CONTENT goes to `out` (stdout
+/// **Stream discipline:** diff CONTENT goes to `out` (stdout
 /// in production) so operators can pipe through `git diff` colour
 /// wrappers. Informational messages go to stderr via `eprintln!` in the
 /// caller. Never `log::*` — prefixes corrupt TTY renders and `jq` consumers.
@@ -1097,7 +1097,7 @@ fn resolved_default(declaration: &StoreDeclaration) -> String {
 /// resolved secret value. The runtime extractor
 /// (`crates/edgezero-core/src/extractor.rs`, `secret_walk`) reads those
 /// key names from `data` and swaps each one for the resolved secret value
-/// from the appropriate secret store. Spec §3.3 (secret-key NAMES at rest).
+/// from the appropriate secret store. Spec 3.3 (secret-key NAMES at rest).
 ///
 /// `generated_at` is stamped with the current UTC second.
 ///
@@ -1111,7 +1111,7 @@ where
     // and #[secret(store_ref)] fields, whose value at rest is the
     // operator-supplied key NAME (e.g. "demo_api_token"). The runtime
     // extractor reads those key names from data and swaps each one for
-    // the resolved secret value. Spec §3.3 (secret-key NAMES at rest).
+    // the resolved secret value. Spec 3.3 (secret-key NAMES at rest).
     let data: serde_json::Value = serde_json::to_value(typed)
         .map_err(|err| format!("failed to serialise typed config: {err}"))?;
     let envelope = BlobEnvelope::new(data, generated_at_rfc3339());
@@ -1119,7 +1119,7 @@ where
 }
 
 /// Current UTC timestamp formatted as RFC 3339 with second precision and
-/// a trailing `Z` (`2026-06-17T18:42:31Z`). Matches spec §4.1 example.
+/// a trailing `Z` (`2026-06-17T18:42:31Z`). Matches spec 4.1 example.
 /// `generated_at` is informational only — it is NOT part of the SHA.
 fn generated_at_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -1849,7 +1849,7 @@ serve = "echo"
         );
     }
 
-    /// High 2 — spec §3.3.8: typed validate uses `validate_excluding_secrets`,
+    /// High 2 — spec 3.3.8: typed validate uses `validate_excluding_secrets`,
     /// so a `#[secret]` field annotated with `length(min = 32)` must NOT
     /// reject a short key name like `"short_key"` (9 bytes).  The runtime
     /// resolves it to the real secret value and runs the full validator there.
@@ -2356,9 +2356,9 @@ deep = true
     // config push (raw + typed) — spec
     // -------------------------------------------------------------------
 
-    // ---------- raw push (stub-pointer, spec §3.2.1) ----------
+    // ---------- raw push (stub-pointer, spec 3.2.1) ----------
 
-    /// Spec §3.2.1: `config push` on the bundled `edgezero` binary is a
+    /// Spec 3.2.1: `config push` on the bundled `edgezero` binary is a
     /// stub-pointer. The blob app-config rewrite requires a typed downstream
     /// CLI; the bundled binary has no `AppConfig<C>` in scope. The subcommand
     /// must always return `Err(...)` with a pointer to the typed downstream CLI.
@@ -2411,7 +2411,7 @@ deep = true
         // `vault` (#[secret(store_ref)]) — must be PRESENT in envelope.data.
         // Their value at rest is the operator-supplied key NAME, not the
         // resolved secret value. The runtime extractor (`secret_walk`) reads
-        // those key names and swaps them for the resolved secret. Spec §3.3.
+        // those key names and swaps them for the resolved secret. Spec 3.3.
         let data = &envelope.data;
         assert_eq!(
             data.get("api_token").and_then(|val| val.as_str()),
@@ -2441,7 +2441,7 @@ deep = true
         // object is deterministic.
 
         // All fields are present verbatim — secret key names included.
-        // Spec §3.3: secret-field VALUES at rest are the operator-supplied
+        // Spec 3.3: secret-field VALUES at rest are the operator-supplied
         // key NAMEs (not the resolved secret values).
         let data = serde_json::json!({
             "api_token": "demo_api_token",
@@ -2470,7 +2470,7 @@ deep = true
         );
     }
 
-    /// Spec §3.3: the blob MUST carry the secret key NAME verbatim.
+    /// Spec 3.3: the blob MUST carry the secret key NAME verbatim.
     /// The runtime extractor (`secret_walk`) reads that name to look up
     /// the resolved value in the secret store. Stripping the field would
     /// cause `ConfigOutOfDate` on every request after a push.
@@ -2534,7 +2534,7 @@ timeout_ms = 50
         );
     }
 
-    /// §5.4: `--key` overrides the default logical store id used as the
+    /// 5.4: `--key` overrides the default logical store id used as the
     /// blob key. Without `--key`, the written file is keyed by the
     /// manifest's `[stores.config]` id (`"app_config"`). With
     /// `--key staging`, the blob must appear under "staging" instead.
@@ -2694,7 +2694,7 @@ default = "one"
     }
 
     // -------------------------------------------------------------------
-    // C4: run_config_push_typed rewrite — §8.2 consent rules + diff
+    // run_config_push_typed — 8.2 consent rules + diff
     // -------------------------------------------------------------------
 
     /// Build a valid `BlobEnvelope` JSON string for the given data, suitable
@@ -2721,9 +2721,9 @@ default = "one"
         .expect("write remote envelope file");
     }
 
-    // ---------- Step 1: deserialise + validate_excluding_secrets ----------
+    // ---------- deserialise + validate_excluding_secrets ----------
 
-    /// §3.3.8 rule: a `#[secret]` field's VALUE is a key name like
+    /// 3.3.8 rule: a `#[secret]` field's VALUE is a key name like
     /// "my-prod-api-key", which may be shorter than a `length(min = 32)`
     /// rule intended for the resolved runtime value. The old
     /// `load_app_config_with_options` path validated the key name against
@@ -2780,7 +2780,7 @@ ids = ["default"]
             .expect("secret-field validator must be skipped on typed push");
     }
 
-    // ---------- Step 2: skip-on-equal (sha match) ----------
+    // ---------- skip-on-equal (sha match) ----------
 
     #[test]
     fn c4_skip_on_equal_exits_early_when_sha_matches() {
@@ -2801,7 +2801,7 @@ ids = ["default"]
             .expect("second push with same content must exit Ok via skip-on-equal");
     }
 
-    // ---------- §8.2 consent gate ----------
+    // ---------- 8.2 consent gate ----------
 
     #[test]
     fn c4_non_tty_without_yes_errors_on_consent() {
@@ -2883,12 +2883,12 @@ ids = ["default"]
             .expect("--no-diff --yes typed push must succeed");
     }
 
-    // ---------- §8.3 Spin Cloud Unsupported four-branch UX ----------
+    // ---------- 8.3 Spin Cloud Unsupported four-branch UX ----------
     //
     // The Spin adapter returns ReadConfigEntry::Unsupported when the
     // deploy command targets Fermyon Cloud ("spin deploy" / "spin cloud
     // deploy"). We use that to exercise the four-branch UX defined in
-    // spec §8.3. The manifest uses `deploy = "spin deploy"` to trigger
+    // spec 8.3. The manifest uses `deploy = "spin deploy"` to trigger
     // the Fermyon Cloud detection path inside `read_config_entry`.
 
     // --- PATH-mutation helpers (mirrors Cloudflare adapter test pattern) ---
@@ -2969,7 +2969,7 @@ ids = ["default"]
         tmp
     }
 
-    /// Manifest fixture for the §8.3 tests: Spin adapter with a Fermyon
+    /// Manifest fixture for the 8.3 tests: Spin adapter with a Fermyon
     /// Cloud deploy command so `read_config_entry` returns `Unsupported`.
     fn spin_cloud_manifest() -> String {
         r#"
@@ -3004,14 +3004,14 @@ ids = ["default"]
     }
 
     /// Non-TTY + no --yes + Spin Cloud (Unsupported) must error with the
-    /// §8.3 non-interactive message. CI has no TTY; no --yes is passed.
+    /// 8.3 non-interactive message. CI has no TTY; no --yes is passed.
     #[test]
     fn c4_unsupported_non_tty_without_yes_errors() {
         let _lock = manifest_guard().lock().expect("manifest guard");
         let (dir, manifest_path, _) = setup_project(&spin_cloud_manifest(), FIXTURE_APP_CONFIG);
         write_minimal_spin_toml(dir.path());
         let args = push_args(&manifest_path, "spin");
-        // No --yes, no TTY: must error with the §8.3 non-interactive error.
+        // No --yes, no TTY: must error with the 8.3 non-interactive error.
         let err = run_config_push_typed::<FixtureConfig>(&args)
             .expect_err("Unsupported + non-TTY + no --yes must error");
         assert!(
@@ -3021,7 +3021,7 @@ ids = ["default"]
     }
 
     /// `--dry-run` against Spin Cloud (Unsupported) must error immediately
-    /// with the §8.3 dry-run message — the flag's contract is "show the
+    /// with the 8.3 dry-run message — the flag's contract is "show the
     /// diff", which is structurally impossible without a remote read-back.
     #[test]
     fn c4_unsupported_dry_run_errors_with_spin_cloud_message() {
@@ -3070,7 +3070,7 @@ ids = ["default"]
         );
     }
 
-    // ---------- C4 Step 5/6: unified diff renderer ----------
+    // ---------- unified diff renderer ----------
 
     #[test]
     fn print_unified_diff_inline_emits_similar_format() {
@@ -3139,8 +3139,8 @@ ids = ["default"]
         use crate::config::print_unified_diff_to_writer;
         use serde_json::json;
         // An added subtree shows as a multi-line `+` block, NOT as N
-        // per-leaf `(added)` lines — this is the round-35 design that
-        // drove the switch to `similar` over hand-rolled walkers.
+        // per-leaf `(added)` lines — the switch to `similar` over
+        // hand-rolled walkers gives the multi-line block format.
         let remote = json!({ "greeting": "hello" });
         let local = json!({
             "greeting": "hello",
@@ -3173,7 +3173,7 @@ ids = ["default"]
         );
     }
 
-    // ---------- C4 Step 3.5: re-fetch (round-36/38) — file-system simulations ----------
+    // ---------- pre-write re-fetch — file-system simulations ----------
 
     /// Skip-on-equal: first push writes the envelope; second push reads
     /// same envelope and exits early. The axum adapter's re-fetch reads
@@ -3235,7 +3235,7 @@ ids = ["default"]
     // High — diff runs run_shared_checks (adapter manifest + collision)
     // -------------------------------------------------------------------
 
-    /// High — spec §3.3.2: `run_config_diff_typed` must run
+    /// High — spec 3.3.2: `run_config_diff_typed` must run
     /// `run_shared_checks` (which includes `validate_adapter_manifest`)
     /// before reaching the remote-read step.  A broken Spin
     /// `spin.toml` (no `[component.*]` sections) triggers
@@ -3295,7 +3295,7 @@ ids = ["default"]
     // Medium 1 — diff runs typed_secret_checks + adapter_typed_checks
     // -------------------------------------------------------------------
 
-    /// Medium 1 — spec §3.3.2: `run_config_diff_typed` must run the same
+    /// Medium 1 — spec 3.3.2: `run_config_diff_typed` must run the same
     /// structural checks as push, including `typed_secret_checks`.  A
     /// `#[secret]` field that is present but empty must be rejected even
     /// on a read-only diff operation.

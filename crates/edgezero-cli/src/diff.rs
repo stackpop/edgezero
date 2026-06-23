@@ -1,6 +1,6 @@
 //! Format renderers for `config diff`: unified (delegating to the
-//! C4 Step 5 helper), structured (human-readable per-path block list),
-//! and json (machine-readable spec §8.1.3 envelope with `local_sha256`,
+//! unified diff helper), structured (human-readable per-path block list),
+//! and json (machine-readable spec 8.1.3 envelope with `local_sha256`,
 //! `remote_sha256`, `added`, `removed`, `changed` fields).
 //!
 //! The orchestrator ([`crate::config::run_config_diff_typed`]) lives in
@@ -10,7 +10,7 @@
 //! `DiffKind` types, and the three renderer functions called by the
 //! dispatcher inside `run_config_diff_typed`.
 //!
-//! **Stream discipline (round-34):** diff CONTENT → stdout (`print!` for
+//! **Stream discipline:** diff CONTENT → stdout (`print!` for
 //! unified; `println!` for structured/json).  Informational MESSAGES →
 //! stderr via `eprintln!`.  NEVER `log::*` — prefixes corrupt `jq` consumers.
 
@@ -71,7 +71,7 @@ pub(crate) struct DiffEntry {
 ///   empty container is a real structural change that would otherwise produce
 ///   no leaf and be silently dropped.
 /// - Arrays (empty or non-empty): emit as a leaf. Element-wise array diffs
-///   are not needed; this matches C4 Step 5 behaviour and §8.1's examples.
+///   are not needed; this matches the unified diff behaviour and 8.1's examples.
 /// - Scalars (`bool`, `null`, `number`, `string`): emit as leaves.
 fn walk_leaves<F>(value: &serde_json::Value, prefix: String, emit: &mut F)
 where
@@ -157,10 +157,10 @@ pub(crate) fn collect_changes(
 /// Render the diff in `structured` format: one human-readable block per
 /// changed leaf (stdout via `println!`).
 ///
-/// Spec §8.1.2.
+/// Spec 8.1.2.
 #[expect(
     clippy::print_stdout,
-    reason = "stream discipline: diff CONTENT goes to stdout per round-34 spec"
+    reason = "stream discipline: diff CONTENT goes to stdout, never stderr"
 )]
 pub(crate) fn render_structured(
     remote_data: &serde_json::Value,
@@ -191,7 +191,7 @@ pub(crate) fn render_structured(
     }
 }
 
-/// Render the diff in `json` format: spec §8.1.3 machine-readable envelope
+/// Render the diff in `json` format: spec 8.1.3 machine-readable envelope
 /// with `local_sha256`, `remote_sha256`, `added`, `removed`, `changed`
 /// (stdout via `println!`).
 ///
@@ -202,10 +202,10 @@ pub(crate) fn render_structured(
 ///
 /// All maps use `BTreeMap` so output is deterministic across runs.
 ///
-/// Spec §8.1.3.
+/// Spec 8.1.3.
 #[expect(
     clippy::print_stdout,
-    reason = "stream discipline: diff CONTENT goes to stdout per round-34 spec"
+    reason = "stream discipline: diff CONTENT goes to stdout, never stderr"
 )]
 pub(crate) fn render_json(
     remote_data: &serde_json::Value,
@@ -238,7 +238,7 @@ pub(crate) fn render_json(
             }
         }
     }
-    // Spec §8.1.3 envelope shape.
+    // Spec 8.1.3 envelope shape.
     let envelope = serde_json::json!({
         "local_sha256": local_sha,
         "remote_sha256": remote_sha,
@@ -407,7 +407,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // render_structured format dispatch (§8.1.2)
+    // render_structured format dispatch (8.1.2)
     // ------------------------------------------------------------------
 
     /// Asserts structured output path-grouped blocks (3-leaf fixture).
@@ -440,10 +440,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // render_json envelope shape (§8.1.3)
+    // render_json envelope shape (8.1.3)
     // ------------------------------------------------------------------
 
-    /// Verify the JSON envelope has the spec §8.1.3 top-level fields:
+    /// Verify the JSON envelope has the spec 8.1.3 top-level fields:
     /// `local_sha256`, `remote_sha256`, `added`, `removed`, `changed`.
     #[test]
     fn json_envelope_has_spec_fields() {

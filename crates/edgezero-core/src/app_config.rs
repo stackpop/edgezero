@@ -68,7 +68,7 @@ pub enum SecretKind {
     StoreRef,
 }
 
-/// Marker trait emitted by `#[derive(AppConfig)]`. The §10.2.1
+/// Marker trait emitted by `#[derive(AppConfig)]`. The 10.2.1
 /// Pattern 4 CI gate detects nested AppConfig-rooted structs via
 /// this marker. The trait is intentionally open (NOT sealed) so
 /// the derive macro can implement it from downstream crates.
@@ -192,7 +192,7 @@ impl EnvLookup {
 /// Validate `cfg` but SKIP per-field validators on `#[secret]` /
 /// `#[secret(store_ref = "...")]` fields. Used by `config push` /
 /// `config diff` paths where those fields hold operator-typed KEY
-/// NAMES, not the resolved secret values. See spec §3.3.8.
+/// NAMES, not the resolved secret values. See spec 3.3.8.
 ///
 /// `#[secret(store_ref)]` fields are kept (their value is a store
 /// id, identical at push and runtime).
@@ -210,8 +210,8 @@ pub fn validate_excluding_secrets<C: validator::Validate + AppConfigMeta>(
     };
     // validator 0.20 exposes errors_mut() -> &mut HashMap<Cow<'static, str>, ValidationErrorsKind>.
     // `bag.remove(field.name)` works because `field.name` is `&'static str`
-    // and `Cow<'static, str>: Borrow<str>` (round-36 H-1 reviewer noted
-    // the earlier comment cited the wrong key type — fixed).
+    // and `Cow<'static, str>: Borrow<str>` (the earlier comment cited the
+    // wrong key type — this is the corrected form).
     let bag = errors.errors_mut();
     for field in C::SECRET_FIELDS {
         if matches!(field.kind, SecretKind::StoreRef) {
@@ -290,7 +290,7 @@ pub fn load_app_config_raw(path: &Path, app_name: &str) -> Result<Value, AppConf
 
 /// Like [`load_app_config`] but DOES NOT call `Validate::validate`.
 /// Used by `config push` / `config diff` paths that route through
-/// `validate_excluding_secrets` instead. See spec §3.3.8.
+/// `validate_excluding_secrets` instead. See spec 3.3.8.
 ///
 /// # Errors
 /// See [`AppConfigError`].
@@ -977,7 +977,7 @@ greeting = "hello"
 
     #[test]
     fn non_finite_rejection_does_not_invoke_canonicaliser() {
-        // Spec §12.1 (line 6408): the canonicaliser MUST NOT run on
+        // Spec 12.1 (line 6408): the canonicaliser MUST NOT run on
         // non-finite-rejected input. Pins the structural guarantee that
         // the loader errors BEFORE any code path could canonicalise —
         // catching the regression where someone adds a "best-effort
@@ -1004,7 +1004,7 @@ greeting = "hello"
 
     #[test]
     fn rejects_non_finite_float_in_toml() {
-        // Spec §12.1 family 1: nan, inf, -inf via TOML literal.
+        // Spec 12.1 family 1: nan, inf, -inf via TOML literal.
         // Each rejection produces InvalidValue with field_path="service.ratio"
         // and a message substring identifying the offending value.
         let dir = tempfile::tempdir().unwrap();
@@ -1039,7 +1039,7 @@ greeting = "hello"
 
     #[test]
     fn rejects_non_finite_float_in_env_overlay() {
-        // Spec §12.1 family 2: nan, inf, -inf via env overlay.
+        // Spec 12.1 family 2: nan, inf, -inf via env overlay.
         // TOML has a finite value; env overlay pulls in the bad value
         // and the overlay's is_finite() check rejects it with
         // InvalidValue carrying the same field_path + message contract.
@@ -1072,7 +1072,7 @@ greeting = "hello"
 
     #[test]
     fn finite_env_overlay_succeeds() {
-        // Spec §12.1 family 3: TOML 1.5 + env override 2.5 both finite => Ok.
+        // Spec 12.1 family 3: TOML 1.5 + env override 2.5 both finite => Ok.
         // The rule rejects non-finite values, not any specific magnitude.
         let path = Path::new("fixture.toml");
         let prefix = app_name_prefix("test");
@@ -1102,7 +1102,7 @@ greeting = "hello"
         struct Fixture {
             value: i32,
         }
-        // Hand-rolled AppConfigMeta — see round-39 L-1 note above.
+        // Hand-rolled AppConfigMeta — matches the same shape as the rest of this test.
         impl AppConfigMeta for Fixture {
             const SECRET_FIELDS: &'static [SecretField] = &[];
         }

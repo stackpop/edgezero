@@ -59,7 +59,7 @@ impl RequestContext {
     }
 
     /// Borrow the default config-store binding (handle + key). See
-    /// spec §5.2.1.
+    /// spec 5.2.1.
     #[must_use]
     #[inline]
     pub fn config_store_default_binding(&self) -> Option<&ConfigStoreBinding> {

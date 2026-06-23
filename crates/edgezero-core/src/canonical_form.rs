@@ -1,7 +1,7 @@
 //! Canonical-form SHA-256 over a [`serde_json::Value`] tree.
 //!
 //! Implements the v1 rules from
-//! `docs/superpowers/specs/2026-06-16-blob-app-config.md` §4.2:
+//! `docs/superpowers/specs/2026-06-16-blob-app-config.md` 4.2:
 //!
 //! - JSON with no insignificant whitespace.
 //! - Object keys sorted by UTF-8 byte order.
@@ -35,7 +35,7 @@ pub fn canonical_data_sha256(data: &Value) -> String {
 #[cfg(test)]
 pub(crate) mod test_hooks {
     //! Test-only per-thread invocation counter so other modules' tests
-    //! can pin the spec §12.1 "canonicaliser MUST NOT run on this input"
+    //! can pin the spec 12.1 "canonicaliser MUST NOT run on this input"
     //! property for non-finite-rejected fixtures. Thread-local (not a
     //! global atomic) so parallel test execution does not race — each
     //! test sees only the calls made on its own thread.
@@ -93,7 +93,7 @@ fn write_number(out: &mut String, n: &serde_json::Number) {
     } else if let Some(uint_val) = n.as_u64() {
         write!(out, "{uint_val}").unwrap_or_default();
     } else if let Some(float_val) = n.as_f64() {
-        // Non-finite floats are loader-rejected per §4.2 round-15 B-2.
+        // Non-finite floats are loader-rejected per 4.2.
         // If one reaches here, it's a programmer error: serialising NaN
         // would emit `null` via serde_json's default, which would
         // collide with real Option::None in the SHA. Panic loudly.
@@ -112,7 +112,7 @@ fn write_number(out: &mut String, n: &serde_json::Number) {
 
 fn write_string(out: &mut String, raw: &str) {
     // Escape table byte-identical to serde_json::to_string(raw)'s
-    // default. Pinned by spec §4.2 — DO NOT change without bumping
+    // default. Pinned by spec 4.2 — DO NOT change without bumping
     // BlobEnvelope::version.
     out.push('"');
     for ch in raw.chars() {
@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn integer_and_float_with_same_text_hash_differently() {
-        // §4.2 type-identity rule. 1500 vs 1500.0.
+        // 4.2 type-identity rule. 1500 vs 1500.0.
         let val_int = json!({ "x": 1500_i64 });
         let val_flt = json!({ "x": 1500.0_f64 });
         assert_ne!(
@@ -183,7 +183,7 @@ mod tests {
         );
     }
 
-    // Note: the loader (Task A5) rejects non-finite floats before they
+    // Note: the loader rejects non-finite floats before they
     // reach this walker. The `assert!(f.is_finite(), ...)` in
     // `write_number` is a programmer-error guard; the test for the
     // loader rejection lives in `app_config::tests`.

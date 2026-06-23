@@ -33,13 +33,13 @@ push and validate commands:
 
 ```sh
 # Validate the manifest + typed config (skips secret-field rules at
-# push time; runtime validates the resolved secret values per spec §3.3.8):
+# push time; runtime validates the resolved secret values per spec 3.3.8):
 cargo run -p {{proj_cli}} -- config validate
 
 # Push `{{name}}.toml` as a single blob envelope into the adapter's
 # config store. The blob carries every field verbatim -- including
 # `#[secret]` fields, whose value at rest is the key NAME (Model A
-# per spec §3.3); the runtime extractor swaps each name for the
+# per spec 3.3); the runtime extractor swaps each name for the
 # resolved secret value at request time.
 cargo run -p {{proj_cli}} -- config push --adapter <axum|cloudflare|fastly|spin>
 

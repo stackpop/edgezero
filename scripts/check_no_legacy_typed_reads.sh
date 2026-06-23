@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# check_no_legacy_typed_reads.sh — CI gate per spec §10.2.1
+# check_no_legacy_typed_reads.sh — CI gate per spec 10.2.1
 #
 # Refuses any usage shape that indicates a legacy per-leaf typed-config read
 # (the pattern where each handler calls config_store_default()?.get(...) or
@@ -7,7 +7,7 @@
 # AppConfig<C> blob-model extractor).
 #
 # Also refuses nested AppConfig extractors (AppConfig<...AppConfig<...>...>),
-# which are illegal per spec §3.3.
+# which are illegal per spec 3.3.
 #
 # Exit 0 — clean tree.
 # Exit 1 — at least one violation found; prints <file>:<line>: violation: <pattern>.
@@ -48,7 +48,7 @@ done < <(
 )
 
 # ------------------------------------------------------------------
-# Pattern 3: nested AppConfig extractor (illegal per spec §3.3)
+# Pattern 3: nested AppConfig extractor (illegal per spec 3.3)
 #   AppConfig<...AppConfig<...>...>
 #
 # Excludes the syn-based gate binary that legitimately references
@@ -57,7 +57,7 @@ done < <(
 # the grep here is the cheap pre-filter for everyone else.
 # ------------------------------------------------------------------
 while IFS= read -r hit; do
-    printf '%s: violation: nested AppConfig extractor — AppConfig<AppConfig<…>> is illegal per spec §3.3\n' "${hit}"
+    printf '%s: violation: nested AppConfig extractor — AppConfig<AppConfig<…>> is illegal per spec 3.3\n' "${hit}"
     VIOLATIONS=$((VIOLATIONS + 1))
 done < <(
     grep -rn --include="*.rs" \

@@ -148,6 +148,13 @@ mod tests {
         cases.compile_fail("tests/ui/key_in_named_store_missing_sibling.rs");
         cases.compile_fail("tests/ui/key_in_named_store_sibling_not_store_ref.rs");
         cases.compile_fail("tests/ui/key_in_named_store_sibling_not_string.rs");
+        // Spec 4.2 + 12.1: the serde-shape bans apply to EVERY
+        // field, not just `#[secret]`-annotated ones. These three
+        // fixtures pin the universal coverage the secret_*.rs
+        // glob alone doesn't exercise.
+        cases.compile_fail("tests/ui/non_secret_with_serde_flatten.rs");
+        cases.compile_fail("tests/ui/non_secret_with_serde_skip_serializing.rs");
+        cases.compile_fail("tests/ui/non_secret_with_serde_skip_serializing_if.rs");
         cases.pass("tests/ui/secret_with_store_ref_named.rs");
     }
 }

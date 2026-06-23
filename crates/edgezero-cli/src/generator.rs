@@ -1314,8 +1314,7 @@ mod tests {
             );
         }
 
-        // Plan task 8.2 step 2 explicit warning: use
-        // `{{proj_core_mod}}` for the core crate's *Rust module*
+        // Use `{{proj_core_mod}}` for the core crate's *Rust module*
         // name, not the package name with a `_core` suffix —
         // `demo-app_core` (mixing `-` and `_`) is invalid Rust.
         assert!(

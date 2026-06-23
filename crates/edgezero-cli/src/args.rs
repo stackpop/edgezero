@@ -58,7 +58,7 @@ pub enum ConfigCmd {
     Diff(ConfigCmdStubArgs),
     /// Push the typed `<name>.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
-    /// (per spec §3.3 Model A — `#[secret]` fields store the key NAME,
+    /// (per spec 3.3 Model A — `#[secret]` fields store the key NAME,
     /// resolved at runtime); a SHA over the canonical-form data gates
     /// drift detection.
     /// (Bundled `edgezero` stub — see after-help for the typed CLI.)
@@ -71,10 +71,10 @@ pub enum ConfigCmd {
 
 /// Hidden catch-all argument sink for the bundled stub variants of
 /// `config push` and `config diff`.  Absorbs any flags the user types
-/// so clap does not error before we can print the pointer text (§3.2.2).
+/// so clap does not error before we can print the pointer text (3.2.2).
 #[derive(clap::Args, Debug)]
 pub struct ConfigCmdStubArgs {
-    /// Hidden catch-all sink (see spec §3.2.2).
+    /// Hidden catch-all sink (see spec 3.2.2).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     pub trailing: Vec<String>,
 }
@@ -209,7 +209,7 @@ pub struct ServeArgs {
 #[derive(clap::ValueEnum, Clone, Debug, Default, PartialEq)]
 pub enum DiffFormat {
     /// Machine-readable JSON object with `local_sha256`, `remote_sha256`,
-    /// `added`, `removed`, `changed` fields (per spec §8.1.3).
+    /// `added`, `removed`, `changed` fields (per spec 8.1.3).
     Json,
     /// Machine-readable structured representation (key/old/new triples).
     Structured,
@@ -240,7 +240,7 @@ pub struct ConfigDiffArgs {
     /// Output format for the diff.
     #[arg(long, default_value = "unified")]
     pub format: DiffFormat,
-    /// Override the default key — §5.4.
+    /// Override the default key — 5.4.
     #[arg(long)]
     pub key: Option<String>,
     /// Diff against the adapter's local-emulator state instead of the
@@ -308,7 +308,7 @@ pub struct ConfigPushArgs {
     /// Print the would-be operations without performing them.
     #[arg(long)]
     pub dry_run: bool,
-    /// Override the default key — §5.4.
+    /// Override the default key — 5.4.
     #[arg(long)]
     pub key: Option<String>,
     /// Push to the adapter's local-emulator state instead of the live
@@ -471,10 +471,9 @@ mod tests {
 
     #[test]
     fn config_push_args_default_manifest_matches_clap_default() {
-        // round-34 M-2: manual Default must stay in sync with every field.
-        // New fields (key, no_diff, yes) were added in C3; if the impl were
-        // to miss any of them the struct would fail to compile due to
-        // #[non_exhaustive] preventing struct-literal construction outside
+        // Manual Default must stay in sync with every field.
+        // If the impl were to miss any of them the struct would fail to compile
+        // due to #[non_exhaustive] preventing struct-literal construction outside
         // this crate, and this test confirms Default values are sensible.
         let args = ConfigPushArgs::default();
         assert_eq!(args.manifest, PathBuf::from("edgezero.toml"));
@@ -666,7 +665,7 @@ mod tests {
             .expect_err("`provision` without --adapter must error");
     }
 
-    // ── config push / diff stub tests (§12.8 + §12.11) ──────────────────
+    // ── config push / diff stub tests (12.8 + 12.11) ──────────────────
 
     /// Bundled binary: bare `config push` parses to the stub variant.
     /// The catch-all absorbs nothing; trailing is empty.
@@ -708,7 +707,7 @@ mod tests {
         assert!(matches!(args.cmd, Command::Config(ConfigCmd::Diff(_))));
     }
 
-    /// §12.11 — `ConfigPushArgs` new flags: `--yes` / `-y` / `--no-diff`
+    /// 12.11 — `ConfigPushArgs` new flags: `--yes` / `-y` / `--no-diff`
     /// / `--dry-run` parse correctly on the *downstream* typed struct.
     /// (The bundled binary uses `ConfigCmdStubArgs`; these tests cover the
     /// struct fields directly via `Default` + mutation, since clap can only
@@ -729,9 +728,9 @@ mod tests {
         assert!(ConfigPushArgs::default().key.is_none());
     }
 
-    // ── ConfigDiffArgs parser-roundtrip tests (§12.11) ──────────────────
+    // ── ConfigDiffArgs parser-roundtrip tests (12.11) ──────────────────
 
-    /// Default `ConfigDiffArgs` has correct zero-values (round-34 M-2).
+    /// Default `ConfigDiffArgs` has correct zero-values.
     /// KEEP as struct-literal sanity check — this is a Default-impl pin,
     /// NOT a clap parse test.
     #[test]

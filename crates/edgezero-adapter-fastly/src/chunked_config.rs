@@ -5,7 +5,7 @@
 //! module splits the envelope into content-addressed chunk entries plus a
 //! root pointer entry that is written LAST.
 //!
-//! The pointer JSON shape (spec §9.2):
+//! The pointer JSON shape (spec 9.2):
 //! ```json
 //! {
 //!   "edgezero_kind": "fastly_config_chunks",

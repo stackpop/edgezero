@@ -314,14 +314,14 @@ impl Adapter for SpinCliAdapter {
         // 2. Deploy command targets Fermyon Cloud → `Unsupported`.
         //    Fermyon Cloud's `spin cloud key-value list` enumerates
         //    STORES, not keys; there is no stable per-key get CLI in
-        //    v1 (§8.3 / §9.4 of the spec). NO shell-out.
+        //    v1 (8.3 / 9.4 of the spec). NO shell-out.
         // 3. `runtime-config.toml` declares a non-`spin` backend
         //    (Redis / AzureCosmos / Unknown) → error naming the backend
         //    and pointing at its native CLI, matching the writer at
         //    `cli.rs:639-650`.
         // 4. Default / `type = "spin"` → SQLite-direct read.
         //
-        // Round-28 H-2: errors from `runtime_config::read` and from
+        // Errors from `runtime_config::read` and from
         // `verify_label_declared` are PROPAGATED (not swallowed with
         // `.ok()`). Silently falling through on a malformed
         // runtime-config would let `config diff` report a result on a
@@ -358,8 +358,8 @@ impl Adapter for SpinCliAdapter {
             ));
         }
 
-        // Branches 3 + 4: parse runtime-config, propagating parse errors
-        // (round-28 H-2), then dispatch on backend type.
+        // Branches 3 + 4: parse runtime-config, propagating parse errors,
+        // then dispatch on backend type.
         let parsed = runtime_config::read(&runtime_config_path)?;
         verify_label_declared(platform, &parsed, &runtime_config_path)?;
         let backend = parsed.key_value_stores.get(platform);
@@ -433,7 +433,7 @@ impl Adapter for SpinCliAdapter {
         let runtime_config_dir = runtime_config_path.parent().unwrap_or(spin_manifest_dir);
         let platform = store.platform.as_str();
 
-        // Parse runtime-config (propagating errors per round-28 H-2).
+        // Parse runtime-config (propagating errors).
         let parsed = runtime_config::read(&runtime_config_path)?;
         verify_label_declared(platform, &parsed, &runtime_config_path)?;
 
@@ -1334,11 +1334,11 @@ mod tests {
         );
     }
 
-    // §12.16 — named-store secret adapter validation
+    // 12.16 — named-store secret adapter validation
 
     #[test]
     fn collision_error_names_both_field_names_and_lowercased_variable() {
-        // §12.16 case (b): KeyInDefault and KeyInNamedStore that
+        // 12.16 case (b): KeyInDefault and KeyInNamedStore that
         // collide on the lowercased Spin variable.
         let entries = [
             TypedSecretEntry::new("default", "one", "Demo_Token"),
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_spin_variable_name_with_hyphen() {
-        // §12.16 case (a): KeyInNamedStore value contains a hyphen,
+        // 12.16 case (a): KeyInNamedStore value contains a hyphen,
         // which is not a valid Spin variable name.
         let entries = [TypedSecretEntry::new("vault", "api_token", "demo-token")];
         let err = SpinCliAdapter.validate_typed_secrets(&entries).unwrap_err();
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[test]
     fn non_spin_adapter_is_exempt_from_collision_check() {
-        // §12.16 case (c): same collision fixture against a manifest
+        // 12.16 case (c): same collision fixture against a manifest
         // declaring only [adapters.axum] — covered by run_adapter_
         // typed_checks NOT calling SpinCliAdapter at all. This is more
         // naturally a CLI-level integration test, but the adapter
@@ -2508,7 +2508,7 @@ mod tests {
         );
     }
 
-    // Round-28 H-2: malformed runtime-config.toml propagates as an error
+    // Malformed runtime-config.toml propagates as an error
     // (not silently swallowed with .ok()).
     #[test]
     fn read_config_entry_propagates_malformed_runtime_config_error() {
@@ -2601,7 +2601,7 @@ mod tests {
         );
     }
 
-    // Round-29 H-1: SQLite path anchors against runtime-config dir, not
+    // SQLite path anchors against runtime-config dir, not
     // spin manifest dir, for relative explicit paths.
     #[test]
     fn read_config_entry_sqlite_path_anchors_against_runtime_config_dir() {
@@ -2645,7 +2645,7 @@ mod tests {
         assert_eq!(value, "val1", "value from cfg-dir-anchored db");
     }
 
-    // Round-29 H-1: default path (no explicit path) falls back to spin manifest dir.
+    // Default path (no explicit path) falls back to spin manifest dir.
     #[test]
     fn read_config_entry_sqlite_default_path_anchors_against_spin_manifest_dir() {
         let dir = tempdir().expect("tempdir");
@@ -2686,7 +2686,7 @@ mod tests {
         assert_eq!(value, "val2", "value from spin-manifest-dir default db");
     }
 
-    // Round-29 H-1: absolute path is honoured verbatim.
+    // Absolute path is honoured verbatim.
     #[test]
     fn read_config_entry_sqlite_absolute_path_honoured() {
         let dir = tempdir().expect("tempdir");

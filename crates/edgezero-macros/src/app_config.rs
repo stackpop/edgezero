@@ -286,7 +286,7 @@ fn is_scalar_string_type(ty: &Type) -> bool {
 /// Walk ALL fields of an `AppConfig`-derived struct and reject
 /// `#[serde(skip_serializing)]`, `#[serde(skip_serializing_if = "...")]`,
 /// and `#[serde(flatten)]`. These attributes desync the canonical-form
-/// rules (§4.2) from the serde JSON shape regardless of whether the
+/// rules (4.2) from the serde JSON shape regardless of whether the
 /// field is annotated `#[secret]`.
 fn enforce_no_disallowed_serde_attrs_on_all_fields(
     fields: &Punctuated<Field, syn::Token![,]>,
@@ -316,7 +316,7 @@ fn enforce_no_disallowed_serde_attrs_on_all_fields(
                     format!(
                         "`#[serde({name})]` is not allowed on fields of an \
                          `AppConfig`-derived struct (it would desync the \
-                         canonical-form rules in §4.2 from the serde JSON shape). \
+                         canonical-form rules in 4.2 from the serde JSON shape). \
                          If you need a flat layout, define it explicitly.",
                     ),
                 ));

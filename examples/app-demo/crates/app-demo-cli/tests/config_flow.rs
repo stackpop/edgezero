@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// emits: `greeting` (plain), `feature.new_checkout` (nested),
 /// `service.timeout_ms` (nested numeric), `api_token` (`#[secret]`,
 /// the value at rest is the secret-store KEY NAME — Model A per
-/// spec §3.3), `vault` (`#[secret(store_ref)]`, the value at rest
+/// spec 3.3), `vault` (`#[secret(store_ref)]`, the value at rest
 /// is the secret-store ID; the runtime extractor's `secret_walk`
 /// reads both verbatim from the blob and resolves `api_token`
 /// against the secret store).
@@ -136,7 +136,7 @@ fn config_validate_strict_passes_against_app_demo_config() {
 #[test]
 fn config_push_axum_writes_local_config_json_with_secret_key_names() {
     // The typed push writes a blob envelope under the logical store id
-    // key. Per spec §3.3 (Model A) the envelope's `data` carries every
+    // key. Per spec 3.3 (Model A) the envelope's `data` carries every
     // field VERBATIM — including `#[secret]` (`api_token`, the
     // secret-store key NAME) and `#[secret(store_ref)]` (`vault`, the
     // secret-store id). The runtime `secret_walk` reads those names
@@ -328,7 +328,7 @@ fn config_push_spin_writes_sqlite_round_tripped_via_rusqlite() {
         "boolean in envelope.data: {data}"
     );
 
-    // Model A (spec §3.3): the secret-bearing fields persist their
+    // Model A (spec 3.3): the secret-bearing fields persist their
     // KEY NAMES at rest. `secret_walk` resolves them at request time.
     assert_eq!(
         data["api_token"], "demo_api_token",
