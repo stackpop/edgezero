@@ -296,16 +296,21 @@ TOML
       # `demo_api_token` for the smoke's lifetime. The caller
       # backs spin.toml up so cleanup restores the original.
       local spin_toml="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-      # Insert demo_api_token into the application [variables] block.
-      # Use awk to add the new line right after `api_token = ...`.
+      # Insert demo_api_token into the application [variables] block,
+      # and downgrade api_token from `required = true` to a default
+      # so spin up can start without the obsolete variable being
+      # satisfied (the AppDemoConfig field name doesn't match the
+      # blob's secret-key NAME, which is what the smoke actually
+      # exercises). Mirror the same edits in the component variables
+      # map.
       awk '
-        /^api_token = / && !patched_vars {
-          print
+        /^api_token = \{ required = true, secret = true \}$/ && !patched_var_api {
+          print "api_token = { default = \"\", secret = true }"
           print "demo_api_token = { required = true, secret = true }"
-          patched_vars = 1
+          patched_var_api = 1
           next
         }
-        /^api_token = "\{\{ api_token \}\}"/ && !patched_comp {
+        /^api_token = "\{\{ api_token \}\}"$/ && !patched_comp {
           print
           print "demo_api_token = \"{{ demo_api_token }}\""
           patched_comp = 1
@@ -350,16 +355,30 @@ boot_runtime() {
         cargo run --quiet -p app-demo-cli -- serve --adapter axum 2>&1) &
       ;;
     cloudflare)
+      # wrangler dev does not inherit the shell's process env into
+      # the worker; values must come through .dev.vars OR
+      # wrangler.toml. Re-seed .dev.vars at boot so both the secret
+      # AND any per-row EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
+      # override the shell exported are picked up by env_config_from_worker.
+      local cf_dev_vars="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      {
+        printf 'demo_api_token="resolved-token"\n'
+        if [ -n "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}" ]; then
+          printf 'EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="%s"\n' \
+            "$EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+        fi
+      } > "$cf_dev_vars"
       (cd "$DEMO_DIR/crates/app-demo-adapter-cloudflare" && \
         wrangler dev --local --port "$PORT" 2>&1) &
       ;;
     fastly)
       # DEMO_API_TOKEN_SECRET is the env var viceroy reads to
       # populate the `demo_api_token` secret-store entry seeded
-      # by seed_secret_for_adapter.
+      # by seed_secret_for_adapter. viceroy 0.17+ uses `serve`
+      # for the long-running HTTP path (`run` was renamed).
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
         DEMO_API_TOKEN_SECRET=resolved-token \
-        viceroy run -C fastly.toml --addr "127.0.0.1:${PORT}" \
+        viceroy serve -C fastly.toml --addr "127.0.0.1:${PORT}" \
           target/wasm32-wasip1/debug/app_demo_adapter_fastly.wasm 2>&1) &
       ;;
     spin)

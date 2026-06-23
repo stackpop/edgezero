@@ -297,10 +297,12 @@ impl Adapter for CloudflareCliAdapter {
         _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        //: read namespace id from wrangler.toml (matched by
+        // Read namespace id from wrangler.toml (matched by
         // `binding = <platform>`), then `wrangler kv bulk put
-        // <tempfile.json> --namespace-id=<id> --remote`. Keys in
-        // dotted form — the CLI already flattened them.
+        // <tempfile.json> --namespace-id=<id> --remote`. The
+        // CLI hands this writer one logical (root_key, envelope_json)
+        // entry; the bulk-put still works because it's one upsert
+        // per entry, and the one-entry case is degenerate.
         //
         // **--remote** is mandatory for the prod-push path:
         // wrangler v4 defaults KV bulk-put to LOCAL storage when
@@ -833,8 +835,10 @@ fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), Strin
 }
 
 /// Render the entries as the `[{"key": "...", "value": "..."}, …]`
-/// JSON wrangler expects for `kv bulk put`. Keys arrive pre-flattened
-/// from the CLI (dotted form,); cloudflare passes them through.
+/// JSON wrangler expects for `kv bulk put`. Under the blob model the
+/// CLI hands this writer one logical `(root_key, envelope_json)` entry;
+/// Cloudflare passes the value through unchanged (the envelope is an
+/// opaque string from the platform's perspective).
 fn bulk_payload(entries: &[(String, String)]) -> Result<String, String> {
     let payload: Vec<serde_json::Value> = entries
         .iter()
