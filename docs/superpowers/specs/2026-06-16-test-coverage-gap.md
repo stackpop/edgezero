@@ -6,7 +6,7 @@
 > checkbox (`- [ ]`) syntax for tracking.
 
 **Date:** 2026-06-16
-**Status:** v1 — Draft, revised through reviewer round 7 (deep review)
+**Status:** v1 — Draft, revised through round 8 (Tier-2 backlog closed)
 **Author:** (TBD)
 **Branch under assessment:** `feature/extensible-cli`
 
@@ -122,17 +122,16 @@ module at all**.
 | `run_native_cli` error paths | `crates/edgezero-adapter/src/cli_support.rs:82-99` | Happy path is covered; the `ErrorKind::NotFound` → install-hint branch (`:84-92`) and the non-zero-exit branch (`:93-98`) are not. |
 | Decompression error path     | `crates/edgezero-core/src/compression.rs:15-60`    | `decode_gzip_stream` / `decode_brotli_stream` test only valid input; malformed input → `Err` is unexercised.                       |
 
-### Tier 2 backlog — verify-then-test (lower confidence)
+### Tier 2 backlog — verify-then-test (RESOLVED in this PR)
 
-These are plausible depth gaps surfaced during assessment but **not yet
-verified** to the point of writing assertions. Each task is: confirm the
-code path exists as described, then add a test mirroring the module's
-existing idiom. Do **not** write a test against an assumed API.
+These were plausible depth gaps surfaced during assessment but not yet
+verified to the point of writing assertions. Both have now been verified
+against the code and closed:
 
-| Candidate gap                   | File                                                  | Verify first                                                                                                                                                                                                                                                                                                |
-| ------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Adapter` trait default methods | `crates/edgezero-adapter/src/registry.rs:211,375,401` | `merged_id_kinds` (default `&[]`), `validate_app_config_keys`/`validate_typed_secrets` (default `Ok`) — needs a minimal `Adapter` test-double overriding the required `execute` **and** `name` (both are required; reuse the existing `TestAdapter` at `registry.rs:459` rather than writing a new double). |
-| `app!` macro error handling     | `crates/edgezero-macros/src/app.rs`                   | Only 2 codegen tests; missing-file / invalid-TOML diagnostics may be untested — confirm and add a trybuild compile-fail fixture if so.                                                                                                                                                                      |
+| Candidate gap                   | File                                                  | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Adapter` trait default methods | `crates/edgezero-adapter/src/registry.rs`             | **Closed.** Verified the no-op defaults (`merged_id_kinds`/`single_store_kinds` → `&[]`; `validate_adapter_manifest`/`validate_app_config_keys`/`validate_typed_secrets` → `Ok`) and covered them via the existing `FIRST` `TestAdapter` (inherits all defaults) — test `default_validation_and_kind_methods_are_noops`.                                                                                                                       |
+| `app!` macro error handling     | `crates/edgezero-macros/src/app.rs`                   | **Closed (partial, by design).** The three `expand_app` file-level diagnostics (read/parse/validate) embed the **absolute** manifest path in their messages, so a trybuild `.stderr` fixture would be machine-dependent and flaky — deliberately NOT added. The cleanly-testable seam is `build_route_tokens`, which had no direct test; covered its error propagation via `build_route_tokens_propagates_invalid_handler_path` (toml-built `Manifest` with a bad handler). |
 
 ### Tier 3 — runtime-bound platform code (out of host-unit-test scope)
 
@@ -467,12 +466,17 @@ git add crates/edgezero-core/src/compression.rs
 git commit -m "test(core): cover gzip and brotli decode error paths"
 ```
 
-### Task 5: Tier-2 backlog (verify-then-test)
+### Task 5: Tier-2 backlog (verify-then-test) — DONE
 
-For each row in §4 "Tier 2 backlog": first read the cited code to
-confirm the path exists as described; if it does, add one test mirroring
-the module's existing idiom and commit; if it does not, note it in the
-v2 changelog and drop it. **Do not** write a test against an assumed API.
+Both backlog rows were verified against the code and closed in this PR
+(see §4 "Tier 2 backlog" for the resolutions):
+
+- **`Adapter` trait defaults** → `default_validation_and_kind_methods_are_noops`
+  in `crates/edgezero-adapter/src/registry.rs`.
+- **`app!` macro error handling** → `build_route_tokens_propagates_invalid_handler_path`
+  in `crates/edgezero-macros/src/app.rs`. The `expand_app` file-level
+  diagnostics were verified untested but deliberately left uncovered (their
+  messages embed absolute paths, making a trybuild fixture flaky).
 
 ---
 
@@ -521,16 +525,16 @@ above (not the already-covered conversions).
 
 ## 9. Acceptance gate
 
-- [ ] Tasks 1, 1b, 2–4 land; all five project CI gates (CLAUDE.md) are green:
+- [x] Tasks 1, 1b, 2–4 land; all five project CI gates (CLAUDE.md) are green:
   1. `cargo fmt --all -- --check`
   2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   3. `cargo test --workspace --all-targets`
   4. `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
   5. `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`
-- [ ] Neither `handler.rs` nor `check_no_nested_app_config.rs` appears in
+- [x] Neither `handler.rs` nor `check_no_nested_app_config.rs` appears in
       the `cfg(test)=0` host-testable
       file list.
-- [ ] Tier-2 backlog (Task 5) rows are each either closed with a test or
+- [x] Tier-2 backlog (Task 5) rows are each either closed with a test or
       recorded as "not a gap" in the v2 changelog.
 - [ ] Tier 3 disposition (Q1) is decided and recorded.
 
@@ -638,3 +642,12 @@ not `wasm32`-gated; §2/§4 reworded. (4) §1 config-push cited nonexistent
 (5) `Body` does impl `Debug` (`body.rs:160`); Task 1's `match` kept as
 style, false rationale removed. Prettier passes; §9 matches the five
 CLAUDE.md gates.
+
+**Tier-2 backlog closed (round 8):** Task 5's two verify-then-test rows
+were resolved in-PR. (1) `Adapter` trait defaults —
+`default_validation_and_kind_methods_are_noops` exercises the no-op
+defaults via the existing `FIRST` `TestAdapter`. (2) `app!` macro —
+verified the `expand_app` file-level diagnostics are untested but flaky
+to trybuild (absolute paths in messages), so covered the cleanly-testable
+seam instead: `build_route_tokens_propagates_invalid_handler_path`. Both
+pass; full gate suite green.

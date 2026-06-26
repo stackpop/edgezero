@@ -251,7 +251,7 @@ fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> Tok
 
 #[cfg(test)]
 mod tests {
-    use super::parse_handler_path;
+    use super::{build_route_tokens, parse_handler_path, Manifest};
 
     #[test]
     fn parse_handler_path_accepts_absolute_crate_path() {
@@ -271,6 +271,31 @@ mod tests {
         assert!(
             err.contains("not a valid path!"),
             "error message should echo the offending input, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_route_tokens_propagates_invalid_handler_path() {
+        // A manifest that parses cleanly but declares a handler whose
+        // Rust path is invalid: `build_route_tokens` must surface the
+        // `parse_handler_path` error rather than panic or silently skip.
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/"
+methods = ["GET"]
+handler = "1bad::handler"
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let err = build_route_tokens(&manifest).expect_err("invalid handler must error");
+        assert!(
+            err.contains("invalid handler path"),
+            "error should propagate from parse_handler_path, got: {err}"
         );
     }
 }

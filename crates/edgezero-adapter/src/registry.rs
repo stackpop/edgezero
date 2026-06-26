@@ -646,4 +646,22 @@ mod tests {
         assert_eq!(ctx.manifest_adapter_deploy_cmd, Some("spin cloud deploy"));
         assert_eq!(ctx.runtime_config_path, Some(path));
     }
+
+    #[test]
+    fn default_validation_and_kind_methods_are_noops() {
+        // `FIRST` overrides only `execute` + `name`, so every other
+        // method here exercises the trait's default impl.
+        assert!(FIRST.merged_id_kinds().is_empty());
+        assert!(FIRST.single_store_kinds().is_empty());
+        assert_eq!(
+            FIRST.validate_adapter_manifest(Path::new("/tmp"), None, None),
+            Ok(())
+        );
+        assert_eq!(
+            FIRST.validate_app_config_keys(&["greeting", "service.timeout_ms"]),
+            Ok(())
+        );
+        let entry = TypedSecretEntry::new("vault", "api_token", "demo_api_token");
+        assert_eq!(FIRST.validate_typed_secrets(&[entry]), Ok(()));
+    }
 }
