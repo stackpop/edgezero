@@ -148,6 +148,44 @@ upper() {
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
 
+# Seed the Fastly local config store `edgezero_runtime_env` with the
+# runtime override env vars. The Fastly Compute@Edge runtime has no
+# process env, so EDGEZERO__* overrides are read from this dedicated
+# Config Store (see env_config_from_runtime_dictionary in
+# crates/edgezero-adapter-fastly/src/lib.rs). $1 is the fastly.toml
+# path; $2 is the per-row __KEY override value (empty -> no override).
+seed_fastly_runtime_env() {
+  local fastly_toml="$1"
+  local key_override="$2"
+  # Strip any prior block we wrote in a previous row -- toml_edit
+  # doesn't support remove-by-prefix from bash, so we re-write the
+  # whole block each time. backup_in_tree already restores the
+  # tracked content on cleanup.
+  python3 - "$fastly_toml" "$key_override" <<'PY'
+import re
+import sys
+path, key_override = sys.argv[1], sys.argv[2]
+with open(path, 'r', encoding='utf-8') as fh:
+    text = fh.read()
+# Drop any prior edgezero_runtime_env block (idempotent across rows).
+pattern = re.compile(
+    r'\n\[local_server\.config_stores\.edgezero_runtime_env\][^\[]*'
+    r'\[local_server\.config_stores\.edgezero_runtime_env\.contents\][^\[]*',
+    re.MULTILINE,
+)
+text = pattern.sub('\n', text)
+if key_override:
+    text += (
+        '\n[local_server.config_stores.edgezero_runtime_env]\n'
+        'format = "inline-toml"\n'
+        '[local_server.config_stores.edgezero_runtime_env.contents]\n'
+        f'EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "{key_override}"\n'
+    )
+with open(path, 'w', encoding='utf-8') as fh:
+    fh.write(text)
+PY
+}
+
 check() {
   local label="$1" expect="$2" actual="$3"
   if [ "$actual" = "$expect" ]; then
@@ -288,31 +326,11 @@ TOML
       return 0
       ;;
     spin)
-      # The Spin fixture's spin.toml declares the `api_token`
-      # variable (the schema field name) but the runtime secret
-      # walk asks for the blob's VALUE -- `demo_api_token`. Patch
-      # the fixture in place so both the [variables] block and
-      # the [component.app-demo.variables] map expose
-      # `demo_api_token` for the smoke's lifetime. The caller
-      # backs spin.toml up so cleanup restores the original.
-      local spin_toml="$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-      # Insert demo_api_token into the application [variables] block.
-      # Use awk to add the new line right after `api_token = ...`.
-      awk '
-        /^api_token = / && !patched_vars {
-          print
-          print "demo_api_token = { required = true, secret = true }"
-          patched_vars = 1
-          next
-        }
-        /^api_token = "\{\{ api_token \}\}"/ && !patched_comp {
-          print
-          print "demo_api_token = \"{{ demo_api_token }}\""
-          patched_comp = 1
-          next
-        }
-        { print }
-      ' "$spin_toml" > "$spin_toml.tmp" && mv "$spin_toml.tmp" "$spin_toml"
+      # spin.toml's [variables] block now declares
+      # `demo_api_token` directly (matches the blob's
+      # secret-key NAME per Model A). boot_runtime sets
+      # SPIN_VARIABLE_DEMO_API_TOKEN inline -- nothing to seed
+      # on disk.
       return 0
       ;;
     *)
@@ -350,17 +368,46 @@ boot_runtime() {
         cargo run --quiet -p app-demo-cli -- serve --adapter axum 2>&1) &
       ;;
     cloudflare)
+      # wrangler dev does not inherit the shell's process env into
+      # the worker; values must come through .dev.vars OR
+      # wrangler.toml. Re-seed .dev.vars at boot so both the secret
+      # AND any per-row EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY
+      # override the shell exported are picked up by env_config_from_worker.
+      local cf_dev_vars="$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
+      {
+        printf 'demo_api_token="resolved-token"\n'
+        if [ -n "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}" ]; then
+          printf 'EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="%s"\n' \
+            "$EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY"
+        fi
+      } > "$cf_dev_vars"
       (cd "$DEMO_DIR/crates/app-demo-adapter-cloudflare" && \
         wrangler dev --local --port "$PORT" 2>&1) &
       ;;
     fastly)
       # DEMO_API_TOKEN_SECRET is the env var viceroy reads to
       # populate the `demo_api_token` secret-store entry seeded
-      # by seed_secret_for_adapter.
+      # by seed_secret_for_adapter. viceroy 0.17+ uses `serve`
+      # for the long-running HTTP path (`run` was renamed).
+      #
+      # The wasm artifact lives in the app-demo workspace's
+      # shared target dir (not the adapter crate's local
+      # target/), and cargo preserves the package name's
+      # hyphens in the filename (`app-demo-adapter-fastly.wasm`,
+      # not `app_demo_adapter_fastly.wasm`).
+      #
+      # The Fastly Compute@Edge runtime has no process env, so
+      # __KEY overrides come from a Fastly Config Store named
+      # `edgezero_runtime_env`. Seed the local viceroy copy with
+      # whatever shell env override the smoke set so the
+      # staging assertion sees the right binding.
+      local fastly_toml="$DEMO_DIR/crates/app-demo-adapter-fastly/fastly.toml"
+      seed_fastly_runtime_env "$fastly_toml" \
+        "${EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY:-}"
       (cd "$DEMO_DIR/crates/app-demo-adapter-fastly" && \
         DEMO_API_TOKEN_SECRET=resolved-token \
-        viceroy run -C fastly.toml --addr "127.0.0.1:${PORT}" \
-          target/wasm32-wasip1/debug/app_demo_adapter_fastly.wasm 2>&1) &
+        viceroy serve -C fastly.toml --addr "127.0.0.1:${PORT}" \
+          "$DEMO_DIR/target/wasm32-wasip1/debug/app-demo-adapter-fastly.wasm" 2>&1) &
       ;;
     spin)
       # spin reads variables from the app manifest; the demo wires
@@ -401,6 +448,25 @@ for suite in "${SUITES[@]}"; do
     continue
   fi
 
+  # Spin compatibility pre-check: spin-sdk ~6 imports
+  # wasi:http/types@0.3.0-rc-2026-03-15 which Spin < 3.7 does
+  # not provide. Auto-skip the row with a clear note rather
+  # than fail in the wasm linker; operators can install 3.7+
+  # and re-run.
+  if [ "$adapter" = "spin" ]; then
+    if ! command -v spin >/dev/null 2>&1; then
+      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (spin CLI not on PATH) ===\n'
+      continue
+    fi
+    spin_ver=$(spin --version 2>/dev/null | awk '{print $2}' | head -1)
+    # Extract MAJOR.MINOR portion, drop pre-release suffix.
+    spin_minor=$(printf '%s' "$spin_ver" | awk -F'.' '{printf "%d%02d", $1, $2}')
+    if [ -n "$spin_minor" ] && [ "$spin_minor" -lt 307 ]; then
+      printf '\n=== 12.7 __KEY override smoke: spin SKIPPED (CLI %s; need >= 3.7 for spin-sdk 6 wasi:http 0.3) ===\n' "$spin_ver"
+      continue
+    fi
+  fi
+
   printf '\n=== 12.7 __KEY override smoke: %s%s ===\n' "$adapter" "${extra:+ $extra}"
   tmp=$(mktemp -d)
   trap "cleanup; rm -rf '$tmp'" EXIT INT TERM
@@ -416,9 +482,9 @@ for suite in "${SUITES[@]}"; do
   if [ "$adapter" = "cloudflare" ]; then
     backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-cloudflare/.dev.vars"
   fi
-  if [ "$adapter" = "spin" ]; then
-    backup_in_tree "$DEMO_DIR/crates/app-demo-adapter-spin/spin.toml"
-  fi
+  # Spin no longer needs spin.toml backup-restore: the fixture's
+  # [variables] declares demo_api_token directly so the smoke
+  # doesn't mutate it.
 
   # Reset the adapter's local emulator state so the smoke starts
   # from a known-clean cutover state. The blob-model push read-back

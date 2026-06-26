@@ -297,10 +297,12 @@ impl Adapter for CloudflareCliAdapter {
         _push_ctx: &AdapterPushContext<'_>,
         dry_run: bool,
     ) -> Result<Vec<String>, String> {
-        //: read namespace id from wrangler.toml (matched by
+        // Read namespace id from wrangler.toml (matched by
         // `binding = <platform>`), then `wrangler kv bulk put
-        // <tempfile.json> --namespace-id=<id> --remote`. Keys in
-        // dotted form — the CLI already flattened them.
+        // <tempfile.json> --namespace-id=<id> --remote`. The
+        // CLI hands this writer one logical (root_key, envelope_json)
+        // entry; the bulk-put still works because it's one upsert
+        // per entry, and the one-entry case is degenerate.
         //
         // **--remote** is mandatory for the prod-push path:
         // wrangler v4 defaults KV bulk-put to LOCAL storage when
@@ -833,8 +835,10 @@ fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), Strin
 }
 
 /// Render the entries as the `[{"key": "...", "value": "..."}, …]`
-/// JSON wrangler expects for `kv bulk put`. Keys arrive pre-flattened
-/// from the CLI (dotted form,); cloudflare passes them through.
+/// JSON wrangler expects for `kv bulk put`. Under the blob model the
+/// CLI hands this writer one logical `(root_key, envelope_json)` entry;
+/// Cloudflare passes the value through unchanged (the envelope is an
+/// opaque string from the platform's perspective).
 fn bulk_payload(entries: &[(String, String)]) -> Result<String, String> {
     let payload: Vec<serde_json::Value> = entries
         .iter()
@@ -885,6 +889,19 @@ fn read_wrangler_kv_key(
     if output.status.success() {
         let body = String::from_utf8(output.stdout)
             .map_err(|err| format!("`wrangler kv key get` stdout is not UTF-8: {err}"))?;
+        // Wrangler 4.x (verified 4.64.0) returns exit 0 + stdout
+        // "Value not found" for a missing key instead of exit 1 +
+        // stderr. Detect that shape and map to MissingKey -- a
+        // missing key in the blob model is valid initial state
+        // (first push hasn't run yet), not corrupt remote state.
+        // Match the trimmed first line so trailing newlines or
+        // future variants like "Value not found.\n" still match.
+        let trimmed = body.trim();
+        if trimmed.eq_ignore_ascii_case("value not found")
+            || trimmed.eq_ignore_ascii_case("value not found.")
+        {
+            return Ok(ReadConfigEntry::MissingKey);
+        }
         return Ok(ReadConfigEntry::Present(body));
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2036,6 +2053,44 @@ id = "00112233445566778899aabbccddeeff"
         assert!(
             matches!(result, ReadConfigEntry::MissingKey),
             "not-found stderr => MissingKey"
+        );
+    }
+
+    /// Wrangler 4.x (verified 4.64.0) returns exit 0 + stdout
+    /// `"Value not found"` for a missing key instead of exit 1 +
+    /// stderr. The previous read path treated every exit-0 stdout
+    /// as a `Present` envelope, which made the next CLI step try
+    /// to parse `"Value not found"` as a `BlobEnvelope` and abort.
+    /// A missing key in the blob model is valid initial state --
+    /// the first push hasn't run yet -- not corrupt remote state,
+    /// so it must map to `MissingKey`.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_key_on_wrangler_4_value_not_found_stdout() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let fake = fake_wrangler_returning("Value not found\n", "", 0);
+        let _path = PathPrepend::new(fake.path());
+        let result = CloudflareCliAdapter
+            .read_config_entry(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("Wrangler 4.x exit-0 'Value not found' must map to MissingKey");
+        if let ReadConfigEntry::Present(body) = &result {
+            panic!(
+                "expected MissingKey on Wrangler 4.x 'Value not found' stdout; \
+                 got Present({body:?})",
+            );
+        }
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "Wrangler 4.x stdout='Value not found' (exit 0) must classify as MissingKey",
         );
     }
 

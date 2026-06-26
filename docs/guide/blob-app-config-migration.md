@@ -208,23 +208,54 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
 
 ### Per-environment key override
 
-Spec §5.4 + §12.7: a single `<app-name>.toml` covers dev / staging /
+Spec 5.4 + 12.7: a single `<app-name>.toml` covers dev / staging /
 production. To swap which blob the runtime reads:
 
 ```sh
 # Push BOTH variants. Each lands at its own key.
 <app-cli> config push --adapter <name> --key app_config
 <app-cli> config push --adapter <name> --key app_config_staging
-
-# At runtime, set the env var to switch which key the extractor reads.
-export EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging
-<your runtime command>
 ```
 
-The env-var pattern is `EDGEZERO__STORES__CONFIG__<ID>__KEY` —
+The override variable is `EDGEZERO__STORES__CONFIG__<ID>__KEY` --
 double-underscore separators, upper-case `<ID>`. The runtime extractor
-packs `default_key` into the `ConfigStoreBinding` from this env at
-adapter init.
+packs `default_key` into the `ConfigStoreBinding` at adapter init.
+**Where you set the override depends on the platform's variable
+mechanism.**
+
+| Adapter        | Where to set `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`                                                                                                                     |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Axum**       | Process env: `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging <app-cli> serve --adapter axum`                                                                   |
+| **Cloudflare** | `.dev.vars` (local) or `wrangler.toml` `[vars]` (deployed) -- wrangler surfaces it to `env.var(...)` in the worker                                                           |
+| **Spin**       | `[application.variables]` in `spin.toml` (defaulted) plus `SPIN_VARIABLE_EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging spin up` for a per-invocation override |
+| **Fastly**     | A dedicated `edgezero_runtime_env` Config Store (Compute@Edge has no process env). See below.                                                                                |
+
+#### Fastly specifically
+
+Compute@Edge has no `std::env`, so EdgeZero reads runtime overrides
+from a Fastly Config Store named `edgezero_runtime_env`. The store is
+created automatically by `edgezero provision --adapter fastly`. After
+provisioning:
+
+```sh
+# Look up the platform store id (matches by name).
+fastly config-store list --json | jq -r '.[] | select(.name=="edgezero_runtime_env") | .id'
+
+# Set the override.
+fastly config-store-entry update \
+  --store-id=<STORE-ID> \
+  --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY \
+  --value=app_config_staging \
+  --upsert
+```
+
+Locally (Viceroy), the store lives in fastly.toml's
+`[local_server.config_stores.edgezero_runtime_env]` block. If the
+store is missing at runtime, EdgeZero logs a one-line warning to
+Fastly logs (`Fastly Config Store 'edgezero_runtime_env' not found;
+EDGEZERO__* runtime overrides will use baked-in defaults`) and falls
+back to the binding's default id -- so the runtime keeps serving, but
+your per-environment override is silently inactive until you provision.
 
 ### Drift detection in CI
 

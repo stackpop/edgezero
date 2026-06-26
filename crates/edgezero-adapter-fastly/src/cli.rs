@@ -280,11 +280,7 @@ impl Adapter for FastlyCliAdapter {
                 // service is surprising. The instruction names
                 // both the store-id lookup AND the link command so
                 // the operator can audit before committing.
-                let post_create_note = read_fastly_service_id(&fastly_path)?.map(|svc_id| {
-                    format!(
-                        "  fastly.toml declares `service_id = \"{svc_id}\"`, so this service is already deployed — `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
-                    )
-                });
+                let post_create_note = resource_link_note(&fastly_path, kind, name)?;
                 let mut line = format!(
                     "created fastly {kind}-store `{name}` (logical id `{logical}`); appended setup tables to {}",
                     fastly_path.display()
@@ -296,6 +292,54 @@ impl Adapter for FastlyCliAdapter {
                 out.push(line);
             }
         }
+        // EdgeZero runtime overrides live in a dedicated Fastly Config
+        // Store named `edgezero_runtime_env`. Compute@Edge has no
+        // process env, so `EDGEZERO__STORES__CONFIG__<ID>__KEY` and
+        // similar overrides have to come from a platform Config Store
+        // the runtime opens by name (see
+        // `env_config_from_runtime_dictionary` in lib.rs). Provision
+        // owns the store creation alongside the operator's declared
+        // stores so the runtime override path is wired correctly out
+        // of the box; if the store already appears in
+        // `[setup.config_stores.edgezero_runtime_env]`, skip.
+        let runtime_env_kind = "config";
+        let runtime_env_name = "edgezero_runtime_env";
+        if dry_run {
+            out.push(format!(
+                "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
+                fastly_path.display()
+            ));
+        } else if !setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
+            create_fastly_store(runtime_env_kind, runtime_env_name)?;
+            append_fastly_setup(&fastly_path, runtime_env_kind, runtime_env_name).map_err(
+                |err| {
+                    format!(
+                        "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
+                        path = fastly_path.display()
+                    )
+                },
+            )?;
+            // Same already-deployed-service caveat as the declared-store
+            // path: if `service_id` is set in fastly.toml, the
+            // `[setup.config_stores.edgezero_runtime_env]` table won't
+            // be re-applied by the next `fastly compute deploy`, so the
+            // runtime can't open the store. Emit the resource-link
+            // remediation alongside the populate-keys hint.
+            let post_create_note =
+                resource_link_note(&fastly_path, runtime_env_kind, runtime_env_name)?;
+            let mut line = format!(
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store); appended setup tables to {}\n  Populate per-environment override keys with:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=app_config_staging --upsert",
+                fastly_path.display()
+            );
+            if let Some(note) = post_create_note {
+                line.push('\n');
+                line.push_str(&note);
+            }
+            out.push(line);
+        } else {
+            // Already declared; nothing to do.
+        }
+
         if out.is_empty() {
             out.push("fastly has no declared stores to provision".to_owned());
         }
@@ -314,9 +358,12 @@ impl Adapter for FastlyCliAdapter {
     ) -> Result<Vec<String>, String> {
         // Resolve the platform config-store id on demand via
         // `fastly config-store list --json` (matched by name =
-        // `store.platform`), then `fastly config-store-entry create
-        // --store-id=<id> --key=<k> --value=<v>` per key. Keys
-        // arrive pre-flattened from the CLI (dotted form).
+        // `store.platform`), then `fastly config-store-entry update
+        // --store-id=<id> --key=<k> --upsert --stdin` per physical
+        // entry. Entries are logical blob-envelope entries from
+        // the CLI (one (key, envelope_json) per push); oversized
+        // Fastly values are expanded below into chunk entries plus
+        // a root pointer by `chunked_config::prepare_fastly_config_entries`.
         let logical = store.logical.as_str();
         let name = store.platform.as_str();
         if entries.is_empty() {
@@ -768,6 +815,23 @@ fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
         .map(str::to_owned)
         .filter(|svc_id| !svc_id.is_empty());
     Ok(svc)
+}
+
+/// If fastly.toml declares `service_id`, the next
+/// `fastly compute deploy` skips `[setup]` entirely (it only runs on
+/// the FIRST deploy of a service). Any store created by provision
+/// after that needs a separate `fastly resource-link create` to link
+/// the platform store to the service version. This helper returns the
+/// remediation note to surface in the provision output, or `None`
+/// when the service hasn't been deployed yet (so the next
+/// `compute deploy` will pick up the `[setup]` row automatically).
+fn resource_link_note(path: &Path, kind: &str, name: &str) -> Result<Option<String>, String> {
+    let note = read_fastly_service_id(path)?.map(|svc_id| {
+        format!(
+            "  fastly.toml declares `service_id = \"{svc_id}\"`, so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
+        )
+    });
+    Ok(note)
 }
 
 /// Probe `fastly.toml` for the existence of `[setup.<kind>_stores.<id>]`.
@@ -1895,11 +1959,15 @@ build = \"cargo build --release\"
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret = 3 status lines.
-        assert_eq!(out.len(), 3);
+        // 1 KV + 1 config + 1 secret + 1 runtime-env = 4 status lines.
+        assert_eq!(out.len(), 4);
         assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
         assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
+        assert!(
+            out[3].contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
+            "runtime-env store row: {out:?}",
+        );
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
@@ -1927,7 +1995,14 @@ build = \"cargo build --release\"
     fn provision_with_no_declared_stores_says_so() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write");
+        // Pre-populate the runtime-env block so the provision flow's
+        // unconditional runtime-env step skips (otherwise it would
+        // shell out to real `fastly` to create the store).
+        fs::write(
+            &path,
+            "name = \"demo\"\n[setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
         let stores = ProvisionStores {
             config: &[],
             kv: &[],
@@ -1950,7 +2025,8 @@ build = \"cargo build --release\"
         let path = dir.path().join("fastly.toml");
         fs::write(
             &path,
-            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
+            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
         )
         .expect("write");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
@@ -1964,6 +2040,66 @@ build = \"cargo build --release\"
             .expect("skip path succeeds without invoking fastly");
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("already declared"), "got: {out:?}");
+    }
+
+    /// When `fastly.toml` declares `service_id`, the next
+    /// `fastly compute deploy` skips `[setup]` entirely. provision
+    /// must emit the `fastly resource-link create` remediation for
+    /// every store it creates -- including the implicit
+    /// `edgezero_runtime_env` store the runtime override path
+    /// depends on. Without this, a freshly-provisioned override
+    /// store would not be linked to the already-deployed service
+    /// and the runtime would silently fall back to baked defaults.
+    #[test]
+    fn provision_emits_resource_link_note_for_runtime_env_on_existing_service() {
+        // Dry-run only -- we just want to drive the resource_link_note
+        // helper for the runtime-env store branch. The real-create
+        // path can't run in tests (would shell out to `fastly`).
+        // The dry-run output line for runtime-env doesn't include the
+        // note (the helper only fires on real create), so we test the
+        // helper directly here.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\nservice_id = \"abc123svc\"\n").expect("write");
+        let note = resource_link_note(&path, "config", "edgezero_runtime_env")
+            .expect("read service_id")
+            .expect("note present when service_id set");
+        assert!(
+            note.contains("service_id = \"abc123svc\""),
+            "note quotes the service id: {note}"
+        );
+        assert!(
+            note.contains("fastly config-store list --json"),
+            "note tells operator how to find the store id: {note}"
+        );
+        assert!(
+            note.contains("name=`edgezero_runtime_env`"),
+            "note names the runtime override store: {note}"
+        );
+        assert!(
+            note.contains(
+                "fastly resource-link create --service-id=abc123svc --resource-id=<STORE-ID> --version=latest --autoclone --name=edgezero_runtime_env"
+            ),
+            "note carries the full resource-link command: {note}"
+        );
+    }
+
+    /// And the inverse: no `service_id` (a service that hasn't been
+    /// deployed yet) means `[setup]` will be applied on the next
+    /// `compute deploy`, so no manual resource-link step is needed.
+    /// The helper must return `None` to avoid noisy false-positive
+    /// guidance.
+    #[test]
+    fn provision_skips_resource_link_note_when_service_undeployed() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let note =
+            resource_link_note(&path, "config", "edgezero_runtime_env").expect("read service_id");
+        assert!(
+            note.is_none(),
+            "no service_id => no resource-link prompt: {note:?}"
+        );
     }
 
     // ---------- find_config_store_id ----------

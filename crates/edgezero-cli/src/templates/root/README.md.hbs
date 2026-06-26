@@ -53,6 +53,10 @@ adapter binding in the per-adapter manifest) before running `config push`.
 
 Use `--key <name>` for per-environment overrides (staging / canary):
 the same `{{name}}.toml` can land under multiple keys, and the runtime
-picks one via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=<name>`. See
-the [blob app-config migration guide](https://stackpop.github.io/edgezero/guide/blob-app-config-migration)
-for the full operator runbook.
+picks one via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=<name>`.
+Where you set that override depends on the adapter -- Axum reads it
+from process env, Cloudflare from worker vars, Spin from application
+variables, and Fastly from a dedicated `edgezero_runtime_env` Config
+Store that `edgezero provision --adapter fastly` creates. See the
+[blob app-config migration guide](https://stackpop.github.io/edgezero/guide/blob-app-config-migration)
+for the per-adapter steps and the full operator runbook.
