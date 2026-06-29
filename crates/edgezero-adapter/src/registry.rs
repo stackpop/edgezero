@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{LazyLock, PoisonError, RwLock};
 
@@ -31,6 +31,28 @@ pub enum AdapterAction {
 pub enum ProvisionMode {
     Cloud,
     Local,
+}
+
+/// Adapter-emitted deployed identifiers. Kept neutral (string-keyed
+/// maps only) so `edgezero-adapter` stays dep-free of
+/// `edgezero-core` -- the CLI maps this into the strongly typed
+/// `ManifestAdapterDeployed` shape when writing `edgezero.toml`.
+/// See spec §"Writeback ownership".
+#[derive(Debug, Default, Clone)]
+pub struct AdapterDeployedState {
+    pub fields: BTreeMap<String, String>,
+    pub sub_tables: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Return value of `Adapter::provision` (and `provision_typed`).
+/// `status_lines` are operator-facing; `deployed`, when `Some`,
+/// records the cloud-returned identifiers the CLI persists into
+/// `edgezero.toml`'s `[adapters.<name>.deployed]` block. Local
+/// provision returns `deployed: None`.
+#[derive(Debug, Default, Clone)]
+pub struct ProvisionOutcome {
+    pub deployed: Option<AdapterDeployedState>,
+    pub status_lines: Vec<String>,
 }
 
 /// A single declared store id, paired with the platform name the
@@ -636,5 +658,24 @@ mod tests {
             matches!(local_result, ReadConfigEntry::Unsupported(_)),
             "expected Unsupported variant from default local impl"
         );
+    }
+
+    #[test]
+    fn provision_outcome_default_is_empty() {
+        let outcome = ProvisionOutcome::default();
+        assert!(outcome.status_lines.is_empty());
+        assert!(outcome.deployed.is_none());
+    }
+
+    #[test]
+    fn adapter_deployed_state_round_trips_via_btreemap() {
+        use std::collections::BTreeMap;
+        let mut state = AdapterDeployedState::default();
+        state.fields.insert("service_id".into(), "SVC1".into());
+        let mut kv = BTreeMap::new();
+        kv.insert("sessions".into(), "abc123".into());
+        state.sub_tables.insert("kv_namespaces".into(), kv);
+        assert_eq!(state.fields["service_id"], "SVC1");
+        assert_eq!(state.sub_tables["kv_namespaces"]["sessions"], "abc123");
     }
 }
