@@ -269,8 +269,8 @@
 
 **Interfaces:**
 
-- Consumes: `ProvisionMode`, `ProvisionOutcome` from Task 1-2
-- Produces: updated trait `fn provision(..., mode: ProvisionMode, dry_run: bool) -> Result<ProvisionOutcome, String>`
+- Consumes: `ProvisionMode`, `ProvisionOutcome`, `AdapterDeployedState` from Task 1-2
+- Produces: updated trait `fn provision(manifest_root, adapter_manifest_path, component_selector, stores, deployed: Option<&AdapterDeployedState>, mode: ProvisionMode, dry_run) -> Result<ProvisionOutcome, String>`
 
 - [ ] **Step 1: Run the existing provision suite to capture the green baseline**
 
@@ -279,7 +279,7 @@
 
 - [ ] **Step 2: Change the trait signature**
 
-  In `crates/edgezero-adapter/src/registry.rs:282`, locate `fn provision(` (currently returns `Result<Vec<String>, String>`). **Preserve the existing parameter order** to minimise churn at call sites — only insert `mode` before `dry_run` and change the return type:
+  In `crates/edgezero-adapter/src/registry.rs:282`, locate `fn provision(` (currently returns `Result<Vec<String>, String>`). **Preserve the existing parameter order** to minimise churn at call sites — insert `mode` before `dry_run` and `deployed` after `stores`, change the return type:
 
   ```rust
   fn provision(
@@ -288,10 +288,19 @@
       adapter_manifest_path: Option<&str>,
       component_selector: Option<&str>,
       stores: &ProvisionStores<'_>,
+      deployed: Option<&AdapterDeployedState>,
       mode: ProvisionMode,
       dry_run: bool,
   ) -> Result<ProvisionOutcome, String>;
   ```
+
+  The `deployed` parameter is the same neutral `AdapterDeployedState` Task 8b's `deployed_state_for(&manifest, canonical_adapter_name)` translator already builds for `synthesise_baseline_manifest`. Cloud-arm impls take `deployed = None` (cloud provision creates the deployed state; doesn't consume it). Local-arm impls read it for the precedence rules:
+  - **Cloudflare** reads `deployed.and_then(|d| d.sub_tables.get("kv_namespaces"))` to source real namespace ids (spec §"Cloudflare" precedence list at spec:1014).
+  - **Fastly** reads `deployed.and_then(|d| d.fields.get("service_id"))` to pin `service_id` in the synthesised `fastly.toml` (spec §"Fastly" at spec:1320).
+  - **Axum** ignores it (no deployed-state inputs).
+  - **Spin** ignores it (no deployed-state inputs in v1).
+
+  Without this parameter, adapters that need the deployed block would have to re-parse `edgezero.toml` -- breaking the `edgezero-adapter → edgezero-core` dep-free invariant the boundary translator was added to preserve. The CLI MUST pass the same value through both `synthesise_baseline_manifest` AND `provision`; the typed dry-run staging closure (Task 29) builds it once and threads it into both calls.
 
   Add a doc comment cross-referencing spec §"CLI / trait surface" and §"Writeback ownership". Do NOT add a default impl — every existing impl must update explicitly.
 
@@ -299,9 +308,11 @@
 
   For each of `crates/edgezero-adapter-{axum,cloudflare,fastly,spin}/src/cli.rs`'s existing `fn provision`:
 
-  - Accept the new `mode: ProvisionMode` parameter (place between `component_selector` and `dry_run` to match the trait order).
+  - Accept the **two** new parameters in this order, matching the trait:
+    1. `deployed: Option<&AdapterDeployedState>` between `stores` and `mode` (cloud arm ignores; local arm uses per the precedence above).
+    2. `mode: ProvisionMode` between `deployed` and `dry_run`.
   - At the top of the function body, add `match mode { ProvisionMode::Cloud => {} ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()), }`. This stub keeps the CLI compilable while Section 5 implements each adapter's local arm in turn.
-  - Change the return path: where the old impl returned `Ok(status_lines)`, return `Ok(ProvisionOutcome { status_lines, deployed: None })`.
+  - Change the return path: where the old impl returned `Ok(status_lines)`, return `Ok(ProvisionOutcome { status_lines, deployed: None })`. Cloud-arm impls always return `deployed: None` at this point; Cloudflare's cloud arm is upgraded in Task 16b to return captured namespace ids.
 
 - [ ] **Step 4: Update the CLI call site**
 
@@ -313,6 +324,7 @@
       adapter_cfg.adapter.manifest.as_deref(),
       adapter_cfg.adapter.component.as_deref(),
       &stores,
+      None, // cloud arm doesn't consume deployed state; it produces it
       adapter_registry::ProvisionMode::Cloud,
       args.dry_run,
   )?;
@@ -479,7 +491,29 @@
 
   In `crates/edgezero-cli/src/config.rs`:
 
-  1. Change `struct ValidationContext` at `:77` to `pub(crate) struct ValidationContext` (same crate, push + validate + diff + provision all see it).
+  1. Change `struct ValidationContext` at `:77` to `pub(crate) struct ValidationContext` (same crate, push + validate + diff + provision all see it). Fields STAY private. Add `pub(crate)` accessor methods alongside the existing private `manifest()` at `:99` so external callers (Task 29's `run_provision_typed` in `provision.rs`) can read the parts they need without field exposure:
+
+     ```rust
+     impl ValidationContext {
+         pub(crate) fn manifest(&self) -> &Manifest {
+             self.manifest_loader.manifest()
+         }
+         pub(crate) fn manifest_path(&self) -> &Path {
+             &self.manifest_path
+         }
+         pub(crate) fn app_name(&self) -> &str {
+             &self.app_name
+         }
+         pub(crate) fn app_config_path(&self) -> &Path {
+             &self.app_config_path
+         }
+         pub(crate) fn raw_config(&self) -> &toml::Value {
+             &self.raw_config
+         }
+     }
+     ```
+
+     Promote the existing private `fn manifest(&self) -> &Manifest` at `:99` to `pub(crate)` (the body stays one line). The other four are net new. Without these accessors, Task 29 would have to either reach into private fields (won't compile) or duplicate the loader -- both worse than a five-line accessor block.
   2. Add a NEW primitive-args helper (different name) that both the existing wrapper AND provision call:
 
      ```rust
@@ -1101,11 +1135,19 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
       //   manifest = "crates/spin/spin.toml"
       // and crates/spin/ exists but spin.toml does NOT.
       // Plug in a fake Spin adapter whose synthesise_baseline_manifest
-      // returns Ok(vec![(PathBuf::from("spin.toml"), "# stub\n".to_string())])
-      // and whose validate_adapter_manifest asserts the file exists
-      // when called.
+      // returns the CONFIGURED adapter manifest path verbatim
+      // (NOT a static "spin.toml") so the synthesised file lands
+      // at <root>/crates/spin/spin.toml -- mirrors what the real
+      // Spin override at Task 24 does. The fake reads
+      // `adapter_manifest_path` and returns
+      // Ok(vec![(PathBuf::from(adapter_manifest_path.unwrap_or("spin.toml")),
+      //          "# stub\n".to_string())]).
+      // The fake's validate_adapter_manifest asserts the file
+      // exists when called.
       // Run run_provision with args.local = true, args.dry_run = false.
-      // Assert Ok AND crates/spin/spin.toml now contains "# stub".
+      // Assert Ok AND <root>/crates/spin/spin.toml contains "# stub"
+      // (NOT <root>/spin.toml -- that would be the regression
+      // shape this test guards against).
   }
 
   #[test]
@@ -1212,10 +1254,16 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
   4. Branch on the dispatch matrix BEFORE validation. Synthesis is called ONLY in the local arms — cloud must never invoke `synthesise_baseline_manifest`, per the spec contract ("`args.local && !manifest_exists`") and the regression test from Step 1 (`provision_cloud_never_runs_bootstrap_synthesis`). Computing baseline_pairs above the match would silently fire the synthesiser for cloud mode and fail that test.
 
      ```rust
+     // Translate the manifest's deployed block ONCE; pass to
+     // both synthesise_baseline_manifest and provision so the
+     // local arms see the same Option<&AdapterDeployedState>.
+     let deployed = deployed_state_for(manifest, canonical_adapter_name);
      match (args.local, args.dry_run) {
          (false, dry_run) => {
              // Cloud mode: NO synthesis. Validate against the real
-             // worktree as today, then dispatch.
+             // worktree as today, then dispatch. Cloud arm passes
+             // `deployed = None` -- cloud provision PRODUCES
+             // deployed state, doesn't consume it.
              adapter.validate_adapter_manifest(
                  manifest_root,
                  adapter_cfg.adapter.manifest.as_deref(),
@@ -1227,6 +1275,7 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
              let stores = owned_stores.as_refs();
              adapter.provision(
                  manifest_root, /* …existing args… */, &stores,
+                 None,
                  adapter_registry::ProvisionMode::Cloud, dry_run,
              )?
          }
@@ -1240,7 +1289,7 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
                  adapter_cfg.adapter.manifest.as_deref(),
                  adapter_cfg.adapter.component.as_deref(),
                  &app_name,
-                 deployed_state_for(manifest, canonical_adapter_name).as_ref(),
+                 deployed.as_ref(),
              )?;
              write_baseline_to_disk(manifest_root, &baseline_pairs)?;
              adapter.validate_adapter_manifest(
@@ -1254,6 +1303,7 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
              let stores = owned_stores.as_refs();
              adapter.provision(
                  manifest_root, /* …existing args… */, &stores,
+                 deployed.as_ref(),
                  adapter_registry::ProvisionMode::Local, false,
              )?
          }
@@ -1267,12 +1317,20 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
                  adapter_cfg.adapter.manifest.as_deref(),
                  adapter_cfg.adapter.component.as_deref(),
                  &app_name,
-                 deployed_state_for(manifest, canonical_adapter_name).as_ref(),
+                 deployed.as_ref(),
              )?;
-             let adapter_crate_dir = resolve_adapter_crate_dir(/* … */);
+             // Pass the project-relative crate path directly; no
+             // need to compute an absolute path and strip back to
+             // relative inside run_with_staging.
+             let adapter_crate_rel = adapter_cfg
+                 .adapter
+                 .crate_path
+                 .as_deref()
+                 .map(Path::new)
+                 .unwrap_or_else(|| Path::new("."));
              let (outcome, _tempdir) = run_with_staging(
                  manifest_root,
-                 &adapter_crate_dir,
+                 adapter_crate_rel,
                  |staged_root, _staged_crate| {
                      write_baseline_to_disk(staged_root, &baseline_pairs)?;
                      adapter.validate_adapter_manifest(
@@ -1286,6 +1344,7 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
                      let stores = owned_stores.as_refs();
                      adapter.provision(
                          staged_root, /* …existing args… */, &stores,
+                         deployed.as_ref(),
                          adapter_registry::ProvisionMode::Local, false,
                      )
                  },
@@ -1469,7 +1528,18 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
   ```rust
   pub(crate) fn run_with_staging<F, R>(
       project_root: &Path,
-      adapter_crate_dir: &Path,
+      /// PROJECT-RELATIVE adapter crate path (e.g. "crates/cf"
+      /// or "."), NOT an absolute path. The old shape took an
+      /// absolute path and computed `crate_rel` via
+      /// `strip_prefix(project_root)` -- which silently fails
+      /// for the default `--manifest edgezero.toml` shape where
+      /// `project_root == "."` and `adapter_crate_dir == "crates/cf"`
+      /// (Rust's `Path::strip_prefix` does NOT treat "." as a
+      /// prefix of "crates/cf"). Taking the relative path
+      /// directly sidesteps the issue entirely; the caller
+      /// already has this value from
+      /// `adapter_cfg.adapter.crate_path.as_deref()`.
+      adapter_crate_rel: &Path,
       body: F,
   ) -> Result<(R, tempfile::TempDir), String>
   where
@@ -1484,13 +1554,18 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
       use std::fs;
       let project = tempfile::TempDir::new().unwrap();
       fs::write(project.path().join("edgezero.toml"), "x").unwrap();
-      let adapter_crate = project.path().join("crates/sample");
-      fs::create_dir_all(&adapter_crate).unwrap();
-      fs::write(adapter_crate.join("manifest.toml"), "y").unwrap();
+      let adapter_crate_rel = Path::new("crates/sample");
+      let adapter_crate_abs = project.path().join(adapter_crate_rel);
+      fs::create_dir_all(&adapter_crate_abs).unwrap();
+      fs::write(adapter_crate_abs.join("manifest.toml"), "y").unwrap();
 
-      let staged_paths = run_with_staging(project.path(), &adapter_crate, |staged_root, staged_crate| {
-          Ok((staged_root.to_path_buf(), staged_crate.to_path_buf()))
-      })
+      let staged_paths = run_with_staging(
+          project.path(),
+          adapter_crate_rel,
+          |staged_root, staged_crate| {
+              Ok((staged_root.to_path_buf(), staged_crate.to_path_buf()))
+          },
+      )
       .unwrap();
       let (staged_root, staged_crate) = staged_paths.0;
       // After staging the original project tree is byte-identical:
@@ -1499,12 +1574,51 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
       assert!(staged_root.is_absolute());
       assert!(staged_crate.starts_with(&staged_root));
   }
+
+  #[test]
+  fn run_with_staging_copies_edgezero_toml_into_staged_root() {
+      // Regression for the relative-source-symlink bug fixed in
+      // an earlier review round AND the strip_prefix bug fixed
+      // by switching to project-RELATIVE crate paths (Task 10
+      // signature). The test reads staged_root/edgezero.toml
+      // INSIDE the closure and asserts the bytes match the
+      // project file's bytes. Uses an ABSOLUTE project_root to
+      // avoid mutating process cwd -- the strip_prefix bug is
+      // not about relative project_root resolution itself, it's
+      // about the staging helper computing crate_rel
+      // incorrectly. The relative-root case (manifest_root = ".")
+      // is exercised end-to-end by the path_safety tests
+      // (Task 6) and the worktree-clean dry-run test (Task 13).
+      use std::fs;
+      let project = tempfile::TempDir::new().unwrap();
+      fs::write(project.path().join("edgezero.toml"), "real-project-bytes\n").unwrap();
+      let adapter_crate_rel = Path::new("crates/sample");
+      fs::create_dir_all(project.path().join(adapter_crate_rel)).unwrap();
+      fs::write(
+          project.path().join(adapter_crate_rel).join("manifest.toml"),
+          "x",
+      )
+      .unwrap();
+
+      let observed = run_with_staging(
+          project.path(),
+          adapter_crate_rel,
+          |staged_root, _staged_crate| {
+              fs::read_to_string(staged_root.join("edgezero.toml"))
+                  .map_err(|e| format!("read staged edgezero.toml: {e}"))
+          },
+      )
+      .unwrap();
+      assert_eq!(observed.0, "real-project-bytes\n");
+  }
   ```
 
-- [ ] **Step 2: Run test to verify it fails**
+  No `scopeguard` (forbidden by the "no new workspace deps" rule); no process-cwd mutation (which would require a global test lock for thread-safety); no test-specific RAII helpers. Test discipline: pass absolute paths in tests; let the production callers thread relative paths through the path-safety + staging stack where they're handled correctly.
 
-  Run: `cargo test -p edgezero-cli run_with_staging_drops`
-  Expected: FAIL
+- [ ] **Step 2: Run BOTH tests to verify they fail**
+
+  Run: `cargo test -p edgezero-cli run_with_staging`
+  Expected: FAIL (both `run_with_staging_drops_tempdir_after_body` AND `run_with_staging_copies_edgezero_toml_into_staged_root` listed in the failing-tests output).
 
 - [ ] **Step 3: Implement `run_with_staging`**
 
@@ -1529,22 +1643,38 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
           .map_err(|e| format!("failed to create staging tempdir: {e}"))?;
       let staged_root = tempdir.path();
 
-      // Symlink edgezero.toml (read-only input).
+      // Copy edgezero.toml (read-only input). We previously used
+      // a symlink as an optimisation, but for the default
+      // `--manifest edgezero.toml` shape `project_root` is "."
+      // and `project_root.join("edgezero.toml")` is the relative
+      // path `./edgezero.toml`. Unix `symlink(src, dst)`
+      // interprets a relative `src` AS RELATIVE TO `dst`'s parent
+      // dir -- so `staged_root/edgezero.toml -> ./edgezero.toml`
+      // resolves to `staged_root/edgezero.toml` itself, a broken
+      // symlink that points at the staged tree instead of the
+      // real project file. A path-based reader inside the closure
+      // would either fail (file doesn't exist) or read the wrong
+      // content. Copying sidesteps this entirely; `edgezero.toml`
+      // is small enough that the perf cost is irrelevant.
       let edgezero_toml = project_root.join("edgezero.toml");
       if edgezero_toml.exists() {
-          symlink_or_copy_file(&edgezero_toml, &staged_root.join("edgezero.toml"))?;
+          let staged_edgezero = staged_root.join("edgezero.toml");
+          if let Some(parent) = staged_edgezero.parent() {
+              std::fs::create_dir_all(parent)
+                  .map_err(|e| format!("failed to create staged parent dir: {e}"))?;
+          }
+          std::fs::copy(&edgezero_toml, &staged_edgezero)
+              .map_err(|e| format!("failed to stage edgezero.toml: {e}"))?;
       }
 
-      // Real-copy the adapter crate dir (mutable).
-      let crate_rel = adapter_crate_dir
-          .strip_prefix(project_root)
-          .map_err(|_| format!(
-              "adapter crate `{}` is not under project root `{}`",
-              adapter_crate_dir.display(),
-              project_root.display(),
-          ))?;
-      let staged_crate = staged_root.join(crate_rel);
-      crate::copy_tree::copy_dir_recursive(adapter_crate_dir, &staged_crate)
+      // Real-copy the adapter crate dir (mutable). `adapter_crate_rel`
+      // is project-relative (e.g. "crates/cf" or "."), so the
+      // source and staged paths derive cleanly from it. No
+      // strip_prefix needed -- removing that call sidesteps the
+      // "." vs "crates/cf" Path::strip_prefix bug.
+      let src_crate = project_root.join(adapter_crate_rel);
+      let staged_crate = staged_root.join(adapter_crate_rel);
+      crate::copy_tree::copy_dir_recursive(&src_crate, &staged_crate)
           .map_err(|e| format!("failed to stage adapter crate dir: {e}"))?;
 
       // Real-copy `.edgezero/` if present; otherwise create empty.
@@ -1562,29 +1692,19 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
       Ok((result, tempdir))
   }
 
-  fn symlink_or_copy_file(src: &Path, dst: &Path) -> Result<(), String> {
-      if let Some(parent) = dst.parent() {
-          std::fs::create_dir_all(parent)
-              .map_err(|e| format!("failed to create staged parent dir: {e}"))?;
-      }
-      #[cfg(unix)]
-      {
-          std::os::unix::fs::symlink(src, dst)
-              .map_err(|e| format!("failed to symlink {}: {e}", src.display()))?;
-      }
-      #[cfg(not(unix))]
-      {
-          std::fs::copy(src, dst)
-              .map_err(|e| format!("failed to copy {}: {e}", src.display()))?;
-      }
-      Ok(())
-  }
+  // Previous revs had a `symlink_or_copy_file` helper for the
+  // read-only inputs; it's been removed because the only call
+  // site (edgezero.toml staging above) now copies unconditionally
+  // to avoid the relative-symlink-resolution bug. If a future
+  // input ever needs symlinking, the helper can be reintroduced
+  // -- but the relative-root case MUST canonicalize the source
+  // before symlinking, OR keep using `std::fs::copy`.
   ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-  Run: `cargo test -p edgezero-cli run_with_staging_drops`
-  Expected: PASS
+  Run: `cargo test -p edgezero-cli run_with_staging`
+  Expected: PASS (both `run_with_staging_drops_tempdir_after_body` AND `run_with_staging_copies_edgezero_toml_into_staged_root` green)
 
 - [ ] **Step 5: Commit**
 
@@ -1642,17 +1762,20 @@ Task 8b lays the structural reorder (synthesis + validation + dispatch all see t
   Task 8b's restructure references two helpers that need concrete implementations:
 
   ```rust
-  /// Join manifest_root with the (already path-safety-checked)
-  /// adapter crate path. Falls back to manifest_root when unset.
-  fn resolve_adapter_crate_dir(
-      manifest_root: &Path,
-      raw_crate_path: Option<&str>,
-  ) -> PathBuf {
-      match raw_crate_path {
-          Some(p) => manifest_root.join(p),
-          None => manifest_root.to_path_buf(),
-      }
-  }
+  // `resolve_adapter_crate_dir` is NOT introduced here. The
+  // previous draft had the dispatch matrix pre-compute an
+  // absolute crate dir and pass it to `run_with_staging`, which
+  // then strip_prefix'd it back -- a brittle round-trip that
+  // failed for the default `--manifest edgezero.toml` shape
+  // (`Path::new("crates/cf").strip_prefix(Path::new("."))` is
+  // an Err). The current shape passes the project-RELATIVE
+  // crate path directly into `run_with_staging` (Task 10), so
+  // no separate "resolve" step is needed inside the dispatch
+  // matrix. `run_serve` still has its own
+  // `resolve_adapter_crate_dir_for_serve` helper (Task 34)
+  // because that path joins the spin crate dir against the
+  // manifest root for the env-file load -- different concern,
+  // different call site.
 
   /// Owned counterpart to the borrowed `ProvisionStores<'_>` at
   /// `crates/edgezero-adapter/src/registry.rs:91`. We need owned
@@ -1688,11 +1811,16 @@ Task 8b lays the structural reorder (synthesis + validation + dispatch all see t
   /// `reject_merged_id_collisions`, `resolve_kind` calls, just
   /// owned at the boundary.
   fn build_stores_against(
-      root: &Path,
+      _root: &Path,
       args: &ProvisionArgs,
       adapter: &dyn Adapter,
       manifest: &Manifest,
   ) -> Result<OwnedProvisionStores, String> {
+      // `_root` is reserved for future per-root state but unused
+      // today. Prefix with `_` to silence `unused_variables` under
+      // `-D warnings` while keeping the precedent for future
+      // additions. Remove the underscore the moment a caller
+      // needs the value.
       let env_config = EnvConfig::from_env();
       reject_merged_id_collisions(&args.adapter, adapter, manifest, &env_config)?;
       Ok(OwnedProvisionStores {
@@ -1749,6 +1877,30 @@ Task 8b lays the structural reorder (synthesis + validation + dispatch all see t
       // mentions each path the adapter would touch and does NOT
       // include any path outside the allow-list.
   }
+
+  #[test]
+  fn dry_run_diff_handles_manifest_in_subdir_of_adapter_crate() {
+      // Fixture deliberately puts the manifest in a SUB-directory
+      // of the adapter crate so the bug actually surfaces:
+      //   [adapters.cloudflare.adapter]
+      //   crate = "crates/cf"
+      //   manifest = "crates/cf/config/wrangler.toml"
+      // The OLD static-name allow-list would compute the diff
+      // pair as `crates/cf/wrangler.toml` (adapter_crate_dir_rel
+      // joined with literal "wrangler.toml") -- WRONG location,
+      // diff would silently report no changes because both sides
+      // of `crates/cf/wrangler.toml` would be absent.
+      //
+      // Run --dry-run with this fixture. Assert the diff section
+      // includes BOTH `crates/cf/config/wrangler.toml` AND
+      // `crates/cf/config/.dev.vars` (the sibling). Asserting
+      // the absence of `crates/cf/wrangler.toml` from the diff
+      // output also catches the static-name regression.
+      //
+      // A test using `crates/cf/wrangler.toml` would NOT catch
+      // the bug because adapter_crate_dir_rel and the manifest
+      // parent dir would coincidentally match.
+  }
   ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1761,48 +1913,97 @@ Task 8b lays the structural reorder (synthesis + validation + dispatch all see t
   Add to `crates/edgezero-cli/src/provision.rs`:
 
   ```rust
-  /// Allow-list of provision-owned paths the dry-run driver diffs.
-  /// Per-adapter membership comes from spec §"Per-adapter local
-  /// state" (Axum: only `.edgezero/.env`; Cloudflare: wrangler.toml
-  /// + .dev.vars; Fastly: fastly.toml; Spin: spin.toml +
-  /// runtime-config.toml + <spin_crate>/.env). `axum.toml` is NOT
-  /// in this list (it stays tracked).
+  /// Resolved per-adapter allow-list inputs the dry-run driver
+  /// diffs. Built by the CLI from the resolved adapter manifest
+  /// path (NOT a static filename) so nested paths like
+  /// `crates/cf/wrangler.toml` resolve correctly. Spec §"Per-
+  /// adapter local state" defines membership per adapter:
+  /// - Axum: project-root `.edgezero/.env` only.
+  /// - Cloudflare: resolved `wrangler.toml` + sibling `.dev.vars`.
+  /// - Fastly: resolved `fastly.toml`.
+  /// - Spin: resolved `spin.toml` + sibling `runtime-config.toml`
+  ///   + sibling `.env`.
+  /// `axum.toml` is NOT in this list (it stays tracked).
+  pub(crate) struct DryRunAllowList {
+      /// (project_path, staged_path) pairs the driver diffs.
+      pub pairs: Vec<(PathBuf, PathBuf)>,
+  }
+
+  /// Build the allow-list from the resolved adapter manifest path.
+  /// Caller-provided `adapter_manifest_abs` is the absolute path
+  /// the adapter would write to (`manifest_root.join(
+  /// adapter_manifest_path.unwrap_or(<adapter_default>))`); the
+  /// helper computes its sibling paths (`.dev.vars`, `.env`,
+  /// `runtime-config.toml`) and the corresponding staged-tempdir
+  /// twins.
   ///
   /// **Case contract:** `Manifest::adapter_entry` at
   /// `crates/edgezero-core/src/manifest.rs:121` returns the
-  /// CANONICAL (operator-spelling) key -- e.g. `Fastly` or
-  /// `Cloudflare`. The allow-list match arms are lowercase by
-  /// convention. Callers MUST lowercase the adapter name BEFORE
-  /// passing it in. Otherwise `[adapters.Fastly]` would hit the
-  /// `_ => &[]` fallback and dry-run would silently diff nothing.
-  pub(crate) fn dry_run_allow_list(adapter_lower: &str) -> &'static [&'static str] {
+  /// CANONICAL (operator-spelling) key -- e.g. `Fastly`. The
+  /// match arms are lowercase by convention. Callers MUST
+  /// lowercase the adapter name before passing it in.
+  pub(crate) fn build_dry_run_allow_list(
+      project_root: &Path,
+      staged_root: &Path,
+      adapter_lower: &str,
+      adapter_manifest_abs: &Path,
+  ) -> DryRunAllowList {
+      let project_manifest = adapter_manifest_abs
+          .strip_prefix(staged_root)
+          .map(|rel| project_root.join(rel))
+          .unwrap_or_else(|_| adapter_manifest_abs.to_path_buf());
+      let manifest_parent_staged = adapter_manifest_abs
+          .parent()
+          .unwrap_or(staged_root)
+          .to_path_buf();
+      let manifest_parent_project = project_manifest
+          .parent()
+          .unwrap_or(project_root)
+          .to_path_buf();
+      let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+      let mut add = |proj: PathBuf, staged: PathBuf| pairs.push((proj, staged));
       match adapter_lower {
-          "axum" => &[".edgezero/.env"],
-          "cloudflare" => &["wrangler.toml", ".dev.vars"],
-          "fastly" => &["fastly.toml"],
-          "spin" => &["spin.toml", "runtime-config.toml", ".env"],
-          _ => &[],
+          "axum" => {
+              add(
+                  project_root.join(".edgezero/.env"),
+                  staged_root.join(".edgezero/.env"),
+              );
+          }
+          "cloudflare" => {
+              add(project_manifest.clone(), adapter_manifest_abs.to_path_buf());
+              add(
+                  manifest_parent_project.join(".dev.vars"),
+                  manifest_parent_staged.join(".dev.vars"),
+              );
+          }
+          "fastly" => {
+              add(project_manifest.clone(), adapter_manifest_abs.to_path_buf());
+          }
+          "spin" => {
+              add(project_manifest.clone(), adapter_manifest_abs.to_path_buf());
+              add(
+                  manifest_parent_project.join("runtime-config.toml"),
+                  manifest_parent_staged.join("runtime-config.toml"),
+              );
+              add(
+                  manifest_parent_project.join(".env"),
+                  manifest_parent_staged.join(".env"),
+              );
+          }
+          _ => {}
       }
+      DryRunAllowList { pairs }
   }
 
-  /// `adapter_crate_dir_rel` MUST be the **project-relative**
-  /// adapter crate path (e.g. `crates/edgezero-adapter-spin`),
-  /// NOT the absolute crate dir. Passing the joined-against-root
-  /// form would double-prefix `project_root` later. Caller's
-  /// `resolve_adapter_crate_dir(...)` returns the joined absolute
-  /// form; strip the project root before passing in (see Task 11
-  /// step 3 + Task 29's wrapper).
-  /// `adapter_lower` MUST be the lowercased adapter name (the
-  /// canonical operator spelling from `Manifest::adapter_entry`
-  /// preserves case -- `Fastly`, `Cloudflare` -- but the
-  /// `dry_run_allow_list` arms are lowercase). Caller does
-  /// `canonical_adapter_name.to_ascii_lowercase()` before
-  /// invoking.
+  /// Caller passes the result of `build_dry_run_allow_list(...)`;
+  /// the diff inputs come from `allow_list.pairs`. Status-line
+  /// rewriting (`wrote X` → `would write X`) is adapter-agnostic
+  /// and uses only the (project_root, staged_root) prefix swap
+  /// plus a verb-prefix table -- no adapter name needed.
   pub(crate) fn render_dry_run_report(
       project_root: &Path,
       staged_root: &Path,
-      adapter_crate_dir_rel: &Path,
-      adapter_lower: &str,
+      allow_list: &DryRunAllowList,
       outcome: &adapter_registry::ProvisionOutcome,
   ) -> String {
       use similar::TextDiff;
@@ -1823,60 +2024,60 @@ Task 8b lays the structural reorder (synthesis + validation + dispatch all see t
           out.push('\n');
       }
 
-      // Per-file diff section.
-      for rel in dry_run_allow_list(adapter_lower) {
-          // .env, .dev.vars, .edgezero/.env live at varying roots:
-          // resolve each against project_root + the adapter crate
-          // when applicable.
-          for (proj_path, staged_path) in resolve_allow_list_pair(
-              project_root, staged_root, adapter_crate_dir_rel, rel,
-          ) {
-              if !staged_path.exists() {
-                  continue;
-              }
-              let new = std::fs::read_to_string(&staged_path).unwrap_or_default();
-              let old = std::fs::read_to_string(&proj_path).unwrap_or_default();
-              if old == new {
-                  continue;
-              }
-              let diff = TextDiff::from_lines(&old, &new);
-              out.push_str(&format!("\n--- {}\n+++ {}\n", proj_path.display(), proj_path.display()));
-              for change in diff.iter_all_changes() {
-                  let sign = match change.tag() {
-                      similar::ChangeTag::Delete => "-",
-                      similar::ChangeTag::Insert => "+",
-                      similar::ChangeTag::Equal => " ",
-                  };
-                  out.push_str(&format!("{sign}{change}"));
-              }
+      // Per-file diff section: caller-provided pairs already
+      // resolved (project_path, staged_path) per adapter, with
+      // resolved adapter manifest path threaded through.
+      for (proj_path, staged_path) in &allow_list.pairs {
+          if !staged_path.exists() {
+              continue;
+          }
+          let new = std::fs::read_to_string(staged_path).unwrap_or_default();
+          let old = std::fs::read_to_string(proj_path).unwrap_or_default();
+          if old == new {
+              continue;
+          }
+          let diff = TextDiff::from_lines(&old, &new);
+          out.push_str(&format!("\n--- {}\n+++ {}\n", proj_path.display(), proj_path.display()));
+          for change in diff.iter_all_changes() {
+              let sign = match change.tag() {
+                  similar::ChangeTag::Delete => "-",
+                  similar::ChangeTag::Insert => "+",
+                  similar::ChangeTag::Equal => " ",
+              };
+              out.push_str(&format!("{sign}{change}"));
           }
       }
       out
   }
 
-  fn resolve_allow_list_pair(
-      project_root: &Path,
-      staged_root: &Path,
-      adapter_crate_dir_rel: &Path,
-      rel: &str,
-  ) -> Vec<(PathBuf, PathBuf)> {
-      // `.edgezero/.env` is project-root-anchored; everything else
-      // is adapter-crate-anchored.
-      if rel.starts_with(".edgezero/") {
-          vec![(
-              project_root.join(rel),
-              staged_root.join(rel),
-          )]
-      } else {
-          vec![(
-              project_root.join(adapter_crate_dir_rel).join(rel),
-              staged_root.join(adapter_crate_dir_rel).join(rel),
-          )]
+  /// Per-adapter default manifest filename, used as the
+  /// fallback when `[adapters.<name>.adapter].manifest` is unset.
+  /// Mirrors each adapter crate's existing default (Cloudflare
+  /// `cli.rs:198`, Fastly `cli.rs:214`, Spin `cli.rs:195`).
+  /// Axum is not in the dry-run allow-list (axum.toml stays
+  /// tracked).
+  pub(crate) fn default_adapter_manifest_for(adapter_lower: &str) -> &'static str {
+      match adapter_lower {
+          "cloudflare" => "wrangler.toml",
+          "fastly" => "fastly.toml",
+          "spin" => "spin.toml",
+          _ => "", // axum has no per-adapter manifest in the allow-list
       }
   }
+
+  // Path resolution that used to live in `resolve_allow_list_pair`
+  // is now in `build_dry_run_allow_list` above -- threading the
+  // resolved adapter manifest path through avoids the
+  // static-filename pitfall flagged by an earlier review. See
+  // `dry_run_diff_handles_manifest_in_subdir_of_adapter_crate`
+  // for the regression test: it uses
+  // `manifest = "crates/cf/config/wrangler.toml"` (manifest in
+  // a SUB-directory of the adapter crate dir) which the
+  // static-name version would silently mis-resolve to
+  // `crates/cf/wrangler.toml` and report no diff.
   ```
 
-  In the `(true, true)` arm of the dispatch matrix (Task 11), after the adapter returns, call `render_dry_run_report` and `println!` the result.
+  In the `(true, true)` arm of the dispatch matrix (Task 11), after the adapter returns, the caller computes `adapter_manifest_abs` (the staged-root-joined adapter manifest path used by the adapter dispatch above), calls `build_dry_run_allow_list(...)` with it, then `render_dry_run_report(...)` and `println!` the result.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -2562,11 +2763,27 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
       Ok(())
   }
 
-  /// Strip at most one leading `#` + adjacent whitespace, then
+  /// Strip at most ONE leading `#` + adjacent whitespace, then
   /// parse `<key>=<value>` and return the trimmed key. Returns
   /// `None` for blank lines and comment-only lines.
+  ///
+  /// Single-`#` semantics matter: `## KEY=value` (double hash --
+  /// the markdown-style heading shape some operators use as
+  /// section separators inside `.env` files) is NOT treated as
+  /// a commented `KEY=value` line; it returns `None` and gets
+  /// left alone. `trim_start_matches('#')` would strip every
+  /// leading `#` and accidentally collapse the section-heading
+  /// case into the commented-config case -- false dedup against
+  /// an operator's section separators. `strip_prefix('#')` after
+  /// `trim_start()` matches the docstring intent exactly.
   pub(crate) fn normalised_key(line: &str) -> Option<String> {
-      let stripped = line.trim_start().trim_start_matches('#').trim_start();
+      let trimmed = line.trim_start();
+      // Strip exactly ONE leading `#`, then any whitespace that
+      // follows it -- e.g. `# KEY=value`, `#KEY=value`, and
+      // `KEY=value` all normalise to the same key; `## KEY` does
+      // NOT.
+      let after_hash = trimmed.strip_prefix('#').unwrap_or(trimmed);
+      let stripped = after_hash.trim_start();
       let (k, _) = stripped.split_once('=')?;
       let k = k.trim();
       if k.is_empty() {
@@ -2574,6 +2791,32 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
       } else {
           Some(k.to_string())
       }
+  }
+  ```
+
+  Add a test asserting the single-hash semantic:
+
+  ```rust
+  #[test]
+  fn normalised_key_strips_at_most_one_leading_hash() {
+      // Uncommented and single-hash forms dedup against each other:
+      assert_eq!(normalised_key("KEY=v"),     Some("KEY".into()));
+      assert_eq!(normalised_key("#KEY=v"),    Some("KEY".into()));
+      assert_eq!(normalised_key("# KEY=v"),   Some("KEY".into()));
+      assert_eq!(normalised_key("  # KEY=v"), Some("KEY".into()));
+
+      // Double-hash leaves the second `#` in the key, producing
+      // a DIFFERENT normalised key ("# KEY") so dedup does NOT
+      // collapse `## KEY=v` into `KEY=v`. Operator section
+      // separators using `## …` stay intact. Crucially, the
+      // returned key is `"# KEY"` and NOT `"KEY"` -- the dedup
+      // map sees them as distinct entries.
+      assert_eq!(normalised_key("## KEY=v"), Some("# KEY".into()));
+
+      // Comment-only lines (no `=`) return None.
+      assert_eq!(normalised_key("# comment"),  None);
+      assert_eq!(normalised_key("### header"), None);
+      assert_eq!(normalised_key(""),           None);
   }
   ```
 
@@ -2629,16 +2872,41 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
   ```rust
   /// Synthesised baseline `wrangler.toml` for clean clones. See
-  /// spec §"Cloudflare (`wrangler.toml`)". Operators with non-
-  /// conventional layouts hand-edit the result; re-runs preserve
-  /// edits via merge mechanics.
+  /// spec §"Cloudflare (`wrangler.toml`)". Built via
+  /// `toml_edit::DocumentMut` (NOT raw `format!`) so any legal
+  /// `[app].name` -- including names with TOML-significant
+  /// characters like `"`, `\`, or newlines -- is escaped
+  /// correctly. Manifest validation today only length-bounds
+  /// the name, so raw interpolation could produce invalid TOML
+  /// for legal inputs.
   pub(crate) fn synthesise_wrangler_toml(app_name: &str) -> String {
-      format!(
-          "# edgezero-provision: v1\n\
-           name = \"{app_name}\"\n\
-           main = \"build/worker/shim.mjs\"\n\
-           compatibility_date = \"2024-01-01\"\n"
-      )
+      use toml_edit::{value, DocumentMut};
+      let mut doc = DocumentMut::new();
+      doc.decor_mut()
+          .set_prefix("# edgezero-provision: v1\n");
+      doc["name"] = value(app_name);
+      doc["main"] = value("build/worker/shim.mjs");
+      doc["compatibility_date"] = value("2024-01-01");
+      doc.to_string()
+  }
+  ```
+
+  Add a fuzz-style test covering pathological-but-legal `[app].name` values:
+
+  ```rust
+  #[test]
+  fn synthesise_wrangler_toml_escapes_pathological_app_names() {
+      for name in [
+          r#"has"quote"#,
+          r#"has\backslash"#,
+          "has\nnewline",
+          r#"has = equals"#,
+      ] {
+          let out = synthesise_wrangler_toml(name);
+          // Re-parsing must succeed AND round-trip the name.
+          let doc: toml_edit::DocumentMut = out.parse().unwrap();
+          assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
+      }
   }
   ```
 
@@ -2681,7 +2949,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
 **Interfaces:**
 
-- Consumes: synthesised baseline (Task 17), `ProvisionStores`, deployed-state lookup via `edgezero.toml` re-parse
+- Consumes: synthesised baseline (Task 17), `ProvisionStores`, `Option<&AdapterDeployedState>` from the new trait parameter (Task 3 step 2). The adapter does NOT re-parse `edgezero.toml` -- the CLI's `deployed_state_for(...)` translator (Task 8b step 3) builds the neutral state and threads it through both `synthesise_baseline_manifest` and `provision`.
 - Produces: Cloudflare's `ProvisionMode::Local` arm in `provision`
 
 - [ ] **Step 1: Write the failing tests**
@@ -2728,10 +2996,23 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   #[test]
   fn cloudflare_local_provision_resolves_nested_adapter_manifest_path() {
       // Fixture: adapter_manifest_path = "crates/cf/wrangler.toml"
-      // (app-demo style). Run local provision against an empty
-      // crates/cf/ dir. Assert crates/cf/wrangler.toml is created
-      // (NOT a sibling at the manifest_root level). Locks
-      // resolution against drift from manifest_root.join("wrangler.toml").
+      // (app-demo style). PRE-SEED crates/cf/wrangler.toml with
+      // the synthesised baseline (call synthesise_wrangler_toml
+      // and write the result to that path) so the test exercises
+      // what local provision does AFTER Task 8b's CLI bootstrap.
+      // The adapter's local arm assumes the file is present; the
+      // test must mirror that contract. Run local provision.
+      // Assert binding upsert lands inside crates/cf/wrangler.toml
+      // (NOT a sibling at the manifest_root level).
+  }
+
+  #[test]
+  fn cloudflare_local_provision_errors_if_manifest_absent() {
+      // Same fixture but DO NOT pre-seed wrangler.toml. Run local
+      // provision. Assert error mentions the missing path and
+      // synthesis was NOT attempted (the adapter trait does not
+      // receive app_name, so synthesis cannot happen here -- it's
+      // Task 8b's job).
   }
   ```
 
@@ -2744,7 +3025,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
   Replace the `ProvisionMode::Local => return Err(...)` stub in `provision` with a block that uses the logical/platform split (spec §"Logical ID vs platform-resolved name (v1 contract)"; matches the cloud arm at Task 16b):
 
-  1. Resolve `wrangler_path = manifest_root.join(adapter_manifest_path.unwrap_or("wrangler.toml"))` (mirrors today's resolution at `crates/edgezero-adapter-cloudflare/src/cli.rs:198`). The app-demo fixture points Cloudflare at `crates/app-demo-adapter-cloudflare/wrangler.toml`, so the root-level fallback is rarely the operative path. If `wrangler_path` is absent, write `synthesise_wrangler_toml(app_name)` there.
+  1. Resolve `wrangler_path = manifest_root.join(adapter_manifest_path.unwrap_or("wrangler.toml"))` (mirrors today's resolution at `crates/edgezero-adapter-cloudflare/src/cli.rs:198`). The app-demo fixture points Cloudflare at `crates/app-demo-adapter-cloudflare/wrangler.toml`, so the root-level fallback is rarely the operative path. **Assume `wrangler_path` already exists** -- Task 8b's CLI bootstrap calls `synthesise_baseline_manifest` and writes the baseline BEFORE `provision` runs. The adapter trait does not receive `app_name`, so synthesis CANNOT happen here; treating the file as already-present keeps the trait surface narrow. If the file is unexpectedly absent (operator deleted it after bootstrap, or a programmer error somewhere), return an error pointing at the missing path -- do NOT silently re-synthesise.
   2. Parse the file via `toml_edit::DocumentMut`.
   3. For each `store` in `stores.kv.iter().chain(stores.config.iter())` (matches `crates/edgezero-adapter-cloudflare/src/cli.rs:207`):
      - **Lookups use `store.logical`** (env-overlay-independent stable key):
@@ -2760,7 +3041,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   4. Write the file back (skip the write when `dry_run`; status line still emitted).
   5. Return `Ok(ProvisionOutcome { status_lines: vec![...], deployed: None })`.
 
-  The deployed-state lookup does NOT happen by re-parsing `edgezero.toml` from inside the adapter — that would re-introduce the `edgezero-adapter → edgezero-core` dep boundary violation a prior review caught. The CLI's Task 8b boundary translator (`deployed_state_for(manifest, canonical_adapter_name)`) reads `[adapters.cloudflare.deployed]` from the already-loaded `&Manifest` and hands the adapter a neutral `Option<&AdapterDeployedState>`. Within Cloudflare's local arm, the lookup is `deployed.and_then(|d| d.sub_tables.get("kv_namespaces")).and_then(|kv| kv.get(store.logical))` (for `id`) and the symmetrical `"preview_kv_namespaces"` lookup (for `preview_id`). When the CLI does re-parse on its own behalf (e.g. for the `ManifestLoader` it constructs for `ValidationContext`), the entry point is `ManifestLoader::from_path` at `crates/edgezero-core/src/manifest.rs:10` — NOT `Manifest::from_path`, which does not exist.
+  The deployed-state lookup uses the neutral `Option<&AdapterDeployedState>` parameter the trait now receives (Task 3 step 2). Within Cloudflare's local arm: `deployed.and_then(|d| d.sub_tables.get("kv_namespaces")).and_then(|kv| kv.get(store.logical))` for `id`, and the symmetrical `"preview_kv_namespaces"` lookup for `preview_id`. The adapter does NOT re-parse `edgezero.toml` -- the CLI's Task 8b boundary translator (`deployed_state_for(manifest, canonical_adapter_name)`) reads `[adapters.cloudflare.deployed]` from the already-loaded `&Manifest` and hands the adapter the neutral state. This preserves the `edgezero-adapter → edgezero-core` dep-free invariant.
 
   **Required env-overlay round-trip test** (in addition to the four tests above): set `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config` in the test's process env, fixture has `[stores.config].ids = ["app_config"]` and `[adapters.cloudflare.deployed].kv_namespaces.app_config = "abc123"`. Run local provision. Assert `wrangler.toml` contains `binding = "prod_config"` (platform-resolved name) AND `id = "abc123"` (deployed value looked up by logical id). A bug that collapses the split would either write `binding = "app_config"` or fail to find the deployed id.
 
@@ -2975,19 +3256,24 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
   ```rust
   pub(crate) fn synthesise_fastly_toml(app_name: &str, service_id: Option<&str>) -> String {
-      let mut out = String::from("# edgezero-provision: v1\n");
-      out.push_str("manifest_version = 3\n");
-      out.push_str(&format!("name = \"{app_name}\"\n"));
-      out.push_str("language = \"rust\"\n");
+      use toml_edit::{table, value, DocumentMut};
+      let mut doc = DocumentMut::new();
+      doc.decor_mut()
+          .set_prefix("# edgezero-provision: v1\n");
+      doc["manifest_version"] = value(3);
+      doc["name"] = value(app_name);
+      doc["language"] = value("rust");
       if let Some(svc) = service_id {
-          out.push_str(&format!("service_id = \"{svc}\"\n"));
+          doc["service_id"] = value(svc);
       }
-      out.push_str("\n[scripts]\n");
-      out.push_str("build = \"cargo build --profile release --target wasm32-wasip1\"\n");
-      out.push_str("\n[local_server]\n");
-      out
+      let scripts = doc["scripts"].or_insert(table());
+      scripts["build"] = value("cargo build --profile release --target wasm32-wasip1");
+      doc["local_server"].or_insert(table());
+      doc.to_string()
   }
   ```
+
+  Add the same pathological-name fuzz test as Cloudflare (`synthesise_fastly_toml_escapes_pathological_app_names`) plus a `synthesise_fastly_toml_escapes_pathological_service_id` covering service ids containing quotes / backslashes (`fastly compute deploy` may return arbitrary strings).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -3052,7 +3338,15 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
       //   data = ""
       //   [local_server.config_stores.app_config]
       //   format = "inline-toml"
-      //   contents = ""
+      //   [local_server.config_stores.app_config.contents]
+      //   # empty table -- NOT `contents = ""`
+      //
+      // `contents` MUST be a TOML table, not a string. The
+      // existing Fastly push writer at
+      // crates/edgezero-adapter-fastly/src/cli.rs:986 calls
+      // `contents_entry.as_table_mut()` and refuses to edit in
+      // place when the value isn't a table; provision writing
+      // a string here would brick subsequent `config push --local`.
   }
 
   #[test]
@@ -3067,16 +3361,43 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   }
 
   #[test]
-  fn fastly_local_provision_synthesises_when_absent() {
-      // Empty fixture dir. Run local provision; assert fastly.toml created.
+  fn fastly_local_provision_errors_if_manifest_absent() {
+      // DO NOT pre-seed fastly.toml. Run local provision.
+      // Assert error mentions the missing path (synthesis is
+      // Task 8b's CLI bootstrap concern; the adapter trait does
+      // not receive app_name so it cannot synthesise here).
+  }
+
+  #[test]
+  fn fastly_local_provision_upserts_deployed_service_id_into_existing_manifest() {
+      // Pre-seed fastly.toml WITHOUT a service_id key (operator
+      // deleted it, or it was synthesised before a deploy
+      // happened). Pass deployed.fields["service_id"] = "SVC1"
+      // via the new `deployed` parameter. Run local provision.
+      // Re-parse fastly.toml; assert top-level
+      // `service_id = "SVC1"` is now present. Locks the spec's
+      // "synthesising OR merging" rule -- the prior plan rev
+      // only handled service_id during synthesis (Task 8b), so
+      // operators who pre-seeded fastly.toml from a stale
+      // template would never get the deployed value pinned.
+  }
+
+  #[test]
+  fn fastly_local_provision_leaves_operator_service_id_alone_when_deployed_absent() {
+      // Pre-seed fastly.toml with `service_id = "operator-set"`.
+      // Pass `deployed = None` (no [adapters.fastly.deployed]).
+      // Run local provision. Assert service_id is still
+      // "operator-set" -- when there's no cloud authority, the
+      // operator's local value wins.
   }
 
   #[test]
   fn fastly_local_provision_resolves_nested_adapter_manifest_path() {
       // Fixture: adapter_manifest_path = "crates/fastly/fastly.toml".
-      // Run local provision against an empty crates/fastly/ dir.
-      // Assert crates/fastly/fastly.toml is created (NOT a
-      // sibling at the manifest_root level).
+      // PRE-SEED crates/fastly/fastly.toml via synthesise_fastly_toml
+      // (mirrors what Task 8b's bootstrap would write). Run local
+      // provision. Assert merges land inside crates/fastly/fastly.toml
+      // (NOT a sibling at the manifest_root level).
   }
   ```
 
@@ -3089,13 +3410,14 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
   In `crates/edgezero-adapter-fastly/src/cli.rs`'s `provision`:
 
-  1. Resolve `fastly_path = manifest_root.join(adapter_manifest_path.unwrap_or("fastly.toml"))` (mirrors today's resolution at `crates/edgezero-adapter-fastly/src/cli.rs:214`). If `fastly_path` is absent, synthesise + write there, passing deployed `service_id` from the already-loaded `Manifest`'s `[adapters.fastly.deployed]` block (translated by the CLI boundary translator from Task 8b; not re-parsed in the adapter).
+  1. Resolve `fastly_path = manifest_root.join(adapter_manifest_path.unwrap_or("fastly.toml"))` (mirrors today's resolution at `crates/edgezero-adapter-fastly/src/cli.rs:214`). **Assume `fastly_path` already exists** -- Task 8b's CLI bootstrap writes the baseline (including the pinned `service_id` from `deployed.fields["service_id"]`) BEFORE `provision` runs, and the trait does not receive `app_name`, so the adapter cannot synthesise here. If the file is unexpectedly absent, return an error pointing at the missing path -- do NOT silently re-synthesise.
   2. Parse `fastly_path` via `toml_edit::DocumentMut`.
-  3. For each `stores.kv.ids` entry: append `[[local_server.kv_stores.<platform>]]` array entry with `key = "__init__"`, `data = ""` IFF absent.
-  4. For each `stores.config.ids` entry: append `[local_server.config_stores.<platform>]` normal table with `format = "inline-toml"`, empty `contents` IFF absent.
-  5. Append `[local_server.config_stores.edgezero_runtime_env]` block IFF absent, with `contents` containing one `EDGEZERO__STORES__<KIND>__<LOGICAL_ID>__NAME = "<platform>"` per id (KV/CONFIG/SECRETS) and commented-out `# EDGEZERO__STORES__CONFIG__<LOGICAL_ID>__KEY = "<logical_id>_staging"` examples for CONFIG ids only.
-  6. Write back (skip on `dry_run`).
-  7. Status lines describe what was added.
+  3. **Upsert top-level `service_id` from `deployed.fields["service_id"]`** when present. Spec §"Fastly" → "Where durable identifiers live" says local provision reads `[adapters.fastly.deployed].service_id` when "synthesising OR MERGING `fastly.toml`" -- not just on first synthesis. If `deployed.fields.get("service_id")` is `Some(svc)`, set `doc["service_id"] = value(svc.as_str())` (overwrite stale local value with the cloud-authoritative one); if `None`, leave any existing operator-set value alone. Operator workflow: first cloud `deploy` creates the service id; operator commits it under `[adapters.fastly.deployed].service_id` in `edgezero.toml`; teammates' next `provision --local` pins it inside their gitignored `fastly.toml`.
+  4. For each `stores.kv.ids` entry: append `[[local_server.kv_stores.<platform>]]` array entry with `key = "__init__"`, `data = ""` IFF absent.
+  5. For each `stores.config.ids` entry: append `[local_server.config_stores.<platform>]` normal table with `format = "inline-toml"` AND an empty `[local_server.config_stores.<platform>.contents]` SUB-TABLE (NOT `contents = ""` — must be a TOML table per the existing Fastly push writer at `crates/edgezero-adapter-fastly/src/cli.rs:986`, which calls `contents_entry.as_table_mut()` and refuses to edit in place when the value isn't a table). IFF absent.
+  6. Append `[local_server.config_stores.edgezero_runtime_env]` block IFF absent, with `contents` containing one `EDGEZERO__STORES__<KIND>__<LOGICAL_ID>__NAME = "<platform>"` per id (KV/CONFIG/SECRETS) and commented-out `# EDGEZERO__STORES__CONFIG__<LOGICAL_ID>__KEY = "<logical_id>_staging"` examples for CONFIG ids only.
+  7. Write back (skip on `dry_run`).
+  8. Status lines describe what was added.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -3202,30 +3524,58 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
   ```rust
   pub(crate) fn synthesise_spin_toml(app_name: &str, component: Option<&str>) -> String {
+      use toml_edit::{array, table, value, Array, ArrayOfTables, DocumentMut, Table};
       let component_id = component.unwrap_or(app_name);
       let component_under = component_id.replace('-', "_");
-      format!(
-          "# edgezero-provision: v1\n\
-           spin_manifest_version = 2\n\
-           \n\
-           [application]\n\
-           name = \"{app_name}\"\n\
-           version = \"0.1.0\"\n\
-           \n\
-           [[trigger.http]]\n\
-           route = \"/...\"\n\
-           component = \"{component_id}\"\n\
-           \n\
-           [component.{component_id}]\n\
-           source = \"../../target/wasm32-wasip2/release/{component_under}.wasm\"\n\
-           key_value_stores = []\n"
-      )
+
+      let mut doc = DocumentMut::new();
+      doc.decor_mut()
+          .set_prefix("# edgezero-provision: v1\n");
+      doc["spin_manifest_version"] = value(2);
+
+      let application = doc["application"].or_insert(table());
+      application["name"] = value(app_name);
+      application["version"] = value("0.1.0");
+
+      // [[trigger.http]] is an array-of-tables; build via
+      // ArrayOfTables so toml_edit emits the `[[...]]` syntax
+      // and so the component reference is escaped correctly.
+      let mut http_trigger = Table::new();
+      http_trigger["route"] = value("/...");
+      http_trigger["component"] = value(component_id);
+      let trigger = doc["trigger"].or_insert(table());
+      let trigger_table = trigger.as_table_mut().expect("trigger must be a table");
+      let mut http_aot = ArrayOfTables::new();
+      http_aot.push(http_trigger);
+      trigger_table.insert("http", toml_edit::Item::ArrayOfTables(http_aot));
+
+      // `[component.<id>]` is a sub-table; component_id may
+      // contain TOML-significant chars in pathological cases,
+      // so insert via the typed Table API rather than splicing
+      // the id into a section header.
+      let component_section = doc["component"].or_insert(table());
+      let component_table = component_section
+          .as_table_mut()
+          .expect("component must be a table");
+      let mut comp = Table::new();
+      comp["source"] = value(format!(
+          "../../target/wasm32-wasip2/release/{component_under}.wasm"
+      ));
+      comp["key_value_stores"] = value(Array::new());
+      component_table.insert(component_id, toml_edit::Item::Table(comp));
+
+      doc.to_string()
   }
 
   pub(crate) fn synthesise_runtime_config_toml() -> String {
+      // No body keys yet -- the adapter's local arm appends
+      // `[key_value_store.<name>]` blocks via toml_edit on top
+      // of this header-only baseline.
       String::from("# edgezero-provision: v1\n")
   }
   ```
+
+  Add Spin pathological-name tests: `synthesise_spin_toml_escapes_pathological_app_names` AND `synthesise_spin_toml_escapes_pathological_component_id` (the component id flows into BOTH the `component = "..."` value AND the `[component.<id>]` key — both must round-trip cleanly).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -3303,17 +3653,34 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   }
 
   #[test]
-  fn spin_local_provision_synthesises_both_files_when_absent() {
-      // Empty fixture; assert spin.toml + runtime-config.toml created.
+  fn spin_local_provision_errors_if_spin_toml_absent() {
+      // DO NOT pre-seed spin.toml. Run local provision.
+      // Assert error mentions the missing path -- synthesis is
+      // Task 8b's CLI bootstrap concern; the adapter trait does
+      // not receive app_name or the component-id fallback so it
+      // cannot synthesise here.
+  }
+
+  #[test]
+  fn spin_local_provision_errors_if_runtime_config_toml_absent() {
+      // Pre-seed spin.toml but NOT runtime-config.toml.
+      // Assert error mentions runtime-config.toml is missing.
+      // Both files are part of Spin's synthesise_baseline_manifest
+      // output (Task 24); a present spin.toml without
+      // runtime-config.toml is a programmer error worth flagging
+      // explicitly.
   }
 
   #[test]
   fn spin_local_provision_resolves_nested_adapter_manifest_path() {
       // Fixture: adapter_manifest_path = "crates/spin/spin.toml".
-      // Run local provision against an empty crates/spin/ dir.
-      // Assert crates/spin/spin.toml AND crates/spin/runtime-config.toml
-      // are both created (runtime-config sits next to spin.toml,
-      // NOT at the manifest_root level).
+      // PRE-SEED both crates/spin/spin.toml (via synthesise_spin_toml)
+      // and crates/spin/runtime-config.toml (via
+      // synthesise_runtime_config_toml) -- mirrors what Task 8b's
+      // bootstrap would write. Run local provision. Assert merges
+      // land inside crates/spin/spin.toml AND
+      // crates/spin/runtime-config.toml (runtime-config sits
+      // next to spin.toml, NOT at the manifest_root level).
   }
   ```
 
@@ -3324,7 +3691,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
 - [ ] **Step 3: Implement Spin's local arm**
 
-  1. Resolve `spin_path = manifest_root.join(adapter_manifest_path.unwrap_or("spin.toml"))` (mirrors today's resolution at `crates/edgezero-adapter-spin/src/cli.rs:195`). Compute `runtime_config_path = spin_path.parent().unwrap_or(manifest_root).join("runtime-config.toml")` -- `runtime-config.toml` lives next to `spin.toml`, matching the Spin convention. Synthesise both when absent.
+  1. Resolve `spin_path = manifest_root.join(adapter_manifest_path.unwrap_or("spin.toml"))` (mirrors today's resolution at `crates/edgezero-adapter-spin/src/cli.rs:195`). Compute `runtime_config_path = spin_path.parent().unwrap_or(manifest_root).join("runtime-config.toml")` -- `runtime-config.toml` lives next to `spin.toml`, matching the Spin convention. **Assume both files already exist** -- Task 8b's CLI bootstrap calls Spin's `synthesise_baseline_manifest` (which returns BOTH paths from Task 24) and writes them BEFORE `provision` runs. The trait does not receive `app_name` or the component-id default, so synthesis CANNOT happen here. If either file is unexpectedly absent, return an error pointing at the missing path.
   2. Parse `spin_path` via `toml_edit::DocumentMut`; locate `[component.<component_id>]` and append missing store ids to `key_value_stores`.
   3. Parse `runtime_config_path`; append `[key_value_store.<platform>]` with `type = "spin"`, `path = ".spin/sqlite_key_value.db"` for each id.
   4. Append `__NAME` and commented `__KEY` lines to `<spin_crate>/.env` via `edgezero_adapter::env_file::append_lines_dedup` (introduced in Task 16c).
@@ -3375,7 +3742,11 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 
   Override `provision_typed`:
 
-  - Resolve `component_id` from `component_selector` (or `[app].name` fallback).
+  - Resolve `component_id` using Spin's existing manifest-based resolution -- `provision_typed` does NOT receive `app_name` (verify by re-reading the trait signature at Task 4), so the `[app].name` fallback the old plan wording mentioned cannot work here. Instead:
+    1. If `component_selector` is `Some(id)`, use it verbatim AND verify a `[component.<id>]` block exists in the parsed `spin.toml` (mirrors today's verification at `crates/edgezero-adapter-spin/src/cli.rs:942`); error if absent.
+    2. If `component_selector` is `None`, parse `spin.toml` and walk `doc["component"].as_table()`. If exactly ONE entry exists, use its key. If zero or multiple, return an explicit "ambiguous Spin component; set `[adapters.spin.adapter].component` to one of: ..." error.
+
+    Synthesis fallback (where `app_name` IS available) lives in `synthesise_spin_toml` (Task 24); that's the right place for the app-name default. By the time `provision_typed` runs, the baseline is already on disk and the manifest's `[component.*]` is the authoritative source.
   - For each entry, compute `spin_var = entry.key_value.to_ascii_lowercase()`.
   - Upsert `[variables].<spin_var>` and `[component.<component_id>.variables].<spin_var>` IFF absent.
   - Append `SPIN_VARIABLE_<spin_var.to_ascii_uppercase()>=` to `<spin_crate>/.env` via `edgezero_adapter::env_file::append_lines_dedup` (Task 16c).
@@ -3668,8 +4039,8 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
       let mut opts = edgezero_core::app_config::AppConfigLoadOptions::default();
       opts.env_overlay = false;
       let cfg: C = edgezero_core::app_config::deserialize_app_config_with_options::<C>(
-          &ctx.app_config_path,
-          &ctx.app_name,
+          ctx.app_config_path(),
+          ctx.app_name(),
           &opts,
       )
       .map_err(|e| format!("app config load failed: {e}"))?;
@@ -3712,20 +4083,16 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
               // Shared dry-run staging: ONE tempdir hosts base
               // provision + provision_typed so the typed merge
               // sees the baseline manifest the base step wrote.
-              let adapter_crate_dir = resolve_adapter_crate_dir(
-                  manifest_root,
-                  adapter_cfg.adapter.crate_path.as_deref(),
-              );
-              // render_dry_run_report needs the RELATIVE form (it
-              // joins against project_root + staged_root itself);
-              // passing the joined-absolute form here would
-              // double-prefix and miss diffs.
-              let adapter_crate_dir_rel: PathBuf = adapter_cfg
+              // run_with_staging takes the project-RELATIVE crate
+              // path (Task 10) -- pass adapter_cfg.adapter.crate_path
+              // directly, no need for the old resolve-then-strip
+              // helper.
+              let adapter_crate_rel = adapter_cfg
                   .adapter
                   .crate_path
                   .as_deref()
-                  .map(PathBuf::from)
-                  .unwrap_or_else(|| PathBuf::from("."));
+                  .map(Path::new)
+                  .unwrap_or_else(|| Path::new("."));
               let deployed_state = deployed_state_for(
                   ctx.manifest(),
                   canonical_adapter_name,
@@ -3734,12 +4101,12 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
                   manifest_root,
                   adapter_cfg.adapter.manifest.as_deref(),
                   adapter_cfg.adapter.component.as_deref(),
-                  &ctx.app_name,
+                  ctx.app_name(),
                   deployed_state.as_ref(),
               )?;
               let ((_outcome, report), _tempdir) = run_with_staging(
                   manifest_root,
-                  &adapter_crate_dir,
+                  adapter_crate_rel,
                   |staged_root, _staged_crate| {
                       write_baseline_to_disk(staged_root, &baseline_pairs)?;
                       adapter.validate_adapter_manifest(
@@ -3756,6 +4123,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
                           adapter_cfg.adapter.manifest.as_deref(),
                           adapter_cfg.adapter.component.as_deref(),
                           &stores,
+                          deployed_state.as_ref(),
                           edgezero_adapter::ProvisionMode::Local,
                           false,
                       )?;
@@ -3778,15 +4146,33 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
                       // Render INSIDE the closure: staged_root is
                       // still valid here; the tempdir drops after
                       // this closure returns. Lowercase the adapter
-                      // name -- dry_run_allow_list arms are
+                      // name -- the allow-list builder arms are
                       // lowercase, but adapter_entry returns the
                       // canonical operator spelling ("Fastly"
                       // would silently miss the allow-list).
+                      //
+                      // Build the allow-list from the RESOLVED
+                      // adapter manifest path (NOT a static
+                      // filename) so nested paths like
+                      // `crates/cf/wrangler.toml` diff correctly.
+                      let adapter_lower =
+                          canonical_adapter_name.to_ascii_lowercase();
+                      let adapter_manifest_abs = staged_root.join(
+                          adapter_cfg.adapter.manifest.as_deref()
+                              .unwrap_or(default_adapter_manifest_for(
+                                  &adapter_lower,
+                              )),
+                      );
+                      let allow_list = build_dry_run_allow_list(
+                          manifest_root,
+                          staged_root,
+                          &adapter_lower,
+                          &adapter_manifest_abs,
+                      );
                       let report = render_dry_run_report(
                           manifest_root,
                           staged_root,
-                          &adapter_crate_dir_rel,
-                          &canonical_adapter_name.to_ascii_lowercase(),
+                          &allow_list,
                           &combined,
                       );
                       Ok((combined, report))
@@ -4094,9 +4480,9 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
   - `examples/app-demo/crates/app-demo-adapter-spin/spin.toml`
   - Any in-tree `runtime-config.toml` next to the Spin manifest
 
-- [ ] **Step 1: Add the four patterns to root `.gitignore`**
+- [ ] **Step 1: Add the four manifest patterns + `.dev.vars` to root `.gitignore`**
 
-  Append to the existing root `.gitignore`:
+  Append to the existing root `.gitignore` (the current file at `.gitignore:18` already covers `.env` and the `.wrangler/` / `.spin/` state dirs but does NOT include `.dev.vars` — Cloudflare's smoke warm-up creates that file via Task 19, so without this entry the post-smoke worktree would not be clean):
 
   ```
   # Cloudflare / Fastly / Spin manifests — regenerated by `edgezero provision --local`.
@@ -4105,6 +4491,11 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
   spin.toml
   wrangler.toml
   runtime-config.toml
+
+  # Cloudflare per-adapter local secret placeholders — written by
+  # `<app-cli> provision --adapter cloudflare --local` (Task 20).
+  # Operator-edited values must NEVER be committed.
+  .dev.vars
   ```
 
 - [ ] **Step 2: Untrack the existing in-tree manifests using the portable runbook**
@@ -4112,7 +4503,15 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
   Run from repo root (do NOT use `xargs -r` — it is GNU-only):
 
   ```bash
-  tracked=$(git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$' || true)
+  # Regex matches the four generated manifest files AND any tracked
+  # `.dev.vars` (Cloudflare's per-secret placeholder file).
+  # The plan's in-tree app-demo fixture happens to NOT track
+  # `.dev.vars` today, but aligning the regex with the spec's
+  # downstream-migration regex (spec §"Migration for downstream
+  # projects") keeps the two runbooks symmetrical and protects
+  # against future drift where a contributor commits a smoke
+  # artifact by mistake.
+  tracked=$(git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' || true)
   if [ -n "$tracked" ]; then
       printf '%s\n' "$tracked" | xargs git rm --cached
   fi
@@ -4123,12 +4522,12 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
   Run: `ls examples/app-demo/crates/app-demo-adapter-{fastly,cloudflare,spin}/`
   Expected: each adapter's manifest is still present in the worktree.
 
-- [ ] **Step 4: Sanity-check the gitignore covered ALL four generated manifest names**
+- [ ] **Step 4: Sanity-check the gitignore covered ALL five gated paths**
 
-  Run the same regex the CI gate (Task 37) installs — match all four generated manifests, NOT just `runtime-config.toml`:
+  Run the SAME regex the CI gate (Task 37) installs — match the four generated manifests AND `.dev.vars`. The regex MUST stay byte-identical to Task 37's so the two checks can never drift; if you find yourself changing one, change the other in the same commit.
 
   ```sh
-  git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$' && exit 1 || true
+  git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' && exit 1 || true
   ```
 
   Expected: no output. (`axum.toml` is intentionally NOT in the regex; it stays tracked.) Task 37 lands the same check as a permanent CI step; this step is the local pre-flight verification that the `git rm --cached` in Step 2 caught every tracked instance.
@@ -4471,29 +4870,42 @@ The spec gitignores FOUR manifest filenames: `fastly.toml`, `spin.toml`, `wrangl
   In the existing test workflow, after dependency install + before `cargo test`, add:
 
   ```yaml
-  - name: Enforce Cloudflare/Fastly/Spin manifests are not tracked
+  - name: Enforce Cloudflare/Fastly/Spin manifests and .dev.vars are not tracked
     run: |
-      if git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$'; then
-        echo "::error::These adapter manifests must be gitignored (spec §'Cloudflare / Fastly / Spin manifests are gitignored'). axum.toml is the only adapter manifest that stays tracked."
+      if git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$'; then
+        echo "::error::These adapter manifests AND Cloudflare's .dev.vars must be gitignored (spec §'Cloudflare / Fastly / Spin manifests are gitignored' + §'Migration for downstream projects'). axum.toml is the only adapter manifest that stays tracked. .dev.vars carries operator secret values and must NEVER be committed."
         exit 1
       fi
   ```
 
+  The regex matches the four generated manifests AND `.dev.vars` -- aligning with the gitignore entries from Task 33 and the spec's downstream migration runbook. Without `.dev.vars` in the CI gate, an operator who accidentally `git add`'d their `.dev.vars` after editing real secret values would push the secrets to the remote unflagged.
+
 - [ ] **Step 2: Verify the step is present**
 
-  Run: `yq '.jobs.test.steps[] | select(.name == "Enforce Cloudflare/Fastly/Spin manifests are not tracked")' .github/workflows/test.yml`
+  Run: `yq '.jobs.test.steps[] | select(.name == "Enforce Cloudflare/Fastly/Spin manifests and .dev.vars are not tracked")' .github/workflows/test.yml`
   Expected: the step is present.
 
-- [ ] **Step 3: Sanity-check the regex matches the four targets but NOT `axum.toml`**
+- [ ] **Step 3: Sanity-check the regex matches the five targets but NOT `axum.toml`**
 
-  Run locally: `printf '%s\n' 'crates/x/fastly.toml' 'crates/x/spin.toml' 'crates/x/wrangler.toml' 'crates/x/runtime-config.toml' 'crates/x/axum.toml' | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$'`
-  Expected: prints the first four, NOT `axum.toml`.
+  Run locally:
+
+  ```sh
+  printf '%s\n' \
+    'crates/x/fastly.toml' \
+    'crates/x/spin.toml' \
+    'crates/x/wrangler.toml' \
+    'crates/x/runtime-config.toml' \
+    'crates/x/.dev.vars' \
+    'crates/x/axum.toml' \
+    | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$'
+  ```
+  Expected: prints the first FIVE (four manifests + `.dev.vars`), NOT `axum.toml`.
 
 - [ ] **Step 4: Commit**
 
   ```bash
   git add .github/workflows/test.yml
-  git commit -m "CI: gate fastly/spin/wrangler/runtime-config.toml tracking (axum.toml exempt)"
+  git commit -m "CI: gate fastly/spin/wrangler/runtime-config.toml + .dev.vars (axum.toml exempt)"
   ```
 
 ---
