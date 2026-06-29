@@ -167,6 +167,7 @@ mod tests {
         run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: false,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect("axum provision exits 0 (no remote resources)");
@@ -184,6 +185,7 @@ mod tests {
         run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect("axum dry-run also exits 0");
@@ -201,6 +203,7 @@ mod tests {
         let err = run_provision(&ProvisionArgs {
             adapter: "wat".to_owned(),
             dry_run: false,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect_err("unknown adapter must error");
@@ -230,6 +233,7 @@ mod tests {
         run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect("spin dry-run dispatches cleanly");
@@ -268,6 +272,7 @@ adapters = ["axum"]
         let err = run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect_err("malformed handler must error before dispatch");
@@ -298,6 +303,7 @@ adapters = ["axum"]
         let err = run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect_err("zero-component spin.toml must error pre-dispatch");
@@ -349,6 +355,7 @@ default = "default"
         let err = run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect_err("Single-capability violation must error");
@@ -398,6 +405,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect("multi-config dispatch must succeed under KV-backed config");
@@ -451,6 +459,7 @@ ids = ["default"]
         let err = run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect_err("env-overlay platform-label collision must fail provision");
@@ -480,6 +489,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "spin".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect("single-id case dispatches cleanly");
@@ -501,6 +511,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "cloudflare".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect("cloudflare dry-run dispatches cleanly");
@@ -521,6 +532,7 @@ ids = ["default"]
         run_provision(&ProvisionArgs {
             adapter: "fastly".to_owned(),
             dry_run: true,
+            local: false,
             manifest: manifest_path.clone(),
         })
         .expect("fastly dry-run dispatches cleanly");

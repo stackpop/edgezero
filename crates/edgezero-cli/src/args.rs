@@ -172,6 +172,12 @@ pub struct ProvisionArgs {
     /// without performing them.
     #[arg(long)]
     pub dry_run: bool,
+    /// Switch the flow from cloud-SDK shell-outs to local-file writes.
+    /// Adapter-local manifests, env files, and runtime-config TOML are
+    /// synthesised or merged in place; no cloud CLIs are invoked. See
+    /// spec §"CLI" for the full mode contract.
+    #[arg(long)]
+    pub local: bool,
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
@@ -191,6 +197,7 @@ impl Default for ProvisionArgs {
         Self {
             adapter: String::new(),
             dry_run: false,
+            local: false,
             manifest: default_manifest_path(),
         }
     }
@@ -663,6 +670,30 @@ mod tests {
     fn provision_requires_adapter() {
         Args::try_parse_from(["edgezero", "provision"])
             .expect_err("`provision` without --adapter must error");
+    }
+
+    #[test]
+    fn provision_args_local_flag_defaults_false() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ProvisionArgs,
+        }
+        let cli = Cli::try_parse_from(["bin", "--adapter", "spin"]).unwrap();
+        assert!(!cli.args.local);
+    }
+
+    #[test]
+    fn provision_args_local_flag_parses() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ProvisionArgs,
+        }
+        let cli = Cli::try_parse_from(["bin", "--adapter", "spin", "--local"]).unwrap();
+        assert!(cli.args.local);
     }
 
     // ── config push / diff stub tests (12.8 + 12.11) ──────────────────

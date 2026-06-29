@@ -22,6 +22,17 @@ pub enum AdapterAction {
     Serve,
 }
 
+/// Provision dispatch mode. `Cloud` keeps today's cloud-CLI shell-out
+/// behaviour; `Local` writes adapter-local emulator state (no cloud
+/// calls). Threaded through `Adapter::provision` so each adapter
+/// branches once at the top of its impl. See spec §"CLI / trait
+/// surface".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvisionMode {
+    Cloud,
+    Local,
+}
+
 /// A single declared store id, paired with the platform name the
 /// runtime will resolve via `EDGEZERO__STORES__<KIND>__<ID>__NAME`.
 ///
