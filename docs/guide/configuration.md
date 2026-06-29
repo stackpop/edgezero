@@ -150,37 +150,28 @@ the `Secrets` extractor. This is separate from `[[environment.secrets]]`:
 
 ```toml
 [stores.secrets]
-name = "EDGEZERO_SECRETS"
-
-[stores.secrets.adapters.fastly]
-name = "MY_FASTLY_SECRETS"
+ids     = ["default"]            # one id per logical secret store
+# default = "default"            # required when ids.len() > 1
 ```
 
-### Global Fields
-
-| Field     | Required | Description                                                                                                 |
-| --------- | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `enabled` | No       | Whether secrets are enabled for adapters without overrides (defaults to `true` when the section is present) |
-| `name`    | No       | Store or binding name (defaults to `EDGEZERO_SECRETS`)                                                      |
-
-### Per-Adapter Overrides
-
-| Field                        | Required | Description                                   |
-| ---------------------------- | -------- | --------------------------------------------- |
-| `adapters.<adapter>.enabled` | No       | Override whether that adapter exposes secrets |
-| `adapters.<adapter>.name`    | No       | Override the adapter-specific store name      |
+The portable `[stores.<kind>]` schema declares **logical ids only**.
+Platform names are resolved at runtime from
+`EDGEZERO__STORES__SECRETS__<ID>__NAME` (defaulting to the logical id
+when unset). Migrating from the pre-rewrite `name` /
+`[stores.secrets.adapters.*]` form? See
+[the migration guide](./manifest-store-migration.md).
 
 ### Adapter Behavior
 
-- Axum reads secrets from process environment variables of the same name.
-- Fastly opens the configured secret store name from `fastly.toml`.
-- Cloudflare reads Worker Secrets individually; the configured `name` is metadata only.
-- Spin reads component variables from `spin.toml` in a single flat namespace. The configured `name`
-  and named secret-store overrides are metadata only for Spin; variable names must be declared in
-  lowercase and are looked up through the Spin variables API.
+| Adapter    | Capability                       | Notes                                                                            |
+| ---------- | -------------------------------- | -------------------------------------------------------------------------------- |
+| axum       | Single (env vars)                | Every declared id maps to the same env-backed store                              |
+| cloudflare | Single (Worker Secrets)          | Per-id `NAME` variables are ignored                                              |
+| fastly     | Multi (Fastly Secret Store)      | Each id opens its own platform store via `EDGEZERO__STORES__SECRETS__<ID>__NAME` |
+| spin       | Single (flat Spin `[variables]`) | Per-id `NAME` variables are ignored                                              |
 
-If `[stores.secrets]` is omitted, the `Secrets` extractor is not attached for
-that adapter. The Spin `run_app` helper honors this manifest gate.
+If `[stores.secrets]` is omitted, the `Secrets` extractor is not attached and
+the runtime `secret_store` accessors on `RequestContext` return `None`.
 
 ## Stores Section
 
@@ -189,39 +180,156 @@ or service settings:
 
 ```toml
 [stores.config]
-name = "app_config"
-
-[stores.config.defaults]
-"greeting" = "hello from config store"
-"service.timeout_ms" = "1500"
-
-[stores.config.adapters.cloudflare]
-name = "app_config"
+ids     = ["app_config"]         # one id per logical config store
+# default = "app_config"         # required when ids.len() > 1
 ```
 
-| Field      | Required | Description                                                                                                       |
-| ---------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
-| `name`     | No       | Global store or binding name; if omitted but the section is present, adapters fall back to `EDGEZERO_CONFIG`      |
-| `adapters` | No       | Per-adapter name overrides, keyed by supported lowercase adapter name (`axum`, `cloudflare`, `fastly`)            |
-| `defaults` | No       | Local default values used by the Axum adapter when env vars are absent; this key set is also Axum's env allowlist |
+The portable schema is symmetric across `[stores.kv]`, `[stores.config]`,
+and `[stores.secrets]`: declare logical `ids` only; resolve platform
+names at runtime via `EDGEZERO__STORES__<KIND>__<ID>__NAME`. The
+pre-rewrite `name`, `enabled`, `[stores.config.defaults]`, and
+`[stores.config.adapters.*]` fields are a hard load error — see
+[the migration guide](./manifest-store-migration.md).
 
 Runtime behavior by adapter:
 
-- Fastly reads from a Fastly Config Store resource link.
-- Cloudflare reads from a single JSON string binding in `wrangler.toml [vars]`.
-- Axum reads only the env vars declared in `defaults`, then falls back to `defaults`.
-- Spin reads component variables declared in `spin.toml`. Spin variables use a flat namespace with
-  lowercase names; there is no config-store binding name, so `[stores.config.adapters.spin]` is
-  rejected during manifest validation.
+- Fastly reads from a Fastly Config Store resource link, one per id.
+- Cloudflare reads from a KV namespace, one per id, asynchronously.
+- Axum reads from `.edgezero/local-config-<id>.json` per logical id
+  (one file per declared config id). Seed entries with
+  `config push --adapter axum`, which writes the same file the
+  runtime reads (creates `.edgezero/` on first use). No shell-out;
+  the file is human-editable for ad-hoc tweaks.
+- Spin reads a `spin_sdk::key_value::Store` per id, one label per
+  declared `[stores.config]` id (multi-store). Labels must be declared
+  in `spin.toml`'s `[component.<id>].key_value_stores` — `provision`
+  writes them automatically. Seed entries via `config push --adapter
+spin`, which dispatches per-backend by reading `runtime-config.toml`:
+  `type = "spin"` → direct write into the local `.spin/sqlite_key_value.db`;
+  Fermyon Cloud deploys → shell `spin cloud key-value set`; other
+  backend types (redis, azure_cosmos) print an actionable error
+  pointing at the backend's native CLI. See
+  [Spin adapter](/guide/adapters/spin#seeding-the-store) for the
+  full resolution order.
 
-When `[stores.config]` is present, the `app!` macro generates config-store metadata on the `App`
-type. The standard adapter `run_app` helpers use that metadata to inject a config-store handle into
-request extensions automatically, so handlers can call `ctx.config_store()`. The Spin `run_app`
-helper also reads the embedded manifest and injects the config store only when `[stores.config]`
-exists or macro-generated config-store metadata is present.
+When `[stores.config]` is present, the `app!` macro bakes the portable
+store registry into `Hooks::stores()`. Adapter `run_app` helpers build
+a per-request `ConfigRegistry` and inject it into request extensions so
+handlers can call `ctx.config_store("app_config")` (or
+`ctx.config_store_default()`).
 
 Treat config-store keys like API surface: validate or allowlist any user-controlled lookup before
-calling `ctx.config_store()?.get(...)`.
+calling `ctx.config_store_default()?.get(...)`.
+
+## Application config
+
+`edgezero.toml` describes the _shape_ of the app — routes, adapters,
+stores. A separate `<name>.toml` file (e.g. `my-app.toml`, sitting
+alongside `edgezero.toml`) carries the _typed values_ the app reads at
+request time: feature flags, timeouts, the keys it uses to look up
+secrets. `edgezero new` generates both, plus a `<Name>Config` struct
+in `crates/<name>-core/src/config.rs` that the file deserialises into.
+
+```rust
+// crates/my-app-core/src/config.rs
+use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+#[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+#[serde(deny_unknown_fields)]
+pub struct MyAppConfig {
+    pub greeting: String,
+    pub service: ServiceConfig,
+
+    #[secret]
+    pub api_token: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceConfig {
+    #[validate(range(min = 100, max = 60_000))]
+    pub timeout_ms: u32,
+}
+```
+
+```toml
+# my-app.toml — loaded into MyAppConfig
+greeting = "hello from my-app"
+api_token = "demo_api_token"   # key into the default secret store
+
+[service]
+timeout_ms = 1500
+```
+
+The file's top-level table maps 1:1 to the struct — no `[config]`
+wrapper. `deny_unknown_fields` makes typos in the TOML a hard load
+error rather than a silent drop.
+
+### Loading the config
+
+```rust
+use edgezero_core::app_config::load_app_config;
+
+let cfg: MyAppConfig =
+    load_app_config(std::path::Path::new("my-app.toml"), "my-app")?;
+```
+
+The function deserialises, runs the `validator` rules (e.g.
+`#[validate(range(...))]`), and returns the typed struct.
+
+### Secret annotations
+
+| Attribute              | Meaning                                                                                        |
+| ---------------------- | ---------------------------------------------------------------------------------------------- |
+| `#[secret]`            | The field's value is a **key inside the default secret store** declared by `[stores.secrets]`. |
+| `#[secret(store_ref)]` | The field's value is a **logical store id** that must appear in `[stores.secrets].ids`.        |
+
+Only bare `String` fields can carry a `#[secret]` annotation;
+combining it with `#[serde(flatten)]`, `#[serde(rename)]`, or
+`#[serde(skip)]` is a compile error. The `config validate` command
+(see [CLI reference](/guide/cli-reference)) checks that every
+`#[secret(store_ref)]` value matches a declared id.
+
+Resolve secrets at request time from the secret store:
+
+```rust
+// #[secret] field — key in the default store
+let token = ctx
+    .secret_store_default()?
+    .require_str(&cfg.api_token)
+    .await?;
+
+// #[secret(store_ref)] field — value names the store itself
+let value = ctx
+    .secret_store(&cfg.vault)?
+    .require_str("active")
+    .await?;
+```
+
+### Environment-variable overlay
+
+Every key in `<name>.toml` can be overridden at runtime by an env
+var named `<APP_NAME>__<SECTION>__…__<KEY>` (uppercase, with `-` in
+the app name replaced by `_`, segments joined by a double-underscore).
+The overlay only applies to keys **already present in the file** —
+it can't introduce new ones — and the existing TOML value's type
+drives how the env string is coerced (`"true"` / `"false"` for
+`bool`, parsed integers for numeric fields, etc.).
+
+```sh
+# Override the nested service.timeout_ms key:
+MY_APP__SERVICE__TIMEOUT_MS=2500 \
+    cargo run -p my-app-adapter-axum
+```
+
+The env-segment translation is uppercase-only — it does **not**
+substitute `-` for `_`, so dashed and underscored TOML keys remain
+distinct env segments. The only way two siblings collapse is when
+they differ only in letter case (e.g. `greeting_a` and `GREETING_A`,
+both uppercasing to `GREETING_A`). That case is rejected as an
+`EnvOverlay` error before any override is applied, so a
+misconfiguration leaves the file values intact.
 
 ## Adapters Section
 
@@ -325,7 +433,7 @@ value = "https://api.example.com"
 name = "API_KEY"
 
 [stores.secrets]
-name = "EDGEZERO_SECRETS"
+ids = ["default"]
 
 [adapters.fastly.adapter]
 crate = "crates/my-app-adapter-fastly"
@@ -374,15 +482,24 @@ serve = "cargo run -p my-app-adapter-axum"
 
 Axum bind-address precedence is:
 
-1. `EDGEZERO_HOST` / `EDGEZERO_PORT`
-2. `edgezero.toml` `[adapters.axum.adapter]` `host` / `port`
-3. `axum.toml` `[adapter]` `host` / `port` when launching through the Axum adapter CLI wrapper
+1. `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT` (canonical;
+   read directly by the runtime). The pre-rewrite
+   `EDGEZERO_HOST` / `EDGEZERO_PORT` shim is gone — rename any CI
+   scripts or local overrides to the canonical double-underscore
+   form.
+2. `edgezero.toml` `[adapters.axum.adapter]` `host` / `port` (the CLI
+   translates these into `EDGEZERO__ADAPTER__HOST` / `EDGEZERO__ADAPTER__PORT`
+   when spawning the subprocess; if a canonical env var is already set,
+   it wins)
+3. `axum.toml` `[adapter]` `host` / `port` when launching through the
+   Axum adapter CLI wrapper
 4. default `127.0.0.1:8787`
 
 Example override:
 
 ```sh
-EDGEZERO_HOST=0.0.0.0 EDGEZERO_PORT=3000 cargo run -p my-app-adapter-axum
+EDGEZERO__ADAPTER__HOST=0.0.0.0 EDGEZERO__ADAPTER__PORT=3000 \
+    cargo run -p my-app-adapter-axum
 ```
 
 ## Using the Manifest
@@ -403,7 +520,7 @@ The macro:
 - Parses HTTP triggers
 - Generates route registration
 - Wires middleware from the manifest
-- Generates config-store metadata from `[stores.config]` when present
+- Bakes portable store metadata (`Hooks::stores()`) from `[stores.kv]`, `[stores.config]`, and `[stores.secrets]` when present
 - Creates the `App` struct that implements `Hooks` (use `App::build_app()`)
 
 ### ManifestLoader

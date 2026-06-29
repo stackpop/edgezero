@@ -63,13 +63,29 @@ struct AdapterContext<'blueprint> {
 }
 
 struct ProjectLayout {
+    cli_dir: PathBuf,
+    cli_name: String,
     core_dir: PathBuf,
     core_mod: String,
     core_name: String,
     crates_dir: PathBuf,
+    /// `EnvPrefix` Handlebars key -- the project name normalised to
+    /// the env-var prefix the runtime actually reads (uppercase,
+    /// `-`→`_`). Mirrors `edgezero_core::app_config::app_name_prefix`
+    /// EXACTLY so the scaffold's documentation comments name the
+    /// real overlay key (e.g. `MY_APP__SERVICE__TIMEOUT_MS=...`),
+    /// not the source-form lowercase (`my-app__...` would be
+    /// silently ignored at runtime).
+    env_prefix: String,
     name: String,
     out_dir: PathBuf,
     project_mod: String,
+    /// `NameUpperCamel` Handlebars key — the project name converted to
+    /// upper-camel-case (`my-app` → `MyApp`) and guaranteed to be a
+    /// valid Rust type identifier. Used by the `<Name>Config`
+    /// struct in the generated `config.rs` and reused by the stage-8
+    /// `*-cli` template.
+    upper_camel: String,
 }
 
 impl ProjectLayout {
@@ -92,16 +108,27 @@ impl ProjectLayout {
         let core_src = core_dir.join("src");
         fs::create_dir_all(&core_src).map_err(|err| GeneratorError::io(&core_src, err))?;
 
+        let cli_name = format!("{name}-cli");
+        let cli_dir = crates_dir.join(&cli_name);
+        let cli_src = cli_dir.join("src");
+        fs::create_dir_all(&cli_src).map_err(|err| GeneratorError::io(&cli_src, err))?;
+
         let project_mod = name.replace('-', "_");
         let core_mod = core_name.replace('-', "_");
+        let upper_camel = upper_camel_from_sanitized(&name);
+        let env_prefix = env_prefix_from_name(&name);
         Ok(ProjectLayout {
+            cli_dir,
+            cli_name,
             core_dir,
             core_mod,
             core_name,
             crates_dir,
+            env_prefix,
             name,
             out_dir,
             project_mod,
+            upper_camel,
         })
     }
 }
@@ -115,6 +142,61 @@ struct AdapterArtifacts {
     workspace_members: Vec<String>,
 }
 
+/// Convert a sanitised crate name to upper-camel-case, guaranteed to be
+/// a valid Rust type identifier.
+///
+/// Splits on `-` and `_`, drops empty segments (this naturally absorbs
+/// a leading `_` that `sanitize_crate_name` may have inserted), then
+/// upper-cases the first character of each segment. If the result
+/// would be empty or start with a non-letter, it is prefixed with
+/// `App` so the output is always a valid `struct` name.
+fn upper_camel_from_sanitized(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for segment in name.split(['-', '_']).filter(|seg| !seg.is_empty()) {
+        let mut chars = segment.chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            for ch in chars {
+                out.extend(ch.to_lowercase());
+            }
+        }
+    }
+    if out.is_empty() || !out.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+        let mut prefixed = String::with_capacity(out.len().saturating_add(3));
+        prefixed.push_str("App");
+        prefixed.push_str(&out);
+        prefixed
+    } else {
+        out
+    }
+}
+
+/// Derive the env-overlay prefix the runtime reads for this project.
+///
+/// MUST mirror `edgezero_core::app_config::app_name_prefix`
+/// EXACTLY -- otherwise the scaffold's documentation comments
+/// would advertise an env-var spelling the runtime ignores. The
+/// runtime rule is `to_ascii_uppercase().replace('-', "_")`, so
+/// `my-app` -> `MY_APP` and `app-demo` -> `APP_DEMO`.
+fn env_prefix_from_name(name: &str) -> String {
+    name.to_ascii_uppercase().replace('-', "_")
+}
+
+/// Locate the edgezero checkout that built this binary.
+///
+/// `CARGO_MANIFEST_DIR` is baked in at compile time and points at
+/// `crates/edgezero-cli`; its grandparent is the workspace root. Returns
+/// `None` when that path no longer holds a checkout (e.g. an installed
+/// binary whose source tree was moved or removed), in which case
+/// dependency resolution falls back to Git.
+fn edgezero_repo_root() -> Option<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent()?.parent()?;
+    let is_checkout = root.join("crates/edgezero-cli/src/lib.rs").is_file()
+        && root.join("crates/edgezero-core/src/lib.rs").is_file();
+    is_checkout.then(|| root.to_path_buf())
+}
+
 /// # Errors
 /// Returns [`GeneratorError`] if any filesystem operation, template render,
 /// or layout invariant fails.
@@ -122,14 +204,23 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
     let layout = ProjectLayout::new(args)?;
 
     let mut workspace_dependencies = seed_workspace_dependencies();
-    let cwd = env::current_dir().map_err(|err| GeneratorError::io(".", err))?;
-    let core_crate_line = resolve_core_dependency(&layout, &cwd, &mut workspace_dependencies);
+    // Resolve edgezero dependencies against the checkout that built this
+    // binary so generated projects use path dependencies wherever they are
+    // created. Only an installed binary detached from its source tree falls
+    // back to the current directory (and then, typically, to Git).
+    let repo_root = match edgezero_repo_root() {
+        Some(root) => root,
+        None => env::current_dir().map_err(|err| GeneratorError::io(".", err))?,
+    };
+    let core_crate_line = resolve_core_dependency(&layout, &repo_root, &mut workspace_dependencies);
+    let cli_crate_line = resolve_cli_dependency(&layout, &repo_root, &mut workspace_dependencies);
 
-    let adapter_artifacts = collect_adapter_data(&layout, &cwd, &mut workspace_dependencies)?;
+    let adapter_artifacts = collect_adapter_data(&layout, &repo_root, &mut workspace_dependencies)?;
 
     let mut data_map = build_base_data(
         &layout,
         &core_crate_line,
+        &cli_crate_line,
         &adapter_artifacts,
         &workspace_dependencies,
     );
@@ -164,6 +255,10 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     );
     deps.insert("axum".to_owned(), "axum = \"0.8\"".to_owned());
     deps.insert(
+        "clap".to_owned(),
+        "clap = { version = \"4\", features = [\"derive\"] }".to_owned(),
+    );
+    deps.insert(
         "serde".to_owned(),
         "serde = { version = \"1\", features = [\"derive\"] }".to_owned(),
     );
@@ -186,14 +281,51 @@ fn seed_workspace_dependencies() -> BTreeMap<String, String> {
     deps.insert("tracing".to_owned(), "tracing = \"0.1\"".to_owned());
     deps.insert(
         "spin-sdk".to_owned(),
-        "spin-sdk = { version = \"5.2\", default-features = false }".to_owned(),
+        "spin-sdk = { version = \"6\", default-features = false }".to_owned(),
+    );
+    // Core depends on `validator` for `#[derive(Validate)]` on the
+    // generated `<Name>Config` struct. Pinned to the same
+    // major as the edgezero workspace so a `workspace = true` dep in
+    // the generated core crate resolves cleanly.
+    deps.insert(
+        "validator".to_owned(),
+        "validator = { version = \"0.20\", features = [\"derive\"] }".to_owned(),
     );
     deps
 }
 
+fn resolve_cli_dependency(
+    layout: &ProjectLayout,
+    repo_root: &Path,
+    workspace_dependencies: &mut BTreeMap<String, String>,
+) -> String {
+    const CLI_GIT_FALLBACK: &str = "edgezero-cli = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-cli\" }";
+
+    let ResolvedDependency {
+        name,
+        workspace_line,
+        crate_line,
+    } = resolve_dep_line(
+        &layout.out_dir,
+        repo_root,
+        "crates/edgezero-cli",
+        CLI_GIT_FALLBACK,
+        &[],
+    );
+
+    if workspace_line == CLI_GIT_FALLBACK {
+        log::warn!(
+            "[edgezero] the generated CLI crate depends on `edgezero-cli` via a Git fallback; it will not build until `edgezero-cli` is available as a library on the referenced remote. Run `edgezero new` from inside an edgezero checkout to use a path dependency instead."
+        );
+    }
+
+    workspace_dependencies.entry(name).or_insert(workspace_line);
+    crate_line
+}
+
 fn resolve_core_dependency(
     layout: &ProjectLayout,
-    cwd: &Path,
+    repo_root: &Path,
     workspace_dependencies: &mut BTreeMap<String, String>,
 ) -> String {
     let ResolvedDependency {
@@ -202,7 +334,7 @@ fn resolve_core_dependency(
         crate_line,
     } = resolve_dep_line(
         &layout.out_dir,
-        cwd,
+        repo_root,
         "crates/edgezero-core",
         "edgezero-core = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-core\", default-features = false }",
         &[],
@@ -214,7 +346,7 @@ fn resolve_core_dependency(
 
 fn collect_adapter_data(
     layout: &ProjectLayout,
-    cwd: &Path,
+    repo_root: &Path,
     workspace_dependencies: &mut BTreeMap<String, String>,
 ) -> Result<AdapterArtifacts, GeneratorError> {
     let mut contexts = Vec::new();
@@ -236,7 +368,7 @@ fn collect_adapter_data(
         let crate_dir_rel = format!("crates/{crate_name}");
         let data_entries = blueprint_data_entries(
             layout,
-            cwd,
+            repo_root,
             blueprint,
             &crate_name,
             &crate_dir_rel,
@@ -281,7 +413,7 @@ fn collect_adapter_data(
 /// resolving its dependencies and recording them in `workspace_dependencies`.
 fn blueprint_data_entries(
     layout: &ProjectLayout,
-    cwd: &Path,
+    repo_root: &Path,
     blueprint: &'static AdapterBlueprint,
     crate_name: &str,
     crate_dir_rel: &str,
@@ -301,7 +433,7 @@ fn blueprint_data_entries(
             crate_line,
         } = resolve_dep_line(
             &layout.out_dir,
-            cwd,
+            repo_root,
             dep.repo_crate,
             dep.fallback,
             dep.features,
@@ -429,20 +561,31 @@ fn append_readme_entries(
 fn build_base_data(
     layout: &ProjectLayout,
     core_crate_line: &str,
+    cli_crate_line: &str,
     artifacts: &AdapterArtifacts,
     workspace_dependencies: &BTreeMap<String, String>,
 ) -> Map<String, Value> {
     let mut data = Map::new();
     data.insert("name".into(), Value::String(layout.name.clone()));
     data.insert("proj_core".into(), Value::String(layout.core_name.clone()));
+    data.insert("proj_cli".into(), Value::String(layout.cli_name.clone()));
     data.insert(
         "proj_core_mod".into(),
         Value::String(layout.core_mod.clone()),
     );
     data.insert("proj_mod".into(), Value::String(layout.project_mod.clone()));
     data.insert(
+        "NameUpperCamel".into(),
+        Value::String(layout.upper_camel.clone()),
+    );
+    data.insert("EnvPrefix".into(), Value::String(layout.env_prefix.clone()));
+    data.insert(
         "dep_edgezero_core".into(),
         Value::String(core_crate_line.to_owned()),
+    );
+    data.insert(
+        "dep_edgezero_cli".into(),
+        Value::String(cli_crate_line.to_owned()),
     );
 
     let adapter_list_str = artifacts
@@ -479,7 +622,82 @@ fn build_base_data(
         Value::String(workspace_dep_lines),
     );
 
+    data.insert(
+        "tool_versions_contents".into(),
+        Value::String(build_tool_versions(&artifacts.adapter_ids)),
+    );
+
     data
+}
+
+/// Render the `.tool-versions` body for a scaffolded project,
+/// adapter-aware.
+///
+/// `asdf install` reads this file to pin per-tool versions. Every
+/// generated project gets `rust` pinned (it's a Rust workspace).
+/// Per-adapter pins are added ONLY when the operator selected
+/// that adapter at `edgezero new` time:
+///
+/// - `cloudflare` → `nodejs` (wrangler is a Node binary).
+/// - `fastly` → `fastly` (the Fastly CLI we shell out to for
+///   provision + config push) plus `viceroy` (what
+///   `fastly compute serve` uses for local emulation).
+/// - `spin` → no asdf pin; the Spin CLI is install-flow-managed
+///   (<https://spinframework.dev/install>). A header comment points
+///   the operator at the URL when `spin` is in the adapter set so
+///   they don't wonder why everything else is pinned but spin.
+/// - `axum` → no extra pin (uses the host Rust toolchain only).
+///
+/// Versions are pulled from this repo's own `.tool-versions` (see
+/// the repo root). When we bump those, we bump these.
+fn build_tool_versions(adapter_ids: &[String]) -> String {
+    let has = |id: &str| adapter_ids.iter().any(|adapter| adapter == id);
+    let mut lines: Vec<String> = Vec::new();
+    if has("cloudflare") {
+        lines.push("nodejs 24.12.0".to_owned());
+    }
+    if has("fastly") {
+        lines.push("fastly 15.1.0".to_owned());
+        lines.push("viceroy 0.17.0".to_owned());
+    }
+    lines.push("rust 1.95.0".to_owned());
+    // Sort + dedup so the file is stable regardless of adapter
+    // declaration order (and asdf doesn't care).
+    lines.sort();
+    lines.dedup();
+    let mut body = lines.join("\n");
+    if has("spin") {
+        body.push_str(
+            "\n\n# Spin is not asdf-managed in this scaffold; install via\n# https://spinframework.dev/install\n",
+        );
+    } else {
+        body.push('\n');
+    }
+    body
+}
+
+/// Render the six workspace-root files (Cargo.toml, edgezero.toml,
+/// README.md, .gitignore, clippy.toml, .tool-versions).
+///
+/// Split out of `render_templates` so the parent stays under the
+/// project's `too_many_lines` clippy cap; the order of writes is
+/// not load-bearing — each template is independent.
+fn write_root_files(
+    hbs: &Handlebars,
+    layout: &ProjectLayout,
+    data_value: &Value,
+) -> Result<(), GeneratorError> {
+    for (template, rel) in [
+        ("root_Cargo_toml", "Cargo.toml"),
+        ("root_edgezero_toml", "edgezero.toml"),
+        ("root_README_md", "README.md"),
+        ("root_gitignore", ".gitignore"),
+        ("root_clippy_toml", "clippy.toml"),
+        ("root_tool_versions", ".tool-versions"),
+    ] {
+        write_tmpl(hbs, template, data_value, &layout.out_dir.join(rel))?;
+    }
+    Ok(())
 }
 
 fn render_templates(
@@ -491,36 +709,7 @@ fn render_templates(
     register_templates(&mut hbs);
 
     log::info!("[edgezero] writing workspace files");
-    write_tmpl(
-        &hbs,
-        "root_Cargo_toml",
-        data_value,
-        &layout.out_dir.join("Cargo.toml"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_edgezero_toml",
-        data_value,
-        &layout.out_dir.join("edgezero.toml"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_README_md",
-        data_value,
-        &layout.out_dir.join("README.md"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_gitignore",
-        data_value,
-        &layout.out_dir.join(".gitignore"),
-    )?;
-    write_tmpl(
-        &hbs,
-        "root_clippy_toml",
-        data_value,
-        &layout.out_dir.join("clippy.toml"),
-    )?;
+    write_root_files(&hbs, layout, data_value)?;
 
     log::info!("[edgezero] writing core crate {}", layout.core_name);
     write_tmpl(
@@ -540,6 +729,32 @@ fn render_templates(
         "core_src_handlers_rs",
         data_value,
         &layout.core_dir.join("src/handlers.rs"),
+    )?;
+    write_tmpl(
+        &hbs,
+        "core_src_config_rs",
+        data_value,
+        &layout.core_dir.join("src/config.rs"),
+    )?;
+    write_tmpl(
+        &hbs,
+        "app_name_toml",
+        data_value,
+        &layout.out_dir.join(format!("{}.toml", layout.name)),
+    )?;
+
+    log::info!("[edgezero] writing cli crate {}", layout.cli_name);
+    write_tmpl(
+        &hbs,
+        "cli_Cargo_toml",
+        data_value,
+        &layout.cli_dir.join("Cargo.toml"),
+    )?;
+    write_tmpl(
+        &hbs,
+        "cli_src_main_rs",
+        data_value,
+        &layout.cli_dir.join("src/main.rs"),
     )?;
 
     for context in adapter_contexts {
@@ -590,6 +805,7 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use edgezero_core::app_config::app_name_prefix;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -625,6 +841,170 @@ mod tests {
     }
 
     #[test]
+    fn upper_camel_from_sanitized_covers_derivation_rules() {
+        // Hyphen and underscore both split into PascalCase segments.
+        assert_eq!(upper_camel_from_sanitized("my-app"), "MyApp");
+        // Single segment is just capitalised.
+        assert_eq!(upper_camel_from_sanitized("foo"), "Foo");
+        // Mixed separators: each non-empty segment contributes one capital.
+        assert_eq!(upper_camel_from_sanitized("a_b-c"), "ABC");
+        // `sanitize_crate_name` may emit a leading `_` for digit-leading
+        // input; the empty leading segment from the split is dropped.
+        assert_eq!(upper_camel_from_sanitized("_foo"), "Foo");
+        // Digit-leading produces a digit-leading PascalCase result, which
+        // would be an invalid Rust ident, so we prefix `App`.
+        assert_eq!(upper_camel_from_sanitized("123-app"), "App123App");
+    }
+
+    #[test]
+    fn env_prefix_from_name_matches_runtime_app_name_prefix_exactly() {
+        // The scaffold's documentation has to advertise the exact
+        // env-var spelling the runtime reads, not the source-form
+        // lowercase. Mirror `edgezero_core::app_config::app_name_prefix`
+        // EXACTLY: uppercase, `-`→`_`. A drift here would teach
+        // operators to set `my-app__SERVICE__TIMEOUT_MS=...` which
+        // the runtime silently ignores.
+        assert_eq!(env_prefix_from_name("my-app"), "MY_APP");
+        assert_eq!(env_prefix_from_name("app-demo"), "APP_DEMO");
+        assert_eq!(env_prefix_from_name("foo"), "FOO");
+        assert_eq!(env_prefix_from_name("a_b-c"), "A_B_C");
+        // Digit-leading: sanitize_crate_name emits `_123app` -- the
+        // underscore is preserved and the uppercase form is correct
+        // for the runtime overlay.
+        assert_eq!(env_prefix_from_name("_123app"), "_123APP");
+    }
+
+    #[test]
+    fn env_prefix_from_name_agrees_with_runtime_app_name_prefix() {
+        // Pin agreement with the runtime by calling the actual
+        // runtime function. If a future change to
+        // `edgezero_core::app_config::app_name_prefix` updates the
+        // normalisation rule (adds character handling, strips a
+        // prefix, etc.) without a matching change here, this test
+        // catches the drift immediately and the scaffold's
+        // documentation stays correct.
+        for name in ["app-demo", "my-app", "foo", "a-b-c", "x", "_123app"] {
+            let runtime_shape = app_name_prefix(name);
+            assert_eq!(
+                env_prefix_from_name(name),
+                runtime_shape,
+                "scaffold env_prefix_from_name drifted from runtime app_name_prefix for {name:?}"
+            );
+        }
+    }
+
+    // ---------- build_tool_versions ----------
+
+    #[test]
+    fn build_tool_versions_pins_rust_only_with_no_adapters() {
+        // The scaffolder always picks at least axum in practice,
+        // but the empty case is the trust boundary: zero adapters
+        // produces a stable file containing exactly the
+        // rust-toolchain pin and a trailing newline.
+        let out = build_tool_versions(&[]);
+        assert_eq!(out, "rust 1.95.0\n");
+    }
+
+    #[test]
+    fn build_tool_versions_pins_nodejs_when_cloudflare_adapter_selected() {
+        // wrangler is a Node binary; pinning nodejs keeps the
+        // version we tested wrangler against (the same nodejs the
+        // repo's own `.tool-versions` pins).
+        let out = build_tool_versions(&["cloudflare".to_owned()]);
+        assert!(out.contains("nodejs 24.12.0"), "must pin nodejs: {out}");
+        assert!(out.contains("rust 1.95.0"), "always pin rust: {out}");
+        assert!(
+            !out.contains("fastly"),
+            "no fastly pin without fastly adapter: {out}"
+        );
+    }
+
+    #[test]
+    fn build_tool_versions_pins_fastly_and_viceroy_when_fastly_adapter_selected() {
+        // `fastly` for the CLI we shell out to in provision /
+        // config push; `viceroy` for `fastly compute serve`. Both
+        // pins are needed when the operator actually uses the
+        // fastly adapter; we pin them ONLY here so a CF-only
+        // project doesn't end up with a fastly-CLI install
+        // requirement.
+        let out = build_tool_versions(&["fastly".to_owned()]);
+        assert!(out.contains("fastly 15.1.0"), "must pin fastly: {out}");
+        assert!(out.contains("viceroy 0.17.0"), "must pin viceroy: {out}");
+        assert!(out.contains("rust 1.95.0"));
+        assert!(
+            !out.contains("nodejs"),
+            "no nodejs pin without cloudflare adapter: {out}"
+        );
+    }
+
+    #[test]
+    fn build_tool_versions_axum_only_does_not_add_extra_pins() {
+        // Axum runs on the host Rust toolchain, no extra binaries
+        // needed — same as the "no adapters" shape but exercised
+        // through the realistic axum-only case.
+        let out = build_tool_versions(&["axum".to_owned()]);
+        assert_eq!(out, "rust 1.95.0\n");
+    }
+
+    #[test]
+    fn build_tool_versions_spin_adds_install_hint_comment_not_asdf_pin() {
+        // Spin is install-flow-managed (not consistently asdf-
+        // managed in our toolchain), so don't write a brittle pin
+        // we can't honour — explain why with an inline hint so the
+        // operator isn't left guessing.
+        let out = build_tool_versions(&["spin".to_owned()]);
+        assert!(out.contains("rust 1.95.0"));
+        assert!(
+            !out.contains("spin "),
+            "must NOT pin spin via asdf shape: {out}"
+        );
+        assert!(
+            out.contains("spinframework.dev/install"),
+            "must point operators at the spin install URL: {out}"
+        );
+    }
+
+    #[test]
+    fn build_tool_versions_all_four_adapters_combines_pins_deterministically() {
+        // Composite case: the typical generated project has all
+        // four adapters. Output must list each pin exactly once
+        // (no duplicates from accidental double-insertion in the
+        // adapter loop), and be sort-stable so the file doesn't
+        // churn across regenerations.
+        let adapters = vec![
+            "cloudflare".to_owned(),
+            "fastly".to_owned(),
+            "spin".to_owned(),
+            "axum".to_owned(),
+        ];
+        let out = build_tool_versions(&adapters);
+        // Each pin appears exactly once.
+        for pin in [
+            "nodejs 24.12.0",
+            "fastly 15.1.0",
+            "viceroy 0.17.0",
+            "rust 1.95.0",
+        ] {
+            assert_eq!(
+                out.matches(pin).count(),
+                1,
+                "`{pin}` must appear exactly once in: {out}"
+            );
+        }
+        // Spin install hint present.
+        assert!(out.contains("spinframework.dev/install"));
+        // Stable order (alphabetical).
+        let pin_block = out.split("\n\n").next().expect("pin block").to_owned();
+        let lines: Vec<&str> = pin_block.lines().collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            lines, sorted,
+            "pin lines must be sorted so the file is regen-stable: {pin_block}"
+        );
+    }
+
+    #[test]
     fn generator_error_format_displays_underlying_fmt_error() {
         // `writeln!`-to-`String` cannot actually fail in production, but the
         // variant is part of the public error surface and `From<fmt::Error>`
@@ -637,56 +1017,167 @@ mod tests {
             .contains("failed to format generator output"));
     }
 
-    #[test]
-    fn generate_new_scaffolds_workspace_layout() {
-        let temp = TempDir::new().expect("temp dir");
-        let bin_dir = temp.path().join("bin");
-        fs::create_dir_all(&bin_dir).expect("bin dir");
+    fn write_git_stub(bin_dir: &Path) {
+        fs::create_dir_all(bin_dir).expect("bin dir");
         let git_path = if cfg!(windows) {
             bin_dir.join("git.cmd")
         } else {
             bin_dir.join("git")
         };
-
         if cfg!(windows) {
             fs::write(&git_path, b"@echo off\r\nexit /b 0\r\n").expect("write git stub");
         } else {
             fs::write(&git_path, b"#!/bin/sh\nexit 0\n").expect("write git stub");
         }
-
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let mut perms = fs::metadata(&git_path).expect("metadata").permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&git_path, perms).expect("chmod");
-        };
+        }
+    }
 
-        let _path_guard = PathOverride::prepend(&bin_dir);
-
-        let args = NewArgs {
-            name: "demo-app".into(),
-            dir: Some(temp.path().to_string_lossy().into_owned()),
-        };
-
-        generate_new(&args).expect("scaffold succeeds");
-
-        let project_dir = temp.path().join("demo-app");
+    fn assert_scaffold_files(project_dir: &Path) {
         assert!(project_dir.is_dir(), "project directory created");
         assert!(project_dir.join("Cargo.toml").exists());
         assert!(project_dir.join("edgezero.toml").exists());
         assert!(project_dir.join(".gitignore").exists());
+        assert!(project_dir.join(".tool-versions").exists());
         assert!(project_dir.join("README.md").exists());
         assert!(project_dir.join("crates/demo-app-core/src/lib.rs").exists());
+        assert!(
+            project_dir.join("crates/demo-app-cli/Cargo.toml").exists(),
+            "<name>-cli crate Cargo.toml should be scaffolded"
+        );
+        assert!(
+            project_dir.join("crates/demo-app-cli/src/main.rs").exists(),
+            "<name>-cli crate main.rs should be scaffolded"
+        );
+        assert!(
+            project_dir
+                .join("crates/demo-app-adapter-spin/spin.toml")
+                .exists(),
+            "spin.toml should be scaffolded"
+        );
+    }
 
+    fn assert_scaffold_app_config(project_dir: &Path) {
+        // `<name>.toml` and `<name>-core/src/config.rs` must be produced,
+        // with the `<NameUpperCamel>Config` struct named after the project
+        // (`demo-app` → `DemoAppConfig`).
+        let app_toml_path = project_dir.join("demo-app.toml");
+        assert!(
+            app_toml_path.exists(),
+            "<name>.toml should be scaffolded at the project root"
+        );
+        let app_toml = fs::read_to_string(&app_toml_path).expect("read demo-app.toml");
+        // Parse the file rather than substring-matching on a comment.
+        // The shape contract is "the root table IS the typed struct; no
+        // `[config]` wrapper". A regression that re-introduces `[config
+        // = ...]` or `[config.service]` would otherwise pass a
+        // comment-only check.
+        let parsed: toml::Value = toml::from_str(&app_toml).expect("parse demo-app.toml");
+        let root = parsed.as_table().expect("root is a TOML table");
+        assert!(
+            root.get("config").is_none(),
+            "<name>.toml must not have a top-level `config` key: the file is the typed struct"
+        );
+        assert!(
+            root.get("service").is_some_and(toml::Value::is_table),
+            "<name>.toml must declare `[service]` at the root, not nested under `[config]`"
+        );
+
+        let config_rs_path = project_dir.join("crates/demo-app-core/src/config.rs");
+        assert!(
+            config_rs_path.exists(),
+            "<name>-core/src/config.rs should be scaffolded"
+        );
+        let config_rs = fs::read_to_string(&config_rs_path).expect("read config.rs");
+        assert!(
+            config_rs.contains("pub struct DemoAppConfig"),
+            "config.rs must declare the DemoAppConfig struct"
+        );
+        assert!(
+            config_rs.contains("edgezero_core::AppConfig"),
+            "config.rs must derive edgezero_core::AppConfig"
+        );
+
+        // The scaffold's env-overlay documentation must name the
+        // ACTUAL prefix the runtime reads -- `DEMO_APP__SERVICE__TIMEOUT_MS`
+        // for project `demo-app`. A regression that reintroduced
+        // `{{name}}__...` in the templates would render as
+        // `demo-app__...` here and teach operators an env-var
+        // spelling the runtime silently ignores. Both the typed
+        // struct's rustdoc AND `<name>.toml`'s comment block must
+        // pass this check.
+        assert!(
+            config_rs.contains("DEMO_APP__SERVICE__TIMEOUT_MS"),
+            "config.rs rustdoc must advertise the DEMO_APP__-prefixed env override: {config_rs}"
+        );
+        assert!(
+            !config_rs.contains("demo-app__") && !config_rs.contains("demo_app__SERVICE"),
+            "config.rs must NOT show source-form lowercase env prefixes: {config_rs}"
+        );
+        assert!(
+            app_toml.contains("DEMO_APP__"),
+            "<name>.toml env-overlay comment must use the DEMO_APP__ prefix: {app_toml}"
+        );
+        assert!(
+            !app_toml.contains("demo-app__") && !app_toml.contains("demo_app__SERVICE"),
+            "<name>.toml must NOT show source-form lowercase env prefixes: {app_toml}"
+        );
+
+        let core_cargo = fs::read_to_string(project_dir.join("crates/demo-app-core/Cargo.toml"))
+            .expect("read core Cargo.toml");
+        assert!(
+            core_cargo.contains("validator = { workspace = true }"),
+            "<name>-core Cargo.toml must pull validator from the workspace"
+        );
+
+        let core_lib = fs::read_to_string(project_dir.join("crates/demo-app-core/src/lib.rs"))
+            .expect("read core lib.rs");
+        assert!(
+            core_lib.contains("pub mod config"),
+            "<name>-core lib.rs must expose the config module so consumers can reach DemoAppConfig"
+        );
+
+        let workspace_cargo =
+            fs::read_to_string(project_dir.join("Cargo.toml")).expect("read workspace Cargo.toml");
+        assert!(
+            workspace_cargo.contains("validator = { version ="),
+            "workspace Cargo.toml must seed the validator dependency"
+        );
+    }
+
+    fn assert_scaffold_workspace(project_dir: &Path) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
-        assert!(cargo_toml.contains("crates/demo-app-core"));
-        assert!(cargo_toml.contains("crates/demo-app-adapter-cloudflare"));
-        assert!(cargo_toml.contains("crates/demo-app-adapter-fastly"));
+        for member in [
+            "crates/demo-app-core",
+            "crates/demo-app-cli",
+            "crates/demo-app-adapter-cloudflare",
+            "crates/demo-app-adapter-fastly",
+            "crates/demo-app-adapter-spin",
+        ] {
+            assert!(
+                cargo_toml.contains(member),
+                "workspace Cargo.toml should include {member}"
+            );
+        }
+        assert!(cargo_toml.contains("[workspace.lints.clippy]"));
+        assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
+
+        // Generated from a checkout: edgezero crates must resolve to local
+        // path dependencies, not the Git fallback (whose `edgezero-cli` has
+        // no library target until this work is published).
         assert!(
-            cargo_toml.contains("crates/demo-app-adapter-spin"),
-            "workspace Cargo.toml should include spin adapter"
+            cargo_toml.contains("edgezero-cli = { path ="),
+            "edgezero-cli must resolve to a local path dependency"
+        );
+        assert!(
+            cargo_toml.contains("edgezero-core = { path ="),
+            "edgezero-core must resolve to a local path dependency"
         );
 
         let manifest =
@@ -697,25 +1188,18 @@ mod tests {
             manifest.contains("[adapters.spin"),
             "edgezero.toml should include spin adapter section"
         );
-        assert!(
-            project_dir
-                .join("crates/demo-app-adapter-spin/spin.toml")
-                .exists(),
-            "spin.toml should be scaffolded"
-        );
 
         let gitignore =
             fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
         assert!(gitignore.contains("target/"));
-
         let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
         assert!(clippy.contains("allow-expect-in-tests = true"));
+    }
 
-        assert!(cargo_toml.contains("[workspace.lints.clippy]"));
-        assert!(cargo_toml.contains("blanket_clippy_restriction_lints = \"allow\""));
-
+    fn assert_scaffold_crate_lints(project_dir: &Path) {
         for crate_dir in [
             "crates/demo-app-core",
+            "crates/demo-app-cli",
             "crates/demo-app-adapter-axum",
             "crates/demo-app-adapter-cloudflare",
             "crates/demo-app-adapter-fastly",
@@ -730,7 +1214,7 @@ mod tests {
             );
         }
 
-        assert_generated_sources_are_lint_clean(&project_dir);
+        assert_generated_sources_are_lint_clean(project_dir);
     }
 
     /// Regression guard for the generated sources: a freshly scaffolded
@@ -769,5 +1253,103 @@ mod tests {
             fastly_main.contains("reason ="),
             "adapter attributes must carry a reason for allow_attributes_without_reason",
         );
+    }
+
+    #[test]
+    fn generate_new_scaffolds_workspace_layout() {
+        let temp = TempDir::new().expect("temp dir");
+        let bin_dir = temp.path().join("bin");
+        write_git_stub(&bin_dir);
+        let _path_guard = PathOverride::prepend(&bin_dir);
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+        };
+
+        generate_new(&args).expect("scaffold succeeds");
+
+        let project_dir = temp.path().join("demo-app");
+        assert_scaffold_files(&project_dir);
+        assert_scaffold_workspace(&project_dir);
+        assert_scaffold_app_config(&project_dir);
+        assert_scaffold_crate_lints(&project_dir);
+        assert_scaffold_cli_full_command_set(&project_dir);
+    }
+
+    /// The scaffolded `<name>-cli` must
+    /// expose the full seven-command surface (`Build`, `Deploy`,
+    /// `New`, `Serve`, `Auth`, `Provision`, `Config(Validate|Push)`)
+    /// and wire the `Config` arm to the **typed** entry points
+    /// parameterised over `<NameUpperCamel>Config` from the
+    /// project's core crate. Without these, a freshly-scaffolded
+    /// project would silently lose access to commands that landed
+    /// in Stages 4–7.
+    fn assert_scaffold_cli_full_command_set(project_dir: &Path) {
+        let cargo_path = project_dir.join("crates/demo-app-cli/Cargo.toml");
+        let cargo = fs::read_to_string(&cargo_path).expect("read cli Cargo.toml");
+        assert!(
+            cargo.contains("demo-app-core = { path = \"../demo-app-core\" }"),
+            "<name>-cli/Cargo.toml must depend on <name>-core (typed config lives there): {cargo}"
+        );
+
+        let main_path = project_dir.join("crates/demo-app-cli/src/main.rs");
+        let main = fs::read_to_string(&main_path).expect("read cli main.rs");
+
+        // Imports — every args type the seven-command Cmd enum
+        // references must be in scope.
+        for import in [
+            "AuthArgs",
+            "BuildArgs",
+            "ConfigPushArgs",
+            "ConfigValidateArgs",
+            "DeployArgs",
+            "NewArgs",
+            "ProvisionArgs",
+            "ServeArgs",
+        ] {
+            assert!(
+                main.contains(import),
+                "<name>-cli/src/main.rs must import `{import}`: {main}"
+            );
+        }
+
+        // Use `{{proj_core_mod}}` for the core crate's *Rust module*
+        // name, not the package name with a `_core` suffix —
+        // `demo-app_core` (mixing `-` and `_`) is invalid Rust.
+        assert!(
+            main.contains("use demo_app_core::config::DemoAppConfig;"),
+            "<name>-cli must import the typed config via the underscored core module name: {main}"
+        );
+
+        // Cmd variants — all seven plus the nested ConfigCmd.
+        for variant in [
+            "Auth(AuthArgs)",
+            "Build(BuildArgs)",
+            "Config(DemoAppConfigCmd)",
+            "Deploy(DeployArgs)",
+            "New(NewArgs)",
+            "Provision(ProvisionArgs)",
+            "Serve(ServeArgs)",
+        ] {
+            assert!(
+                main.contains(variant),
+                "<name>-cli Cmd must include `{variant}`: {main}"
+            );
+        }
+
+        // Typed dispatch — the whole reason a downstream CLI
+        // exists. Raw push/validate would defeat the point.
+        for call in [
+            "run_config_push_typed::<DemoAppConfig>",
+            "run_config_validate_typed::<DemoAppConfig>",
+            "edgezero_cli::run_auth",
+            "edgezero_cli::run_provision",
+        ] {
+            assert!(
+                main.contains(call),
+                "<name>-cli main.rs must dispatch via `{call}`: {main}"
+            );
+        }
     }
 }

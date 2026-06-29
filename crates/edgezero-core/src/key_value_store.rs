@@ -23,22 +23,28 @@
 //!
 //! # Usage
 //!
-//! Access the KV store in a handler via [`crate::context::RequestContext::kv_handle`]:
+//! Use the [`crate::extractor::Kv`] extractor with the `#[action]`
+//! macro and pick a store by id at the call site (portable
+//! store API):
 //!
 //! ```rust,ignore
-//! async fn visit_counter(ctx: RequestContext) -> Result<String, EdgeError> {
-//!     let kv = ctx.kv_handle().expect("kv store configured");
-//!     let count: i32 = kv.read_modify_write("visits", 0, |n| n + 1).await?;
+//! #[action]
+//! async fn visit_counter(kv: Kv) -> Result<String, EdgeError> {
+//!     let store = kv
+//!         .default()
+//!         .ok_or_else(|| EdgeError::service_unavailable("no default kv"))?;
+//!     let count: i32 = store.read_modify_write("visits", 0, |n| n + 1).await?;
 //!     Ok(format!("Visit #{count}"))
 //! }
 //! ```
 //!
-//! Or use the [`crate::extractor::Kv`] extractor with the `#[action]` macro:
+//! Or reach the store through [`crate::context::RequestContext`]
+//! when you have a context instead of an extractor:
 //!
 //! ```rust,ignore
-//! #[action]
-//! async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
-//!     let count: i32 = store.read_modify_write("visits", 0, |n| n + 1).await?;
+//! async fn visit_counter(ctx: RequestContext) -> Result<String, EdgeError> {
+//!     let kv = ctx.kv_store_default().expect("default kv configured");
+//!     let count: i32 = kv.read_modify_write("visits", 0, |n| n + 1).await?;
 //!     Ok(format!("Visit #{count}"))
 //! }
 //! ```
@@ -299,6 +305,11 @@ pub enum KvError {
     #[error("kv store error: {0}")]
     Internal(#[from] anyhow::Error),
 
+    /// A backend listing or paging limit was exceeded (e.g. Spin's
+    /// `max_list_keys` cap on `get_keys`).
+    #[error("kv backend limit exceeded: {message}")]
+    LimitExceeded { message: String },
+
     /// The requested key was not found (used by `delete` when strict).
     #[error("key not found: {key}")]
     NotFound { key: String },
@@ -310,6 +321,11 @@ pub enum KvError {
     /// The KV store backend is temporarily unavailable.
     #[error("kv store unavailable")]
     Unavailable,
+
+    /// The operation is not supported by the active backend (e.g. TTL writes
+    /// on Spin, where `key_value::Store::set` accepts no expiry).
+    #[error("kv operation not supported by backend: {operation}")]
+    Unsupported { operation: String },
 
     /// A validation error (e.g., invalid key or value).
     #[error("validation error: {0}")]
@@ -325,7 +341,10 @@ pub enum KvError {
 ///
 /// ```ignore
 /// #[action]
-/// async fn handler(Kv(store): Kv) -> Result<String, EdgeError> {
+/// async fn handler(kv: Kv) -> Result<String, EdgeError> {
+///     let store = kv
+///         .default()
+///         .ok_or_else(|| EdgeError::service_unavailable("no default kv"))?;
 ///     let count: i32 = store.get_or("visits", 0).await?;
 ///     store.put("visits", &(count + 1)).await?;
 ///     Ok(format!("visits: {}", count + 1))
@@ -682,6 +701,12 @@ impl From<KvError> for EdgeError {
                 EdgeError::internal(anyhow::anyhow!("kv serialization error: {msg}"))
             }
             KvError::Internal(source) => EdgeError::internal(source),
+            KvError::Unsupported { operation } => EdgeError::not_implemented(format!(
+                "kv operation not supported by backend: {operation}"
+            )),
+            KvError::LimitExceeded { message } => {
+                EdgeError::service_unavailable(format!("kv backend limit exceeded: {message}"))
+            }
         }
     }
 }
@@ -1049,6 +1074,26 @@ mod tests {
         let kv_err = KvError::Unavailable;
         let edge_err: EdgeError = kv_err.into();
         assert_eq!(edge_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn kv_error_unsupported_converts_to_not_implemented() {
+        let kv_err = KvError::Unsupported {
+            operation: "put_bytes_with_ttl".to_owned(),
+        };
+        let edge_err: EdgeError = kv_err.into();
+        assert_eq!(edge_err.status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(edge_err.message().contains("put_bytes_with_ttl"));
+    }
+
+    #[test]
+    fn kv_error_limit_exceeded_converts_to_service_unavailable() {
+        let kv_err = KvError::LimitExceeded {
+            message: "max_list_keys=1000 exceeded".to_owned(),
+        };
+        let edge_err: EdgeError = kv_err.into();
+        assert_eq!(edge_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(edge_err.message().contains("max_list_keys"));
     }
 
     #[test]

@@ -11,8 +11,10 @@ set -euo pipefail
 #   ./scripts/smoke_test_config.sh cloudflare
 #   ./scripts/smoke_test_config.sh spin
 #
-# Note (spin): Spin variable names may not contain dots. Keys with dots
-# (feature.new_checkout, service.timeout_ms) are skipped for the spin adapter.
+# Note (spin): handler-facing dotted keys (`feature.new_checkout`,
+# `service.timeout_ms`) are supported on Spin too; `SpinConfigStore`
+# translates them to the flat variable form (`feature__new_checkout`,
+# `service__timeout_ms`) before lookup.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEMO_DIR="$ROOT_DIR/examples/app-demo"
@@ -37,6 +39,22 @@ case "$ADAPTER" in
     PORT=8787
     echo "==> Building app-demo (axum)..."
     (cd "$DEMO_DIR" && cargo build -p app-demo-adapter-axum 2>&1)
+    # Stage 2 Axum config is read from `.edgezero/local-config-<id>.json`
+    # per logical id (see `AxumConfigStore::from_local_file`). `config push`
+    # writes that file in Stage 7; until then the smoke script seeds it
+    # directly with the same demo values Fastly's
+    # `[local_server.config_stores.app_config.contents]` carries (and that
+    # `config push --adapter spin --local` will write directly into
+    # `.spin/sqlite_key_value.db` once the per-backend writer lands).
+    echo "==> Seeding .edgezero/local-config-app_config.json..."
+    mkdir -p "$DEMO_DIR/.edgezero"
+    cat > "$DEMO_DIR/.edgezero/local-config-app_config.json" <<'JSON'
+{
+  "greeting": "hello from config store",
+  "feature.new_checkout": "false",
+  "service.timeout_ms": "1500"
+}
+JSON
     echo "==> Starting Axum adapter on port $PORT..."
     (cd "$DEMO_DIR" && cargo run -p app-demo-adapter-axum 2>&1) &
     SERVER_PID=$!
@@ -67,10 +85,28 @@ case "$ADAPTER" in
       echo "Spin CLI is required. Install from https://developer.fermyon.com/spin/v3/install" >&2
       exit 1
     }
-    echo "==> Building Spin WASM (wasm32-wasip1)..."
-    (cd "$DEMO_DIR" && cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin 2>&1)
+    echo "==> Building Spin WASM (wasm32-wasip2)..."
+    (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
+    # Seed the local Spin KV-backed config store BEFORE `spin up`
+    # so the demo's `app_config` label has values to read. Without
+    # this, the runtime opens an empty store and the per-key
+    # checks below would all observe defaults. `--local` forces the
+    # SQLite-direct write into `.spin/sqlite_key_value.db`,
+    # bypassing Fermyon Cloud auto-detection; `--no-env` matches
+    # the smoke harness shape (no per-key env overlays in play).
+    echo "==> Seeding Spin local KV via 'app-demo-cli config push --adapter spin --local --no-env'..."
+    (cd "$DEMO_DIR" && cargo run -p app-demo-cli --quiet -- \
+      config push --adapter spin --local --no-env 2>&1)
     echo "==> Starting Spin on port $PORT..."
-    (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && spin up --listen "127.0.0.1:$PORT" 2>&1) &
+    # `--runtime-config-file runtime-config.toml` is REQUIRED — the
+    # demo's spin.toml declares non-`default` KV labels
+    # (`app_config`, `sessions`, `cache`) and Spin's runtime only
+    # auto-provides the `default` label. Without the runtime-config
+    # flag, `spin up` aborts with `unknown key_value_stores label
+    # <name>` before the server is ready.
+    (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
+      spin up --listen "127.0.0.1:$PORT" \
+        --runtime-config-file runtime-config.toml 2>&1) &
     SERVER_PID=$!
     ;;
   *)
@@ -131,18 +167,14 @@ check "GET /config/greeting returns 200" "200" "$STATUS"
 BODY=$(curl -s "$BASE/config/greeting")
 check "greeting value" "hello from config store" "$BODY"
 
-# Spin variable names cannot contain dots; these keys are only tested on
-# adapters whose config stores support arbitrary key names.
-if [ "$ADAPTER" != "spin" ]; then
-  STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/feature.new_checkout")
-  check "GET /config/feature.new_checkout returns 200" "200" "$STATUS"
+STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/feature.new_checkout")
+check "GET /config/feature.new_checkout returns 200" "200" "$STATUS"
 
-  BODY=$(curl -s "$BASE/config/feature.new_checkout")
-  check "feature.new_checkout value" "false" "$BODY"
+BODY=$(curl -s "$BASE/config/feature.new_checkout")
+check "feature.new_checkout value" "false" "$BODY"
 
-  BODY=$(curl -s "$BASE/config/service.timeout_ms")
-  check "service.timeout_ms value" "1500" "$BODY"
-fi
+BODY=$(curl -s "$BASE/config/service.timeout_ms")
+check "service.timeout_ms value" "1500" "$BODY"
 
 section "Config: missing key returns 404"
 STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/config/does.not.exist")

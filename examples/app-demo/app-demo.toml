@@ -1,0 +1,36 @@
+# `app-demo.toml` — typed application config for the `app-demo` example.
+#
+# The file's top-level table maps 1:1 to the `AppDemoConfig` struct in
+# `crates/app-demo-core/src/config.rs`. There is no `[config]`
+# wrapper.
+#
+# Env-var overlay: every key here can be overridden at runtime by
+# `APP_DEMO__<SECTION>__…__<KEY>` (the prefix is the project name
+# uppercased with `-`→`_`; nested sections are joined by `__`) as
+# long as the key already exists below. Example:
+# `APP_DEMO__SERVICE__TIMEOUT_MS=2500` overrides the
+# `[service] timeout_ms` field below.
+
+# `api_token` is the *key* inside the resolved default secret store
+# (see `[stores.secrets]` in `edgezero.toml`). Under the blob model
+# (Model A), the `AppConfig<AppDemoConfig>` extractor automatically
+# resolves the secret value — no manual `require_str` call needed.
+api_token = "demo_api_token"
+greeting = "hello from app-demo"
+# `vault` is a `#[secret(store_ref)]` value — the logical id of a
+# secret store declared in `[stores.secrets].ids`. The app-demo
+# manifest declares a single id, `"default"`.
+vault = "default"
+
+# Nested struct field. Under the blob app-config model (spec §3.3),
+# `config push` writes ONE envelope per [stores.config] key. The
+# envelope's `data` carries this whole tree verbatim — including
+# `feature.new_checkout` as nested JSON, not as a dotted-key leaf.
+# At request time the `AppConfig<AppDemoConfig>` extractor
+# deserialises `data` into the typed struct, so handlers read
+# `cfg.feature.new_checkout` directly.
+[feature]
+new_checkout = false
+
+[service]
+timeout_ms = 1500

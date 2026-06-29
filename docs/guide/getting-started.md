@@ -7,6 +7,7 @@ This guide walks you through creating your first EdgeZero application.
 - Rust toolchain (stable; see `.tool-versions` in the repo)
 - For Fastly: `wasm32-wasip1` target and the Fastly CLI
 - For Cloudflare: `wasm32-unknown-unknown` target and Wrangler
+- For Spin: `wasm32-wasip2` target and the [Spin CLI](https://spinframework.dev/)
 
 ## Installation
 
@@ -27,18 +28,21 @@ cd my-app
 
 This generates a workspace with:
 
-- `crates/my-app-core` - Your shared handlers and routing logic
+- `crates/my-app-core` - Your shared handlers, routing logic, and the typed `MyAppConfig` struct in `src/config.rs`
+- `crates/my-app-cli` - Your project's own CLI binary, built on the `edgezero-cli` library
 - `crates/my-app-adapter-fastly` - Fastly Compute entrypoint
 - `crates/my-app-adapter-cloudflare` - Cloudflare Workers entrypoint
 - `crates/my-app-adapter-axum` - Native Axum entrypoint
+- `crates/my-app-adapter-spin` - Fermyon Spin entrypoint
 - `edgezero.toml` - Manifest describing routes, middleware, and adapter config
+- `my-app.toml` - Typed application config matching the `MyAppConfig` struct (see [Application config](/guide/configuration#application-config))
 
-## Start the Dev Server
+## Run Your App Locally
 
-Run the local Axum-powered development server:
+Run your generated app on the native Axum adapter:
 
 ```bash
-edgezero dev
+edgezero serve --adapter axum
 ```
 
 Your app is now running at `http://127.0.0.1:8787`. Try the generated endpoints:
@@ -64,12 +68,17 @@ A scaffolded project looks like this:
 my-app/
 ├── Cargo.toml              # Workspace manifest
 ├── edgezero.toml           # EdgeZero configuration
+├── my-app.toml             # Typed application config (loaded into MyAppConfig)
 ├── crates/
 │   ├── my-app-core/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs      # App definition with edgezero_core::app!
+│   │       ├── config.rs   # MyAppConfig with #[derive(AppConfig)]
 │   │       └── handlers.rs # Your route handlers
+│   ├── my-app-cli/
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs     # Your project's CLI, built on edgezero-cli
 │   ├── my-app-adapter-fastly/
 │   │   ├── Cargo.toml
 │   │   ├── fastly.toml
@@ -78,9 +87,13 @@ my-app/
 │   │   ├── Cargo.toml
 │   │   ├── wrangler.toml
 │   │   └── src/main.rs
-│   └── my-app-adapter-axum/
+│   ├── my-app-adapter-axum/
+│   │   ├── Cargo.toml
+│   │   ├── axum.toml
+│   │   └── src/main.rs
+│   └── my-app-adapter-spin/
 │       ├── Cargo.toml
-│       ├── axum.toml
+│       ├── spin.toml
 │       └── src/main.rs
 ```
 

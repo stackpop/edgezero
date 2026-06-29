@@ -3,6 +3,11 @@ node_modules/
 
 # compiled output
 bin/
+# `bin/` above is overly broad — it also blocks Cargo's `src/bin/`
+# directories, which are LEGITIMATE source (one file per binary
+# target). Re-include any `src/bin/` directory anywhere in the tree.
+!**/src/bin/
+!**/src/bin/**
 pkg/
 target/
 .wrangler/
@@ -17,9 +22,6 @@ target/
 
 # Worktrees
 .worktrees/
-
-# Superpowers plans
-docs/superpowers/
 
 # Editors
 .claude/*

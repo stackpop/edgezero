@@ -74,73 +74,31 @@ impl App {
     }
 }
 
-/// Adapter-specific config-store override metadata generated from `[stores.config.adapters.*]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfigStoreAdapterMetadata {
-    adapter: &'static str,
-    name: &'static str,
+/// Compile-time metadata for one logical store kind, baked by the `app!` macro.
+///
+/// Carries only the portable facts declared in `[stores.<kind>]`: the logical
+/// store ids and the resolved default. Platform names are resolved at runtime
+/// from `EDGEZERO__STORES__*` environment variables.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreMetadata {
+    /// Resolved default logical store id.
+    pub default: &'static str,
+    /// All declared logical store ids (non-empty).
+    pub ids: &'static [&'static str],
 }
 
-impl ConfigStoreAdapterMetadata {
-    #[must_use]
-    #[inline]
-    pub fn adapter(&self) -> &'static str {
-        self.adapter
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn name(&self) -> &'static str {
-        self.name
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn new(adapter: &'static str, name: &'static str) -> Self {
-        Self { adapter, name }
-    }
-}
-
-/// Provider-neutral config-store metadata generated from `[stores.config]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfigStoreMetadata {
-    adapters: &'static [ConfigStoreAdapterMetadata],
-    default_name: &'static str,
-}
-
-impl ConfigStoreMetadata {
-    #[must_use]
-    #[inline]
-    pub fn adapters(&self) -> &'static [ConfigStoreAdapterMetadata] {
-        self.adapters
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn default_name(&self) -> &'static str {
-        self.default_name
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn name_for_adapter(&self, adapter: &str) -> &'static str {
-        self.adapters
-            .iter()
-            .find(|entry| entry.adapter.eq_ignore_ascii_case(adapter))
-            .map_or(self.default_name, |entry| entry.name)
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn new(
-        default_name: &'static str,
-        adapters: &'static [ConfigStoreAdapterMetadata],
-    ) -> Self {
-        Self {
-            adapters,
-            default_name,
-        }
-    }
+/// Portable store config baked into the `App` by the `app!` macro.
+///
+/// A `Hooks` implementation built without the macro leaves every field `None`,
+/// so a downstream binary compiles and runs with no `edgezero.toml` present.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StoresMetadata {
+    /// `[stores.config]` declaration, if present.
+    pub config: Option<StoreMetadata>,
+    /// `[stores.kv]` declaration, if present.
+    pub kv: Option<StoreMetadata>,
+    /// `[stores.secrets]` declaration, if present.
+    pub secrets: Option<StoreMetadata>,
 }
 
 /// Trait implemented by application hook adapters.
@@ -157,15 +115,6 @@ pub trait Hooks {
         app
     }
 
-    /// Structured config-store metadata for the application, if declared.
-    ///
-    /// Macro-generated apps derive this from `[stores.config]` in `edgezero.toml`.
-    #[must_use]
-    #[inline]
-    fn config_store() -> Option<&'static ConfigStoreMetadata> {
-        None
-    }
-
     /// Allow implementations to mutate the freshly constructed application before use.
     /// The default implementation performs no changes.
     #[inline]
@@ -180,6 +129,17 @@ pub trait Hooks {
 
     /// Build the router service for the application.
     fn routes() -> RouterService;
+
+    /// Portable store metadata for the application.
+    ///
+    /// Macro-generated apps derive this from `[stores.*]` in `edgezero.toml`.
+    /// The default is empty, so an `App` built without the `app!` macro — and a
+    /// downstream binary built without an `edgezero.toml` — still compiles.
+    #[must_use]
+    #[inline]
+    fn stores() -> StoresMetadata {
+        StoresMetadata::default()
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +164,10 @@ mod tests {
         fn routes() -> RouterService {
             RouterService::builder().build()
         }
+
+        fn stores() -> StoresMetadata {
+            StoresMetadata::default()
+        }
     }
 
     #[expect(
@@ -211,17 +175,6 @@ mod tests {
         reason = "test stub — `build_app` intentionally uses the trait default; other methods are overridden for test coverage"
     )]
     impl Hooks for TestHooks {
-        fn config_store() -> Option<&'static ConfigStoreMetadata> {
-            static CONFIG_STORE: ConfigStoreMetadata = ConfigStoreMetadata::new(
-                "default-config",
-                &[ConfigStoreAdapterMetadata::new(
-                    CLOUDFLARE_ADAPTER,
-                    "cf-config",
-                )],
-            );
-            Some(&CONFIG_STORE)
-        }
-
         fn configure(app: &mut App) {
             app.set_name("configured");
         }
@@ -237,6 +190,20 @@ mod tests {
 
             RouterService::builder().get("/test", handler).build()
         }
+
+        fn stores() -> StoresMetadata {
+            StoresMetadata {
+                config: Some(StoreMetadata {
+                    default: "app_config",
+                    ids: &["app_config"],
+                }),
+                kv: Some(StoreMetadata {
+                    default: "sessions",
+                    ids: &["sessions", "cache"],
+                }),
+                secrets: None,
+            }
+        }
     }
 
     fn empty_router() -> RouterService {
@@ -247,12 +214,14 @@ mod tests {
     fn build_app_invokes_hooks_for_routes_and_configuration() {
         let app = TestHooks::build_app();
         assert_eq!(app.name(), "configured");
-        let config = TestHooks::config_store().expect("config store metadata");
-        assert_eq!(config.name_for_adapter(CLOUDFLARE_ADAPTER), "cf-config");
-        assert_eq!(config.name_for_adapter("CLOUDFLARE"), "cf-config");
-        assert_eq!(config.name_for_adapter(FASTLY_ADAPTER), "default-config");
-        assert_eq!(config.default_name(), "default-config");
-        assert_eq!(config.adapters().len(), 1);
+        let stores = TestHooks::stores();
+        let config = stores.config.expect("config store metadata");
+        assert_eq!(config.default, "app_config");
+        assert_eq!(config.ids, &["app_config"]);
+        let kv = stores.kv.expect("kv store metadata");
+        assert_eq!(kv.default, "sessions");
+        assert_eq!(kv.ids, &["sessions", "cache"]);
+        assert!(stores.secrets.is_none());
 
         let request = request_builder()
             .method(Method::GET)
@@ -275,7 +244,7 @@ mod tests {
     fn default_hooks_use_default_name_and_into_router() {
         let app = DefaultHooks::build_app();
         assert_eq!(app.name(), App::default_name());
-        assert_eq!(DefaultHooks::config_store(), None);
+        assert_eq!(DefaultHooks::stores(), StoresMetadata::default());
         let router = app.into_router();
         assert!(router.routes().is_empty());
     }

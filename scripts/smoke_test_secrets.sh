@@ -120,14 +120,20 @@ start_server() {
         echo "Spin CLI is required. Install from https://developer.fermyon.com/spin/v3/install" >&2
         exit 1
       }
-      echo "==> Building Spin WASM (wasm32-wasip1)..."
-      (cd "$DEMO_DIR" && cargo build --target wasm32-wasip1 --release -p app-demo-adapter-spin 2>&1)
+      echo "==> Building Spin WASM (wasm32-wasip2)..."
+      (cd "$DEMO_DIR" && cargo build --target wasm32-wasip2 --release -p app-demo-adapter-spin 2>&1)
       echo "==> Starting Spin on port $PORT..."
       # SpinSecretStore normalises the key to lowercase, so SMOKE_SECRET maps to
       # the Spin variable smoke_secret.  Pass the value via SPIN_VARIABLE_SMOKE_SECRET.
+      # `--runtime-config-file runtime-config.toml`: the demo's
+      # spin.toml declares non-`default` KV labels (`app_config`,
+      # `sessions`, `cache`) — Spin's runtime needs the file or
+      # `spin up` aborts with `unknown key_value_stores label
+      # <name>` before secrets are exercised.
       (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
         SPIN_VARIABLE_SMOKE_SECRET="$SMOKE_SECRET_VALUE" \
-        spin up --listen "127.0.0.1:$PORT" 2>&1) &
+        spin up --listen "127.0.0.1:$PORT" \
+          --runtime-config-file runtime-config.toml 2>&1) &
       SERVER_PID=$!
       ;;
     *)

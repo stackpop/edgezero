@@ -1,5 +1,12 @@
 fastly 15.1.0
 nodejs 24.12.0
 rust 1.95.0
+# spin-cli is not pinned by asdf-style version managers (no
+# asdf-spin plugin in widespread use). spin-sdk ~6.0 in the
+# workspace imports wasi:http/types@0.3.0-rc-2026-03-15, which
+# the Spin 3.6.x runtime does not provide; Spin 3.7+ is required
+# for the demo's Spin adapter to boot. Install matching CLI
+# manually (https://spinframework.dev/install) before running
+# smoke_test_config_key_override.sh; otherwise set SKIP_SPIN=1.
 viceroy 0.17.0
 wasmtime 44.0.1

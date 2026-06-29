@@ -1,4 +1,4 @@
-use crate::manifest_definitions::{Manifest, DEFAULT_CONFIG_STORE_NAME};
+use crate::manifest_definitions::{Manifest, StoreDeclaration};
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
@@ -30,39 +30,37 @@ impl Parse for AppArgs {
     }
 }
 
-fn build_config_store_tokens(manifest: &Manifest) -> TokenStream2 {
-    let Some(config) = manifest.stores.config.as_ref() else {
-        return quote! {
-            fn config_store() -> Option<&'static edgezero_core::app::ConfigStoreMetadata> {
-                None
-            }
-        };
+/// Render a `StoreMetadata { default, ids }` literal for one `[stores.<kind>]`
+/// declaration, or `None` when the declaration is absent.
+fn store_metadata_tokens(maybe_declaration: Option<&StoreDeclaration>) -> TokenStream2 {
+    let Some(declaration) = maybe_declaration else {
+        return quote! { None };
     };
-
-    let fallback_name = config.name.as_deref().unwrap_or(DEFAULT_CONFIG_STORE_NAME);
-    let fallback_name_lit = LitStr::new(fallback_name, Span::call_site());
-    let override_entries: Vec<_> = config
-        .adapters
+    let default_lit = LitStr::new(declaration.default_id(), Span::call_site());
+    let id_lits = declaration
+        .ids
         .iter()
-        .map(|(adapter, cfg)| {
-            let adapter_lit = LitStr::new(adapter, Span::call_site());
-            let name_lit = LitStr::new(&cfg.name, Span::call_site());
-            quote! {
-                edgezero_core::app::ConfigStoreAdapterMetadata::new(#adapter_lit, #name_lit),
-            }
-        })
-        .collect();
-
+        .map(|id| LitStr::new(id, Span::call_site()));
     quote! {
-        fn config_store() -> Option<&'static edgezero_core::app::ConfigStoreMetadata> {
-            static CONFIG_STORE: edgezero_core::app::ConfigStoreMetadata =
-                edgezero_core::app::ConfigStoreMetadata::new(
-                    #fallback_name_lit,
-                    &[
-                        #(#override_entries)*
-                    ],
-                );
-            Some(&CONFIG_STORE)
+        Some(edgezero_core::app::StoreMetadata {
+            default: #default_lit,
+            ids: &[#(#id_lits),*],
+        })
+    }
+}
+
+/// Codegen the `Hooks::stores()` impl from the portable `[stores.*]` schema.
+fn build_stores_tokens(manifest: &Manifest) -> TokenStream2 {
+    let config = store_metadata_tokens(manifest.stores.config.as_ref());
+    let kv = store_metadata_tokens(manifest.stores.kv.as_ref());
+    let secrets = store_metadata_tokens(manifest.stores.secrets.as_ref());
+    quote! {
+        fn stores() -> edgezero_core::app::StoresMetadata {
+            edgezero_core::app::StoresMetadata {
+                config: #config,
+                kv: #kv,
+                secrets: #secrets,
+            }
         }
     }
 }
@@ -140,7 +138,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
         Ok(tokens) => tokens,
         Err(msg) => return quote!(compile_error!(#msg);).into(),
     };
-    let config_store_tokens = build_config_store_tokens(&manifest);
+    let stores_tokens = build_stores_tokens(&manifest);
 
     // The emitted `Hooks` impl below explicitly defines `configure` and
     // `build_app` even though their bodies mirror the trait defaults. This is
@@ -161,7 +159,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
                 #app_name_lit
             }
 
-            #config_store_tokens
+            #stores_tokens
 
             fn build_app() -> edgezero_core::app::App {
                 let mut app = edgezero_core::app::App::with_name(Self::routes(), Self::name());

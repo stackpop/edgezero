@@ -14,11 +14,5 @@ use worker::{event, Context, Env, Request, Response, Result};
 #[event(fetch)]
 #[inline]
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
-    edgezero_adapter_cloudflare::run_app::<App>(
-        include_str!("../../../edgezero.toml"),
-        req,
-        env,
-        ctx,
-    )
-    .await
+    edgezero_adapter_cloudflare::run_app::<App>(req, env, ctx).await
 }

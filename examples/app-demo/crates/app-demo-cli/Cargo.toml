@@ -1,0 +1,27 @@
+[package]
+name = "app-demo-cli"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+app-demo-core = { path = "../app-demo-core" }
+clap = { workspace = true }
+edgezero-cli = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+edgezero-adapter = { workspace = true, features = ["cli"] }
+edgezero-adapter-axum = { workspace = true }
+edgezero-adapter-spin = { workspace = true, features = ["cli"] }
+edgezero-core = { workspace = true, features = ["test-utils"] }
+futures = { workspace = true }
+# Used by the spin push integration test to verify the SQLite-direct
+# writer's round-trip against Spin's `spin_key_value` schema.
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

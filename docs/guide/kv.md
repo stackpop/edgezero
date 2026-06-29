@@ -18,7 +18,11 @@ struct VisitData {
 }
 
 #[action]
-async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
+async fn visit_counter(kv: Kv) -> Result<String, EdgeError> {
+    let store = kv
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default kv configured"))?;
+
     // Read-modify-write helper (Note: not atomic!)
     let data = store
         .read_modify_write("visits", VisitData::default(), |mut d| {
@@ -33,31 +37,48 @@ async fn visit_counter(Kv(store): Kv) -> Result<String, EdgeError> {
 
 ## Usage
 
-### 1. Configure the Store Name
+### 1. Declare logical KV store ids
 
-In your `edgezero.toml`:
+In your `edgezero.toml` — declare one or more logical ids (the portable
+fact "this app uses a KV store called `sessions`"). Platform names are
+resolved at runtime from `EDGEZERO__STORES__KV__<ID>__NAME`; with the
+variable unset, the platform name defaults to the logical id.
 
 ```toml
 [stores.kv]
-name = "EDGEZERO_KV" # Default name for all adapters
+ids     = ["sessions", "cache"]
+default = "sessions"            # required when ids.len() > 1
 ```
+
+For a single-store app the `default` field is optional and resolves to
+`ids[0]`. Migrating from the pre-rewrite `name` / `[stores.kv.adapters.*]`
+form? See [the migration guide](./manifest-store-migration.md).
 
 ### 2. Access the Store
 
-You can access the store using the `Kv` extractor (recommended) or via `RequestContext`.
+Use the id-keyed `Kv` extractor (recommended) or `RequestContext` accessors.
 
-**Using Extractor:**
+**Using the extractor — pick a store by id at the call site:**
 
 ```rust
-async fn handler(Kv(store): Kv) { ... }
+async fn handler(kv: Kv) -> Result<Response, EdgeError> {
+    let sessions = kv
+        .named("sessions")
+        .ok_or_else(|| EdgeError::service_unavailable("no `sessions` kv"))?;
+    // — or, for the single-store common case —
+    let default = kv
+        .default()
+        .ok_or_else(|| EdgeError::service_unavailable("no default kv"))?;
+    // …
+}
 ```
 
-**Using Context:**
+**Using context:**
 
 ```rust
 async fn handler(ctx: RequestContext) {
-    let store = ctx.kv_handle().expect("kv configured");
-    ...
+    let store = ctx.kv_store("sessions").expect("kv `sessions` configured");
+    // or: ctx.kv_store_default()
 }
 ```
 
@@ -86,43 +107,37 @@ Use it only when approximate values are acceptable (e.g. visit counters, feature
 For strict correctness, use a transactional data store.
 :::
 
-Key listing is paginated by design. This avoids buffering an unbounded number of keys in memory and matches the underlying provider APIs. The Spin adapter returns `KvError::Validation` for key listing because Spin's current `Store::get_keys()` API is unbounded.
+Key listing is paginated by design. This avoids buffering an unbounded number of keys in memory and matches the underlying provider APIs. The Spin adapter materialises `Store::get_keys()` and pages client-side; a `max_list_keys` cap (configurable via `EDGEZERO__STORES__KV__<ID>__MAX_LIST_KEYS`, default `1000`) guards against runaway lists and yields `KvError::LimitExceeded` when exceeded.
 
 ## Platform Specifics
 
 ### Local Development
 
-- **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. The default store name uses `.edgezero/kv.redb`; custom store names get their own derived file. Data persists across restarts (add `.edgezero/` to your `.gitignore`).
-- **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` entry in `fastly.toml`.
+- **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. Each declared KV id gets its own derived file; data persists across restarts (add `.edgezero/` to your `.gitignore`).
+- **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` and `[setup.kv_stores]` entry per declared KV id. `edgezero provision --adapter fastly` writes both blocks for you; the example below assumes a `sessions` id.
 
   ```toml
-  [[local_server.kv_stores.EDGEZERO_KV]]
+  [[local_server.kv_stores.sessions]]
   key = "__init__"
   data = ""
 
-  [setup.kv_stores.EDGEZERO_KV]
+  [setup.kv_stores.sessions]
   description = "Application KV store"
   ```
 
-- **Cloudflare (Workerd)**: Requires a KV namespace and a binding in `wrangler.toml`.
-  1. Create the namespace (run once per environment):
+  Override the platform name per environment via
+  `EDGEZERO__STORES__KV__SESSIONS__NAME=<other-name>`; provision honours
+  the override when it writes the setup blocks.
 
-     ```sh
-     wrangler kv namespace create EDGEZERO_KV
-     wrangler kv namespace create EDGEZERO_KV --preview
-     ```
+- **Cloudflare (Workerd)**: `edgezero provision --adapter cloudflare` creates the namespace and appends the `[[kv_namespaces]]` binding using the env-resolved platform name (`EDGEZERO__STORES__KV__<ID>__NAME` or the logical id by default). The example below shows what provision writes for a `sessions` id with no override:
 
-     Each command prints an `id` — copy them into `wrangler.toml`:
+  ```toml
+  [[kv_namespaces]]
+  binding = "sessions"
+  id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"       # filled by provision
+  ```
 
-  2. Add the binding to `wrangler.toml`:
-     ```toml
-     [[kv_namespaces]]
-     binding = "EDGEZERO_KV"
-     id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"       # from step 1
-     preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" # from step 1 --preview
-     ```
-
-  The `binding` name MUST match the store name configured in `edgezero.toml` (default: `"EDGEZERO_KV"`).
+  The `binding` name MUST match what the runtime opens — by default the logical id, otherwise the env override.
 
 - **Spin**: Requires a `key_value_stores` label in `spin.toml`.
 
@@ -131,17 +146,16 @@ Key listing is paginated by design. This avoids buffering an unbounded number of
   key_value_stores = ["default"]
   ```
 
-  The label MUST match the store name configured in `edgezero.toml`, or the Spin-specific override. Spin's local runtime auto-provisions the `"default"` label; custom labels require a Spin runtime config or cloud link.
+  The label MUST match what `EDGEZERO__STORES__KV__<ID>__NAME` resolves to (or the logical id when the variable is unset). Spin's local runtime auto-provisions the `"default"` label; custom labels require a Spin runtime config or cloud link. Example:
 
   ```toml
   [stores.kv]
-  name = "EDGEZERO_KV"
-
-  [stores.kv.adapters.spin]
-  name = "default"
+  ids     = ["sessions"]
+  # No platform name in the manifest — set EDGEZERO__STORES__KV__SESSIONS__NAME=default
+  # at run time (or leave unset to bind the label "sessions").
   ```
 
-  `edgezero_adapter_spin::run_app` reads `edgezero.toml` and opens the resolved Spin label. Low-level manual dispatch helpers do not read the manifest.
+  `edgezero_adapter_spin::run_app` reads baked `[stores.*]` metadata + `EDGEZERO__*` env vars and opens the resolved Spin label per id. Low-level manual dispatch helpers (`dispatch`, `dispatch_with_kv_label`) bypass the env-config path.
 
 ### Consistency
 
@@ -149,7 +163,7 @@ Both Fastly and Cloudflare KV stores are **eventually consistent**.
 
 - A value written at one edge location may not be immediately visible at another.
 - `read_modify_write()` is **not atomic**. Concurrent updates to the same key may result in lost writes.
-- **TTL**: `put_with_ttl` enforces a minimum of **60 seconds** and a maximum of **1 year** before delegating to an adapter. Spin KV does not support TTL, so the Spin adapter returns `KvError::Validation` without writing the value.
+- **TTL**: `put_with_ttl` enforces a minimum of **60 seconds** and a maximum of **1 year** before delegating to an adapter. Spin KV does not support TTL, so the Spin adapter returns `KvError::Unsupported { operation: "put_bytes_with_ttl" }` without writing the value.
 
 ## Limits & Validation
 

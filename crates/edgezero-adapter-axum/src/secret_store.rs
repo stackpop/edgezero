@@ -4,7 +4,7 @@
 //! variables before starting the dev server:
 //!
 //! ```bash
-//! API_KEY=mysecret cargo edgezero dev
+//! API_KEY=mysecret edgezero serve --adapter axum
 //! ```
 
 use std::env;

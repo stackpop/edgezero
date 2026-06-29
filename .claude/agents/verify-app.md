@@ -50,7 +50,7 @@ Demo adapters must build for their respective WASM targets.
 ## 6. Dev server smoke test
 
 ```
-cargo run -p edgezero-cli --features dev-example -- dev &
+cargo run -p edgezero-cli --features demo-example -- demo &
 pid=$!
 trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 sleep 3

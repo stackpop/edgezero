@@ -29,23 +29,24 @@ The Axum entrypoint wires the adapter:
 ```rust
 use my_app_core::App;
 
-fn main() {
-    if let Err(err) = edgezero_adapter_axum::run_app::<App>(include_str!("../../../edgezero.toml")) {
-        eprintln!("axum adapter failed: {err}");
-        std::process::exit(1);
-    }
+fn main() -> anyhow::Result<()> {
+    edgezero_adapter_axum::run_app::<App>()
 }
 ```
 
-`run_app` installs `simple_logger`, builds the app, and wires the local config store from
-`[stores.config]` automatically.
+`run_app` installs `simple_logger`, builds the app, and reads bind /
+store / logging config at runtime from `EDGEZERO__*` environment
+variables (see [the migration guide](../manifest-store-migration.md)).
+The portable store metadata baked into `App` by the `app!` macro
+drives which logical stores are exposed; no `edgezero.toml` needs to
+be loaded by the runtime.
 
 ## Development Server
 
-The `edgezero dev` command uses the Axum adapter:
+Run your project locally on the Axum adapter:
 
 ```bash
-edgezero dev
+edgezero serve --adapter axum
 ```
 
 This starts a server at `http://127.0.0.1:8787` with standard logging to stdout.
@@ -137,23 +138,44 @@ cargo test -p my-app-adapter-axum
 
 ## Config Store
 
-For local development, the Axum adapter only reads environment variables for keys declared in
-`[stores.config.defaults]`, then falls back to those defaults in `edgezero.toml`:
+For local development, each declared `[stores.config]` id resolves to a
+local-file config store backed by `.edgezero/local-config-<id>.json`.
+The portable manifest carries no inline defaults — the
+pre-rewrite `[stores.config.defaults]` table is gone (see
+[the migration guide](../manifest-store-migration.md)).
 
 ```toml
 [stores.config]
-name = "app_config"
-
-[stores.config.defaults]
-"greeting" = "hello from config store"
-"feature.new_checkout" = "false"
-"service.timeout_ms" = ""
+ids     = ["app_config"]
+# default = "app_config"   # required when ids.len() > 1
 ```
 
-Handlers access the injected store through `ctx.config_store()`. Environment variables take
-precedence over manifest defaults. If a key should be overrideable from env without carrying a real
-default value, declare it with an empty-string placeholder. Do not pass raw user input straight to
-`ctx.config_store()?.get(...)` in production handlers; validate or allowlist keys first.
+```jsonc
+// .edgezero/local-config-app_config.json
+{
+  "greeting": "hello from config store",
+  "feature.new_checkout": "false",
+  "service.timeout_ms": "1500",
+}
+```
+
+Handlers access stores via the `Config` extractor or `ctx.config_store(id)`:
+
+```rust
+async fn handler(config: Config) -> Result<Response, EdgeError> {
+    let store = config.default().ok_or_else(|| EdgeError::service_unavailable("no default config"))?;
+    let greeting = store.get("greeting").await?.unwrap_or_default();
+    // …
+}
+```
+
+Do not pass raw user input straight to `store.get(…)` in production
+handlers; validate or allowlist keys first. Seed the per-id JSON
+files with `edgezero config push --adapter axum` (or
+`<your-cli> config push --adapter axum` for the typed flow with
+`#[secret]` stripping), which writes the same
+`.edgezero/local-config-<id>.json` files the runtime reads —
+no shell-out, no server to authenticate against.
 
 ## Container Deployment
 
@@ -183,7 +205,7 @@ The runtime currently binds to `127.0.0.1:8787` regardless of the `axum.toml` po
 
 A typical development workflow:
 
-1. **Start dev server**: `edgezero dev`
+1. **Run locally**: `edgezero serve --adapter axum`
 2. **Make changes** to handlers in `my-app-core`
 3. **Test locally** with curl or browser
 4. **Run tests**: `cargo test`

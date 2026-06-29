@@ -11,10 +11,14 @@
 
 pub mod addr;
 pub mod app;
+pub mod app_config;
+pub mod blob_envelope;
 pub mod body;
+pub mod canonical_form;
 pub mod compression;
 pub mod config_store;
 pub mod context;
+pub mod env_config;
 pub mod error;
 pub mod extractor;
 pub mod handler;
@@ -28,5 +32,6 @@ pub mod responder;
 pub mod response;
 pub mod router;
 pub mod secret_store;
+pub mod store_registry;
 
-pub use edgezero_macros::{action, app};
+pub use edgezero_macros::{action, app, AppConfig};

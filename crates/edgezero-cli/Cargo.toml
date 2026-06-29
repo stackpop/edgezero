@@ -8,6 +8,15 @@ description = "EdgeZero CLI: build and deploy to multiple edge adapters"
 [lints]
 workspace = true
 
+[[bin]]
+name = "edgezero"
+path = "src/main.rs"
+
+[[bin]]
+name = "check_no_nested_app_config"
+path = "src/bin/check_no_nested_app_config.rs"
+required-features = ["nested-app-config-check"]
+
 [dependencies]
 edgezero-core = { workspace = true }
 edgezero-adapter = { path = "../edgezero-adapter" }
@@ -16,15 +25,21 @@ edgezero-adapter-cloudflare = { workspace = true, features = ["cli"], optional =
 edgezero-adapter-fastly = { workspace = true, features = ["cli"], optional = true }
 edgezero-adapter-spin = { workspace = true, features = ["cli"], optional = true }
 app-demo-core = { path = "../../examples/app-demo/crates/app-demo-core", package = "app-demo-core", optional = true }
+chrono = { workspace = true }
 clap = { version = "4", features = ["derive"], optional = true }
 futures = { workspace = true }
 handlebars = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
+similar = { workspace = true }
 simple_logger = { workspace = true }
 serde_json = { workspace = true}
 thiserror = { workspace = true }
 toml = { workspace = true }
+validator = { workspace = true }
+proc-macro2 = { workspace = true, features = ["span-locations"], optional = true }
+syn = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
 
 [build-dependencies]
 toml = { workspace = true }
@@ -41,4 +56,5 @@ default = [
     "edgezero-adapter-spin",
 ]
 cli = ["dep:clap"]
-dev-example = ["dep:app-demo-core"]
+demo-example = ["dep:app-demo-core", "edgezero-adapter-axum"]
+nested-app-config-check = ["dep:proc-macro2", "dep:syn", "dep:walkdir"]
