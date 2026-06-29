@@ -1633,7 +1633,7 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
   /// TempDir drops. See spec §"Dry-run".
   pub(crate) fn run_with_staging<F, R>(
       project_root: &Path,
-      adapter_crate_dir: &Path,
+      adapter_crate_rel: &Path,
       body: F,
   ) -> Result<(R, tempfile::TempDir), String>
   where
@@ -1725,7 +1725,7 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
 - Consumes: `run_with_staging` (Task 10), `write_baseline_to_disk` + the three-arm match Task 8b sketches
 - Produces: behavioural tests covering all four cells of the matrix from Global Constraints
 
-Task 8b lays the structural reorder (synthesis + validation + dispatch all see the same root). This task adds the behavioural test coverage for the four cells of the dispatch matrix and resolves the placeholder helpers Task 8b's sketch references (`resolve_adapter_crate_dir`, `build_stores`).
+Task 8b lays the structural reorder (synthesis + validation + dispatch all see the same root). This task adds the behavioural test coverage for the four cells of the dispatch matrix and resolves the `build_stores` placeholder Task 8b's sketch references. The previous draft also listed `resolve_adapter_crate_dir` here, but that helper is no longer introduced -- Task 10's `run_with_staging` now takes the project-relative crate path directly (Task 10 step 3 has the rationale).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3978,7 +3978,6 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   - `edgezero_adapter::get_adapter(name) -> Option<&'static dyn Adapter>` (at `crates/edgezero-adapter/src/registry.rs:513`; returns `Option`, not `Result`).
   - `crate::path_safety::assert_provision_paths_contained` (Task 6).
   - `manifest_root_from(&args.manifest)` — small helper in `provision.rs` that returns `args.manifest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))`. Extract from the existing inline duplication in `run_provision`.
-  - `resolve_adapter_crate_dir` (Task 11 step 3).
   - `build_stores_against` (Task 11 step 3).
   - `write_baseline_to_disk` (Task 8b step 4).
   - `render_dry_run_report` (Task 12).
@@ -4669,10 +4668,14 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
       )
   }
 
-  /// Same join-fallback rule as `provision.rs`'s
-  /// `resolve_adapter_crate_dir` (Task 11 step 3). Duplicated here
-  /// because the helper is private to `provision.rs`; if both
-  /// callers grow more logic, extract to a shared module.
+  /// Join `manifest_root` with the operator-declared adapter
+  /// crate path; fall back to `manifest_root` when unset. This
+  /// helper exists ONLY for `run_serve` -- `run_provision`'s
+  /// dispatch matrix (Task 11) passes the project-relative
+  /// crate path directly into `run_with_staging` and does NOT
+  /// need an analogous resolver. If a future caller needs the
+  /// same join, extract to a shared module rather than copying
+  /// the body.
   fn resolve_adapter_crate_dir_for_serve(
       manifest_root: &Path,
       raw_crate_path: Option<&str>,
