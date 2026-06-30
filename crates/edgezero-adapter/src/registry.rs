@@ -334,6 +334,37 @@ pub trait Adapter: Sync + Send {
         dry_run: bool,
     ) -> Result<ProvisionOutcome, String>;
 
+    /// Typed-secret companion to `provision`. Runs ONLY in local mode
+    /// (`mode == Local`); cloud mode is a no-op by spec §"CLI / trait
+    /// surface". The CLI dispatches this AFTER `provision` on the same
+    /// `manifest_root`, so per-store bindings are already in place; this
+    /// method only adds adapter-specific per-secret placeholders sourced
+    /// from `C::SECRET_FIELDS` (the generic CLI walks them; bundled
+    /// `edgezero` cannot).
+    ///
+    /// The default impl is a no-op so existing adapters compile
+    /// untouched while the per-adapter overrides land in Section 5.
+    ///
+    /// # Errors
+    /// The default impl never errors. Adapter overrides may return
+    /// human-readable error strings if local placeholder setup fails.
+    #[inline]
+    #[expect(
+        clippy::elidable_lifetime_names,
+        reason = "lifetime name 'entry explicitly documents the secret entry lifetime for clarity"
+    )]
+    fn provision_typed<'entry>(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _typed_secrets: &[TypedSecretEntry<'entry>],
+        _mode: ProvisionMode,
+        _dry_run: bool,
+    ) -> Result<ProvisionOutcome, String> {
+        Ok(ProvisionOutcome::default())
+    }
+
     /// Push config entries into the platform's config store backing
     /// `store_id`. Returns a list of human-readable status lines the
     /// CLI logs verbatim.
@@ -701,5 +732,21 @@ mod tests {
         state.sub_tables.insert("kv_namespaces".into(), kv);
         assert_eq!(state.fields["service_id"], "SVC1");
         assert_eq!(state.sub_tables["kv_namespaces"]["sessions"], "abc123");
+    }
+
+    #[test]
+    fn provision_typed_default_impl_returns_empty_outcome() {
+        let outcome = FIRST
+            .provision_typed(
+                Path::new("/tmp"),
+                None,
+                None,
+                &[],
+                ProvisionMode::Local,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.status_lines.is_empty());
+        assert!(outcome.deployed.is_none());
     }
 }
