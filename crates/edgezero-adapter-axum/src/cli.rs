@@ -11,8 +11,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -162,8 +162,14 @@ impl Adapter for AxumCliAdapter {
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
+        _deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
         _dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionOutcome, String> {
+        match mode {
+            ProvisionMode::Cloud => {}
+            ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()),
+        }
         //: axum has no remote resources. Print one note per
         // declared store id so the operator sees the CLI heard
         // them — same shape `dry_run` would have, since there is
@@ -200,7 +206,10 @@ impl Adapter for AxumCliAdapter {
         if out.is_empty() {
             out.push("axum has no declared stores to provision".to_owned());
         }
-        Ok(out)
+        Ok(ProvisionOutcome {
+            status_lines: out,
+            deployed: None,
+        })
     }
 
     fn push_config_entries(

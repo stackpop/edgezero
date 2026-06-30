@@ -304,24 +304,35 @@ pub trait Adapter: Sync + Send {
     /// (`wrangler.toml`, `fastly.toml`, `spin.toml`) relative to
     /// the root. `stores` carries the declared ids per kind.
     ///
-    /// Default: no-op (returns an empty `Vec`) so adapters that
-    /// don't own any platform resources don't need to override.
+    /// `deployed` carries the adapter's previously-persisted
+    /// deployed identifiers (e.g. Cloudflare KV namespace ids,
+    /// Fastly service id). Local-arm impls consult it for
+    /// precedence rules (spec §"CLI / trait surface"); cloud-arm
+    /// impls pass `None` — they produce, not consume, the deployed
+    /// state. `mode` selects cloud vs. local emulator paths
+    /// (spec §"CLI / trait surface", §"Writeback ownership").
+    ///
+    /// No default impl is provided — every adapter must update
+    /// explicitly so the compiler flags any missed call sites.
     ///
     /// # Errors
     /// Returns a human-readable error string if any platform
     /// invocation or manifest edit fails. `dry_run` impls should
     /// describe what they *would* do without performing it.
-    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "provision needs the manifest root, adapter manifest path, component selector, resolved stores, previously-deployed state (for local-arm precedence), dispatch mode (cloud vs local), and dry-run flag — 8 args. Each is distinct; an aggregate struct would be a larger ergonomic regression for adapter implementers."
+    )]
     fn provision(
         &self,
-        _manifest_root: &Path,
-        _adapter_manifest_path: Option<&str>,
-        _component_selector: Option<&str>,
-        _stores: &ProvisionStores<'_>,
-        _dry_run: bool,
-    ) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
-    }
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        stores: &ProvisionStores<'_>,
+        deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String>;
 
     /// Push config entries into the platform's config store backing
     /// `store_id`. Returns a list of human-readable status lines the
@@ -595,6 +606,19 @@ mod tests {
 
         fn name(&self) -> &'static str {
             self.name
+        }
+
+        fn provision(
+            &self,
+            _manifest_root: &Path,
+            _adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+            _stores: &ProvisionStores<'_>,
+            _deployed: Option<&AdapterDeployedState>,
+            _mode: ProvisionMode,
+            _dry_run: bool,
+        ) -> Result<ProvisionOutcome, String> {
+            Ok(ProvisionOutcome::default())
         }
     }
 

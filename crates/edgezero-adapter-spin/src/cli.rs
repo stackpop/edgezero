@@ -17,8 +17,9 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId, TypedSecretEntry,
+    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -181,8 +182,14 @@ impl Adapter for SpinCliAdapter {
         adapter_manifest_path: Option<&str>,
         component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
+        _deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
         dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionOutcome, String> {
+        match mode {
+            ProvisionMode::Cloud => {}
+            ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()),
+        }
         //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
         // runtime / Fermyon at deploy). For each declared KV id
@@ -251,7 +258,10 @@ impl Adapter for SpinCliAdapter {
         if out.is_empty() {
             out.push("spin has no declared stores to provision".to_owned());
         }
-        Ok(out)
+        Ok(ProvisionOutcome {
+            status_lines: out,
+            deployed: None,
+        })
     }
 
     fn push_config_entries(
@@ -1384,6 +1394,18 @@ mod tests {
             fn name(&self) -> &'static str {
                 "stub"
             }
+            fn provision(
+                &self,
+                _manifest_root: &Path,
+                _adapter_manifest_path: Option<&str>,
+                _component_selector: Option<&str>,
+                _stores: &ProvisionStores<'_>,
+                _deployed: Option<&AdapterDeployedState>,
+                _mode: ProvisionMode,
+                _dry_run: bool,
+            ) -> Result<ProvisionOutcome, String> {
+                Ok(ProvisionOutcome::default())
+            }
         }
         let entries = [
             TypedSecretEntry::new("default", "one", "Demo_Token"),
@@ -1649,11 +1671,19 @@ mod tests {
             secrets: &[],
         };
         let out = SpinCliAdapter
-            .provision(dir.path(), Some("spin.toml"), None, &stores, true)
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect("dry-run succeeds");
-        assert_eq!(out.len(), 2);
-        assert!(out[0].contains("would ensure KV label `sessions`"));
-        assert!(out[1].contains("would ensure KV label `cache`"));
+        assert_eq!(out.status_lines.len(), 2);
+        assert!(out.status_lines[0].contains("would ensure KV label `sessions`"));
+        assert!(out.status_lines[1].contains("would ensure KV label `cache`"));
         let after = fs::read_to_string(&path).expect("read back");
         assert_eq!(after, original, "dry-run mutated spin.toml");
     }
@@ -1680,10 +1710,19 @@ mod tests {
             secrets: &[],
         };
         let out = SpinCliAdapter
-            .provision(dir.path(), Some("spin.toml"), None, &stores, false)
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
             .expect("real-run succeeds");
         assert!(
-            out[0].contains("`prod_sessions`") && out[0].contains("`sessions`"),
+            out.status_lines[0].contains("`prod_sessions`")
+                && out.status_lines[0].contains("`sessions`"),
             "status line names BOTH the platform label and the logical id: {out:?}"
         );
 
@@ -1712,10 +1751,21 @@ mod tests {
             secrets: &[],
         };
         let out = SpinCliAdapter
-            .provision(dir.path(), Some("spin.toml"), None, &stores, false)
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
             .expect("real run succeeds");
-        assert_eq!(out.len(), 1);
-        assert!(out[0].contains("added KV label `sessions`"), "got: {out:?}");
+        assert_eq!(out.status_lines.len(), 1);
+        assert!(
+            out.status_lines[0].contains("added KV label `sessions`"),
+            "got: {out:?}"
+        );
         let after = fs::read_to_string(dir.path().join("spin.toml")).expect("read back");
         assert!(
             after.contains("\"sessions\""),
@@ -1733,7 +1783,15 @@ mod tests {
             secrets: &[],
         };
         let err = SpinCliAdapter
-            .provision(dir.path(), None, None, &stores, true)
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect_err("missing adapter manifest path must error");
         assert!(
             err.contains("spin.toml"),
@@ -1760,15 +1818,24 @@ mod tests {
             secrets: &secret_ids,
         };
         let out = SpinCliAdapter
-            .provision(dir.path(), Some("spin.toml"), None, &stores, false)
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
             .expect("config + secrets provision succeeds");
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.status_lines.len(), 2);
         assert!(
-            out[0].contains("config label") && out[0].contains("key_value_stores"),
+            out.status_lines[0].contains("config label")
+                && out.status_lines[0].contains("key_value_stores"),
             "config row reports KV-array write: {out:?}"
         );
         assert!(
-            out[1].contains("manual"),
+            out.status_lines[1].contains("manual"),
             "secret row still flags manual declaration: {out:?}"
         );
 
@@ -1792,9 +1859,20 @@ mod tests {
             secrets: &[],
         };
         let out = SpinCliAdapter
-            .provision(dir.path(), Some("spin.toml"), None, &stores, false)
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
             .expect("no-store provision is fine");
-        assert_eq!(out, vec!["spin has no declared stores to provision"]);
+        assert_eq!(
+            out.status_lines,
+            vec!["spin has no declared stores to provision"]
+        );
     }
 
     // ---------- dispatch_push matrix ----------

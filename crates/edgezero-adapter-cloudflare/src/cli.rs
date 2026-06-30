@@ -10,8 +10,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -190,8 +190,14 @@ impl Adapter for CloudflareCliAdapter {
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
+        _deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
         dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionOutcome, String> {
+        match mode {
+            ProvisionMode::Cloud => {}
+            ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()),
+        }
         //: KV ids and config ids both back to Cloudflare KV
         // namespaces. Secrets are runtime-managed via
         // `wrangler secret put` — provision is a no-op for them.
@@ -284,7 +290,10 @@ impl Adapter for CloudflareCliAdapter {
         if out.is_empty() {
             out.push("cloudflare has no declared stores to provision".to_owned());
         }
-        Ok(out)
+        Ok(ProvisionOutcome {
+            status_lines: out,
+            deployed: None,
+        })
     }
 
     fn push_config_entries(
@@ -1572,14 +1581,22 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &secret_ids,
         };
         let out = CloudflareCliAdapter
-            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect("dry-run succeeds");
         // 2 KV + 1 config + 1 secret = 4 status lines.
-        assert_eq!(out.len(), 4);
-        assert!(out[0].contains("would run `wrangler kv namespace create sessions`"));
-        assert!(out[1].contains("would run `wrangler kv namespace create cache`"));
-        assert!(out[2].contains("would run `wrangler kv namespace create app_config`"));
-        assert!(out[3].contains("runtime-managed via `wrangler secret put`"));
+        assert_eq!(out.status_lines.len(), 4);
+        assert!(out.status_lines[0].contains("would run `wrangler kv namespace create sessions`"));
+        assert!(out.status_lines[1].contains("would run `wrangler kv namespace create cache`"));
+        assert!(out.status_lines[2].contains("would run `wrangler kv namespace create app_config`"));
+        assert!(out.status_lines[3].contains("runtime-managed via `wrangler secret put`"));
         // Manifest untouched.
         let after = fs::read_to_string(dir.path().join("wrangler.toml")).expect("read");
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated wrangler.toml");
@@ -1603,19 +1620,27 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &[],
         };
         let out = CloudflareCliAdapter
-            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect("dry-run succeeds");
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.status_lines.len(), 1);
         assert!(
-            out[0].contains("wrangler kv namespace create prod_config"),
+            out.status_lines[0].contains("wrangler kv namespace create prod_config"),
             "dry-run uses platform name in the `wrangler` invocation: {out:?}"
         );
         assert!(
-            out[0].contains("binding = \"prod_config\""),
+            out.status_lines[0].contains("binding = \"prod_config\""),
             "dry-run writes platform name as the binding: {out:?}"
         );
         assert!(
-            out[0].contains("logical id `app_config`"),
+            out.status_lines[0].contains("logical id `app_config`"),
             "logical id is preserved for operator wording: {out:?}"
         );
     }
@@ -1630,7 +1655,15 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &[],
         };
         let err = CloudflareCliAdapter
-            .provision(dir.path(), None, None, &stores, true)
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect_err("missing adapter manifest path must error");
         assert!(
             err.contains("wrangler.toml"),
@@ -1653,12 +1686,20 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &[],
         };
         let out = CloudflareCliAdapter
-            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect("dry-run succeeds");
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.status_lines.len(), 1);
         assert!(
-            out[0].contains("already provisioned")
-                && out[0].contains("00112233445566778899aabbccddeeff"),
+            out.status_lines[0].contains("already provisioned")
+                && out.status_lines[0].contains("00112233445566778899aabbccddeeff"),
             "skip line names the existing id: {out:?}"
         );
         let after = fs::read_to_string(&path).expect("read");
@@ -1686,11 +1727,19 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &[],
         };
         let out = CloudflareCliAdapter
-            .provision(dir.path(), Some("wrangler.toml"), None, &stores, true)
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect("dry-run succeeds");
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.status_lines.len(), 1);
         assert!(
-            out[0].contains("would run `wrangler kv namespace create sessions`"),
+            out.status_lines[0].contains("would run `wrangler kv namespace create sessions`"),
             "placeholder id is treated as unprovisioned: {out:?}"
         );
     }
@@ -1705,9 +1754,20 @@ id = "00112233445566778899aabbccddeeff"
             secrets: &[],
         };
         let out = CloudflareCliAdapter
-            .provision(dir.path(), Some("wrangler.toml"), None, &stores, false)
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
             .expect("no-store provision is fine");
-        assert_eq!(out, vec!["cloudflare has no declared stores to provision"]);
+        assert_eq!(
+            out.status_lines,
+            vec!["cloudflare has no declared stores to provision"]
+        );
     }
 
     // ---------- find_namespace_id ----------

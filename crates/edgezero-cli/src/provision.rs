@@ -114,20 +114,23 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         secrets: &secret_ids,
     };
 
-    let lines = adapter.provision(
+    let outcome = adapter.provision(
         manifest_root,
         adapter_cfg.adapter.manifest.as_deref(),
         adapter_cfg.adapter.component.as_deref(),
         &stores,
+        None, // cloud arm doesn't consume deployed state; it produces it
+        adapter_registry::ProvisionMode::Cloud,
         args.dry_run,
     )?;
 
     if args.dry_run {
         log::info!("[edgezero] provision --dry-run for `{}`:", args.adapter);
     }
-    for line in lines {
+    for line in outcome.status_lines {
         log::info!("{line}");
     }
+    // outcome.deployed wiring lands in Task 16.
     Ok(())
 }
 

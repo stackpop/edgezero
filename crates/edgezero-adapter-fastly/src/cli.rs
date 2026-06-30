@@ -11,8 +11,8 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -204,8 +204,14 @@ impl Adapter for FastlyCliAdapter {
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
+        _deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
         dry_run: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<ProvisionOutcome, String> {
+        match mode {
+            ProvisionMode::Cloud => {}
+            ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()),
+        }
         // Fastly is Multi for every store kind. Each id maps 1:1
         // to a Fastly resource (kv-store / config-store /
         // secret-store) created via the Fastly CLI; the manifest
@@ -343,7 +349,10 @@ impl Adapter for FastlyCliAdapter {
         if out.is_empty() {
             out.push("fastly has no declared stores to provision".to_owned());
         }
-        Ok(out)
+        Ok(ProvisionOutcome {
+            status_lines: out,
+            deployed: None,
+        })
     }
 
     fn push_config_entries(
@@ -1957,15 +1966,27 @@ build = \"cargo build --release\"
             secrets: &secret_ids,
         };
         let out = FastlyCliAdapter
-            .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect("dry-run succeeds");
         // 1 KV + 1 config + 1 secret + 1 runtime-env = 4 status lines.
-        assert_eq!(out.len(), 4);
-        assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
-        assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
-        assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
+        assert_eq!(out.status_lines.len(), 4);
+        assert!(out.status_lines[0].contains("would run `fastly kv-store create --name=sessions`"));
+        assert!(out.status_lines[1]
+            .contains("would run `fastly config-store create --name=app_config`"));
         assert!(
-            out[3].contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
+            out.status_lines[2].contains("would run `fastly secret-store create --name=default`")
+        );
+        assert!(
+            out.status_lines[3]
+                .contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
             "runtime-env store row: {out:?}",
         );
         // Manifest untouched.
@@ -1983,7 +2004,15 @@ build = \"cargo build --release\"
             secrets: &[],
         };
         let err = FastlyCliAdapter
-            .provision(dir.path(), None, None, &stores, true)
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
             .expect_err("missing adapter manifest path must error");
         assert!(
             err.contains("fastly.toml"),
@@ -2009,9 +2038,20 @@ build = \"cargo build --release\"
             secrets: &[],
         };
         let out = FastlyCliAdapter
-            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
             .expect("no-store provision is fine");
-        assert_eq!(out, vec!["fastly has no declared stores to provision"]);
+        assert_eq!(
+            out.status_lines,
+            vec!["fastly has no declared stores to provision"]
+        );
     }
 
     #[test]
@@ -2036,10 +2076,21 @@ build = \"cargo build --release\"
             secrets: &[],
         };
         let out = FastlyCliAdapter
-            .provision(dir.path(), Some("fastly.toml"), None, &stores, false)
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
             .expect("skip path succeeds without invoking fastly");
-        assert_eq!(out.len(), 1);
-        assert!(out[0].contains("already declared"), "got: {out:?}");
+        assert_eq!(out.status_lines.len(), 1);
+        assert!(
+            out.status_lines[0].contains("already declared"),
+            "got: {out:?}"
+        );
     }
 
     /// When `fastly.toml` declares `service_id`, the next
