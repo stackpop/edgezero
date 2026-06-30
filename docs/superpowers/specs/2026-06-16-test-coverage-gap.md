@@ -6,7 +6,7 @@
 > checkbox (`- [ ]`) syntax for tracking.
 
 **Date:** 2026-06-16
-**Status:** v1 — Draft, revised through round 8 (Tier-2 backlog closed)
+**Status:** v1 — Draft, revised through round 9 (self-review hardening)
 **Author:** (TBD)
 **Branch under assessment:** `feature/extensible-cli`
 
@@ -651,3 +651,20 @@ verified the `expand_app` file-level diagnostics are untested but flaky
 to trybuild (absolute paths in messages), so covered the cleanly-testable
 seam instead: `build_route_tokens_propagates_invalid_handler_path`. Both
 pass; full gate suite green.
+
+**Self-review hardening (round 9):** an adversarial review (mutation-lens
++ branch-coverage) of the added tests found weak/missing cases; all
+addressed. (1) `nested-AppConfig` checker — added the previously untested
+recursion arms of `type_contains_app_config_struct` (Rc/Arc/tuple/array/
+slice/reference/paren + cross-wrapper combos + an unwrapped-generic
+negative), `struct_derives_app_config` bare-ident / multi-derive /
+suffix-collision cases, and — the biggest gap — an **end-to-end** suite
+driving the two-pass `NestedAppConfigVisitor` over parsed source (positive
+through a wrapper, negatives, multi-count, definition-order, doc-comment
+non-false-positive, tuple-struct unnamed field): 4 → 15 tests. (2)
+`build_route_tokens` happy path — per-method token count, handler-less
+skip, GET-default. (3) `registry` — the error-returning `push_config_entries`
+/ `push_config_entries_local` defaults (assert the adapter-name message,
+not just `is_err`). (4) Strengthened weak assertions: `handler` now checks
+the response **body** flows through (not just status 200); `run_native_cli`
+non-zero test pins the `exited with status` branch. Full gate suite green.

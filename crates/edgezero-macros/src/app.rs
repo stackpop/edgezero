@@ -298,4 +298,68 @@ handler = "1bad::handler"
             "error should propagate from parse_handler_path, got: {err}"
         );
     }
+
+    #[test]
+    fn build_route_tokens_emits_one_token_per_method() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/"
+methods = ["GET", "POST", "PUT"]
+handler = "crate::handlers::root"
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let tokens = build_route_tokens(&manifest).expect("valid manifest builds routes");
+        // One route token per (trigger × method): 1 trigger × 3 methods.
+        assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn build_route_tokens_skips_trigger_without_handler() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/has"
+methods = ["GET"]
+handler = "crate::handlers::root"
+
+[[triggers.http]]
+path = "/none"
+methods = ["GET"]
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let tokens = build_route_tokens(&manifest).expect("builds");
+        // The handler-less trigger hits the `else { continue }` and
+        // contributes no routes.
+        assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn build_route_tokens_defaults_to_get_when_methods_absent() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/"
+handler = "crate::handlers::root"
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let tokens = build_route_tokens(&manifest).expect("builds");
+        // No `methods` key → `Trigger::methods()` defaults to `["GET"]`.
+        assert_eq!(tokens.len(), 1);
+    }
 }

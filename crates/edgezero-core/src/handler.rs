@@ -64,6 +64,10 @@ mod tests {
         let handler = ok.into_handler();
         let response = block_on(handler.call(ctx())).expect("ok response");
         assert_eq!(response.status(), StatusCode::OK);
+        // Prove the closure's return value actually flowed through
+        // `into_response` — not just that *some* default-OK response came
+        // back. A bridge that dropped the body would still be status 200.
+        assert_eq!(response.body().as_bytes(), Some(&b"hi"[..]));
     }
 
     #[test]

@@ -664,4 +664,29 @@ mod tests {
         let entry = TypedSecretEntry::new("vault", "api_token", "demo_api_token");
         assert_eq!(FIRST.validate_typed_secrets(&[entry]), Ok(()));
     }
+
+    #[test]
+    fn default_push_config_entries_error_names_the_adapter() {
+        // Unlike the no-op defaults above, the push defaults RETURN AN
+        // ERROR that interpolates the adapter name — load-bearing for CLI
+        // UX, so assert the message content, not just `is_err`.
+        let root = Path::new("/tmp");
+        let store = ResolvedStoreId::from_logical("app_config");
+        let ctx = AdapterPushContext::new();
+
+        let err = FIRST
+            .push_config_entries(root, None, None, &store, &[], &ctx, false)
+            .expect_err("default push must be unsupported");
+        assert!(err.contains("dummy"), "should name the adapter: {err}");
+        assert!(err.contains("does not implement"), "msg: {err}");
+
+        let local_err = FIRST
+            .push_config_entries_local(root, None, None, &store, &[], &ctx, false)
+            .expect_err("default local push must be unsupported");
+        assert!(
+            local_err.contains("dummy"),
+            "should name the adapter: {local_err}"
+        );
+        assert!(local_err.contains("--local"), "msg: {local_err}");
+    }
 }

@@ -235,6 +235,11 @@ mod tests {
     fn run_native_cli_nonzero_exit_is_error() {
         // `false` exits non-zero on every supported CI host (unix/macOS).
         let err = run_native_cli("false", &[], "hint").expect_err("non-zero exit must error");
-        assert!(!err.is_empty());
+        // Pin the exit-status branch specifically — `!is_empty()` would
+        // also pass for the wrong (not-found / spawn) branch.
+        assert!(
+            err.contains("exited with status"),
+            "expected the exit-status branch, got: {err}"
+        );
     }
 }
