@@ -32,6 +32,8 @@ mod diff;
 #[cfg(feature = "cli")]
 mod generator;
 #[cfg(feature = "cli")]
+mod path_safety;
+#[cfg(feature = "cli")]
 mod provision;
 #[cfg(feature = "cli")]
 mod scaffold;
