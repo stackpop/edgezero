@@ -1217,7 +1217,7 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     )
 }
 
-fn resolve_app_config_path_primitive(
+pub(crate) fn resolve_app_config_path_primitive(
     explicit: Option<&Path>,
     manifest_path: &Path,
     app_name: &str,
