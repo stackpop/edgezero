@@ -74,7 +74,7 @@ struct ResolvedAdapterPushContext {
 }
 
 /// Pre-loaded state shared by the raw and typed flows.
-struct ValidationContext {
+pub(crate) struct ValidationContext {
     /// Resolved app-config TOML path. Either the explicit
     /// `--app-config`, or `<app_name>.toml` next to the manifest.
     app_config_path: PathBuf,
@@ -96,8 +96,52 @@ struct ValidationContext {
 }
 
 impl ValidationContext {
-    fn manifest(&self) -> &Manifest {
+    // Accessors below are pub(crate) API for the provision flow. They
+    // are not called in production code in this crate yet so the
+    // dead_code lint fires for the lib target; we gate the suppression
+    // on `not(test)` so the expect is only active where the lint fires
+    // (production lib), and is absent when tests are compiled (where
+    // the methods are used and the expect would be unfulfilled).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "pub(crate) API surface for the provision flow; not yet called in production code in this crate"
+        )
+    )]
+    pub(crate) fn app_config_path(&self) -> &Path {
+        &self.app_config_path
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "pub(crate) API surface for the provision flow; not yet called in production code in this crate"
+        )
+    )]
+    pub(crate) fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    pub(crate) fn manifest(&self) -> &Manifest {
         self.manifest_loader.manifest()
+    }
+
+    #[expect(
+        dead_code,
+        reason = "pub(crate) API surface for the provision flow; not yet called anywhere in this crate"
+    )]
+    pub(crate) fn manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    #[expect(
+        dead_code,
+        reason = "pub(crate) API surface for the provision flow; not yet called anywhere in this crate"
+    )]
+    pub(crate) fn raw_config(&self) -> &toml::Value {
+        &self.raw_config
     }
 }
 
@@ -213,8 +257,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
 
-    typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_typed_preflight(&typed, &ctx)?;
 
     log::info!(
         "[edgezero] config validate (typed): {} + {} OK{}",
@@ -281,8 +324,7 @@ where
     .map_err(|err| format_app_config_error(&err))?;
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
-    typed_secret_checks(&typed, &ctx.validation)?;
-    run_adapter_typed_checks::<C>(&ctx.validation)?;
+    run_typed_preflight(&typed, &ctx.validation)?;
 
     // Resolve adapter paths.
     let (manifest_root, adapter_manifest_path, component_selector, push_ctx) =
@@ -412,8 +454,7 @@ where
     .map_err(|err| format_app_config_error(&err))?;
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("local validation failed: {err}"))?;
-    typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_typed_preflight(&typed, &ctx)?;
 
     // Build the local envelope.
     let local_data: serde_json::Value = serde_json::to_value(&typed)
@@ -1125,9 +1166,14 @@ fn generated_at_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContext, String> {
-    let manifest_loader = ManifestLoader::from_path(&args.manifest)
-        .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
+pub(crate) fn load_validation_context_with_options(
+    manifest_path: &Path,
+    app_config_override: Option<&Path>,
+    strict: bool,
+    env_overlay: bool,
+) -> Result<ValidationContext, String> {
+    let manifest_loader = ManifestLoader::from_path(manifest_path)
+        .map_err(|err| format!("failed to load {}: {err}", manifest_path.display()))?;
 
     // Spec: every project carries a `[app].name`. Without it we
     // can't compute the env-overlay prefix or resolve the default
@@ -1135,18 +1181,19 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
         format!(
             "{} has no `[app].name` — required to resolve the typed app-config",
-            args.manifest.display()
+            manifest_path.display()
         )
     })?;
 
-    let app_config_path = resolve_app_config_path(args, &args.manifest, &app_name);
+    let app_config_path =
+        resolve_app_config_path_primitive(app_config_override, manifest_path, &app_name);
 
     // Load the raw root table once. The typed flow will re-load it
     // via `load_app_config_with_options::<C>` to drive deserialise +
     // validator; we keep this copy for shared checks (e.g. Spin
     // `[component.*]` discovery) that don't need `C`.
     let mut opts = AppConfigLoadOptions::default();
-    opts.env_overlay = !args.no_env;
+    opts.env_overlay = env_overlay;
     let raw_config =
         app_config::load_app_config_raw_with_options(&app_config_path, &app_name, &opts)
             .map_err(|err| format_app_config_error(&err))?;
@@ -1154,20 +1201,29 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     Ok(ValidationContext {
         app_config_path,
         app_name,
-        args_strict: args.strict,
+        args_strict: strict,
         manifest_loader,
-        manifest_path: args.manifest.clone(),
+        manifest_path: manifest_path.to_path_buf(),
         raw_config,
     })
 }
 
-fn resolve_app_config_path(
-    args: &ConfigValidateArgs,
+fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContext, String> {
+    load_validation_context_with_options(
+        &args.manifest,
+        args.app_config.as_deref(),
+        args.strict,
+        !args.no_env,
+    )
+}
+
+fn resolve_app_config_path_primitive(
+    explicit: Option<&Path>,
     manifest_path: &Path,
     app_name: &str,
 ) -> PathBuf {
-    if let Some(explicit) = &args.app_config {
-        return explicit.clone();
+    if let Some(path) = explicit {
+        return path.to_path_buf();
     }
     let manifest_dir = manifest_path
         .parent()
@@ -1177,6 +1233,18 @@ fn resolve_app_config_path(
         || PathBuf::from(&default_name),
         |dir| dir.join(&default_name),
     )
+}
+
+#[expect(
+    dead_code,
+    reason = "thin wrapper kept for call-site clarity; production callers use the primitive directly"
+)]
+fn resolve_app_config_path(
+    args: &ConfigValidateArgs,
+    manifest_path: &Path,
+    app_name: &str,
+) -> PathBuf {
+    resolve_app_config_path_primitive(args.app_config.as_deref(), manifest_path, app_name)
 }
 
 fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
@@ -1287,12 +1355,9 @@ pub(crate) fn reject_merged_id_collisions(
     Ok(())
 }
 
-/// Typed-only adapter dispatch: feed each adapter the `#[secret]`
-/// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
-/// runtime store ids, not flat-namespace candidates) so adapters
-/// whose secret store has a flat-namespace constraint (Spin) can
-/// detect within-secrets collisions.
-fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+pub(crate) fn build_typed_secret_entries<'ctx, C: AppConfigMeta>(
+    ctx: &'ctx ValidationContext,
+) -> Result<Vec<TypedSecretEntry<'ctx>>, String> {
     let raw_table = ctx
         .raw_config
         .as_table()
@@ -1304,7 +1369,7 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
         .secrets
         .as_ref()
         .map(StoreDeclaration::default_id);
-    let mut entries: Vec<TypedSecretEntry<'_>> = Vec::new();
+    let mut entries: Vec<TypedSecretEntry<'ctx>> = Vec::new();
     for field in C::SECRET_FIELDS {
         match field.kind {
             SecretKind::KeyInDefault => {
@@ -1323,6 +1388,25 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
             SecretKind::StoreRef => {}
         }
     }
+    Ok(entries)
+}
+
+pub(crate) fn run_typed_preflight<C: AppConfigMeta>(
+    typed: &C,
+    ctx: &ValidationContext,
+) -> Result<(), String> {
+    typed_secret_checks(typed, ctx)?;
+    run_adapter_typed_checks::<C>(ctx)?;
+    Ok(())
+}
+
+/// Typed-only adapter dispatch: feed each adapter the `#[secret]`
+/// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
+/// runtime store ids, not flat-namespace candidates) so adapters
+/// whose secret store has a flat-namespace constraint (Spin) can
+/// detect within-secrets collisions.
+fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+    let entries = build_typed_secret_entries::<C>(ctx)?;
 
     for name in ctx.manifest().adapters.keys() {
         if let Some(adapter) = adapter_registry::get_adapter(name) {
@@ -3361,5 +3445,24 @@ ids = ["default"]
             err.contains("api_token") && err.contains("non-empty"),
             "error names the empty secret field: {err}"
         );
+    }
+
+    #[test]
+    fn run_typed_preflight_smoke_passes_for_valid_typed_config() {
+        let _lock = manifest_guard().lock().unwrap();
+        let (_dir, manifest, _) = setup_project(VALID_MANIFEST, FIXTURE_APP_CONFIG);
+        let ctx = load_validation_context_with_options(&manifest, None, false, false).unwrap();
+        let load_opts = {
+            let mut load_opts = AppConfigLoadOptions::default();
+            load_opts.env_overlay = false;
+            load_opts
+        };
+        let typed: FixtureConfig = app_config::deserialize_app_config_with_options(
+            ctx.app_config_path(),
+            ctx.app_name(),
+            &load_opts,
+        )
+        .unwrap();
+        run_typed_preflight(&typed, &ctx).unwrap();
     }
 }
