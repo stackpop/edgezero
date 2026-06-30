@@ -547,11 +547,11 @@ impl KvHandle {
     ) where
         Metadata: FnOnce() -> String,
     {
-        if let Some(started_at) = started_at {
+        if let Some(start) = started_at {
             let status = if result.is_ok() { "ok" } else { "error" };
             log::debug!(
                 "kv operation={operation} elapsed_ms={} status={status} {}",
-                started_at.elapsed().as_millis(),
+                start.elapsed().as_millis(),
                 metadata()
             );
         }
@@ -563,9 +563,9 @@ impl KvHandle {
 
     fn kv_write_metadata(key_len: usize, bytes_len: usize, ttl: Option<Duration>) -> String {
         match ttl {
-            Some(ttl) => format!(
+            Some(duration) => format!(
                 "key_len={key_len} bytes={bytes_len} ttl_secs={}",
-                ttl.as_secs()
+                duration.as_secs()
             ),
             None => format!("key_len={key_len} bytes={bytes_len}"),
         }
