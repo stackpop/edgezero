@@ -18,13 +18,6 @@ use std::path::{Component, Path, PathBuf};
 /// they have it, but the helper defensively normalises so a
 /// relative `args.manifest.parent()` ("" or "examples/app-demo")
 /// compares correctly.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by provision.rs (Task 8) and config push arm (Task 7)"
-    )
-)]
 pub(crate) fn assert_provision_paths_contained(
     project_root: &Path,
     adapter_manifest_path: Option<&str>,

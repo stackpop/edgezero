@@ -21,6 +21,7 @@
 use crate::args::{ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat};
 use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
+use crate::path_safety::assert_provision_paths_contained;
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
@@ -335,6 +336,21 @@ where
         component_selector: component_selector.as_deref(),
         push_ctx: &push_ctx,
     };
+
+    // Path containment check: reject `..` traversal and absolute paths
+    // in the manifest-declared adapter paths before any adapter dispatch.
+    if args.local {
+        let adapter_crate_path = ctx
+            .validation
+            .manifest()
+            .adapter_entry(ctx.adapter.name())
+            .and_then(|(_, cfg)| cfg.adapter.crate_path.clone());
+        assert_provision_paths_contained(
+            manifest_root,
+            adapter_manifest_path.as_deref(),
+            adapter_crate_path.as_deref(),
+        )?;
+    }
 
     // Build envelope.
     // Honour --key override (5.4): if the caller supplied an explicit key,
@@ -2774,6 +2790,72 @@ default = "one"
         assert!(
             err.contains("Single") && err.contains("secrets"),
             "error must come from --strict capability check: {err}"
+        );
+    }
+
+    // ---------- push --local path containment ----------
+
+    #[test]
+    fn config_push_local_rejects_parent_traversal_in_adapter_manifest() {
+        let manifest_bad = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+manifest = "../outside/axum.toml"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_bad, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.local = true;
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("parent traversal in adapter manifest must be rejected");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "error must name the traversal violation: {err}"
+        );
+    }
+
+    #[test]
+    fn config_push_local_rejects_absolute_adapter_manifest() {
+        let manifest_bad = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+manifest = "/tmp/some.toml"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_bad, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.local = true;
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("absolute adapter manifest path must be rejected");
+        assert!(
+            err.contains("must be a project-relative path"),
+            "error must name the absolute-path violation: {err}"
         );
     }
 
