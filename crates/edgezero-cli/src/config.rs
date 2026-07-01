@@ -129,10 +129,6 @@ impl ValidationContext {
         self.manifest_loader.manifest()
     }
 
-    #[expect(
-        dead_code,
-        reason = "pub(crate) API surface for the provision flow; not yet called anywhere in this crate"
-    )]
     pub(crate) fn manifest_path(&self) -> &Path {
         &self.manifest_path
     }
@@ -314,6 +310,33 @@ where
 {
     // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
+
+    // Path containment: reject `..` traversal and absolute paths in
+    // every declared adapter's manifest / crate strings BEFORE
+    // `run_shared_checks` dispatches per-adapter validation. Spin's
+    // `validate_adapter_manifest` does `fs::read_to_string(manifest_root
+    // .join(adapter_manifest_path))`, so a malicious path resolves
+    // outside the project unless we reject it here first. The spec
+    // ("Path containment (MUST)") requires the helper run BEFORE any
+    // manifest-path use — that means before shared checks, not just
+    // before adapter dispatch. Loop over every adapter because shared
+    // checks iterate every adapter, not just `ctx.adapter`.
+    if args.local {
+        let manifest_root_for_check = ctx
+            .validation
+            .manifest_path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        for adapter_cfg in ctx.validation.manifest().adapters.values() {
+            assert_provision_paths_contained(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        }
+    }
+
     run_shared_checks(&ctx.validation)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
@@ -336,21 +359,6 @@ where
         component_selector: component_selector.as_deref(),
         push_ctx: &push_ctx,
     };
-
-    // Path containment check: reject `..` traversal and absolute paths
-    // in the manifest-declared adapter paths before any adapter dispatch.
-    if args.local {
-        let adapter_crate_path = ctx
-            .validation
-            .manifest()
-            .adapter_entry(ctx.adapter.name())
-            .and_then(|(_, cfg)| cfg.adapter.crate_path.clone());
-        assert_provision_paths_contained(
-            manifest_root,
-            adapter_manifest_path.as_deref(),
-            adapter_crate_path.as_deref(),
-        )?;
-    }
 
     // Build envelope.
     // Honour --key override (5.4): if the caller supplied an explicit key,
@@ -2856,6 +2864,60 @@ ids = ["default"]
         assert!(
             err.contains("must be a project-relative path"),
             "error must name the absolute-path violation: {err}"
+        );
+    }
+
+    /// Regression: the containment guard MUST fire before
+    /// `run_shared_checks`, which iterates every declared adapter and
+    /// calls `validate_adapter_manifest`. Spin's implementation does
+    /// `fs::read_to_string(manifest_root.join(rel))` — an ordering bug
+    /// would surface as a Spin "failed to read spin manifest" error
+    /// rather than the containment error. This test declares the
+    /// pushed adapter as axum but adds a poisoned `[adapters.spin]`
+    /// entry with a traversal path, and asserts the error names the
+    /// containment violation (proving the guard fired first).
+    #[test]
+    fn config_push_local_rejects_parent_traversal_in_sibling_spin_adapter() {
+        let manifest_bad = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "../outside/spin.toml"
+component = "demo"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_bad, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.local = true;
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("sibling adapter with traversal path must be rejected");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "guard must fire before Spin's validate_adapter_manifest reads the poisoned path: {err}"
+        );
+        assert!(
+            !err.contains("failed to read spin manifest"),
+            "if this substring appears, the Spin fs::read escaped before the containment guard: {err}"
         );
     }
 
