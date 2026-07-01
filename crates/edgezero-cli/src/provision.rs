@@ -8,7 +8,8 @@
 //! each `edgezero-adapter-*` crate's `Adapter::provision` impl, not
 //! here.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::args::ProvisionArgs;
 use crate::config::{
@@ -17,8 +18,9 @@ use crate::config::{
 use crate::ensure_adapter_defined;
 use crate::path_safety::assert_provision_paths_contained;
 use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
+use edgezero_adapter::AdapterDeployedState;
 use edgezero_core::env_config::EnvConfig;
-use edgezero_core::manifest::{ManifestLoader, StoreDeclaration};
+use edgezero_core::manifest::{Manifest, ManifestAdapter, ManifestLoader, StoreDeclaration};
 
 /// # Errors
 ///
@@ -64,12 +66,6 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         )?;
     }
 
-    let mode = if args.local {
-        adapter_registry::ProvisionMode::Local
-    } else {
-        adapter_registry::ProvisionMode::Cloud
-    };
-
     // Linked in this build? Adapters are feature-gated; a release
     // built without `--features cloudflare` won't have it
     // registered even if the manifest declares it.
@@ -108,49 +104,62 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    adapter.validate_adapter_manifest(
-        manifest_root,
-        adapter_cfg.adapter.manifest.as_deref(),
-        adapter_cfg.adapter.component.as_deref(),
-    )?;
 
-    // Resolve each logical store id to its platform name via the
-    // same `EDGEZERO__STORES__<KIND>__<ID>__NAME` env overlay the
-    // runtime reads. Provision writes the PLATFORM name into the
-    // per-platform manifest (wrangler.toml, spin.toml,
-    // fastly.toml); the logical id stays available for status-line
-    // wording so operators see what they declared even when the
-    // env override redirected the create.
-    let env_config = EnvConfig::from_env();
+    // Fallback to "" when [app].name is unset: today's synthesiser
+    // default is a no-op so the value isn't consulted; per-adapter
+    // overrides (Tasks 17/21/24) that DO use it treat empty as the
+    // "operator hasn't set app.name yet" case.
+    let app_name = manifest.app.name.clone().unwrap_or_default();
 
-    // Same env-resolved merged-id collision check `config validate`
-    // runs. Without it, `provision --adapter spin --dry-run` would
-    // happily ack a manifest where (e.g.) [stores.kv].sessions and
-    // [stores.config].app_config both resolve to platform label
-    // `shared` via the env overlay -- both writes would silently
-    // land on the same Spin KV store at runtime. Catches BOTH
-    // logical-id collisions and env-resolved platform-label
-    // collisions across merged kinds.
-    reject_merged_id_collisions(&args.adapter, adapter, manifest, &env_config)?;
+    // Translate the manifest's deployed block into the neutral
+    // `AdapterDeployedState` for the synthesiser call site. Task 14
+    // adds the typed struct that makes this a real translation;
+    // today it's always `None`.
+    let deployed = deployed_state_for(manifest, &args.adapter);
 
-    let config_ids = resolve_kind(manifest.stores.config.as_ref(), &env_config, "config");
-    let kv_ids = resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv");
-    let secret_ids = resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets");
-    let stores = ProvisionStores {
-        config: &config_ids,
-        kv: &kv_ids,
-        secrets: &secret_ids,
+    let outcome = match (args.local, args.dry_run) {
+        (false, dry_run) => {
+            // Cloud: no synthesis. Validate + build stores against the
+            // real worktree, dispatch with mode=Cloud, deployed=None.
+            validate_and_dispatch(
+                adapter,
+                manifest,
+                adapter_cfg,
+                manifest_root,
+                &args.adapter,
+                None,
+                adapter_registry::ProvisionMode::Cloud,
+                dry_run,
+            )?
+        }
+        (true, false) => {
+            // Local real-write: synthesise baseline INSIDE this arm
+            // so cloud never touches it. Write baseline to the
+            // worktree, then validate + build stores + dispatch.
+            let baseline_pairs = adapter.synthesise_baseline_manifest(
+                manifest_root,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.component.as_deref(),
+                &app_name,
+                deployed.as_ref(),
+            )?;
+            write_baseline_to_disk(manifest_root, &baseline_pairs)?;
+            validate_and_dispatch(
+                adapter,
+                manifest,
+                adapter_cfg,
+                manifest_root,
+                &args.adapter,
+                deployed.as_ref(),
+                adapter_registry::ProvisionMode::Local,
+                false,
+            )?
+        }
+        (true, true) => {
+            // Local dry-run: staging harness lands in Task 10/11.
+            return Err("local dry-run staging lands in Task 10/11".to_owned());
+        }
     };
-
-    let outcome = adapter.provision(
-        manifest_root,
-        adapter_cfg.adapter.manifest.as_deref(),
-        adapter_cfg.adapter.component.as_deref(),
-        &stores,
-        None, // cloud arm doesn't consume deployed state; it produces it
-        mode,
-        args.dry_run,
-    )?;
 
     if args.dry_run {
         log::info!("[edgezero] provision --dry-run for `{}`:", args.adapter);
@@ -178,14 +187,201 @@ fn resolve_kind(
     })
 }
 
+/// Write each `(rel, contents)` baseline pair under `root`, skipping
+/// files that already exist. Preserves operator content and earlier
+/// synthesis output. Used for worktree writes (real-write local) and
+/// tempdir writes (dry-run staging, Task 10+) — the only difference
+/// is which root is passed in.
+fn write_baseline_to_disk(root: &Path, pairs: &[(PathBuf, String)]) -> Result<(), String> {
+    for (rel_path, contents) in pairs {
+        let abs = root.join(rel_path);
+        if abs.exists() {
+            continue;
+        }
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("create {}: {err}", parent.display()))?;
+        }
+        fs::write(&abs, contents).map_err(|err| format!("write {}: {err}", abs.display()))?;
+    }
+    Ok(())
+}
+
+/// Translate the parent manifest's deployed block for `canonical_adapter_name`
+/// into the neutral `AdapterDeployedState` shape. Task 14 introduces the typed
+/// `ManifestAdapterDeployed` struct; until that lands this returns `None`
+/// unconditionally. The synthesiser call path already receives
+/// `Option<&AdapterDeployedState>` — just always `None` today. Section 4
+/// fills in the real translation.
+fn deployed_state_for(
+    _manifest: &Manifest,
+    _canonical_adapter_name: &str,
+) -> Option<AdapterDeployedState> {
+    None
+}
+
+/// Shared validate + env-overlay + collision-check + resolve-stores +
+/// dispatch tail for both cloud and local live-mode arms. Baseline
+/// synthesis (local only) fires BEFORE this helper — the tail after
+/// synthesis is identical between the two arms, so factoring it here
+/// keeps `run_provision` under the module's function-length lint AND
+/// removes the copy-paste risk of two arms drifting out of sync.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shared tail needs adapter, manifest, adapter cfg, manifest root, adapter name, deployed state, mode, and dry-run — same 8 argument shape as `Adapter::provision` itself, whose lint annotation applies for the same reason"
+)]
+fn validate_and_dispatch(
+    adapter: &'static dyn adapter_registry::Adapter,
+    manifest: &Manifest,
+    adapter_cfg: &ManifestAdapter,
+    manifest_root: &Path,
+    adapter_name: &str,
+    deployed: Option<&AdapterDeployedState>,
+    mode: adapter_registry::ProvisionMode,
+    dry_run: bool,
+) -> Result<adapter_registry::ProvisionOutcome, String> {
+    adapter.validate_adapter_manifest(
+        manifest_root,
+        adapter_cfg.adapter.manifest.as_deref(),
+        adapter_cfg.adapter.component.as_deref(),
+    )?;
+    let env_config = EnvConfig::from_env();
+    reject_merged_id_collisions(adapter_name, adapter, manifest, &env_config)?;
+    let config_ids = resolve_kind(manifest.stores.config.as_ref(), &env_config, "config");
+    let kv_ids = resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv");
+    let secret_ids = resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets");
+    let stores = ProvisionStores {
+        config: &config_ids,
+        kv: &kv_ids,
+        secrets: &secret_ids,
+    };
+    adapter.provision(
+        manifest_root,
+        adapter_cfg.adapter.manifest.as_deref(),
+        adapter_cfg.adapter.component.as_deref(),
+        &stores,
+        deployed,
+        mode,
+        dry_run,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::args::ProvisionArgs;
     use crate::test_support::{manifest_guard, EnvOverride, PROVISION_MANIFEST};
+    use edgezero_adapter::registry::{
+        register_adapter, Adapter, AdapterAction, ProvisionMode, ProvisionOutcome,
+    };
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+
+    // ----- fixtures for CLI-owned first-run bootstrap synthesis -----
+    //
+    // A distinct fake adapter (`__test_bootstrap_fake__`) is
+    // registered per-test into the global adapter registry via the
+    // public `register_adapter` helper. The `manifest_guard()` mutex
+    // already serialises tests that touch the registry, so a
+    // second registration under the same name from a concurrent
+    // test cannot race. Observability is via two module-scope
+    // `AtomicBool` flags — `SYNTH_CALLED` for the synthesiser call
+    // and `VALIDATE_SAW_FILE` for the downstream
+    // `validate_adapter_manifest` invariant.
+    //
+    // The fake echoes `adapter_manifest_path` back as the
+    // synthesised file's relative path, mirroring the Spin override
+    // that lands at Task 24 — the file must land at
+    // `<root>/<adapter_cfg.adapter.manifest>`, NOT at a hard-coded
+    // path.
+
+    const FAKE_MANIFEST_BODY: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.__test_bootstrap_fake__.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.__test_bootstrap_fake__.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+
+    static FAKE_ADAPTER: FakeBootstrapAdapter = FakeBootstrapAdapter;
+    static SYNTH_CALLED: AtomicBool = AtomicBool::new(false);
+    static VALIDATE_SAW_FILE: AtomicBool = AtomicBool::new(false);
+
+    struct FakeBootstrapAdapter;
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the fake only exercises name/provision/synthesise_baseline_manifest/validate_adapter_manifest; every other trait method inherits its default (no-op or Unsupported)"
+    )]
+    impl Adapter for FakeBootstrapAdapter {
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "__test_bootstrap_fake__"
+        }
+
+        fn provision(
+            &self,
+            _manifest_root: &Path,
+            _adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+            _stores: &ProvisionStores<'_>,
+            _deployed: Option<&AdapterDeployedState>,
+            _mode: ProvisionMode,
+            _dry_run: bool,
+        ) -> Result<ProvisionOutcome, String> {
+            Ok(ProvisionOutcome::default())
+        }
+
+        fn synthesise_baseline_manifest(
+            &self,
+            _manifest_root: &Path,
+            adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+            _app_name: &str,
+            _deployed: Option<&AdapterDeployedState>,
+        ) -> Result<Vec<(PathBuf, String)>, String> {
+            SYNTH_CALLED.store(true, Ordering::SeqCst);
+            let rel = adapter_manifest_path.unwrap_or("spin.toml").to_owned();
+            Ok(vec![(PathBuf::from(rel), "# stub\n".to_owned())])
+        }
+
+        fn validate_adapter_manifest(
+            &self,
+            manifest_root: &Path,
+            adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+        ) -> Result<(), String> {
+            // The synthesised file MUST exist by the time validate
+            // runs — that's the invariant this whole task guards.
+            let rel = adapter_manifest_path.unwrap_or("spin.toml");
+            let abs = manifest_root.join(rel);
+            if abs.exists() {
+                VALIDATE_SAW_FILE.store(true, Ordering::SeqCst);
+                Ok(())
+            } else {
+                Err(format!(
+                    "fake validate: {} missing at validate time",
+                    abs.display()
+                ))
+            }
+        }
+    }
+
+    fn reset_fake_state() {
+        SYNTH_CALLED.store(false, Ordering::SeqCst);
+        VALIDATE_SAW_FILE.store(false, Ordering::SeqCst);
+    }
 
     #[test]
     fn run_provision_axum_prints_local_only_notes_for_each_store() {
@@ -782,6 +978,122 @@ ids = ["default"]
                 && !err.contains("must be a project-relative path")
                 && !err.contains("resolves outside project root"),
             "path-safety must not fire for a valid fixture: {err}"
+        );
+    }
+
+    // ---------- CLI-owned first-run bootstrap synthesis ----------
+
+    #[test]
+    fn provision_local_synthesises_missing_adapter_manifest_before_validation() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        // Fixture: crates/spin/ exists but spin.toml does NOT.
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, FAKE_MANIFEST_BODY).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+
+        run_provision(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: false,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("local provision synthesises baseline then validates");
+
+        assert!(
+            SYNTH_CALLED.load(Ordering::SeqCst),
+            "synthesiser must fire in local mode"
+        );
+        assert!(
+            VALIDATE_SAW_FILE.load(Ordering::SeqCst),
+            "validate must see synthesised file"
+        );
+        let synth_path = temp.path().join("crates/spin/spin.toml");
+        let synth = fs::read_to_string(&synth_path)
+            .expect("synthesised file lands under the configured adapter manifest path");
+        assert!(
+            synth.contains("# stub"),
+            "synthesised file contains the fake payload: {synth}"
+        );
+        // Regression guard: the synthesised file must NOT land at
+        // <root>/spin.toml — that path is what the earlier "hard-code
+        // spin.toml" shape produced.
+        assert!(
+            !temp.path().join("spin.toml").exists(),
+            "sentinel: synthesis must not write to a hard-coded root-level path"
+        );
+    }
+
+    #[test]
+    fn provision_local_bootstrap_is_a_no_op_when_manifest_already_present() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+        // Operator-authored content that must survive.
+        let operator_body = "# operator-authored\n";
+        fs::write(temp.path().join("crates/spin/spin.toml"), operator_body)
+            .expect("write operator manifest");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, FAKE_MANIFEST_BODY).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+
+        run_provision(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: false,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("provision passes when manifest already exists");
+
+        // The synthesiser fires, but write_baseline_to_disk skips
+        // existing files, so operator content survives byte-for-byte.
+        let after = fs::read_to_string(temp.path().join("crates/spin/spin.toml"))
+            .expect("existing spin.toml still readable");
+        assert_eq!(
+            after, operator_body,
+            "existing operator-authored file must remain byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn provision_cloud_never_runs_bootstrap_synthesis() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        // crates/spin/ exists but spin.toml does NOT — validation must
+        // therefore fail in cloud mode because bootstrap synthesis is
+        // NOT invoked to fill the gap.
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, FAKE_MANIFEST_BODY).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: false,
+            local: false,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("cloud mode with missing adapter manifest must error at validate");
+        assert!(
+            err.contains("missing at validate time"),
+            "error surfaces the missing-manifest failure: {err}"
+        );
+        assert!(
+            !SYNTH_CALLED.load(Ordering::SeqCst),
+            "synthesiser must NOT fire in cloud mode"
         );
     }
 }

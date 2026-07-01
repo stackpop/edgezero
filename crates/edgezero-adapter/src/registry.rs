@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -508,6 +508,37 @@ pub trait Adapter: Sync + Send {
     #[inline]
     fn single_store_kinds(&self) -> &'static [&'static str] {
         &[]
+    }
+
+    /// First-run bootstrap synthesiser, called by the CLI ONLY when
+    /// `mode == Local` AND the adapter manifest (or related local
+    /// files like `runtime-config.toml`) is absent. Returns
+    /// `Ok(Vec::new())` for adapters that own no synthesised local
+    /// state (e.g. Axum — `axum.toml` stays tracked).
+    ///
+    /// Each `(relative_path, contents)` tuple is written by the CLI
+    /// under `manifest_root` BEFORE `validate_adapter_manifest`
+    /// runs, so a clean clone can pass validation.
+    ///
+    /// **Boundary contract (MUST):** signature uses only `std` +
+    /// types defined IN this crate. Adapters that need values from
+    /// the parent manifest receive them through the neutral
+    /// `Option<&AdapterDeployedState>` argument — the CLI translates
+    /// from `&Manifest` to `AdapterDeployedState` at the call site.
+    ///
+    /// # Errors
+    /// The default impl never errors. Adapter overrides may return
+    /// human-readable error strings if baseline synthesis fails.
+    #[inline]
+    fn synthesise_baseline_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _app_name: &str,
+        _deployed: Option<&AdapterDeployedState>,
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        Ok(Vec::new())
     }
 
     /// Adapter-specific manifest check — e.g. Spin's
