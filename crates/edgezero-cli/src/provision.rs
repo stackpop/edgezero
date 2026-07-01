@@ -15,6 +15,7 @@ use crate::config::{
     enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
 };
 use crate::ensure_adapter_defined;
+use crate::path_safety::assert_provision_paths_contained;
 use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{ManifestLoader, StoreDeclaration};
@@ -41,6 +42,33 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
             args.manifest.display()
         )
     })?;
+
+    // Path containment: reject `..` traversal and absolute paths in
+    // the manifest-declared adapter paths before any adapter dispatch
+    // or file resolution. Mirrors the `config push --local` guard
+    // (Task 7); the same helper closes the spec's "local provision
+    // never writes outside the adapter crate" promise. Cloud mode
+    // still targets remote SDKs so containment isn't load-bearing;
+    // gating on `args.local` also preserves the existing cloud
+    // fixtures where `manifest` lives at project root outside `crate`.
+    if args.local {
+        let manifest_root_for_check = args
+            .manifest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        assert_provision_paths_contained(
+            manifest_root_for_check,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.crate_path.as_deref(),
+        )?;
+    }
+
+    let mode = if args.local {
+        adapter_registry::ProvisionMode::Local
+    } else {
+        adapter_registry::ProvisionMode::Cloud
+    };
 
     // Linked in this build? Adapters are feature-gated; a release
     // built without `--features cloudflare` won't have it
@@ -120,7 +148,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         adapter_cfg.adapter.component.as_deref(),
         &stores,
         None, // cloud arm doesn't consume deployed state; it produces it
-        adapter_registry::ProvisionMode::Cloud,
+        mode,
         args.dry_run,
     )?;
 
@@ -156,6 +184,7 @@ mod tests {
     use crate::args::ProvisionArgs;
     use crate::test_support::{manifest_guard, EnvOverride, PROVISION_MANIFEST};
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -539,5 +568,220 @@ ids = ["default"]
             manifest: manifest_path.clone(),
         })
         .expect("fastly dry-run dispatches cleanly");
+    }
+
+    // ---------- provision --local path containment ----------
+
+    #[test]
+    fn provision_local_rejects_parent_traversal_in_adapter_manifest() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "../outside/spin.toml"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        // Canary: the traversal target resolves to `<parent>/outside/spin.toml`.
+        // If path-safety fires before dispatch, this path must not exist after.
+        let outside_dir = temp
+            .path()
+            .parent()
+            .expect("tempdir has parent")
+            .join("outside");
+        assert!(!outside_dir.exists(), "sentinel: outside/ absent pre-call");
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("parent traversal in adapter manifest must be rejected");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "error must name the traversal violation: {err}"
+        );
+        assert!(
+            !outside_dir.exists(),
+            "sentinel: outside/ still absent after call (dispatch did not fire)"
+        );
+    }
+
+    #[test]
+    fn provision_local_rejects_absolute_adapter_manifest() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        // Use a path inside a fresh tempdir subtree so we can prove
+        // it stays absent even though nothing outside the test would
+        // reasonably poke it: /tmp/some.toml would be a shared name.
+        let outside_root = TempDir::new().expect("outside temp dir");
+        let outside_abs = outside_root.path().join("some.toml");
+        let manifest_body = format!(
+            r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "{}"
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#,
+            outside_abs.display()
+        );
+        fs::write(&manifest_path, &manifest_body).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        assert!(
+            !outside_abs.exists(),
+            "sentinel: absolute path absent pre-call"
+        );
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "spin".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("absolute adapter manifest path must be rejected");
+        assert!(
+            err.contains("must be a project-relative path"),
+            "error must name the absolute-path violation: {err}"
+        );
+        assert!(
+            !outside_abs.exists(),
+            "sentinel: absolute path still absent after call"
+        );
+    }
+
+    #[test]
+    fn provision_local_rejects_parent_traversal_in_adapter_crate() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "../escape"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let escape_dir = temp
+            .path()
+            .parent()
+            .expect("tempdir has parent")
+            .join("escape");
+        assert!(!escape_dir.exists(), "sentinel: escape/ absent pre-call");
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("parent traversal in adapter crate must be rejected");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "error must name the traversal violation: {err}"
+        );
+        assert!(
+            !escape_dir.exists(),
+            "sentinel: escape/ still absent after call"
+        );
+    }
+
+    #[test]
+    fn provision_local_accepts_relative_manifest_root_default() {
+        // Bare `--manifest edgezero.toml` — `args.manifest.parent()`
+        // returns "". Path-safety must not reject the well-formed
+        // adapter paths in this fixture; the axum adapter itself
+        // then errors from Section 5 because local mode isn't wired
+        // yet, but that error is NOT a path-safety error.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: PathBuf::from("edgezero.toml"),
+        })
+        .expect_err("local dispatch reaches adapter (Section 5 stub errors)");
+        assert!(
+            !err.contains("must not contain `..` traversal")
+                && !err.contains("must be a project-relative path")
+                && !err.contains("resolves outside project root"),
+            "path-safety must not fire for a valid fixture: {err}"
+        );
+    }
+
+    #[test]
+    fn provision_local_accepts_relative_manifest_root_nested() {
+        // Nested `--manifest <tempdir>/edgezero.toml` — parent is
+        // the tempdir path. Same shape as above: path-safety passes,
+        // the axum adapter errors from its Section 5 stub.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("local dispatch reaches adapter (Section 5 stub errors)");
+        assert!(
+            !err.contains("must not contain `..` traversal")
+                && !err.contains("must be a project-relative path")
+                && !err.contains("resolves outside project root"),
+            "path-safety must not fire for a valid fixture: {err}"
+        );
     }
 }
