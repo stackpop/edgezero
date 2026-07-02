@@ -1033,19 +1033,41 @@ serve = "echo"
     /// assertion — any staging leak that writes into the worktree
     /// flips one of the pairs.
     fn snapshot_dir(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        snapshot_dir_excluding(root, &[])
+    }
+
+    /// Same as `snapshot_dir` but skips directories whose file name
+    /// matches an entry in `excluded_dir_names` (at any depth).
+    /// Used by the app-demo dry-run test: `examples/app-demo/target`
+    /// alone is tens of gigabytes of Rust build output whose contents
+    /// are irrelevant to "did dry-run mutate the worktree" — reading
+    /// them into memory would time the test out with no signal gain.
+    fn snapshot_dir_excluding(root: &Path, excluded_dir_names: &[&str]) -> Vec<(PathBuf, Vec<u8>)> {
         let mut out = Vec::new();
-        snapshot_walk(root, root, &mut out).expect("snapshot walk");
+        snapshot_walk(root, root, excluded_dir_names, &mut out).expect("snapshot walk");
         out.sort_by(|left, right| left.0.cmp(&right.0));
         out
     }
 
-    fn snapshot_walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) -> io::Result<()> {
+    fn snapshot_walk(
+        base: &Path,
+        dir: &Path,
+        excluded_dir_names: &[&str],
+        out: &mut Vec<(PathBuf, Vec<u8>)>,
+    ) -> io::Result<()> {
         for read_result in fs::read_dir(dir)? {
             let entry = read_result?;
             let file_type = entry.file_type()?;
             let path = entry.path();
             if file_type.is_dir() {
-                snapshot_walk(base, &path, out)?;
+                let name = entry.file_name();
+                if excluded_dir_names
+                    .iter()
+                    .any(|excluded| name.as_os_str() == *excluded)
+                {
+                    continue;
+                }
+                snapshot_walk(base, &path, excluded_dir_names, out)?;
             } else if !file_type.is_symlink() {
                 // Regular files only — symlinks are intentionally
                 // skipped so the snapshot mirrors `copy_dir_recursive`'s
@@ -2118,7 +2140,6 @@ ids = ["default"]
     // follow-up task can retrofit either a subprocess-based capture
     // or a `tracing`-subscriber swap.
     #[test]
-    #[ignore = "re-enable after Section 5 lands per-adapter local provision"]
     fn provision_local_dry_run_worktree_clean_and_no_tempdir_paths_in_stdout() {
         let _lock = manifest_guard().lock().expect("manifest guard");
 
@@ -2141,14 +2162,22 @@ ids = ["default"]
             manifest_path.display()
         );
 
-        for adapter in ["cloudflare", "fastly", "spin", "axum"] {
-            let before = snapshot_dir(&app_demo_root);
+        // Exclude directories that are gitignored / test-runtime-only.
+        // `target/` alone is tens of gigabytes of Rust build output;
+        // reading it would time the test out with no signal — build
+        // artifacts are gitignored and outside the "did dry-run touch
+        // the worktree" question. `.spin/` and `.wrangler/` hold
+        // adapter runtime state (sqlite KV files, cached tokens) that
+        // fluctuate under normal `run_serve` and are also gitignored.
+        let excluded: &[&str] = &["target", ".git", ".spin", ".wrangler"];
 
-            // Ignore the Result — today's stub adapters return
-            // `Err("local mode lands in Section 5")`. Contract A is
-            // the "was the worktree modified?" claim, and it holds
-            // regardless of whether the adapter succeeded. Explicit
-            // type annotation quiets `let_underscore_untyped` /
+        for adapter in ["cloudflare", "fastly", "spin", "axum"] {
+            let before = snapshot_dir_excluding(&app_demo_root, excluded);
+
+            // Ignore the Result — Contract A is the "was the worktree
+            // modified?" claim, and it holds regardless of whether the
+            // adapter's Local arm returned Ok or Err. Explicit type
+            // annotation quiets `let_underscore_untyped` /
             // `let_underscore_must_use`.
             let _result: Result<(), String> = run_provision(&ProvisionArgs {
                 adapter: (*adapter).to_owned(),
@@ -2157,7 +2186,7 @@ ids = ["default"]
                 manifest: manifest_path.clone(),
             });
 
-            let after = snapshot_dir(&app_demo_root);
+            let after = snapshot_dir_excluding(&app_demo_root, excluded);
             assert_eq!(
                 before, after,
                 "adapter {adapter}: dry-run must leave the worktree byte-identical"
