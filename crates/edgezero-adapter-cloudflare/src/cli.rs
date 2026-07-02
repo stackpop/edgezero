@@ -38,7 +38,7 @@ static CLOUDFLARE_BLUEPRINT: AdapterBlueprint = AdapterBlueprint {
         build_features: &["cloudflare"],
     },
     commands: CommandTemplates {
-        build: "wrangler build --cwd {crate_dir}",
+        build: "wrangler deploy --dry-run --cwd {crate_dir}",
         deploy: "wrangler deploy --cwd {crate_dir}",
         serve: "wrangler dev --cwd {crate_dir}",
     },
@@ -919,7 +919,7 @@ fn read_wrangler_kv_key(
 }
 
 /// # Errors
-/// Returns an error if the Cloudflare wrangler build command fails.
+/// Returns an error if the Cloudflare Cargo build command fails.
 #[inline]
 pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     let manifest =
@@ -1147,6 +1147,17 @@ mod tests {
     const TEST_KV_ID_ALT: &str = "cache";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
+
+    #[test]
+    fn cloudflare_scaffold_does_not_emit_removed_wrangler_build_command() {
+        let command = CLOUDFLARE_BLUEPRINT.commands.build;
+        assert!(!command.contains("wrangler build"), "{command}");
+        assert_eq!(
+            command,
+            "wrangler deploy --dry-run --cwd {crate_dir}",
+            "the validation build must execute Wrangler's real custom-build pipeline"
+        );
+    }
 
     /// RAII guard: prepends a directory to `$PATH` and restores the original
     /// value on drop. Mirrors the `PathPrepend` used in `push_cloud.rs`.
