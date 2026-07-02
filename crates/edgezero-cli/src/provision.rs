@@ -11,6 +11,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use similar::{ChangeTag, TextDiff};
+
 use crate::args::ProvisionArgs;
 use crate::config::{
     enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
@@ -42,6 +44,23 @@ impl OwnedProvisionStores {
             secrets: &self.secrets,
         }
     }
+}
+
+/// Resolved per-adapter allow-list inputs the dry-run driver diffs.
+/// Built by the CLI from the resolved adapter manifest path (NOT a
+/// static filename) so nested paths like
+/// `crates/cf/config/wrangler.toml` resolve correctly. Spec §"Per-
+/// adapter local state" defines membership per adapter:
+/// - Axum: project-root `.edgezero/.env` only.
+/// - Cloudflare: resolved `wrangler.toml` + sibling `.dev.vars`.
+/// - Fastly: resolved `fastly.toml`.
+/// - Spin: resolved `spin.toml` + sibling `runtime-config.toml` +
+///   sibling `.env`.
+///
+/// `axum.toml` is NOT in this list (it stays tracked).
+pub(crate) struct DryRunAllowList {
+    /// (`project_path`, `staged_path`) pairs the driver diffs.
+    pub pairs: Vec<(PathBuf, PathBuf)>,
 }
 
 /// # Errors
@@ -321,6 +340,138 @@ fn build_stores_against(
     })
 }
 
+/// Build the allow-list from the resolved adapter manifest path.
+/// `adapter_manifest_abs` is the absolute path the adapter would
+/// write to (`staged_root.join(adapter_manifest_rel)`); the helper
+/// computes its sibling paths and the corresponding project-tree
+/// twins by prefix-swapping `staged_root` → `project_root`.
+///
+/// **Case contract:** callers MUST lowercase the adapter name
+/// before passing it in. The manifest's canonical spelling (e.g.
+/// `Fastly`) does NOT match the match arms.
+pub(crate) fn build_dry_run_allow_list(
+    project_root: &Path,
+    staged_root: &Path,
+    adapter_lower: &str,
+    adapter_manifest_abs: &Path,
+) -> DryRunAllowList {
+    let project_manifest = adapter_manifest_abs.strip_prefix(staged_root).map_or_else(
+        |_| adapter_manifest_abs.to_path_buf(),
+        |rel| project_root.join(rel),
+    );
+    let manifest_parent_staged = adapter_manifest_abs
+        .parent()
+        .unwrap_or(staged_root)
+        .to_path_buf();
+    let manifest_parent_project = project_manifest
+        .parent()
+        .unwrap_or(project_root)
+        .to_path_buf();
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    match adapter_lower {
+        "axum" => {
+            pairs.push((
+                project_root.join(".edgezero/.env"),
+                staged_root.join(".edgezero/.env"),
+            ));
+        }
+        "cloudflare" => {
+            pairs.push((project_manifest.clone(), adapter_manifest_abs.to_path_buf()));
+            pairs.push((
+                manifest_parent_project.join(".dev.vars"),
+                manifest_parent_staged.join(".dev.vars"),
+            ));
+        }
+        "fastly" => {
+            pairs.push((project_manifest, adapter_manifest_abs.to_path_buf()));
+        }
+        "spin" => {
+            pairs.push((project_manifest.clone(), adapter_manifest_abs.to_path_buf()));
+            pairs.push((
+                manifest_parent_project.join("runtime-config.toml"),
+                manifest_parent_staged.join("runtime-config.toml"),
+            ));
+            pairs.push((
+                manifest_parent_project.join(".env"),
+                manifest_parent_staged.join(".env"),
+            ));
+        }
+        _ => {}
+    }
+    DryRunAllowList { pairs }
+}
+
+/// Per-adapter default manifest filename. Fallback for when
+/// `[adapters.<name>.adapter].manifest` is unset. Mirrors each
+/// adapter crate's default.
+pub(crate) fn default_adapter_manifest_for(adapter_lower: &str) -> &'static str {
+    match adapter_lower {
+        "cloudflare" => "wrangler.toml",
+        "fastly" => "fastly.toml",
+        "spin" => "spin.toml",
+        _ => "", // axum has no per-adapter manifest in the allow-list
+    }
+}
+
+/// Render the dry-run report: rewritten status lines + per-file
+/// unified diff. Status-line rewriting (`wrote X` → `would write X`)
+/// uses only the (`project_root`, `staged_root`) prefix swap plus a
+/// verb-prefix table.
+pub(crate) fn render_dry_run_report(
+    project_root: &Path,
+    staged_root: &Path,
+    allow_list: &DryRunAllowList,
+    outcome: &adapter_registry::ProvisionOutcome,
+) -> String {
+    let mut out = String::new();
+
+    // Status lines: rewrite staged-tempdir paths back to project-
+    // relative AND prefix each verb with "would ".
+    for line in &outcome.status_lines {
+        let rewritten = line.replace(
+            staged_root.to_string_lossy().as_ref(),
+            project_root.to_string_lossy().as_ref(),
+        );
+        let with_verb = rewritten
+            .replacen("wrote ", "would write ", 1)
+            .replacen("created ", "would create ", 1)
+            .replacen("appended ", "would append ", 1);
+        out.push_str(&with_verb);
+        out.push('\n');
+    }
+
+    // Per-file diff section: caller-provided pairs already resolved
+    // (project_path, staged_path).
+    for (proj_path, staged_path) in &allow_list.pairs {
+        if !staged_path.exists() {
+            continue;
+        }
+        let new = fs::read_to_string(staged_path).unwrap_or_default();
+        let old = fs::read_to_string(proj_path).unwrap_or_default();
+        if old == new {
+            continue;
+        }
+        let diff = TextDiff::from_lines(&old, &new);
+        out.push('\n');
+        out.push_str("--- ");
+        out.push_str(&proj_path.display().to_string());
+        out.push('\n');
+        out.push_str("+++ ");
+        out.push_str(&proj_path.display().to_string());
+        out.push('\n');
+        for change in diff.iter_all_changes() {
+            let sign = match change.tag() {
+                ChangeTag::Delete => "-",
+                ChangeTag::Insert => "+",
+                ChangeTag::Equal => " ",
+            };
+            out.push_str(sign);
+            out.push_str(&change.to_string());
+        }
+    }
+    out
+}
+
 /// The `(true, true)` dispatch arm: synthesise the baseline manifest
 /// (bytes only — no I/O against the real worktree), then stage the
 /// adapter crate + `.edgezero/` + `edgezero.toml` into a tempdir and
@@ -353,7 +504,7 @@ fn run_local_dry_run(
         .crate_path
         .as_deref()
         .map_or_else(|| Path::new("."), Path::new);
-    let (outcome, _tempdir) = run_with_staging(
+    let (outcome, tempdir) = run_with_staging(
         manifest_root,
         adapter_crate_rel,
         |staged_root, _staged_crate| {
@@ -375,6 +526,28 @@ fn run_local_dry_run(
             )
         },
     )?;
+
+    let staged_root = tempdir.path();
+    let adapter_lower = args.adapter.to_lowercase();
+    let adapter_manifest_rel = adapter_cfg
+        .adapter
+        .manifest
+        .as_deref()
+        .unwrap_or_else(|| default_adapter_manifest_for(&adapter_lower));
+    let adapter_manifest_staged = staged_root.join(adapter_manifest_rel);
+    let allow_list = build_dry_run_allow_list(
+        manifest_root,
+        staged_root,
+        &adapter_lower,
+        &adapter_manifest_staged,
+    );
+    let report = render_dry_run_report(manifest_root, staged_root, &allow_list, &outcome);
+    // Only emit the report if it's non-empty (avoids extraneous blank
+    // log lines when the adapter status_lines are empty and no
+    // allow-list file differs).
+    if !report.is_empty() {
+        log::info!("{report}");
+    }
     Ok(outcome)
 }
 
@@ -1502,6 +1675,172 @@ ids = ["default"]
         assert!(
             bytes.contains("# stub"),
             "content should match fake's synthesiser output"
+        );
+    }
+
+    // ---------- dry-run allow-list + report rendering ----------
+
+    #[test]
+    fn dry_run_status_lines_use_would_write_verb() {
+        // Direct fn-under-test: call render_dry_run_report against a
+        // synthetic ProvisionOutcome whose status_lines exercise all
+        // three verbs the rewriter handles.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, FAKE_MANIFEST_BODY).expect("write manifest");
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create crate dir");
+
+        let outcome = ProvisionOutcome {
+            status_lines: vec![
+                "wrote crates/spin/spin.toml".to_owned(),
+                "created .edgezero/.env".to_owned(),
+                "appended crates/spin/.env".to_owned(),
+            ],
+            ..ProvisionOutcome::default()
+        };
+        let allow_list = DryRunAllowList { pairs: vec![] };
+        let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome);
+        assert!(
+            report.contains("would write crates/spin/spin.toml"),
+            "verb-rewriting must turn 'wrote' into 'would write': {report}"
+        );
+        assert!(
+            report.contains("would create .edgezero/.env"),
+            "verb-rewriting must turn 'created' into 'would create': {report}"
+        );
+        assert!(
+            report.contains("would append crates/spin/.env"),
+            "verb-rewriting must turn 'appended' into 'would append': {report}"
+        );
+        // Negative: raw verbs must not survive
+        assert!(!report.contains("\nwrote "), "raw 'wrote' must be gone");
+        assert!(!report.contains("\ncreated "), "raw 'created' must be gone");
+        assert!(
+            !report.contains("\nappended "),
+            "raw 'appended' must be gone"
+        );
+    }
+
+    #[test]
+    fn dry_run_diff_covers_all_allowlist_paths() {
+        // Table-driven: for each adapter, build a fixture where the
+        // allow-listed files exist in the staged tree, then call
+        // render_dry_run_report and assert the printed diff section
+        // mentions each expected path and excludes non-listed paths.
+        let project = TempDir::new().expect("project");
+        let staged = TempDir::new().expect("staged");
+
+        // Cloudflare fixture: wrangler.toml + sibling .dev.vars
+        fs::write(staged.path().join("wrangler.toml"), "name = \"cf\"\n").unwrap();
+        fs::write(staged.path().join(".dev.vars"), "SECRET=abc\n").unwrap();
+        let cf_allow = build_dry_run_allow_list(
+            project.path(),
+            staged.path(),
+            "cloudflare",
+            &staged.path().join("wrangler.toml"),
+        );
+        let cf_report = render_dry_run_report(
+            project.path(),
+            staged.path(),
+            &cf_allow,
+            &ProvisionOutcome::default(),
+        );
+        assert!(
+            cf_report.contains("wrangler.toml"),
+            "cloudflare must diff wrangler.toml: {cf_report}"
+        );
+        assert!(
+            cf_report.contains(".dev.vars"),
+            "cloudflare must diff .dev.vars: {cf_report}"
+        );
+        // Negative: axum-only paths must not appear
+        assert!(
+            !cf_report.contains("axum.toml"),
+            "axum.toml must not appear in cloudflare diff"
+        );
+
+        // Axum fixture: .edgezero/.env only
+        let axum_project = TempDir::new().expect("axum project");
+        let axum_staged = TempDir::new().expect("axum staged");
+        fs::create_dir_all(axum_staged.path().join(".edgezero")).unwrap();
+        fs::write(axum_staged.path().join(".edgezero/.env"), "K=V\n").unwrap();
+        let axum_allow = build_dry_run_allow_list(
+            axum_project.path(),
+            axum_staged.path(),
+            "axum",
+            &axum_staged.path().join("axum.toml"), // adapter manifest not used for axum
+        );
+        let axum_report = render_dry_run_report(
+            axum_project.path(),
+            axum_staged.path(),
+            &axum_allow,
+            &ProvisionOutcome::default(),
+        );
+        assert!(
+            axum_report.contains(".edgezero/.env"),
+            "axum must diff .edgezero/.env: {axum_report}"
+        );
+        // Negative: cloudflare-only paths
+        assert!(
+            !axum_report.contains("wrangler.toml"),
+            "wrangler.toml must not appear in axum diff"
+        );
+    }
+
+    #[test]
+    fn dry_run_diff_handles_manifest_in_subdir_of_adapter_crate() {
+        // Fixture: manifest in a SUB-directory of the adapter crate.
+        //   [adapters.cloudflare.adapter]
+        //   crate = "crates/cf"
+        //   manifest = "crates/cf/config/wrangler.toml"
+        // The static-name allow-list would compute pair location as
+        // `crates/cf/wrangler.toml` — WRONG. Both sides absent →
+        // silent no-diff.
+        let project = TempDir::new().expect("project");
+        let staged = TempDir::new().expect("staged");
+        fs::create_dir_all(staged.path().join("crates/cf/config")).unwrap();
+        fs::write(
+            staged.path().join("crates/cf/config/wrangler.toml"),
+            "name = \"cf-nested\"\n",
+        )
+        .unwrap();
+        fs::write(
+            staged.path().join("crates/cf/config/.dev.vars"),
+            "SECRET=abc\n",
+        )
+        .unwrap();
+
+        let allow = build_dry_run_allow_list(
+            project.path(),
+            staged.path(),
+            "cloudflare",
+            &staged.path().join("crates/cf/config/wrangler.toml"),
+        );
+        let report = render_dry_run_report(
+            project.path(),
+            staged.path(),
+            &allow,
+            &ProvisionOutcome::default(),
+        );
+
+        // Positive: nested paths present
+        assert!(
+            report.contains("crates/cf/config/wrangler.toml"),
+            "nested wrangler.toml must appear in the diff: {report}"
+        );
+        assert!(
+            report.contains("crates/cf/config/.dev.vars"),
+            "nested .dev.vars (sibling of the resolved manifest) must appear: {report}"
+        );
+        // Negative: the WRONG (static-name) location must NOT appear.
+        // A regression to the old shape would silently write
+        // `--- crates/cf/wrangler.toml` here.
+        assert!(
+            !report.contains("--- crates/cf/wrangler.toml"),
+            "diff must not reference the wrong (adapter-crate-relative) location: {report}"
         );
     }
 
