@@ -393,6 +393,30 @@ pub struct ManifestAdapterDeployed {
     pub service_id: Option<String>,
 }
 
+impl ManifestAdapterDeployed {
+    /// Return the names of fields that are populated (non-empty
+    /// map, or `Some` value). Used by the CLI to cross-check
+    /// against `Adapter::deployed_fields` — but the mapping of
+    /// field-to-adapter lives in the adapter crates, NOT here.
+    /// Adding a new field to this struct requires adding a matching
+    /// arm below.
+    #[inline]
+    #[must_use]
+    pub fn populated_fields(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.kv_namespaces.is_empty() {
+            out.push("kv_namespaces");
+        }
+        if !self.preview_kv_namespaces.is_empty() {
+            out.push("preview_kv_namespaces");
+        }
+        if self.service_id.is_some() {
+            out.push("service_id");
+        }
+        out
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Validate)]
 #[non_exhaustive]
 #[validate(schema(function = "validate_manifest_adapter_definition"))]
@@ -2142,5 +2166,47 @@ default = "feature__flags"
         ManifestLoader::try_load_from_str(manifest)
             .err()
             .expect("double-underscore store id must fail validation");
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_service_id_when_set() {
+        let deployed = ManifestAdapterDeployed {
+            service_id: Some("SVC1".to_owned()),
+            ..ManifestAdapterDeployed::default()
+        };
+        assert_eq!(deployed.populated_fields(), vec!["service_id"]);
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_kv_maps_when_non_empty() {
+        let mut deployed = ManifestAdapterDeployed::default();
+        deployed
+            .kv_namespaces
+            .insert("sessions".to_owned(), "abc".to_owned());
+        assert_eq!(deployed.populated_fields(), vec!["kv_namespaces"]);
+    }
+
+    #[test]
+    fn deployed_populated_fields_empty_when_all_defaults() {
+        let deployed = ManifestAdapterDeployed::default();
+        assert!(deployed.populated_fields().is_empty());
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_all_when_all_set() {
+        let mut deployed = ManifestAdapterDeployed {
+            service_id: Some("SVC1".to_owned()),
+            ..ManifestAdapterDeployed::default()
+        };
+        deployed
+            .kv_namespaces
+            .insert("sessions".to_owned(), "abc".to_owned());
+        deployed
+            .preview_kv_namespaces
+            .insert("sessions".to_owned(), "abc_preview".to_owned());
+        assert_eq!(
+            deployed.populated_fields(),
+            vec!["kv_namespaces", "preview_kv_namespaces", "service_id"]
+        );
     }
 }

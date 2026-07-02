@@ -1273,9 +1273,46 @@ fn resolve_app_config_path(
 
 fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
     run_adapter_shared_checks(ctx)?;
+    validate_deployed_field_ownership(ctx.manifest())?;
     if ctx.args_strict {
         strict_capability_completeness(ctx.manifest())?;
         strict_handler_paths(ctx.manifest())?;
+    }
+    Ok(())
+}
+
+/// Cross-check: every populated field in a `[adapters.<name>.deployed]`
+/// block must be owned by the registered adapter for that name. If
+/// the adapter isn't registered in this build (feature disabled or
+/// typo in the section name), skip the check — `ensure_adapter_defined`
+/// surfaces the missing adapter separately.
+///
+/// Runs at manifest-shape validation time via `run_shared_checks`
+/// so `config validate --strict`, `provision`, `config push --local`,
+/// and `config diff` all see the same rejection.
+pub(crate) fn validate_deployed_field_ownership(manifest: &Manifest) -> Result<(), String> {
+    for (name, adapter_cfg) in &manifest.adapters {
+        let Some(deployed) = adapter_cfg.deployed.as_ref() else {
+            continue;
+        };
+        let populated = deployed.populated_fields();
+        if populated.is_empty() {
+            continue;
+        }
+        let Some(adapter) = adapter_registry::get_adapter(name) else {
+            // Not registered in this build; skip. Typo-detection
+            // is `ensure_adapter_defined`'s job.
+            continue;
+        };
+        let owned = adapter.deployed_fields();
+        for field in &populated {
+            if !owned.contains(field) {
+                return Err(format!(
+                    "[adapters.{name}.deployed].{field}: field is not owned by the `{name}` adapter (owned fields: [{}])",
+                    owned.join(", ")
+                ));
+            }
+        }
     }
     Ok(())
 }

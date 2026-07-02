@@ -136,6 +136,10 @@ struct CloudflareCliAdapter;
     reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
 )]
 impl Adapter for CloudflareCliAdapter {
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &["kv_namespaces", "preview_kv_namespaces"]
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `wrangler` is the native sign-in surface for Cloudflare

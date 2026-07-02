@@ -644,6 +644,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+    use validator::Validate as _;
 
     // ----- fixtures for CLI-owned first-run bootstrap synthesis -----
     //
@@ -678,6 +679,7 @@ serve = "echo"
 "#;
 
     static FAKE_ADAPTER: FakeBootstrapAdapter = FakeBootstrapAdapter;
+    static NO_FIELDS_FAKE_ADAPTER: NoFieldsFakeAdapter = NoFieldsFakeAdapter;
     static RECORDED_DRY_RUN: AtomicBool = AtomicBool::new(false);
     static SYNTH_CALLED: AtomicBool = AtomicBool::new(false);
     static VALIDATE_SAW_FILE: AtomicBool = AtomicBool::new(false);
@@ -689,6 +691,8 @@ serve = "echo"
     struct CwdGuard(PathBuf);
 
     struct FakeBootstrapAdapter;
+
+    struct NoFieldsFakeAdapter;
 
     impl CwdGuard {
         fn set(new_cwd: &Path) -> io::Result<Self> {
@@ -714,6 +718,10 @@ serve = "echo"
         reason = "the fake only exercises name/provision/synthesise_baseline_manifest/validate_adapter_manifest; every other trait method inherits its default (no-op or Unsupported)"
     )]
     impl Adapter for FakeBootstrapAdapter {
+        fn deployed_fields(&self) -> &'static [&'static str] {
+            &["service_id"]
+        }
+
         fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
             Ok(())
         }
@@ -768,6 +776,33 @@ serve = "echo"
                     abs.display()
                 ))
             }
+        }
+    }
+
+    #[expect(
+        clippy::missing_trait_methods,
+        reason = "the no-fields fake exercises deployed_fields default; every other trait method inherits its default (no-op or Unsupported)"
+    )]
+    impl Adapter for NoFieldsFakeAdapter {
+        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "__test_no_fields_fake__"
+        }
+
+        fn provision(
+            &self,
+            _manifest_root: &Path,
+            _adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+            _stores: &ProvisionStores<'_>,
+            _deployed: Option<&AdapterDeployedState>,
+            _mode: ProvisionMode,
+            _dry_run: bool,
+        ) -> Result<ProvisionOutcome, String> {
+            Ok(ProvisionOutcome::default())
         }
     }
 
@@ -2005,5 +2040,60 @@ ids = ["default"]
             // root. Capture strategy TBD (see the module comment
             // above this test).
         }
+    }
+
+    #[test]
+    fn validate_deployed_field_ownership_accepts_declared_field() {
+        // Fake registers itself as owning `service_id`. A manifest
+        // with [adapters.__test_bootstrap_fake__.deployed] service_id
+        // = "..." must validate cleanly.
+        use crate::config::validate_deployed_field_ownership;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+
+        let toml_body = r#"
+        [app]
+        name = "demo"
+        [adapters.__test_bootstrap_fake__]
+        [adapters.__test_bootstrap_fake__.adapter]
+        crate = "crates/spin"
+        manifest = "crates/spin/spin.toml"
+        [adapters.__test_bootstrap_fake__.deployed]
+        service_id = "SVC1"
+        "#;
+        let manifest: Manifest = toml::from_str(toml_body).unwrap();
+        manifest.validate().unwrap();
+        validate_deployed_field_ownership(&manifest)
+            .expect("fake owns service_id -- must validate cleanly");
+    }
+
+    #[test]
+    fn validate_deployed_field_ownership_rejects_undeclared_field() {
+        // A different fake that owns NO deployed fields. A manifest
+        // with service_id under its section must be rejected.
+        use crate::config::validate_deployed_field_ownership;
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&NO_FIELDS_FAKE_ADAPTER);
+
+        let toml_body = r#"
+        [app]
+        name = "demo"
+        [adapters.__test_no_fields_fake__]
+        [adapters.__test_no_fields_fake__.adapter]
+        crate = "crates/spin"
+        manifest = "crates/spin/spin.toml"
+        [adapters.__test_no_fields_fake__.deployed]
+        service_id = "SVC1"
+        "#;
+        let manifest: Manifest = toml::from_str(toml_body).unwrap();
+        manifest.validate().unwrap();
+        let err = validate_deployed_field_ownership(&manifest)
+            .expect_err("adapter declares no fields -- must reject");
+        assert!(
+            err.contains("service_id") && err.contains("__test_no_fields_fake__"),
+            "error must name the offending field and adapter: {err}"
+        );
     }
 }

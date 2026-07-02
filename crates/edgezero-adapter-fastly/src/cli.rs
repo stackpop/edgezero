@@ -169,6 +169,10 @@ enum ConfigStoreLookup {
     reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &["service_id"]
+    }
+
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
             // `fastly profile {create|delete|list}` is the native

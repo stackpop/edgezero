@@ -256,6 +256,20 @@ pub enum ReadConfigEntry {
 /// of `edgezero-core`. Defaults are no-ops; adapters override what
 /// they actually need.
 pub trait Adapter: Sync + Send {
+    /// Names of the `ManifestAdapterDeployed` fields this adapter
+    /// reads at provision time. Manifest-level cross-check
+    /// (`validate_deployed_field_ownership` in the CLI) rejects
+    /// `[adapters.<name>.deployed]` blocks whose populated fields
+    /// aren't in this list — catching operator typos and writeback
+    /// bugs before they corrupt the deployed state at next provision.
+    ///
+    /// Default is `&[]` — adapters that don't persist deployed state
+    /// (spin, axum today) inherit it.
+    #[inline]
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Execute the requested action with optional adapter-specific args.
     ///
     /// `args` is a stringly-typed pass-through for arguments meant
