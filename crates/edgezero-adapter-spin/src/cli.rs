@@ -16,6 +16,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
+use edgezero_adapter::env_file::append_lines_dedup;
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
@@ -188,7 +189,15 @@ impl Adapter for SpinCliAdapter {
     ) -> Result<ProvisionOutcome, String> {
         match mode {
             ProvisionMode::Cloud => {}
-            ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()),
+            ProvisionMode::Local => {
+                return provision_local(
+                    manifest_root,
+                    adapter_manifest_path,
+                    component_selector,
+                    stores,
+                    dry_run,
+                );
+            }
         }
         //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
@@ -1080,6 +1089,307 @@ fn ensure_kv_label_in_component(
     fs::write(spin_path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
     Ok(true)
+}
+
+/// Local-mode provision arm: extend `[component.<id>].key_value_stores`
+/// in `spin.toml`, append `[key_value_store.<platform>]` blocks (Spin
+/// `SQLite` backend) to `runtime-config.toml`, and write
+/// `EDGEZERO__STORES__<KIND>__<LOGICAL_UPPER>__NAME=<platform>` lines
+/// (all kinds) plus a commented `__KEY=<logical>_staging` placeholder
+/// (CONFIG only) to `.env` next to `spin.toml`.
+///
+/// Both `spin.toml` and `runtime-config.toml` MUST exist at the
+/// resolved paths -- Task 8b's CLI bootstrap writes both via
+/// `synthesise_baseline_manifest` before provision runs. If either
+/// is missing, we error clearly rather than silently re-synthesising:
+/// a missing runtime-config next to a present spin.toml is a
+/// programmer error worth surfacing (rather than silently mutating
+/// the tree into an inconsistent state).
+///
+/// **Lookups use `store.logical`** (env-overlay-independent) for the
+/// env-var KEY portion (`APP_CONFIG__NAME`); **TOML cells and env-var
+/// VALUES use `store.platform`** (env-overlay resolved binding name
+/// teammates can vary via `EDGEZERO__STORES__<KIND>__<ID>__NAME`).
+fn provision_local(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    component_selector: Option<&str>,
+    stores: &ProvisionStores<'_>,
+    dry_run: bool,
+) -> Result<ProvisionOutcome, String> {
+    use toml_edit::DocumentMut;
+
+    let spin_rel = adapter_manifest_path.unwrap_or("spin.toml");
+    let spin_path = manifest_root.join(spin_rel);
+    let spin_dir = spin_path.parent().unwrap_or(manifest_root);
+    let rc_path = spin_dir.join("runtime-config.toml");
+    let env_path = spin_dir.join(".env");
+
+    if !spin_path.exists() {
+        return Err(format!(
+            "expected spin.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            spin_path.display()
+        ));
+    }
+    if !rc_path.exists() {
+        return Err(format!(
+            "expected runtime-config.toml at {} next to spin.toml (Task 8b's CLI bootstrap should have written it before provision ran)",
+            rc_path.display()
+        ));
+    }
+
+    // 1. spin.toml: append platform labels to [component.<id>].key_value_stores.
+    let spin_raw = fs::read_to_string(&spin_path)
+        .map_err(|err| format!("failed to read {}: {err}", spin_path.display()))?;
+    let mut spin_doc: DocumentMut = spin_raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", spin_path.display()))?;
+    let mut spin_changed = false;
+    let needs_component = !stores.kv.is_empty() || !stores.config.is_empty();
+    if needs_component {
+        let component_id = resolve_component_id(&spin_doc, component_selector, &spin_path)?;
+        for store in stores.kv.iter().chain(stores.config.iter()) {
+            if append_kv_store_to_component(
+                &mut spin_doc,
+                &component_id,
+                &store.platform,
+                &spin_path,
+            )? {
+                spin_changed = true;
+            }
+        }
+    }
+
+    // 2. runtime-config.toml: append [key_value_store.<platform>] blocks.
+    let rc_raw = fs::read_to_string(&rc_path)
+        .map_err(|err| format!("failed to read {}: {err}", rc_path.display()))?;
+    let mut rc_doc: DocumentMut = rc_raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", rc_path.display()))?;
+    let mut rc_changed = false;
+    for store in stores.kv.iter().chain(stores.config.iter()) {
+        if append_key_value_store_block(&mut rc_doc, &store.platform) {
+            rc_changed = true;
+        }
+    }
+
+    // 3. .env: __NAME lines (all kinds) + commented __KEY placeholders
+    // (CONFIG only). Dedup honours operator overrides -- an operator
+    // who already uncommented + edited a __KEY line does NOT get the
+    // commented placeholder re-added on a subsequent provision.
+    let env_lines = build_env_lines(stores);
+
+    if spin_changed && !dry_run {
+        fs::write(&spin_path, spin_doc.to_string())
+            .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
+    }
+    if rc_changed && !dry_run {
+        fs::write(&rc_path, rc_doc.to_string())
+            .map_err(|err| format!("failed to write {}: {err}", rc_path.display()))?;
+    }
+    append_lines_dedup(&env_path, &env_lines, dry_run)
+        .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+
+    let total = stores
+        .kv
+        .len()
+        .saturating_add(stores.config.len())
+        .saturating_add(stores.secrets.len());
+    let status_lines = vec![format!(
+        "spin: wrote bindings + runtime-config + .env for {total} store(s) at {}",
+        spin_path.display()
+    )];
+    Ok(ProvisionOutcome {
+        status_lines,
+        deployed: None,
+    })
+}
+
+/// Resolve which `[component.<id>]` table `provision_local` writes
+/// into, given a parsed `spin.toml`. Same rule as
+/// [`resolve_spin_component`] and [`Adapter::validate_adapter_manifest`]:
+/// - explicit `component_selector`: must match a declared component
+///   id, else error;
+/// - single component: implicit;
+/// - multi-component without selector: error.
+///
+/// Operates on a `DocumentMut` (already parsed) so `provision_local`
+/// can share the single doc read with the writer.
+fn resolve_component_id(
+    doc: &toml_edit::DocumentMut,
+    selector: Option<&str>,
+    spin_path: &Path,
+) -> Result<String, String> {
+    let component_ids: Vec<String> = doc
+        .get("component")
+        .and_then(toml_edit::Item::as_table)
+        .map(|tbl| tbl.iter().map(|(key, _)| key.to_owned()).collect())
+        .unwrap_or_default();
+
+    if component_ids.is_empty() {
+        return Err(format!(
+            "{}: no [component.*] declarations found",
+            spin_path.display()
+        ));
+    }
+    if let Some(sel) = selector {
+        if component_ids.iter().any(|id| id == sel) {
+            return Ok(sel.to_owned());
+        }
+        return Err(format!(
+            "[adapters.spin.adapter].component = {:?} is not declared in {} (available: {})",
+            sel,
+            spin_path.display(),
+            component_ids.join(", ")
+        ));
+    }
+    if component_ids.len() == 1 {
+        return Ok(component_ids.into_iter().next().unwrap_or_default());
+    }
+    Err(format!(
+        "{} declares {} components ({}) but [adapters.spin.adapter].component is unset; set one explicitly",
+        spin_path.display(),
+        component_ids.len(),
+        component_ids.join(", ")
+    ))
+}
+
+/// In-memory variant of [`ensure_kv_label_in_component`]: append
+/// `platform` to `[component.<component_id>].key_value_stores` in
+/// `doc`. Creates the array if absent. Returns `Ok(true)` if the
+/// label was newly added, `Ok(false)` if already present. The caller
+/// writes the doc back to disk once at the end of `provision_local`
+/// so multiple platform labels land in a single atomic write.
+fn append_kv_store_to_component(
+    doc: &mut toml_edit::DocumentMut,
+    component_id: &str,
+    platform: &str,
+    spin_path: &Path,
+) -> Result<bool, String> {
+    use toml_edit::{value, Array, Value};
+
+    let component_root = doc.get_mut("component").ok_or_else(|| {
+        format!(
+            "{}: [component.*] tables expected but `component` key missing",
+            spin_path.display()
+        )
+    })?;
+    let component_tbl = component_root
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: `component` is not a table", spin_path.display()))?;
+    let target = component_tbl.get_mut(component_id).ok_or_else(|| {
+        format!(
+            "{}: [component.{component_id}] is not declared",
+            spin_path.display()
+        )
+    })?;
+    let target_tbl = target.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: [component.{component_id}] is not a table",
+            spin_path.display()
+        )
+    })?;
+    let entry = target_tbl
+        .entry("key_value_stores")
+        .or_insert_with(|| value(Array::new()));
+    let arr = entry
+        .as_value_mut()
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            format!(
+                "{}: [component.{component_id}].key_value_stores is not an array",
+                spin_path.display()
+            )
+        })?;
+    if arr.iter().any(|item| item.as_str() == Some(platform)) {
+        return Ok(false);
+    }
+    arr.push(platform);
+    Ok(true)
+}
+
+/// Append `[key_value_store.<platform>]` with `type = "spin"` +
+/// `path = ".spin/sqlite_key_value.db"` to `doc` if the platform's
+/// stanza is absent. Idempotent — an already-present stanza is left
+/// untouched (returns `false`). All local-mode stores back to the
+/// same local `SQLite` file (Spin's default local KV backend).
+///
+/// The parent `[key_value_store]` table is set implicit so
+/// `toml_edit` emits only `[key_value_store.<platform>]` section
+/// headers, matching the shape `spin up` reads.
+fn append_key_value_store_block(doc: &mut toml_edit::DocumentMut, platform: &str) -> bool {
+    use toml_edit::{value, Item, Table};
+
+    // Fast-path idempotency check: if a stanza for this platform
+    // already exists, no work to do.
+    if doc
+        .get("key_value_store")
+        .and_then(toml_edit::Item::as_table)
+        .is_some_and(|tbl| tbl.contains_key(platform))
+    {
+        return false;
+    }
+
+    let parent = doc.entry("key_value_store").or_insert_with(|| {
+        let mut parent_tbl = Table::new();
+        parent_tbl.set_implicit(true);
+        Item::Table(parent_tbl)
+    });
+    let Some(parent_tbl) = parent.as_table_mut() else {
+        // `key_value_store` exists but is not a table -- extremely
+        // unlikely in a Spin-managed runtime-config.toml. Return
+        // false so the caller sees "nothing changed" rather than
+        // clobbering a malformed file.
+        return false;
+    };
+    let mut inner = Table::new();
+    inner.insert("type", value("spin"));
+    inner.insert("path", value(".spin/sqlite_key_value.db"));
+    parent_tbl.insert(platform, Item::Table(inner));
+    true
+}
+
+/// Build the `.env` line set emitted by [`provision_local`].
+///
+/// One `EDGEZERO__STORES__<KIND>__<LOGICAL_UPPER>__NAME=<platform>`
+/// entry per declared store (KV / CONFIG / SECRETS). CONFIG stores
+/// additionally get a **commented** `__KEY` placeholder — Spin has
+/// no way to preview the KEY overlay at provision time, so we hint
+/// the shape and let the operator uncomment + edit it.
+///
+/// Env-var KEY uses the LOGICAL id in uppercase so the runtime's
+/// env-overlay lookup finds it regardless of teammates' platform
+/// name overrides. Env-var VALUE uses the PLATFORM name so the
+/// runtime opens the same Spin KV store name that `spin.toml`'s
+/// `key_value_stores` array + `runtime-config.toml`'s stanza declare.
+///
+/// Dedup responsibility is delegated to [`append_lines_dedup`]: the
+/// commented and uncommented forms normalise to the same key, so an
+/// operator who already uncommented + edited a `__KEY` line survives
+/// a re-run of provision (the commented placeholder is NOT re-added).
+fn build_env_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (kind, kind_stores) in [
+        ("KV", stores.kv),
+        ("CONFIG", stores.config),
+        ("SECRETS", stores.secrets),
+    ] {
+        for store in kind_stores {
+            let logical_upper = store.logical.to_ascii_uppercase();
+            let platform = &store.platform;
+            lines.push(format!(
+                "EDGEZERO__STORES__{kind}__{logical_upper}__NAME={platform}"
+            ));
+        }
+    }
+    for store in stores.config {
+        let logical_upper = store.logical.to_ascii_uppercase();
+        let logical = &store.logical;
+        lines.push(format!(
+            "# EDGEZERO__STORES__CONFIG__{logical_upper}__KEY={logical}_staging"
+        ));
+    }
+    lines
 }
 
 /// # Errors
@@ -2898,6 +3208,348 @@ mod tests {
             panic!("expected Present variant");
         };
         assert_eq!(value, "abs_val");
+    }
+
+    // ---------- provision_local (Local arm) — Task 25 ----------
+
+    /// Seed BOTH baseline files (spin.toml + runtime-config.toml) at
+    /// `dir`, matching Task 24's `synthesise_baseline_manifest` output.
+    fn seed_baseline(dir: &Path, app_name: &str) {
+        fs::write(dir.join("spin.toml"), synthesise_spin_toml(app_name, None))
+            .expect("seed spin.toml");
+        fs::write(
+            dir.join("runtime-config.toml"),
+            synthesise_runtime_config_toml(),
+        )
+        .expect("seed runtime-config.toml");
+    }
+
+    #[test]
+    fn spin_local_provision_writes_kv_bindings_and_runtime_config_blocks() {
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).expect("read spin.toml");
+        // Both platform labels (KV + config) land in
+        // [component.<id>].key_value_stores.
+        assert!(
+            spin_after.contains("\"sessions\""),
+            "KV label in spin.toml: {spin_after}"
+        );
+        assert!(
+            spin_after.contains("\"app_config\""),
+            "config label in spin.toml: {spin_after}"
+        );
+
+        let rc_after = fs::read_to_string(dir.path().join("runtime-config.toml"))
+            .expect("read runtime-config.toml");
+        for label in ["sessions", "app_config"] {
+            assert!(
+                rc_after.contains(&format!("[key_value_store.{label}]")),
+                "runtime-config has [key_value_store.{label}]: {rc_after}"
+            );
+        }
+        assert!(
+            rc_after.contains(r#"type = "spin""#),
+            "type = \"spin\": {rc_after}"
+        );
+        assert!(
+            rc_after.contains(r#"path = ".spin/sqlite_key_value.db""#),
+            "sqlite path: {rc_after}"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_writes_env_name_lines_for_kv_config_secrets() {
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_SECRET_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+
+        let env_after = fs::read_to_string(dir.path().join(".env")).expect("read .env");
+        assert!(
+            env_after.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config"),
+            "config __NAME line: {env_after}"
+        );
+        assert!(
+            env_after.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=sessions"),
+            "kv __NAME line: {env_after}"
+        );
+        assert!(
+            env_after.contains("EDGEZERO__STORES__SECRETS__DEFAULT__NAME=default"),
+            "secret __NAME line: {env_after}"
+        );
+        assert!(
+            env_after.contains("# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging"),
+            "commented config __KEY placeholder: {env_after}"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_errors_if_spin_toml_absent() {
+        let dir = tempdir().expect("tempdir");
+        // Do NOT seed spin.toml. runtime-config.toml alone must not
+        // paper over the missing spin.toml.
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            synthesise_runtime_config_toml(),
+        )
+        .expect("seed runtime-config");
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("missing spin.toml must error");
+        assert!(
+            err.contains("spin.toml") && err.contains(dir.path().to_str().unwrap()),
+            "error names the missing spin.toml path: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_errors_if_runtime_config_toml_absent() {
+        let dir = tempdir().expect("tempdir");
+        // Seed spin.toml but NOT runtime-config.toml. Missing
+        // runtime-config next to a present spin.toml is a
+        // programmer error worth surfacing (rather than silently
+        // re-synthesising an inconsistent tree).
+        fs::write(
+            dir.path().join("spin.toml"),
+            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+        )
+        .expect("seed spin.toml");
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("missing runtime-config.toml must error");
+        assert!(
+            err.contains("runtime-config.toml"),
+            "error names runtime-config.toml specifically: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_resolves_nested_adapter_manifest_path() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("crates/spin");
+        fs::create_dir_all(&nested).expect("mkdir nested");
+        seed_baseline(&nested, TEST_COMPONENT_ID);
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("crates/spin/spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("nested-path local provision succeeds");
+
+        let spin_after = fs::read_to_string(nested.join("spin.toml")).expect("read spin.toml");
+        assert!(
+            spin_after.contains("\"sessions\""),
+            "KV label lands in nested spin.toml: {spin_after}"
+        );
+        let rc_after =
+            fs::read_to_string(nested.join("runtime-config.toml")).expect("read runtime-config");
+        assert!(
+            rc_after.contains("[key_value_store.sessions]"),
+            "stanza lands in nested runtime-config.toml: {rc_after}"
+        );
+        assert!(
+            nested.join(".env").exists(),
+            ".env lands next to nested spin.toml"
+        );
+        assert!(
+            !dir.path().join(".env").exists(),
+            "root-level .env must NOT be written"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_dedup_preserves_operator_edited_env_lines() {
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        // Operator pre-seeds an uncommented __KEY override.
+        fs::write(
+            dir.path().join(".env"),
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=operator_override\n",
+        )
+        .expect("seed .env");
+
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+
+        let env_after = fs::read_to_string(dir.path().join(".env")).expect("read .env");
+        assert!(
+            env_after.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=operator_override"),
+            "operator's uncommented __KEY line survives: {env_after}"
+        );
+        assert!(
+            !env_after.contains("# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="),
+            "commented __KEY placeholder must NOT be re-added: {env_after}"
+        );
+        // Exactly one line whose normalised key is the __KEY env-var
+        // name -- the uncommented operator override wins.
+        let key_lines = env_after
+            .lines()
+            .filter(|line| {
+                let after_hash = line.trim_start().strip_prefix('#').unwrap_or(line);
+                after_hash
+                    .trim_start()
+                    .starts_with("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=")
+            })
+            .count();
+        assert_eq!(
+            key_lines, 1,
+            "exactly one __KEY line after dedup: {env_after}"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_uses_platform_binding_when_env_overlay_active() {
+        // Env-overlay round-trip. Simulates
+        //   EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config
+        // via ResolvedStoreId::new(logical, platform). The env-var KEY
+        // must still use the LOGICAL id in upper-case (`APP_CONFIG`);
+        // the TOML cells + env-var VALUE use the PLATFORM name
+        // (`prod_config`) so the runtime opens the store name that
+        // spin.toml + runtime-config.toml declare.
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).expect("read spin.toml");
+        assert!(
+            spin_after.contains("\"prod_config\""),
+            "spin.toml has platform label prod_config: {spin_after}"
+        );
+        assert!(
+            !spin_after.contains("\"app_config\""),
+            "spin.toml must NOT have the logical id app_config: {spin_after}"
+        );
+
+        let rc_after = fs::read_to_string(dir.path().join("runtime-config.toml"))
+            .expect("read runtime-config");
+        assert!(
+            rc_after.contains("[key_value_store.prod_config]"),
+            "runtime-config has [key_value_store.prod_config]: {rc_after}"
+        );
+        assert!(
+            !rc_after.contains("[key_value_store.app_config]"),
+            "runtime-config must NOT have logical-named stanza: {rc_after}"
+        );
+
+        let env_after = fs::read_to_string(dir.path().join(".env")).expect("read .env");
+        assert!(
+            env_after.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config"),
+            "env-var key uses LOGICAL uppercase, value uses PLATFORM: {env_after}"
+        );
+        assert!(
+            !env_after.contains("EDGEZERO__STORES__CONFIG__PROD_CONFIG__NAME="),
+            "platform name must NOT leak into the env-var key: {env_after}"
+        );
     }
 
     // ---------- synthesise_spin_toml / synthesise_runtime_config_toml ----------
