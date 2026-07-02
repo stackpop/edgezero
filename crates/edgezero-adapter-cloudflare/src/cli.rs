@@ -133,7 +133,7 @@ struct CloudflareCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
+    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `wrangler.toml` for the Task 8b clean-clone bootstrap)."
 )]
 impl Adapter for CloudflareCliAdapter {
     fn deployed_fields(&self) -> &'static [&'static str] {
@@ -567,6 +567,19 @@ impl Adapter for CloudflareCliAdapter {
         // Config (KV namespaces), Single for Secrets (Worker
         // Secrets is a single flat bag).
         &["secrets"]
+    }
+
+    fn synthesise_baseline_manifest(
+        &self,
+        _manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        app_name: &str,
+        _deployed: Option<&AdapterDeployedState>,
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        let rel =
+            adapter_manifest_path.map_or_else(|| PathBuf::from("wrangler.toml"), PathBuf::from);
+        Ok(vec![(rel, synthesise_wrangler_toml(app_name))])
     }
 }
 
@@ -1172,6 +1185,28 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Synthesised baseline `wrangler.toml` for clean clones. Built via
+/// `toml_edit::DocumentMut` (NOT raw `format!`) so any legal
+/// `[app].name` — including names with TOML-significant characters
+/// like `"`, `\`, or newlines — is escaped correctly. Manifest
+/// validation today only length-bounds the name; raw interpolation
+/// would produce invalid TOML for legal inputs.
+pub(crate) fn synthesise_wrangler_toml(app_name: &str) -> String {
+    use toml_edit::{value, DocumentMut};
+
+    let mut doc = DocumentMut::new();
+    doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
+    // `Table::insert` returns the previous value (if any). We build a
+    // fresh document from `DocumentMut::new()`, so nothing to displace
+    // -- but the return is discarded intentionally. Using `insert`
+    // instead of `doc["..."] = ...` sidesteps `clippy::indexing_slicing`
+    // (the index form panics if the key is missing; `insert` doesn't).
+    doc.insert("name", value(app_name));
+    doc.insert("main", value("build/worker/shim.mjs"));
+    doc.insert("compatibility_date", value("2024-01-01"));
+    doc.to_string()
 }
 
 #[cfg(test)]
@@ -2360,6 +2395,32 @@ id = "00112233445566778899aabbccddeeff"
                 "error names the missing field: {err}"
             ),
             Ok(_) => panic!("expected Err when adapter_manifest_path is None"),
+        }
+    }
+
+    // ---------- synthesise_wrangler_toml ----------
+
+    #[test]
+    fn synthesises_minimal_wrangler_toml_with_header() {
+        let out = synthesise_wrangler_toml("demo");
+        assert!(out.starts_with("# edgezero-provision: v1"));
+        assert!(out.contains(r#"name = "demo""#));
+        assert!(out.contains(r#"main = "build/worker/shim.mjs""#));
+        assert!(out.contains("compatibility_date = "));
+    }
+
+    #[test]
+    fn synthesise_wrangler_toml_escapes_pathological_app_names() {
+        for name in [
+            r#"has"quote"#,
+            r"has\backslash",
+            "has\nnewline",
+            "has = equals",
+        ] {
+            let out = synthesise_wrangler_toml(name);
+            // Re-parsing must succeed AND round-trip the name.
+            let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
         }
     }
 }
