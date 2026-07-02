@@ -64,6 +64,30 @@ We want a single, consistent, "bind it yourself" mechanism for all three.
    in core. No process-global state; no per-adapter changes.
 6. **Remove route listing** — delete the entire `enable_route_listing` machinery
    and `/__edgezero/routes`.
+7. **Typed extractors for access (revised 2026-07-02)** — handlers access the
+   injected data through independent typed extractors, not `ctx.introspection()`.
+   See the Revision section.
+
+> **Revision — 2026-07-02: independent typed extractors.**
+> The injection (Decision 5) and the dispatch chokepoint are unchanged —
+> `IntrospectionData` is still injected at `RouterInner::dispatch`. The only
+> change is how handlers *access* it: instead of reaching into
+> `ctx.introspection()` directly (Component 4), the two handlers that need it
+> declare the dependency via independent typed extractors, matching the
+> `Json`/`Path`/`AppConfig` idiom:
+>
+> - `ManifestJson(pub Arc<str>)` — the baked manifest JSON. Used by `manifest`.
+> - `RouteTable(pub Arc<[RouteInfo]>)` — the live route index. Used by `routes`.
+>
+> Both implement `FromRequest`, read from the injected `IntrospectionData` via
+> `ctx.introspection()`, and error (500 internal) if it is absent. `config` takes
+> `RequestContext` and uses neither — it reads the default config store.
+>
+> No per-route gating, no `RouteEntry` flag, no `app!` macro changes, no builder
+> methods: the routes remain plain `[[triggers.http]]` bindings (mountable by
+> apps), and the extractor on the handler signature is the only thing that
+> changes. Where this conflicts with Component 4's "handler reads
+> `ctx.introspection()`", the Revision governs.
 
 ## Architecture
 

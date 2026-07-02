@@ -1196,3 +1196,99 @@ gh pr ready 300
 **Placeholder scan:** No TBD/TODO; every code step shows real code. Verification notes ("confirm `ConfigStoreError` constructor names", "verify `{{{adapter_list}}}` name", "match body-collection helper") are drift guardrails, not missing content.
 
 **Type consistency:** `IntrospectionData { manifest_json: Option<Arc<str>>, routes: Arc<[RouteInfo]> }`, `with_manifest_json(impl Into<Arc<str>>)`, and `introspection() -> Option<&IntrospectionData>` are used identically across Tasks 2/3/6. Handler names `manifest`/`config`/`routes` match the trigger `handler = "edgezero_core::introspection::…"` strings in Task 6. Manual enum `Serialize` (Task 1 Step 5a) matches the `Deserialize` wire forms.
+
+---
+
+## Addendum (2026-07-02): independent typed extractors
+
+**Why:** Tasks 1–8 have `manifest`/`routes` read `ctx.introspection()` directly.
+Per user direction, expose the injected data through independent typed
+extractors instead — matching the `Json`/`Path`/`AppConfig` idiom and making each
+handler's dependency explicit. **Nothing else changes:** injection stays
+unconditional at `RouterInner::dispatch`, routes stay plain `[[triggers.http]]`
+bindings (already mountable), and there is NO per-route gating, NO `RouteEntry`
+flag, NO `app!` macro change. `config` is untouched (it uses the config store).
+
+Base: merge-ready branch head (after `8999623`). Single task, edgezero-core only.
+
+### Task 9: independent `ManifestJson` / `RouteTable` extractors
+
+**Files:** `crates/edgezero-core/src/introspection.rs` (add two extractors, refactor two handlers, update/extend colocated tests).
+
+- [ ] **Step 1 (RED): add extractor tests + refactor-target tests.** Keep the
+  existing `manifest_returns_injected_json` / `routes_lists_registered_routes` /
+  all `config_*` tests as-is (they drive through `oneshot`, so they still pass
+  once handlers use extractors). Add:
+  - `manifest_json_extractor_reads_injected` — build a router with the `manifest`
+    handler + `with_manifest_json("{\"app\":{}}")`, `oneshot`, assert 200 + body.
+  - `manifest_json_extractor_absent_is_500` — a router WITHOUT `with_manifest_json`
+    bound to `manifest` yields 500 (payload has `manifest_json: None`).
+  Run `cargo test -p edgezero-core introspection` — new tests fail to compile
+  (extractors absent).
+
+- [ ] **Step 2: add the extractors** in `introspection.rs`:
+```rust
+use crate::extractor::FromRequest;   // match the crate's actual FromRequest path
+use crate::router::RouteInfo;
+use std::sync::Arc;
+
+/// Extractor for the baked manifest JSON (the `IntrospectionData` injected at
+/// dispatch). Errors 500 if introspection data is absent.
+pub struct ManifestJson(pub Arc<str>);
+
+#[async_trait::async_trait(?Send)]
+impl FromRequest for ManifestJson {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.introspection()
+            .and_then(|d| d.manifest_json.clone())
+            .map(ManifestJson)
+            .ok_or_else(|| EdgeError::internal(anyhow::anyhow!(
+                "manifest introspection data not available"
+            )))
+    }
+}
+
+/// Extractor for the live route index.
+pub struct RouteTable(pub Arc<[RouteInfo]>);
+
+#[async_trait::async_trait(?Send)]
+impl FromRequest for RouteTable {
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.introspection()
+            .map(|d| RouteTable(Arc::clone(&d.routes)))
+            .ok_or_else(|| EdgeError::internal(anyhow::anyhow!(
+                "route-table introspection data not available"
+            )))
+    }
+}
+```
+  (Confirm the `FromRequest` trait path and `async_trait` usage against
+  `extractor.rs`; match how existing extractors declare the impl.)
+
+- [ ] **Step 3: refactor the handlers** (`config` unchanged):
+```rust
+#[action]
+pub async fn manifest(ManifestJson(json): ManifestJson) -> Result<Response, EdgeError> {
+    json_response(StatusCode::OK, Body::text(json.to_string()))
+}
+
+#[action]
+pub async fn routes(RouteTable(table): RouteTable) -> Result<Response, EdgeError> {
+    let views: Vec<RouteView> = table
+        .iter()
+        .map(|r| RouteView { method: r.method().as_str().to_owned(), path: r.path().to_owned() })
+        .collect();
+    json_response(StatusCode::OK, Body::json(&views).map_err(EdgeError::internal)?)
+}
+```
+
+- [ ] **Step 4 (GREEN):** `cargo test -p edgezero-core introspection` (all pass,
+  incl. the existing body-shape assertions and the new extractor tests); then
+  `cargo test -p edgezero-core`, `cargo fmt`, `cargo clippy -p edgezero-core --all-targets -- -D warnings`.
+
+- [ ] **Step 5: app-demo unchanged but re-verify** — the triggers already bind
+  `edgezero_core::introspection::{manifest,config,routes}`; handler signatures
+  changed but the paths/behavior didn't. Run
+  `cd examples/app-demo && cargo test -p app-demo-core introspection_routes_are_wired`.
+
+- [ ] **Step 6: Commit** — `git commit -m "Expose introspection via ManifestJson/RouteTable extractors"`
