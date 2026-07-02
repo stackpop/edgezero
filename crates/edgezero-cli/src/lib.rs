@@ -28,6 +28,8 @@ mod config;
 #[cfg(all(feature = "cli", feature = "demo-example"))]
 mod demo_server;
 #[cfg(feature = "cli")]
+mod diff;
+#[cfg(feature = "cli")]
 mod generator;
 #[cfg(feature = "cli")]
 mod provision;
@@ -46,7 +48,8 @@ pub mod args;
 pub use auth::run_auth;
 #[cfg(feature = "cli")]
 pub use config::{
-    run_config_push, run_config_push_typed, run_config_validate, run_config_validate_typed,
+    run_config_diff_typed, run_config_push, run_config_push_typed, run_config_validate,
+    run_config_validate_typed, DiffExit,
 };
 #[cfg(feature = "cli")]
 pub use provision::run_provision;
@@ -62,18 +65,66 @@ use std::io::ErrorKind;
 #[cfg(feature = "cli")]
 use std::path::PathBuf;
 
-/// Initialize a CLI logger that prints messages without timestamps or level
-/// prefixes — the CLI's output IS the user-facing UX, not a debug log.
+/// CLI output logger: prints `record.args()` verbatim with no
+/// timestamps, levels, or module prefixes — the CLI's output IS
+/// the user-facing UX, not a debug log. `info` goes to stdout;
+/// `warn`/`error` go to stderr. `debug` and `trace` are filtered
+/// out by `enabled()` and `LevelFilter::Info`; there is no
+/// verbosity flag yet — adding one is a follow-up that would
+/// route debug/trace alongside info.
+///
+/// Replaces the previous `SimpleLogger`-based init: `SimpleLogger`
+/// always emitted `INFO [edgezero_cli::xxx] ...` prefixes even
+/// with `without_timestamps()`, regressing the user-facing CLI UX
+/// the surrounding doc comment promised.
+#[cfg(feature = "cli")]
+struct CliLogger;
+
+#[cfg(feature = "cli")]
+impl log::Log for CliLogger {
+    #[inline]
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    #[inline]
+    fn flush(&self) {}
+
+    #[inline]
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        match record.level() {
+            log::Level::Error | log::Level::Warn => {
+                #[expect(
+                    clippy::print_stderr,
+                    reason = "CLI UX output goes to stderr for warn/error"
+                )]
+                {
+                    eprintln!("{}", record.args());
+                }
+            }
+            log::Level::Info => {
+                #[expect(clippy::print_stdout, reason = "CLI UX output goes to stdout for info")]
+                {
+                    println!("{}", record.args());
+                }
+            }
+            log::Level::Debug | log::Level::Trace => {}
+        }
+    }
+}
+
+/// Initialize a CLI logger that prints messages without timestamps
+/// or level prefixes — the CLI's output IS the user-facing UX, not
+/// a debug log. See [`CliLogger`] for the routing rules.
 #[cfg(feature = "cli")]
 #[inline]
 pub fn init_cli_logger() {
-    use log::LevelFilter;
-    use simple_logger::SimpleLogger;
-    let _logger_init = SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .without_timestamps()
-        .with_module_level("edgezero_cli", LevelFilter::Info)
-        .init();
+    static CLI_LOGGER: CliLogger = CliLogger;
+    let _logger_init =
+        log::set_logger(&CLI_LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
 }
 
 /// Build the project for a target edge adapter.
@@ -195,7 +246,7 @@ fn ensure_adapter_defined(
     manifest_loader: Option<&ManifestLoader>,
 ) -> Result<(), String> {
     if let Some(loader) = manifest_loader {
-        if loader.manifest().adapters.contains_key(adapter_name) {
+        if loader.manifest().adapter_entry(adapter_name).is_some() {
             return Ok(());
         }
         let available: Vec<String> = loader.manifest().adapters.keys().cloned().collect();

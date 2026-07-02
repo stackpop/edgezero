@@ -10,16 +10,20 @@ version = "0.1.0"
 # KV-backed `app_config` store (see `[component.app-demo].key_value_stores`
 # below) — `[variables]` here is now SECRETS-ONLY.
 #
-# `api_token` is the `#[secret]` field from `AppDemoConfig`; its value
-# resolves through Spin's flat variable namespace, so it must be declared
-# with `secret = true` for the wasm component to read it. `vault` is
-# `#[secret(store_ref)]` — the value is a runtime store id, not material
-# to keep secret, but bound the same way for consistency with the
-# `AppDemoConfig` surface. `smoke_secret` keeps an empty default so the
-# server starts without a value set; pass
-# `SPIN_VARIABLE_SMOKE_SECRET=<value>` when running smoke_test_secrets.sh.
+# The blob carries `api_token = "demo_api_token"` -- i.e. the field
+# `api_token` HOLDS the secret-store key NAME (`demo_api_token`), per
+# spec 3.3 Model A. The runtime secret walk asks Spin for that NAME,
+# so the variable is declared as `demo_api_token` (default = "" so
+# `spin up` starts without a provider configured; pass
+# `SPIN_VARIABLE_DEMO_API_TOKEN=<value>` for a populated run).
+#
+# `vault` is `#[secret(store_ref)]` -- the value is a runtime store
+# id, not material to keep secret, but bound for consistency with the
+# `AppDemoConfig` surface. `smoke_secret` keeps an empty default so
+# `smoke_test_secrets.sh` can flip it via
+# `SPIN_VARIABLE_SMOKE_SECRET=<value>`.
 [variables]
-api_token = { required = true, secret = true }
+demo_api_token = { default = "", secret = true }
 vault = { default = "default" }
 smoke_secret = { default = "" }
 
@@ -40,7 +44,7 @@ allowed_outbound_hosts = ["https://*:*"]
 key_value_stores = ["app_config", "sessions", "cache"]
 
 [component.app-demo.variables]
-api_token = "{{ api_token }}"
+demo_api_token = "{{ demo_api_token }}"
 vault = "{{ vault }}"
 smoke_secret = "{{ smoke_secret }}"
 

@@ -125,9 +125,15 @@ start_server() {
       echo "==> Starting Spin on port $PORT..."
       # SpinSecretStore normalises the key to lowercase, so SMOKE_SECRET maps to
       # the Spin variable smoke_secret.  Pass the value via SPIN_VARIABLE_SMOKE_SECRET.
+      # `--runtime-config-file runtime-config.toml`: the demo's
+      # spin.toml declares non-`default` KV labels (`app_config`,
+      # `sessions`, `cache`) — Spin's runtime needs the file or
+      # `spin up` aborts with `unknown key_value_stores label
+      # <name>` before secrets are exercised.
       (cd "$DEMO_DIR/crates/app-demo-adapter-spin" && \
         SPIN_VARIABLE_SMOKE_SECRET="$SMOKE_SECRET_VALUE" \
-        spin up --listen "127.0.0.1:$PORT" 2>&1) &
+        spin up --listen "127.0.0.1:$PORT" \
+          --runtime-config-file runtime-config.toml 2>&1) &
       SERVER_PID=$!
       ;;
     *)

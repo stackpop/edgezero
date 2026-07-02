@@ -1,9 +1,9 @@
-//! {{name}} CLI — built on the `edgezero-cli` library.
+//! {{name}} CLI -- built on the `edgezero-cli` library.
 //!
 //! This binary reuses every built-in `edgezero` command via the
 //! `edgezero_cli` library and is the place to add your own
 //! subcommands. The `Config` arm dispatches the **typed** validate
-//! and push paths, parameterised over `{{NameUpperCamel}}Config` —
+//! and push paths, parameterised over `{{NameUpperCamel}}Config` --
 //! the struct your `{{proj_core}}` crate owns. The default
 //! `edgezero` binary runs the *raw* paths because it has no typed
 //! struct in scope; a downstream CLI like this one upgrades to
@@ -12,9 +12,10 @@
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs, ProvisionArgs,
-    ServeArgs,
+    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs,
+    ProvisionArgs, ServeArgs,
 };
+use edgezero_cli::DiffExit;
 use {{proj_core_mod}}::config::{{NameUpperCamel}}Config;
 
 #[derive(Parser, Debug)]
@@ -45,17 +46,23 @@ enum Cmd {
     Serve(ServeArgs),
 }
 
-/// Mirrors `edgezero_cli::args::ConfigCmd` but dispatches both
-/// `validate` and `push` to the **typed** entry points
-/// parameterised over `{{NameUpperCamel}}Config` — the downstream
-/// project owns the struct, so it can enforce the typed
-/// deserialise, `validator` rules, and `#[secret]` /
-/// `#[secret(store_ref)]` checks the raw default-binary path skips
-///.
+/// Mirrors `edgezero_cli::args::ConfigCmd` but dispatches `validate`,
+/// `push`, and `diff` to the **typed** entry points parameterised over
+/// `{{NameUpperCamel}}Config` -- the downstream project owns the struct,
+/// so it can enforce the typed deserialise, `validator` rules, and
+/// `#[secret]` / `#[secret(store_ref)]` checks the raw default-binary
+/// path skips.
 #[derive(Subcommand, Debug)]
 enum {{NameUpperCamel}}ConfigCmd {
-    /// Push `{{name}}.toml` (flattened, secret-stripped) to the
-    /// adapter's config store.
+    /// Diff `{{name}}.toml` against the live (or local-emulator) config
+    /// store and report changes. Exits 0 (no changes), 1 (changes with
+    /// `--exit-code`), or 2 (unsupported / error).
+    Diff(ConfigDiffArgs),
+    /// Push `{{name}}.toml` as a single blob envelope to the
+    /// adapter's config store. The blob carries every field verbatim
+    /// (per spec 3.3 Model A -- `#[secret]` fields store the key NAME,
+    /// resolved at runtime); a SHA over the canonical-form data gates
+    /// drift detection.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and `{{name}}.toml` against the
     /// typed `{{NameUpperCamel}}Config` contract.
@@ -66,9 +73,20 @@ fn main() {
     use std::process;
 
     edgezero_cli::init_cli_logger();
-    let result = match Args::parse().cmd {
+    let result: Result<(), String> = match Args::parse().cmd {
         Cmd::Auth(args) => edgezero_cli::run_auth(&args),
         Cmd::Build(args) => edgezero_cli::run_build(&args),
+        Cmd::Config({{NameUpperCamel}}ConfigCmd::Diff(args)) => {
+            // `run_config_diff_typed` returns `Result<DiffExit, String>` (not
+            // `Result<(), String>`), so we can't use `?` directly here.
+            // Match the Ok shape explicitly: exit(code) for non-zero codes
+            // (1 = diff present with --exit-code; 2 = Unsupported).
+            match edgezero_cli::run_config_diff_typed::<{{NameUpperCamel}}Config>(&args) {
+                Ok(DiffExit { code: 0 }) => Ok(()),
+                Ok(DiffExit { code }) => process::exit(code),
+                Err(err) => Err(err),
+            }
+        }
         Cmd::Config({{NameUpperCamel}}ConfigCmd::Push(args)) => {
             edgezero_cli::run_config_push_typed::<{{NameUpperCamel}}Config>(&args)
         }
@@ -82,6 +100,8 @@ fn main() {
     };
     if let Err(err) = result {
         log::error!("[{{name}}] {err}");
-        process::exit(1);
+        // Exit 2 for all errors so diff errors satisfy Q10's "errors always ≥ 2" rule.
+        // Push / validate errors are not behaviour-checked against the 1 vs 2 distinction.
+        process::exit(2);
     }
 }

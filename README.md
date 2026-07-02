@@ -27,6 +27,7 @@ Full documentation is available at **[stackpop.github.io/edgezero](https://stack
 - [Architecture](https://stackpop.github.io/edgezero/guide/architecture) - How EdgeZero works
 - [Configuration](https://stackpop.github.io/edgezero/guide/configuration) - `edgezero.toml` reference
 - [CLI Reference](https://stackpop.github.io/edgezero/guide/cli-reference) - All CLI commands
+- [Blob App-Config Migration](https://stackpop.github.io/edgezero/guide/blob-app-config-migration) - Typed `AppConfig<C>` extractor + `config push` / `config diff` workflow
 
 ## Supported Platforms
 

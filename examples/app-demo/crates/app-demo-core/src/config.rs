@@ -17,19 +17,20 @@ use validator::Validate;
 #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
 #[serde(deny_unknown_fields)]
 pub struct AppDemoConfig {
-    /// Resolved at runtime via
-    /// `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
-    /// The value is the *key* in the default secret store, not the
-    /// secret bytes themselves.
+    /// The value stored here is the *key* name in the default secret store
+    /// (Model A). The `AppConfig<AppDemoConfig>` extractor resolves it
+    /// automatically via the secret walk — no manual `require_str` call
+    /// needed in handlers.
     #[secret]
     pub api_token: String,
 
-    /// Feature-flag sub-table. Nested so `config push` writes the
-    /// dotted key `feature.new_checkout` — matching the existing
-    /// handler that reads `feature.new_checkout` from the config
-    /// store and the per-adapter seeds in `fastly.toml`/`spin.toml`.
-    /// Spin's config store is now KV-backed and stores dotted keys
-    /// verbatim (no `feature__new_checkout` translation step).
+    /// Feature-flag sub-table. Under the blob app-config model
+    /// (spec 3.3) `config push` writes ONE envelope per
+    /// `[stores.config]` key whose `data` carries this whole tree
+    /// verbatim — `feature.new_checkout` lands as nested JSON, not
+    /// as a dotted-key leaf. The `AppConfig<AppDemoConfig>` extractor
+    /// deserialises `data` into the typed struct at request time, so
+    /// handlers read `cfg.feature.new_checkout` directly.
     /// `#[validate(nested)]` makes the outer `validate()` call
     /// recurse into `FeatureConfig`'s rules.
     #[validate(nested)]

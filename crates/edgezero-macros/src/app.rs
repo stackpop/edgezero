@@ -140,6 +140,11 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     };
     let stores_tokens = build_stores_tokens(&manifest);
 
+    // The emitted `Hooks` impl below explicitly defines `configure` and
+    // `build_app` even though their bodies mirror the trait defaults. This is
+    // required because `missing_trait_methods` (restriction = deny) forbids
+    // relying on trait defaults in the impl. If `Hooks::configure` or
+    // `Hooks::build_app` defaults change, update these emitted bodies to match.
     let output = quote! {
         pub struct #app_ident;
 

@@ -1,0 +1,7 @@
+error: `#[secret(store_ref = "vault")]` names sibling field `vault` which does not exist on this struct
+ --> tests/ui/key_in_named_store_missing_sibling.rs:4:51
+  |
+4 | #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+  |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the derive macro `edgezero_core::AppConfig` (in Nightly builds, run with -Z macro-backtrace for more info)

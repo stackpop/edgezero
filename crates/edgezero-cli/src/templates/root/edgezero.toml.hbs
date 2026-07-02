@@ -68,6 +68,10 @@ adapters = [{{{adapter_list}}}]
 # [stores.kv]
 # ids = ["app_kv"]
 #
+# Uncomment `[stores.config]` to opt in to typed app-config via the blob
+# model. Once declared, `<name>-cli config push --adapter <name>` writes a
+# signed JSON envelope into the adapter's config store; handlers receive it
+# via `AppConfig<{{NameUpperCamel}}Config>` with no manual store calls.
 # [stores.config]
 # ids = ["app_config"]
 #

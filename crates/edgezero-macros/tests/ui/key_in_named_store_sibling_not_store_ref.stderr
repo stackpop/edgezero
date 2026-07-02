@@ -1,0 +1,7 @@
+error: `#[secret(store_ref = "vault")]` names sibling field `vault` which must be annotated `#[secret(store_ref)]`, but it is not
+ --> tests/ui/key_in_named_store_sibling_not_store_ref.rs:5:51
+  |
+5 | #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+  |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the derive macro `edgezero_core::AppConfig` (in Nightly builds, run with -Z macro-backtrace for more info)

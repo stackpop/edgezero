@@ -63,6 +63,10 @@ export default defineConfig({
             text: 'Manifest Store Migration',
             link: '/guide/manifest-store-migration',
           },
+          {
+            text: 'Blob App-Config Migration',
+            link: '/guide/blob-app-config-migration',
+          },
         ],
       },
     ],

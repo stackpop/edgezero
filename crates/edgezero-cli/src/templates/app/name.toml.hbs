@@ -1,4 +1,4 @@
-# `{{name}}.toml` — typed application config.
+# `{{name}}.toml` -- typed application config.
 #
 # The file's top-level table maps 1:1 to the
 # `{{NameUpperCamel}}Config` struct in
@@ -18,12 +18,13 @@ greeting = "hello from {{name}}"
 [service]
 timeout_ms = 1500
 
-# When you uncomment `#[secret] api_token` in the AppConfig struct
-# (see `crates/{{proj_core}}/src/config.rs`), the matching key here
-# is the *name* of the secret -- the runtime resolves it through
-# the wired secret store via
-# `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
-# Uncomment alongside the corresponding `[stores.secrets]` block
-# in `edgezero.toml`.
+# When you uncomment `#[secret] api_token` in the AppConfig
+# struct (see `crates/{{proj_core}}/src/config.rs`), the
+# matching key here is the *key name* in the default secret
+# store -- NOT the secret bytes. The framework's secret walk
+# resolves it at extractor time; in handler code,
+# `cfg.api_token` is already the resolved secret value.
+# Uncomment alongside the corresponding `[stores.secrets]`
+# block in `edgezero.toml`.
 #
 # api_token = "demo_api_token"

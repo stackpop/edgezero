@@ -89,7 +89,7 @@ pub(crate) fn chunk_entries(entries: &[(String, String)]) -> Result<Vec<Vec<Stri
         let pair = format_pair(key, value)?;
         if pair.len() >= MAX_ARGV_BYTES_PER_INVOCATION {
             return Err(format!(
-                "entry `{key}` is {} bytes — exceeds the {MAX_ARGV_BYTES_PER_INVOCATION}-byte safe-argv-per-invocation cap for `spin cloud key-value set`. Trim the value, or use a different backend (KV-with-blob, or a managed runtime-config backend) for entries this large.",
+                "blob at key `{key}` is {} bytes — exceeds the {MAX_ARGV_BYTES_PER_INVOCATION}-byte safe-argv-per-invocation cap for `spin cloud key-value set`. Restructure your typed app-config into multiple types and split across [stores.config] ids (spec 9.4).",
                 pair.len()
             ));
         }

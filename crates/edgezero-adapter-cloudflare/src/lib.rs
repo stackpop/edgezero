@@ -48,9 +48,14 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 
 /// Build an [`EnvConfig`] from a Cloudflare `Env`. Workers have no
 /// `std::env`, and the `Env` binding object cannot be enumerated, so the exact
-/// `EDGEZERO__STORES__<KIND>__<ID>__NAME` keys are derived from the baked
-/// store metadata and queried individually, alongside the fixed
+/// `EDGEZERO__STORES__<KIND>__<ID>__NAME` / `__KEY` keys are derived from the
+/// baked store metadata and queried individually, alongside the fixed
 /// `EDGEZERO__ADAPTER__*` / `EDGEZERO__LOGGING__*` keys.
+///
+/// `__KEY` is included for `CONFIG` ids only -- it's how spec 5.4 routes the
+/// runtime extractor at a per-environment override blob (e.g. `app_config`
+/// vs `app_config_staging`). KV/SECRETS bindings don't have a per-id key
+/// override.
 #[cfg(all(feature = "cloudflare", target_arch = "wasm32"))]
 fn env_config_from_worker(env: &Env, stores: StoresMetadata) -> EnvConfig {
     let mut keys: Vec<String> = vec![
@@ -65,10 +70,11 @@ fn env_config_from_worker(env: &Env, stores: StoresMetadata) -> EnvConfig {
     ] {
         if let Some(meta) = store_meta {
             for id in meta.ids {
-                keys.push(format!(
-                    "EDGEZERO__STORES__{kind}__{}__NAME",
-                    id.to_ascii_uppercase()
-                ));
+                let id_upper = id.to_ascii_uppercase();
+                keys.push(format!("EDGEZERO__STORES__{kind}__{id_upper}__NAME"));
+                if kind == "CONFIG" {
+                    keys.push(format!("EDGEZERO__STORES__{kind}__{id_upper}__KEY"));
+                }
             }
         }
     }

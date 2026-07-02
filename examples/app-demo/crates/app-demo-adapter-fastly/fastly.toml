@@ -7,10 +7,15 @@ service_id = ""
 
 [local_server]
 
-# Config store entries for local Viceroy testing.
+# Config store for local Viceroy testing.
 # The platform name matches the logical id from edgezero.toml
 # (`[stores.config].ids = ["app_config"]`); override at runtime with
 # `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=<store>` if you need to remap.
+#
+# In production the `AppConfig<AppDemoConfig>` extractor reads a single
+# blob-envelope JSON value stored under the binding's `default_key`
+# (written by `app-demo-cli config push`). The individual keys below
+# are legacy seeds used only by the raw `/config/{name}` demo handler.
 [local_server.config_stores.app_config]
 format = "inline-toml"
 

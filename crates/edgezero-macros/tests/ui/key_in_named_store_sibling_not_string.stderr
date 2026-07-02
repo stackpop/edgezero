@@ -1,0 +1,5 @@
+error: `#[secret]` / `#[secret(store_ref)]` may only annotate a scalar string field (e.g. `String`)
+  --> tests/ui/key_in_named_store_sibling_not_string.rs:11:12
+   |
+11 |     vault: u32,
+   |            ^^^

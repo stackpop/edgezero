@@ -1348,7 +1348,7 @@ features = ["rustls", "blocking", "json"] }`.
 - [ ] **Task 3.1** (D10 split): `crates/edgezero-adapter-spin/src/seed.rs`.
       Build the host-compilable core: `SeedWriter` trait,
       `InMemorySeedWriter`, `handle_seed_request_core(req: &Request,
-    …) -> Response` using `edgezero_core::http` types only. NO
+…) -> Response` using `edgezero_core::http` types only. NO
       `spin_sdk` references in the core layer.
 - [ ] **Task 3.2**: Host unit tests against `InMemorySeedWriter`
       covering every row of the D9 status code table PLUS the
@@ -1362,13 +1362,13 @@ features = ["rustls", "blocking", "json"] }`.
       `A::stores().config` × `env.store_name("config", id)`.
 - [ ] **Task 3.4** (D10 wrapper, wasm-gated): Thin
       `rust
-    pub(crate) async fn handle_seed_request_spin(
-        req: spin_sdk::http::Request,
-        writer: &SpinKvSeedWriter,
-        valid_token: Option<&str>,
-        known_platform_labels: &[String],
-    ) -> anyhow::Result<SpinFullResponse>
-    `
+pub(crate) async fn handle_seed_request_spin(
+    req: spin_sdk::http::Request,
+    writer: &SpinKvSeedWriter,
+    valid_token: Option<&str>,
+    known_platform_labels: &[String],
+) -> anyhow::Result<SpinFullResponse>
+`
       that translates Spin `Request` → `edgezero_core::http::Request`
       via `into_core_request` (uses `?`), calls the core handler,
       translates back via `from_core_response` (uses `?`). v10
@@ -1392,9 +1392,9 @@ features = ["rustls", "blocking", "json"] }`.
       import is unused and the wasm-clippy `-D warnings` gate
       fails on `unused_imports`. 2. Add `run_app_with_seeder` with the SAME return shape:
       `rust
-       pub async fn run_app_with_seeder<A: Hooks>(req: SpinRequest)
-           -> anyhow::Result<SpinFullResponse>
-       `
+   pub async fn run_app_with_seeder<A: Hooks>(req: SpinRequest)
+       -> anyhow::Result<SpinFullResponse>
+   `
       Routes `/__edgezero/config/seed` to
       `handle_seed_request_spin(req, &SpinKvSeedWriter, …).await`
       (returns `anyhow::Result<SpinFullResponse>` per Task 3.4)
@@ -1406,7 +1406,7 @@ features = ["rustls", "blocking", "json"] }`.
       with the body swapped from
       `edgezero_adapter_spin::run_app::<App>(req).await` to
       `edgezero_adapter_spin::run_app_with_seeder::<App>(req).await`. 4. Token resolved from `EnvConfig::get(&["adapters", "spin",
-       "seed_token"])`; if unset / blank / shorter than 16 bytes
+   "seed_token"])`; if unset / blank / shorter than 16 bytes
       (D9), every request hitting the seed route returns 401
       (fail-closed).
 
@@ -1515,16 +1515,16 @@ features = ["rustls", "blocking", "json"] }`.
 - [ ] **Wasm dep gating checks** (D11, fixed per L1 — use
       `cargo tree -i` which errors when the dep is absent).
       ``sh
-    # reqwest MUST NOT leak into the wasm tree. `cargo tree -i`
-    # errors when reqwest isn't a dep; invert with `!`:
-    ! cargo tree -i reqwest -p edgezero-adapter-spin \
-        --features spin --target wasm32-wasip2 2>/dev/null
-    # subtle / serde_json MUST be in the wasm tree.
-    cargo tree -i subtle -p edgezero-adapter-spin \
-        --features spin --target wasm32-wasip2
-    cargo tree -i serde_json -p edgezero-adapter-spin \
-        --features spin --target wasm32-wasip2
-    ``
+  # reqwest MUST NOT leak into the wasm tree. `cargo tree -i`
+  # errors when reqwest isn't a dep; invert with `!`:
+  ! cargo tree -i reqwest -p edgezero-adapter-spin \
+   --features spin --target wasm32-wasip2 2>/dev/null
+  # subtle / serde_json MUST be in the wasm tree.
+  cargo tree -i subtle -p edgezero-adapter-spin \
+   --features spin --target wasm32-wasip2
+  cargo tree -i serde_json -p edgezero-adapter-spin \
+   --features spin --target wasm32-wasip2
+  ``
 - [ ] **End-to-end smoke test** in `examples/app-demo` (v11
       round-9 L1: shell-form, backgrounded, port-wait + trap
       cleanup so the test can actually be run in CI / pasted

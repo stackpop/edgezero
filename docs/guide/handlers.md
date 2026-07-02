@@ -385,18 +385,19 @@ Implement `IntoResponse` for custom response types:
 
 ```rust
 use edgezero_core::body::Body;
+use edgezero_core::error::EdgeError;
 use edgezero_core::http::{Response, StatusCode};
 use edgezero_core::response::IntoResponse;
 
 pub struct HtmlResponse(pub String);
 
 impl IntoResponse for HtmlResponse {
-    fn into_response(self) -> Response {
+    fn into_response(self) -> Result<Response, EdgeError> {
         Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/html; charset=utf-8")
             .body(Body::from(self.0))
-            .unwrap()
+            .map_err(EdgeError::internal)
     }
 }
 

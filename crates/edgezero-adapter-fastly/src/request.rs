@@ -13,7 +13,7 @@ use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
-    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+    BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use fastly::{Error as FastlyError, Request as FastlyRequest, Response as FastlyResponse};
 use futures::executor;
@@ -140,7 +140,7 @@ impl<'app> FastlyService<'app> {
         };
         let secrets = match self.secrets {
             SecretSource::Off => None,
-            SecretSource::On { required } => resolve_secret_handle(required),
+            SecretSource::On { required } => Some(resolve_secret_handle(required)),
         };
         dispatch_with_handles(
             self.app,
@@ -289,8 +289,9 @@ fn dispatch_with_handles(
 ///
 /// Fastly is `Multi` for all three kinds, so each declared id resolves to
 /// its own platform store via `EDGEZERO__STORES__<KIND>__<ID>__NAME` (or the
-/// id default). KV failures escalate when `kv_required` is set; missing
-/// config / secret stores degrade silently with a one-time warning.
+/// id default). KV failures escalate via [`resolve_kv_handle`]'s
+/// `kv_required=true` path; missing config / secret stores degrade silently
+/// with a one-time warning.
 pub(crate) fn dispatch_with_registries(
     app: &App,
     req: FastlyRequest,
@@ -332,9 +333,15 @@ fn synthesise_store_registries(
     Option<SecretRegistry>,
 ) {
     let config_registry = stores.config_registry.or_else(|| {
-        stores
-            .config_store
-            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+        stores.config_store.map(|handle| {
+            ConfigRegistry::single_id(
+                "default".to_owned(),
+                ConfigStoreBinding {
+                    handle,
+                    default_key: "default".to_owned(),
+                },
+            )
+        })
     });
     let kv_registry = stores.kv_registry.or_else(|| {
         stores
@@ -383,12 +390,18 @@ fn build_config_registry(
     env: &EnvConfig,
 ) -> Option<ConfigRegistry> {
     let meta = config_meta?;
-    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
         let store_name = env.store_name("config", id);
         match FastlyConfigStore::try_open(&store_name) {
             Ok(store) => {
-                by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+                by_id.insert(
+                    (*id).to_owned(),
+                    ConfigStoreBinding {
+                        handle: ConfigStoreHandle::new(Arc::new(store)),
+                        default_key: env.store_key("config", id),
+                    },
+                );
             }
             Err(err) => warn_missing_store_once(&store_name, &err.to_string()),
         }
@@ -480,11 +493,26 @@ fn resolve_kv_handle(
     }
 }
 
-fn resolve_secret_handle(secrets_required: bool) -> Option<SecretHandle> {
-    if !secrets_required {
-        return None;
-    }
-    Some(SecretHandle::new(Arc::new(FastlySecretStore)))
+/// Construct the Fastly secret-store handle. Called from the
+/// `SecretSource::On { .. }` arm of `dispatch`. The `_required`
+/// parameter is preserved (and ignored) for symmetry with the kv
+/// path's `resolve_kv_handle(_, _required)`, where `required`
+/// decides whether a runtime open failure is fatal or silently
+/// degrades. `FastlySecretStore` is a unit struct whose
+/// construction can't fail, so there's nothing for `required` to
+/// gate here — and `clippy::unnecessary_wraps` would flag an
+/// `Option<SecretHandle>` return on a function that never returns
+/// None. The caller wraps the result in `Some(...)` so the
+/// `SecretSource::Off => None` branch still produces the right
+/// `Option`.
+///
+/// Pre-fix, the return type was `Option<SecretHandle>` and the
+/// body short-circuited to `None` when `!_required`, which
+/// silently swallowed `.with_secrets()` (which sets `required:
+/// false`): handlers ran without a `SecretRegistry` even though the
+/// builder claimed to inject one.
+fn resolve_secret_handle(_required: bool) -> SecretHandle {
+    SecretHandle::new(Arc::new(FastlySecretStore))
 }
 
 fn warn_missing_kv_store_once(kv_store_name: &str, error: &impl Display) {
@@ -623,6 +651,49 @@ mod synthesis_tests {
         assert_eq!(
             secret_reg.default().expect("default bound").store_name(),
             "default"
+        );
+    }
+
+    // Regression for the `.with_secrets()` bug — the pre-fix
+    // `resolve_secret_handle(false)` short-circuited to `None`, so the
+    // documented `.with_secrets().dispatch(...)` path silently ran
+    // handlers without a `SecretRegistry`. After the fix, the handle
+    // is always built when `SecretSource::On` is selected; `_required`
+    // is reserved for whichever future per-secret-lookup availability
+    // policy lands.
+
+    #[test]
+    fn resolve_secret_handle_builds_handle_when_required_false_matches_with_secrets_default() {
+        // The return type is unconditionally `SecretHandle` (post-
+        // clippy::unnecessary_wraps cleanup); just exercise the
+        // call to lock in that `.with_secrets()`-shaped paths
+        // (required=false) still build a handle without panicking.
+        let _handle = resolve_secret_handle(false);
+    }
+
+    #[test]
+    fn resolve_secret_handle_builds_handle_when_required_true_matches_require_secrets() {
+        let _handle = resolve_secret_handle(true);
+    }
+
+    /// Spec 12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
+    /// must surface as `ConfigStoreBinding.default_key`.
+    ///
+    /// `build_config_registry` calls `FastlyConfigStore::try_open` which
+    /// requires live Fastly hostcalls and cannot be unit-tested here; this
+    /// test exercises the env-resolution layer that `build_config_registry`
+    /// reads from. Platform-integration coverage relies on the E2 smoke
+    /// scripts.
+    #[test]
+    fn config_default_key_env_override_resolved() {
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        assert_eq!(
+            env.store_key("config", "app_config"),
+            "app_config_staging",
+            "env override must propagate to the key resolved by build_config_registry"
         );
     }
 }
