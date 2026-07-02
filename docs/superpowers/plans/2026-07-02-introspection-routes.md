@@ -1087,7 +1087,7 @@ different token and should not appear).
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docs/guide/routing.md
+git add docs/guide/routing.md docs/guide/roadmap.md
 git commit -m "Docs: replace route-listing with introspection routes"
 ```
 
