@@ -194,13 +194,21 @@ impl Adapter for CloudflareCliAdapter {
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
-        _deployed: Option<&AdapterDeployedState>,
+        deployed: Option<&AdapterDeployedState>,
         mode: ProvisionMode,
         dry_run: bool,
     ) -> Result<ProvisionOutcome, String> {
         match mode {
             ProvisionMode::Cloud => {}
-            ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()),
+            ProvisionMode::Local => {
+                return provision_local(
+                    manifest_root,
+                    adapter_manifest_path,
+                    stores,
+                    deployed,
+                    dry_run,
+                );
+            }
         }
         //: KV ids and config ids both back to Cloudflare KV
         // namespaces. Secrets are runtime-managed via
@@ -319,7 +327,7 @@ impl Adapter for CloudflareCliAdapter {
         // map, since the existing id is already recorded in the
         // operator's `[adapters.cloudflare.deployed]` block from a
         // prior run.
-        let deployed = if created_kv_ns.is_empty() {
+        let created_deployed = if created_kv_ns.is_empty() {
             None
         } else {
             let mut state = AdapterDeployedState::default();
@@ -330,7 +338,7 @@ impl Adapter for CloudflareCliAdapter {
         };
         Ok(ProvisionOutcome {
             status_lines: out,
-            deployed,
+            deployed: created_deployed,
         })
     }
 
@@ -892,6 +900,163 @@ fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), Strin
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     Ok(())
+}
+
+/// Local-mode provision arm: rewrite `[[kv_namespaces]]` entries in
+/// the adapter's `wrangler.toml` for every declared KV / config
+/// store, applying the deployed-precedence rule.
+///
+/// Precedence for the `id` cell of each entry:
+/// 1. `deployed.sub_tables["kv_namespaces"][store.logical]` — the
+///    cloud-side id recorded from a prior Cloud provision.
+/// 2. The existing local `id` on a `[[kv_namespaces]]` entry whose
+///    `binding` matches `store.platform`. Preserves operator-set
+///    ids on file-based (no-cloud) setups.
+/// 3. `format!("<placeholder-namespace-id-{}>", store.logical)`.
+///
+/// `preview_id` is written ONLY from
+/// `deployed.sub_tables["preview_kv_namespaces"][store.logical]`; it
+/// is never synthesised (matches the Cloud arm at `cli.rs:821`, which
+/// also omits `preview_id` unless the operator provides one).
+///
+/// **Lookups use `store.logical`** (env-overlay-independent, stable
+/// across machines); **TOML cells use `store.platform`** (env-overlay
+/// resolved binding name teammates can vary via
+/// `EDGEZERO__STORES__<KIND>__<ID>__NAME`).
+///
+/// Assumes `wrangler.toml` already exists at the resolved path
+/// (Task 8b's CLI bootstrap writes it before provision runs); if it
+/// is missing, returns an error naming the path rather than silently
+/// re-synthesising, since the adapter trait does not receive an
+/// `app_name` to synthesise with.
+fn provision_local(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    stores: &ProvisionStores<'_>,
+    deployed: Option<&AdapterDeployedState>,
+    dry_run: bool,
+) -> Result<ProvisionOutcome, String> {
+    use toml_edit::DocumentMut;
+
+    let wrangler_rel = adapter_manifest_path.unwrap_or("wrangler.toml");
+    let wrangler_path = manifest_root.join(wrangler_rel);
+    if !wrangler_path.exists() {
+        return Err(format!(
+            "expected wrangler.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            wrangler_path.display()
+        ));
+    }
+    let raw = fs::read_to_string(&wrangler_path)
+        .map_err(|err| format!("failed to read {}: {err}", wrangler_path.display()))?;
+    let mut doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", wrangler_path.display()))?;
+
+    let mut status_lines: Vec<String> = Vec::new();
+    for store in stores.kv.iter().chain(stores.config.iter()) {
+        // Lookups use LOGICAL id.
+        let deployed_id = deployed
+            .and_then(|state| state.sub_tables.get("kv_namespaces"))
+            .and_then(|kv| kv.get(&store.logical))
+            .map(String::as_str);
+        let deployed_preview = deployed
+            .and_then(|state| state.sub_tables.get("preview_kv_namespaces"))
+            .and_then(|kv| kv.get(&store.logical))
+            .map(String::as_str);
+        let placeholder = format!("<placeholder-namespace-id-{}>", store.logical);
+
+        // TOML cells use PLATFORM binding.
+        let resolved_id = upsert_kv_namespace_entry(
+            &mut doc,
+            &wrangler_path,
+            &store.platform,
+            deployed_id,
+            deployed_preview,
+            &placeholder,
+        )?;
+        status_lines.push(format!(
+            "cloudflare: kv binding `{}` -> id `{}` (logical id `{}`)",
+            store.platform, resolved_id, store.logical,
+        ));
+    }
+
+    if !dry_run {
+        fs::write(&wrangler_path, doc.to_string())
+            .map_err(|err| format!("failed to write {}: {err}", wrangler_path.display()))?;
+    }
+
+    Ok(ProvisionOutcome {
+        status_lines,
+        deployed: None,
+    })
+}
+
+/// In-memory upsert of a single `[[kv_namespaces]]` entry inside
+/// `doc`, matched by `binding = platform`. Precedence for the
+/// resolved id and `preview_id` is documented on [`provision_local`].
+///
+/// Returns the id cell as written so the caller can name it in the
+/// operator-facing status line.
+///
+/// Errors if `kv_namespaces` exists but is not an array-of-tables --
+/// symmetric with [`upsert_kv_namespace`]'s check. Missing
+/// `kv_namespaces` is created as an empty array-of-tables and the
+/// new entry appended.
+fn upsert_kv_namespace_entry(
+    doc: &mut toml_edit::DocumentMut,
+    path: &Path,
+    platform: &str,
+    deployed_id: Option<&str>,
+    deployed_preview: Option<&str>,
+    placeholder: &str,
+) -> Result<String, String> {
+    use toml_edit::{value, ArrayOfTables, Item, Table};
+
+    let entry = doc
+        .entry("kv_namespaces")
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    let arr = entry.as_array_of_tables_mut().ok_or_else(|| {
+        format!(
+            "{}: `kv_namespaces` exists but is not an array-of-tables (`[[kv_namespaces]]`); convert it manually before re-running provision",
+            path.display()
+        )
+    })?;
+
+    let existing_idx = arr
+        .iter()
+        .position(|table| table.get("binding").and_then(Item::as_str) == Some(platform));
+    let resolved_id = if let Some(idx) = existing_idx {
+        // Existing entry: replace id from deployed if present,
+        // otherwise leave existing id in place (operator-set /
+        // prior placeholder). Only fall back to a fresh placeholder
+        // if the existing entry has NO id at all.
+        let existing_id = arr
+            .get(idx)
+            .and_then(|table| table.get("id").and_then(Item::as_str).map(str::to_owned));
+        let resolved = deployed_id
+            .map(str::to_owned)
+            .or(existing_id)
+            .unwrap_or_else(|| placeholder.to_owned());
+        if let Some(table) = arr.get_mut(idx) {
+            table.insert("id", value(&resolved));
+            if let Some(preview) = deployed_preview {
+                table.insert("preview_id", value(preview));
+            }
+        }
+        resolved
+    } else {
+        // No matching entry: append a new `[[kv_namespaces]]` table.
+        let resolved = deployed_id.unwrap_or(placeholder).to_owned();
+        let mut new_table = Table::new();
+        new_table.insert("binding", value(platform));
+        new_table.insert("id", value(&resolved));
+        if let Some(preview) = deployed_preview {
+            new_table.insert("preview_id", value(preview));
+        }
+        arr.push(new_table);
+        resolved
+    };
+    Ok(resolved_id)
 }
 
 /// Render the entries as the `[{"key": "...", "value": "..."}, …]`
@@ -2422,5 +2587,311 @@ id = "00112233445566778899aabbccddeeff"
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
             assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
         }
+    }
+
+    // ---------- provision (Local mode) ----------
+
+    /// Build an `AdapterDeployedState` with a single
+    /// `kv_namespaces.<logical> = <namespace_id>` mapping. Keeps the
+    /// per-test fixture terse.
+    fn deployed_kv(logical: &str, namespace_id: &str) -> AdapterDeployedState {
+        let mut kv = BTreeMap::new();
+        kv.insert(logical.to_owned(), namespace_id.to_owned());
+        let mut state = AdapterDeployedState::default();
+        state.sub_tables.insert("kv_namespaces".to_owned(), kv);
+        state
+    }
+
+    #[test]
+    fn cloudflare_local_provision_emits_bindings_with_placeholders_when_no_deployed() {
+        // [stores.kv].ids = ["sessions"], no deployed block.
+        // Expect the freshly-written entry to carry the placeholder id,
+        // and NOT emit a preview_id at all (deployed lookup only).
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        assert!(
+            out.deployed.is_none(),
+            "local provision must not repopulate deployed: {:?}",
+            out.deployed
+        );
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("[[kv_namespaces]]"),
+            "array-of-tables header emitted: {after}"
+        );
+        assert!(
+            after.contains("binding = \"sessions\""),
+            "binding named after logical (no env overlay): {after}"
+        );
+        assert!(
+            after.contains("id = \"<placeholder-namespace-id-sessions>\""),
+            "placeholder id derived from logical: {after}"
+        );
+        assert!(
+            !after.contains("preview_id"),
+            "preview_id must NOT be synthesised without deployed data: {after}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_uses_deployed_namespace_id_when_set() {
+        // Deployed carries `kv_namespaces.sessions = "abc123"`.
+        // Expect the id cell in wrangler.toml to be "abc123" (deployed
+        // wins over placeholder).
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let state = deployed_kv(TEST_KV_ID, "abc123");
+        let out = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                Some(&state),
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        assert!(out.deployed.is_none());
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("id = \"abc123\""),
+            "deployed id wins over placeholder: {after}"
+        );
+        assert!(
+            !after.contains("<placeholder-namespace-id-sessions>"),
+            "no placeholder emitted when deployed provides an id: {after}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_preserves_sibling_operator_keys() {
+        // Operator hand-added `usage_model = "bundled"` on the
+        // [[kv_namespaces]] table. Provision must overwrite `id` from
+        // deployed but leave `usage_model` untouched.
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"operator-set\"\nusage_model = \"bundled\"\n",
+        );
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let state = deployed_kv(TEST_KV_ID, "from-cloud");
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                Some(&state),
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("id = \"from-cloud\""),
+            "deployed id wins over existing local id: {after}"
+        );
+        assert!(
+            after.contains("usage_model = \"bundled\""),
+            "operator sibling key preserved: {after}"
+        );
+        assert_eq!(
+            after.matches("binding = \"sessions\"").count(),
+            1,
+            "no duplicate binding entry: {after}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_falls_back_to_existing_local_id_when_no_deployed() {
+        // No deployed. Existing local id = "operator-set" is
+        // preserved (precedence: deployed -> existing -> placeholder).
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"operator-set\"\n",
+        );
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("id = \"operator-set\""),
+            "existing local id preserved when no deployed: {after}"
+        );
+        assert!(
+            !after.contains("<placeholder-namespace-id-sessions>"),
+            "no placeholder emitted when existing id is present: {after}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_resolves_nested_adapter_manifest_path() {
+        // Mirrors the app-demo layout: adapter_manifest_path =
+        // "crates/cf/wrangler.toml". Pre-seed the nested file (Task
+        // 8b's CLI bootstrap does this before provision runs).
+        // Assert the upsert lands in the nested file and NOT in a
+        // sibling wrangler.toml at manifest_root.
+        let dir = tempdir().expect("tempdir");
+        let nested_dir = dir.path().join("crates").join("cf");
+        fs::create_dir_all(&nested_dir).expect("mkdir nested");
+        let nested_path = nested_dir.join("wrangler.toml");
+        fs::write(&nested_path, synthesise_wrangler_toml("demo")).expect("seed nested");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&nested_path).expect("read nested");
+        assert!(
+            after.contains("binding = \"sessions\""),
+            "upsert landed in nested wrangler.toml: {after}"
+        );
+        assert!(
+            after.contains("id = \"<placeholder-namespace-id-sessions>\""),
+            "placeholder id written into nested wrangler.toml: {after}"
+        );
+        // A sibling wrangler.toml at manifest_root must NOT have
+        // been created.
+        assert!(
+            !dir.path().join("wrangler.toml").exists(),
+            "no sibling wrangler.toml at manifest_root: {}",
+            dir.path().display()
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_errors_if_manifest_absent() {
+        // Same nested path, but no pre-seed. The adapter trait
+        // doesn't receive app_name -- provision cannot synthesise
+        // the manifest itself; that's Task 8b's job.
+        let dir = tempdir().expect("tempdir");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("missing wrangler.toml must error");
+        assert!(
+            err.contains("crates/cf/wrangler.toml") || err.contains("crates\\cf\\wrangler.toml"),
+            "error names the missing path: {err}"
+        );
+        assert!(
+            err.contains("wrangler.toml"),
+            "error mentions wrangler.toml: {err}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_writes_platform_binding_looks_up_deployed_by_logical() {
+        // Env-overlay round-trip. Simulates
+        //   EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config
+        // via ResolvedStoreId::new(logical, platform).
+        //
+        // Deployed is keyed by LOGICAL ("app_config"); the binding
+        // cell in wrangler.toml must be PLATFORM ("prod_config").
+        // Bug that collapses the split would either write
+        //   binding = "app_config"    (wrong: platform ignored)
+        // OR fail to find the deployed id (wrong: lookup used
+        // platform instead of logical).
+        let dir = tempdir().expect("tempdir");
+        let path = write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        let state = deployed_kv(TEST_CONFIG_ID, "abc123");
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                Some(&state),
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("binding = \"prod_config\""),
+            "binding cell uses PLATFORM name: {after}"
+        );
+        assert!(
+            !after.contains("binding = \"app_config\""),
+            "logical id must NOT leak into the binding cell: {after}"
+        );
+        assert!(
+            after.contains("id = \"abc123\""),
+            "deployed id resolved via LOGICAL lookup: {after}"
+        );
     }
 }
