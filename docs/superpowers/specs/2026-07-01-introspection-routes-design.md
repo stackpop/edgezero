@@ -68,26 +68,37 @@ We want a single, consistent, "bind it yourself" mechanism for all three.
    injected data through independent typed extractors, not `ctx.introspection()`.
    See the Revision section.
 
-> **Revision — 2026-07-02: independent typed extractors.**
-> The injection (Decision 5) and the dispatch chokepoint are unchanged —
-> `IntrospectionData` is still injected at `RouterInner::dispatch`. The only
-> change is how handlers *access* it: instead of reaching into
-> `ctx.introspection()` directly (Component 4), the two handlers that need it
-> declare the dependency via independent typed extractors, matching the
-> `Json`/`Path`/`AppConfig` idiom:
+> **Revision — 2026-07-02: independent typed extractors + per-route gated injection.**
+> Two changes to Decision 5 and Component 4:
 >
+> **(1) Access via independent typed extractors.** The two handlers that need
+> introspection data declare the dependency via extractors, matching the
+> `Json`/`Path`/`AppConfig` idiom, instead of reaching into `ctx.introspection()`:
 > - `ManifestJson(pub Arc<str>)` — the baked manifest JSON. Used by `manifest`.
 > - `RouteTable(pub Arc<[RouteInfo]>)` — the live route index. Used by `routes`.
->
-> Both implement `FromRequest`, read from the injected `IntrospectionData` via
+> Both implement `FromRequest`, read the injected `IntrospectionData` via
 > `ctx.introspection()`, and error (500 internal) if it is absent. `config` takes
 > `RequestContext` and uses neither — it reads the default config store.
 >
-> No per-route gating, no `RouteEntry` flag, no `app!` macro changes, no builder
-> methods: the routes remain plain `[[triggers.http]]` bindings (mountable by
-> apps), and the extractor on the handler signature is the only thing that
-> changes. Where this conflicts with Component 4's "handler reads
-> `ctx.introspection()`", the Revision governs.
+> **(2) Gated injection (supersedes Decision 5's "every request").** The router
+> no longer injects `IntrospectionData` unconditionally. `RouteEntry` carries a
+> `needs_introspection` flag; `RouterInner` precomputes a single
+> `Arc<IntrospectionData>` at `build()`; `dispatch` inserts a clone **only after
+> matching a flagged route**. Non-introspection traffic (virtually all requests)
+> pays nothing. No process-global state; each router owns its payload (so tests
+> and multiple apps in one process stay independent).
+>
+> **How a route gets flagged — no app-facing change.** App authors write the
+> same `[[triggers.http]]` row (`handler = "edgezero_core::introspection::…"`);
+> the `app!` macro recognizes handlers in the `edgezero_core::introspection::`
+> namespace and emits the flagged registration (`route_introspective`)
+> automatically. There is NO `[introspection]` manifest section and no per-route
+> knob in `edgezero.toml`. Manual `RouterBuilder` users opt in via
+> `route_introspective(path, method, handler)`; a plain `.get(...)` binding of an
+> introspection handler leaves the route unflagged and the extractor returns 500.
+>
+> Where this conflicts with Decision 5 ("every request") or Component 4 ("handler
+> reads `ctx.introspection()`"), the Revision governs.
 
 ## Architecture
 

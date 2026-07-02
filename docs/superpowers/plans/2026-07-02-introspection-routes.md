@@ -1199,96 +1199,113 @@ gh pr ready 300
 
 ---
 
-## Addendum (2026-07-02): independent typed extractors
+---
 
-**Why:** Tasks 1–8 have `manifest`/`routes` read `ctx.introspection()` directly.
-Per user direction, expose the injected data through independent typed
-extractors instead — matching the `Json`/`Path`/`AppConfig` idiom and making each
-handler's dependency explicit. **Nothing else changes:** injection stays
-unconditional at `RouterInner::dispatch`, routes stay plain `[[triggers.http]]`
-bindings (already mountable), and there is NO per-route gating, NO `RouteEntry`
-flag, NO `app!` macro change. `config` is untouched (it uses the config store).
+## Addendum (2026-07-02): independent extractors + per-route gated injection
 
-Base: merge-ready branch head (after `8999623`). Single task, edgezero-core only.
+Two increments over Tasks 1–8. **Task 9 (extractors) is already committed**
+(`0feb194`): `ManifestJson`/`RouteTable` extractors added, `manifest`/`routes`
+handlers refactored to use them (`config` unchanged). This addendum records that
+plus the remaining gating work.
 
-### Task 9: independent `ManifestJson` / `RouteTable` extractors
+**Task 10 (gating)** makes injection per-route instead of every-request, with NO
+app-facing change: the `app!` macro auto-flags routes whose handler is in the
+`edgezero_core::introspection::` namespace. No `[introspection]` section, no
+`edgezero.toml` knob.
 
-**Files:** `crates/edgezero-core/src/introspection.rs` (add two extractors, refactor two handlers, update/extend colocated tests).
+Base: after `0feb194`.
 
-- [ ] **Step 1 (RED): add extractor tests + refactor-target tests.** Keep the
-  existing `manifest_returns_injected_json` / `routes_lists_registered_routes` /
-  all `config_*` tests as-is (they drive through `oneshot`, so they still pass
-  once handlers use extractors). Add:
-  - `manifest_json_extractor_reads_injected` — build a router with the `manifest`
-    handler + `with_manifest_json("{\"app\":{}}")`, `oneshot`, assert 200 + body.
-  - `manifest_json_extractor_absent_is_500` — a router WITHOUT `with_manifest_json`
-    bound to `manifest` yields 500 (payload has `manifest_json: None`).
-  Run `cargo test -p edgezero-core introspection` — new tests fail to compile
-  (extractors absent).
+### Task 10a: per-route gating in the router (edgezero-core)
 
-- [ ] **Step 2: add the extractors** in `introspection.rs`:
+**Files:** `crates/edgezero-core/src/router.rs` (+ its tests)
+
+- [ ] **Step 1: flag on `RouteEntry`** — add `needs_introspection: bool`; update the manual `Clone`/`clone_from` impls to copy it.
+- [ ] **Step 2: `add_route` takes the flag; add `route_introspective`.**
 ```rust
-use crate::extractor::FromRequest;   // match the crate's actual FromRequest path
-use crate::router::RouteInfo;
-use std::sync::Arc;
-
-/// Extractor for the baked manifest JSON (the `IntrospectionData` injected at
-/// dispatch). Errors 500 if introspection data is absent.
-pub struct ManifestJson(pub Arc<str>);
-
-#[async_trait::async_trait(?Send)]
-impl FromRequest for ManifestJson {
-    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.introspection()
-            .and_then(|d| d.manifest_json.clone())
-            .map(ManifestJson)
-            .ok_or_else(|| EdgeError::internal(anyhow::anyhow!(
-                "manifest introspection data not available"
-            )))
+    fn add_route<H>(&mut self, path: &str, method: Method, handler: H, needs_introspection: bool)
+    where H: IntoHandler {
+        let router = self.routes.entry(method.clone()).or_default();
+        router
+            .insert(path, RouteEntry { handler: handler.into_handler(), needs_introspection })
+            .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
+        self.route_info.push(RouteInfo::new(method, path.to_owned()));
     }
-}
 
-/// Extractor for the live route index.
-pub struct RouteTable(pub Arc<[RouteInfo]>);
+    pub fn route<H>(mut self, path: &str, method: Method, handler: H) -> Self
+    where H: IntoHandler { self.add_route(path, method, handler, false); self }
 
-#[async_trait::async_trait(?Send)]
-impl FromRequest for RouteTable {
-    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.introspection()
-            .map(|d| RouteTable(Arc::clone(&d.routes)))
-            .ok_or_else(|| EdgeError::internal(anyhow::anyhow!(
-                "route-table introspection data not available"
-            )))
-    }
-}
+    /// Register a route whose handler needs introspection data
+    /// (`ManifestJson`/`RouteTable`). Only such routes get `IntrospectionData`
+    /// injected at dispatch. The `app!` macro emits this automatically for
+    /// handlers in the `edgezero_core::introspection::` namespace.
+    #[must_use]
+    pub fn route_introspective<H>(mut self, path: &str, method: Method, handler: H) -> Self
+    where H: IntoHandler { self.add_route(path, method, handler, true); self }
 ```
-  (Confirm the `FromRequest` trait path and `async_trait` usage against
-  `extractor.rs`; match how existing extractors declare the impl.)
-
-- [ ] **Step 3: refactor the handlers** (`config` unchanged):
+  (`get`/`post`/`put`/`delete` keep delegating to `route` → flag stays false.)
+- [ ] **Step 3: precompute the payload once in `build()`** and store `introspection: Arc<IntrospectionData>` on `RouterInner` (replacing the bare `manifest_json` field it currently threads):
 ```rust
-#[action]
-pub async fn manifest(ManifestJson(json): ManifestJson) -> Result<Response, EdgeError> {
-    json_response(StatusCode::OK, Body::text(json.to_string()))
-}
-
-#[action]
-pub async fn routes(RouteTable(table): RouteTable) -> Result<Response, EdgeError> {
-    let views: Vec<RouteView> = table
-        .iter()
-        .map(|r| RouteView { method: r.method().as_str().to_owned(), path: r.path().to_owned() })
-        .collect();
-    json_response(StatusCode::OK, Body::json(&views).map_err(EdgeError::internal)?)
-}
+    pub fn build(self) -> RouterService {
+        let route_index: Arc<[RouteInfo]> = Arc::from(self.route_info);
+        let introspection = Arc::new(IntrospectionData {
+            manifest_json: self.manifest_json,
+            routes: Arc::clone(&route_index),
+        });
+        RouterService::new(self.routes, self.middlewares, route_index, introspection)
+    }
 ```
+  (Update `RouterService::new` to take `introspection: Arc<IntrospectionData>`.)
+- [ ] **Step 4: gate the insert in `dispatch`** — move it AFTER `find_route`, only for flagged routes:
+```rust
+    async fn dispatch(&self, request: Request) -> Result<Response, EdgeError> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_owned();
+        match self.find_route(&method, &path) {
+            RouteMatch::Found(entry, params) => {
+                let needs = entry.needs_introspection;
+                let mut request = request;
+                if needs {
+                    request.extensions_mut().insert(Arc::clone(&self.introspection));
+                }
+                let ctx = RequestContext::new(request, params);
+                let next = Next::new(&self.middlewares, entry.handler.as_ref());
+                next.run(ctx).await
+            }
+            RouteMatch::MethodNotAllowed(mut allowed) => {
+                allowed.sort_by(|l, r| l.as_str().cmp(r.as_str()));
+                Err(EdgeError::method_not_allowed(&method, &allowed))
+            }
+            RouteMatch::NotFound => Err(EdgeError::not_found(path)),
+        }
+    }
+```
+  `RequestContext::introspection()` (context.rs) now reads `Arc<IntrospectionData>`:
+```rust
+    pub fn introspection(&self) -> Option<&crate::router::IntrospectionData> {
+        self.request.extensions().get::<std::sync::Arc<crate::router::IntrospectionData>>()
+            .map(|arc| arc.as_ref())
+    }
+```
+- [ ] **Step 5: tests** — the existing `dispatch_injects_introspection_data` / `middleware_sees_introspection_data` tests register their probe route with `.route_introspective("/", Method::GET, handler)`; ADD a negative test: a plain `.get("/x", handler)` route sees `ctx.introspection().is_none()`. Run `cargo test -p edgezero-core router introspection_data`, then full `cargo test -p edgezero-core`, `cargo fmt`, `cargo clippy -p edgezero-core --all-targets -- -D warnings`.
+- [ ] **Step 6: introspection.rs tests** — the extractor tests that build routers with `.get("/m", manifest)` must switch to `.route_introspective("/m", Method::GET, manifest)` so the data is injected (else they now 500). Keep `manifest_without_baked_json_is_500` but make it register introspective WITHOUT `with_manifest_json` (data present, `manifest_json` None → 500). Add/keep a test that a NON-introspective binding of `manifest` yields 500 (no data injected). Run `cargo test -p edgezero-core introspection`.
+- [ ] **Step 7: Commit** — `git commit -m "Gate introspection injection per route via route_introspective"`
 
-- [ ] **Step 4 (GREEN):** `cargo test -p edgezero-core introspection` (all pass,
-  incl. the existing body-shape assertions and the new extractor tests); then
-  `cargo test -p edgezero-core`, `cargo fmt`, `cargo clippy -p edgezero-core --all-targets -- -D warnings`.
+### Task 10b: `app!` macro auto-flags introspection routes
 
-- [ ] **Step 5: app-demo unchanged but re-verify** — the triggers already bind
-  `edgezero_core::introspection::{manifest,config,routes}`; handler signatures
-  changed but the paths/behavior didn't. Run
-  `cd examples/app-demo && cargo test -p app-demo-core introspection_routes_are_wired`.
+**Files:** `crates/edgezero-macros/src/app.rs` (+ verify app-demo / generated project)
 
-- [ ] **Step 6: Commit** — `git commit -m "Expose introspection via ManifestJson/RouteTable extractors"`
+- [ ] **Step 1: emit `route_introspective` for introspection-namespace handlers.** In `build_route_tokens`, per trigger:
+```rust
+const INTROSPECTION_NS: &str = "edgezero_core::introspection::";
+let is_introspective = trigger.handler.as_deref().is_some_and(|h| h.starts_with(INTROSPECTION_NS));
+let register = if is_introspective {
+    quote! { builder = builder.route_introspective(#path_lit, #method_tok, #handler_path); }
+} else {
+    quote! { builder = builder.route(#path_lit, #method_tok, #handler_path); }
+};
+```
+  Match the file's existing `#method_tok`/`#handler_path` construction and how it currently emits `get`/`post`/`route`. Keep non-introspection routes byte-for-byte as before. `with_manifest_json` + `include_bytes!` tracking stay as-is.
+- [ ] **Step 2: verify** — `cargo build -p edgezero-macros && cargo test -p edgezero-macros`; `cargo fmt --all && cargo clippy -p edgezero-macros -p edgezero-core --all-targets -- -D warnings`; `cd examples/app-demo && cargo test -p app-demo-core introspection_routes_are_wired` (app-demo binds the three handlers → macro auto-flags manifest/routes; assertions unchanged; `/config` unflagged but works via config store); `cargo test -p edgezero-cli --test generated_project_builds -- --ignored`.
+- [ ] **Step 3: Commit** — `git commit -m "app!: auto-flag introspection-namespace routes as introspective"`
+
+### Task 11: full verification + whole-branch review before pushing to #300.
