@@ -2,9 +2,25 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add three reusable core `#[action]` handlers — `edgezero_core::introspection::{manifest, config, routes}` — that any app binds via `[[triggers.http]]`, default-mounted at `/_<app-name>/{manifest,config,routes}`.
+> ## ⚠️ EXECUTION STATUS — READ FIRST
+>
+> **Tasks 1–9 below are COMPLETE and committed.** Do NOT re-implement them.
+>
+> **Tasks 2 and 3 describe the ORIGINAL architecture — UNCONDITIONAL per-request
+> injection with handlers reading `ctx.introspection()` directly. That approach
+> was SUPERSEDED.** They are retained only as the historical record of what was
+> committed and then evolved. Do NOT implement Tasks 2/3 "as written"; the
+> committed code has since been changed by the Addendum.
+>
+> **The ACTIVE, authoritative implementation path is the "Addendum (2026-07-02)"
+> at the end of this document** — opt-in, per-route **gated** injection driven by
+> `#[action(manifest|routes)]`, with typed extractors for access. It matches the
+> rewritten spec. When the Addendum conflicts with the main body, the Addendum
+> governs. See the spec's "Design evolution" section for the full path.
 
-**Architecture:** The `app!` macro serializes the parsed manifest to JSON at expansion time and hands it to `RouterService::builder().with_manifest_json(...)`. `RouterInner::dispatch` injects an `IntrospectionData { manifest_json, routes }` extension into each request; the three core handlers read it (config reads the default config store instead). The legacy `enable_route_listing` machinery and `/__edgezero/routes` are removed.
+**Goal:** Add three reusable core introspection handlers — `edgezero_core::introspection::{manifest, config, routes}` — that any app binds via `[[triggers.http]]`, default-mounted at `/_<app-name>/{manifest,config,routes}`.
+
+**Architecture (final — see Addendum):** `Manifest` gains `Serialize`; the `app!` macro bakes it to JSON via `RouterService::builder().with_manifest_json(...)`. Handlers opt into introspection data with an atomic `#[action(manifest)]` / `#[action(routes)]` parameter, which expands them to capability-carrying handler structs; `add_route` reads `DynHandler::needs_introspection()` and flags the `RouteEntry`; `RouterInner::dispatch` injects a shared `Arc<IntrospectionData>` **only for flagged routes**. `ManifestJson`/`RouteTable` extractors read it; `config` uses the default config store (no injection). `app!` and `edgezero.toml` never learn about introspection. The legacy `enable_route_listing` machinery and `/__edgezero/routes` are removed.
 
 **Tech Stack:** Rust 1.95 (edition 2021), `serde`/`serde_json`, `matchit` routing, `#[action]`/`app!` proc-macros, `futures::executor::block_on` for tests. WASM-first: no Tokio, no runtime-specific deps in core.
 
@@ -1199,72 +1215,188 @@ gh pr ready 300
 
 ---
 
----
+## Addendum (2026-07-02): ACTIVE PATH — `#[action(manifest|routes)]` opt-in + gated injection
 
----
+**This supersedes Tasks 2 & 3's unconditional injection.** Task 9 (extractors) is
+already committed (`0feb194`): `ManifestJson`/`RouteTable` extractors exist and
+`manifest`/`routes` use them. The tasks below make injection **per-route gated**
+via an atomic `#[action(...)]` opt-in, with `app!`/`edgezero.toml` untouched.
 
-## Addendum (2026-07-02): `#[action(introspection)]` opt-in + gated injection
-
-Supersedes the earlier "unconditional inject" (Tasks 2/3) and the dropped
-"app!-flagging" idea. **Task 9 (extractors) is already committed** (`0feb194`):
-`ManifestJson`/`RouteTable` added; `manifest`/`routes` refactored to use them.
-This addendum makes injection per-route via an explicit `#[action]` opt-in.
-
-**Design:** `#[action]` (no args) unchanged → handler fn (reports
-`needs_introspection()==false` via the `Fn` blanket `DynHandler` impl).
-`#[action(introspection)]` → handler emitted as a unit struct with its own
-`impl DynHandler` reporting `true`. The router reads `boxed.needs_introspection()`
-at `add_route`, flags the `RouteEntry`, and `dispatch` injects `IntrospectionData`
-only for flagged routes. `app!` and `edgezero.toml` are untouched. No global, no
-`FromRequest` const, no unstable specialization. Blast radius confirmed zero
-(only `manifest`/`routes` become structs; neither is ever called directly).
+**Verified facts (from investigation):**
+- `DynHandler` (`handler.rs`): `pub trait DynHandler: Send + Sync { fn call(&self, ctx: RequestContext) -> HandlerFuture; }`, blanket-impl'd for `F: Fn(RequestContext) -> Fut`. Object-safe with an added defaulted `needs_introspection`. `HandlerFuture = Pin<Box<dyn Future<Output = Result<Response, EdgeError>> + 'static>>` (no `Send`).
+- Handlers are invoked only via `DynHandler::call` (middleware `Next::run`), never as fns; only `manifest`/`routes` will become structs and neither is called directly → **zero blast radius**.
+- `Responder::respond(self) -> Result<Response, EdgeError>`.
 
 Base: after `0feb194`.
 
 ### Task 10a: `DynHandler::needs_introspection` (edgezero-core/src/handler.rs)
-- [ ] Add to the `DynHandler` trait: `fn needs_introspection(&self) -> bool { false }`. Object-safe (concrete `&self`→bool). The blanket `impl<F: Fn…> DynHandler for F` inherits the default. `cargo test -p edgezero-core`; fmt; clippy.
-- [ ] Commit: `Add DynHandler::needs_introspection (default false)`
 
-### Task 10b: `#[action(introspection)]` param + struct codegen (edgezero-macros/src/action.rs)
-- [ ] Replace the `!attr.is_empty()` rejection with a parser: `Punctuated<syn::Ident, Token![,]>` via `Parser::parse2`. Empty → `needs_introspection=false`. `introspection` → true. Any other ident → `compile_error!` "unknown #[action] parameter `X`; supported: introspection". (`use syn::parse::Parser; use syn::punctuated::Punctuated; use syn::Token;`)
-- [ ] When `needs_introspection` is false: emit exactly today's output (the handler fn) — unchanged.
-- [ ] When true: emit the inner fn (unchanged) plus:
+- [ ] **Step 1 — add the defaulted method.** In `handler.rs`, add to the trait:
 ```rust
-#(#attrs)*
-#[allow(non_camel_case_types)]
-#vis struct #ident;
+pub trait DynHandler: Send + Sync {
+    fn call(&self, ctx: RequestContext) -> HandlerFuture;
 
-impl ::edgezero_core::handler::DynHandler for #ident {
-    #[inline]
-    fn call(&self, __ctx: ::edgezero_core::context::RequestContext)
-        -> ::edgezero_core::http::HandlerFuture {
-        ::std::boxed::Box::pin(async move {
+    /// Whether a route bound to this handler needs `IntrospectionData` injected
+    /// at dispatch. Default false; `#[action(manifest|routes)]` handlers override.
+    fn needs_introspection(&self) -> bool {
+        false
+    }
+}
+```
+  The blanket `impl<F,Fut,Res> DynHandler for F` needs NO change (inherits the default).
+- [ ] **Step 2 — verify.** `cargo build -p edgezero-core` (compiles; object safety intact). `cargo fmt -p edgezero-core`; `cargo clippy -p edgezero-core --all-targets -- -D warnings`.
+- [ ] **Step 3 — commit:** `Add DynHandler::needs_introspection (default false)`
+
+### Task 10b: `#[action(manifest|routes)]` param parser + struct codegen (edgezero-macros/src/action.rs)
+
+- [ ] **Step 1 (RED) — macro unit tests.** Update/add tests in `action.rs`'s `#[cfg(test)]`:
+  - Replace `rejects_attribute_arguments` with `rejects_unknown_param`: input `#[action(bogus)]` on an async fn → rendered output contains `unknown #[action] parameter`.
+  - Add `introspection_param_emits_struct`: input `#[action(manifest)]` on `async fn manifest(...)` → rendered output contains `struct manifest` AND `DynHandler` AND `needs_introspection`.
+  - Keep `wraps_async_function` (plain `#[action]` still contains `fn demo` + `__demo_inner`).
+  Run `cargo test -p edgezero-macros` → the two new/changed tests FAIL (parser/codegen not present).
+- [ ] **Step 2 — parse the param list.** Replace the current `if !attr.is_empty() { return Error…"does not accept arguments" }` guard with:
+```rust
+use syn::parse::Parser as _;
+use syn::punctuated::Punctuated;
+
+let params: Punctuated<syn::Ident, syn::Token![,]> = if attr.is_empty() {
+    Punctuated::new()
+} else {
+    match Punctuated::<syn::Ident, syn::Token![,]>::parse_terminated.parse2(attr.clone()) {
+        Ok(p) => p,
+        Err(err) => return err.to_compile_error(),
+    }
+};
+let mut needs_introspection = false;
+for param in &params {
+    // Known atomic introspection capabilities. Extensible; all currently
+    // collapse to the single injected `IntrospectionData` bundle.
+    if param == "manifest" || param == "routes" {
+        needs_introspection = true;
+    } else {
+        return syn::Error::new(
+            param.span(),
+            format!("unknown #[action] parameter `{param}`; supported: manifest, routes"),
+        )
+        .to_compile_error();
+    }
+}
+```
+- [ ] **Step 3 — branch codegen.** Keep the existing `extract_stmts`/`arg_idents`/`inner_fn` computation. Then:
+```rust
+let output = if needs_introspection {
+    quote! {
+        #inner_fn
+
+        #(#attrs)*
+        #[allow(non_camel_case_types)]
+        #vis struct #ident;
+
+        impl ::edgezero_core::handler::DynHandler for #ident {
+            #[inline]
+            fn call(&self, __ctx: ::edgezero_core::context::RequestContext)
+                -> ::edgezero_core::http::HandlerFuture {
+                ::std::boxed::Box::pin(async move {
+                    #(#extract_stmts)*
+                    let result = #inner_ident(#(#arg_idents),*).await;
+                    ::edgezero_core::responder::Responder::respond(result)
+                })
+            }
+            #[inline]
+            fn needs_introspection(&self) -> bool { true }
+        }
+    }
+} else {
+    // UNCHANGED from today — the fn form.
+    quote! {
+        #inner_fn
+
+        #(#attrs)*
+        #vis async fn #ident(
+            __ctx: ::edgezero_core::context::RequestContext,
+        ) -> ::std::result::Result<::edgezero_core::http::Response, ::edgezero_core::error::EdgeError> {
             #(#extract_stmts)*
             let result = #inner_ident(#(#arg_idents),*).await;
             ::edgezero_core::responder::Responder::respond(result)
+        }
+    }
+};
+output
+```
+- [ ] **Step 4 (GREEN):** `cargo test -p edgezero-macros` (all pass). `cargo fmt --all`; `cargo clippy -p edgezero-macros --all-targets -- -D warnings`.
+- [ ] **Step 5 — commit:** `#[action]: accept atomic (manifest|routes) params; emit capability-carrying handler struct`
+
+### Task 10c: router gating + accessor (edgezero-core/src/router.rs, context.rs)
+
+- [ ] **Step 1 (RED) — router tests.** In `router.rs` tests:
+  - Rewrite `dispatch_injects_introspection_data` and `middleware_sees_introspection_data` to register a LOCAL probe struct whose `DynHandler::needs_introspection()` returns `true` (a closure can't opt in), asserting `ctx.introspection().is_some()` from the handler and from a middleware respectively.
+  - Add `plain_route_gets_no_introspection`: a `.get("/x", |_ctx| async { Ok::<_,EdgeError>("ok") })` route asserts `ctx.introspection().is_none()`.
+  Example probe:
+```rust
+struct IntrospectiveProbe(std::sync::Arc<std::sync::Mutex<Option<bool>>>);
+impl crate::handler::DynHandler for IntrospectiveProbe {
+    fn call(&self, ctx: RequestContext) -> crate::http::HandlerFuture {
+        let cell = std::sync::Arc::clone(&self.0);
+        Box::pin(async move {
+            *cell.lock().unwrap() = Some(ctx.introspection().is_some());
+            Ok("ok".into_response()?)   // match the crate's response idiom
         })
     }
-    #[inline]
     fn needs_introspection(&self) -> bool { true }
 }
 ```
-  (`__ctx` is underscore-prefixed → no unused-var warning when a handler uses no extractors.)
-- [ ] Update the macro's own unit tests: `rejects_attribute_arguments` → now assert `#[action(bogus)]` yields "unknown #[action] parameter"; add a test that `#[action(introspection)]` output contains `struct` + `DynHandler` + `needs_introspection`; keep `wraps_async_function` (plain `#[action]` still a fn). `cargo test -p edgezero-macros`; fmt; clippy.
-- [ ] Commit: `#[action]: accept (introspection) param; emit capability-carrying handler struct`
+  Run `cargo test -p edgezero-core router introspection_data` → fails (flag/gating not present; `introspection()` type mismatch).
+- [ ] **Step 2 — `RouteEntry` flag.** Add `needs_introspection: bool` and copy it in the manual `Clone`/`clone_from`.
+- [ ] **Step 3 — read the flag in `add_route`:**
+```rust
+let boxed = handler.into_handler();
+let needs_introspection = boxed.needs_introspection();
+router.insert(path, RouteEntry { handler: boxed, needs_introspection })
+    .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
+```
+- [ ] **Step 4 — precompute the payload.** In `build()`:
+```rust
+let route_index: Arc<[RouteInfo]> = Arc::from(self.route_info);
+let introspection = Arc::new(IntrospectionData {
+    manifest_json: self.manifest_json,
+    routes: Arc::clone(&route_index),
+});
+RouterService::new(self.routes, self.middlewares, route_index, introspection)
+```
+  Change `RouterInner`'s `manifest_json: Option<Arc<str>>` field to `introspection: Arc<IntrospectionData>`, and `RouterService::new`'s last param likewise.
+- [ ] **Step 5 — gate `dispatch`.** Remove the unconditional insert at the top; inside `RouteMatch::Found(entry, params)`:
+```rust
+let mut request = request;
+if entry.needs_introspection {
+    request.extensions_mut().insert(::std::sync::Arc::clone(&self.introspection));
+}
+let ctx = RequestContext::new(request, params);
+```
+  (`dispatch` reads `method`/`path` from `request` before the match, as today; make the bound `request` mutable in the arm.)
+- [ ] **Step 6 — accessor.** `context.rs`:
+```rust
+pub fn introspection(&self) -> Option<&crate::router::IntrospectionData> {
+    self.request
+        .extensions()
+        .get::<std::sync::Arc<crate::router::IntrospectionData>>()
+        .map(|arc| arc.as_ref())
+}
+```
+- [ ] **Step 7 (GREEN):** `cargo test -p edgezero-core` (all pass). `cargo fmt`; `cargo clippy -p edgezero-core --all-targets -- -D warnings`.
+- [ ] **Step 8 — commit:** `Gate IntrospectionData injection on RouteEntry.needs_introspection`
 
-### Task 10c: router gating + context accessor (edgezero-core/src/router.rs, context.rs)
-- [ ] `RouteEntry { handler, needs_introspection: bool }` (+ manual Clone copies the bool).
-- [ ] `add_route`: `let boxed = handler.into_handler(); let needs = boxed.needs_introspection(); RouteEntry { handler: boxed, needs_introspection: needs }`. (No `route_introspective` needed — the flag is read from the handler.)
-- [ ] `build()`: precompute `let introspection = Arc::new(IntrospectionData { manifest_json: self.manifest_json, routes: Arc::clone(&route_index) });` and pass to `RouterService::new` (replace the `manifest_json` param). `RouterInner` stores `introspection: Arc<IntrospectionData>`.
-- [ ] `dispatch`: remove the unconditional insert; after `RouteMatch::Found(entry, params)`, `if entry.needs_introspection { request.extensions_mut().insert(Arc::clone(&self.introspection)); }` then build `RequestContext`.
-- [ ] `context.rs::introspection()`: read `Arc<IntrospectionData>` (`get::<Arc<IntrospectionData>>().map(|a| a.as_ref())`).
-- [ ] Tests: rewrite `dispatch_injects_introspection_data`/`middleware_sees_introspection_data` to register a local probe `struct` whose `DynHandler::needs_introspection()` returns true (closures report false), asserting `ctx.introspection().is_some()`; ADD a negative test that a plain `.get("/x", closure)` route sees `ctx.introspection().is_none()`. `cargo test -p edgezero-core`; fmt; clippy.
-- [ ] Commit: `Gate IntrospectionData injection on RouteEntry.needs_introspection`
+### Task 10d: opt the handlers in + compile-level proof (edgezero-core/src/introspection.rs)
 
-### Task 10d: opt the handlers in (edgezero-core/src/introspection.rs)
-- [ ] Change `manifest` and `routes` from `#[action]` to `#[action(introspection)]`. `config` stays `#[action]`. The existing extractor tests still pass (`.get("/m", manifest)` registers the struct; auto-flagged → injected → 200; `manifest_without_baked_json_is_500` still 500 because `manifest_json` is None). `cargo test -p edgezero-core introspection`.
-- [ ] Commit: `Opt manifest/routes into introspection injection via #[action(introspection)]`
+- [ ] **Step 1 — opt in.** Change `manifest` from `#[action]` to `#[action(manifest)]`, and `routes` to `#[action(routes)]`. `config` stays `#[action]`.
+- [ ] **Step 2 — compile/behavioral proof (this is the key test the reviewer asked for).** The existing `manifest_returns_injected_json` test already does `RouterService::builder().with_manifest_json("…").get("/m", manifest).build()` then `oneshot` → asserts 200 + body. Because `manifest` is now a UNIT STRUCT value, this test compiling and passing proves `.get("/m", manifest)` accepts the struct-as-handler and that `add_route` auto-flags it (else `oneshot` would 500 on the `ManifestJson` extractor). Keep it. Confirm `manifest_without_baked_json_is_500` still holds (route flagged → `IntrospectionData` injected, but `manifest_json` is `None` → extractor 500). Add `routes_returns_registered_routes` similarly if not already covered.
+- [ ] **Step 3 — verify.** `cargo test -p edgezero-core introspection` (all pass, incl. body-shape assertions).
+- [ ] **Step 4 — commit:** `Opt manifest/routes into gated injection via #[action(manifest|routes)]`
 
-### Task 11: verification + review
-- [ ] Full gates: fmt; clippy `-D warnings`; `cargo test --workspace --all-targets`; `cd examples/app-demo && cargo test --workspace --all-targets` (all existing handlers unchanged → app-demo unaffected; `introspection_routes_are_wired` still passes); `cargo test -p edgezero-cli --test generated_project_builds -- --ignored`; nested-AppConfig audit; feature checks; wasm32-wasip2.
+### Task 11: full verification + whole-branch review
+
+- [ ] `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets`.
+- [ ] `cd examples/app-demo && cargo test --workspace --all-targets` (all other handlers unchanged → app-demo unaffected; `introspection_routes_are_wired` still passes: `manifest`/`routes` flagged, `config` via store).
+- [ ] `cargo test -p edgezero-cli --test generated_project_builds -- --ignored` (template handlers are plain `#[action]` → still fns → generated project unaffected).
+- [ ] `cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates`.
+- [ ] `cargo check --workspace --all-targets --features "fastly cloudflare spin"`; `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`.
 - [ ] Whole-branch review of the addendum commits, then push to #300.
