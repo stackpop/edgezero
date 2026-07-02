@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
@@ -214,6 +214,16 @@ impl Adapter for CloudflareCliAdapter {
         let wrangler_path = manifest_root.join(rel);
 
         let mut out = Vec::new();
+        // Track logical -> namespace_id for freshly-created namespaces
+        // so the CLI's writeback can persist them under
+        // `[adapters.cloudflare.deployed].kv_namespaces.<logical>`.
+        // Keyed by LOGICAL id so teammates' env overlays (which
+        // change the platform binding name) still resolve the same
+        // mapping on their side. Only populated in the non-dry-run
+        // create branch below -- dry-runs and idempotency skips
+        // contribute nothing (no real wrangler invocation, no id to
+        // record).
+        let mut created_kv_ns: BTreeMap<String, String> = BTreeMap::new();
         for store in stores.kv.iter().chain(stores.config.iter()) {
             let logical = &store.logical;
             // The Cloudflare KV binding name is what the runtime
@@ -283,6 +293,13 @@ impl Adapter for CloudflareCliAdapter {
                 "created KV namespace `{binding}` (logical id `{logical}`, namespace id={namespace_id}); written to {}",
                 wrangler_path.display()
             ));
+            // Record under the LOGICAL id, not the platform binding.
+            // Teammates' `provision --local` re-resolves logical ->
+            // platform via THEIR env overlay and reads the namespace
+            // id back via the same logical key -- keying by
+            // `binding` (platform) would break that lookup when
+            // the overlays diverge.
+            created_kv_ns.insert(logical.clone(), namespace_id);
         }
         for store in stores.secrets {
             let logical = &store.logical;
@@ -294,9 +311,26 @@ impl Adapter for CloudflareCliAdapter {
         if out.is_empty() {
             out.push("cloudflare has no declared stores to provision".to_owned());
         }
+        // dry_run branch above `continue`s BEFORE reaching
+        // `create_kv_namespace`, so `created_kv_ns` stays empty for
+        // dry-runs -- `deployed` collapses to `None` and the CLI
+        // writeback is a no-op. An idempotent skip (binding already
+        // present with a real id) similarly doesn't repopulate the
+        // map, since the existing id is already recorded in the
+        // operator's `[adapters.cloudflare.deployed]` block from a
+        // prior run.
+        let deployed = if created_kv_ns.is_empty() {
+            None
+        } else {
+            let mut state = AdapterDeployedState::default();
+            state
+                .sub_tables
+                .insert("kv_namespaces".to_owned(), created_kv_ns);
+            Some(state)
+        };
         Ok(ProvisionOutcome {
             status_lines: out,
-            deployed: None,
+            deployed,
         })
     }
 
@@ -1771,6 +1805,97 @@ id = "00112233445566778899aabbccddeeff"
         assert_eq!(
             out.status_lines,
             vec!["cloudflare has no declared stores to provision"]
+        );
+        // No wrangler was invoked (no stores) => no id to record.
+        assert!(
+            out.deployed.is_none(),
+            "no-store provision has nothing to write back: {:?}",
+            out.deployed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cloudflare_cloud_provision_returns_created_namespace_ids() {
+        // Non-dry-run Cloud provision must populate
+        // `deployed.sub_tables["kv_namespaces"]` keyed by LOGICAL id
+        // (not the platform binding name). Task 16's CLI writeback
+        // then lands them under `[adapters.cloudflare.deployed]`.
+        //
+        // Uses the same wrangler-fake shim pattern as the
+        // read_config_entry tests: a shell script on PATH prints the
+        // Wrangler-3 `[[kv_namespaces]] / id = "..."` block that
+        // `extract_namespace_id` parses.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let project_dir = tempdir().expect("tempdir");
+        write_wrangler(project_dir.path(), "name = \"demo\"\n");
+        let stdout = "[[kv_namespaces]]\nbinding = \"ignored-by-parser\"\nid = \"00112233445566778899aabbccddeeff\"\n";
+        let fake = fake_wrangler_returning(stdout, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = CloudflareCliAdapter
+            .provision(
+                project_dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                false,
+            )
+            .expect("cloud provision succeeds against fake wrangler");
+        let deployed = out
+            .deployed
+            .expect("cloud provision with creates populates deployed");
+        let kv = deployed
+            .sub_tables
+            .get("kv_namespaces")
+            .expect("deployed carries kv_namespaces sub-table");
+        // Key MUST be the LOGICAL id -- teammates' env overlays
+        // change the platform binding, but the logical id is
+        // env-overlay-independent.
+        assert_eq!(
+            kv.get(TEST_KV_ID).map(String::as_str),
+            Some("00112233445566778899aabbccddeeff"),
+            "kv_namespaces keyed by logical id `{TEST_KV_ID}`: {kv:?}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_cloud_provision_dry_run_returns_none_deployed() {
+        // Cloud dry-run means no real `wrangler kv namespace create`
+        // invocation happened -- no real id to record. `deployed`
+        // must be `None` so the CLI writeback is a no-op.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), "name = \"demo\"\n");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let out = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert!(
+            out.deployed.is_none(),
+            "dry-run must not populate deployed (no wrangler ran): {:?}",
+            out.deployed
         );
     }
 
