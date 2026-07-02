@@ -4,6 +4,8 @@
              `edgezero_adapter::TypeName` instead of `edgezero_adapter::registry::TypeName`"
 )]
 
+pub mod env_file;
+
 pub mod registry;
 
 pub mod scaffold;
