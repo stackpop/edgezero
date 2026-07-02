@@ -9,6 +9,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
+use edgezero_adapter::env_file::append_lines_dedup;
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
@@ -985,10 +986,64 @@ fn provision_local(
             .map_err(|err| format!("failed to write {}: {err}", wrangler_path.display()))?;
     }
 
+    // `.dev.vars` lives NEXT TO the resolved wrangler.toml so
+    // `wrangler dev` picks it up automatically for nested layouts
+    // (e.g. `adapter_manifest_path = "crates/cf/wrangler.toml"`).
+    let dev_vars_path = wrangler_path
+        .parent()
+        .unwrap_or(manifest_root)
+        .join(".dev.vars");
+    let dev_vars_lines = build_dev_vars_lines(stores);
+    append_lines_dedup(&dev_vars_path, &dev_vars_lines, dry_run)
+        .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
+    status_lines.push(format!(
+        "cloudflare: wrote {} .dev.vars entries to {}",
+        dev_vars_lines.len(),
+        dev_vars_path.display()
+    ));
+
     Ok(ProvisionOutcome {
         status_lines,
         deployed: None,
     })
+}
+
+/// Build the `.dev.vars` line set emitted by [`provision_local`].
+///
+/// One `EDGEZERO__STORES__<KIND>__<LOGICAL_UPPER>__NAME="<platform>"`
+/// entry per declared store (KV / CONFIG / SECRETS). CONFIG stores
+/// additionally get a **commented** `__KEY` placeholder — Cloudflare
+/// has no way to preview the KEY overlay at provision time, so we
+/// hint the shape and let the operator uncomment + fill it in.
+///
+/// Dedup responsibility is delegated to
+/// [`edgezero_adapter::env_file::append_lines_dedup`]: because the
+/// commented and uncommented forms normalise to the same key, an
+/// operator who already uncommented + edited a KEY line survives a
+/// re-run of provision — the commented placeholder is not re-added.
+fn build_dev_vars_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (kind, kind_stores) in [
+        ("KV", stores.kv),
+        ("CONFIG", stores.config),
+        ("SECRETS", stores.secrets),
+    ] {
+        for store in kind_stores {
+            let logical_upper = store.logical.to_ascii_uppercase();
+            let platform = &store.platform;
+            lines.push(format!(
+                r#"EDGEZERO__STORES__{kind}__{logical_upper}__NAME="{platform}""#
+            ));
+        }
+    }
+    for store in stores.config {
+        let logical_upper = store.logical.to_ascii_uppercase();
+        let logical = &store.logical;
+        lines.push(format!(
+            r#"# EDGEZERO__STORES__CONFIG__{logical_upper}__KEY="<placeholder-{logical}-key>""#
+        ));
+    }
+    lines
 }
 
 /// In-memory upsert of a single `[[kv_namespaces]]` entry inside
@@ -2892,6 +2947,149 @@ id = "00112233445566778899aabbccddeeff"
         assert!(
             after.contains("id = \"abc123\""),
             "deployed id resolved via LOGICAL lookup: {after}"
+        );
+    }
+
+    // ---------- provision (Local mode) — .dev.vars emission ----------
+
+    #[test]
+    fn cloudflare_local_provision_writes_dev_vars_name_lines() {
+        // Fixture: [stores.config].ids = ["app_config"],
+        // [stores.kv].ids = ["sessions"]. No .dev.vars pre-existing.
+        // Provision must land the file next to wrangler.toml with a
+        // __NAME line per store and a commented __KEY placeholder for
+        // the config store.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let dev_vars = fs::read_to_string(dir.path().join(".dev.vars")).expect("read .dev.vars");
+        assert!(
+            dev_vars.contains(r#"EDGEZERO__STORES__KV__SESSIONS__NAME="sessions""#),
+            "KV __NAME line present: {dev_vars}"
+        );
+        assert!(
+            dev_vars.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME="app_config""#),
+            "CONFIG __NAME line present: {dev_vars}"
+        );
+        assert!(
+            dev_vars.contains(
+                r#"# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="<placeholder-app_config-key>""#
+            ),
+            "commented CONFIG __KEY placeholder present: {dev_vars}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_dev_vars_dedup_respects_commented_overrides() {
+        // Operator has already uncommented + edited the KEY line.
+        // Re-running provision must NOT re-add the commented
+        // placeholder — normalised_key collapses commented and
+        // uncommented forms, so the operator's value survives.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let dev_vars_path = dir.path().join(".dev.vars");
+        fs::write(
+            &dev_vars_path,
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=\"real_staging\"\n",
+        )
+        .expect("seed .dev.vars");
+
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let dev_vars = fs::read_to_string(&dev_vars_path).expect("read .dev.vars");
+        assert!(
+            dev_vars.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="real_staging""#),
+            "operator's uncommented KEY line survives: {dev_vars}"
+        );
+        assert!(
+            !dev_vars.contains("<placeholder-app_config-key>"),
+            "commented placeholder must NOT be re-added: {dev_vars}"
+        );
+        // Exactly one line whose normalised key matches the KEY
+        // env-var name. The uncommented one wins.
+        let key_lines = dev_vars
+            .lines()
+            .filter(|line| {
+                let after_hash = line.trim_start().strip_prefix('#').unwrap_or(line);
+                after_hash
+                    .trim_start()
+                    .starts_with("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=")
+            })
+            .count();
+        assert_eq!(
+            key_lines, 1,
+            "exactly one KEY line remains after dedup: {dev_vars}"
+        );
+    }
+
+    #[test]
+    fn cloudflare_local_provision_dev_vars_uses_platform_name_when_env_overlay_active() {
+        // Env-overlay round-trip. Simulates
+        //   EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=prod_config
+        // via ResolvedStoreId::new(logical, platform). The emitted
+        // __NAME line's VALUE must be the env-resolved platform
+        // (`prod_config`); the ENV-VAR KEY must still use the
+        // LOGICAL id in upper-case (`APP_CONFIG`) so the runtime's
+        // env-overlay lookup finds it.
+        let dir = tempdir().expect("tempdir");
+        write_wrangler(dir.path(), &synthesise_wrangler_toml("demo"));
+        let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let dev_vars = fs::read_to_string(dir.path().join(".dev.vars")).expect("read .dev.vars");
+        assert!(
+            dev_vars.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME="prod_config""#),
+            "value uses PLATFORM name, env-var key uses LOGICAL: {dev_vars}"
+        );
+        assert!(
+            !dev_vars.contains("EDGEZERO__STORES__CONFIG__PROD_CONFIG__NAME="),
+            "platform name must NOT leak into the env-var key: {dev_vars}"
         );
     }
 }
