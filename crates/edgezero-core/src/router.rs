@@ -7,25 +7,29 @@ use tower_service::Service;
 
 use crate::context::RequestContext;
 use crate::error::EdgeError;
-use crate::handler::{BoxHandler, IntoHandler};
+use crate::handler::{BoxHandler, IntoHandler, IntrospectionNeeds};
 use crate::http::{HandlerFuture, Method, Request, Response};
+use crate::introspection::{ManifestJson, RouteTable};
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
 use crate::response::IntoResponse as _;
 
 struct RouteEntry {
     handler: BoxHandler,
+    introspection_needs: IntrospectionNeeds,
 }
 
 impl Clone for RouteEntry {
     fn clone(&self) -> Self {
         Self {
             handler: Arc::clone(&self.handler),
+            introspection_needs: self.introspection_needs,
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
         self.handler = Arc::clone(&source.handler);
+        self.introspection_needs = source.introspection_needs;
     }
 }
 
@@ -57,15 +61,6 @@ impl RouteInfo {
     }
 }
 
-/// Per-request introspection payload injected by [`RouterInner::dispatch`].
-#[derive(Clone)]
-pub struct IntrospectionData {
-    /// The app manifest serialized to JSON at compile time by `app!`.
-    pub manifest_json: Option<Arc<str>>,
-    /// Every registered route, in registration order.
-    pub routes: Arc<[RouteInfo]>,
-}
-
 enum RouteMatch<'route> {
     Found(&'route RouteEntry, PathParams),
     MethodNotAllowed(Vec<Method>),
@@ -91,11 +86,17 @@ impl RouterBuilder {
     {
         let router = self.routes.entry(method.clone()).or_default();
 
+        // The handler reports which introspection payloads its route needs; the
+        // flag is read once here and consulted per request in `dispatch`.
+        let boxed = handler.into_handler();
+        let introspection_needs = boxed.introspection_needs();
+
         router
             .insert(
                 path,
                 RouteEntry {
-                    handler: handler.into_handler(),
+                    handler: boxed,
+                    introspection_needs,
                 },
             )
             .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
@@ -203,16 +204,26 @@ struct RouterInner {
 
 impl RouterInner {
     async fn dispatch(&self, mut request: Request) -> Result<Response, EdgeError> {
-        request.extensions_mut().insert(IntrospectionData {
-            manifest_json: self.manifest_json.clone(),
-            routes: Arc::clone(&self.route_index),
-        });
-
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
 
         match self.find_route(&method, &path) {
             RouteMatch::Found(entry, params) => {
+                // Inject only the introspection payloads this route asked for —
+                // nothing for the vast majority of routes that need none.
+                let needs = entry.introspection_needs;
+                if needs.manifest {
+                    if let Some(json) = &self.manifest_json {
+                        request
+                            .extensions_mut()
+                            .insert(ManifestJson(Arc::clone(json)));
+                    }
+                }
+                if needs.routes {
+                    request
+                        .extensions_mut()
+                        .insert(RouteTable(Arc::clone(&self.route_index)));
+                }
                 let ctx = RequestContext::new(request, params);
                 let next = Next::new(&self.middlewares, entry.handler.as_ref());
                 next.run(ctx).await
@@ -320,6 +331,135 @@ impl RouterService {
 
 #[cfg(test)]
 mod tests {
+    /// Per-capability introspection injection: a route receives exactly the
+    /// payloads its handler opted into via `#[action(manifest|routes)]`.
+    mod introspection_gating {
+        use super::*;
+        use crate::handler::DynHandler;
+
+        /// A handler that records which introspection payloads its request
+        /// carried, as `(manifest_present, routes_present)`, and reports `needs`.
+        struct CapProbe {
+            needs: IntrospectionNeeds,
+            seen: Arc<Mutex<Option<(bool, bool)>>>,
+        }
+
+        impl DynHandler for CapProbe {
+            fn call(&self, ctx: RequestContext) -> HandlerFuture {
+                let seen = Arc::clone(&self.seen);
+                Box::pin(async move {
+                    *seen.lock().unwrap() = Some((
+                        ctx.extension::<ManifestJson>().is_some(),
+                        ctx.extension::<RouteTable>().is_some(),
+                    ));
+                    response_with_body(StatusCode::OK, Body::empty())
+                })
+            }
+            fn introspection_needs(&self) -> IntrospectionNeeds {
+                self.needs
+            }
+        }
+
+        #[test]
+        fn manifest_route_injects_only_manifest() {
+            // Manifest available AND requested → ManifestJson present, RouteTable absent.
+            let seen = run_probe(
+                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                IntrospectionNeeds {
+                    manifest: true,
+                    routes: false,
+                },
+            );
+            assert_eq!(seen, (true, false));
+        }
+
+        #[test]
+        fn middleware_sees_injected_manifest() {
+            // Injection happens before the middleware chain, so a middleware on a
+            // manifest-flagged route sees the payload.
+            struct Probe(Arc<Mutex<Option<bool>>>);
+            #[async_trait::async_trait(?Send)]
+            impl Middleware for Probe {
+                async fn handle(
+                    &self,
+                    ctx: RequestContext,
+                    next: Next<'_>,
+                ) -> Result<Response, EdgeError> {
+                    *self.0.lock().unwrap() = Some(ctx.extension::<ManifestJson>().is_some());
+                    next.run(ctx).await
+                }
+            }
+
+            let saw: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+            let router = RouterService::builder()
+                .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
+                .middleware(Probe(Arc::clone(&saw)))
+                .get(
+                    "/",
+                    CapProbe {
+                        needs: IntrospectionNeeds {
+                            manifest: true,
+                            routes: false,
+                        },
+                        seen: Arc::new(Mutex::new(None)),
+                    },
+                )
+                .build();
+            let request = request_builder()
+                .method(Method::GET)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            block_on(router.oneshot(request)).unwrap();
+            assert_eq!(*saw.lock().unwrap(), Some(true));
+        }
+
+        #[test]
+        fn plain_route_injects_neither() {
+            // Manifest IS baked but the route requested nothing → neither injected.
+            let seen = run_probe(
+                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                IntrospectionNeeds::default(),
+            );
+            assert_eq!(seen, (false, false));
+        }
+
+        #[test]
+        fn routes_route_injects_only_routes() {
+            // Only `routes` requested → RouteTable present (from the always-available
+            // route index), ManifestJson absent (not requested; none baked either).
+            let seen = run_probe(
+                RouterService::builder(),
+                IntrospectionNeeds {
+                    manifest: false,
+                    routes: true,
+                },
+            );
+            assert_eq!(seen, (false, true));
+        }
+
+        fn run_probe(builder: RouterBuilder, needs: IntrospectionNeeds) -> (bool, bool) {
+            let seen = Arc::new(Mutex::new(None));
+            let router = builder
+                .get(
+                    "/",
+                    CapProbe {
+                        needs,
+                        seen: Arc::clone(&seen),
+                    },
+                )
+                .build();
+            let request = request_builder()
+                .method(Method::GET)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            block_on(router.oneshot(request)).unwrap();
+            let observed = *seen.lock().unwrap();
+            observed.expect("handler ran")
+        }
+    }
+
     use super::*;
     use crate::body::Body;
     use crate::context::RequestContext;
@@ -533,6 +673,7 @@ mod tests {
     fn route_entry_clone_copies_handler() {
         let entry = RouteEntry {
             handler: ok_handler.into_handler(),
+            introspection_needs: IntrospectionNeeds::default(),
         };
         let cloned = entry.clone();
 
@@ -581,77 +722,6 @@ mod tests {
         let mut cx = Context::from_waker(waker);
         let ready = Service::<Request>::poll_ready(&mut service, &mut cx);
         assert!(matches!(ready, Poll::Ready(Ok(()))));
-    }
-
-    #[test]
-    fn dispatch_injects_introspection_data() {
-        let seen: Arc<Mutex<Option<(bool, usize)>>> = Arc::new(Mutex::new(None));
-        let seen_capture = Arc::clone(&seen);
-
-        let handler = move |ctx: RequestContext| {
-            let seen_inner = Arc::clone(&seen_capture);
-            async move {
-                let data = ctx.introspection().expect("introspection data present");
-                *seen_inner.lock().unwrap() =
-                    Some((data.manifest_json.is_some(), data.routes.len()));
-                Ok::<_, EdgeError>("ok")
-            }
-        };
-
-        let router = RouterService::builder()
-            .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
-            .get("/", handler)
-            .build();
-
-        let request = request_builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
-        block_on(router.oneshot(request)).unwrap();
-
-        let (had_manifest, route_count) = seen.lock().unwrap().expect("handler ran");
-        assert!(had_manifest, "manifest_json should be injected");
-        assert_eq!(route_count, 1);
-    }
-
-    #[test]
-    fn middleware_sees_introspection_data() {
-        struct Probe(Arc<Mutex<Option<(bool, usize)>>>);
-        #[async_trait::async_trait(?Send)]
-        impl Middleware for Probe {
-            async fn handle(
-                &self,
-                ctx: RequestContext,
-                next: Next<'_>,
-            ) -> Result<Response, EdgeError> {
-                *self.0.lock().unwrap() = ctx
-                    .introspection()
-                    .map(|data| (data.manifest_json.is_some(), data.routes.len()));
-                next.run(ctx).await
-            }
-        }
-
-        let saw: Arc<Mutex<Option<(bool, usize)>>> = Arc::new(Mutex::new(None));
-        let router = RouterService::builder()
-            .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
-            .middleware(Probe(Arc::clone(&saw)))
-            .get("/", |_ctx: RequestContext| async {
-                Ok::<_, EdgeError>("ok")
-            })
-            .build();
-        let request = request_builder()
-            .method(Method::GET)
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
-        block_on(router.oneshot(request)).unwrap();
-        let (had_manifest, route_count) = saw.lock().unwrap().expect("middleware ran");
-        assert!(had_manifest, "middleware should see manifest_json");
-        assert!(
-            route_count > 0,
-            "middleware should see non-empty route list"
-        );
     }
 
     #[test]

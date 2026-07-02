@@ -21,39 +21,39 @@ struct RouteView {
     path: String,
 }
 
-/// Extractor for the baked manifest JSON carried in the request's
-/// [`crate::router::IntrospectionData`]. Errors with 500 if the data is
-/// absent (i.e. the router did not inject it).
+/// Extractor for the baked manifest JSON. It is also the payload the router
+/// injects (via `dispatch`) for a route whose handler is `#[action(manifest)]`;
+/// `from_request` clones it back out. Errors with 500 if the route did not opt
+/// into the `manifest` capability (or no manifest was baked).
+#[derive(Clone)]
 pub struct ManifestJson(pub Arc<str>);
 
 #[async_trait(?Send)]
 impl FromRequest for ManifestJson {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.introspection()
-            .and_then(|data| data.manifest_json.clone())
-            .map(ManifestJson)
-            .ok_or_else(|| {
-                EdgeError::internal(anyhow::anyhow!("manifest introspection data not available"))
-            })
+        ctx.extension::<ManifestJson>().ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!("manifest introspection data not available"))
+        })
     }
 }
 
-/// Extractor for the live route index carried in the request's
-/// [`crate::router::IntrospectionData`]. Errors with 500 if the data is absent.
+/// Extractor for the live route index. It is also the payload the router injects
+/// for a route whose handler is `#[action(routes)]`; `from_request` clones it
+/// back out. Errors with 500 if the route did not opt into the `routes`
+/// capability.
+#[derive(Clone)]
 pub struct RouteTable(pub Arc<[RouteInfo]>);
 
 #[async_trait(?Send)]
 impl FromRequest for RouteTable {
     #[inline]
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.introspection()
-            .map(|data| RouteTable(Arc::clone(&data.routes)))
-            .ok_or_else(|| {
-                EdgeError::internal(anyhow::anyhow!(
-                    "route-table introspection data not available"
-                ))
-            })
+        ctx.extension::<RouteTable>().ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!(
+                "route-table introspection data not available"
+            ))
+        })
     }
 }
 

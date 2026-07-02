@@ -3,7 +3,6 @@ use crate::error::EdgeError;
 use crate::http::Request;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
-use crate::router::IntrospectionData;
 use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
     KvRegistry, SecretRegistry, StoreRegistry,
@@ -70,6 +69,18 @@ impl RequestContext {
             .and_then(|registry| registry.default_ref())
     }
 
+    /// Clone a request extension of type `T`, if present. Used by the
+    /// introspection extractors (`ManifestJson` / `RouteTable`) to read the
+    /// payload the router injected for their route.
+    #[must_use]
+    #[inline]
+    pub(crate) fn extension<T>(&self) -> Option<T>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.request.extensions().get::<T>().cloned()
+    }
+
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the body cannot be deserialized as form-urlencoded data into `T`, or the body is streaming.
     #[inline]
@@ -89,13 +100,6 @@ impl RequestContext {
     #[inline]
     pub fn into_request(self) -> Request {
         self.request
-    }
-
-    /// The per-request [`IntrospectionData`] injected by the router, if any.
-    #[must_use]
-    #[inline]
-    pub fn introspection(&self) -> Option<&IntrospectionData> {
-        self.request.extensions().get::<IntrospectionData>()
     }
 
     /// # Errors
