@@ -4,14 +4,12 @@
 **Status:** Approved — implementation in progress
 **Scope:** `edgezero-core`, `edgezero-macros`, `examples/app-demo`, `edgezero-cli` templates
 
-> **Note on history.** This spec was rewritten on 2026-07-02 to describe the
-> **final** architecture only: **opt-in, per-route gated injection driven by
+> **Note on history.** This spec describes the **final** architecture only:
+> **opt-in, per-route, per-capability gated injection driven by
 > `#[action(manifest|routes)]`, with typed extractors for access.** Earlier drafts
-> described unconditional per-request injection with handlers reading
-> `ctx.introspection()` directly; that approach was superseded (it taxed all
-> traffic for endpoints hit rarely). The "Design evolution" section at the end
-> records the path taken. Where any older wording survives elsewhere, this
-> document governs.
+> injected data on every request (or via a single blanket gate / bundle); those
+> were superseded. The "Design evolution" section at the end records the path.
+> This document governs.
 
 ## Summary
 
@@ -50,7 +48,8 @@ Today there is no runtime way to inspect what an app *is*:
   wired through a bespoke builder method rather than the normal routing path.
 
 We want a single, consistent, "bind it yourself" mechanism for all three — that
-costs nothing for the ~100% of requests that are not introspection calls.
+costs nothing for the ~100% of requests that are not introspection calls, and
+that only provisions the *specific* data each handler asks for.
 
 ## Key Decisions
 
@@ -66,19 +65,29 @@ costs nothing for the ~100% of requests that are not introspection calls.
    **not** inspect handler paths.
 4. **Paths** — per-app namespace `/_<app-name>/{manifest,config,routes}` (single
    underscore); just the default paths written into the templates.
-5. **Access via typed extractors** — handlers that need injected data declare it
-   in their signature, matching the `Json`/`Path`/`AppConfig` idiom:
+5. **Access via typed extractors that are also the injected payloads.** Handlers
+   that need data declare it in their signature, matching the
+   `Json`/`Path`/`AppConfig` idiom:
    - `ManifestJson(pub Arc<str>)` — the baked manifest JSON (used by `manifest`).
    - `RouteTable(pub Arc<[RouteInfo]>)` — the live route index (used by `routes`).
-   Both implement `FromRequest`, read the injected `IntrospectionData` via
-   `ctx.introspection()`, and return `500` if it is absent. `config` takes
-   `RequestContext` and uses neither.
-6. **Opt-in, per-route gated injection driven by `#[action(...)]`** — the router
-   injects `IntrospectionData` **only for routes whose handler opted in**, never
-   for general traffic. The opt-in is an atomic `#[action]` parameter and the
-   capability rides the handler to registration (details in Component 2/3). No
-   process-global state, no unstable specialization, no `app!`/`edgezero.toml`
-   change.
+   Each derives `Clone`, is what the router injects into the request, and its
+   `FromRequest::from_request` clones its own type back out (`500` if absent).
+   `config` takes `RequestContext` and uses neither.
+6. **Opt-in, per-capability gated injection driven by an atomic `#[action(...)]`
+   parameter.** The router injects each capability's payload **only** for routes
+   whose handler opted into that specific capability — never for general traffic,
+   and never more than the handler asked for. The opt-in is atomic all the way
+   down:
+   - `#[action(manifest)]` / `#[action(routes)]` / `#[action(manifest, routes)]`
+     declare exactly which data the handler consumes. `#[action]` (no params) is
+     unchanged.
+   - Each param maps 1:1 to a field of `IntrospectionNeeds { manifest, routes }`,
+     reported by the handler via `DynHandler::introspection_needs()`.
+   - `dispatch` injects `ManifestJson` iff `needs.manifest`, and `RouteTable` iff
+     `needs.routes`. A `manifest`-only route never carries the route table, and
+     vice versa.
+   No process-global state, no unstable specialization, no bundle struct, and no
+   `app!`/`edgezero.toml` change.
 7. **Remove route listing** — delete the `enable_route_listing` machinery and
    `/__edgezero/routes`.
 
@@ -97,26 +106,27 @@ build_router()
   builder.with_manifest_json("{…}")       RouterService::oneshot(req)
   builder.get(path, introspection::routes) └─ RouterInner::dispatch(req)
         │                                       │  find_route(req) → RouteEntry
-        ▼                                       │  if entry.needs_introspection:
-RouterInner {                                   │      req.extensions.insert(
-  introspection: Arc<IntrospectionData>,  ──────┼────►    Arc::clone(introspection))
-}  (built once)                                 ▼
-                                          handler runs; extractor reads
-                                          ctx.introspection():
+        ▼                                       │  needs = entry.introspection_needs
+RouterInner {                                   │  if needs.manifest && manifest_json:
+  manifest_json: Option<Arc<str>>,        ──────┼────►  insert ManifestJson(clone)
+  route_index:   Arc<[RouteInfo]>,        ──────┼────►  if needs.routes: insert RouteTable(clone)
+}                                               ▼
+                                          handler runs; extractor clones its
+                                          own type out of the request:
                                             manifest → ManifestJson(json)
                                             routes   → RouteTable(index)
                                             config   → default config store (no injection)
 ```
 
 - **The opt-in is on the handler.** `#[action(manifest)]` / `#[action(routes)]`
-  expand the handler to a capability-carrying struct (below). `add_route` reads
-  that capability and flags the `RouteEntry`. `dispatch` injects the shared
-  `Arc<IntrospectionData>` only for flagged routes.
-- **manifest**: parsed at compile time, re-serialized to JSON by the macro,
-  baked into `build_router()`, held on the router's `IntrospectionData`, injected
-  for `manifest`-flagged routes, returned verbatim. No runtime TOML dependency.
-- **routes**: projected at request time from the live route index in
-  `IntrospectionData`.
+  expand the handler to a capability-carrying struct whose
+  `introspection_needs()` sets the matching field(s). `add_route` reads that and
+  stores `IntrospectionNeeds` on the `RouteEntry`.
+- **manifest**: parsed at compile time, re-serialized to JSON by the macro, held
+  as `Option<Arc<str>>` on the router, injected (as `ManifestJson`) only for
+  routes that asked for `manifest`, returned verbatim. No runtime TOML dependency.
+- **routes**: injected (as `RouteTable`) only for routes that asked for `routes`;
+  projected at request time to `[{method, path}]`.
 - **config**: read from the default config store; needs no injection.
 
 ### Component 1 — `Manifest: Serialize` (`edgezero-core/src/manifest.rs`)  *(done)*
@@ -129,25 +139,25 @@ never serialized: `environment.secrets` entries omit `value` via a
 `serialize_with` redactor; `environment.variables` keep it. Internal fields
 (`root`, `logging_resolved`) stay `#[serde(skip)]`.
 
-### Component 2 — `#[action]` opt-in + capability-carrying handlers (`edgezero-macros/src/action.rs`)
+### Component 2 — `#[action]` atomic opt-in + capability-carrying handlers (`edgezero-macros/src/action.rs`)
 
 `#[action]` gains an **optional atomic parameter list** naming the introspection
-data the handler needs:
+data the handler consumes:
 
-- **`#[action]`** (no params) — unchanged. Expands to a handler **fn**, which via
-  the existing `Fn` blanket `impl DynHandler` reports `needs_introspection() == false`.
+- **`#[action]`** (no params) — unchanged. Expands to a handler **fn**; via the
+  existing `Fn` blanket `impl DynHandler` its `introspection_needs()` returns the
+  default (all-false).
 - **`#[action(manifest)]`, `#[action(routes)]`, `#[action(manifest, routes)]`** —
-  expand the handler to a **unit struct** with its own `impl DynHandler` whose
-  `needs_introspection()` returns `true`. (A fn can't carry a per-item flag past
-  type-erasure into `Arc<dyn DynHandler>`; a struct can. Only opt-in handlers
-  become structs; every other handler stays a fn.)
+  expand the handler to a **unit struct** with its own `impl DynHandler`, whose
+  `introspection_needs()` returns an `IntrospectionNeeds` with exactly the named
+  fields set. (A fn can't carry per-item data past type-erasure into
+  `Arc<dyn DynHandler>`; a struct can. Only opt-in handlers become structs; every
+  other handler stays a fn, untouched.)
 
-The macro validates each param against the known set `{ manifest, routes }` and
-emits `compile_error!` on an unknown ident. The set is extensible (future atomic
-capabilities are new idents). The atomic names are the declarative surface; since
-`IntrospectionData` is one cheap `Arc` bundle, all recognized capabilities
-currently collapse to the single `needs_introspection()` gate (room to split
-payloads later without an attribute change).
+The macro parses the params as a comma-separated ident list, validates each
+against the known set `{ manifest, routes }`, and emits `compile_error!` on an
+unknown ident. The set is extensible (future atomic capabilities are new idents
++ new `IntrospectionNeeds` fields).
 
 Generated struct (paths absolute, matching the existing macro):
 
@@ -169,32 +179,76 @@ impl ::edgezero_core::handler::DynHandler for #ident {
         })
     }
     #[inline]
-    fn needs_introspection(&self) -> bool { true }
+    fn introspection_needs(&self) -> ::edgezero_core::handler::IntrospectionNeeds {
+        ::edgezero_core::handler::IntrospectionNeeds { manifest: #manifest_lit, routes: #routes_lit }
+    }
 }
 ```
 
-### Component 3 — Router gating + accessor (`edgezero-core/src/{handler,router,context}.rs`)
+where `#manifest_lit` / `#routes_lit` are the `bool` literals derived from the
+parsed params.
 
-- **`DynHandler`** gains `fn needs_introspection(&self) -> bool { false }`
-  (object-safe; the `Fn` blanket impl inherits the default).
-- **`RouteEntry`** gains `needs_introspection: bool`. `add_route` reads it from
-  the boxed handler at registration:
+### Component 3 — Router gating (`edgezero-core/src/{handler,router,context}.rs`)
+
+**`handler.rs`** — the capability value type + the reporting method:
+
+```rust
+/// Which introspection payloads a route's handler needs injected at dispatch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IntrospectionNeeds {
+    pub manifest: bool,
+    pub routes: bool,
+}
+
+impl IntrospectionNeeds {
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.manifest || self.routes
+    }
+}
+
+pub trait DynHandler: Send + Sync {
+    fn call(&self, ctx: RequestContext) -> HandlerFuture;
+
+    /// Introspection payloads a route bound to this handler needs. Default is
+    /// none; `#[action(manifest|routes)]` handlers override it.
+    fn introspection_needs(&self) -> IntrospectionNeeds {
+        IntrospectionNeeds::default()
+    }
+}
+```
+
+The `Fn` blanket `impl DynHandler` needs no change (inherits the default).
+
+**`router.rs`:**
+
+- `RouteEntry` gains `introspection_needs: IntrospectionNeeds` (`Copy`; copied in
+  the manual `Clone`/`clone_from`).
+- `add_route` reads it from the boxed handler at registration:
   ```rust
   let boxed = handler.into_handler();
-  let needs_introspection = boxed.needs_introspection();
-  router.insert(path, RouteEntry { handler: boxed, needs_introspection });
+  let introspection_needs = boxed.introspection_needs();
+  router.insert(path, RouteEntry { handler: boxed, introspection_needs });
   ```
-- **`RouterInner`** holds a precomputed `introspection: Arc<IntrospectionData>`,
-  built once in `build()` from `self.manifest_json` + the route index.
+- `RouterInner` keeps `manifest_json: Option<Arc<str>>` and
+  `route_index: Arc<[RouteInfo]>` (no bundle struct).
   `RouterBuilder::with_manifest_json(impl Into<Arc<str>>)` (set by the `app!`
   macro) supplies the JSON.
-- **`RouterInner::dispatch`** injects only for flagged routes, after matching:
+- `dispatch` injects per capability, after matching:
   ```rust
   match self.find_route(&method, &path) {
       RouteMatch::Found(entry, params) => {
+          let needs = entry.introspection_needs;
           let mut request = request;
-          if entry.needs_introspection {
-              request.extensions_mut().insert(Arc::clone(&self.introspection));
+          if needs.manifest {
+              if let Some(json) = &self.manifest_json {
+                  request.extensions_mut()
+                      .insert(crate::introspection::ManifestJson(Arc::clone(json)));
+              }
+          }
+          if needs.routes {
+              request.extensions_mut()
+                  .insert(crate::introspection::RouteTable(Arc::clone(&self.route_index)));
           }
           let ctx = RequestContext::new(request, params);
           let next = Next::new(&self.middlewares, entry.handler.as_ref());
@@ -203,42 +257,42 @@ impl ::edgezero_core::handler::DynHandler for #ident {
       // MethodNotAllowed / NotFound unchanged
   }
   ```
-- **`RequestContext::introspection()`** reads the `Arc`:
-  ```rust
-  pub fn introspection(&self) -> Option<&crate::router::IntrospectionData> {
-      self.request.extensions().get::<std::sync::Arc<crate::router::IntrospectionData>>()
-          .map(|arc| arc.as_ref())
-  }
-  ```
 
-`IntrospectionData` is the injected payload:
+**`context.rs`** — a single `pub(crate)` accessor the extractors share (there is
+no public `introspection()` accessor and no `IntrospectionData` type):
+
 ```rust
-#[derive(Clone)]
-pub struct IntrospectionData {
-    pub manifest_json: Option<Arc<str>>,
-    pub routes: Arc<[RouteInfo]>,
+pub(crate) fn extension<T>(&self) -> Option<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    self.request.extensions().get::<T>().cloned()
 }
 ```
 
 ### Component 4 — `edgezero_core::introspection` module (`edgezero-core/src/introspection.rs`)
 
-The extractors and three handlers:
+The extractors (which are also the injected payloads) and three handlers:
 
 ```rust
+#[derive(Clone)]
 pub struct ManifestJson(pub Arc<str>);
+
 #[async_trait(?Send)]
 impl FromRequest for ManifestJson {
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.introspection().and_then(|d| d.manifest_json.clone()).map(ManifestJson)
+        ctx.extension::<ManifestJson>()
             .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("manifest introspection data not available")))
     }
 }
 
+#[derive(Clone)]
 pub struct RouteTable(pub Arc<[RouteInfo]>);
+
 #[async_trait(?Send)]
 impl FromRequest for RouteTable {
     async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
-        ctx.introspection().map(|d| RouteTable(Arc::clone(&d.routes)))
+        ctx.extension::<RouteTable>()
             .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("route-table introspection data not available")))
     }
 }
@@ -271,7 +325,9 @@ pub async fn config(ctx: RequestContext) -> Result<Response, EdgeError> {
 ```
 
 `RouteView { method: String, path: String }` (derives `Serialize`) is the JSON
-shape for `routes`. `Response` is imported from `crate::http`.
+shape for `routes`. `Response` is imported from `crate::http`. Because `dispatch`
+constructs `ManifestJson`/`RouteTable`, `router.rs` imports them from
+`crate::introspection` (a same-crate module reference — no crate-level cycle).
 
 ### Component 5 — `app!` macro (`edgezero-macros/src/app.rs`)  *(done, unchanged by the gating work)*
 
@@ -279,10 +335,10 @@ shape for `routes`. `Response` is imported from `crate::http`.
   failure) and emit `builder = builder.with_manifest_json(<lit>)` as the first
   builder mutation in `build_router()`.
 - Emit `const _: &[u8] = include_bytes!(<abs manifest path>);` so Cargo treats
-  `edgezero.toml` as a build input (rebuild on manifest change).
+  `edgezero.toml` as a build input.
 - Route registration is ordinary `builder.get(path, handler)` / `route(...)`; the
   macro does **not** inspect handler paths. Gating comes entirely from the
-  handler's `needs_introspection()`.
+  handler's `introspection_needs()`.
 
 ### Component 6 — Removals  *(done)*
 
@@ -300,22 +356,24 @@ No template handler code is generated — the handlers live in core.
 
 ## Interfaces (summary)
 
-| Unit                       | Public surface                                                  |
-| -------------------------- | --------------------------------------------------------------- |
-| `IntrospectionData`        | `{ manifest_json: Option<Arc<str>>, routes: Arc<[RouteInfo]> }`  |
-| `DynHandler`               | `fn needs_introspection(&self) -> bool { false }`                |
-| `RouterBuilder`            | `with_manifest_json(impl Into<Arc<str>>)`                        |
-| `RequestContext`           | `introspection() -> Option<&IntrospectionData>`                  |
-| `introspection::ManifestJson` | `FromRequest`; `pub Arc<str>`                                 |
-| `introspection::RouteTable`   | `FromRequest`; `pub Arc<[RouteInfo]>`                         |
-| `introspection::{manifest,routes}` | `#[action(manifest)]` / `#[action(routes)]` GET → JSON      |
-| `introspection::config`    | `#[action]` GET → JSON (default config store)                    |
+| Unit                          | Public surface                                                    |
+| ----------------------------- | ----------------------------------------------------------------- |
+| `IntrospectionNeeds`          | `{ manifest: bool, routes: bool }`, `Copy`, `Default`, `any()`    |
+| `DynHandler`                  | `fn introspection_needs(&self) -> IntrospectionNeeds { default }` |
+| `RouterBuilder`               | `with_manifest_json(impl Into<Arc<str>>)`                         |
+| `RequestContext`              | `pub(crate) extension::<T>() -> Option<T>` (no public accessor)   |
+| `introspection::ManifestJson` | `pub Arc<str>`; `Clone`; `FromRequest`                            |
+| `introspection::RouteTable`   | `pub Arc<[RouteInfo]>`; `Clone`; `FromRequest`                    |
+| `introspection::{manifest,routes}` | `#[action(manifest)]` / `#[action(routes)]` GET → JSON       |
+| `introspection::config`       | `#[action]` GET → JSON (default config store)                     |
 
 ## Error Handling
 
-- **manifest** / **routes**: extractor returns `500 internal` if
-  `IntrospectionData` is absent (route not opted in) or, for `manifest`, if
-  `manifest_json` is `None` (no `with_manifest_json`).
+- **manifest** / **routes**: the extractor returns `500 internal` if its payload
+  is absent from the request — i.e. the route did not opt into that capability
+  (`#[action(manifest)]` / `#[action(routes)]` missing), or, for `manifest`, the
+  app never called `with_manifest_json` (`manifest_json` is `None`, so `dispatch`
+  injects nothing).
 - **config**: no default config store → `404`; no blob → `404`; `ConfigStoreError`
   mapped via `EdgeError::from` (503 unavailable / 400 invalid-key / 500 internal);
   malformed or unverifiable envelope → `500`.
@@ -325,13 +383,15 @@ No template handler code is generated — the handlers live in core.
 Colocated `#[cfg(test)]`, `futures::executor::block_on` (no Tokio), no network.
 
 - **macros**: `#[action]` (no params) still emits a fn; `#[action(manifest)]`
-  emits a struct impl'ing `DynHandler` with `needs_introspection() == true`;
-  `#[action(bogus)]` is a compile error. Plus a **compile/behavioral** test in
-  core that a struct handler registers and runs: `.get("/m", manifest)` →
-  `oneshot` → 200 (proves the unit-struct-as-handler-value path works end to end).
-- **handler.rs / router.rs**: `needs_introspection()` default is false for fn
-  handlers; a flagged route injects `IntrospectionData` (handler + middleware see
-  it); a non-flagged route does **not** (`ctx.introspection().is_none()`).
+  emits a struct impl'ing `DynHandler` with `introspection_needs()` setting
+  `manifest: true`; `#[action(bogus)]` is a compile error. Plus a
+  **compile/behavioral** test in core proving `.get("/m", manifest)` accepts the
+  unit-struct handler value and runs end to end (`oneshot` → 200).
+- **handler.rs / router.rs**: default `introspection_needs()` is all-false for fn
+  handlers; a `manifest`-flagged route injects `ManifestJson` (handler +
+  middleware can read it) and does **not** inject `RouteTable`; a `routes`-flagged
+  route is the mirror; a plain route injects neither
+  (`ctx.extension::<ManifestJson>().is_none()`).
 - **introspection module**: `manifest` returns injected JSON; `routes` returns
   `[{method,path}]`; `config` returns envelope `data` and the full status matrix
   (200/404/400/503/500×3); `manifest` with no baked JSON → 500.
@@ -356,22 +416,27 @@ Colocated `#[cfg(test)]`, `futures::executor::block_on` (no Tokio), no network.
   wherever bound; config output is secret-safe, and `/manifest` emits
   `environment.variables[].value` (not secrets) — documented so operators don't
   store secrets in `[environment.variables]`. Access control is a follow-up.
-- **No process-global state**: `IntrospectionData` is per-`RouterService`, so
-  tests and multiple apps in one process stay independent.
+- **No process-global state**: `manifest_json` / `route_index` are
+  per-`RouterService`, so tests and multiple apps in one process stay independent.
 - **No `[introspection]` manifest section, no builder enable-API, no `app!`
   handler-path inspection** — the opt-in lives on `#[action(...)]`.
 
 ## Design evolution (for reviewers)
 
-1. First cut: inject `IntrospectionData` on **every** request; handlers read
+1. First cut: inject a bundle on **every** request; handlers read
    `ctx.introspection()`. Rejected — taxes all traffic for rarely-hit endpoints.
 2. Considered a process-global (`OnceLock`) source — rejected: one-manifest-
    per-process breaks unit tests and adds shared mutable state.
 3. Considered `app!` recognizing the `edgezero_core::introspection::` handler
    namespace to flag routes — rejected as a fragile string-match hack.
-4. **Final:** the opt-in is an atomic `#[action(manifest|routes)]` parameter;
-   the capability rides the handler to registration via
-   `DynHandler::needs_introspection()`; the router gates injection per route.
-   Typed extractors (`ManifestJson`/`RouteTable`) are the access mechanism.
-   No global, no `app!` hack, no unstable specialization, and `#[action]` (no
-   params) is 100% unchanged so only `manifest`/`routes` become structs.
+4. Considered a single `DynHandler::needs_introspection() -> bool` + one
+   `IntrospectionData` bundle — rejected: inconsistent with the atomic
+   `#[action(manifest|routes)]` params, and it over-provisions (a `manifest`-only
+   route would carry the route table).
+5. **Final:** fully atomic. `#[action(manifest|routes)]` → `IntrospectionNeeds`
+   (per-capability bools) reported by `DynHandler::introspection_needs()`; the
+   router injects each capability's payload independently, only for routes that
+   asked for it. The extractors `ManifestJson`/`RouteTable` are themselves the
+   injected payloads. No global, no `app!` hack, no bundle, no unstable
+   specialization; `#[action]` (no params) is 100% unchanged so only
+   `manifest`/`routes` become structs.
