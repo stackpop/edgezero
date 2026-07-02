@@ -1550,32 +1550,24 @@ ids = ["default"]
         // which recursively copies the adapter crate dir into the
         // staging tempdir. The fixture must pre-create the crate dir
         // referenced by PROVISION_MANIFEST or staging errors before
-        // dispatch reaches the axum Section-5 stub.
+        // dispatch reaches axum's Local arm.
         fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
         let _cwd = CwdGuard::set(temp.path()).expect("chdir into tempdir");
 
-        let err = run_provision(&ProvisionArgs {
+        // Task 27: axum's Local arm now succeeds (writes .env into a
+        // `.edgezero/` under `manifest_root`). This test used to
+        // sentinel on the Section-5 stub's error; the equivalent
+        // positive signal is a status line that names axum's Local
+        // outcome. Reaching THAT line proves the manifest loaded,
+        // path-safety passed, AND `run_with_staging` routed the
+        // closure through validate + build_stores + provision.
+        run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: true,
             local: true,
             manifest: PathBuf::from("edgezero.toml"),
         })
-        .expect_err("axum's Section-5 stub errs from inside the staged dispatch");
-        // Positive assertion: reaching axum's Section-5 stub proves
-        // the manifest loaded, path-safety passed, AND `run_with_staging`
-        // routed the closure through validate + build_stores + provision.
-        // Without this, an earlier failure would silently satisfy the
-        // negative assertions below and give false-positive coverage.
-        assert!(
-            err.contains("local mode lands in Section 5"),
-            "must reach axum's Section-5 stub through staging: {err}"
-        );
-        assert!(
-            !err.contains("must not contain `..` traversal")
-                && !err.contains("must be a project-relative path")
-                && !err.contains("resolves outside project root"),
-            "path-safety must not fire for a valid fixture: {err}"
-        );
+        .expect("axum's Local arm succeeds through the staged dispatch");
     }
 
     #[test]
@@ -1589,23 +1581,15 @@ ids = ["default"]
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
         fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
 
-        let err = run_provision(&ProvisionArgs {
+        // Task 27: same successful-Local-arm sentinel as the "_default"
+        // sibling above.
+        run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
             dry_run: true,
             local: true,
             manifest: manifest_path.clone(),
         })
-        .expect_err("axum's Section-5 stub errs from inside the staged dispatch");
-        assert!(
-            err.contains("local mode lands in Section 5"),
-            "must reach axum's Section-5 stub through staging: {err}"
-        );
-        assert!(
-            !err.contains("must not contain `..` traversal")
-                && !err.contains("must be a project-relative path")
-                && !err.contains("resolves outside project root"),
-            "path-safety must not fire for a valid fixture: {err}"
-        );
+        .expect("axum's Local arm succeeds through the staged dispatch");
     }
 
     // ---------- CLI-owned first-run bootstrap synthesis ----------
