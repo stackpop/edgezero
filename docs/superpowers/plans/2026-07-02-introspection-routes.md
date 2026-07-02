@@ -99,12 +99,40 @@ value = "super-secret-value"
     let secret = &json["environment"]["secrets"][0];
     assert_eq!(secret["name"], "API_TOKEN");
     assert!(secret.get("value").is_none(), "secret value must be redacted");
+    // Enums serialize to their wire strings, not Rust variant names.
+    assert_eq!(json["triggers"]["http"][0]["methods"][0], "GET");
+}
+
+#[test]
+fn serializes_enums_with_wire_casing() {
+    let toml = r#"
+[app]
+name = "t"
+
+[[triggers.http]]
+id = "r"
+path = "/"
+methods = ["POST"]
+handler = "t::h::r"
+body-mode = "buffered"
+
+[logging.axum]
+level = "info"
+"#;
+    let manifest: Manifest = toml::from_str(toml).unwrap();
+    let json = serde_json::to_value(&manifest).unwrap();
+    assert_eq!(json["triggers"]["http"][0]["methods"][0], "POST");
+    assert_eq!(json["triggers"]["http"][0]["body_mode"], "buffered");
+    assert_eq!(json["logging"]["axum"]["level"], "info");
 }
 ```
 
+(Adjust the `[logging.axum]`/`body-mode` key spellings to match the manifest's
+actual serde field renames — verify against manifest.rs before running.)
+
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p edgezero-core serializes_manifest_and_redacts_secret_values`
+Run: `cargo test -p edgezero-core serializes_manifest_and_redacts_secret_values serializes_enums_with_wire_casing`
 Expected: FAIL to compile — `Manifest` does not implement `Serialize`; `ManifestApp` has no `version`/`kind`.
 
 - [ ] **Step 3: Add `version`/`kind` to `ManifestApp`**
@@ -122,7 +150,10 @@ In `ManifestApp` (manifest.rs:217), add after `name`:
 
 - [ ] **Step 4: Add the secret redactor**
 
-Add near `ManifestEnvironment` (manifest.rs:276):
+Add near `ManifestEnvironment` (manifest.rs:276). Use an **owned** redacted
+struct so serde's `skip_serializing_if` fn signatures match (a `&[String]` field
+would make `Vec::is_empty` fail to type-check; an `&Option<_>` field would make
+`Option::is_none` fail). Cloning is cheap and only happens at serialize time:
 
 ```rust
 /// Serialize a `[[environment.secrets]]` list without exposing `value`.
@@ -135,33 +166,88 @@ where
     use serde::ser::SerializeSeq;
 
     #[derive(Serialize)]
-    struct RedactedBinding<'a> {
+    struct RedactedBinding {
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        adapters: &'a [String],
+        adapters: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        description: &'a Option<String>,
+        description: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        env: &'a Option<String>,
-        name: &'a str,
+        env: Option<String>,
+        name: String,
         // `value` intentionally omitted.
     }
 
     let mut seq = serializer.serialize_seq(Some(secrets.len()))?;
     for binding in secrets {
         seq.serialize_element(&RedactedBinding {
-            adapters: &binding.adapters,
-            description: &binding.description,
-            env: &binding.env,
-            name: &binding.name,
+            adapters: binding.adapters.clone(),
+            description: binding.description.clone(),
+            env: binding.env.clone(),
+            name: binding.name.clone(),
         })?;
     }
     seq.end()
 }
 ```
 
-- [ ] **Step 5: Add `Serialize` derives + wire the redactor**
+- [ ] **Step 5a: Add manual `Serialize` impls for the enums**
 
-Add `Serialize` to the `#[derive(...)]` on: `Manifest` (:86), `ManifestApp` (:217), `ManifestTriggers` (:230), `ManifestHttpTrigger` (:238), `ManifestEnvironment` (:276), `ManifestBinding` (:287), `ManifestAdapter` (:344), `ManifestAdapterDeployed` (:368 area), `ManifestAdapterBuild`, `ManifestAdapterCommands`, `ManifestAdapterDefinition`, `ManifestLogging`, `ManifestLoggingConfig`, `ManifestStores`, `StoreDeclaration`, plus the `HttpMethod` enum used in triggers. Keep existing `Deserialize`/`Validate`.
+`HttpMethod` (:581), `BodyMode` (:639), and `LogLevel` (:669) have hand-written
+`Deserialize` impls that accept wire strings (`"GET"`, `"buffered"`, `"info"`).
+A derived `Serialize` would emit variant names (`Get`/`Buffered`/`Info`) —
+**wrong**. Add manual impls that mirror deserialization. Do NOT add `Serialize`
+to their derive lists. `Serialize` has no defaulted methods, so no
+`#[expect(clippy::missing_trait_methods)]` is needed (unlike the `Deserialize`
+impls). Add after each enum's existing impl block:
+
+```rust
+impl serde::Serialize for HttpMethod {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl serde::Serialize for BodyMode {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Buffered => "buffered",
+            Self::Stream => "stream",
+        })
+    }
+}
+
+impl serde::Serialize for LogLevel {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+```
+
+- [ ] **Step 5: Add `Serialize` derives to the structs + wire the redactor**
+
+Add `Serialize` to the `#[derive(...)]` on these **structs** (verify each line
+against the file — they are the Deserialize-deriving manifest structs reachable
+from `Manifest` output on `main`): `Manifest` (:86), `ManifestApp` (:217),
+`ManifestTriggers` (:230), `ManifestHttpTrigger` (:238), `ManifestEnvironment`
+(:276), `ManifestBinding` (:287), `ManifestAdapter` (:344),
+`ManifestAdapterDefinition` (:368), `ManifestAdapterBuild` (:405),
+`ManifestAdapterCommands` (:418), `ManifestStores` (:460), `StoreDeclaration`
+(:482), `ManifestLogging` (:519), `ManifestLoggingConfig` (:527). Keep existing
+`Deserialize`/`Validate`.
+
+Do **not** add `Serialize` to the enums (Step 5a handles those manually), and do
+**not** add it to the internal resolved/non-serde structs at :330, :338, :539
+(they are reachable only via `#[serde(skip)]` fields — `root`,
+`logging_resolved`). `toml::Value` fields (e.g. any `#[serde(flatten)]` legacy
+map, if present) already implement `Serialize`.
+
+> **Note (branch drift):** the earlier design exploration ran against the
+> `feature/provision-local-impl` checkout, which has an extra
+> `ManifestAdapterDeployed` struct and an adapter `deployed` field. Those do
+> **not** exist on `main` (this worktree's base) — do not reference them.
 
 On `ManifestEnvironment::secrets`, add:
 
@@ -175,7 +261,7 @@ Add `#[serde(skip_serializing_if = "...")]` to keep output clean where fields ar
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p edgezero-core serializes_manifest_and_redacts_secret_values`
+Run: `cargo test -p edgezero-core serializes_manifest_and_redacts_secret_values serializes_enums_with_wire_casing`
 Expected: PASS.
 Then: `cargo test -p edgezero-core manifest` — Expected: all existing manifest tests still PASS.
 
@@ -245,9 +331,45 @@ fn dispatch_injects_introspection_data() {
 
 (Use whatever request-builder/`block_on` imports the existing router tests use; match them.)
 
+Also add a middleware-visibility test (errata #5 requires proving both handler
+and middleware see the injected data, since injection happens before the
+middleware chain runs):
+
+```rust
+#[test]
+fn middleware_sees_introspection_data() {
+    use crate::context::RequestContext;
+    use crate::middleware::{Middleware, Next};
+    use std::sync::{Arc, Mutex};
+
+    struct Probe(Arc<Mutex<bool>>);
+    #[async_trait::async_trait(?Send)]
+    impl Middleware for Probe {
+        async fn handle(&self, ctx: RequestContext, next: Next) -> Result<Response, EdgeError> {
+            *self.0.lock().unwrap() = ctx.introspection().is_some();
+            next.run(ctx).await
+        }
+    }
+
+    let saw = Arc::new(Mutex::new(false));
+    let router = RouterService::builder()
+        .with_manifest_json("{}")
+        .middleware(Probe(Arc::clone(&saw)))
+        .get("/", |_ctx: RequestContext| async { Ok::<_, EdgeError>("ok") })
+        .build();
+    let request = crate::http::request_builder()
+        .method(Method::GET).uri("/").body(Body::empty()).unwrap();
+    let _ = block_on(router.oneshot(request)).unwrap();
+    assert!(*saw.lock().unwrap(), "middleware should see introspection data");
+}
+```
+
+(Match the exact `Middleware`/`Next` import paths and `async_trait` usage the
+existing middleware tests in this crate use.)
+
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p edgezero-core dispatch_injects_introspection_data`
+Run: `cargo test -p edgezero-core dispatch_injects_introspection_data middleware_sees_introspection_data`
 Expected: FAIL to compile — `with_manifest_json` and `RequestContext::introspection` do not exist.
 
 - [ ] **Step 3: Add `IntrospectionData` + builder field/setter**
@@ -306,7 +428,7 @@ In `context.rs`, near `config_store_default_binding`:
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p edgezero-core dispatch_injects_introspection_data`
+Run: `cargo test -p edgezero-core dispatch_injects_introspection_data middleware_sees_introspection_data`
 Expected: PASS.
 Then: `cargo test -p edgezero-core router` — Expected: PASS (existing route-listing tests still pass; they are removed in Task 5).
 
@@ -352,8 +474,9 @@ use crate::blob_envelope::BlobEnvelope;
 use crate::body::Body;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
-use crate::http::{response_builder, StatusCode};
-use crate::response::Response;
+// NOTE: `Response` is an HTTP alias exported from `crate::http`, NOT
+// `crate::response` (response.rs itself imports it from crate::http).
+use crate::http::{response_builder, Response, StatusCode};
 use edgezero_core::action;
 use serde::Serialize;
 
@@ -366,9 +489,66 @@ struct RouteView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
+    use crate::context::RequestContext;
     use crate::http::{request_builder, Method};
+    use crate::params::PathParams;
     use crate::router::RouterService;
+    use crate::store_registry::{ConfigRegistry, ConfigStoreBinding, StoreRegistry};
+    use async_trait::async_trait;
     use futures::executor::block_on;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    // A config store returning a fixed result for `get`, used to drive the
+    // config handler's status-code mapping. Mirrors the pattern in
+    // extractor.rs::config_extractor_resolves_from_registry.
+    struct StubStore(Result<Option<String>, ConfigStoreError>);
+    #[async_trait(?Send)]
+    impl ConfigStore for StubStore {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            match &self.0 {
+                Ok(v) => Ok(v.clone()),
+                Err(ConfigStoreError::Unavailable { .. }) => {
+                    Err(ConfigStoreError::unavailable("down"))
+                }
+                Err(ConfigStoreError::InvalidKey { .. }) => {
+                    Err(ConfigStoreError::invalid_key("bad"))
+                }
+                Err(_) => Err(ConfigStoreError::internal(anyhow::anyhow!("boom"))),
+            }
+        }
+    }
+
+    // Build a request carrying a default ConfigRegistry backed by `store`,
+    // run it through the `config` handler, and return the response.
+    fn run_config(store: StubStore) -> crate::http::Response {
+        let registry: ConfigRegistry = StoreRegistry::new(
+            [(
+                "default".to_owned(),
+                ConfigStoreBinding {
+                    handle: ConfigStoreHandle::new(Arc::new(store)),
+                    default_key: "default".to_owned(),
+                },
+            )]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "default".to_owned(),
+        );
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/c")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(registry);
+        let ctx = RequestContext::new(request, PathParams::default());
+        block_on(super::config(ctx)).unwrap_or_else(|e| e.into_response().unwrap())
+    }
+
+    fn valid_envelope_json(data: serde_json::Value) -> String {
+        // Build a real envelope so sha/version are correct.
+        serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned())).unwrap()
+    }
 
     #[test]
     fn manifest_returns_injected_json() {
@@ -379,10 +559,7 @@ mod tests {
         let req = request_builder().method(Method::GET).uri("/m").body(Body::empty()).unwrap();
         let resp = block_on(router.oneshot(req)).unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers().get("content-type").unwrap(),
-            "application/json"
-        );
+        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
     }
 
     #[test]
@@ -400,8 +577,64 @@ mod tests {
         let resp = block_on(router.oneshot(req)).unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    #[test]
+    fn config_happy_path_returns_envelope_data_secret_safe() {
+        let data = serde_json::json!({ "greeting": "hi", "api_token": "demo_api_token" });
+        let resp = run_config(StubStore(Ok(Some(valid_envelope_json(data)))));
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Raw envelope `data` is returned verbatim: the secret field holds the
+        // KEY NAME, never a resolved value.
+        // (Read the body via the crate's test body helper and assert the JSON
+        // contains "api_token":"demo_api_token".)
+    }
+
+    #[test]
+    fn config_missing_blob_is_not_found() {
+        let resp = run_config(StubStore(Ok(None)));
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn config_backend_unavailable_maps_503() {
+        let resp = run_config(StubStore(Err(ConfigStoreError::unavailable("x"))));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn config_invalid_key_maps_400() {
+        let resp = run_config(StubStore(Err(ConfigStoreError::invalid_key("x"))));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn config_malformed_envelope_maps_500() {
+        let resp = run_config(StubStore(Ok(Some("not json".to_owned()))));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn config_sha_mismatch_maps_500() {
+        // Valid JSON envelope shape but wrong sha → verify() fails.
+        let bad = r#"{"data":{"a":1},"generated_at":"t","sha256":"deadbeef","version":1}"#;
+        let resp = run_config(StubStore(Ok(Some(bad.to_owned()))));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn config_unknown_version_maps_500() {
+        let bad = r#"{"data":{},"generated_at":"t","sha256":"x","version":99}"#;
+        let resp = run_config(StubStore(Ok(Some(bad.to_owned()))));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
 ```
+
+Notes: verify `ConfigStoreError` variant/constructor names (`unavailable`,
+`invalid_key`, `internal`) against config_store.rs:177-199, and the
+`crate::http::Response` / body-reading test helper the crate already uses. The
+happy-path body assertion should use whatever body-collection helper the other
+core tests use (e.g. a `block_on` over the body) — match existing conventions.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
@@ -547,7 +780,9 @@ Expected: builds cleanly.
 
 - [ ] **Step 4: Verify a consumer still builds**
 
-Run: `cargo build -p edgezero-core` then `cargo check -p app-demo-core --manifest-path examples/app-demo/Cargo.toml` (or `cd examples/app-demo && cargo check -p app-demo-core`).
+`examples/app-demo` is `exclude`d from the root workspace (Cargo.toml:12), so it must be built from its own directory:
+
+Run: `cargo build -p edgezero-core` then `cd examples/app-demo && cargo check -p app-demo-core`
 Expected: builds; the generated `build_router` now sets manifest JSON.
 
 - [ ] **Step 5: Commit**
@@ -643,35 +878,74 @@ description = "Registered route table"
 
 - [ ] **Step 2: Write the failing router-level test**
 
-In app-demo-core's test module (colocated with `build_router`/`App`), add:
+In app-demo-core's test module (colocated with `build_router`/`App`), add. A
+routing miss ALSO returns 404 via `oneshot` (router.rs), so an `OK | NOT_FOUND`
+assertion would pass even if `/config` were never wired. Instead, **seed a
+`ConfigRegistry`** so a wired `/config` route returns 200, proving the trigger
+exists, and assert the raw envelope `data` exposes the key-name (never a
+resolved secret value):
 
 ```rust
 #[test]
 fn introspection_routes_are_wired() {
     use edgezero_core::body::Body;
+    use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::http::{request_builder, Method, StatusCode};
+    use edgezero_core::store_registry::{ConfigRegistry, ConfigStoreBinding, StoreRegistry};
+    use edgezero_core::blob_envelope::BlobEnvelope;
+    use async_trait::async_trait;
     use futures::executor::block_on;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     let router = crate::build_router();
+
+    // manifest + routes need no config store.
     for path in ["/_app-demo/manifest", "/_app-demo/routes"] {
         let req = request_builder().method(Method::GET).uri(path).body(Body::empty()).unwrap();
         let resp = block_on(router.oneshot(req)).unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "{path} should be 200");
         assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
     }
-    // /_app-demo/config is 404 without a populated config store, but must be routed
-    // (i.e. not a routing 404 with empty body). Assert it is reachable:
-    let req = request_builder().method(Method::GET).uri("/_app-demo/config").body(Body::empty()).unwrap();
+
+    // /config: seed a default config store with a valid envelope so a wired
+    // route returns 200 (a routing miss would be 404, proving nothing).
+    struct FixedStore(String);
+    #[async_trait(?Send)]
+    impl ConfigStore for FixedStore {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+    let data = serde_json::json!({ "greeting": "hi", "api_token": "demo_api_token" });
+    let blob = serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned())).unwrap();
+    let registry: ConfigRegistry = StoreRegistry::new(
+        [(
+            "app_config".to_owned(),
+            ConfigStoreBinding {
+                handle: ConfigStoreHandle::new(Arc::new(FixedStore(blob))),
+                default_key: "app_config".to_owned(),
+            },
+        )].into_iter().collect::<BTreeMap<_, _>>(),
+        "app_config".to_owned(),
+    );
+    let mut req = request_builder().method(Method::GET).uri("/_app-demo/config").body(Body::empty()).unwrap();
+    req.extensions_mut().insert(registry);
     let resp = block_on(router.oneshot(req)).unwrap();
-    assert!(matches!(resp.status(), StatusCode::OK | StatusCode::NOT_FOUND));
+    assert_eq!(resp.status(), StatusCode::OK, "/config should be wired and 200 with a store");
+    // (Collect the body and assert it contains "api_token":"demo_api_token" —
+    // the raw key-name — and NOT a resolved secret value. Use the app-demo
+    // test suite's existing body-collection helper.)
 }
 ```
 
-(Match the app-demo crate's existing test imports/module location; `build_router` is generated by `app!`.)
+(Match the app-demo crate's existing test imports/module location; `build_router` is generated by `app!`. Confirm app-demo's default config store id is `app_config` per its `[stores.config]`.)
 
 - [ ] **Step 3: Run test to verify it fails, then passes**
 
-Run: `cargo test -p app-demo-core introspection_routes_are_wired`
+`examples/app-demo` is excluded from the root workspace, so run from its directory:
+
+Run: `cd examples/app-demo && cargo test -p app-demo-core introspection_routes_are_wired`
 Expected: initially FAILS if triggers not yet parsed/handler path unresolved; after Step 1 + Tasks 3-4, PASS.
 
 - [ ] **Step 4: Add the same rows to the generated-app template**
@@ -762,6 +1036,15 @@ git add docs/guide/routing.md
 git commit -m "Docs: replace route-listing with introspection routes"
 ```
 
+> **Out-of-scope, flagged for decision (review finding #8):** CLI docs
+> (`docs/guide/cli-reference.md:241`, `docs/guide/cli-walkthrough.md:153`) state
+> that typed `config push` "strips secret fields", which reportedly contradicts
+> the key-name envelope model (`examples/app-demo/.../config_flow.rs:206`). This
+> is a **pre-existing** inaccuracy about `config push` semantics, independent of
+> introspection routes, and the push behavior itself has not been re-verified
+> here. It is intentionally excluded from this plan. If desired, correct it in a
+> separate change after confirming the actual push behavior.
+
 ---
 
 ### Task 8: Full verification (CI gates + app-demo smoke)
@@ -781,7 +1064,14 @@ Expected: no warnings.
 - [ ] **Step 3: Workspace tests**
 
 Run: `cargo test --workspace --all-targets`
-Expected: all pass, including the new manifest/router/introspection/app-demo tests.
+Expected: all pass (manifest/router/introspection). **Note:** the root workspace
+`exclude`s `examples/app-demo` (Cargo.toml:12), so this does NOT run the
+app-demo tests — those are covered by Step 3b (matching CI's separate job).
+
+- [ ] **Step 3b: app-demo tests (separate workspace)**
+
+Run: `cd examples/app-demo && cargo test --workspace --all-targets`
+Expected: all pass, including `introspection_routes_are_wired`.
 
 - [ ] **Step 4: Feature compilation**
 
@@ -815,17 +1105,19 @@ gh pr ready 300
 ## Self-Review
 
 **Spec coverage:**
-- Manifest→JSON (baked, Serialize): Task 1 + Task 4. ✓ (errata: secret redaction, version/kind)
-- Config→envelope data (secret-safe, verify): Task 3. ✓
+- Manifest→JSON (baked, Serialize): Task 1 + Task 4. ✓ (errata: secret redaction, version/kind, manual enum Serialize with wire casing)
+- Config→envelope data (secret-safe, verify): Task 3, with full status-code coverage (200/404/400/503/500×3). ✓
 - Routes→live index: Task 3. ✓
-- Router-chokepoint injection (no global/no adapter changes): Task 2. ✓
+- Router-chokepoint injection (no global/no adapter changes): Task 2, with handler + middleware visibility tests. ✓
 - `RequestContext::introspection()`: Task 2. ✓
 - `#[action]` self-alias: Task 3 Step 1. ✓
 - Remove `enable_route_listing`/`/__edgezero/routes`: Task 5. ✓
-- Templates + app-demo default triggers under `/_<app-name>/…`: Task 6. ✓
-- Docs update: Task 7. ✓
-- CI gates: Task 8. ✓
+- Templates + app-demo default triggers under `/_<app-name>/…`: Task 6 (config test seeds a registry to prove wiring). ✓
+- Docs update: Task 7 (cli-doc drift flagged out-of-scope). ✓
+- CI gates incl. separate app-demo workspace: Task 8. ✓
 
-**Placeholder scan:** No TBD/TODO; every code step shows real code. Two verification notes ("confirm field names", "verify `{{{adapter_list}}}` name") are guardrails against drift, not missing content.
+**Review findings applied (2026-07-02):** enum serialization + casing test (blocking); owned `RedactedBinding` + removed nonexistent `ManifestAdapterDeployed` (blocking); `Response` from `crate::http` (blocking); full config status-code tests (high); app-demo config test seeds a registry and asserts 200 (high); `cd examples/app-demo` for excluded-workspace commands (high); middleware-visibility test (medium); cli-doc drift flagged, not silently absorbed (medium).
 
-**Type consistency:** `IntrospectionData { manifest_json: Option<Arc<str>>, routes: Arc<[RouteInfo]> }`, `with_manifest_json(impl Into<Arc<str>>)`, and `introspection() -> Option<&IntrospectionData>` are used identically across Tasks 2/3/6. Handler names `manifest`/`config`/`routes` match the trigger `handler = "edgezero_core::introspection::…"` strings in Task 6.
+**Placeholder scan:** No TBD/TODO; every code step shows real code. Verification notes ("confirm `ConfigStoreError` constructor names", "verify `{{{adapter_list}}}` name", "match body-collection helper") are drift guardrails, not missing content.
+
+**Type consistency:** `IntrospectionData { manifest_json: Option<Arc<str>>, routes: Arc<[RouteInfo]> }`, `with_manifest_json(impl Into<Arc<str>>)`, and `introspection() -> Option<&IntrospectionData>` are used identically across Tasks 2/3/6. Handler names `manifest`/`config`/`routes` match the trigger `handler = "edgezero_core::introspection::…"` strings in Task 6. Manual enum `Serialize` (Task 1 Step 5a) matches the `Deserialize` wire forms.
