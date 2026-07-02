@@ -14,7 +14,8 @@ use std::process::Command;
 
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
+    find_manifest_upwards, find_workspace_root, read_package_name, run_native_cli,
+    select_nearest_manifest,
 };
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
@@ -1115,7 +1116,7 @@ fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
     }
 
     let root = find_workspace_root(start);
-    let mut candidates: Vec<PathBuf> = WalkDir::new(&root)
+    let candidates: Vec<PathBuf> = WalkDir::new(&root)
         .follow_links(true)
         .max_depth(8)
         .into_iter()
@@ -1129,16 +1130,7 @@ fn find_spin_manifest(start: &Path) -> Result<PathBuf, String> {
         })
         .collect();
 
-    if candidates.is_empty() {
-        return Err("could not locate spin.toml".to_owned());
-    }
-
-    candidates.sort_by_key(|path| {
-        let parent = path.parent().unwrap_or(Path::new(""));
-        path_distance(start, parent)
-    });
-
-    Ok(candidates.remove(0))
+    select_nearest_manifest(start, candidates, "spin.toml")
 }
 
 fn locate_artifact(
@@ -1434,6 +1426,27 @@ mod tests {
         // entries pushed via the seed handler). Secrets remain Spin
         // `[variables]` until we ship native secret support.
         assert_eq!(SpinCliAdapter.single_store_kinds(), &["secrets"]);
+    }
+
+    #[test]
+    fn rejects_equidistant_spin_manifests() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let first = root.join("apps/first");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
+        fs::write(first.join("spin.toml"), "spin_manifest_version = 2").unwrap();
+
+        let second = root.join("apps/second");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
+        fs::write(second.join("spin.toml"), "spin_manifest_version = 2").unwrap();
+
+        let error = find_spin_manifest(root).expect_err("equidistant manifests are ambiguous");
+        assert!(error.contains(first.join("spin.toml").to_string_lossy().as_ref()));
+        assert!(error.contains(second.join("spin.toml").to_string_lossy().as_ref()));
     }
 
     #[test]

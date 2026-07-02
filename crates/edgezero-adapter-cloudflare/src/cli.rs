@@ -7,7 +7,8 @@ use std::process::Command;
 
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
+    find_manifest_upwards, find_workspace_root, read_package_name, run_native_cli,
+    select_nearest_manifest,
 };
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
@@ -1024,7 +1025,7 @@ fn find_wrangler_manifest(start: &Path) -> Result<PathBuf, String> {
     }
 
     let root = find_workspace_root(start);
-    let mut candidates: Vec<PathBuf> = WalkDir::new(&root)
+    let candidates: Vec<PathBuf> = WalkDir::new(&root)
         .follow_links(true)
         .max_depth(8)
         .into_iter()
@@ -1038,16 +1039,7 @@ fn find_wrangler_manifest(start: &Path) -> Result<PathBuf, String> {
         })
         .collect();
 
-    if candidates.is_empty() {
-        return Err("could not locate wrangler.toml".to_owned());
-    }
-
-    candidates.sort_by_key(|path| {
-        let parent = path.parent().unwrap_or(Path::new(""));
-        path_distance(start, parent)
-    });
-
-    Ok(candidates.remove(0))
+    select_nearest_manifest(start, candidates, "wrangler.toml")
 }
 
 fn locate_artifact(
@@ -1153,10 +1145,30 @@ mod tests {
         let command = CLOUDFLARE_BLUEPRINT.commands.build;
         assert!(!command.contains("wrangler build"), "{command}");
         assert_eq!(
-            command,
-            "wrangler deploy --dry-run --cwd {crate_dir}",
+            command, "wrangler deploy --dry-run --cwd {crate_dir}",
             "the validation build must execute Wrangler's real custom-build pipeline"
         );
+    }
+
+    #[test]
+    fn rejects_equidistant_wrangler_manifests() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let first = root.join("apps/first");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
+        fs::write(first.join("wrangler.toml"), "name=\"first\"").unwrap();
+
+        let second = root.join("apps/second");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
+        fs::write(second.join("wrangler.toml"), "name=\"second\"").unwrap();
+
+        let error = find_wrangler_manifest(root).expect_err("equidistant manifests are ambiguous");
+        assert!(error.contains(first.join("wrangler.toml").to_string_lossy().as_ref()));
+        assert!(error.contains(second.join("wrangler.toml").to_string_lossy().as_ref()));
     }
 
     /// RAII guard: prepends a directory to `$PATH` and restores the original

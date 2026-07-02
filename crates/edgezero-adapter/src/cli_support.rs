@@ -66,6 +66,59 @@ pub fn path_distance(left: &Path, right: &Path) -> usize {
         .saturating_add(right_components.len().saturating_sub(common))
 }
 
+/// Select the unique nearest provider manifest instead of making an
+/// order-dependent choice.
+///
+/// # Errors
+/// Returns an error when no candidate exists or multiple candidates have the
+/// same minimum distance from `start`.
+#[inline]
+pub fn select_nearest_manifest(
+    start: &Path,
+    mut candidates: Vec<PathBuf>,
+    manifest_name: &str,
+) -> Result<PathBuf, String> {
+    if candidates.is_empty() {
+        return Err(format!("could not locate {manifest_name}"));
+    }
+
+    candidates.sort();
+    let mut ranked: Vec<(usize, PathBuf)> = candidates
+        .into_iter()
+        .map(|path| {
+            let parent = path.parent().unwrap_or(Path::new(""));
+            (path_distance(start, parent), path)
+        })
+        .collect();
+    ranked.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let nearest_distance = ranked
+        .first()
+        .map(|(distance, _)| *distance)
+        .ok_or_else(|| format!("could not select {manifest_name}"))?;
+    let mut nearest: Vec<_> = ranked
+        .into_iter()
+        .filter(|(distance, _)| *distance == nearest_distance)
+        .map(|(_, path)| path)
+        .collect();
+
+    if nearest.len() == 1 {
+        return nearest
+            .pop()
+            .ok_or_else(|| format!("could not select {manifest_name}"));
+    }
+
+    let rendered = nearest
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!(
+        "ambiguous {manifest_name}: multiple equally near manifests found:\n{rendered}\n\
+         set the working directory to the intended adapter crate or define an explicit adapter command"
+    ))
+}
+
 /// Spawn `program args…` inheriting parent stdio, returning a
 /// human-readable error message.
 ///
@@ -191,6 +244,32 @@ mod tests {
         let left = Path::new("/a/b/c");
         let right = Path::new("/a/b/d/e");
         assert_eq!(path_distance(left, right), 3);
+    }
+
+    #[test]
+    fn nearest_manifest_returns_unique_closest_candidate() {
+        let start = Path::new("/repo/apps/a");
+        let candidates = vec![
+            PathBuf::from("/repo/apps/a/fastly.toml"),
+            PathBuf::from("/repo/apps/b/fastly.toml"),
+        ];
+        let selected =
+            select_nearest_manifest(start, candidates, "fastly.toml").expect("unique manifest");
+        assert_eq!(selected, PathBuf::from("/repo/apps/a/fastly.toml"));
+    }
+
+    #[test]
+    fn nearest_manifest_rejects_equal_distance_candidates() {
+        let start = Path::new("/repo");
+        let candidates = vec![
+            PathBuf::from("/repo/apps/a/fastly.toml"),
+            PathBuf::from("/repo/apps/b/fastly.toml"),
+        ];
+        let error =
+            select_nearest_manifest(start, candidates, "fastly.toml").expect_err("ambiguous");
+        assert!(error.contains("ambiguous fastly.toml"));
+        assert!(error.contains("/repo/apps/a/fastly.toml"));
+        assert!(error.contains("/repo/apps/b/fastly.toml"));
     }
 
     #[test]
