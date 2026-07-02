@@ -266,6 +266,80 @@ fn validate_and_dispatch(
     )
 }
 
+/// Stage a real recursive copy of the adapter crate dir AND the
+/// `.edgezero/` dir (if present) under a fresh `TempDir`, then invoke
+/// `body` with the staged paths. The original project worktree is
+/// never mutated. Caller is responsible for diffing the staged tree
+/// against the project tree before the returned `TempDir` drops. See
+/// spec §"Dry-run".
+///
+/// Gated on `#[cfg(test)]` for now: the only callers are the
+/// same-file tests. Task 11 lifts this gate (and `lib.rs`'s
+/// `mod copy_tree;` gate) together when the `(true, true)` dispatch
+/// arm gains a real caller.
+#[cfg(test)]
+pub(crate) fn run_with_staging<F, R>(
+    project_root: &Path,
+    adapter_crate_rel: &Path,
+    body: F,
+) -> Result<(R, tempfile::TempDir), String>
+where
+    F: FnOnce(&Path, &Path) -> Result<R, String>,
+{
+    use crate::copy_tree::copy_dir_recursive;
+
+    let tempdir = tempfile::TempDir::new()
+        .map_err(|err| format!("failed to create staging tempdir: {err}"))?;
+    let staged_root = tempdir.path();
+
+    // Copy `edgezero.toml` (read-only input). Symlinking would be
+    // tempting as an optimisation, but for the default
+    // `--manifest edgezero.toml` shape `project_root` is "." and
+    // `project_root.join("edgezero.toml")` is `./edgezero.toml`.
+    // Unix `symlink(src, dst)` interprets a relative `src` as
+    // relative to `dst`'s parent — so
+    // `staged_root/edgezero.toml -> ./edgezero.toml` resolves back
+    // to `staged_root/edgezero.toml` itself, a broken self-loop.
+    // Copying is small and correct.
+    let edgezero_toml = project_root.join("edgezero.toml");
+    if edgezero_toml.exists() {
+        let staged_edgezero = staged_root.join("edgezero.toml");
+        if let Some(parent) = staged_edgezero.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create staged parent dir: {err}"))?;
+        }
+        fs::copy(&edgezero_toml, &staged_edgezero)
+            .map_err(|err| format!("failed to stage edgezero.toml: {err}"))?;
+    }
+
+    // Real-copy the adapter crate dir (mutable). `adapter_crate_rel`
+    // is project-relative (e.g. "crates/cf" or "."), so no
+    // `strip_prefix` is needed — the earlier draft that computed
+    // `crate_rel` via `strip_prefix(project_root)` silently failed for
+    // the default `project_root == "."` shape.
+    let src_crate = project_root.join(adapter_crate_rel);
+    let staged_crate = staged_root.join(adapter_crate_rel);
+    copy_dir_recursive(&src_crate, &staged_crate)
+        .map_err(|err| format!("failed to stage adapter crate dir: {err}"))?;
+
+    // Real-copy `.edgezero/` if present; otherwise create empty. Some
+    // adapters own `.edgezero/local-config-*.json` state files (axum);
+    // staging must preserve them, and their absence in a green-clone
+    // case must still yield a mountable dir.
+    let dot_edgezero = project_root.join(".edgezero");
+    let staged_dot = staged_root.join(".edgezero");
+    if dot_edgezero.exists() {
+        copy_dir_recursive(&dot_edgezero, &staged_dot)
+            .map_err(|err| format!("failed to stage .edgezero/: {err}"))?;
+    } else {
+        fs::create_dir_all(&staged_dot)
+            .map_err(|err| format!("failed to create staged .edgezero/: {err}"))?;
+    }
+
+    let result = body(staged_root, &staged_crate)?;
+    Ok((result, tempdir))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,5 +1206,65 @@ ids = ["default"]
             !SYNTH_CALLED.load(Ordering::SeqCst),
             "synthesiser must NOT fire in cloud mode"
         );
+    }
+
+    // ---------- run_with_staging dry-run helper ----------
+
+    #[test]
+    fn run_with_staging_drops_tempdir_after_body() {
+        let project = tempfile::TempDir::new().unwrap();
+        fs::write(project.path().join("edgezero.toml"), "x").unwrap();
+        let adapter_crate_rel = Path::new("crates/sample");
+        let adapter_crate_abs = project.path().join(adapter_crate_rel);
+        fs::create_dir_all(&adapter_crate_abs).unwrap();
+        fs::write(adapter_crate_abs.join("manifest.toml"), "y").unwrap();
+
+        let staged_paths = run_with_staging(
+            project.path(),
+            adapter_crate_rel,
+            |staged_root, staged_crate| Ok((staged_root.to_path_buf(), staged_crate.to_path_buf())),
+        )
+        .unwrap();
+        let (staged_root, staged_crate) = staged_paths.0;
+        // After staging the original project tree is byte-identical:
+        assert_eq!(
+            fs::read_to_string(project.path().join("edgezero.toml")).unwrap(),
+            "x"
+        );
+        // Staged copies existed during body execution:
+        assert!(staged_root.is_absolute());
+        assert!(staged_crate.starts_with(&staged_root));
+    }
+
+    #[test]
+    fn run_with_staging_copies_edgezero_toml_into_staged_root() {
+        // Regression for the relative-source-symlink bug AND the
+        // strip_prefix bug (fixed by switching to project-RELATIVE
+        // crate paths). Reads staged_root/edgezero.toml INSIDE the
+        // closure and asserts the bytes match. Uses an ABSOLUTE
+        // project_root to avoid mutating process cwd — the
+        // strip_prefix bug is not about relative project_root
+        // resolution itself, it's about the staging helper computing
+        // crate_rel incorrectly.
+        let project = tempfile::TempDir::new().unwrap();
+        fs::write(project.path().join("edgezero.toml"), "real-project-bytes\n").unwrap();
+        let adapter_crate_rel = Path::new("crates/sample");
+        fs::create_dir_all(project.path().join(adapter_crate_rel)).unwrap();
+        fs::write(
+            project.path().join(adapter_crate_rel).join("manifest.toml"),
+            "x",
+        )
+        .unwrap();
+
+        let observed = run_with_staging(
+            project.path(),
+            adapter_crate_rel,
+            |staged_root, _staged_crate| {
+                fs::read_to_string(staged_root.join("edgezero.toml"))
+                    .map_err(|err| format!("read staged edgezero.toml: {err}"))
+            },
+        )
+        .unwrap();
+        assert_eq!(observed.0, "real-project-bytes\n");
     }
 }
