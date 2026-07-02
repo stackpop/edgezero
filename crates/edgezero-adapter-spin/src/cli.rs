@@ -137,7 +137,7 @@ struct SpinCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch). `synthesise_baseline_manifest` IS overridden below (emits a baseline `spin.toml` + a header-only `runtime-config.toml` for the clean-clone bootstrap; runtime-config.toml lands next to spin.toml so nested `adapter_manifest_path` values are honoured)."
+    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch). `synthesise_baseline_manifest` IS overridden below (emits a baseline `spin.toml` + a header-only `runtime-config.toml` for the clean-clone bootstrap; runtime-config.toml lands next to spin.toml so nested `adapter_manifest_path` values are honoured). `provision_typed` IS overridden below (local mode emits lowercased `[variables]` + `[component.<id>.variables]` entries and `SPIN_VARIABLE_*` placeholders in `.env`; cloud mode is a no-op)."
 )]
 impl Adapter for SpinCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -271,6 +271,30 @@ impl Adapter for SpinCliAdapter {
             status_lines: out,
             deployed: None,
         })
+    }
+
+    fn provision_typed(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        typed_secrets: &[TypedSecretEntry<'_>],
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String> {
+        // Cloud mode is a no-op: Fermyon Cloud manages secret variables
+        // through its own dashboard / `spin cloud variable set` CLI, so
+        // there is nothing for the CLI to write from typed metadata.
+        if !matches!(mode, ProvisionMode::Local) {
+            return Ok(ProvisionOutcome::default());
+        }
+        provision_typed_local(
+            manifest_root,
+            adapter_manifest_path,
+            component_selector,
+            typed_secrets,
+            dry_run,
+        )
     }
 
     fn push_config_entries(
@@ -1205,16 +1229,18 @@ fn provision_local(
     })
 }
 
-/// Resolve which `[component.<id>]` table `provision_local` writes
-/// into, given a parsed `spin.toml`. Same rule as
-/// [`resolve_spin_component`] and [`Adapter::validate_adapter_manifest`]:
+/// Resolve which `[component.<id>]` table `provision_local` /
+/// `provision_typed_local` write into, given a parsed `spin.toml`.
+/// Same rule as [`resolve_spin_component`] and
+/// [`Adapter::validate_adapter_manifest`]:
 /// - explicit `component_selector`: must match a declared component
 ///   id, else error;
 /// - single component: implicit;
-/// - multi-component without selector: error.
+/// - multi-component without selector: error naming
+///   `[adapters.spin.adapter].component` and listing available ids.
 ///
-/// Operates on a `DocumentMut` (already parsed) so `provision_local`
-/// can share the single doc read with the writer.
+/// Operates on a `DocumentMut` (already parsed) so the callers can
+/// share the single doc read with the writer.
 fn resolve_component_id(
     doc: &toml_edit::DocumentMut,
     selector: Option<&str>,
@@ -1252,6 +1278,169 @@ fn resolve_component_id(
         component_ids.len(),
         component_ids.join(", ")
     ))
+}
+
+/// Local-mode `provision_typed` arm: for each typed secret declared
+/// on the app, edit `spin.toml` to add a lowercased `[variables]`
+/// entry (`{ default = "", secret = true }`) plus a
+/// `[component.<id>.variables]` binding that references it via the
+/// `{{ spin_var }}` template placeholder, then write a
+/// `SPIN_VARIABLE_<UPPER>=` line into `<spin_dir>/.env` so `spin up`
+/// resolves the secret from the environment at runtime.
+///
+/// Casing: Spin's schema requires lowercase variable names
+/// (`^[a-z][a-z0-9_]*$`); the Spin runtime reads variables from
+/// upper-cased `SPIN_VARIABLE_*` env vars. `spin_var` is the
+/// canonicalised (`to_ascii_lowercase`) secret key.
+///
+/// Idempotency: an existing `[variables].<spin_var>` entry is left
+/// alone (operator override survives); the same rule applies to
+/// `[component.<id>.variables].<spin_var>`. `.env` dedup is
+/// delegated to [`append_lines_dedup`].
+fn provision_typed_local(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    component_selector: Option<&str>,
+    typed_secrets: &[TypedSecretEntry<'_>],
+    dry_run: bool,
+) -> Result<ProvisionOutcome, String> {
+    use toml_edit::DocumentMut;
+
+    let spin_rel = adapter_manifest_path.unwrap_or("spin.toml");
+    let spin_path = manifest_root.join(spin_rel);
+    let env_path = spin_path.parent().unwrap_or(manifest_root).join(".env");
+
+    if !spin_path.exists() {
+        return Err(format!(
+            "expected spin.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            spin_path.display()
+        ));
+    }
+
+    let spin_raw = fs::read_to_string(&spin_path)
+        .map_err(|err| format!("failed to read {}: {err}", spin_path.display()))?;
+    let mut spin_doc: DocumentMut = spin_raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", spin_path.display()))?;
+
+    // Resolve the component id ONCE — if unresolvable (multi-component
+    // with no selector, or a bad explicit selector), abort BEFORE
+    // touching either the .env or spin.toml on disk.
+    let component_id = resolve_component_id(&spin_doc, component_selector, &spin_path)?;
+
+    let mut status_lines: Vec<String> = Vec::with_capacity(typed_secrets.len());
+    let mut env_lines: Vec<String> = Vec::with_capacity(typed_secrets.len());
+    let mut spin_changed = false;
+
+    for entry in typed_secrets {
+        let spin_var = entry.key_value.to_ascii_lowercase();
+        let env_var = format!("SPIN_VARIABLE_{}", spin_var.to_ascii_uppercase());
+
+        if upsert_variables_entry(&mut spin_doc, &spin_var, &spin_path)? {
+            spin_changed = true;
+        }
+        if upsert_component_variable(&mut spin_doc, &component_id, &spin_var, &spin_path)? {
+            spin_changed = true;
+        }
+
+        env_lines.push(format!("{env_var}="));
+        status_lines.push(format!(
+            "spin: variable `{spin_var}` on component `{component_id}` (env `{env_var}`)"
+        ));
+    }
+
+    if spin_changed && !dry_run {
+        fs::write(&spin_path, spin_doc.to_string())
+            .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
+    }
+    append_lines_dedup(&env_path, &env_lines, dry_run)
+        .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+
+    Ok(ProvisionOutcome {
+        status_lines,
+        deployed: None,
+    })
+}
+
+/// Insert `[variables].<spin_var> = { default = "", secret = true }`
+/// into `doc` if the key is absent. If a `[variables].<spin_var>`
+/// entry already exists — commonly because the operator has
+/// customised the `default` fallback or added extra metadata —
+/// LEAVE it untouched so the operator override survives repeat
+/// provisions. Returns `Ok(true)` if the entry was newly added,
+/// `Ok(false)` if it was already present.
+fn upsert_variables_entry(
+    doc: &mut toml_edit::DocumentMut,
+    spin_var: &str,
+    spin_path: &Path,
+) -> Result<bool, String> {
+    use toml_edit::{InlineTable, Item, Table, Value};
+
+    let variables = doc
+        .entry("variables")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let variables_tbl = variables
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: `variables` is not a table", spin_path.display()))?;
+    if variables_tbl.contains_key(spin_var) {
+        return Ok(false);
+    }
+    let mut inline = InlineTable::new();
+    inline.insert("default", Value::from(""));
+    inline.insert("secret", Value::from(true));
+    variables_tbl.insert(spin_var, Item::Value(Value::InlineTable(inline)));
+    Ok(true)
+}
+
+/// Insert `[component.<component_id>.variables].<spin_var> = "{{ spin_var }}"`
+/// (a literal placeholder string containing the template braces)
+/// if the key is absent. LEAVES an existing binding alone so an
+/// operator who has already wired the variable to a literal (or a
+/// different template) survives a repeat provision. Returns
+/// `Ok(true)` if newly added, `Ok(false)` if already present.
+fn upsert_component_variable(
+    doc: &mut toml_edit::DocumentMut,
+    component_id: &str,
+    spin_var: &str,
+    spin_path: &Path,
+) -> Result<bool, String> {
+    use toml_edit::{value, Item, Table};
+
+    let component_root = doc.get_mut("component").ok_or_else(|| {
+        format!(
+            "{}: [component.*] tables expected but `component` key missing",
+            spin_path.display()
+        )
+    })?;
+    let component_tbl = component_root
+        .as_table_mut()
+        .ok_or_else(|| format!("{}: `component` is not a table", spin_path.display()))?;
+    let target = component_tbl.get_mut(component_id).ok_or_else(|| {
+        format!(
+            "{}: [component.{component_id}] is not declared",
+            spin_path.display()
+        )
+    })?;
+    let target_tbl = target.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: [component.{component_id}] is not a table",
+            spin_path.display()
+        )
+    })?;
+    let variables = target_tbl
+        .entry("variables")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let variables_tbl = variables.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: [component.{component_id}.variables] is not a table",
+            spin_path.display()
+        )
+    })?;
+    if variables_tbl.contains_key(spin_var) {
+        return Ok(false);
+    }
+    variables_tbl.insert(spin_var, value(format!("{{{{ {spin_var} }}}}")));
+    Ok(true)
 }
 
 /// In-memory variant of [`ensure_kv_label_in_component`]: append
@@ -3549,6 +3738,248 @@ mod tests {
         assert!(
             !env_after.contains("EDGEZERO__STORES__CONFIG__PROD_CONFIG__NAME="),
             "platform name must NOT leak into the env-var key: {env_after}"
+        );
+    }
+
+    // ---------- provision_typed (Task 26) ----------
+
+    #[test]
+    fn spin_provision_typed_writes_lowercased_variables_and_uppercased_env() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("spin.toml"),
+            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+        )
+        .unwrap();
+
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "API_TOKEN",
+            "Demo_API_TOKEN",
+        )];
+        SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed local ok");
+
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).unwrap();
+        assert!(
+            spin_after.contains("[variables]"),
+            "root [variables] header: {spin_after}"
+        );
+        assert!(
+            spin_after.contains("demo_api_token = { default = \"\", secret = true }"),
+            "inline variables entry with default=\"\" and secret=true: {spin_after}"
+        );
+        assert!(
+            spin_after.contains("[component.demo.variables]"),
+            "component variables header: {spin_after}"
+        );
+        assert!(
+            spin_after.contains(r#"demo_api_token = "{{ demo_api_token }}""#),
+            "component-level template placeholder: {spin_after}"
+        );
+
+        let env_after = fs::read_to_string(dir.path().join(".env")).unwrap();
+        assert!(
+            env_after
+                .lines()
+                .any(|line| line == "SPIN_VARIABLE_DEMO_API_TOKEN="),
+            "SPIN_VARIABLE_<UPPER>= placeholder line: {env_after}"
+        );
+    }
+
+    #[test]
+    fn spin_provision_typed_uses_explicit_component_selector() {
+        let dir = tempdir().unwrap();
+        // Synthesise with component_selector = "worker" so the
+        // [component.worker] table exists.
+        fs::write(
+            dir.path().join("spin.toml"),
+            synthesise_spin_toml("demo", Some("worker")),
+        )
+        .unwrap();
+
+        let entries = [TypedSecretEntry::new("default", "API_TOKEN", "demo_token")];
+        SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                Some("worker"),
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed with selector ok");
+
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).unwrap();
+        assert!(
+            spin_after.contains("[component.worker.variables]"),
+            "selector target receives placeholder: {spin_after}"
+        );
+        assert!(
+            !spin_after.contains("[component.demo.variables]"),
+            "non-selected component id must NOT receive placeholder: {spin_after}"
+        );
+    }
+
+    #[test]
+    fn spin_provision_typed_errors_when_component_ambiguous_and_no_selector() {
+        let dir = tempdir().unwrap();
+        // Multi-component spin.toml with NO selector.
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n\
+             [application]\nname = \"x\"\nversion = \"0\"\n\
+             [component.foo]\nsource = \"foo.wasm\"\n\
+             [component.bar]\nsource = \"bar.wasm\"\n",
+        )
+        .unwrap();
+
+        let entries = [TypedSecretEntry::new("default", "API_TOKEN", "demo_token")];
+        let err = SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("ambiguous component must error");
+        assert!(
+            err.contains("foo")
+                && err.contains("bar")
+                && err.contains("[adapters.spin.adapter].component"),
+            "error names available component ids AND the config knob: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_provision_typed_errors_when_selector_does_not_match_component() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("spin.toml"),
+            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+        )
+        .unwrap();
+
+        let entries = [TypedSecretEntry::new("default", "API_TOKEN", "demo_token")];
+        let err = SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                Some("missing"),
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("bad selector must error");
+        assert!(
+            err.contains("missing"),
+            "error names the missing selector: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_provision_typed_cloud_mode_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        // Do NOT seed spin.toml — cloud mode must return an empty
+        // outcome WITHOUT touching the filesystem.
+        let entries = [TypedSecretEntry::new("default", "API_TOKEN", "demo_token")];
+        let out = SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &entries,
+                ProvisionMode::Cloud,
+                false,
+            )
+            .expect("cloud mode no-op ok");
+        assert!(
+            out.status_lines.is_empty(),
+            "cloud mode emits no status lines: {:?}",
+            out.status_lines
+        );
+        assert!(
+            out.deployed.is_none(),
+            "cloud mode carries no deployed state"
+        );
+        assert!(
+            !dir.path().join("spin.toml").exists(),
+            "cloud mode must NOT create spin.toml"
+        );
+        assert!(
+            !dir.path().join(".env").exists(),
+            "cloud mode must NOT create .env"
+        );
+    }
+
+    #[test]
+    fn spin_provision_typed_deduplicates_matching_variable() {
+        let dir = tempdir().unwrap();
+        // Operator has customised `default = "custom-fallback"` — a
+        // repeat provision_typed must NOT clobber it.
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n\
+             [application]\nname = \"demo\"\nversion = \"0\"\n\
+             [[trigger.http]]\nroute = \"/...\"\ncomponent = \"demo\"\n\
+             [component.demo]\nsource = \"demo.wasm\"\n\
+             [variables]\ndemo_api_token = { default = \"custom-fallback\", secret = true }\n",
+        )
+        .unwrap();
+
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "API_TOKEN",
+            "demo_api_token",
+        )];
+        SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("idempotent provision_typed ok");
+
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).unwrap();
+        assert!(
+            spin_after.contains(r#"default = "custom-fallback""#),
+            "operator's custom `default` value preserved: {spin_after}"
+        );
+    }
+
+    #[test]
+    fn spin_provision_typed_errors_if_spin_toml_absent() {
+        let dir = tempdir().unwrap();
+        // Do NOT seed spin.toml. Local mode must error naming the
+        // missing baseline (Task 8b's CLI bootstrap should have
+        // written it).
+        let entries = [TypedSecretEntry::new("default", "API_TOKEN", "demo_token")];
+        let err = SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("missing spin.toml must error");
+        assert!(
+            err.contains("spin.toml") && err.contains(dir.path().to_str().unwrap()),
+            "error names the missing spin.toml path: {err}"
         );
     }
 
