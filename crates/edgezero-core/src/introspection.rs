@@ -5,16 +5,56 @@ use crate::blob_envelope::BlobEnvelope;
 use crate::body::Body;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
+use crate::extractor::FromRequest;
 // NOTE: `Response` is an HTTP alias exported from `crate::http`, NOT
 // `crate::response` (response.rs itself imports it from crate::http).
 use crate::http::{response_builder, Response, StatusCode};
+use crate::router::RouteInfo;
+use async_trait::async_trait;
 use edgezero_core::action;
 use serde::Serialize;
+use std::sync::Arc;
 
 #[derive(Serialize)]
 struct RouteView {
     method: String,
     path: String,
+}
+
+/// Extractor for the baked manifest JSON carried in the request's
+/// [`crate::router::IntrospectionData`]. Errors with 500 if the data is
+/// absent (i.e. the router did not inject it).
+pub struct ManifestJson(pub Arc<str>);
+
+#[async_trait(?Send)]
+impl FromRequest for ManifestJson {
+    #[inline]
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.introspection()
+            .and_then(|data| data.manifest_json.clone())
+            .map(ManifestJson)
+            .ok_or_else(|| {
+                EdgeError::internal(anyhow::anyhow!("manifest introspection data not available"))
+            })
+    }
+}
+
+/// Extractor for the live route index carried in the request's
+/// [`crate::router::IntrospectionData`]. Errors with 500 if the data is absent.
+pub struct RouteTable(pub Arc<[RouteInfo]>);
+
+#[async_trait(?Send)]
+impl FromRequest for RouteTable {
+    #[inline]
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.introspection()
+            .map(|data| RouteTable(Arc::clone(&data.routes)))
+            .ok_or_else(|| {
+                EdgeError::internal(anyhow::anyhow!(
+                    "route-table introspection data not available"
+                ))
+            })
+    }
 }
 
 fn json_response(status: StatusCode, body: Body) -> Result<Response, EdgeError> {
@@ -27,31 +67,20 @@ fn json_response(status: StatusCode, body: Body) -> Result<Response, EdgeError> 
 
 /// GET — the app manifest as JSON (baked at compile time by `app!`).
 #[action]
-pub async fn manifest(ctx: RequestContext) -> Result<Response, EdgeError> {
-    let json = ctx
-        .introspection()
-        .and_then(|data| data.manifest_json.clone())
-        .ok_or_else(|| {
-            EdgeError::internal(anyhow::anyhow!("manifest introspection data missing"))
-        })?;
+pub async fn manifest(ManifestJson(json): ManifestJson) -> Result<Response, EdgeError> {
     json_response(StatusCode::OK, Body::text(json.to_string()))
 }
 
 /// GET — `[{ "method", "path" }]` for every registered route.
 #[action]
-pub async fn routes(ctx: RequestContext) -> Result<Response, EdgeError> {
-    let views: Vec<RouteView> = ctx
-        .introspection()
-        .map(|data| {
-            data.routes
-                .iter()
-                .map(|route| RouteView {
-                    method: route.method().as_str().to_owned(),
-                    path: route.path().to_owned(),
-                })
-                .collect()
+pub async fn routes(RouteTable(table): RouteTable) -> Result<Response, EdgeError> {
+    let views: Vec<RouteView> = table
+        .iter()
+        .map(|route| RouteView {
+            method: route.method().as_str().to_owned(),
+            path: route.path().to_owned(),
         })
-        .unwrap_or_default();
+        .collect();
     let body = Body::json(&views).map_err(EdgeError::internal)?;
     json_response(StatusCode::OK, body)
 }
@@ -171,6 +200,20 @@ mod tests {
             body_json(resp),
             serde_json::json!({ "app": { "name": "t" } })
         );
+    }
+
+    #[test]
+    fn manifest_without_baked_json_is_500() {
+        // No `with_manifest_json`: IntrospectionData is still injected, but
+        // `manifest_json` is None, so the `ManifestJson` extractor errors 500.
+        let router = RouterService::builder().get("/m", manifest).build();
+        let req = request_builder()
+            .method(Method::GET)
+            .uri("/m")
+            .body(Body::empty())
+            .unwrap();
+        let resp = block_on(router.oneshot(req)).unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
