@@ -15,6 +15,7 @@ pub mod app_config;
 pub mod blob_envelope;
 pub mod body;
 pub mod canonical_form;
+pub mod chunked_config;
 pub mod compression;
 pub mod config_store;
 pub mod context;

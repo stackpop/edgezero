@@ -5,6 +5,12 @@
 //! module splits the envelope into content-addressed chunk entries plus a
 //! root pointer entry that is written LAST.
 //!
+//! The logic is pure (I/O is delegated to caller-supplied callbacks), so it
+//! lives in `edgezero-core` rather than the Fastly adapter: host-side tools
+//! and runtimes that read Fastly-shaped config stores can resolve chunked
+//! values without depending on the Fastly SDK. `edgezero-adapter-fastly`
+//! re-exports this module and remains the primary consumer.
+//!
 //! The pointer JSON shape (spec 9.2):
 //! ```json
 //! {
@@ -24,21 +30,18 @@ use sha2::{Digest as _, Sha256};
 /// Per-entry value limit enforced by Fastly Config Store. Used by the
 /// CLI writer to gate direct-vs-chunked storage; the runtime resolver
 /// reads chunk lengths from the pointer struct, not this constant.
-#[cfg(any(feature = "cli", test))]
-pub(crate) const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
+pub const FASTLY_CONFIG_ENTRY_LIMIT: usize = 8_000;
 /// Target payload size per chunk (kept under the entry limit to leave
 /// room for the key and any protocol overhead). CLI writer only.
-#[cfg(any(feature = "cli", test))]
-pub(crate) const CHUNK_PAYLOAD_TARGET: usize = 7_000;
+pub const CHUNK_PAYLOAD_TARGET: usize = 7_000;
 /// Infix inserted between the root key and the content-address in a
 /// chunk key: `<root>.__edgezero_chunks.<sha256>.<index>`. CLI writer
 /// only; the resolver reads chunk keys from the pointer struct.
-#[cfg(any(feature = "cli", test))]
-pub(crate) const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
+pub const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
 /// `edgezero_kind` discriminant stored in the pointer JSON. Used by
 /// BOTH the writer (when serialising the pointer) AND the resolver
 /// (when validating the parsed pointer) -- stays unconditional.
-pub(crate) const POINTER_KIND: &str = "fastly_config_chunks";
+pub const POINTER_KIND: &str = "fastly_config_chunks";
 
 // ---------------------------------------------------------------------------
 // Private pointer schema
@@ -83,8 +86,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Returns an error string if the pointer JSON itself would exceed 8 000
 /// characters (extremely unlikely in practice; recommends restructuring).
-#[cfg(any(feature = "cli", test))]
-pub(crate) fn prepare_fastly_config_entries(
+#[inline]
+pub fn prepare_fastly_config_entries(
     root_key: &str,
     envelope_json: &str,
 ) -> Result<Vec<(String, String)>, String> {
@@ -172,7 +175,6 @@ pub(crate) fn prepare_fastly_config_entries(
 /// Find the largest byte offset `<= end_raw` that is a valid UTF-8
 /// codepoint boundary within `src`.  `start` is used as a hint so we
 /// don't scan the entire string from zero each time. CLI writer only.
-#[cfg(any(feature = "cli", test))]
 fn find_utf8_boundary(src: &str, start: usize, end_raw: usize) -> usize {
     if end_raw >= src.len() {
         return src.len();
@@ -204,7 +206,8 @@ fn find_utf8_boundary(src: &str, start: usize, end_raw: usize) -> usize {
 ///
 /// Returns a descriptive error string naming the root key or the failing
 /// chunk key when any integrity check fails.
-pub(crate) fn resolve_fastly_config_value<F>(
+#[inline]
+pub fn resolve_fastly_config_value<F>(
     root_key: &str,
     root_value: String,
     mut fetch: F,
@@ -212,7 +215,7 @@ pub(crate) fn resolve_fastly_config_value<F>(
 where
     F: FnMut(&str) -> Result<Option<String>, String>,
 {
-    use edgezero_core::blob_envelope::BlobEnvelope;
+    use crate::blob_envelope::BlobEnvelope;
 
     // --- Path 1: direct BlobEnvelope ---
     if let Ok(envelope) = serde_json::from_str::<BlobEnvelope>(&root_value) {
@@ -317,7 +320,7 @@ mod tests {
     /// Build a valid `BlobEnvelope` JSON string of approximately `target_len`
     /// characters by padding the data payload.
     fn make_envelope_json(target_len: usize) -> String {
-        use edgezero_core::blob_envelope::BlobEnvelope;
+        use crate::blob_envelope::BlobEnvelope;
         use serde_json::json;
 
         // Build a minimal envelope first to measure overhead.
@@ -384,7 +387,7 @@ mod tests {
         // Construct an envelope whose padding contains emoji (4 bytes each).
         // We intentionally size it so a naive byte-boundary split would land
         // mid-codepoint.
-        use edgezero_core::blob_envelope::BlobEnvelope;
+        use crate::blob_envelope::BlobEnvelope;
         use serde_json::json;
 
         // crab emoji: 4 bytes each; 3000 crabs = 12 000 bytes of payload
@@ -458,7 +461,7 @@ mod tests {
 
     #[test]
     fn resolver_returns_direct_envelope_unchanged() {
-        use edgezero_core::blob_envelope::BlobEnvelope;
+        use crate::blob_envelope::BlobEnvelope;
         use serde_json::json;
 
         let envelope = BlobEnvelope::new(json!({"hello": "world"}), "2026-06-22T00:00:00Z".into());

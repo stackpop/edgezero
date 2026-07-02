@@ -1,7 +1,6 @@
 //! Utilities for bridging Fastly Compute@Edge requests into the
 //! `edgezero-core` service abstractions.
 
-pub(crate) mod chunked_config;
 #[cfg(feature = "cli")]
 pub mod cli;
 #[cfg(feature = "fastly")]
@@ -22,6 +21,8 @@ pub mod secret_store;
 
 #[cfg(feature = "fastly")]
 use edgezero_core::app::{Hooks, StoresMetadata};
+#[cfg(any(feature = "cli", feature = "fastly", test))]
+pub(crate) use edgezero_core::chunked_config;
 #[cfg(feature = "fastly")]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
