@@ -136,7 +136,7 @@ struct SpinCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch)."
+    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch). `synthesise_baseline_manifest` IS overridden below (emits a baseline `spin.toml` + a header-only `runtime-config.toml` for the clean-clone bootstrap; runtime-config.toml lands next to spin.toml so nested `adapter_manifest_path` values are honoured)."
 )]
 impl Adapter for SpinCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -464,6 +464,34 @@ impl Adapter for SpinCliAdapter {
         // Spin KV API since Stage 5 of the spin-kv-config plan).
         // Single for Secrets (still flat-variable namespace).
         &["secrets"]
+    }
+
+    fn synthesise_baseline_manifest(
+        &self,
+        _manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        app_name: &str,
+        _deployed: Option<&AdapterDeployedState>,
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        let spin_rel =
+            adapter_manifest_path.map_or_else(|| PathBuf::from("spin.toml"), PathBuf::from);
+        // runtime-config.toml sits next to spin.toml so a nested
+        // `adapter_manifest_path` (e.g. `crates/spin/spin.toml`)
+        // places runtime-config.toml at
+        // `crates/spin/runtime-config.toml`. When `spin_rel` has no
+        // parent (bare `spin.toml`), fall back to the workspace root.
+        let rc_rel = spin_rel
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(
+                || PathBuf::from("runtime-config.toml"),
+                |parent| parent.join("runtime-config.toml"),
+            );
+        Ok(vec![
+            (spin_rel, synthesise_spin_toml(app_name, component_selector)),
+            (rc_rel, synthesise_runtime_config_toml()),
+        ])
     }
 
     fn validate_adapter_manifest(
@@ -1224,6 +1252,81 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Header-only baseline for `runtime-config.toml`. Task 25's
+/// local arm appends `[key_value_store.<name>]` blocks on top of
+/// this baseline; there is nothing to synthesise structurally at
+/// bootstrap time — the header line pins the schema version so
+/// later appenders know they are editing an EdgeZero-owned file.
+pub(crate) fn synthesise_runtime_config_toml() -> String {
+    String::from("# edgezero-provision: v1\n")
+}
+
+/// Synthesised baseline `spin.toml` for clean clones. Built via
+/// `toml_edit::DocumentMut` (NOT raw `format!`) so any legal
+/// `[app].name` or `[adapters.spin.adapter].component` selector
+/// — including values with TOML-significant characters like `"`,
+/// `\`, or newlines — is escaped correctly.
+///
+/// Component-id resolution: `component.unwrap_or(app_name)`. The
+/// wasm source path uses the UNDERSCORED component id because
+/// Rust's Cargo output filenames convert hyphens to underscores
+/// (`my-crate` → `my_crate.wasm`).
+pub(crate) fn synthesise_spin_toml(app_name: &str, component: Option<&str>) -> String {
+    use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
+
+    let component_id = component.unwrap_or(app_name);
+    let component_under = component_id.replace('-', "_");
+
+    let mut doc = DocumentMut::new();
+    doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
+    // `Table::insert` returns the previous value (if any). We build
+    // a fresh document from `DocumentMut::new()`, so nothing to
+    // displace -- discarding the returned Option is intentional.
+    // Using `insert` rather than `doc["..."] = ...` sidesteps
+    // `clippy::indexing_slicing` (the index form panics if the key
+    // is missing; `insert` doesn't).
+    doc.insert("spin_manifest_version", value(2));
+
+    // [application]
+    let mut application = Table::new();
+    application.insert("name", value(app_name));
+    application.insert("version", value("0.1.0"));
+    doc.insert("application", Item::Table(application));
+
+    // [[trigger.http]] — array-of-tables so toml_edit emits the
+    // `[[...]]` double-bracket syntax. The `trigger` parent table
+    // is marked implicit so the emitter skips a bare `[trigger]`
+    // header (`[[trigger.http]]` already declares the container).
+    let mut http_trigger = Table::new();
+    http_trigger.insert("route", value("/..."));
+    http_trigger.insert("component", value(component_id));
+    let mut http_aot = ArrayOfTables::new();
+    http_aot.push(http_trigger);
+    let mut trigger = Table::new();
+    trigger.set_implicit(true);
+    trigger.insert("http", Item::ArrayOfTables(http_aot));
+    doc.insert("trigger", Item::Table(trigger));
+
+    // [component.<id>] — insert the sub-table typed so a pathological
+    // component id can't inject unescaped section-header syntax; the
+    // parent `component` table is implicit so the emitter renders
+    // only `[component.<id>]` (no bare `[component]` header).
+    let mut comp = Table::new();
+    comp.insert(
+        "source",
+        value(format!(
+            "../../target/wasm32-wasip2/release/{component_under}.wasm"
+        )),
+    );
+    comp.insert("key_value_stores", value(Array::new()));
+    let mut component_section = Table::new();
+    component_section.set_implicit(true);
+    component_section.insert(component_id, Item::Table(comp));
+    doc.insert("component", Item::Table(component_section));
+
+    doc.to_string()
 }
 
 #[cfg(test)]
@@ -2795,5 +2898,79 @@ mod tests {
             panic!("expected Present variant");
         };
         assert_eq!(value, "abs_val");
+    }
+
+    // ---------- synthesise_spin_toml / synthesise_runtime_config_toml ----------
+
+    #[test]
+    fn synthesises_spin_toml_uses_app_name_when_component_unset() {
+        let out = synthesise_spin_toml("demo", None);
+        assert!(out.starts_with("# edgezero-provision: v1"));
+        assert!(out.contains("spin_manifest_version = 2"));
+        assert!(out.contains(r#"name = "demo""#));
+        assert!(out.contains(r#"component = "demo""#));
+        assert!(out.contains("[component.demo]"));
+    }
+
+    #[test]
+    fn synthesises_spin_toml_honors_component_selector() {
+        let out = synthesise_spin_toml("demo", Some("worker"));
+        assert!(out.contains(r#"component = "worker""#));
+        assert!(out.contains("[component.worker]"));
+        // wasm path matches the component id, not the app name:
+        assert!(out.contains("/release/worker.wasm"));
+    }
+
+    #[test]
+    fn synthesises_runtime_config_toml_is_header_only() {
+        let out = synthesise_runtime_config_toml();
+        assert_eq!(out, "# edgezero-provision: v1\n");
+    }
+
+    #[test]
+    fn synthesise_spin_toml_escapes_pathological_app_names() {
+        for name in [
+            r#"has"quote"#,
+            r"has\backslash",
+            "has\nnewline",
+            "has = equals",
+        ] {
+            let out = synthesise_spin_toml(name, None);
+            let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            assert_eq!(
+                doc["application"]["name"].as_str(),
+                Some(name),
+                "app name round-trip failed for {name:?}: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthesise_spin_toml_escapes_pathological_component_id() {
+        // Component id flows into BOTH the trigger's `component =`
+        // value AND the `[component.<id>]` table key — both must
+        // round-trip cleanly.
+        for cid in [r#"has"quote"#, r"has\backslash", "has\nnewline"] {
+            let out = synthesise_spin_toml("demo", Some(cid));
+            let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            // trigger[0].component == cid
+            let trigger_http = doc["trigger"]["http"]
+                .as_array_of_tables()
+                .expect("trigger.http must be ArrayOfTables");
+            assert_eq!(trigger_http.len(), 1);
+            assert_eq!(
+                trigger_http.get(0).unwrap()["component"].as_str(),
+                Some(cid),
+                "trigger.component round-trip failed for {cid:?}: {out}"
+            );
+            // [component.<cid>] exists and has a `source` key
+            let comp = doc["component"]
+                .as_table()
+                .expect("component must be a table");
+            assert!(
+                comp.contains_key(cid),
+                "component table missing key {cid:?}: {out}"
+            );
+        }
     }
 }
