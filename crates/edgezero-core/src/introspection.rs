@@ -183,6 +183,10 @@ mod tests {
             .unwrap();
         let resp = block_on(router.oneshot(req)).unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
         // Shape: [{ "method", "path" }] — the /r route itself is present.
         let body = body_json(resp);
         let arr = body.as_array().expect("routes array");

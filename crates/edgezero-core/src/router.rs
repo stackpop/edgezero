@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn middleware_sees_introspection_data() {
-        struct Probe(Arc<Mutex<bool>>);
+        struct Probe(Arc<Mutex<Option<(bool, usize)>>>);
         #[async_trait::async_trait(?Send)]
         impl Middleware for Probe {
             async fn handle(
@@ -625,14 +625,16 @@ mod tests {
                 ctx: RequestContext,
                 next: Next<'_>,
             ) -> Result<Response, EdgeError> {
-                *self.0.lock().unwrap() = ctx.introspection().is_some();
+                *self.0.lock().unwrap() = ctx
+                    .introspection()
+                    .map(|data| (data.manifest_json.is_some(), data.routes.len()));
                 next.run(ctx).await
             }
         }
 
-        let saw = Arc::new(Mutex::new(false));
+        let saw: Arc<Mutex<Option<(bool, usize)>>> = Arc::new(Mutex::new(None));
         let router = RouterService::builder()
-            .with_manifest_json("{}")
+            .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
             .middleware(Probe(Arc::clone(&saw)))
             .get("/", |_ctx: RequestContext| async {
                 Ok::<_, EdgeError>("ok")
@@ -644,9 +646,11 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         block_on(router.oneshot(request)).unwrap();
+        let (had_manifest, route_count) = saw.lock().unwrap().expect("middleware ran");
+        assert!(had_manifest, "middleware should see manifest_json");
         assert!(
-            *saw.lock().unwrap(),
-            "middleware should see introspection data"
+            route_count > 0,
+            "middleware should see non-empty route list"
         );
     }
 

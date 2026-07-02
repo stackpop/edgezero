@@ -143,6 +143,10 @@ methods = ["GET"]
 handler = "edgezero_core::introspection::routes"
 ```
 
+::: warning Security
+These endpoints are unauthenticated wherever they are bound — restrict access at the network or middleware layer before exposing them publicly. Note that `/manifest` emits `environment.variables[].value` verbatim; only `environment.secrets` values are redacted. Do not store secrets in `[environment.variables]`.
+:::
+
 The `routes` handler returns JSON like:
 
 ```json
