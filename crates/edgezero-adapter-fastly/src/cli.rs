@@ -13,6 +13,7 @@ use edgezero_adapter::cli_support::{
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -166,7 +167,7 @@ enum ConfigStoreLookup {
 // `&[]` for documentation, matching the inherited default.
 #[expect(
     clippy::missing_trait_methods,
-    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `fastly.toml` for the Task 8b clean-clone bootstrap, threading `[adapters.fastly.deployed].service_id` through when present)."
+    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `fastly.toml` for the Task 8b clean-clone bootstrap, threading `[adapters.fastly.deployed].service_id` through when present). `provision_typed` IS overridden below (Local mode appends `[[local_server.secret_stores.<store_id>]]` entries in `fastly.toml`; Cloud is a no-op)."
 )]
 impl Adapter for FastlyCliAdapter {
     fn deployed_fields(&self) -> &'static [&'static str] {
@@ -363,6 +364,63 @@ impl Adapter for FastlyCliAdapter {
         }
         Ok(ProvisionOutcome {
             status_lines: out,
+            deployed: None,
+        })
+    }
+
+    fn provision_typed(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        typed_secrets: &[TypedSecretEntry<'_>],
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String> {
+        // Cloud secret storage uses `fastly secret-store-entry create`
+        // at deploy time. This local writer only seeds Viceroy's
+        // `[[local_server.secret_stores.<store_id>]]` array-of-tables
+        // — cloud mode is a documented no-op.
+        if !matches!(mode, ProvisionMode::Local) {
+            return Ok(ProvisionOutcome::default());
+        }
+        let fastly_rel = adapter_manifest_path.unwrap_or("fastly.toml");
+        let fastly_path = manifest_root.join(fastly_rel);
+        if !fastly_path.exists() {
+            return Err(format!(
+                "expected fastly.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+                fastly_path.display()
+            ));
+        }
+        let raw = fs::read_to_string(&fastly_path)
+            .map_err(|err| format!("failed to read {}: {err}", fastly_path.display()))?;
+        let mut doc: toml_edit::DocumentMut = raw
+            .parse()
+            .map_err(|err| format!("failed to parse {}: {err}", fastly_path.display()))?;
+
+        let mut status_lines: Vec<String> = Vec::new();
+        let mut appended = 0_usize;
+
+        for entry in typed_secrets {
+            let added = upsert_secret_store_entry(&mut doc, entry.store_id, entry.key_value)?;
+            if added {
+                appended = appended.saturating_add(1);
+            }
+            status_lines.push(format!(
+                "fastly: secret_store `{}` key `{}` (env `{}`)",
+                entry.store_id,
+                entry.key_value,
+                entry.key_value.to_ascii_uppercase(),
+            ));
+        }
+
+        if !dry_run && appended > 0 {
+            fs::write(&fastly_path, doc.to_string())
+                .map_err(|err| format!("failed to write {}: {err}", fastly_path.display()))?;
+        }
+
+        Ok(ProvisionOutcome {
+            status_lines,
             deployed: None,
         })
     }
@@ -1304,6 +1362,60 @@ fn upsert_runtime_env_config_store(
 
     store_tbl.insert("contents", Item::Table(contents_tbl));
     config_stores_tbl.insert(RUNTIME_ENV_NAME, Item::Table(store_tbl));
+    Ok(true)
+}
+
+/// Append one `[[local_server.secret_stores.<store_id>]]` entry with
+/// `key = "<key_value>"` and `env = "<KEY_VALUE_UPPER>"` — Fastly's
+/// secret-store convention pairs the key name with the env var the
+/// local runtime exposes it under. Idempotent: if the target array
+/// already contains an entry with matching `key = "<key_value>"` we
+/// skip and leave sibling entries (including operator-adjusted `env`
+/// values) alone. Returns `Ok(true)` when a new entry was appended,
+/// `Ok(false)` when a matching key was already present.
+///
+/// Refuses to clobber non-standard values: if the target
+/// `secret_stores.<store_id>` node exists but isn't an array of
+/// tables, or if `local_server` / `local_server.secret_stores`
+/// exist but aren't tables, the helper errors with a "refusing to
+/// edit in place" diagnostic.
+fn upsert_secret_store_entry(
+    doc: &mut toml_edit::DocumentMut,
+    store_id: &str,
+    key_value: &str,
+) -> Result<bool, String> {
+    use toml_edit::{value, ArrayOfTables, Item, Table};
+
+    let local_server_entry = doc
+        .entry("local_server")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
+        "`local_server` exists but is not a table; refusing to edit in place".to_owned()
+    })?;
+    let secret_stores_entry = local_server_tbl
+        .entry("secret_stores")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let secret_stores_tbl = secret_stores_entry.as_table_mut().ok_or_else(|| {
+        "`local_server.secret_stores` exists but is not a table; refusing to edit in place"
+            .to_owned()
+    })?;
+    let store_entry = secret_stores_tbl
+        .entry(store_id)
+        .or_insert_with(|| Item::ArrayOfTables(ArrayOfTables::new()));
+    let store_arr = store_entry.as_array_of_tables_mut().ok_or_else(|| {
+        format!(
+            "`local_server.secret_stores.{store_id}` exists but is not an array of tables; refusing to edit in place"
+        )
+    })?;
+    for existing in store_arr.iter() {
+        if existing.get("key").and_then(|item| item.as_str()) == Some(key_value) {
+            return Ok(false);
+        }
+    }
+    let mut row = Table::new();
+    row.insert("key", value(key_value));
+    row.insert("env", value(key_value.to_ascii_uppercase()));
+    store_arr.push(row);
     Ok(true)
 }
 
@@ -2805,6 +2917,231 @@ build = \"cargo build --release\"
         assert_eq!(
             after_first, after_second,
             "second provision is a no-op -- fastly.toml must be bit-for-bit unchanged"
+        );
+    }
+
+    // ---------- provision_typed (secret stores) ----------
+
+    /// Local `provision_typed` appends
+    /// `[[local_server.secret_stores.<store_id>]]` entries with
+    /// `key = "<key_value>"` and `env = "<KEY_VALUE_UPPER>"` per
+    /// `TypedSecretEntry`, grouped by the entry's `store_id`.
+    #[test]
+    fn fastly_provision_typed_writes_secret_store_entries_under_resolved_store_id() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let entries = [
+            TypedSecretEntry::new("default", "api_token", "demo_api_token"),
+            TypedSecretEntry::new("vendor_secrets", "vendor_key", "vendor_demo_key"),
+        ];
+        FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("[[local_server.secret_stores.default]]"),
+            "default store array-of-tables header present: {after}"
+        );
+        assert!(
+            after.contains(r#"key = "demo_api_token""#),
+            "default store key line present: {after}"
+        );
+        assert!(
+            after.contains(r#"env = "DEMO_API_TOKEN""#),
+            "default store env line uppercased: {after}"
+        );
+        assert!(
+            after.contains("[[local_server.secret_stores.vendor_secrets]]"),
+            "vendor_secrets store array-of-tables header present: {after}"
+        );
+        assert!(
+            after.contains(r#"key = "vendor_demo_key""#),
+            "vendor_secrets store key line present: {after}"
+        );
+        assert!(
+            after.contains(r#"env = "VENDOR_DEMO_KEY""#),
+            "vendor_secrets store env line uppercased: {after}"
+        );
+        // Confirm shape via re-parse: the per-store slot MUST be an
+        // ArrayOfTables (not a plain table) — Viceroy expects the
+        // array-of-tables form for secret-store entries.
+        let doc: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        assert!(
+            doc["local_server"]["secret_stores"]["default"]
+                .as_array_of_tables()
+                .is_some(),
+            "default is array-of-tables"
+        );
+        assert!(
+            doc["local_server"]["secret_stores"]["vendor_secrets"]
+                .as_array_of_tables()
+                .is_some(),
+            "vendor_secrets is array-of-tables"
+        );
+    }
+
+    /// `adapter_manifest_path` may be a NESTED relative path. Entries
+    /// land in the nested `fastly.toml`, not at a sibling under
+    /// `manifest_root`.
+    #[test]
+    fn fastly_provision_typed_lands_in_resolved_fastly_toml_not_manifest_root() {
+        let dir = tempdir().expect("tempdir");
+        let nested_rel = "crates/fastly/fastly.toml";
+        let nested_path = dir.path().join(nested_rel);
+        fs::create_dir_all(nested_path.parent().expect("parent")).expect("mkdir");
+        fs::write(&nested_path, synthesise_fastly_toml("demo", None)).expect("write");
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some(nested_rel),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        let after = fs::read_to_string(&nested_path).expect("read nested");
+        assert!(
+            after.contains("[[local_server.secret_stores.default]]"),
+            "entries land in nested manifest: {after}"
+        );
+        assert!(
+            after.contains(r#"key = "demo_api_token""#),
+            "key line in nested manifest: {after}"
+        );
+        let sibling = dir.path().join("fastly.toml");
+        assert!(
+            !sibling.exists(),
+            "no sibling fastly.toml created at manifest_root"
+        );
+    }
+
+    /// Cloud mode is a no-op — real cloud secret storage uses
+    /// `fastly secret-store-entry create` at deploy time, not local
+    /// `.toml` writeback. Assert empty outcome + untouched manifest.
+    #[test]
+    fn fastly_provision_typed_cloud_mode_is_a_no_op() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        let baseline = synthesise_fastly_toml("demo", None);
+        fs::write(&path, &baseline).expect("write");
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        let outcome = FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &entries,
+                ProvisionMode::Cloud,
+                false,
+            )
+            .expect("cloud mode is a no-op, must succeed");
+        assert!(
+            outcome.status_lines.is_empty(),
+            "cloud outcome status_lines empty: {:?}",
+            outcome.status_lines
+        );
+        assert!(outcome.deployed.is_none(), "cloud outcome deployed is None");
+        let after = fs::read_to_string(&path).expect("read");
+        assert_eq!(after, baseline, "fastly.toml untouched in cloud mode");
+    }
+
+    /// Idempotency: a matching `key = "<key_value>"` entry already in
+    /// the target array is preserved (including operator's non-matching
+    /// `env` override). No duplicate row is appended.
+    #[test]
+    fn fastly_provision_typed_deduplicates_matching_key() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        let mut seed = synthesise_fastly_toml("demo", None);
+        seed.push_str(
+            "\n[[local_server.secret_stores.default]]\nkey = \"demo_api_token\"\nenv = \"CUSTOM_ENV\"\n",
+        );
+        fs::write(&path, &seed).expect("write");
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        // Operator's env override is preserved (not overwritten to the
+        // default `DEMO_API_TOKEN`).
+        assert!(
+            after.contains(r#"env = "CUSTOM_ENV""#),
+            "operator's env override preserved: {after}"
+        );
+        assert!(
+            !after.contains(r#"env = "DEMO_API_TOKEN""#),
+            "adapter did NOT overwrite operator env: {after}"
+        );
+        // Exactly one entry for the store with key = "demo_api_token".
+        let doc: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        let arr = doc["local_server"]["secret_stores"]["default"]
+            .as_array_of_tables()
+            .expect("default is array-of-tables");
+        let matches: usize = arr
+            .iter()
+            .filter(|tbl| tbl.get("key").and_then(|item| item.as_str()) == Some("demo_api_token"))
+            .count();
+        assert_eq!(matches, 1, "exactly one matching key entry: {after}");
+    }
+
+    /// Absent `fastly.toml` is a Task 8b bootstrap bug — error clearly
+    /// with the resolved absolute path, matching the Task 22
+    /// `provision_local` error style so both flows fail the same way.
+    #[test]
+    fn fastly_provision_typed_errors_if_manifest_absent() {
+        let dir = tempdir().expect("tempdir");
+        // Do NOT pre-seed fastly.toml.
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        let err = FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("missing manifest must error");
+        assert!(
+            err.contains("fastly.toml"),
+            "error names the missing path: {err}"
+        );
+        assert!(
+            err.contains(&dir.path().join("fastly.toml").display().to_string()),
+            "error contains the resolved absolute path: {err}"
         );
     }
 
