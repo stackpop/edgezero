@@ -3,22 +3,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use matchit::Router as PathRouter;
-use serde::Serialize;
 use tower_service::Service;
 
-use crate::body::Body;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
 use crate::handler::{BoxHandler, IntoHandler};
-use crate::http::{
-    header::CONTENT_TYPE, response_builder, HandlerFuture, HeaderValue, Method, Request, Response,
-    ResponseBuilder, StatusCode,
-};
+use crate::http::{HandlerFuture, Method, Request, Response};
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
 use crate::response::IntoResponse as _;
-
-pub const DEFAULT_ROUTE_LISTING_PATH: &str = "/__edgezero/routes";
 
 struct RouteEntry {
     handler: BoxHandler,
@@ -73,12 +66,6 @@ pub struct IntrospectionData {
     pub routes: Arc<[RouteInfo]>,
 }
 
-#[derive(Serialize)]
-struct RouteListingEntry {
-    method: String,
-    path: String,
-}
-
 enum RouteMatch<'route> {
     Found(&'route RouteEntry, PathParams),
     MethodNotAllowed(Vec<Method>),
@@ -90,7 +77,6 @@ pub struct RouterBuilder {
     manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
     route_info: Vec<RouteInfo>,
-    route_listing_path: Option<String>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
 }
 
@@ -118,54 +104,10 @@ impl RouterBuilder {
             .push(RouteInfo::new(method, path.to_owned()));
     }
 
-    /// # Panics
-    /// Panics if a route is registered for both an explicit path and the route-listing path.
-    /// Both paths are programmer-supplied at build time; a duplicate is a routing-config bug
-    /// that should fail loudly before the binary ever serves traffic.
-    #[expect(
-        clippy::panic,
-        reason = "duplicate route is a build-time programmer error, not a runtime condition"
-    )]
     #[must_use]
     #[inline]
-    pub fn build(mut self) -> RouterService {
-        let listing_path = self.route_listing_path.clone();
-
-        let mut route_info = self.route_info.clone();
-        if let Some(path) = &listing_path {
-            route_info.push(RouteInfo::new(Method::GET, path.clone()));
-        }
-
-        let route_index: Arc<[RouteInfo]> = Arc::from(route_info);
-
-        if let Some(path) = listing_path {
-            let outer_index = Arc::clone(&route_index);
-            let listing_handler = move |_ctx: RequestContext| {
-                let inner_index = Arc::clone(&outer_index);
-                async move {
-                    let payload: Vec<RouteListingEntry> = inner_index
-                        .iter()
-                        .map(|route| RouteListingEntry {
-                            method: route.method().as_str().to_owned(),
-                            path: route.path().to_owned(),
-                        })
-                        .collect();
-
-                    build_listing_response(&payload, response_builder())
-                }
-            };
-
-            self.routes
-                .entry(Method::GET)
-                .or_default()
-                .insert(
-                    path.as_str(),
-                    RouteEntry {
-                        handler: listing_handler.into_handler(),
-                    },
-                )
-                .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
-        }
+    pub fn build(self) -> RouterService {
+        let route_index: Arc<[RouteInfo]> = Arc::from(self.route_info);
 
         RouterService::new(
             self.routes,
@@ -182,33 +124,6 @@ impl RouterBuilder {
         H: IntoHandler,
     {
         self.route(path, Method::DELETE, handler)
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn enable_route_listing(self) -> Self {
-        self.enable_route_listing_at(DEFAULT_ROUTE_LISTING_PATH)
-    }
-
-    /// # Panics
-    /// Panics if `path` is empty or does not begin with `/`.
-    #[must_use]
-    #[inline]
-    pub fn enable_route_listing_at<S>(mut self, path: S) -> Self
-    where
-        S: Into<String>,
-    {
-        let route_listing_path = path.into();
-        assert!(
-            !route_listing_path.is_empty(),
-            "route listing path cannot be empty"
-        );
-        assert!(
-            route_listing_path.starts_with('/'),
-            "route listing path must begin with '/'"
-        );
-        self.route_listing_path = Some(route_listing_path);
-        self
     }
 
     #[must_use]
@@ -403,19 +318,6 @@ impl RouterService {
     }
 }
 
-fn build_listing_response<T: Serialize>(
-    payload: &T,
-    builder: ResponseBuilder,
-) -> Result<Response, EdgeError> {
-    let body = Body::json(payload).map_err(EdgeError::internal)?;
-    let response = builder
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .body(body)
-        .map_err(EdgeError::internal)?;
-    Ok(response)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,9 +329,7 @@ mod tests {
     use crate::response::response_with_body;
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
-    use serde::ser::Error as _;
-    use serde::{Deserialize, Serialize};
-    use serde_json::json;
+    use serde::Deserialize;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
@@ -644,117 +544,6 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let response = block_on(cloned.handler.call(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate route definition")]
-    fn route_listing_duplicate_path_panics() {
-        let _service = RouterService::builder()
-            .enable_route_listing()
-            .get(DEFAULT_ROUTE_LISTING_PATH, ok_handler)
-            .build();
-    }
-
-    #[test]
-    fn route_listing_outputs_all_routes() {
-        async fn noop(_ctx: RequestContext) -> Result<(), EdgeError> {
-            Ok(())
-        }
-
-        let service = RouterService::builder()
-            .enable_route_listing()
-            .get("/health", noop)
-            .post("/items", noop)
-            .build();
-
-        let request = request_builder()
-            .method(Method::GET)
-            .uri(DEFAULT_ROUTE_LISTING_PATH)
-            .body(Body::empty())
-            .expect("request");
-
-        let response = block_on(service.clone().call(request)).expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.body().as_bytes().expect("buffered");
-        let payload: Vec<serde_json::Value> = serde_json::from_slice(body).expect("json payload");
-
-        assert!(payload.contains(&json!({
-            "method": "GET",
-            "path": DEFAULT_ROUTE_LISTING_PATH
-        })));
-        assert!(payload.contains(&json!({
-            "method": "GET",
-            "path": "/health"
-        })));
-        assert!(payload.contains(&json!({
-            "method": "POST",
-            "path": "/items"
-        })));
-
-        let routes = service.routes();
-        assert!(routes
-            .iter()
-            .any(|route| route.path() == "/health" && *route.method() == Method::GET));
-
-        let health_request = request_builder()
-            .method(Method::GET)
-            .uri("/health")
-            .body(Body::empty())
-            .expect("request");
-        let health_response = block_on(service.clone().call(health_request)).expect("response");
-        assert_eq!(health_response.status(), StatusCode::NO_CONTENT);
-
-        let items_request = request_builder()
-            .method(Method::POST)
-            .uri("/items")
-            .body(Body::empty())
-            .expect("request");
-        let items_response = block_on(service.clone().call(items_request)).expect("response");
-        assert_eq!(items_response.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[test]
-    #[should_panic(expected = "route listing path cannot be empty")]
-    fn route_listing_rejects_empty_path() {
-        let _builder = RouterService::builder().enable_route_listing_at("");
-    }
-
-    #[test]
-    #[should_panic(expected = "route listing path must begin with '/'")]
-    fn route_listing_rejects_missing_slash() {
-        let _builder = RouterService::builder().enable_route_listing_at("routes");
-    }
-
-    #[test]
-    fn route_listing_response_handles_builder_failure() {
-        #[derive(Serialize)]
-        struct Payload {
-            ok: bool,
-        }
-
-        let builder = response_builder().header("bad\nname", "value");
-        let err =
-            build_listing_response(&Payload { ok: true }, builder).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn route_listing_response_handles_json_failure() {
-        struct FailingSerialize;
-
-        impl Serialize for FailingSerialize {
-            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                Err(S::Error::custom("boom"))
-            }
-        }
-
-        let err = build_listing_response(&FailingSerialize, response_builder())
-            .expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
