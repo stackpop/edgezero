@@ -783,6 +783,11 @@ impl OutboundResponse {
         deadline: Deadline,
     ) -> Result<T, EdgeError>;
     /// Pass the response through as a core `Response` (keeps a streamed body lazy).
+    /// Infallible for a well-formed `OutboundResponse`; the `Result` mirrors the
+    /// other terminal methods and carries `Err(EdgeError::internal(..))` only on an
+    /// adapter-invariant violation — e.g. a response whose body handle was already
+    /// surrendered by a prior terminal call (an adapter bug, reserved to `internal`
+    /// per §3.4.3, never a network/status condition).
     pub fn into_response(self) -> Result<Response, EdgeError>;
 }
 ```
@@ -983,7 +988,11 @@ impl Deadline {
     /// has no `MAX` and platform overflow behaviour differs. The clamp is
     /// finite and well above any realistic fan-out batch/proxy budget, so this never
     /// truncates a legitimate caller and never panics. Adapter boundaries must
-    /// not crash the host.
+    /// not crash the host. The internal `now + min(d, DEADLINE_FAR_FUTURE)` addition
+    /// itself uses the same saturating `now.checked_add(clamped).unwrap_or(now)` form
+    /// as `dispatch_budget` (§3.3.2), so even the defensive case where the clamped add
+    /// would overflow the underlying `Instant` yields an already-expired deadline
+    /// (fails closed) rather than panicking.
     pub fn after(d: Duration) -> Self;
     pub fn at_instant(instant: web_time::Instant) -> Self;  // construct from absolute instant
     pub fn instant(&self) -> web_time::Instant;    // accessor for the absolute instant
@@ -1977,46 +1986,35 @@ Every field is `#[serde(default)]`, so existing manifests parse unchanged.
 
 #### 3.5.2 Adapter capability metadata
 
-The registry `Adapter` trait gains one method (`capability`). The exact shape
-depends on whether the codebase is **today's pre-#269 checkout** or **PR-#269**:
+The registry `Adapter` trait gains one method (`capability`). PR #269 has merged to
+main, so the trait already carries the `provision` / config-validation surface; this
+spec adds only `capability`:
 
 ```rust
-// crates/edgezero-adapter/src/registry.rs — pre-#269 (today's checkout)
+// crates/edgezero-adapter/src/registry.rs — current (post-#269) shape
 pub trait Adapter: Sync + Send {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
     fn name(&self) -> &'static str;
-    fn capability(&self, capability: Capability) -> CapabilitySupport;   // new
-}
-```
+    fn capability(&self, capability: Capability) -> CapabilitySupport;   // added by this spec
 
-```rust
-// crates/edgezero-adapter/src/registry.rs — PR-#269 target baseline
-pub trait Adapter: Sync + Send {
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
-    fn name(&self) -> &'static str;
-    fn capability(&self, capability: Capability) -> CapabilitySupport;   // new
-
-    // The following methods are the #269 surface — now merged to main, so they
-    // are present in the current checkout (the sibling-gate rows below are the
-    // active topology; the pre-#269 fallback is historical):
+    // Already present on main as of PR #269 (shown so readers don't misread the
+    // trait as exhaustive; they do **not** affect capability metadata —
+    // `capability(..)` is the only method `ensure_capabilities` consults):
     fn provision(&self, args: &ProvisionArgs) -> Result<(), String>;
     fn push_config_entries(&self, args: &ConfigPushArgs) -> Result<(), String>;
     fn validate_config(&self, args: &ConfigValidateArgs) -> Result<(), String>;
-    // …other PR-#269 validation hooks elided here; see crates/edgezero-adapter/src/registry.rs
-    // in PR-#269 for the full set. They do **not** affect capability metadata —
-    // `capability(..)` is the only method `ensure_capabilities` consults.
+    // …other #269 validation hooks elided here; see crates/edgezero-adapter/src/registry.rs
+    // for the full set.
 }
 ```
 
-This spec only adds `capability(..)`. Everything else in the trait is owned by
-PR #269 (or by today's pre-#269 baseline, accordingly) and is shown above purely
-so readers don't misread the `Adapter` reference in §3.5.3 as an exhaustive
-declaration. The `Adapter::provision(..)` and config-validation hooks referenced
-in §3.5.3 / §6 / §7 are the PR-#269 methods listed in the second block; they are
-called from the **sibling pre-dispatch gates** on `run_provision` /
-`run_config_push` / `run_config_validate`, not from `Adapter::execute`. On
-today's checkout there is no `provision` / `config` surface at all — the
-sibling-gate wording in §3.5.3 only applies once PR #269 lands.
+This spec only adds `capability(..)`. The `provision` / config-validation methods are
+owned by PR #269 and shown above purely so readers don't misread the `Adapter`
+reference in §3.5.3 as an exhaustive declaration. The `Adapter::provision(..)` and
+config-validation hooks referenced in §3.5.3 / §6 / §7 are called from the **sibling
+pre-dispatch gates** on `run_provision` / `run_config_push` / `run_config_validate`,
+not from `Adapter::execute`. (The pre-#269 checkout had no `provision` / `config`
+surface; that fallback is now historical — appendix rounds 1–43 reflect it.)
 
 Capability matrix (all four adapters):
 
@@ -2673,6 +2671,20 @@ async fn send_all(
   the read that discovers EOF can itself cross the deadline and would otherwise
   slip through with `Ok(resp)`). Streamed bodies are wrapped to check before and
   after each underlying read. Bounded overshoot per §3.3.4.
+- **Cancellation / drop semantics.** Fastly exposes no async-cancellation primitive
+  for an in-flight `PendingRequest`, and Phase 2 harvests with **blocking** `wait()` /
+  `poll()` (no `.await` between dispatch and completion), so `send_all` has no interior
+  suspension point at which the future could be dropped mid-harvest — once Phase 1
+  returns, the loop runs synchronously to completion. Two consequences the contract
+  guarantees: (a) **every dispatched `PendingRequest` is always harvested** — the
+  Phase 2 invariant (line above) resolves each slot, so no `PendingRequest` is ever
+  leaked un-`wait()`-ed. The **only** deliberate drop-without-`wait()` is the
+  streamed-upload budget-exhausted path (§5.4 "Upload consumes the budget on Fastly"),
+  which drops the `StreamingBody` + `PendingRequest` intentionally. (b) **A sibling
+  slot's deadline firing does not abort other slots** — each slot's budget is enforced
+  independently by its own dispatch-time host timeouts plus the per-slot cooperative
+  `budget.deadline` check, never by cancelling a neighbour. The cross-slot effect is
+  strictly a *harvest-order delay* (§3.3.4 / §8 risk 8), not cross-slot cancellation.
 - **Dynamic backends.** Arbitrary HTTPS hosts use Fastly dynamic backends
   (`Backend::builder`). Per Fastly's
   [`BackendBuilder` docs](https://docs.rs/fastly/latest/fastly/backend/struct.BackendBuilder.html),
@@ -3257,6 +3269,10 @@ async fn send_all_runs_requests_concurrently() {
 | Reentrant `body_bytes` while `Draining` returns `Err(EdgeError::internal(..))` without panic | yes | — | — |
 | Pre-append cap accounting: a single oversized chunk on a small cap errors **without extending the collected buffer past `max`** (the in-flight chunk briefly co-exists with the buffer during the overflow check, per §3.4.1 / §3.4.4 — the test asserts the *persistent* buffer never grows past `max`, not that the in-flight `current_chunk` is never received). Inbound and outbound bounded drains both covered | yes | yes | — |
 | `Form` / `ValidatedForm` migrated to `form_within(DEFAULT_INBOUND_FORM_BYTES = 1 MiB)`; over-cap → 400 | yes | yes | — |
+| `Json` / `ValidatedJson` migrated to `json_within(DEFAULT_INBOUND_JSON_BYTES = 8 MiB)`; over-cap → 400; cache + poison behaviour identical to `body_bytes` (§3.4.5 / §7 `src/extractor.rs`) | yes | yes | — |
+| Explicit-cap inbound extractors `ValidatedJsonWithin<T, MAX>` / `ValidatedFormWithin<T, MAX>` enforce the const-generic `MAX` (not the default): a body over `MAX` → 400, a body under `MAX` but over the default parses `Ok`. Asserts the `MAX` override path added in §7 `src/extractor.rs` | yes | — | — |
+| Per-adapter `capability()` support matrix (§3.5.2): for each of the four registered adapters, `adapter.capability(c)` returns the documented `Native` / `BestEffort` / `Unsupported` value for **every** one of the nine capabilities (asserts the §3.5.2 matrix directly, not just gate outcomes — Axum/Fastly `BestEffort` cells included) | yes | — | — |
+| Back-compat manifest parse (§6): a manifest with **no** `[capabilities]` section parses `Ok` with `Manifest::capabilities` defaulted (`#[serde(default)]`), and every adapter-selecting command proceeds (no capability contract to enforce) | yes | — | — |
 | Adapter `dispatch_budget(req)` everywhere: each adapter calls the core `dispatch_budget(req, now)` helper and threads the resulting `DispatchBudget` to its platform timer. The **core helper** is Tier 1 (covered by the row above); the "every adapter actually calls it" assertion is Tier 2 (contract crate inspects the call site) / Tier 3 (real runtime observes the 30 s cap) | — | yes | yes |
 | `.timeout(short).deadline(long)` honours the *shorter* effective — **dispatch_budget classification (Tier 1):** the core helper returns `DispatchBudget { duration: short, deadline: now + short }`. Mock-driven test asserts the classification | yes | — | — |
 | `.timeout(short).deadline(long)` honours the *shorter* effective deadline end-to-end (streamed body returns 504 at `now + short`, not `now + long`) — **adapter wrapper (Tier 2 / Tier 3):** wrapper armed with `budget.duration` actually fires at `now + short` against a real platform timer | — | yes | yes |
@@ -3327,22 +3343,32 @@ also runs the Axum `tests/contract.rs` and the Tier 1 suite. The Tier 3
 runtime jobs are added to `.github/workflows/test.yml` as separate jobs so a
 missing runtime never blocks the core gate.
 
-**Spin gate triple — pre-#269 vs PR-#269.** The fifth gate's literal command
-string is checkout-dependent and **not preserved verbatim** across PR #269:
+**Where Tier 2 runs per adapter.** Only Axum's `tests/contract.rs` is native, so
+it (plus the Tier 1 core suite) runs under the host `cargo test --workspace
+--all-targets` gate. The three WASM adapters' contract tests are
+`#![cfg(all(feature = "<adapter>", target_arch = "wasm32"))]`-gated, so they do
+**not** run on the host gate; they execute in `test.yml`'s existing per-adapter
+wasm-target matrix step — `cargo test -p edgezero-adapter-<adapter> --features
+<adapter> --target <wasm-target> --test contract` (Fastly `wasm32-wasip1`, Spin
+`wasm32-wasip2`, Cloudflare `wasm32-unknown-unknown`). The no-network Tier 2
+assertions (registered-backend map inspection, SDK call/chunk counters, harvest
+ordering against host-side fakes) run there; Tier 3 wall-clock jobs remain the
+separate runtime jobs above.
 
-- **Pre-#269 (today's checkout):** `cargo check -p edgezero-adapter-spin --target
-  wasm32-wasip1 --features spin` — matches `crates/edgezero-adapter-spin`'s
-  current SDK 5 / wasip1 target. This is the form `CLAUDE.md` currently
-  quotes.
-- **PR-#269 (target baseline):** `cargo check -p edgezero-adapter-spin --target
-  wasm32-wasip2 --features spin` — Spin SDK 6 / wasip2 (status-header bullet).
-  Implementers landing this spec **after** PR #269 must update the gate quote
-  in `CLAUDE.md` and `.github/workflows/*.yml` to `wasm32-wasip2`; preserving
-  the stale `wasm32-wasip1` quote would silently break the Spin build. §8
-  risk 10 tracks the CLAUDE.md / CI quote refresh.
+**Spin gate triple — now wasip2 (PR #269 merged).** The fifth gate's literal
+command string changed with PR #269, which has since merged to main:
 
-The other four gates are unaffected by PR #269 and apply identically in
-both worlds.
+- **Active (post-#269, current main):** `cargo check -p edgezero-adapter-spin
+  --target wasm32-wasip2 --features spin` — Spin SDK 6 / wasip2. This is the
+  gate this spec is written against.
+- **Historical (pre-#269):** `cargo check -p edgezero-adapter-spin --target
+  wasm32-wasip1 --features spin` — the SDK 5 / wasip1 form. `CLAUDE.md` and some
+  `.github/workflows/*.yml` snippets still quote this stale `wasm32-wasip1`
+  triple in places; leaving it there would silently break the Spin build, so the
+  quote refresh to `wasm32-wasip2` is a required follow-up (§7 "Project meta";
+  §8 risk 10).
+
+The other four gates are unaffected and apply identically.
 
 ## 6. Migration impact
 
@@ -3370,7 +3396,7 @@ Other changes:
 - **`Manifest`** gains `capabilities` (with nested `outbound`) — additive
   (`#[serde(default)]`); existing manifests parse unchanged.
 - **`Adapter` trait** gains `capability()` — all four registered adapters implement it.
-- **CLI** dispatch in the PR-#269 world: `ensure_capabilities` is wired in at
+- **CLI** dispatch (PR #269, now on main): `ensure_capabilities` is wired in at
   **five pre-dispatch gate sites** (§3.5.3) — one inside
   `edgezero_cli::adapter::execute(..)` (covering `build` / `serve` / `deploy` /
   `auth login` / `auth logout` / `auth status`, *before* the manifest-shell-command
@@ -3480,6 +3506,12 @@ Other changes:
   `OutboundHttpClient::send` and `send_all`, buffered + streamed modes,
   decompressed-byte cap, header normalization for decompressed responses
   (strip `content-encoding` / `content-length`).
+- `src/request.rs` — update the platform-request → `RequestContext` materialisation
+  for the round-6 / §3.4.5 restructure: build the context from `parts` + a
+  `BodyCell` instead of an owned `Request`, and route inbound body access through
+  `body_bytes` / `json_within` / `form_within` (per the §6 `RequestContext` sweep).
+  Applies to the Axum and Cloudflare `request.rs` modules that wrap `Body::Stream`
+  (§3.4.1); Fastly and Spin adjust their equivalent request-materialisation site.
 - `src/response.rs` — **per-adapter streaming policy.** Today each adapter's
   response converter (`crates/edgezero-adapter-{axum,fastly,spin}/src/response.rs`)
   buffers `Body::Stream` before producing the platform response. The migration
@@ -3554,7 +3586,10 @@ Other changes:
     dependency** for the SHA-256 digest; the 128-bit truncation is `&digest[..16]`.
     Alternatively, if a SHA-256 helper already exists in `edgezero-core` (audit step
     in the same sweep), the adapter uses that; either way the dep is declared
-    explicitly in this migration, not assumed transitive.
+    explicitly in this migration, not assumed transitive. **Root `Cargo.toml`
+    `[workspace.dependencies]` already declares `sha2` as of PR #269**, so only the
+    Fastly crate's `sha2 = { workspace = true }` opt-in is new — no root-manifest
+    edit is required.
   - Dispatch-time host timeouts and SSL configuration on `BackendBuilder` per
     §3.3.4 / §4.3, using the **four canonical URI accessors** introduced in
     rounds 25 / 46 / 47:
@@ -3579,6 +3614,12 @@ Other changes:
     `with_backend(..)` setter on `Request`.
 - Spin: render `allowed_outbound_hosts` from the manifest per §3.5.4.
 - `tests/contract.rs` — created for Axum; extended for the other three (§5).
+- Tier 3 mock origin — new `MockServer` helper (`start_with_delay`, §5.3), a tokio
+  loopback HTTP server used only by the native Tier 3 tests. It lives in the Axum
+  adapter's `tests/` (or a shared `dev-dependencies` test-support module) so it never
+  enters the WASM adapters' build graph; it is **not** the in-process
+  `MockOutboundClient` (that is the Tier 1 core mock listed under
+  `edgezero-core/Cargo.toml`).
 
 **`crates/edgezero-cli`**
 - `src/adapter.rs` — wire `ensure_capabilities` as the **first statement** of
@@ -3589,8 +3630,13 @@ Other changes:
   three commands that don't flow through `execute(..)` — `run_provision`,
   `run_config_push`, `run_config_validate` — get **sibling pre-dispatch gates**:
   each is the first statement of its `run_*` function and calls the same
-  `ensure_capabilities` helper. The contributor-only `run_demo` also calls
-  `ensure_capabilities("axum", ..)` at its top before the Axum runner starts.
+  `ensure_capabilities` helper. Concretely those functions live at
+  `crates/edgezero-cli/src/provision.rs::run_provision` and
+  `crates/edgezero-cli/src/config.rs::{run_config_push, run_config_validate}`; the
+  contributor-only `run_demo` (`crates/edgezero-cli/src/demo_server.rs`, re-exported
+  via `src/lib.rs`) also calls `ensure_capabilities("axum", ..)` at its top before
+  the Axum runner starts. The `ensure_capabilities` helper itself is **defined new in
+  `src/adapter.rs`** (alongside `execute`) and imported by the sibling gate sites.
   **All five gate sites** (one inside `execute(..)`, the four siblings on
   `run_provision` / `run_config_push` / `run_config_validate` / `run_demo`) are
   documented in §3.5.3's gate table. The legacy `handle_build` / `handle_serve`
@@ -3613,8 +3659,18 @@ Other changes:
 - `proxying.md`, `adapters/overview.md`, `handlers.md` (and any other proxy references) —
   rewrite for the outbound API.
 
-**`.github/workflows/test.yml`**
-- add Tier 3 runtime jobs (Axum now; Fastly/Cloudflare/Spin as runtimes are wired).
+**`.github/workflows/*.yml`**
+- add Tier 3 runtime jobs to `test.yml` (Axum now; Fastly/Cloudflare/Spin as runtimes
+  are wired).
+- refresh any Spin `cargo check` gate quote from `wasm32-wasip1` to `wasm32-wasip2`
+  (SDK 6, PR #269). The per-adapter wasm-target matrix already uses the correct
+  triples; the stale quote lives in prose/snippet form (§5.5, §8 risk 10).
+
+**`CLAUDE.md`**
+- refresh the Spin gate command and the Compilation-Targets table from
+  `wasm32-wasip1` to `wasm32-wasip2` so contributors don't paste the pre-#269 triple
+  (§5.5, §8 risk 10). No `§3`/`§4` design change — the spec references
+  `spin_sdk::http::send` symbolically, which is SDK-6-compatible.
 
 ## 8. Open questions / risks
 
