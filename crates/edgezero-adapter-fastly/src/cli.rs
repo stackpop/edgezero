@@ -208,13 +208,21 @@ impl Adapter for FastlyCliAdapter {
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         stores: &ProvisionStores<'_>,
-        _deployed: Option<&AdapterDeployedState>,
+        deployed: Option<&AdapterDeployedState>,
         mode: ProvisionMode,
         dry_run: bool,
     ) -> Result<ProvisionOutcome, String> {
         match mode {
             ProvisionMode::Cloud => {}
-            ProvisionMode::Local => return Err("local mode lands in Section 5".to_owned()),
+            ProvisionMode::Local => {
+                return provision_local(
+                    manifest_root,
+                    adapter_manifest_path,
+                    stores,
+                    deployed,
+                    dry_run,
+                );
+            }
         }
         // Fastly is Multi for every store kind. Each id maps 1:1
         // to a Fastly resource (kv-store / config-store /
@@ -1035,6 +1043,268 @@ fn write_fastly_local_config_store(
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     Ok(())
+}
+
+/// Local-mode provision: seed Viceroy state in `fastly.toml` for the
+/// declared stores + the `edgezero_runtime_env` runtime-override
+/// store. NO shell-outs to `fastly` -- everything is a `toml_edit`
+/// mutation, so operators can run `provision --local` without
+/// authenticating.
+///
+/// The manifest must already exist (Task 8b's CLI bootstrap writes it
+/// via `synthesise_fastly_toml`); we deliberately don't re-synthesise
+/// here because the app name isn't in scope at this call site.
+///
+/// `deployed.fields.get("service_id")`, when present, is upserted to
+/// the top-level `service_id` key -- spec says the deployed
+/// service-id wins over anything the operator pre-seeded from a stale
+/// template. When `deployed` has no `service_id` we leave any existing
+/// value alone (operator's local seed is authoritative).
+///
+/// All other mutations (kv-store blocks, config-store blocks, runtime
+/// override block) are idempotent — re-running is a no-op.
+fn provision_local(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    stores: &ProvisionStores<'_>,
+    deployed: Option<&AdapterDeployedState>,
+    dry_run: bool,
+) -> Result<ProvisionOutcome, String> {
+    use toml_edit::{value, DocumentMut};
+
+    let fastly_rel = adapter_manifest_path.unwrap_or("fastly.toml");
+    let fastly_path = manifest_root.join(fastly_rel);
+    if !fastly_path.exists() {
+        return Err(format!(
+            "expected fastly.toml at {} (Task 8b's CLI bootstrap should have written it before provision ran)",
+            fastly_path.display()
+        ));
+    }
+    let raw = fs::read_to_string(&fastly_path)
+        .map_err(|err| format!("failed to read {}: {err}", fastly_path.display()))?;
+    let mut doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", fastly_path.display()))?;
+
+    let mut status_lines: Vec<String> = Vec::new();
+
+    // 1. Upsert top-level `service_id` from deployed. Applies to BOTH
+    //    synthesis and MERGE paths -- operators who pre-seeded
+    //    fastly.toml from a stale template still get the cloud-
+    //    authoritative id pinned. No cloud authority => leave any
+    //    existing operator-set value alone.
+    if let Some(sid) = deployed.and_then(|state| state.fields.get("service_id")) {
+        doc.insert("service_id", value(sid.as_str()));
+        status_lines.push(format!(
+            "fastly: pinned service_id = \"{sid}\" from deployed"
+        ));
+    }
+
+    // 2. [[local_server.kv_stores.<platform>]] per KV store.
+    for store in stores.kv {
+        upsert_local_kv_store(&mut doc, &store.platform)?;
+        status_lines.push(format!(
+            "fastly: local kv_store `{}` (logical id `{}`)",
+            store.platform, store.logical
+        ));
+    }
+
+    // 3. [local_server.config_stores.<platform>] + empty `.contents`
+    //    sub-table per CONFIG store. `contents` MUST be a TOML table
+    //    (not `contents = ""`) -- the `config push --local` writer
+    //    edits it in place via `as_table_mut()`.
+    for store in stores.config {
+        upsert_local_config_store(&mut doc, &store.platform)?;
+        status_lines.push(format!(
+            "fastly: local config_store `{}` (logical id `{}`)",
+            store.platform, store.logical
+        ));
+    }
+
+    // 4. `edgezero_runtime_env` block: __NAME lines for all kinds +
+    //    commented __KEY placeholders for CONFIG stores. Same
+    //    discipline as Cloudflare `.dev.vars`.
+    if upsert_runtime_env_config_store(&mut doc, stores)? {
+        status_lines.push("fastly: wrote edgezero_runtime_env block".to_owned());
+    }
+
+    if !dry_run {
+        fs::write(&fastly_path, doc.to_string())
+            .map_err(|err| format!("failed to write {}: {err}", fastly_path.display()))?;
+    }
+
+    Ok(ProvisionOutcome {
+        status_lines,
+        deployed: None,
+    })
+}
+
+/// Append `[[local_server.kv_stores.<platform_name>]]` with a stub
+/// `key = "__init__"` / `data = ""` row to `doc`, IFF no entry with
+/// that platform name already exists. Idempotent.
+fn upsert_local_kv_store(
+    doc: &mut toml_edit::DocumentMut,
+    platform_name: &str,
+) -> Result<(), String> {
+    use toml_edit::{value, ArrayOfTables, Item, Table};
+
+    let local_server_entry = doc
+        .entry("local_server")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
+        "`local_server` exists but is not a table; refusing to edit in place".to_owned()
+    })?;
+    let kv_stores_entry = local_server_tbl
+        .entry("kv_stores")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let kv_stores_tbl = kv_stores_entry.as_table_mut().ok_or_else(|| {
+        "`local_server.kv_stores` exists but is not a table; refusing to edit in place".to_owned()
+    })?;
+    // Idempotent: skip if an array-of-tables (or anything) already
+    // registered for this platform name.
+    if kv_stores_tbl.contains_key(platform_name) {
+        return Ok(());
+    }
+    let mut arr = ArrayOfTables::new();
+    let mut row = Table::new();
+    row.insert("key", value("__init__"));
+    row.insert("data", value(""));
+    arr.push(row);
+    kv_stores_tbl.insert(platform_name, Item::ArrayOfTables(arr));
+    Ok(())
+}
+
+/// Insert `[local_server.config_stores.<platform_name>]` with
+/// `format = "inline-toml"` and an EMPTY `contents` sub-TABLE. The
+/// empty table (NOT `contents = ""`) is load-bearing: the Fastly
+/// `config push --local` writer edits `contents` in place via
+/// `as_table_mut()` and refuses to proceed if it isn't a table.
+/// Idempotent — skip if the block already exists.
+fn upsert_local_config_store(
+    doc: &mut toml_edit::DocumentMut,
+    platform_name: &str,
+) -> Result<(), String> {
+    use toml_edit::{value, Item, Table};
+
+    let local_server_entry = doc
+        .entry("local_server")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
+        "`local_server` exists but is not a table; refusing to edit in place".to_owned()
+    })?;
+    let config_stores_entry = local_server_tbl
+        .entry("config_stores")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let config_stores_tbl = config_stores_entry.as_table_mut().ok_or_else(|| {
+        "`local_server.config_stores` exists but is not a table; refusing to edit in place"
+            .to_owned()
+    })?;
+    if config_stores_tbl.contains_key(platform_name) {
+        return Ok(());
+    }
+    let mut store_tbl = Table::new();
+    store_tbl.set_implicit(false);
+    store_tbl.insert("format", value("inline-toml"));
+    let mut contents_tbl = Table::new();
+    contents_tbl.set_implicit(false);
+    store_tbl.insert("contents", Item::Table(contents_tbl));
+    config_stores_tbl.insert(platform_name, Item::Table(store_tbl));
+    Ok(())
+}
+
+/// Insert `[local_server.config_stores.edgezero_runtime_env]` with
+/// `format = "inline-toml"` and a `.contents` sub-table containing:
+/// - one `EDGEZERO__STORES__<KIND>__<LOGICAL_UPPER>__NAME = "<platform>"`
+///   line per declared store across ALL kinds (KV / CONFIG / SECRETS);
+/// - one COMMENTED `# EDGEZERO__STORES__CONFIG__<LOGICAL_UPPER>__KEY =
+///   "<logical>_staging"` placeholder per CONFIG store, mirroring the
+///   Cloudflare `.dev.vars` discipline. Fastly has no way to preview
+///   the KEY overlay at provision time — commented placeholders hint
+///   the shape and let the operator uncomment + fill it in.
+///
+/// Idempotent — skip if the block already exists. Returns `true` when
+/// the block was newly written, `false` when it was already present.
+fn upsert_runtime_env_config_store(
+    doc: &mut toml_edit::DocumentMut,
+    stores: &ProvisionStores<'_>,
+) -> Result<bool, String> {
+    use toml_edit::{value, Item, Table};
+
+    const RUNTIME_ENV_NAME: &str = "edgezero_runtime_env";
+
+    let local_server_entry = doc
+        .entry("local_server")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let local_server_tbl = local_server_entry.as_table_mut().ok_or_else(|| {
+        "`local_server` exists but is not a table; refusing to edit in place".to_owned()
+    })?;
+    let config_stores_entry = local_server_tbl
+        .entry("config_stores")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let config_stores_tbl = config_stores_entry.as_table_mut().ok_or_else(|| {
+        "`local_server.config_stores` exists but is not a table; refusing to edit in place"
+            .to_owned()
+    })?;
+    if config_stores_tbl.contains_key(RUNTIME_ENV_NAME) {
+        return Ok(false);
+    }
+
+    let mut store_tbl = Table::new();
+    store_tbl.set_implicit(false);
+    store_tbl.insert("format", value("inline-toml"));
+
+    let mut contents_tbl = Table::new();
+    contents_tbl.set_implicit(false);
+    for (kind_label, kind_stores) in [
+        ("KV", stores.kv),
+        ("CONFIG", stores.config),
+        ("SECRETS", stores.secrets),
+    ] {
+        for store in kind_stores {
+            let key = format!(
+                "EDGEZERO__STORES__{kind_label}__{}__NAME",
+                store.logical.to_ascii_uppercase()
+            );
+            contents_tbl.insert(&key, value(store.platform.as_str()));
+        }
+    }
+
+    // Commented `__KEY` placeholders for CONFIG stores. Toml_edit
+    // has no primitive for "commented key inside a table", so we
+    // stash the comment lines as a suffix on the last-inserted
+    // key/value's decor. The test asserts only presence-as-substring
+    // in the raw file text, so location within the block doesn't
+    // matter — but appending at the end keeps the __NAME contract
+    // uncontaminated (a re-parse still yields only real keys).
+    let comment_suffix: String = stores
+        .config
+        .iter()
+        .map(|store| {
+            let upper = store.logical.to_ascii_uppercase();
+            let logical = store.logical.as_str();
+            format!("\n# EDGEZERO__STORES__CONFIG__{upper}__KEY = \"{logical}_staging\"")
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    if !comment_suffix.is_empty() {
+        let last_key = contents_tbl.iter().last().map(|(key, _)| key.to_owned());
+        if let Some(last) = last_key {
+            if let Some(item) = contents_tbl.get_mut(&last) {
+                if let Some(val) = item.as_value_mut() {
+                    val.decor_mut().set_suffix(comment_suffix);
+                }
+            }
+        } else {
+            // Edge case: no declared stores at all (contents_tbl is
+            // empty). Attach the comments via the contents table's
+            // own decor so they survive serialisation.
+            contents_tbl.decor_mut().set_suffix(comment_suffix);
+        }
+    }
+
+    store_tbl.insert("contents", Item::Table(contents_tbl));
+    config_stores_tbl.insert(RUNTIME_ENV_NAME, Item::Table(store_tbl));
+    Ok(true)
 }
 
 // -------------------------------------------------------------------
@@ -2221,6 +2491,320 @@ build = \"cargo build --release\"
         assert!(
             note.is_none(),
             "no service_id => no resource-link prompt: {note:?}"
+        );
+    }
+
+    // ---------- provision (local mode) ----------
+
+    /// Local provision writes `[[local_server.kv_stores.<platform>]]`
+    /// and `[local_server.config_stores.<platform>]` blocks. The
+    /// config-store block's `contents` MUST be a TOML table (not
+    /// `contents = ""`), because the Fastly `config push --local`
+    /// writer edits it in place via `as_table_mut()`.
+    #[test]
+    fn fastly_local_provision_writes_kv_and_config_store_blocks() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        // KV: array-of-tables with the stub row.
+        assert!(
+            after.contains("[[local_server.kv_stores.sessions]]"),
+            "kv block present: {after}"
+        );
+        assert!(
+            after.contains(r#"key = "__init__""#),
+            "kv stub key present: {after}"
+        );
+        assert!(
+            after.contains(r#"data = """#),
+            "kv stub data present: {after}"
+        );
+        // CONFIG: table block plus empty contents SUB-TABLE (not
+        // `contents = ""`). Re-parse to confirm shape.
+        assert!(
+            after.contains("[local_server.config_stores.app_config]"),
+            "config-store block header present: {after}"
+        );
+        assert!(
+            after.contains(r#"format = "inline-toml""#),
+            "config-store format key present: {after}"
+        );
+        assert!(
+            after.contains("[local_server.config_stores.app_config.contents]"),
+            "config-store contents sub-table header present: {after}"
+        );
+        assert!(
+            !after.contains(r#"contents = """#),
+            "contents MUST NOT be an empty string: {after}"
+        );
+        let doc: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        assert!(
+            doc["local_server"]["config_stores"]["app_config"]["contents"]
+                .as_table()
+                .is_some(),
+            "contents parses as a table (required by config push --local)"
+        );
+    }
+
+    /// Local provision writes the `edgezero_runtime_env` runtime-
+    /// override block: `__NAME` lines for ALL declared kinds and
+    /// commented `__KEY` placeholders for CONFIG stores only.
+    #[test]
+    fn fastly_local_provision_writes_edgezero_runtime_env() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("[local_server.config_stores.edgezero_runtime_env]"),
+            "runtime-env block header present: {after}"
+        );
+        assert!(
+            after.contains("[local_server.config_stores.edgezero_runtime_env.contents]"),
+            "runtime-env contents sub-table header present: {after}"
+        );
+        assert!(
+            after.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME = "app_config""#),
+            "CONFIG __NAME line: {after}"
+        );
+        assert!(
+            after.contains(r#"EDGEZERO__STORES__KV__SESSIONS__NAME = "sessions""#),
+            "KV __NAME line: {after}"
+        );
+        assert!(
+            after.contains(r#"# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY = "app_config_staging""#),
+            "commented CONFIG __KEY placeholder present: {after}"
+        );
+    }
+
+    /// A missing `fastly.toml` is a bug in the Task 8b bootstrap path.
+    /// Provision must error CLEARLY -- naming the expected path --
+    /// rather than silently re-synthesising (we don't have the app
+    /// name in scope here).
+    #[test]
+    fn fastly_local_provision_errors_if_manifest_absent() {
+        let dir = tempdir().expect("tempdir");
+        // Do NOT pre-seed fastly.toml.
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        let err = FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("missing manifest must error");
+        assert!(
+            err.contains("fastly.toml"),
+            "error names the missing path: {err}"
+        );
+        assert!(
+            err.contains(&dir.path().join("fastly.toml").display().to_string()),
+            "error contains the resolved absolute path: {err}"
+        );
+    }
+
+    /// Spec §"Fastly": the deployed `service_id` must be upserted
+    /// during BOTH synthesis AND merge. Task 21 handles synthesis
+    /// (first-run bootstrap); THIS lock covers the merge case where
+    /// the operator pre-seeded fastly.toml from a stale template
+    /// before a deploy happened.
+    #[test]
+    fn fastly_local_provision_upserts_deployed_service_id_into_existing_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Pre-seed WITHOUT service_id.
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        assert!(
+            !fs::read_to_string(&path)
+                .expect("read")
+                .contains("service_id"),
+            "baseline has no service_id"
+        );
+        let mut deployed = AdapterDeployedState::default();
+        deployed
+            .fields
+            .insert("service_id".to_owned(), "SVC1".to_owned());
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                Some(&deployed),
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains(r#"service_id = "SVC1""#),
+            "deployed service_id pinned into merged manifest: {after}"
+        );
+    }
+
+    /// Inverse of the previous lock: when there's no cloud authority
+    /// (deployed = None), operator's local value wins. Provision must
+    /// NOT overwrite a `service_id` the operator set themselves.
+    #[test]
+    fn fastly_local_provision_leaves_operator_service_id_alone_when_deployed_absent() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", Some("operator-set"))).expect("write");
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains(r#"service_id = "operator-set""#),
+            "operator-set service_id survives when deployed absent: {after}"
+        );
+    }
+
+    /// `adapter_manifest_path` may be a NESTED relative path (e.g.
+    /// `crates/fastly/fastly.toml`). Provision must land its writes
+    /// in the nested file, NOT at a sibling under `manifest_root`.
+    #[test]
+    fn fastly_local_provision_resolves_nested_adapter_manifest_path() {
+        let dir = tempdir().expect("tempdir");
+        let nested_rel = "crates/fastly/fastly.toml";
+        let nested_path = dir.path().join(nested_rel);
+        fs::create_dir_all(nested_path.parent().expect("parent")).expect("mkdir");
+        fs::write(&nested_path, synthesise_fastly_toml("demo", None)).expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some(nested_rel),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        let after = fs::read_to_string(&nested_path).expect("read nested");
+        assert!(
+            after.contains("[[local_server.kv_stores.sessions]]"),
+            "merge lands in nested manifest: {after}"
+        );
+        // And no sibling was created at manifest_root level.
+        let sibling = dir.path().join("fastly.toml");
+        assert!(
+            !sibling.exists(),
+            "no sibling fastly.toml created at manifest_root"
+        );
+    }
+
+    /// Idempotency lock: running local provision twice on the same
+    /// fixture must leave the manifest bit-for-bit unchanged (mod the
+    /// first-run mutation).
+    #[test]
+    fn fastly_local_provision_is_idempotent_on_second_run() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first run succeeds");
+        let after_first = fs::read_to_string(&path).expect("read after first");
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("second run succeeds");
+        let after_second = fs::read_to_string(&path).expect("read after second");
+        assert_eq!(
+            after_first, after_second,
+            "second provision is a no-op -- fastly.toml must be bit-for-bit unchanged"
         );
     }
 
