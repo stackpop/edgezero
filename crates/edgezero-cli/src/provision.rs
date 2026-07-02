@@ -274,8 +274,10 @@ mod tests {
     use edgezero_adapter::registry::{
         register_adapter, Adapter, AdapterAction, ProvisionMode, ProvisionOutcome,
     };
+    use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::io;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
 
@@ -315,7 +317,32 @@ serve = "echo"
     static SYNTH_CALLED: AtomicBool = AtomicBool::new(false);
     static VALIDATE_SAW_FILE: AtomicBool = AtomicBool::new(false);
 
+    /// RAII guard: on `set`, chdir into `new_cwd`; on drop, restore
+    /// the previous cwd. Callers MUST hold `manifest_guard()` while
+    /// this is live — process cwd is global state and can only be
+    /// mutated safely under that serialisation lock.
+    struct CwdGuard(PathBuf);
+
     struct FakeBootstrapAdapter;
+
+    impl CwdGuard {
+        fn set(new_cwd: &Path) -> io::Result<Self> {
+            let prev = env::current_dir()?;
+            env::set_current_dir(new_cwd)?;
+            Ok(Self(prev))
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            // Best-effort cwd restore during unwind or normal drop.
+            // A failure here is unrecoverable at the drop site; the
+            // manifest_guard() lock the caller holds is released
+            // regardless, so the next test acquiring it will
+            // set_current_dir explicitly if it needs to.
+            drop(env::set_current_dir(&self.0));
+        }
+    }
 
     #[expect(
         clippy::missing_trait_methods,
@@ -928,16 +955,16 @@ ids = ["default"]
     #[test]
     fn provision_local_accepts_relative_manifest_root_default() {
         // Bare `--manifest edgezero.toml` — `args.manifest.parent()`
-        // returns "". Path-safety must not reject the well-formed
-        // adapter paths in this fixture; the axum adapter itself
-        // then errors from Section 5 because local mode isn't wired
-        // yet, but that error is NOT a path-safety error.
+        // returns "", triggering the `.unwrap_or_else(|| Path::new("."))`
+        // fallback. To reach that fallback we must actually load
+        // edgezero.toml relative to cwd, so chdir into a tempdir
+        // that holds a valid fixture. The `_cwd` RAII guard restores
+        // the previous cwd on drop; `_lock` serialises all cwd + env
+        // manipulation.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
-        let manifest_path = temp.path().join("edgezero.toml");
-        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
-        let manifest_str = manifest_path.to_string_lossy().into_owned();
-        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        fs::write(temp.path().join("edgezero.toml"), PROVISION_MANIFEST).expect("write manifest");
+        let _cwd = CwdGuard::set(temp.path()).expect("chdir into tempdir");
 
         let err = run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
@@ -945,7 +972,15 @@ ids = ["default"]
             local: true,
             manifest: PathBuf::from("edgezero.toml"),
         })
-        .expect_err("local dispatch reaches adapter (Section 5 stub errors)");
+        .expect_err("must reach the (true, true) dispatch stub");
+        // Positive assertion: the (true, true) arm's stub error
+        // proves the manifest loaded AND path-safety passed. Without
+        // this, a manifest-load failure would silently satisfy the
+        // negative assertions below and give false-positive coverage.
+        assert!(
+            err.contains("local dry-run staging lands in Task 10/11"),
+            "must reach dispatch matrix, not fail on manifest load: {err}"
+        );
         assert!(
             !err.contains("must not contain `..` traversal")
                 && !err.contains("must be a project-relative path")
@@ -956,15 +991,13 @@ ids = ["default"]
 
     #[test]
     fn provision_local_accepts_relative_manifest_root_nested() {
-        // Nested `--manifest <tempdir>/edgezero.toml` — parent is
-        // the tempdir path. Same shape as above: path-safety passes,
-        // the axum adapter errors from its Section 5 stub.
+        // Nested `--manifest <tempdir>/edgezero.toml` — parent is the
+        // tempdir path (non-empty), exercising the standard
+        // `args.manifest.parent()` code path.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
-        let manifest_str = manifest_path.to_string_lossy().into_owned();
-        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
 
         let err = run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
@@ -972,7 +1005,11 @@ ids = ["default"]
             local: true,
             manifest: manifest_path.clone(),
         })
-        .expect_err("local dispatch reaches adapter (Section 5 stub errors)");
+        .expect_err("must reach the (true, true) dispatch stub");
+        assert!(
+            err.contains("local dry-run staging lands in Task 10/11"),
+            "must reach dispatch matrix, not fail on manifest load: {err}"
+        );
         assert!(
             !err.contains("must not contain `..` traversal")
                 && !err.contains("must be a project-relative path")
