@@ -120,6 +120,15 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     }
     manifest.finalize();
 
+    let manifest_json = match serde_json::to_string(&manifest) {
+        Ok(json) => json,
+        Err(err) => {
+            let msg = format!("failed to serialize manifest to JSON: {err}");
+            return quote!(compile_error!(#msg);).into();
+        }
+    };
+    let manifest_json_lit = LitStr::new(&manifest_json, Span::call_site());
+
     let app_ident = args
         .app_ident
         .unwrap_or_else(|| Ident::new("App", Span::call_site()));
@@ -170,6 +179,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
         pub fn build_router() -> edgezero_core::router::RouterService {
             let mut builder = edgezero_core::router::RouterService::builder();
+            builder = builder.with_manifest_json(#manifest_json_lit);
             #(#middleware_tokens)*
             #(#route_tokens)*
             builder.build()
