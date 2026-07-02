@@ -20,7 +20,7 @@
 
 **Goal:** Add three reusable core introspection handlers — `edgezero_core::introspection::{manifest, config, routes}` — that any app binds via `[[triggers.http]]`, default-mounted at `/_<app-name>/{manifest,config,routes}`.
 
-**Architecture (final — see Addendum):** `Manifest` gains `Serialize`; the `app!` macro bakes it to JSON via `RouterService::builder().with_manifest_json(...)`. Handlers opt into introspection data with an atomic `#[action(manifest)]` / `#[action(routes)]` parameter, which expands them to capability-carrying handler structs; `add_route` reads `DynHandler::needs_introspection()` and flags the `RouteEntry`; `RouterInner::dispatch` injects a shared `Arc<IntrospectionData>` **only for flagged routes**. `ManifestJson`/`RouteTable` extractors read it; `config` uses the default config store (no injection). `app!` and `edgezero.toml` never learn about introspection. The legacy `enable_route_listing` machinery and `/__edgezero/routes` are removed.
+**Architecture (final — see Addendum):** `Manifest` gains `Serialize`; the `app!` macro bakes it to JSON via `RouterService::builder().with_manifest_json(...)`. Handlers opt into introspection data with an atomic `#[action(manifest)]` / `#[action(routes)]` parameter, which expands them to capability-carrying handler structs whose `DynHandler::introspection_needs()` returns an `IntrospectionNeeds { manifest, routes }`; `add_route` reads it onto the `RouteEntry`; `RouterInner::dispatch` injects each payload **independently and only for routes that asked** — `ManifestJson` iff `needs.manifest`, `RouteTable` iff `needs.routes` (no shared bundle). The `ManifestJson`/`RouteTable` extractors are themselves the injected payloads and clone their own type back out via a `pub(crate) extension::<T>()` accessor; `config` uses the default config store (no injection). `app!` and `edgezero.toml` never learn about introspection. The legacy `enable_route_listing` machinery and `/__edgezero/routes` are removed.
 
 **Tech Stack:** Rust 1.95 (edition 2021), `serde`/`serde_json`, `matchit` routing, `#[action]`/`app!` proc-macros, `futures::executor::block_on` for tests. WASM-first: no Tokio, no runtime-specific deps in core.
 
@@ -1258,8 +1258,24 @@ pub trait DynHandler: Send + Sync {
 }
 ```
   The `Fn` blanket impl needs no change.
-- [ ] **Step 2 — verify:** `cargo build -p edgezero-core`; `cargo fmt -p edgezero-core`; `cargo clippy -p edgezero-core --all-targets -- -D warnings`.
-- [ ] **Step 3 — commit:** `Add IntrospectionNeeds + DynHandler::introspection_needs`
+- [ ] **Step 2 — test that a plain fn/closure handler reports the default.** Add to `handler.rs`'s `#[cfg(test)]` (the blanket `impl DynHandler for F: Fn(...)` must yield all-false):
+```rust
+#[test]
+fn fn_handler_reports_default_introspection_needs() {
+    // A plain closure handler uses the blanket DynHandler impl.
+    let handler = |_ctx: crate::context::RequestContext| async {
+        Ok::<&'static str, crate::error::EdgeError>("ok")
+    };
+    assert_eq!(
+        crate::handler::DynHandler::introspection_needs(&handler),
+        IntrospectionNeeds::default()
+    );
+    assert!(!IntrospectionNeeds::default().any());
+}
+```
+  (Match the crate's test imports; `&str: IntoResponse` satisfies the blanket bound.)
+- [ ] **Step 3 — verify (repo rule: `cargo test` after code changes):** `cargo test -p edgezero-core` (all pass, incl. the new test); `cargo fmt -p edgezero-core`; `cargo clippy -p edgezero-core --all-targets -- -D warnings`.
+- [ ] **Step 4 — commit:** `Add IntrospectionNeeds + DynHandler::introspection_needs`
 
 ### Task 10b: `#[action(manifest|routes)]` param parser + struct codegen (edgezero-macros/src/action.rs)
 
@@ -1328,15 +1344,28 @@ quote! {
 
 ### Task 10d: the atomic gating swap (edgezero-core/src/{router,context,introspection}.rs) — all in one commit so it compiles
 
-- [ ] **Step 1 (RED) — router tests.** Rewrite `dispatch_injects_introspection_data` and `middleware_sees_introspection_data` to register a LOCAL probe struct (a closure can not report `introspection_needs`), and add a negative test. Probe builds its response with `response_builder` (no `IntoResponse` import needed):
+- [ ] **Step 1 (RED) — router tests that PROVE per-capability atomicity.** The
+  key guarantee (spec §Key Decision 6): a route injects **exactly** the payloads
+  its handler asked for — `manifest`-only → `ManifestJson` present AND `RouteTable`
+  absent; `routes`-only → the mirror; plain → neither. A single-payload probe
+  would let an over-injecting implementation pass, so the probe records BOTH
+  payloads' presence and each test asserts the exact `(manifest_present,
+  routes_present)` pair. The probe carries its own `IntrospectionNeeds` so one
+  type covers all cases, and builds its response with `response_builder` (no
+  `IntoResponse` import):
 ```rust
-struct ManifestProbe(std::sync::Arc<std::sync::Mutex<Option<bool>>>);
-impl crate::handler::DynHandler for ManifestProbe {
+struct CapProbe {
+    seen: std::sync::Arc<std::sync::Mutex<Option<(bool, bool)>>>,
+    needs: crate::handler::IntrospectionNeeds,
+}
+impl crate::handler::DynHandler for CapProbe {
     fn call(&self, ctx: RequestContext) -> crate::http::HandlerFuture {
-        let cell = std::sync::Arc::clone(&self.0);
+        let seen = std::sync::Arc::clone(&self.seen);
         Box::pin(async move {
-            *cell.lock().unwrap() =
-                Some(ctx.extension::<crate::introspection::ManifestJson>().is_some());
+            *seen.lock().unwrap() = Some((
+                ctx.extension::<crate::introspection::ManifestJson>().is_some(),
+                ctx.extension::<crate::introspection::RouteTable>().is_some(),
+            ));
             crate::http::response_builder()
                 .status(crate::http::StatusCode::OK)
                 .body(crate::body::Body::empty())
@@ -1344,14 +1373,17 @@ impl crate::handler::DynHandler for ManifestProbe {
         })
     }
     fn introspection_needs(&self) -> crate::handler::IntrospectionNeeds {
-        crate::handler::IntrospectionNeeds { manifest: true, routes: false }
+        self.needs
     }
 }
 ```
-  - flagged route: `.with_manifest_json("{}").get("/", ManifestProbe(cell))` → cell records `true`.
-  - middleware test: same flagged route + a probe middleware asserting `ctx.extension::<ManifestJson>().is_some()` (injection happens before middleware).
-  - negative test `plain_route_gets_no_manifest`: `.get("/x", |_ctx: RequestContext| async { … })` (a plain closure) → the handler records `ctx.extension::<crate::introspection::ManifestJson>().is_none()`.
-  Run (single filter per command — Cargo takes ONE positional filter):
+  Three explicit atomicity tests (each builds a router, `oneshot`s a GET, then
+  reads the cell). Use `IntrospectionNeeds { manifest, routes }` literally:
+  - `manifest_route_injects_only_manifest`: probe `needs { manifest: true, routes: false }`, router `.with_manifest_json("{}").get("/", probe)` → cell == `Some((true, false))`.
+  - `routes_route_injects_only_routes`: probe `needs { manifest: false, routes: true }`, router `.get("/", probe)` (no `with_manifest_json` needed — `RouteTable` comes from the always-present route index) → cell == `Some((false, true))`.
+  - `plain_route_injects_neither`: probe `needs IntrospectionNeeds::default()` (or a plain closure), `.with_manifest_json("{}").get("/", probe)` → cell == `Some((false, false))` (manifest is available but NOT injected because the route didn't ask).
+  Plus keep a **middleware** test: a `manifest`-flagged route + a probe middleware asserting `ctx.extension::<ManifestJson>().is_some()` before the handler runs (injection precedes the middleware chain).
+  Run (single positional filter per command — Cargo takes ONE):
   `cargo test -p edgezero-core router` (fails: `introspection_needs`/`extension`/gating absent).
 - [ ] **Step 2 — `RouteEntry` flag.** Add `introspection_needs: IntrospectionNeeds` (`Copy`); copy it in the manual `Clone`/`clone_from`.
 - [ ] **Step 3 — read it in `add_route`:**
