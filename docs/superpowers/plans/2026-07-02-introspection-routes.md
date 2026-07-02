@@ -135,7 +135,7 @@ manifest.rs before running.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p edgezero-core serializes_manifest_and_redacts_secret_values serializes_enums_with_wire_casing`
+Run: `cargo test -p edgezero-core serializes_` (one filter matching both `serializes_manifest_and_redacts_secret_values` and `serializes_enums_with_wire_casing` — Cargo takes a single test-name filter)
 Expected: FAIL to compile — `Manifest` does not implement `Serialize`; `ManifestApp` has no `version`/`kind`.
 
 - [ ] **Step 3: Add `version`/`kind` to `ManifestApp`**
@@ -264,7 +264,7 @@ Add `#[serde(skip_serializing_if = "...")]` to keep output clean where fields ar
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p edgezero-core serializes_manifest_and_redacts_secret_values serializes_enums_with_wire_casing`
+Run: `cargo test -p edgezero-core serializes_` (one filter matching both `serializes_manifest_and_redacts_secret_values` and `serializes_enums_with_wire_casing` — Cargo takes a single test-name filter)
 Expected: PASS.
 Then: `cargo test -p edgezero-core manifest` — Expected: all existing manifest tests still PASS.
 
@@ -372,7 +372,7 @@ existing middleware tests in this crate use.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p edgezero-core dispatch_injects_introspection_data middleware_sees_introspection_data`
+Run: `cargo test -p edgezero-core introspection_data` (one filter matching both `dispatch_injects_introspection_data` and `middleware_sees_introspection_data`)
 Expected: FAIL to compile — `with_manifest_json` and `RequestContext::introspection` do not exist.
 
 - [ ] **Step 3: Add `IntrospectionData` + builder field/setter**
@@ -431,7 +431,7 @@ In `context.rs`, near `config_store_default_binding`:
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p edgezero-core dispatch_injects_introspection_data middleware_sees_introspection_data`
+Run: `cargo test -p edgezero-core introspection_data` (one filter matching both `dispatch_injects_introspection_data` and `middleware_sees_introspection_data`)
 Expected: PASS.
 Then: `cargo test -p edgezero-core router` — Expected: PASS (existing route-listing tests still pass; they are removed in Task 5).
 
@@ -795,10 +795,22 @@ Then in the emitted `build_router()` (the `quote! { ... pub fn build_router() ..
         }
 ```
 
-- [ ] **Step 3: Verify the macro crate compiles**
+- [ ] **Step 3: Build and test the macro crate**
 
 Run: `cargo build -p edgezero-macros`
 Expected: builds cleanly.
+Then: `cargo test -p edgezero-macros`
+Expected: PASS — the existing `app_config_derive` + `tests/ui` trybuild suite
+still passes (CLAUDE.md requires `cargo test` after any code change).
+
+> **Macro-output coverage:** the spec calls for macro expansion coverage
+> (spec:303). The `app!` output for this change (`with_manifest_json(<json>)`) is
+> exercised end-to-end in **Task 6**: app-demo's `introspection_routes_are_wired`
+> test builds the real `app!`-generated `build_router()` and asserts
+> `/_app-demo/manifest` returns the baked JSON with `[app].name == "app-demo"`.
+> That is a stronger check than a string-match expansion test, so no separate
+> trybuild case is added for the positive path. (trybuild remains the right tool
+> only for compile-fail cases, none of which this change introduces.)
 
 - [ ] **Step 4: Verify a consumer still builds**
 
@@ -1029,13 +1041,16 @@ git commit -m "Wire default introspection triggers into app-demo and generated a
 
 **Files:**
 - Modify: `docs/guide/routing.md` (around :118, the route-listing reference)
+- Modify: `docs/guide/roadmap.md:16` ("route listing + body-mode behavior")
 
 **Interfaces:** none (documentation only).
 
-- [ ] **Step 1: Locate the reference**
+- [ ] **Step 1: Locate the references**
 
-Run: `grep -n "route listing\|__edgezero/routes\|enable_route_listing" docs/guide/routing.md`
-Expected: a reference around line 118. Do NOT touch any `.__edgezero_chunks` docs (unrelated).
+Run: `grep -rn "route listing\|__edgezero/routes\|enable_route_listing" docs/guide`
+Expected: `docs/guide/routing.md` (~:118) and `docs/guide/roadmap.md:16`. Scope the
+grep to `docs/guide` (NOT `docs/`) so it does not match this plan and the spec
+under `docs/superpowers`. Do NOT touch any `.__edgezero_chunks` docs (unrelated).
 
 - [ ] **Step 2: Replace with introspection-route docs**
 
@@ -1055,10 +1070,19 @@ methods = ["GET"]
 handler = "edgezero_core::introspection::manifest"
 ```
 
+- [ ] **Step 2b: Update roadmap.md**
+
+In `docs/guide/roadmap.md:16`, the "Example coverage" bullet ends with "…logging
+precedence, and route listing + body-mode behavior". Replace "route listing"
+with "introspection routes" so it reads "…logging precedence, and introspection
+routes + body-mode behavior".
+
 - [ ] **Step 3: Verify no stale references remain**
 
-Run: `grep -rn "enable_route_listing\|__edgezero/routes" docs/`
-Expected: no matches (excluding `.__edgezero_chunks` which is a different token — verify the grep does not match it; if it does, refine to `__edgezero/routes`).
+Run: `grep -rn "enable_route_listing\|__edgezero/routes\|route listing" docs/guide`
+Expected: no matches under `docs/guide` (scope to `docs/guide`, not `docs/`, so
+the plan/spec under `docs/superpowers` are not matched; `.__edgezero_chunks` is a
+different token and should not appear).
 
 - [ ] **Step 4: Commit**
 
@@ -1164,6 +1188,8 @@ gh pr ready 300
 - CI gates incl. separate app-demo workspace: Task 8. ✓
 
 **Review findings applied (round 1):** enum serialization + casing test (blocking); owned `RedactedBinding` + removed nonexistent `ManifestAdapterDeployed` (blocking); `Response` from `crate::http` (blocking); full config status-code tests (high); app-demo config test seeds a registry and asserts 200 (high); `cd examples/app-demo` for excluded-workspace commands (high); middleware-visibility test (medium); cli-doc drift flagged, not silently absorbed (medium).
+
+**Review findings applied (round 3):** single-filter `cargo test` commands (Cargo takes one test-name filter) in Tasks 1 & 2 (high); Task 7 stale-doc greps scoped to `docs/guide` so they don't match the plan/spec under `docs/superpowers` (high); Task 7 also updates `docs/guide/roadmap.md:16` "route listing" phrasing (medium); Task 4 now runs `cargo test -p edgezero-macros` per CLAUDE.md, with macro-output coverage delegated to Task 6's end-to-end assertion rather than a brittle expansion test (medium).
 
 **Review findings applied (round 2):** real body assertions for manifest (equality), routes (`[{method,path}]` shape), and config (`api_token` key-name present, secret-safe) in Tasks 3 & 6 (high); `run_config` now routes through `oneshot` so no `IntoResponse` import is needed, and unused test imports dropped (high); `body-mode` serde-rename fixed in the casing test (high); `ConfigStoreError::Internal → 500` test added (medium); Task 8 gains generated-project-build (`--ignored`) and nested-AppConfig-audit steps matching CI's template-surface jobs (medium).
 
