@@ -411,6 +411,25 @@ A line-by-line review of every claim in §2–§7 against the actual code. **Bot
 - **[B, nit] §4.2/§4.4 dotted-path rendering:** the spec uses both `partners[*]` (static metadata) and `partners[3]` (runtime error). Have `SecretField::dotted_path()` render `ArrayEach` as `[*]` for the static path and per-index `[n]` at runtime; the existing `[{idx}]` convention (`extractor.rs:959`) already matches.
 - **[GEN, resolved] §6 GEN row** ("should this spec live in edgezero or trusted-server?") is now answered — it lives at `docs/superpowers/specs/` in the edgezero repo.
 
+### Second-pass blockers (must fold into Workstream B before it is plan-ready)
+
+A follow-up review found additional issues the first pass missed. All verified against `origin/main` @ `42843b1`.
+
+- **[B, BLOCKER] An active CI guard forbids the exact nesting this spec introduces.** `crates/edgezero-cli/src/bin/check_no_nested_app_config.rs` (spec 10.2.1) detects any `AppConfig`-derived struct used as a field inside another `AppConfig`-derived struct — unwrapping `Option`/`Vec`/`Box`/`Rc`/`Arc`/tuples/arrays — and CI runs it as "Nested AppConfig audit" (`.github/workflows/test.yml:58`, scanning `examples/app-demo` + `crates/edgezero-cli/src/templates`). Workstream B's whole premise (a sub-struct that itself derives `AppConfig`, opted-in via `#[app_config(nested)]`) is a violation today. The guard must be **inverted**, not deleted: "nested `AppConfig` is allowed **iff** the containing field carries `#[app_config(nested)]`." This is a required plan item, and it changes the audit binary + its tests.
+- **[B, BLOCKER] Optional secrets need metadata.** §4.3 accepts `Option<String>` and §4.4 skips an absent optional, but §4.2's `SecretField` carries only `{ kind, path }`. The runtime walk and the CLI reflections cannot distinguish "required leaf missing → error" from "optional leaf absent → skip" without an explicit flag. Add `optional: bool` (or fold it into `SecretKind`).
+- **[B, BLOCKER] The path model is internally inconsistent — commit to owned segments.** §4.2 shows `path: &'static [SecretPathSegment]` while §4.3/B-3 conclude nested recursion must build owned/`Cow` paths (the only viable cross-crate lowering). These contradict. Resolve by making paths owned: `secret_fields() -> Vec<SecretField>` with `path: Vec<SecretPathSegment>` (or `Cow<'static, _>`). Update §4.2 to match B-3 rather than leaving a `&'static` shape it cannot satisfy.
+- **[B, HIGH] Register the helper attribute.** `crates/edgezero-macros/src/lib.rs:20` is `#[proc_macro_derive(AppConfig, attributes(secret))]` — it must become `attributes(secret, app_config)` or the `#[app_config(nested)]` opt-in fails to parse.
+- **[B, HIGH] `TypedSecretEntry.field_name` is a borrowed `&'static`/`&'entry str`.** `crates/edgezero-adapter/src/registry.rs:178` borrows the field name; dotted/array paths (`partners[3].api_key`) are computed strings with no `'static` backing. Make `field_name` owned (`String`/`Cow<'static, str>`) or carry an owned label alongside the borrowed entry, and thread that through the Spin collision check.
+- **[B, HIGH] Enforce container `rename_all` on nested-only parents.** `crates/edgezero-macros/src/app_config.rs:75` gates the `rename_all` guard on `!annotations.is_empty()` (direct `#[secret]` fields only). A parent whose secrets live entirely in `#[app_config(nested)]` children has empty direct annotations, so a container `#[serde(rename_all=…)]` there would silently desync the emitted Rust field-path segment from the serialized key. Extend the guard to also fire when the struct has any `#[app_config(nested)]` field.
+- **[B, HIGH] Decide array scope now, not later.** The problem statement and examples (§4.1, `partners[*].api_key`) include array secrets, yet B-1 defers `ArrayEach`. Do not write an object-only plan unless trusted-server's `Settings` audit confirms **no** secret leaves inside arrays; otherwise include `ArrayEach` from the start.
+
+### Go / No-Go
+
+Split into **two independent implementation plans** (matching §5's "A and B are independent"):
+
+- **Workstream A (`State<T>`) is plan-ready now** — no blockers; router insertion before `RequestContext::new` (`router.rs:267`) and the generic `#[action]` `FromRequest` call (`action.rs:87`) both fit as designed.
+- **Workstream B (nested/array secrets) should start only after** folding in the second-pass blockers above — especially: inverting the nested-AppConfig CI guard, `optional` metadata, owned path segments, helper-attribute registration, owned `TypedSecretEntry` labels, nested-only `rename_all` enforcement, and a settled array scope.
+
 ### Baseline note
 
 Local `main` (`b298bc1`, "Extract run_typed_preflight…") is a **broken divergent tip**: it deletes `config.rs` (3365 lines) while leaving `mod config;`/`pub use config::…` in `lib.rs`, so `edgezero-cli` does not compile there, and it is not an ancestor of `origin/main`. `run_typed_preflight` exists nowhere in the tree — that refactor's new files were never committed. All §4.5 claims were therefore verified against `origin/main` (`42843b1`), where `config.rs` is intact; the spec's function names are correct against that tree.
