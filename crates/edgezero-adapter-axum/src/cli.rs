@@ -14,6 +14,7 @@ use edgezero_adapter::env_file::append_lines_dedup;
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -132,7 +133,7 @@ struct EdgezeroAxumConfig {
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`)."
+    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `provision_typed` IS overridden below (Local mode appends `<key_value>=` secret placeholders to `.edgezero/.env`; Cloud is a no-op — axum has no cloud secret store)."
 )]
 impl Adapter for AxumCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -209,6 +210,42 @@ impl Adapter for AxumCliAdapter {
         }
         Ok(ProvisionOutcome {
             status_lines: out,
+            deployed: None,
+        })
+    }
+
+    fn provision_typed(
+        &self,
+        manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        typed_secrets: &[TypedSecretEntry<'_>],
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String> {
+        // Axum has no cloud secret store: cloud is a documented no-op.
+        // Local mode appends `<key_value>=` lines to `.edgezero/.env`
+        // (unquoted empty value — the loosest `.env` form). The
+        // operator fills in the actual secret by editing the file.
+        // `append_lines_dedup` handles parent-dir creation so
+        // `.edgezero/` gets auto-created on the first-run case.
+        if !matches!(mode, ProvisionMode::Local) {
+            return Ok(ProvisionOutcome::default());
+        }
+        let env_path = manifest_root.join(".edgezero").join(".env");
+        let lines: Vec<String> = typed_secrets
+            .iter()
+            .map(|entry| format!("{}=", entry.key_value))
+            .collect();
+        append_lines_dedup(&env_path, &lines, dry_run)
+            .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+        let status_lines = vec![format!(
+            "axum: wrote {} secret placeholders to {}",
+            typed_secrets.len(),
+            env_path.display()
+        )];
+        Ok(ProvisionOutcome {
+            status_lines,
             deployed: None,
         })
     }
@@ -1773,5 +1810,194 @@ mod tests {
             !outcome.status_lines.is_empty(),
             "cloud arm still emits informational status lines"
         );
+    }
+
+    // ---------- provision_typed (Local mode) — secret placeholders ----------
+
+    #[test]
+    fn axum_provision_typed_appends_secret_placeholders_to_edgezero_env() {
+        // Fixture: no `.edgezero/` pre-existing (append_lines_dedup
+        // creates it via parent-dir handling). provision_typed writes
+        // `<key_value>=` per entry — unquoted empty value.
+        let dir = tempdir().unwrap();
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        let outcome = AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env_path = dir.path().join(".edgezero/.env");
+        assert!(env_path.exists(), ".env exists: {}", env_path.display());
+        let env = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            env.lines().any(|line| line == "demo_api_token="),
+            "unquoted empty-value placeholder present: {env}"
+        );
+        assert!(
+            outcome
+                .status_lines
+                .iter()
+                .any(|line| line.contains(&env_path.display().to_string())),
+            "status line names the .env path: {:?}",
+            outcome.status_lines
+        );
+        assert!(
+            outcome.deployed.is_none(),
+            "local provision_typed returns no deployed state"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_creates_dot_edgezero_if_missing() {
+        // No `.edgezero/` pre-existing. append_lines_dedup (Task 16c)
+        // creates parent dirs, so the first-run case works without an
+        // explicit `create_dir_all` in provision_typed.
+        let dir = tempdir().unwrap();
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            "sanity: .edgezero/ must NOT pre-exist"
+        );
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        assert!(
+            dir.path().join(".edgezero").is_dir(),
+            ".edgezero/ auto-created via append_lines_dedup parent-dir handling"
+        );
+        assert!(
+            dir.path().join(".edgezero/.env").exists(),
+            ".env landed inside auto-created .edgezero/"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_cloud_mode_is_a_no_op() {
+        // Cloud is a no-op: axum has no cloud secret store. The load-
+        // bearing negative assertion is that Cloud mode must NOT
+        // create `.edgezero/` or `.env`.
+        let dir = tempdir().unwrap();
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        let outcome = AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Cloud,
+                false,
+            )
+            .unwrap();
+        assert!(
+            outcome.status_lines.is_empty(),
+            "cloud mode emits no status lines: {:?}",
+            outcome.status_lines
+        );
+        assert!(
+            outcome.deployed.is_none(),
+            "cloud mode returns no deployed state"
+        );
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            "cloud mode must NOT auto-create .edgezero/"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_deduplicates_matching_key() {
+        // Operator has already filled in the real value. Re-running
+        // provision_typed must NOT clobber it with the empty
+        // placeholder — append_lines_dedup collapses keys.
+        let dir = tempdir().unwrap();
+        let dot_edgezero = dir.path().join(".edgezero");
+        fs::create_dir_all(&dot_edgezero).unwrap();
+        let env_path = dot_edgezero.join(".env");
+        fs::write(&env_path, "demo_api_token=operator_value\n").unwrap();
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "demo_api_token",
+        )];
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            env.contains("demo_api_token=operator_value"),
+            "operator's real value survives: {env}"
+        );
+        let token_lines = env
+            .lines()
+            .filter(|line| {
+                let after_hash = line.trim_start().strip_prefix('#').unwrap_or(line);
+                after_hash.trim_start().starts_with("demo_api_token=")
+            })
+            .count();
+        assert_eq!(
+            token_lines, 1,
+            "exactly one demo_api_token line remains: {env}"
+        );
+    }
+
+    #[test]
+    fn axum_provision_typed_handles_multiple_entries() {
+        // Multiple TypedSecretEntry values across different store_ids.
+        // Every key_value must land as a `<key_value>=` line, exactly
+        // once each.
+        let dir = tempdir().unwrap();
+        let entries = [
+            TypedSecretEntry::new("default", "api_token", "demo_api_token"),
+            TypedSecretEntry::new("default", "hmac_key", "demo_hmac_key"),
+            TypedSecretEntry::new("audit", "audit_token", "audit_secret"),
+        ];
+        AxumCliAdapter
+            .provision_typed(
+                dir.path(),
+                None,
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env = fs::read_to_string(dir.path().join(".edgezero/.env")).unwrap();
+        for expected in ["demo_api_token=", "demo_hmac_key=", "audit_secret="] {
+            let count = env.lines().filter(|line| *line == expected).count();
+            assert_eq!(
+                count, 1,
+                "expected exactly one line `{expected}` in .env: {env}"
+            );
+        }
     }
 }
