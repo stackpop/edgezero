@@ -354,6 +354,13 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub commands: ManifestAdapterCommands,
+    /// Deploy-time identifiers returned by cloud CLIs and persisted in
+    /// `edgezero.toml` so teammates' `provision --local` can regenerate
+    /// adapter manifests with real ids. See spec §"Where durable
+    /// identifiers live".
+    #[serde(default)]
+    #[validate(nested)]
+    pub deployed: Option<ManifestAdapterDeployed>,
     /// Catch-all for any sub-table other than the four canonical ones
     /// (`adapter`, `build`, `commands`, `logging`). The pre-rewrite
     /// `[adapters.<name>.stores.*]` tables land here and are rejected by
@@ -363,6 +370,27 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub logging: ManifestLoggingConfig,
+}
+
+/// Deploy-time identifiers returned by cloud CLIs and persisted
+/// in `edgezero.toml` so teammates' `provision --local` can
+/// regenerate adapter manifests with real ids. See spec
+/// §"Where durable identifiers live".
+#[derive(Debug, Default, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestAdapterDeployed {
+    /// Primary namespace ids, keyed by logical
+    /// `[stores.kv]` / `[stores.config]` id (Cloudflare only).
+    #[serde(default)]
+    pub kv_namespaces: BTreeMap<String, String>,
+    /// Preview-namespace ids, keyed by the SAME logical id.
+    /// Separate map so a legal store id like `sessions_preview`
+    /// cannot collide with a sibling-suffix convention.
+    #[serde(default)]
+    pub preview_kv_namespaces: BTreeMap<String, String>,
+    /// Fastly compute service id returned by `fastly compute deploy`.
+    #[serde(default)]
+    pub service_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Validate)]
@@ -1546,6 +1574,78 @@ manifest = "fastly.toml"
             Some("crates/fastly-adapter")
         );
         assert_eq!(adapter.adapter.manifest.as_deref(), Some("fastly.toml"));
+    }
+
+    // The manifest parser treats `[adapters.<name>.deployed]` as a
+    // shared schema — it doesn't branch on the adapter name. These
+    // tests name the fixture adapter `demo` so their coverage is
+    // read as "the shared struct captures each field kind" rather
+    // than "the parser knows about a specific adapter." Section 6
+    // is where individual adapters read the field subset they use.
+
+    #[test]
+    fn adapter_deployed_block_captures_kv_namespace_maps() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "crates/x"
+        manifest = "crates/x/manifest.toml"
+        [adapters.demo.deployed]
+        kv_namespaces.sessions = "abc123"
+        preview_kv_namespaces.sessions = "abc123_preview"
+        "#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        manifest.validate().unwrap();
+        let deployed = manifest.adapters["demo"].deployed.as_ref().unwrap();
+        assert_eq!(deployed.kv_namespaces["sessions"], "abc123");
+        assert_eq!(deployed.preview_kv_namespaces["sessions"], "abc123_preview");
+        assert!(deployed.service_id.is_none());
+    }
+
+    #[test]
+    fn adapter_deployed_block_captures_service_id() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "crates/x"
+        manifest = "crates/x/manifest.toml"
+        [adapters.demo.deployed]
+        service_id = "SVC1"
+        "#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.adapters["demo"]
+                .deployed
+                .as_ref()
+                .unwrap()
+                .service_id
+                .as_deref(),
+            Some("SVC1")
+        );
+    }
+
+    #[test]
+    fn adapter_deployed_block_rejects_unknown_field() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "x"
+        manifest = "x/manifest.toml"
+        [adapters.demo.deployed]
+        typo_field = "x"
+        "#;
+        let err = toml::from_str::<Manifest>(toml).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     // Empty/minimal manifest tests
