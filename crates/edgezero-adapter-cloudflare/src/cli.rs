@@ -13,6 +13,7 @@ use edgezero_adapter::env_file::append_lines_dedup;
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -134,7 +135,7 @@ struct CloudflareCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `wrangler.toml` for the Task 8b clean-clone bootstrap)."
+    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `wrangler.toml` for the Task 8b clean-clone bootstrap). `provision_typed` IS overridden below (appends `<key_value>=\"\"` secret placeholders to `.dev.vars` in Local mode; Cloud is a no-op — `wrangler secret put` is the remote path)."
 )]
 impl Adapter for CloudflareCliAdapter {
     fn deployed_fields(&self) -> &'static [&'static str] {
@@ -340,6 +341,53 @@ impl Adapter for CloudflareCliAdapter {
         Ok(ProvisionOutcome {
             status_lines: out,
             deployed: created_deployed,
+        })
+    }
+
+    fn provision_typed(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        typed_secrets: &[TypedSecretEntry<'_>],
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String> {
+        // Cloud is a no-op: `wrangler secret put` is the tool for
+        // remote secret upload. `provision_typed` handles ONLY the
+        // local preview writeback — a `<key_value>=""` placeholder
+        // per typed field, appended to the SAME `.dev.vars` file
+        // `provision_local` seeds with `EDGEZERO__STORES__…__NAME` /
+        // `__KEY` overlays.
+        if !matches!(mode, ProvisionMode::Local) {
+            return Ok(ProvisionOutcome::default());
+        }
+        // Anchor `.dev.vars` on the RESOLVED wrangler.toml path so
+        // nested layouts (e.g. `adapter_manifest_path =
+        // "crates/app-demo-adapter-cloudflare/wrangler.toml"`) land
+        // the file in the same crate dir wrangler dev reads from,
+        // NOT at `manifest_root/.dev.vars`. Mirrors the placement
+        // `provision_local` uses for the __NAME / __KEY lines.
+        let wrangler_rel = adapter_manifest_path.unwrap_or("wrangler.toml");
+        let wrangler_path = manifest_root.join(wrangler_rel);
+        let dev_vars_path = wrangler_path
+            .parent()
+            .unwrap_or(manifest_root)
+            .join(".dev.vars");
+        let lines: Vec<String> = typed_secrets
+            .iter()
+            .map(|entry| format!(r#"{}="""#, entry.key_value))
+            .collect();
+        append_lines_dedup(&dev_vars_path, &lines, dry_run)
+            .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
+        let status_lines = vec![format!(
+            "cloudflare: wrote {} secret placeholders to {}",
+            typed_secrets.len(),
+            dev_vars_path.display()
+        )];
+        Ok(ProvisionOutcome {
+            status_lines,
+            deployed: None,
         })
     }
 
@@ -3090,6 +3138,174 @@ id = "00112233445566778899aabbccddeeff"
         assert!(
             !dev_vars.contains("EDGEZERO__STORES__CONFIG__PROD_CONFIG__NAME="),
             "platform name must NOT leak into the env-var key: {dev_vars}"
+        );
+    }
+
+    // ---------- provision_typed (Local mode) — secret placeholders ----------
+
+    #[test]
+    fn cloudflare_provision_typed_appends_secret_placeholders_to_dev_vars() {
+        // Fixture: nested wrangler.toml layout matching app-demo.
+        // provision_typed writes `<key_value>=""` per entry into the
+        // `.dev.vars` NEXT TO the wrangler manifest (append_lines_dedup
+        // creates parent dirs, so no pre-seed of the wrangler.toml is
+        // required for this test).
+        let dir = tempdir().expect("tempdir");
+        let entries = [TypedSecretEntry::new(
+            TEST_SECRET_ID,
+            "api_token",
+            "demo_api_token",
+        )];
+        let outcome = CloudflareCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        let dev_vars_path = dir.path().join("crates/cf/.dev.vars");
+        assert!(
+            dev_vars_path.exists(),
+            ".dev.vars exists at nested path: {}",
+            dev_vars_path.display()
+        );
+        let dev_vars = fs::read_to_string(&dev_vars_path).expect("read .dev.vars");
+        assert!(
+            dev_vars.contains(r#"demo_api_token="""#),
+            "placeholder line present: {dev_vars}"
+        );
+        assert!(
+            outcome
+                .status_lines
+                .iter()
+                .any(|line| line.contains(&dev_vars_path.display().to_string())),
+            "status line names the .dev.vars path: {:?}",
+            outcome.status_lines
+        );
+        assert!(
+            outcome.deployed.is_none(),
+            "local provision_typed returns no deployed state"
+        );
+    }
+
+    #[test]
+    fn cloudflare_provision_typed_dev_vars_lands_next_to_wrangler_toml() {
+        // Locks the `wrangler_path.parent().join(".dev.vars")`
+        // anchor against drift: with `adapter_manifest_path =
+        // "crates/cf/wrangler.toml"`, `.dev.vars` MUST land at
+        // `temp/crates/cf/.dev.vars` and NOT at `temp/.dev.vars`.
+        let dir = tempdir().expect("tempdir");
+        let entries = [TypedSecretEntry::new(
+            TEST_SECRET_ID,
+            "api_token",
+            "demo_api_token",
+        )];
+        CloudflareCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        assert!(
+            dir.path().join("crates/cf/.dev.vars").exists(),
+            ".dev.vars anchored on wrangler.toml parent"
+        );
+        assert!(
+            !dir.path().join(".dev.vars").exists(),
+            "root-level .dev.vars must NOT be written"
+        );
+    }
+
+    #[test]
+    fn cloudflare_provision_typed_cloud_mode_is_a_no_op() {
+        // Cloud is a no-op: `wrangler secret put` is the remote
+        // path. Empty outcome, no `.dev.vars` written anywhere.
+        let dir = tempdir().expect("tempdir");
+        let entries = [TypedSecretEntry::new(
+            TEST_SECRET_ID,
+            "api_token",
+            "demo_api_token",
+        )];
+        let outcome = CloudflareCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &entries,
+                ProvisionMode::Cloud,
+                false,
+            )
+            .expect("provision_typed Cloud succeeds");
+        assert!(
+            outcome.status_lines.is_empty(),
+            "cloud mode emits no status lines: {:?}",
+            outcome.status_lines
+        );
+        assert!(
+            outcome.deployed.is_none(),
+            "cloud mode returns no deployed state"
+        );
+        assert!(
+            !dir.path().join("crates/cf/.dev.vars").exists(),
+            "cloud mode must NOT touch .dev.vars"
+        );
+        assert!(
+            !dir.path().join(".dev.vars").exists(),
+            "cloud mode must NOT touch .dev.vars at manifest_root either"
+        );
+    }
+
+    #[test]
+    fn cloudflare_provision_typed_deduplicates_against_existing_dev_vars() {
+        // Operator has already filled in the real value. Re-running
+        // provision_typed must NOT clobber it with the empty
+        // placeholder — append_lines_dedup collapses keys.
+        let dir = tempdir().expect("tempdir");
+        let dev_vars_dir = dir.path().join("crates/cf");
+        fs::create_dir_all(&dev_vars_dir).expect("mkdir nested");
+        let dev_vars_path = dev_vars_dir.join(".dev.vars");
+        fs::write(&dev_vars_path, "demo_api_token=\"already_set\"\n").expect("seed .dev.vars");
+        let entries = [TypedSecretEntry::new(
+            TEST_SECRET_ID,
+            "api_token",
+            "demo_api_token",
+        )];
+        CloudflareCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("crates/cf/wrangler.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        let dev_vars = fs::read_to_string(&dev_vars_path).expect("read .dev.vars");
+        assert!(
+            dev_vars.contains(r#"demo_api_token="already_set""#),
+            "operator's real value survives: {dev_vars}"
+        );
+        assert!(
+            !dev_vars.contains(r#"demo_api_token="""#),
+            "empty-value placeholder must NOT be appended: {dev_vars}"
+        );
+        let token_lines = dev_vars
+            .lines()
+            .filter(|line| {
+                let after_hash = line.trim_start().strip_prefix('#').unwrap_or(line);
+                after_hash.trim_start().starts_with("demo_api_token=")
+            })
+            .count();
+        assert_eq!(
+            token_lines, 1,
+            "exactly one demo_api_token line remains: {dev_vars}"
         );
     }
 }
