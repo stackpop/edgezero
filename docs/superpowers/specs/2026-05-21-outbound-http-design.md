@@ -1856,9 +1856,19 @@ pub enum Capability {
                                         // delivers chunks without first collecting
                                         // the whole body (Axum = BestEffort,
                                         // see §3.5.2 footnote 3)
-    ConfigStore,
-    KvStore,
-    SecretStore,
+    ConfigStore,                        // adapter can back a `[stores.config]`
+                                        // binding — read-only key/value config
+                                        // resolved at request time. Gated
+                                        // pre-dispatch like the outbound
+                                        // capabilities (§3.5.3). Native on all four
+                                        // adapters (matrix below; §4).
+    KvStore,                            // adapter can back a `[stores.kv]` binding —
+                                        // mutable key/value storage. Gated
+                                        // pre-dispatch; Native on all four adapters.
+    SecretStore,                        // adapter can back a `[stores.secret]`
+                                        // binding — secret material surfaced to
+                                        // handlers. Gated pre-dispatch; Native on
+                                        // all four adapters.
 }
 
 impl Capability {
@@ -1986,7 +1996,9 @@ pub trait Adapter: Sync + Send {
     fn name(&self) -> &'static str;
     fn capability(&self, capability: Capability) -> CapabilitySupport;   // new
 
-    // The following methods are PR-#269 surface (not in today's checkout):
+    // The following methods are the #269 surface — now merged to main, so they
+    // are present in the current checkout (the sibling-gate rows below are the
+    // active topology; the pre-#269 fallback is historical):
     fn provision(&self, args: &ProvisionArgs) -> Result<(), String>;
     fn push_config_entries(&self, args: &ConfigPushArgs) -> Result<(), String>;
     fn validate_config(&self, args: &ConfigValidateArgs) -> Result<(), String>;
@@ -2249,13 +2261,14 @@ Commands **not** covered (and why):
   policy the registry-lookup path already uses for "no manifest, no capability
   contract." Documented in the rustdoc.
 
-**Today's checkout (pre-#269) collapses to the same shape with fewer rows:**
-`Command::{Build, Serve, Deploy, Dev}` all dispatch through the registry's
-`Adapter::execute(AdapterAction::{Build, Serve, Deploy}, ..)` plus `Command::Dev`'s
-implicit-Axum runner. The gate goes at the top of each of those four handlers (or
-the equivalent helper they call) until PR #269 collapses them into the single
-`execute(..)` dispatcher. The wording in rounds 1–43 of the appendices is accurate
-against that pre-#269 shape.
+**Historical (pre-#269) shape — now superseded (PR #269 has merged to main):**
+Before #269 landed, `Command::{Build, Serve, Deploy, Dev}` all dispatched through
+the registry's `Adapter::execute(AdapterAction::{Build, Serve, Deploy}, ..)` plus
+`Command::Dev`'s implicit-Axum runner, and the gate went at the top of each of
+those four handlers (or the equivalent helper they called). #269 collapsed them
+into the single `execute(..)` dispatcher plus the sibling gates in the table
+above, which is now the active topology. The wording in rounds 1–43 of the
+appendices reflects that pre-#269 shape and is retained as history.
 
 ```rust
 fn ensure_capabilities(
@@ -2496,6 +2509,10 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   `budget.deadline` (the synthetic-if-absent absolute deadline from
   `dispatch_budget`). The wrapper yields a `gateway_timeout` error chunk past the
   deadline so the streamed body honours the deadline end-to-end per §3.3.3.
+- Errors: `worker::Delay` expiry → `gateway_timeout`; `worker::fetch` transport
+  failure (DNS/TLS/connection refused) → `bad_gateway`; over-cap → `bad_request`.
+  Any completed exchange (incl. non-2xx) → `Ok`. (§3.4.3 is the fallback for
+  variants not enumerated here.)
 - `capability()` per §3.5.2: `Native` for **all nine** capabilities
   (`outbound-http`, `outbound-deadlines`, `outbound-flexible-phase-budget` (single
   `worker::Delay` for the total race, no per-phase split), `send-all-slot-isolation`,
@@ -3112,6 +3129,10 @@ service — this distinction is explicit so a green capability check is not misr
   added on top.
 - Existing gzip/br decompression is kept; decompressed-byte cap enforced incrementally
   (§3.4.1). `Streamed` mode wraps the response body as `Body::Stream`.
+- Errors: wasi-timer expiry → `gateway_timeout`; `spin_sdk::http::send` transport
+  failure (DNS/TLS/connection refused) → `bad_gateway`; over-cap → `bad_request`.
+  Any completed exchange (incl. non-2xx) → `Ok`. (§3.4.3 is the fallback for
+  variants not enumerated here.)
 - Spin requires `allowed_outbound_hosts`; the adapter renders it from
   `[capabilities.outbound].hosts` per §3.5.4 when generating `spin.toml`.
 - `capability()` per §3.5.2: `Native` for **all nine** capabilities. Spin's wasi
