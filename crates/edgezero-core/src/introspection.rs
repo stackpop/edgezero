@@ -66,13 +66,13 @@ fn json_response(status: StatusCode, body: Body) -> Result<Response, EdgeError> 
 }
 
 /// GET — the app manifest as JSON (baked at compile time by `app!`).
-#[action]
+#[action(manifest)]
 pub async fn manifest(ManifestJson(json): ManifestJson) -> Result<Response, EdgeError> {
     json_response(StatusCode::OK, Body::text(json.to_string()))
 }
 
 /// GET — `[{ "method", "path" }]` for every registered route.
-#[action]
+#[action(routes)]
 pub async fn routes(RouteTable(table): RouteTable) -> Result<Response, EdgeError> {
     let views: Vec<RouteView> = table
         .iter()
