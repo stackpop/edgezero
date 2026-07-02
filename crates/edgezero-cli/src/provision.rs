@@ -17,6 +17,7 @@ use toml_edit::{table, value, DocumentMut};
 use crate::args::ProvisionArgs;
 use crate::config::{
     enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
+    validate_deployed_field_ownership,
 };
 use crate::copy_tree::copy_dir_recursive;
 use crate::ensure_adapter_defined;
@@ -62,6 +63,27 @@ impl OwnedProvisionStores {
 pub(crate) struct DryRunAllowList {
     /// (`project_path`, `staged_path`) pairs the driver diffs.
     pub pairs: Vec<(PathBuf, PathBuf)>,
+}
+
+/// # Errors
+///
+/// Manifest-shape gates run before the dispatch matrix: capability
+/// gate, handler-path shape, and deployed-field ownership. The
+/// ownership check exists here for parity with `run_shared_checks` in
+/// the config path, so `config validate` / `push` / `diff` and
+/// `provision` all reject the same manifests. Extracted from
+/// `run_provision` to keep that fn under the workspace `too_many_lines`
+/// lint; no behaviour change.
+///
+/// # Errors
+///
+/// Returns the first check's error string when any of the three gates
+/// rejects the manifest.
+fn run_manifest_shape_gates(manifest: &Manifest, adapter_name: &str) -> Result<(), String> {
+    enforce_single_store_capability(manifest, adapter_name)?;
+    strict_handler_paths(manifest)?;
+    validate_deployed_field_ownership(manifest)?;
+    Ok(())
 }
 
 /// # Errors
@@ -119,28 +141,8 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         )
     })?;
 
-    // Capability gate: mirror the strict `config validate` check for
-    // THIS adapter only. Without it, `provision --adapter spin`
-    // happily accepts a manifest with two config ids and dispatches
-    // to a backend that has no way to model multiple stores -- the
-    // failure only surfaces at runtime as a confusing "wrong store"
-    // miss. The check is unconditional (no --strict gate) because
-    // it's not stylistic: the platform genuinely cannot honour the
-    // declaration.
-    enforce_single_store_capability(manifest, &args.adapter)?;
+    run_manifest_shape_gates(manifest, &args.adapter)?;
 
-    // Manifest-shape gate: provision is the most expensive
-    // operation in the CLI (it can create real Cloudflare / Fastly
-    // resources), so a malformed handler path or a broken
-    // adapter manifest should fail HERE rather than after the
-    // remote create succeeded. `strict_handler_paths` is cheap
-    // and unconditional in `config validate --strict`; we run it
-    // unconditionally here for the same reason as the capability
-    // check above. The per-adapter `validate_adapter_manifest`
-    // hook (Spin's `[component.*]` discovery, etc.) is the other
-    // half of the strict-validate preflight; it's adapter-specific
-    // so we call it only for the targeted adapter.
-    strict_handler_paths(manifest)?;
     let manifest_root = args
         .manifest
         .parent()
@@ -264,17 +266,47 @@ fn write_baseline_to_disk(root: &Path, pairs: &[(PathBuf, String)]) -> Result<()
     Ok(())
 }
 
-/// Translate the parent manifest's deployed block for `canonical_adapter_name`
-/// into the neutral `AdapterDeployedState` shape. Task 14 introduces the typed
-/// `ManifestAdapterDeployed` struct; until that lands this returns `None`
-/// unconditionally. The synthesiser call path already receives
-/// `Option<&AdapterDeployedState>` — just always `None` today. Section 4
-/// fills in the real translation.
+/// Translate the parent manifest's `[adapters.<name>.deployed]` block
+/// into the neutral `AdapterDeployedState` shape adapters consume via
+/// `synthesise_baseline_manifest` and `provision`. Field mapping:
+///   - `service_id` (scalar) → `state.fields["service_id"]`.
+///   - `kv_namespaces` (map) → `state.sub_tables["kv_namespaces"]`.
+///   - `preview_kv_namespaces` (map) → `state.sub_tables["preview_kv_namespaces"]`.
+///
+/// Returns `None` when the adapter has no `deployed` block OR when every
+/// field is empty — synthesise / provision impls treat `None` the same as
+/// an empty state, so building an empty `AdapterDeployedState` would be
+/// wasteful. The lookup is case-insensitive via `manifest.adapter_entry`,
+/// matching how `[adapters.Fastly]` and `[adapters.fastly]` resolve to
+/// the same declaration.
 fn deployed_state_for(
-    _manifest: &Manifest,
-    _canonical_adapter_name: &str,
+    manifest: &Manifest,
+    canonical_adapter_name: &str,
 ) -> Option<AdapterDeployedState> {
-    None
+    let (_, adapter_cfg) = manifest.adapter_entry(canonical_adapter_name)?;
+    let deployed = adapter_cfg.deployed.as_ref()?;
+    let mut state = AdapterDeployedState::default();
+    if let Some(service_id) = deployed.service_id.as_ref() {
+        state
+            .fields
+            .insert("service_id".to_owned(), service_id.clone());
+    }
+    if !deployed.kv_namespaces.is_empty() {
+        state
+            .sub_tables
+            .insert("kv_namespaces".to_owned(), deployed.kv_namespaces.clone());
+    }
+    if !deployed.preview_kv_namespaces.is_empty() {
+        state.sub_tables.insert(
+            "preview_kv_namespaces".to_owned(),
+            deployed.preview_kv_namespaces.clone(),
+        );
+    }
+    if state.fields.is_empty() && state.sub_tables.is_empty() {
+        None
+    } else {
+        Some(state)
+    }
 }
 
 /// Merge `state` into `[adapters.<adapter_name>.deployed]` inside
@@ -731,6 +763,7 @@ mod tests {
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
     use tempfile::TempDir;
     use validator::Validate as _;
 
@@ -769,6 +802,12 @@ serve = "echo"
     static FAKE_ADAPTER: FakeBootstrapAdapter = FakeBootstrapAdapter;
     static NO_FIELDS_FAKE_ADAPTER: NoFieldsFakeAdapter = NoFieldsFakeAdapter;
     static RECORDED_DRY_RUN: AtomicBool = AtomicBool::new(false);
+    // Captures the `deployed` argument the CLI passes into
+    // `FakeBootstrapAdapter::synthesise_baseline_manifest`. Used by
+    // Section-4 tests that assert `deployed_state_for` translated a
+    // real `[adapters.<name>.deployed]` block and threaded it
+    // through — not left it silently `None`.
+    static RECORDED_SYNTH_DEPLOYED: Mutex<Option<AdapterDeployedState>> = Mutex::new(None);
     static SYNTH_CALLED: AtomicBool = AtomicBool::new(false);
     static VALIDATE_SAW_FILE: AtomicBool = AtomicBool::new(false);
 
@@ -838,9 +877,12 @@ serve = "echo"
             adapter_manifest_path: Option<&str>,
             _component_selector: Option<&str>,
             _app_name: &str,
-            _deployed: Option<&AdapterDeployedState>,
+            deployed: Option<&AdapterDeployedState>,
         ) -> Result<Vec<(PathBuf, String)>, String> {
             SYNTH_CALLED.store(true, Ordering::SeqCst);
+            if let Ok(mut slot) = RECORDED_SYNTH_DEPLOYED.lock() {
+                *slot = deployed.cloned();
+            }
             let rel = adapter_manifest_path.unwrap_or("spin.toml").to_owned();
             Ok(vec![(PathBuf::from(rel), "# stub\n".to_owned())])
         }
@@ -896,6 +938,9 @@ serve = "echo"
 
     fn reset_fake_state() {
         RECORDED_DRY_RUN.store(false, Ordering::SeqCst);
+        if let Ok(mut slot) = RECORDED_SYNTH_DEPLOYED.lock() {
+            *slot = None;
+        }
         SYNTH_CALLED.store(false, Ordering::SeqCst);
         VALIDATE_SAW_FILE.store(false, Ordering::SeqCst);
     }
@@ -2182,6 +2227,180 @@ ids = ["default"]
         assert!(
             err.contains("service_id") && err.contains("__test_no_fields_fake__"),
             "error must name the offending field and adapter: {err}"
+        );
+    }
+
+    // ---------- deployed_state_for + run_provision wiring ----------
+
+    #[test]
+    fn deployed_state_for_translates_all_field_kinds() {
+        // Manifest with a `demo` adapter carrying every deployed-field
+        // kind: scalar service_id, kv_namespaces map, and
+        // preview_kv_namespaces map. The translator must land them at
+        // the neutral positions each adapter reads from — scalar
+        // fields under `state.fields`, maps under `state.sub_tables`.
+        let toml_body = r#"
+[app]
+name = "demo"
+
+[adapters.demo]
+[adapters.demo.adapter]
+crate = "crates/x"
+manifest = "crates/x/m.toml"
+
+[adapters.demo.deployed]
+service_id = "SVC1"
+kv_namespaces.sessions = "abc123"
+preview_kv_namespaces.sessions = "abc123_preview"
+"#;
+        let manifest: Manifest = toml::from_str(toml_body).unwrap();
+        let state =
+            deployed_state_for(&manifest, "demo").expect("populated deployed must be Some(state)");
+        assert_eq!(
+            state.fields.get("service_id").map(String::as_str),
+            Some("SVC1")
+        );
+        assert_eq!(
+            state
+                .sub_tables
+                .get("kv_namespaces")
+                .and_then(|map| map.get("sessions"))
+                .map(String::as_str),
+            Some("abc123")
+        );
+        assert_eq!(
+            state
+                .sub_tables
+                .get("preview_kv_namespaces")
+                .and_then(|map| map.get("sessions"))
+                .map(String::as_str),
+            Some("abc123_preview")
+        );
+    }
+
+    #[test]
+    fn deployed_state_for_returns_none_when_all_fields_empty() {
+        // Adapter has NO deployed block: translator returns None so
+        // synthesise / provision impls see the same signal they did
+        // in the pre-Task-14 world (empty state = None).
+        let toml_body = r#"
+[app]
+name = "demo"
+
+[adapters.demo]
+[adapters.demo.adapter]
+crate = "crates/x"
+manifest = "crates/x/m.toml"
+"#;
+        let manifest: Manifest = toml::from_str(toml_body).unwrap();
+        assert!(deployed_state_for(&manifest, "demo").is_none());
+    }
+
+    #[test]
+    fn provision_local_threads_deployed_state_into_synthesiser() {
+        // Regression: `deployed_state_for` was left returning None
+        // through the whole of Section 4. Result: real deployed IDs
+        // in edgezero.toml never reached the adapter's
+        // synthesise_baseline_manifest call, defeating the "teammates
+        // regenerate local manifests from tracked durable IDs" spec
+        // promise. This test asserts the CLI reads
+        // `[adapters.<fake>.deployed]` and passes it through.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo"
+
+[adapters.__test_bootstrap_fake__]
+[adapters.__test_bootstrap_fake__.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.__test_bootstrap_fake__.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.__test_bootstrap_fake__.deployed]
+service_id = "SVC1"
+"#;
+        fs::write(&manifest_path, manifest_body).unwrap();
+        fs::create_dir_all(temp.path().join("crates/spin")).unwrap();
+
+        run_provision(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: false,
+            local: true,
+            manifest: manifest_path,
+        })
+        .expect("local real-write should reach the fake's synthesiser");
+
+        assert!(SYNTH_CALLED.load(Ordering::SeqCst));
+        let observed = RECORDED_SYNTH_DEPLOYED
+            .lock()
+            .expect("recorded deployed slot poisoned")
+            .clone()
+            .expect("synthesiser must have received Some(state)");
+        assert_eq!(
+            observed.fields.get("service_id").map(String::as_str),
+            Some("SVC1"),
+            "manifest's `[adapters.*.deployed] service_id` must reach the adapter: {observed:?}"
+        );
+    }
+
+    #[test]
+    fn provision_rejects_deployed_block_with_field_adapter_does_not_own() {
+        // The ownership check exists in run_shared_checks (config
+        // validate + push + diff pick it up), but until this patch
+        // run_provision did NOT call it. That gap let
+        // `edgezero provision` accept manifests that `edgezero config
+        // validate` correctly rejected. Regression test: register
+        // NoFieldsFakeAdapter (owns nothing per deployed_fields()),
+        // put a service_id under its deployed block, and assert
+        // run_provision Errs with the ownership violation before
+        // reaching the dispatch matrix.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&NO_FIELDS_FAKE_ADAPTER);
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo"
+
+[adapters.__test_no_fields_fake__]
+[adapters.__test_no_fields_fake__.adapter]
+crate = "crates/x"
+manifest = "crates/x/m.toml"
+
+[adapters.__test_no_fields_fake__.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.__test_no_fields_fake__.deployed]
+service_id = "SVC1"
+"#;
+        fs::write(&manifest_path, manifest_body).unwrap();
+        fs::create_dir_all(temp.path().join("crates/x")).unwrap();
+
+        let err = run_provision(&ProvisionArgs {
+            adapter: "__test_no_fields_fake__".to_owned(),
+            dry_run: true,
+            local: false,
+            manifest: manifest_path,
+        })
+        .expect_err("adapter owns no deployed fields: service_id must be rejected");
+        assert!(
+            err.contains("service_id") && err.contains("__test_no_fields_fake__"),
+            "error must name offending field + adapter: {err}"
+        );
+        assert!(
+            !SYNTH_CALLED.load(Ordering::SeqCst),
+            "ownership check must fire before synthesise_baseline_manifest"
         );
     }
 
