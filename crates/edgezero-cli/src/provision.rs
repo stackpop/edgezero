@@ -979,7 +979,18 @@ serve = "echo"
     }
 
     #[test]
-    fn run_provision_axum_prints_local_only_notes_for_each_store() {
+    fn run_provision_cloud_non_dry_run_succeeds_when_adapter_is_side_effect_free() {
+        // Cloud non-dry-run smoke: the CLI dispatch matrix reaches
+        // the adapter and exits 0 when the adapter's Cloud arm has no
+        // side effects to perform. Uses axum because its Cloud
+        // provision is a no-op; any adapter with an empty Cloud arm
+        // would fit — the assertion is about the CLI's dispatch,
+        // not axum-specific behavior. Stronger dispatch-shape
+        // coverage (which dry_run value the adapter observes, which
+        // arm of the (local, dry_run) matrix runs) is in the
+        // fake-based tests: provision_cloud_dry_run_passes_dry_run
+        // _true_to_adapter, provision_local_no_dry_run_writes_to
+        // _worktree, provision_local_dry_run_leaves_worktree_clean.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -993,25 +1004,7 @@ serve = "echo"
             local: false,
             manifest: manifest_path.clone(),
         })
-        .expect("axum provision exits 0 (no remote resources)");
-    }
-
-    #[test]
-    fn run_provision_axum_dry_run_is_also_a_no_op() {
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let temp = TempDir::new().expect("temp dir");
-        let manifest_path = temp.path().join("edgezero.toml");
-        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
-        let manifest_str = manifest_path.to_string_lossy().into_owned();
-        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
-
-        run_provision(&ProvisionArgs {
-            adapter: "axum".to_owned(),
-            dry_run: true,
-            local: false,
-            manifest: manifest_path.clone(),
-        })
-        .expect("axum dry-run also exits 0");
+        .expect("side-effect-free adapter cloud provision exits 0");
     }
 
     #[test]
@@ -1034,32 +1027,6 @@ serve = "echo"
             err.contains("wat"),
             "error should name the unknown adapter: {err}"
         );
-    }
-
-    #[test]
-    fn run_provision_spin_dry_run_dispatches_to_adapter() {
-        // Dry-run path doesn't edit spin.toml, so CI can exercise
-        // dispatch by writing a single-component spin.toml the
-        // resolver can locate.
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let temp = TempDir::new().expect("temp dir");
-        let manifest_path = temp.path().join("edgezero.toml");
-        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
-        fs::write(
-            temp.path().join("spin.toml"),
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
-        )
-        .expect("write spin.toml");
-        let manifest_str = manifest_path.to_string_lossy().into_owned();
-        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
-
-        run_provision(&ProvisionArgs {
-            adapter: "spin".to_owned(),
-            dry_run: true,
-            local: false,
-            manifest: manifest_path.clone(),
-        })
-        .expect("spin dry-run dispatches cleanly");
     }
 
     #[test]
@@ -1107,9 +1074,13 @@ adapters = ["axum"]
 
     #[test]
     fn run_provision_spin_rejects_malformed_adapter_manifest_before_dispatching() {
-        // The adapter-specific `validate_adapter_manifest` hook
-        // also gates provision now -- a spin.toml with zero
-        // components must error before we touch any remote.
+        // CLI-logic test: `run_provision` MUST call
+        // `adapter.validate_adapter_manifest` before dispatch, and
+        // MUST surface its error. Spin is the illustrative example
+        // because its `validate_adapter_manifest` actually validates
+        // (a spin.toml with zero components errors); axum's is a
+        // no-op so it can't drive this assertion. The check itself
+        // is CLI-side, not Spin-specific.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -1138,11 +1109,14 @@ adapters = ["axum"]
 
     #[test]
     fn run_provision_spin_rejects_multi_secret_ids_via_capability_gate() {
-        // Stage 5: Spin moved `config` to KV (multi-capable). Secrets
-        // remain Single-capable until we ship native secret support,
-        // so a manifest declaring two secret ids must still trip the
-        // gate before dispatching to the spin adapter dry-run. This
-        // test pins parity with `config validate --strict`.
+        // CLI-logic test: the capability gate
+        // (`enforce_single_store_capability`) reads the adapter's
+        // `merged_id_kinds()` and rejects manifests declaring more
+        // than one id in a single-capable kind. Spin is the
+        // illustrative example because secrets remain Single-capable
+        // there while `config` moved to KV; any adapter with a
+        // Single-capable kind + a manifest exceeding that limit would
+        // fit. Pins parity with `config validate --strict`.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -1190,10 +1164,11 @@ default = "default"
 
     #[test]
     fn run_provision_spin_accepts_multi_config_ids_since_kv_migration() {
-        // Stage 5: config is KV-backed for Spin, so multiple config
-        // ids no longer trip enforce_single_store_capability. The
-        // dispatch reaches the adapter dry-run and reports one
-        // `key_value_stores` write per id.
+        // CLI-logic test: the capability gate accepts multiple ids
+        // when the adapter's `merged_id_kinds()` includes the kind.
+        // Spin is the illustrative example because its `config` kind
+        // is KV-backed (multi-capable) post-migration; any adapter
+        // with a multi-capable kind would fit.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -1236,13 +1211,13 @@ ids = ["default"]
 
     #[test]
     fn run_provision_spin_rejects_env_overlay_platform_label_collision_across_kv_and_config() {
-        // M1: provision must run the same merged-id collision check
-        // `config validate` runs. Without it, `provision --adapter
-        // spin --dry-run` happily acks a manifest where distinct
-        // logical ids `[stores.kv].sessions` and
-        // `[stores.config].app_config` BOTH resolve to platform
-        // label `shared` via the env overlay -- both writes would
-        // silently land on the same Spin KV store at runtime.
+        // CLI-logic test: `reject_merged_id_collisions` catches
+        // env-overlay collisions where distinct logical ids across
+        // merged kinds resolve to the same platform label. Spin is
+        // the illustrative example because it merges kv + config
+        // into a single KV backend (any adapter whose
+        // `merged_id_kinds()` covers 2+ kinds would fit). Pins parity
+        // with the same check `config validate` runs.
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
@@ -1316,49 +1291,6 @@ ids = ["default"]
             manifest: manifest_path.clone(),
         })
         .expect("single-id case dispatches cleanly");
-    }
-
-    #[test]
-    fn run_provision_cloudflare_dry_run_dispatches_to_adapter() {
-        // Dry-run path doesn't shell out to wrangler, so CI can
-        // exercise dispatch without wrangler installed.
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let temp = TempDir::new().expect("temp dir");
-        let manifest_path = temp.path().join("edgezero.toml");
-        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
-        fs::write(temp.path().join("wrangler.toml"), "name = \"demo\"\n")
-            .expect("write wrangler.toml");
-        let manifest_str = manifest_path.to_string_lossy().into_owned();
-        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
-
-        run_provision(&ProvisionArgs {
-            adapter: "cloudflare".to_owned(),
-            dry_run: true,
-            local: false,
-            manifest: manifest_path.clone(),
-        })
-        .expect("cloudflare dry-run dispatches cleanly");
-    }
-
-    #[test]
-    fn run_provision_fastly_dry_run_dispatches_to_adapter() {
-        // Dry-run path doesn't shell out to fastly, so CI can
-        // exercise dispatch without fastly installed.
-        let _lock = manifest_guard().lock().expect("manifest guard");
-        let temp = TempDir::new().expect("temp dir");
-        let manifest_path = temp.path().join("edgezero.toml");
-        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
-        fs::write(temp.path().join("fastly.toml"), "name = \"demo\"\n").expect("write fastly.toml");
-        let manifest_str = manifest_path.to_string_lossy().into_owned();
-        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
-
-        run_provision(&ProvisionArgs {
-            adapter: "fastly".to_owned(),
-            dry_run: true,
-            local: false,
-            manifest: manifest_path.clone(),
-        })
-        .expect("fastly dry-run dispatches cleanly");
     }
 
     // ---------- provision --local path containment ----------
