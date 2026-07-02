@@ -332,6 +332,28 @@ mod tests {
     }
 
     #[test]
+    fn manifest_and_routes_params_set_both_capabilities() {
+        let input = quote! {
+            async fn both(
+                ManifestJson(json): ManifestJson,
+                RouteTable(table): RouteTable,
+            ) -> ::std::result::Result<
+                ::edgezero_core::http::Response,
+                ::edgezero_core::error::EdgeError,
+            > {
+                let _ = (json, table);
+                unimplemented!()
+            }
+        };
+        let output = expand_action_impl(&quote!(manifest, routes), input);
+        let collapsed = collapse_whitespace(&render(&output));
+        // The combined form emits a struct whose `introspection_needs` sets both.
+        assert!(collapsed.contains("structboth"));
+        assert!(collapsed.contains("manifest:true"));
+        assert!(collapsed.contains("routes:true"));
+    }
+
+    #[test]
     fn rejects_self_receivers() {
         let input = quote! {
             async fn invalid(&self) -> ::edgezero_core::http::Response {
