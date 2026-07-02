@@ -783,11 +783,11 @@ impl OutboundResponse {
         deadline: Deadline,
     ) -> Result<T, EdgeError>;
     /// Pass the response through as a core `Response` (keeps a streamed body lazy).
-    /// Infallible for a well-formed `OutboundResponse`; the `Result` mirrors the
-    /// other terminal methods and carries `Err(EdgeError::internal(..))` only on an
-    /// adapter-invariant violation — e.g. a response whose body handle was already
-    /// surrendered by a prior terminal call (an adapter bug, reserved to `internal`
-    /// per §3.4.3, never a network/status condition).
+    /// Infallible in safe use: like the other terminal methods it takes `self` by
+    /// move, so double-consumption of the body is prevented at compile time. The
+    /// `Result` mirrors those methods' signatures for uniformity and reserves a
+    /// single `Err(EdgeError::internal(..))` path for an adapter-invariant violation
+    /// (reserved to `internal` per §3.4.3) — never a network/status condition.
     pub fn into_response(self) -> Result<Response, EdgeError>;
 }
 ```
@@ -3271,7 +3271,7 @@ async fn send_all_runs_requests_concurrently() {
 | `Form` / `ValidatedForm` migrated to `form_within(DEFAULT_INBOUND_FORM_BYTES = 1 MiB)`; over-cap → 400 | yes | yes | — |
 | `Json` / `ValidatedJson` migrated to `json_within(DEFAULT_INBOUND_JSON_BYTES = 8 MiB)`; over-cap → 400; cache + poison behaviour identical to `body_bytes` (§3.4.5 / §7 `src/extractor.rs`) | yes | yes | — |
 | Explicit-cap inbound extractors `ValidatedJsonWithin<T, MAX>` / `ValidatedFormWithin<T, MAX>` enforce the const-generic `MAX` (not the default): a body over `MAX` → 400, a body under `MAX` but over the default parses `Ok`. Asserts the `MAX` override path added in §7 `src/extractor.rs` | yes | — | — |
-| Per-adapter `capability()` support matrix (§3.5.2): for each of the four registered adapters, `adapter.capability(c)` returns the documented `Native` / `BestEffort` / `Unsupported` value for **every** one of the nine capabilities (asserts the §3.5.2 matrix directly, not just gate outcomes — Axum/Fastly `BestEffort` cells included) | yes | — | — |
+| Per-adapter `capability()` support matrix (§3.5.2): for each of the four registered adapters, `adapter.capability(c)` returns the documented `CapabilitySupport` value (`Native` / `BoundedCooperative` / `BestEffort` / `Unsupported`) for **every** one of the nine capabilities (asserts the §3.5.2 matrix directly, not just gate outcomes — the Axum/Fastly `BestEffort` and Fastly `BoundedCooperative` cells included) | yes | — | — |
 | Back-compat manifest parse (§6): a manifest with **no** `[capabilities]` section parses `Ok` with `Manifest::capabilities` defaulted (`#[serde(default)]`), and every adapter-selecting command proceeds (no capability contract to enforce) | yes | — | — |
 | Adapter `dispatch_budget(req)` everywhere: each adapter calls the core `dispatch_budget(req, now)` helper and threads the resulting `DispatchBudget` to its platform timer. The **core helper** is Tier 1 (covered by the row above); the "every adapter actually calls it" assertion is Tier 2 (contract crate inspects the call site) / Tier 3 (real runtime observes the 30 s cap) | — | yes | yes |
 | `.timeout(short).deadline(long)` honours the *shorter* effective — **dispatch_budget classification (Tier 1):** the core helper returns `DispatchBudget { duration: short, deadline: now + short }`. Mock-driven test asserts the classification | yes | — | — |
