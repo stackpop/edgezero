@@ -80,22 +80,38 @@ We want a single, consistent, "bind it yourself" mechanism for all three.
 > `ctx.introspection()`, and error (500 internal) if it is absent. `config` takes
 > `RequestContext` and uses neither — it reads the default config store.
 >
-> **(2) Gated injection (supersedes Decision 5's "every request").** The router
-> no longer injects `IntrospectionData` unconditionally. `RouteEntry` carries a
-> `needs_introspection` flag; `RouterInner` precomputes a single
-> `Arc<IntrospectionData>` at `build()`; `dispatch` inserts a clone **only after
-> matching a flagged route**. Non-introspection traffic (virtually all requests)
-> pays nothing. No process-global state; each router owns its payload (so tests
-> and multiple apps in one process stay independent).
+> **(2) Gated injection, driven by an explicit `#[action]` opt-in
+> (supersedes Decision 5's "every request").** The router no longer injects
+> `IntrospectionData` unconditionally. The capability is declared on the handler
+> and rides it to registration — no `app!` change, no `edgezero.toml` change, no
+> process-global, no unstable specialization:
 >
-> **How a route gets flagged — no app-facing change.** App authors write the
-> same `[[triggers.http]]` row (`handler = "edgezero_core::introspection::…"`);
-> the `app!` macro recognizes handlers in the `edgezero_core::introspection::`
-> namespace and emits the flagged registration (`route_introspective`)
-> automatically. There is NO `[introspection]` manifest section and no per-route
-> knob in `edgezero.toml`. Manual `RouterBuilder` users opt in via
-> `route_introspective(path, method, handler)`; a plain `.get(...)` binding of an
-> introspection handler leaves the route unflagged and the extractor returns 500.
+> - **`#[action]` gains an optional parameter list.** `#[action]` (no args) is
+>   **unchanged** — it still expands to a handler fn, and via the `Fn` blanket
+>   `impl DynHandler` reports `needs_introspection() == false`. `#[action(introspection)]`
+>   expands the handler to a **unit struct** with its own `impl DynHandler` whose
+>   `needs_introspection()` returns `true`. The parameter list is future-proofed
+>   (`#[action(introspection, …)]`); unknown params are a compile error. A fn
+>   can't carry the flag past type-erasure, which is why opt-in handlers become
+>   structs — but that only affects handlers that opt in (here: `manifest`,
+>   `routes`); every other handler stays a fn, untouched.
+> - **`DynHandler` gains `fn needs_introspection(&self) -> bool { false }`.**
+> - **The router reads the flag generically at registration.** `add_route` calls
+>   `boxed.needs_introspection()` and stores it on `RouteEntry`. `RouterInner`
+>   precomputes a single `Arc<IntrospectionData>` at `build()`; `dispatch` inserts
+>   a clone **only after matching a flagged route**. Non-introspection traffic
+>   (virtually all requests) pays nothing. Each router owns its payload, so tests
+>   and multiple apps in one process stay independent.
+> - **The `ManifestJson`/`RouteTable` extractors are unchanged** — they remain the
+>   *access* mechanism (read `ctx.introspection()`); `#[action(introspection)]` is
+>   the *opt-in* that causes the data to be injected. `config` stays `#[action]`
+>   and uses neither.
+>
+> **No app-facing change.** App authors write the same `[[triggers.http]]` row;
+> `manifest`/`routes` carry `#[action(introspection)]` in core, so the flag is
+> intrinsic to those handlers. There is NO `[introspection]` manifest section, no
+> per-route knob in `edgezero.toml`, and `app!` emits ordinary `builder.get(...)`
+> — it never inspects handler paths.
 >
 > Where this conflicts with Decision 5 ("every request") or Component 4 ("handler
 > reads `ctx.introspection()`"), the Revision governs.
