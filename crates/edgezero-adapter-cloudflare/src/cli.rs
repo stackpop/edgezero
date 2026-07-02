@@ -1140,37 +1140,6 @@ mod tests {
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
 
-    #[test]
-    fn cloudflare_scaffold_does_not_emit_removed_wrangler_build_command() {
-        let command = CLOUDFLARE_BLUEPRINT.commands.build;
-        assert!(!command.contains("wrangler build"), "{command}");
-        assert_eq!(
-            command, "wrangler deploy --dry-run --cwd {crate_dir}",
-            "the validation build must execute Wrangler's real custom-build pipeline"
-        );
-    }
-
-    #[test]
-    fn rejects_equidistant_wrangler_manifests() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
-
-        let first = root.join("apps/first");
-        fs::create_dir_all(&first).unwrap();
-        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
-        fs::write(first.join("wrangler.toml"), "name=\"first\"").unwrap();
-
-        let second = root.join("apps/second");
-        fs::create_dir_all(&second).unwrap();
-        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
-        fs::write(second.join("wrangler.toml"), "name=\"second\"").unwrap();
-
-        let error = find_wrangler_manifest(root).expect_err("equidistant manifests are ambiguous");
-        assert!(error.contains(first.join("wrangler.toml").to_string_lossy().as_ref()));
-        assert!(error.contains(second.join("wrangler.toml").to_string_lossy().as_ref()));
-    }
-
     /// RAII guard: prepends a directory to `$PATH` and restores the original
     /// value on drop. Mirrors the `PathPrepend` used in `push_cloud.rs`.
     #[cfg(unix)]
@@ -1204,6 +1173,37 @@ mod tests {
                 None => env::remove_var("PATH"),
             }
         }
+    }
+
+    #[test]
+    fn cloudflare_scaffold_does_not_emit_removed_wrangler_build_command() {
+        let command = CLOUDFLARE_BLUEPRINT.commands.build;
+        assert!(!command.contains("wrangler build"), "{command}");
+        assert_eq!(
+            command, "wrangler deploy --dry-run --cwd {crate_dir}",
+            "the validation build must execute Wrangler's real custom-build pipeline"
+        );
+    }
+
+    #[test]
+    fn rejects_equidistant_wrangler_manifests() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+
+        let first = root.join("apps/first");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("Cargo.toml"), "[package]\nname=\"first\"").unwrap();
+        fs::write(first.join("wrangler.toml"), "name=\"first\"").unwrap();
+
+        let second = root.join("apps/second");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("Cargo.toml"), "[package]\nname=\"second\"").unwrap();
+        fs::write(second.join("wrangler.toml"), "name=\"second\"").unwrap();
+
+        let error = find_wrangler_manifest(root).expect_err("equidistant manifests are ambiguous");
+        assert!(error.contains(first.join("wrangler.toml").to_string_lossy().as_ref()));
+        assert!(error.contains(second.join("wrangler.toml").to_string_lossy().as_ref()));
     }
 
     // ---------- extract_namespace_id ----------
