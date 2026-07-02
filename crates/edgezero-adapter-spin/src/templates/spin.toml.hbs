@@ -15,10 +15,11 @@ allowed_outbound_hosts = ["https://*:*"]
 # `[stores.config] ids = ["app_config"]` stanza in the generated
 # `edgezero.toml`: uncomment it (and the matching `app_config` field
 # on your `AppConfig`) to opt in. When opted in, EdgeZero's KV-backed
-# config store opens this label at runtime; `edgezero config push
-# --adapter spin` writes directly into the SQLite backend declared
-# for it in `runtime-config.toml` (or shells `spin cloud key-value
-# set` when the manifest's deploy command targets Fermyon Cloud).
+# config store holds a single JSON blob (with embedded SHA-256);
+# `<name>-cli config push --adapter spin` writes that blob into the
+# SQLite backend declared for this label in `runtime-config.toml`
+# (or shells `spin cloud key-value set` when the manifest's deploy
+# command targets Fermyon Cloud).
 # Without `[stores.config]`, this binding is an unused label and is
 # safe to delete alongside the matching `[key_value_store.app_config]`
 # stanza in `runtime-config.toml`.

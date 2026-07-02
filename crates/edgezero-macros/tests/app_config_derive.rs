@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use edgezero_core::app_config::{AppConfigMeta as _, SecretField, SecretKind};
+    use edgezero_core::app_config::{AppConfigMeta as _, AppConfigRoot, SecretField, SecretKind};
 
     #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
     #[serde(deny_unknown_fields)]
@@ -48,6 +48,19 @@ mod tests {
     struct ConfigBothKinds {
         _greeting: String,
         #[secret]
+        api_token: String,
+        #[secret(store_ref)]
+        vault: String,
+    }
+
+    #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    #[expect(
+        dead_code,
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; the SECRET_FIELDS array reads them via the derive, not via Rust field access"
+    )]
+    struct ConfigKeyInNamedStore {
+        #[secret(store_ref = "vault")]
         api_token: String,
         #[secret(store_ref)]
         vault: String,
@@ -98,8 +111,50 @@ mod tests {
     }
 
     #[test]
+    fn key_in_named_store_attribute_yields_correct_secret_fields() {
+        assert_eq!(
+            ConfigKeyInNamedStore::SECRET_FIELDS,
+            &[
+                SecretField {
+                    name: "api_token",
+                    kind: SecretKind::KeyInNamedStore {
+                        store_ref_field: "vault",
+                    },
+                },
+                SecretField {
+                    name: "vault",
+                    kind: SecretKind::StoreRef,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_emits_app_config_root_impl() {
+        // The trait is a marker; we just need it to compile and the
+        // blanket impl to be reachable via the trait object.
+        fn assert_root<T: AppConfigRoot>() {}
+        assert_root::<ConfigNoSecrets>();
+        assert_root::<ConfigKeyInDefault>();
+        assert_root::<ConfigStoreRef>();
+        assert_root::<ConfigBothKinds>();
+        assert_root::<ConfigKeyInNamedStore>();
+    }
+
+    #[test]
     fn trybuild_compile_fail_fixtures() {
         let cases = trybuild::TestCases::new();
         cases.compile_fail("tests/ui/secret_*.rs");
+        cases.compile_fail("tests/ui/key_in_named_store_missing_sibling.rs");
+        cases.compile_fail("tests/ui/key_in_named_store_sibling_not_store_ref.rs");
+        cases.compile_fail("tests/ui/key_in_named_store_sibling_not_string.rs");
+        // Spec 4.2 + 12.1: the serde-shape bans apply to EVERY
+        // field, not just `#[secret]`-annotated ones. These three
+        // fixtures pin the universal coverage the secret_*.rs
+        // glob alone doesn't exercise.
+        cases.compile_fail("tests/ui/non_secret_with_serde_flatten.rs");
+        cases.compile_fail("tests/ui/non_secret_with_serde_skip_serializing.rs");
+        cases.compile_fail("tests/ui/non_secret_with_serde_skip_serializing_if.rs");
+        cases.pass("tests/ui/secret_with_store_ref_named.rs");
     }
 }

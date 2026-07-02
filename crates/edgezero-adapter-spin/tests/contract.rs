@@ -115,7 +115,7 @@ mod tests {
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::{SecretError, SecretHandle, SecretStore};
     use edgezero_core::store_registry::{
-        BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry,
+        BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry,
     };
     use futures::executor::block_on;
     use futures::stream;
@@ -414,9 +414,13 @@ mod tests {
             key: "greeting",
             value: "hello-spin",
         }));
-        request
-            .extensions_mut()
-            .insert(ConfigRegistry::single_id("default".to_owned(), handle));
+        request.extensions_mut().insert(ConfigRegistry::single_id(
+            "default".to_owned(),
+            ConfigStoreBinding {
+                handle,
+                default_key: "default".to_owned(),
+            },
+        ));
 
         let response = block_on(app.router().oneshot(request)).expect("response");
 

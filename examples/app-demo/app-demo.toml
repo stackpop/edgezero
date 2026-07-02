@@ -12,8 +12,9 @@
 # `[service] timeout_ms` field below.
 
 # `api_token` is the *key* inside the resolved default secret store
-# (see `[stores.secrets]` in `edgezero.toml`). The handler resolves it
-# via `ctx.secret_store_default()?.require_str(&cfg.api_token)`.
+# (see `[stores.secrets]` in `edgezero.toml`). Under the blob model
+# (Model A), the `AppConfig<AppDemoConfig>` extractor automatically
+# resolves the secret value — no manual `require_str` call needed.
 api_token = "demo_api_token"
 greeting = "hello from app-demo"
 # `vault` is a `#[secret(store_ref)]` value — the logical id of a
@@ -21,12 +22,13 @@ greeting = "hello from app-demo"
 # manifest declares a single id, `"default"`.
 vault = "default"
 
-# Nested so `config push` writes the dotted key
-# `feature.new_checkout` — matching the handler that reads
-# `feature.new_checkout` from the config store and the per-adapter
-# seeds in `fastly.toml`/`spin.toml`. Spin's config store is now
-# KV-backed and stores dotted keys verbatim, so no translation is
-# applied: the runtime reads back exactly `feature.new_checkout`.
+# Nested struct field. Under the blob app-config model (spec §3.3),
+# `config push` writes ONE envelope per [stores.config] key. The
+# envelope's `data` carries this whole tree verbatim — including
+# `feature.new_checkout` as nested JSON, not as a dotted-key leaf.
+# At request time the `AppConfig<AppDemoConfig>` extractor
+# deserialises `data` into the typed struct, so handlers read
+# `cfg.feature.new_checkout` directly.
 [feature]
 new_checkout = false
 

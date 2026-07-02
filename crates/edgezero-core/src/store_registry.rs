@@ -9,16 +9,17 @@
 //!
 //! Type aliases:
 //! - [`KvRegistry`] = `StoreRegistry<BoundKvStore>`
-//! - [`ConfigRegistry`] = `StoreRegistry<BoundConfigStore>`
+//! - [`ConfigRegistry`] = `StoreRegistry<ConfigStoreBinding>`
 //! - [`SecretRegistry`] = `StoreRegistry<BoundSecretStore>`
 //!
-//! KV and config handles are already bound to a single backing store by
-//! construction, so the `Bound*` aliases for those are just the existing
-//! handle types. [`BoundSecretStore`] is a real wrapper because the
-//! underlying [`SecretHandle::get_bytes`] takes a `store_name` argument —
-//! the registry captures the per-id platform name (resolved from
-//! `EDGEZERO__STORES__SECRETS__<ID>__NAME`) so handlers can call
-//! [`BoundSecretStore::get_bytes`] with just the key.
+//! KV handles are already bound to a single backing store by construction,
+//! so [`BoundKvStore`] is just the existing handle type. Config uses
+//! [`ConfigStoreBinding`], which pairs a [`ConfigStoreHandle`] with the
+//! default lookup key for that binding (see spec 5.2.1). [`BoundSecretStore`]
+//! is a real wrapper because the underlying [`SecretHandle::get_bytes`] takes
+//! a `store_name` argument — the registry captures the per-id platform name
+//! (resolved from `EDGEZERO__STORES__SECRETS__<ID>__NAME`) so handlers can
+//! call [`BoundSecretStore::get_bytes`] with just the key.
 
 use std::collections::BTreeMap;
 
@@ -34,6 +35,19 @@ pub type BoundKvStore = KvHandle;
 /// A per-bind config handle, returned by
 /// [`ConfigRegistry::named`] / [`ConfigRegistry::default`].
 pub type BoundConfigStore = ConfigStoreHandle;
+
+/// Per-id binding pair for the config store: the handle the
+/// extractor calls `get(...)` on, plus the key the extractor
+/// looks up by default. The `default_key` is computed by
+/// adapters from `EnvConfig::store_key("config", id)`. See spec
+/// 5.2.1.
+#[derive(Clone, Debug)]
+pub struct ConfigStoreBinding {
+    /// The default key this binding resolves when no key is specified.
+    pub default_key: String,
+    /// The config store handle used for key lookups.
+    pub handle: ConfigStoreHandle,
+}
 
 /// A per-bind secret handle: a [`SecretHandle`] pre-bound to a platform
 /// store name. The registry resolves the name per logical id at request
@@ -127,6 +141,14 @@ impl<H: Clone> StoreRegistry<H> {
         &self.default_id
     }
 
+    /// Borrow the default handle without cloning. Mirrors
+    /// [`default`](Self::default) but yields a reference.
+    #[must_use]
+    #[inline]
+    pub fn default_ref(&self) -> Option<&H> {
+        self.by_id.get(&self.default_id)
+    }
+
     /// Try to build a registry from a pre-built id → handle map and the
     /// declared default id, dropping it entirely when the default id is
     /// not registered. Adapters that skip a failed-to-open backend per id
@@ -155,6 +177,14 @@ impl<H: Clone> StoreRegistry<H> {
     #[inline]
     pub fn named(&self, id: &str) -> Option<H> {
         self.by_id.get(id).cloned()
+    }
+
+    /// Borrow the handle for `id`. Mirrors
+    /// [`named`](Self::named) but yields a reference.
+    #[must_use]
+    #[inline]
+    pub fn named_ref(&self, id: &str) -> Option<&H> {
+        self.by_id.get(id)
     }
 
     /// Create a registry from a pre-built id → handle map and the resolved
@@ -196,8 +226,8 @@ impl<H: Clone> StoreRegistry<H> {
 
 /// Registry of per-id KV handles.
 pub type KvRegistry = StoreRegistry<BoundKvStore>;
-/// Registry of per-id config handles.
-pub type ConfigRegistry = StoreRegistry<BoundConfigStore>;
+/// Registry of per-id config bindings (handle + default key).
+pub type ConfigRegistry = StoreRegistry<ConfigStoreBinding>;
 /// Registry of per-id secret handles.
 pub type SecretRegistry = StoreRegistry<BoundSecretStore>;
 
@@ -211,6 +241,10 @@ mod tests {
             .map(|(id, value)| ((*id).to_owned(), (*value).to_owned()))
             .collect();
         StoreRegistry::new(by_id, default_id.to_owned())
+    }
+
+    fn single_id_registry(id: &'static str, value: &'static str) -> StoreRegistry<&'static str> {
+        StoreRegistry::single_id(id.to_owned(), value)
     }
 
     #[test]
@@ -259,5 +293,13 @@ mod tests {
         // call `new(by_id, missing_default)`. Catching this loudly avoids
         // silent registries whose `default()` returns `None`.
         let _registry: StoreRegistry<String> = build_registry(&[("sessions", "a")], "cache");
+    }
+
+    #[test]
+    fn default_ref_and_named_ref_yield_references() {
+        let registry = single_id_registry("only", "value");
+        assert_eq!(registry.default_ref(), Some(&"value"));
+        assert_eq!(registry.named_ref("only"), Some(&"value"));
+        assert_eq!(registry.named_ref("missing"), None);
     }
 }

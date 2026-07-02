@@ -1,15 +1,18 @@
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 
+use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value};
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ResolvedStoreId,
+    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
+    ResolvedStoreId,
 };
 use edgezero_adapter::scaffold::{
     register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
@@ -163,7 +166,7 @@ enum ConfigStoreLookup {
 // `&[]` for documentation, matching the inherited default.
 #[expect(
     clippy::missing_trait_methods,
-    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `single_store_kinds` IS overridden below (returns `&[]`)."
+    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
 )]
 impl Adapter for FastlyCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -233,14 +236,14 @@ impl Adapter for FastlyCliAdapter {
                 let name = store.platform.as_str();
                 if dry_run {
                     out.push(format!(
-                        "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] / [local_server.{kind}_stores.{name}] to {} (logical id `{logical}`)",
+                        "would run `fastly {kind}-store create --name={name}` and append [setup.{kind}_stores.{name}] to {} (logical id `{logical}`)",
                         fastly_path.display()
                     ));
                     continue;
                 }
                 if setup_block_present(&fastly_path, kind, name)? {
                     out.push(format!(
-                        "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] / [local_server.{kind}_stores.{name}] blocks AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
+                        "fastly {kind}-store `{name}` (logical id `{logical}`) already declared in {}; skipping. To force a fresh remote: delete the [setup.{kind}_stores.{name}] block AND run `fastly {kind}-store delete --name={name}` (the old remote store lingers otherwise), then re-run provision.",
                         fastly_path.display()
                     ));
                     continue;
@@ -255,16 +258,88 @@ impl Adapter for FastlyCliAdapter {
                 // stuck.
                 append_fastly_setup(&fastly_path, kind, name).map_err(|err| {
                     format!(
-                        "fastly {kind}-store `{name}` (logical id `{logical}`) was created remotely, but writeback to {path} failed: {err}\n  To recover, either:\n    1. Manually append `[setup.{kind}_stores.{name}]` and `[local_server.{kind}_stores.{name}]` to {path} and re-run, or\n    2. Delete the orphan remote store via `fastly {kind}-store delete --name={name}` and re-run `edgezero provision --adapter fastly`.",
+                        "fastly {kind}-store `{name}` (logical id `{logical}`) was created remotely, but writeback to {path} failed: {err}\n  To recover, either:\n    1. Manually append `[setup.{kind}_stores.{name}]` to {path} and re-run, or\n    2. Delete the orphan remote store via `fastly {kind}-store delete --name={name}` and re-run `edgezero provision --adapter fastly`.",
                         path = fastly_path.display()
                     )
                 })?;
-                out.push(format!(
+                // Fastly's `[setup.<kind>_stores.<name>]` table is
+                // consumed ONLY when `fastly compute deploy` is
+                // creating a NEW service. If `service_id` is
+                // already present in fastly.toml, the service has
+                // been deployed at least once and subsequent
+                // deploys skip `[setup]` entirely — so the store
+                // exists in the account but has no resource link
+                // tying it to a service version, and the running
+                // Compute service can't open it.
+                //
+                // Detect that case and EMIT the exact one-shot
+                // command the operator should run to link the
+                // store. We deliberately don't auto-run it: the
+                // link cones the active version (`--autoclone`),
+                // and silently mutating an already-deployed
+                // service is surprising. The instruction names
+                // both the store-id lookup AND the link command so
+                // the operator can audit before committing.
+                let post_create_note = resource_link_note(&fastly_path, kind, name)?;
+                let mut line = format!(
                     "created fastly {kind}-store `{name}` (logical id `{logical}`); appended setup tables to {}",
                     fastly_path.display()
-                ));
+                );
+                if let Some(note) = post_create_note {
+                    line.push('\n');
+                    line.push_str(&note);
+                }
+                out.push(line);
             }
         }
+        // EdgeZero runtime overrides live in a dedicated Fastly Config
+        // Store named `edgezero_runtime_env`. Compute@Edge has no
+        // process env, so `EDGEZERO__STORES__CONFIG__<ID>__KEY` and
+        // similar overrides have to come from a platform Config Store
+        // the runtime opens by name (see
+        // `env_config_from_runtime_dictionary` in lib.rs). Provision
+        // owns the store creation alongside the operator's declared
+        // stores so the runtime override path is wired correctly out
+        // of the box; if the store already appears in
+        // `[setup.config_stores.edgezero_runtime_env]`, skip.
+        let runtime_env_kind = "config";
+        let runtime_env_name = "edgezero_runtime_env";
+        if dry_run {
+            out.push(format!(
+                "would run `fastly {runtime_env_kind}-store create --name={runtime_env_name}` and append [setup.{runtime_env_kind}_stores.{runtime_env_name}] to {} (EdgeZero runtime override store)",
+                fastly_path.display()
+            ));
+        } else if !setup_block_present(&fastly_path, runtime_env_kind, runtime_env_name)? {
+            create_fastly_store(runtime_env_kind, runtime_env_name)?;
+            append_fastly_setup(&fastly_path, runtime_env_kind, runtime_env_name).map_err(
+                |err| {
+                    format!(
+                        "fastly {runtime_env_kind}-store `{runtime_env_name}` was created remotely, but writeback to {path} failed: {err}\n  Recover via `fastly {runtime_env_kind}-store delete --name={runtime_env_name}` then re-run `edgezero provision --adapter fastly`.",
+                        path = fastly_path.display()
+                    )
+                },
+            )?;
+            // Same already-deployed-service caveat as the declared-store
+            // path: if `service_id` is set in fastly.toml, the
+            // `[setup.config_stores.edgezero_runtime_env]` table won't
+            // be re-applied by the next `fastly compute deploy`, so the
+            // runtime can't open the store. Emit the resource-link
+            // remediation alongside the populate-keys hint.
+            let post_create_note =
+                resource_link_note(&fastly_path, runtime_env_kind, runtime_env_name)?;
+            let mut line = format!(
+                "created fastly {runtime_env_kind}-store `{runtime_env_name}` (EdgeZero runtime override store); appended setup tables to {}\n  Populate per-environment override keys with:\n    fastly config-store-entry update --store-id=<STORE-ID> --key=EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY --value=app_config_staging --upsert",
+                fastly_path.display()
+            );
+            if let Some(note) = post_create_note {
+                line.push('\n');
+                line.push_str(&note);
+            }
+            out.push(line);
+        } else {
+            // Already declared; nothing to do.
+        }
+
         if out.is_empty() {
             out.push("fastly has no declared stores to provision".to_owned());
         }
@@ -283,9 +358,12 @@ impl Adapter for FastlyCliAdapter {
     ) -> Result<Vec<String>, String> {
         // Resolve the platform config-store id on demand via
         // `fastly config-store list --json` (matched by name =
-        // `store.platform`), then `fastly config-store-entry create
-        // --store-id=<id> --key=<k> --value=<v>` per key. Keys
-        // arrive pre-flattened from the CLI (dotted form).
+        // `store.platform`), then `fastly config-store-entry update
+        // --store-id=<id> --key=<k> --upsert --stdin` per physical
+        // entry. Entries are logical blob-envelope entries from
+        // the CLI (one (key, envelope_json) per push); oversized
+        // Fastly values are expanded below into chunk entries plus
+        // a root pointer by `chunked_config::prepare_fastly_config_entries`.
         let logical = store.logical.as_str();
         let name = store.platform.as_str();
         if entries.is_empty() {
@@ -293,26 +371,49 @@ impl Adapter for FastlyCliAdapter {
                 "no config entries to push to fastly config-store `{name}` (logical id `{logical}`)"
             )]);
         }
+        // Expand each logical (key, envelope_json) into physical entries
+        // via the chunk-pointer helper. Entries ≤ 8 000 chars go through
+        // as a single direct entry; larger envelopes are split into
+        // content-addressed chunks with a root pointer written LAST.
+        // Collect all physical entries before any writes so pointer-too-
+        // large errors surface before touching the remote store.
+        let mut physical_entries: Vec<(String, String)> = Vec::new();
+        for (key, body) in entries {
+            let expanded = prepare_fastly_config_entries(key, body)?;
+            physical_entries.extend(expanded);
+        }
         if dry_run {
-            // List each entry so the operator can verify intent
-            // before committing. Matches the spin dry-run preview
-            // shape.
+            // Report intent without shelling out. One line per logical key
+            // noting whether it would be direct or chunked, plus chunk count.
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and run `fastly config-store-entry create` for {} entries:",
-                entries.len()
+                "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and push entries:"
             ));
-            for (key, _) in entries {
-                out.push(format!("  would create entry `{key}`"));
+            for (key, body) in entries {
+                let expanded = prepare_fastly_config_entries(key, body)
+                    .unwrap_or_else(|_| vec![(key.clone(), body.clone())]);
+                if expanded.len() == 1 {
+                    out.push(format!(
+                        "  would push `{key}` as direct entry ({}B)",
+                        body.len()
+                    ));
+                } else {
+                    let chunk_count = expanded.len().saturating_sub(1);
+                    out.push(format!(
+                        "  would push `{key}` as chunked ({chunk_count} chunks + 1 pointer, {}B total)",
+                        body.len()
+                    ));
+                }
             }
             return Ok(out);
         }
         let resolved_id = resolve_remote_config_store_id(name)?;
-        push_entries_with_committer(entries, |key, value| {
+        push_entries_with_committer(&physical_entries, |key, value| {
             create_config_store_entry(&resolved_id, key, value)
         })?;
         Ok(vec![format!(
-            "pushed {} entries to fastly config-store `{name}` (logical id `{logical}`, id={resolved_id})",
+            "pushed {} physical entries ({} logical) to fastly config-store `{name}` (logical id `{logical}`, id={resolved_id})",
+            physical_entries.len(),
             entries.len()
         )])
     }
@@ -349,24 +450,200 @@ impl Adapter for FastlyCliAdapter {
                 fastly_path.display()
             )]);
         }
+        // Expand logical entries into physical entries (chunks + pointer).
+        let mut physical_entries: Vec<(String, String)> = Vec::new();
+        for (key, body) in entries {
+            let expanded = prepare_fastly_config_entries(key, body)?;
+            physical_entries.extend(expanded);
+        }
         if dry_run {
             let mut out = Vec::with_capacity(entries.len().saturating_add(1));
             out.push(format!(
-                "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with {} entries:",
+                "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with entries:",
                 fastly_path.display(),
-                entries.len()
             ));
-            for (key, _) in entries {
-                out.push(format!("  would set `{key}`"));
+            for (key, body) in entries {
+                let expanded = prepare_fastly_config_entries(key, body)
+                    .unwrap_or_else(|_| vec![(key.clone(), body.clone())]);
+                if expanded.len() == 1 {
+                    out.push(format!(
+                        "  would set `{key}` as direct entry ({}B)",
+                        body.len()
+                    ));
+                } else {
+                    let chunk_count = expanded.len().saturating_sub(1);
+                    out.push(format!(
+                        "  would set `{key}` as chunked ({chunk_count} chunks + 1 pointer, {}B total)",
+                        body.len()
+                    ));
+                }
             }
             return Ok(out);
         }
-        write_fastly_local_config_store(&fastly_path, name, entries)?;
+        write_fastly_local_config_store(&fastly_path, name, &physical_entries)?;
         Ok(vec![format!(
-            "wrote {} entries to `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`); restart `fastly compute serve` to pick up changes",
+            "wrote {} physical entries ({} logical) to `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`); restart `fastly compute serve` to pick up changes",
+            physical_entries.len(),
             entries.len(),
             fastly_path.display()
         )])
+    }
+
+    fn read_config_entry(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Shell out to `fastly config-store-entry describe
+        // --store-id=<id> --key=<key> --json`, resolve the store id on
+        // demand via `fastly config-store list --json`, then parse the
+        // JSON response.
+        let name = store.platform.as_str();
+        let store_id = match resolve_remote_config_store_id(name) {
+            Ok(id) => id,
+            Err(err) => {
+                // "not found" from resolve means the store doesn't exist.
+                let lower = err.to_ascii_lowercase();
+                if lower.contains("not found")
+                    || lower.contains("did you run")
+                    || lower.contains("no fastly config-store matches")
+                {
+                    return Ok(ReadConfigEntry::MissingStore);
+                }
+                return Err(err);
+            }
+        };
+        let store_arg = format!("--store-id={store_id}");
+        let key_arg = format!("--key={key}");
+        let output = Command::new("fastly")
+            .args([
+                "config-store-entry",
+                "describe",
+                store_arg.as_str(),
+                key_arg.as_str(),
+                "--json",
+            ])
+            .output()
+            .map_err(|err| {
+                if err.kind() == ErrorKind::NotFound {
+                    format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+                } else {
+                    format!("failed to spawn `fastly`: {err}")
+                }
+            })?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Parse the JSON and extract the `item_value` field.
+            let parsed: serde_json::Value =
+                serde_json::from_str(&stdout).map_err(|err| {
+                    format!(
+                        "failed to parse `fastly config-store-entry describe` JSON: {err}\nraw stdout: {stdout}"
+                    )
+                })?;
+            let value = parsed
+                .get("item_value")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "`fastly config-store-entry describe` JSON has no string `item_value` field; \
+                         fastly CLI may have changed its output schema. Raw stdout: {stdout}"
+                    )
+                })?;
+            // Resolve chunk pointers: if `value` is a direct BlobEnvelope it
+            // passes through unchanged; if it is a chunk pointer the chunks
+            // are fetched from the same store and reconstructed.
+            let resolved = resolve_fastly_config_value(key, value.to_owned(), |chunk_key| {
+                fetch_remote_config_store_entry(&store_id, chunk_key)
+            })?;
+            return Ok(ReadConfigEntry::Present(resolved));
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404")
+        {
+            return Ok(ReadConfigEntry::MissingKey);
+        }
+        Err(format!(
+            "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited with status {}\nstderr: {}",
+            output.status,
+            stderr.trim()
+        ))
+    }
+
+    fn read_config_entry_local(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        store: &ResolvedStoreId,
+        key: &str,
+        _push_ctx: &AdapterPushContext<'_>,
+    ) -> Result<ReadConfigEntry, String> {
+        // Read from `[local_server.config_stores.<platform_name>.contents]`
+        // in fastly.toml — the same section `push_config_entries_local` writes.
+        let Some(rel) = adapter_manifest_path else {
+            return Err(
+                "[adapters.fastly.adapter].manifest must point at fastly.toml for config diff --local"
+                    .to_owned(),
+            );
+        };
+        let fastly_path = manifest_root.join(rel);
+        let name = store.platform.as_str();
+        let raw = match fs::read_to_string(&fastly_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Ok(ReadConfigEntry::MissingStore)
+            }
+            Err(err) => {
+                return Err(format!("failed to read {}: {err}", fastly_path.display()));
+            }
+        };
+        let doc: toml_edit::DocumentMut = raw
+            .parse()
+            .map_err(|err| format!("failed to parse {}: {err}", fastly_path.display()))?;
+        // Probe `[local_server.config_stores.<name>]` — if absent, the store
+        // has not been seeded locally yet.
+        let Some(contents) = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(name))
+            .and_then(|store_tbl| store_tbl.get("contents"))
+        else {
+            return Ok(ReadConfigEntry::MissingStore);
+        };
+        // The contents table is `key = "value"` pairs.
+        match contents.get(key) {
+            Some(item) => {
+                let value = item.as_str().ok_or_else(|| {
+                    format!(
+                        "`[local_server.config_stores.{name}.contents].{key}` in {} is not a string",
+                        fastly_path.display()
+                    )
+                })?;
+                // Resolve chunk pointers using the same toml contents table.
+                let resolved =
+                    resolve_fastly_config_value(key, value.to_owned(), |chunk_key| match contents
+                        .get(chunk_key)
+                    {
+                        Some(chunk_item) => {
+                            let chunk_val = chunk_item.as_str().ok_or_else(|| {
+                                format!(
+                                    "chunk key `{chunk_key}` in {} is not a string",
+                                    fastly_path.display()
+                                )
+                            })?;
+                            Ok(Some(chunk_val.to_owned()))
+                        }
+                        None => Ok(None),
+                    })?;
+                Ok(ReadConfigEntry::Present(resolved))
+            }
+            None => Ok(ReadConfigEntry::MissingKey),
+        }
     }
 
     fn single_store_kinds(&self) -> &'static [&'static str] {
@@ -377,6 +654,70 @@ impl Adapter for FastlyCliAdapter {
         // unlike spin's flat-namespace single-store model.
         &[]
     }
+}
+
+/// Fetch a single entry value from a remote Fastly Config Store entry by
+/// key, using `fastly config-store-entry describe --store-id=<id> --key=<k>
+/// --json`. Used by the chunk-pointer resolver to fan out to chunk entries.
+///
+/// Returns:
+/// - `Ok(Some(value))` when the entry exists.
+/// - `Ok(None)` when the entry is absent (not-found / 404 / does not exist).
+/// - `Err(...)` on adapter or parse errors.
+///
+/// # Errors
+/// Returns an error if `fastly` isn't on `PATH`, spawning fails, the JSON
+/// cannot be parsed, or the CLI exits with an unexpected non-zero status.
+fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<String>, String> {
+    let store_arg = format!("--store-id={store_id}");
+    let key_arg = format!("--key={key}");
+    let output = Command::new("fastly")
+        .args([
+            "config-store-entry",
+            "describe",
+            store_arg.as_str(),
+            key_arg.as_str(),
+            "--json",
+        ])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+            format!(
+                "failed to parse `fastly config-store-entry describe` JSON for chunk \
+                     key `{key}`: {err}\nraw stdout: {stdout}"
+            )
+        })?;
+        let value = parsed
+            .get("item_value")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "`fastly config-store-entry describe` JSON has no string `item_value` \
+                     field for chunk key `{key}`; fastly CLI may have changed its output schema. \
+                     Raw stdout: {stdout}"
+                )
+            })?;
+        return Ok(Some(value.to_owned()));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404") {
+        return Ok(None);
+    }
+    Err(format!(
+        "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` \
+         exited with status {}\nstderr: {}",
+        output.status,
+        stderr.trim()
+    ))
 }
 
 /// Shell out to `fastly <kind>-store create --name=<platform-name>`. The
@@ -453,22 +794,61 @@ fn looks_like_already_exists(stderr: &str, kind: &str) -> bool {
     lower.contains(&dashed) || lower.contains(&underscored) || lower.contains(&spaced)
 }
 
-/// Probe `fastly.toml` for the existence of BOTH
-/// `[setup.<kind>_stores.<id>]` AND `[local_server.<kind>_stores.<id>]`.
-/// Both are required for a complete provision; checking only `[setup]`
-/// would let a half-edited manifest (e.g. `[setup.*]` present but
-/// `[local_server.*]` missing) slip through as "already provisioned"
-/// and never get repaired. Treats a missing file as "not present" so
-/// the first provision call can create it.
+/// Read the top-level `service_id` from `fastly.toml`. Returns
+/// `Ok(None)` when the file is absent (scaffold state before first
+/// `fastly compute deploy`) or when `service_id` is missing /
+/// empty. Used by `provision` to detect when an already-deployed
+/// service needs a separate resource-link step beyond `[setup]`
+/// (which `compute deploy` only consumes on the FIRST deploy).
+fn read_fastly_service_id(path: &Path) -> Result<Option<String>, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
+    };
+    let doc: toml_edit::DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    let svc = doc
+        .get("service_id")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned)
+        .filter(|svc_id| !svc_id.is_empty());
+    Ok(svc)
+}
+
+/// If fastly.toml declares `service_id`, the next
+/// `fastly compute deploy` skips `[setup]` entirely (it only runs on
+/// the FIRST deploy of a service). Any store created by provision
+/// after that needs a separate `fastly resource-link create` to link
+/// the platform store to the service version. This helper returns the
+/// remediation note to surface in the provision output, or `None`
+/// when the service hasn't been deployed yet (so the next
+/// `compute deploy` will pick up the `[setup]` row automatically).
+fn resource_link_note(path: &Path, kind: &str, name: &str) -> Result<Option<String>, String> {
+    let note = read_fastly_service_id(path)?.map(|svc_id| {
+        format!(
+            "  fastly.toml declares `service_id = \"{svc_id}\"`, so this service is already deployed -- `[setup]` will NOT be re-run on the next `fastly compute deploy`. The store exists in the account but is NOT yet linked to the service. To finish provisioning, look up the store id with `fastly {kind}-store list --json` (match by name=`{name}`), then run:\n    fastly resource-link create --service-id={svc_id} --resource-id=<STORE-ID> --version=latest --autoclone --name={name}\n  (the link clones the active version so existing traffic is not affected until you `fastly service-version activate`)."
+        )
+    });
+    Ok(note)
+}
+
+/// Probe `fastly.toml` for the existence of `[setup.<kind>_stores.<id>]`.
+/// Treats a missing file as "not present" so the first provision call
+/// can create it.
 ///
-/// Limitation: this only verifies that the two tables EXIST with
-/// the right names. It does not verify their inner shape (no
-/// `format` field probe, no resource-link validation). A manifest
-/// the operator hand-edited into a structurally-correct-but-empty
-/// state will be treated as "already provisioned" and the skip
-/// line will say so. The fastly CLI itself ends up being the
-/// authoritative checker at deploy time; `provision` only owns
-/// the "did `EdgeZero` write these blocks?" question.
+/// Why only `[setup]` (no longer `[local_server]`): an empty
+/// `[local_server.<kind>_stores.<id>]` table doesn't satisfy
+/// fastly's local-server schema — config-stores need
+/// `format = "inline-toml"` + a contents table, kv/secret stores
+/// need a JSON `file = "..."` or an array of `{key, data}` entries.
+/// Writing an empty table makes `fastly compute serve` skip the
+/// declared store or error at startup. `provision`'s job is the
+/// remote / `[setup]` half; local-server stanzas are written by
+/// `edgezero config push --adapter fastly --local`
+/// (config-stores only), and kv/secret local-server seeding is
+/// hand-edited until we add equivalent writers for those kinds.
 fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String> {
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -479,25 +859,25 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
         .parse()
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
     let plural = format!("{kind}_stores");
-    let has = |parent: &str| {
-        doc.get(parent)
-            .and_then(|root| root.get(plural.as_str()))
-            .and_then(|kind_tbl| kind_tbl.get(id))
-            .is_some()
-    };
-    // append_fastly_setup is idempotent per parent: if only one of
-    // the two blocks is present, returning false here lets it run
-    // again and add just the missing block (the present-key check
-    // inside append_fastly_setup skips the one that already exists).
-    Ok(has("setup") && has("local_server"))
+    Ok(doc
+        .get("setup")
+        .and_then(|root| root.get(plural.as_str()))
+        .and_then(|kind_tbl| kind_tbl.get(id))
+        .is_some())
 }
 
-/// Append `[setup.<kind>_stores.<id>]` and
-/// `[local_server.<kind>_stores.<id>]` to `fastly.toml`. Creates
-/// the file (and the parent `[setup]` / `[local_server]` tables)
-/// if absent. Both new blocks are written as empty tables — the
-/// resource-link declaration is enough for `fastly compute deploy`
-/// to honour, and `config push` fills in entries later.
+/// Append `[setup.<kind>_stores.<id>]` to `fastly.toml`. Creates
+/// the file (and the parent `[setup]` table) if absent. The block
+/// is written as an empty table — that's what
+/// `fastly compute deploy` consumes the first time it creates a
+/// service: the resource-link declaration is enough, and the
+/// account-level resource itself is already created in the
+/// preceding `create_fastly_store` shellout.
+///
+/// We DON'T write `[local_server.<kind>_stores.<id>]` here: see
+/// `setup_block_present`'s doc for the schema rationale. The local-
+/// server seeding moved to `config push --local` (config-stores
+/// only), so provision only owns the remote / setup half.
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
     use toml_edit::{table, DocumentMut, Item};
 
@@ -511,26 +891,24 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
         .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
 
     let plural = format!("{kind}_stores");
-    for parent in ["setup", "local_server"] {
-        let parent_entry = doc.entry(parent).or_insert_with(table);
-        let parent_tbl = parent_entry.as_table_mut().ok_or_else(|| {
-            format!(
-                "{}: `{parent}` exists but is not a table; refusing to edit in place",
-                path.display()
-            )
-        })?;
-        let kind_entry = parent_tbl
-            .entry(plural.as_str())
-            .or_insert_with(|| Item::Table(toml_edit::Table::new()));
-        let kind_tbl = kind_entry.as_table_mut().ok_or_else(|| {
-            format!(
-                "{}: `{parent}.{plural}` exists but is not a table; refusing to edit in place",
-                path.display()
-            )
-        })?;
-        if !kind_tbl.contains_key(id) {
-            kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
-        }
+    let parent_entry = doc.entry("setup").or_insert_with(table);
+    let parent_tbl = parent_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `setup` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+    let kind_entry = parent_tbl
+        .entry(plural.as_str())
+        .or_insert_with(|| Item::Table(toml_edit::Table::new()));
+    let kind_tbl = kind_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `setup.{plural}` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+    if !kind_tbl.contains_key(id) {
+        kind_tbl.insert(id, Item::Table(toml_edit::Table::new()));
     }
 
     fs::write(path, doc.to_string())
@@ -578,18 +956,45 @@ fn write_fastly_local_config_store(
         )
     })?;
 
-    // Replace the per-store block wholesale so stale entries don't
-    // linger across pushes (the inverse of provision's "preserve
-    // existing tables" rule -- here the push is the source of truth
-    // for the contents).
-    let mut store_tbl = Table::new();
-    store_tbl.insert("format", toml_edit::value("inline-toml"));
-    let mut contents_tbl = Table::new();
+    // Upsert into the existing per-store contents table so a
+    // `config push --key app_config_staging` does NOT wipe the
+    // previously-pushed `app_config` blob. Spec 12.7 requires
+    // default + staging keys to coexist so the runtime
+    // EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY env var can
+    // switch between them. (Earlier wholesale-replace was a
+    // misread of the "stale entries don't linger" property:
+    // that applies WITHIN a key (old chunks for the same root
+    // become unreferenced when a new chunk-set installs a new
+    // pointer), NOT across sibling keys.)
+    let store_entry = config_stores_tbl.entry(platform_name).or_insert_with(|| {
+        let mut tbl = Table::new();
+        tbl.insert("format", toml_edit::value("inline-toml"));
+        tbl.insert("contents", Item::Table(Table::new()));
+        Item::Table(tbl)
+    });
+    let store_tbl = store_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `local_server.config_stores.{platform_name}` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
+    // Ensure the `format` key is present even on a pre-existing
+    // entry that omitted it.
+    if !store_tbl.contains_key("format") {
+        store_tbl.insert("format", toml_edit::value("inline-toml"));
+    }
+    let contents_entry = store_tbl
+        .entry("contents")
+        .or_insert_with(|| Item::Table(Table::new()));
+    let contents_tbl = contents_entry.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `local_server.config_stores.{platform_name}.contents` exists but is not a table; refusing to edit in place",
+            path.display()
+        )
+    })?;
     for (key, value) in entries {
         contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
     }
-    store_tbl.insert("contents", Item::Table(contents_tbl));
-    config_stores_tbl.insert(platform_name, Item::Table(store_tbl));
 
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
@@ -641,19 +1046,46 @@ where
     Ok(pushed.len())
 }
 
+/// Shell `fastly config-store-entry update --upsert --stdin` with
+/// the value piped through stdin instead of `--value=<value>` on
+/// argv.
+///
+/// Two reasons for this exact invocation:
+///
+/// 1. `--upsert` (vs. the original `create` subcommand): the prior
+///    `create` form errored on any key that already existed in the
+///    config store, which made `config push` non-repeatable —
+///    after the first push, every follow-up push triggered by a
+///    config edit would fail at the first unchanged key.
+///    `update --upsert` is documented as "insert or update", which
+///    matches the convergent semantic the other config-push paths
+///    already have (axum overwrites the JSON, cloudflare's
+///    `wrangler kv bulk put` overwrites, spin's
+///    `cloud key-value set` overwrites).
+///
+/// 2. `--stdin` (vs. `--value=<value>`): `--value=` exposed every
+///    config entry's bytes in `ps`/`/proc/<pid>/cmdline` listings
+///    AND was bounded by the host's `ARG_MAX` (4 KiB to 256 KiB
+///    depending on platform — easy to trip with a JSON blob).
+///    `--stdin` reads the value from stdin instead — keeps value
+///    bytes out of argv and lifts the size cap to whatever the OS
+///    pipe buffer + the CLI's read accept (megabytes in practice).
 fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(), String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
-    let value_arg = format!("--value={value}");
-    let output = Command::new("fastly")
+    let mut child = Command::new("fastly")
         .args([
             "config-store-entry",
-            "create",
+            "update",
             store_arg.as_str(),
             key_arg.as_str(),
-            value_arg.as_str(),
+            "--upsert",
+            "--stdin",
         ])
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| {
             if err.kind() == ErrorKind::NotFound {
                 format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
@@ -661,11 +1093,25 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
                 format!("failed to spawn `fastly`: {err}")
             }
         })?;
+    // Move stdin OUT of child via `take` so the ChildStdin drops at
+    // end of scope — that closes the pipe and lets the CLI see EOF.
+    // `child.wait_with_output()` then consumes child cleanly.
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open stdin pipe to `fastly`".to_owned())?;
+    stdin
+        .write_all(value.as_bytes())
+        .map_err(|err| format!("failed to write value to `fastly` stdin: {err}"))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait on `fastly`: {err}"))?;
     if output.status.success() {
         return Ok(());
     }
     Err(format!(
-        "`fastly config-store-entry create --store-id={store_id} --key={key} ...` exited with status {}\nstderr: {}",
+        "`fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
     ))
@@ -944,6 +1390,10 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use edgezero_adapter::cli_support::read_package_name;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     // Shared fixture names. Pinning these as consts (instead of
@@ -955,6 +1405,41 @@ mod tests {
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
+
+    /// RAII guard: prepends a directory to `$PATH` and restores the original
+    /// value on drop.
+    #[cfg(unix)]
+    struct PathPrepend {
+        original: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl PathPrepend {
+        fn new(extra: &Path) -> Self {
+            let original = env::var_os("PATH");
+            let new_path = match &original {
+                Some(prev) => {
+                    let mut accum = OsString::from(extra);
+                    accum.push(":");
+                    accum.push(prev);
+                    accum
+                }
+                None => OsString::from(extra),
+            };
+            env::set_var("PATH", new_path);
+            Self { original }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathPrepend {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(prev) => env::set_var("PATH", prev),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
 
     #[test]
     fn finds_closest_manifest_when_multiple_exist() {
@@ -1220,20 +1705,22 @@ mod tests {
     }
 
     #[test]
-    fn setup_block_present_false_when_only_setup_or_only_local_server_exists() {
-        // Spec requires BOTH [setup.<kind>_stores.<id>] AND
-        // [local_server.<kind>_stores.<id>] for a fully provisioned
-        // store. A half-edited manifest (e.g. operator hand-added
-        // the [setup.*] block but skipped [local_server.*]) must
-        // return false so the next provision repairs the missing
-        // block; append_fastly_setup is idempotent per parent, so
-        // it skips the present one and writes the missing one.
+    fn setup_block_present_true_when_only_setup_exists() {
+        // Post-F6 (PR #269 round 2): `setup_block_present` only
+        // checks `[setup.<kind>_stores.<id>]`. The pre-fix check
+        // ALSO required `[local_server.<kind>_stores.<id>]`, but
+        // writing an empty `[local_server.*]` table didn't match
+        // fastly's local-server schema (config-stores need
+        // `format` + contents, kv/secret stores need a JSON file
+        // or `{key, data}` entries). Local-server seeding moved
+        // to `config push --adapter fastly --local`, so probe
+        // only cares about `[setup]` now.
         let dir = tempdir().expect("tempdir");
         let only_setup = dir.path().join("only_setup.toml");
         fs::write(&only_setup, "name = \"demo\"\n[setup.kv_stores.sessions]\n").expect("write");
         assert!(
-            !setup_block_present(&only_setup, "kv", TEST_KV_ID).expect("probe"),
-            "[setup.*] alone is not enough -- [local_server.*] also required"
+            setup_block_present(&only_setup, "kv", TEST_KV_ID).expect("probe"),
+            "[setup.*] alone is now sufficient: {only_setup:?}"
         );
 
         let only_local = dir.path().join("only_local.toml");
@@ -1244,14 +1731,14 @@ mod tests {
         .expect("write");
         assert!(
             !setup_block_present(&only_local, "kv", TEST_KV_ID).expect("probe"),
-            "[local_server.*] alone is not enough -- [setup.*] also required"
+            "[local_server.*] alone is NOT a provisioned-setup signal"
         );
     }
 
     // ---------- append_fastly_setup ----------
 
     #[test]
-    fn append_fastly_setup_creates_both_tables_in_minimal_file() {
+    fn append_fastly_setup_creates_setup_table_in_minimal_file() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         fs::write(&path, "name = \"demo\"\n").expect("write");
@@ -1261,9 +1748,14 @@ mod tests {
             after.contains("[setup.kv_stores.sessions]"),
             "setup table added: {after}"
         );
+        // Post-F6: no `[local_server.*]` write — that empty stanza
+        // didn't satisfy fastly's local-server schema and made
+        // `fastly compute serve` error or skip the store. Local-
+        // server seeding is now `config push --adapter fastly
+        // --local`'s job.
         assert!(
-            after.contains("[local_server.kv_stores.sessions]"),
-            "local_server table added: {after}"
+            !after.contains("[local_server.kv_stores.sessions]"),
+            "[local_server.*] empty table no longer written by provision: {after}"
         );
         assert!(
             after.contains("name = \"demo\""),
@@ -1275,11 +1767,7 @@ mod tests {
     fn append_fastly_setup_appends_alongside_existing_kind_tables() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
-            "[setup.kv_stores.cache]\n[local_server.kv_stores.cache]\n",
-        )
-        .expect("write");
+        fs::write(&path, "[setup.kv_stores.cache]\n").expect("write");
         append_fastly_setup(&path, "kv", TEST_KV_ID).expect("append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
@@ -1296,11 +1784,7 @@ mod tests {
     fn append_fastly_setup_is_idempotent_on_duplicate_id() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(
-            &path,
-            "[setup.kv_stores.sessions]\nfoo = \"keep\"\n[local_server.kv_stores.sessions]\n",
-        )
-        .expect("write");
+        fs::write(&path, "[setup.kv_stores.sessions]\nfoo = \"keep\"\n").expect("write");
         append_fastly_setup(&path, "kv", TEST_KV_ID).expect("idempotent append");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
@@ -1317,7 +1801,10 @@ mod tests {
         append_fastly_setup(&path, "config", TEST_CONFIG_ID).expect("create");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(after.contains("[setup.config_stores.app_config]"));
-        assert!(after.contains("[local_server.config_stores.app_config]"));
+        assert!(
+            !after.contains("[local_server.config_stores.app_config]"),
+            "[local_server.*] no longer written by provision: {after}"
+        );
     }
 
     #[test]
@@ -1472,11 +1959,15 @@ build = \"cargo build --release\"
         let out = FastlyCliAdapter
             .provision(dir.path(), Some("fastly.toml"), None, &stores, true)
             .expect("dry-run succeeds");
-        // 1 KV + 1 config + 1 secret = 3 status lines.
-        assert_eq!(out.len(), 3);
+        // 1 KV + 1 config + 1 secret + 1 runtime-env = 4 status lines.
+        assert_eq!(out.len(), 4);
         assert!(out[0].contains("would run `fastly kv-store create --name=sessions`"));
         assert!(out[1].contains("would run `fastly config-store create --name=app_config`"));
         assert!(out[2].contains("would run `fastly secret-store create --name=default`"));
+        assert!(
+            out[3].contains("would run `fastly config-store create --name=edgezero_runtime_env`"),
+            "runtime-env store row: {out:?}",
+        );
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
@@ -1504,7 +1995,14 @@ build = \"cargo build --release\"
     fn provision_with_no_declared_stores_says_so() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
-        fs::write(&path, "name = \"demo\"\n").expect("write");
+        // Pre-populate the runtime-env block so the provision flow's
+        // unconditional runtime-env step skips (otherwise it would
+        // shell out to real `fastly` to create the store).
+        fs::write(
+            &path,
+            "name = \"demo\"\n[setup.config_stores.edgezero_runtime_env]\n",
+        )
+        .expect("write");
         let stores = ProvisionStores {
             config: &[],
             kv: &[],
@@ -1527,7 +2025,8 @@ build = \"cargo build --release\"
         let path = dir.path().join("fastly.toml");
         fs::write(
             &path,
-            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n",
+            "[setup.kv_stores.sessions]\n[local_server.kv_stores.sessions]\n\
+             [setup.config_stores.edgezero_runtime_env]\n",
         )
         .expect("write");
         let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
@@ -1541,6 +2040,66 @@ build = \"cargo build --release\"
             .expect("skip path succeeds without invoking fastly");
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("already declared"), "got: {out:?}");
+    }
+
+    /// When `fastly.toml` declares `service_id`, the next
+    /// `fastly compute deploy` skips `[setup]` entirely. provision
+    /// must emit the `fastly resource-link create` remediation for
+    /// every store it creates -- including the implicit
+    /// `edgezero_runtime_env` store the runtime override path
+    /// depends on. Without this, a freshly-provisioned override
+    /// store would not be linked to the already-deployed service
+    /// and the runtime would silently fall back to baked defaults.
+    #[test]
+    fn provision_emits_resource_link_note_for_runtime_env_on_existing_service() {
+        // Dry-run only -- we just want to drive the resource_link_note
+        // helper for the runtime-env store branch. The real-create
+        // path can't run in tests (would shell out to `fastly`).
+        // The dry-run output line for runtime-env doesn't include the
+        // note (the helper only fires on real create), so we test the
+        // helper directly here.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\nservice_id = \"abc123svc\"\n").expect("write");
+        let note = resource_link_note(&path, "config", "edgezero_runtime_env")
+            .expect("read service_id")
+            .expect("note present when service_id set");
+        assert!(
+            note.contains("service_id = \"abc123svc\""),
+            "note quotes the service id: {note}"
+        );
+        assert!(
+            note.contains("fastly config-store list --json"),
+            "note tells operator how to find the store id: {note}"
+        );
+        assert!(
+            note.contains("name=`edgezero_runtime_env`"),
+            "note names the runtime override store: {note}"
+        );
+        assert!(
+            note.contains(
+                "fastly resource-link create --service-id=abc123svc --resource-id=<STORE-ID> --version=latest --autoclone --name=edgezero_runtime_env"
+            ),
+            "note carries the full resource-link command: {note}"
+        );
+    }
+
+    /// And the inverse: no `service_id` (a service that hasn't been
+    /// deployed yet) means `[setup]` will be applied on the next
+    /// `compute deploy`, so no manual resource-link step is needed.
+    /// The helper must return `None` to avoid noisy false-positive
+    /// guidance.
+    #[test]
+    fn provision_skips_resource_link_note_when_service_undeployed() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+        let note =
+            resource_link_note(&path, "config", "edgezero_runtime_env").expect("read service_id");
+        assert!(
+            note.is_none(),
+            "no service_id => no resource-link prompt: {note:?}"
+        );
     }
 
     // ---------- find_config_store_id ----------
@@ -1676,7 +2235,7 @@ build = \"cargo build --release\"
         assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
         assert!(
             out[0].contains("would resolve fastly config-store `app_config`")
-                && out[0].contains("config-store-entry create"),
+                && out[0].contains("push entries"),
             "dry-run header describes the would-be flow: {out:?}"
         );
         assert!(
@@ -1708,6 +2267,1181 @@ build = \"cargo build --release\"
         assert!(
             out[0].contains("no config entries"),
             "status line names the no-op: {out:?}"
+        );
+    }
+
+    // ---------- read_config_entry_local ----------
+
+    #[test]
+    fn read_local_returns_missing_store_when_fastly_toml_absent() {
+        let dir = tempdir().expect("tempdir");
+        // No fastly.toml written — file missing.
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("missing file is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "absent fastly.toml => MissingStore"
+        );
+    }
+
+    #[test]
+    fn read_local_returns_missing_store_when_no_local_server_contents() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // fastly.toml exists but has no [local_server.config_stores.*] block.
+        fs::write(&path, "name = \"demo\"\n[setup.config_stores.app_config]\n").expect("write");
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("missing local_server block is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "no local_server stanza => MissingStore"
+        );
+    }
+
+    #[test]
+    fn read_local_returns_missing_key_when_key_absent_from_contents() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Write a local_server block with a different key so the store exists
+        // but the requested key is absent.
+        fs::write(
+            &path,
+            format!(
+                "name = \"demo\"\n\
+                 [local_server.config_stores.{TEST_CONFIG_ID}]\n\
+                 format = \"inline-toml\"\n\
+                 [local_server.config_stores.{TEST_CONFIG_ID}.contents]\n\
+                 other_key = \"other_value\"\n"
+            ),
+        )
+        .expect("write");
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("missing key is not an error");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "key absent from contents => MissingKey"
+        );
+    }
+
+    #[test]
+    fn read_local_returns_present_when_key_exists_in_contents() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write initial toml");
+
+        // Use a valid BlobEnvelope value — the resolver requires BlobEnvelope
+        // or chunk-pointer JSON; raw strings are not accepted post-chunking.
+        let envelope_json = serde_json::to_string(&BlobEnvelope::new(
+            json!({"hello": "fastly"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        write_fastly_local_config_store(
+            &path,
+            TEST_CONFIG_ID,
+            &[("greeting".to_owned(), envelope_json.clone())],
+        )
+        .expect("setup write");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("key present");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present variant");
+        };
+        assert_eq!(value, envelope_json, "value matches what was written");
+    }
+
+    #[test]
+    fn read_local_roundtrips_with_push_local() {
+        // Write via push_config_entries_local, then read via
+        // read_config_entry_local — the two must agree on the value.
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, "name = \"demo\"\n").expect("write");
+
+        // push_config_entries_local passes the value through the chunk-pointer
+        // helper which stores it verbatim when ≤ 8 000 chars. The reader then
+        // resolves it through the same resolver that requires BlobEnvelope JSON.
+        let envelope_json = serde_json::to_string(&BlobEnvelope::new(
+            json!({"hello": "roundtrip"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        let entries = vec![("greeting".to_owned(), envelope_json.clone())];
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("read succeeds");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present after push+read roundtrip");
+        };
+        assert_eq!(value, envelope_json, "roundtrip value matches");
+    }
+
+    #[test]
+    fn read_local_requires_adapter_manifest_path() {
+        let dir = tempdir().expect("tempdir");
+        let result = FastlyCliAdapter.read_config_entry_local(
+            dir.path(),
+            None, // adapter_manifest_path missing
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "greeting",
+            &AdapterPushContext::new(),
+        );
+        match result {
+            Err(err) => assert!(
+                err.contains("[adapters.fastly.adapter].manifest"),
+                "error names the missing field: {err}"
+            ),
+            Ok(_) => panic!("expected Err when adapter_manifest_path is None"),
+        }
+    }
+
+    // ---------- read_config_entry (fake fastly, remote shell-out) ----------
+
+    /// Build a tempdir containing a `fastly` shim script that:
+    /// - Responds to `config-store list --json` with a store-list JSON containing
+    ///   `TEST_CONFIG_ID` mapped to `store-abc123`.
+    /// - Responds to `config-store-entry describe ...` with `stdout_body` on
+    ///   stdout and `stderr_body` on stderr, exiting with `exit_code`.
+    ///
+    /// Payloads are written to separate sibling files so shell-active chars
+    /// in the content don't get re-interpreted by the script.
+    #[cfg(unix)]
+    fn fake_fastly_returning(
+        stdout_body: &str,
+        stderr_body: &str,
+        exit_code: i32,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("fastly");
+        let stdout_file = dir.path().join("stdout_payload.txt");
+        let stderr_file = dir.path().join("stderr_payload.txt");
+        let list_file = dir.path().join("list_payload.txt");
+        // Store-list JSON: bare array with one entry matching TEST_CONFIG_ID.
+        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        fs::write(&stdout_file, stdout_body).expect("write stdout payload");
+        fs::write(&stderr_file, stderr_body).expect("write stderr payload");
+        fs::write(&list_file, list_json).expect("write list payload");
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\ncat '{}' >&2\nexit {exit_code}\n",
+            list_file.display(),
+            stdout_file.display(),
+            stderr_file.display(),
+        );
+        fs::write(&script_path, script).expect("write fastly script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    /// Build a fake `fastly` that logs each argv token (one per line) to
+    /// `out_path`, handles the list call correctly, and exits 0 for both calls.
+    #[cfg(unix)]
+    fn fake_fastly_argv_log(out_path: &Path) -> tempfile::TempDir {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("fastly");
+        let list_file = dir.path().join("list_payload.txt");
+        let entry_file = dir.path().join("entry_payload.txt");
+        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        // item_value must be a valid BlobEnvelope JSON so the resolver accepts it.
+        let envelope_json = serde_json::to_string(&BlobEnvelope::new(
+            json!({"v": "logged"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        let entry_json = format!(
+            r#"{{"item_value":{},"store_id":"store-abc123"}}"#,
+            serde_json::to_string(&envelope_json).expect("escape")
+        );
+        fs::write(&list_file, list_json).expect("write list payload");
+        fs::write(&entry_file, &entry_json).expect("write entry payload");
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\" >> '{}'; done\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\ncat '{}'\nexit 0\n",
+            out_path.display(),
+            list_file.display(),
+            entry_file.display(),
+        );
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    /// Process-wide mutex serialising PATH-mutating tests so parallel
+    /// test threads don't race on the environment variable.
+    #[cfg(unix)]
+    fn path_mutation_guard() -> &'static Mutex<()> {
+        use std::sync::OnceLock;
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_present_on_success() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Fake fastly: list succeeds with app_config → store-abc123;
+        // describe returns valid JSON with item_value that is a BlobEnvelope.
+        let envelope = serde_json::to_string(&BlobEnvelope::new(
+            json!({"hello": "fastly"}),
+            "2026-06-22T00:00:00Z".into(),
+        ))
+        .expect("serialize");
+        let entry_json = format!(
+            r#"{{"item_value":{},"store_id":"store-abc123"}}"#,
+            serde_json::to_string(&envelope).expect("escape")
+        );
+        let fake = fake_fastly_returning(&entry_json, "", 0);
+        let _path = PathPrepend::new(fake.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("fake fastly exit-0 must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, envelope);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_key_on_not_found_stderr() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // describe exits non-zero with "not found" in stderr → MissingKey.
+        let fake = fake_fastly_returning("", "Error: item not found", 1);
+        let _path = PathPrepend::new(fake.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("not-found maps to MissingKey (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingKey),
+            "not-found stderr => MissingKey"
+        );
+    }
+
+    /// The Fastly impl distinguishes store-not-found from key-not-found via
+    /// `resolve_remote_config_store_id`: when the list call exits non-zero and
+    /// the error string contains "not found", `read_config_entry` returns
+    /// `MissingStore` without ever calling the describe subcommand.
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_returns_missing_store_on_appropriate_stderr() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Script that exits non-zero for the list call so resolve fails with
+        // a "not found" error, causing read_config_entry to return MissingStore.
+        let fake_dir = tempdir().expect("tempdir");
+        let stderr_file = fake_dir.path().join("stderr_payload.txt");
+        fs::write(&stderr_file, "Error: config store not found for service").expect("write stderr");
+        let script_path = fake_dir.path().join("fastly");
+        let script = format!(
+            "#!/bin/sh\ncat '{stderr}' >&2\nexit 1\n",
+            stderr = stderr_file.display(),
+        );
+        fs::write(&script_path, script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        let _path = PathPrepend::new(fake_dir.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("list failure with not-found maps to MissingStore (not Err)");
+        assert!(
+            matches!(result, ReadConfigEntry::MissingStore),
+            "list not-found => MissingStore"
+        );
+    }
+
+    /// Verify that `read_config_entry` invokes
+    /// `fastly config-store-entry describe --store-id=<id> --key=<key> --json`
+    /// (after the resolve step that calls `fastly config-store list --json`).
+    #[cfg(unix)]
+    #[test]
+    fn read_remote_invokes_correct_argv() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let fake = fake_fastly_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "greeting",
+                &AdapterPushContext::new(),
+            )
+            .expect("argv-log fake must succeed");
+        assert!(
+            matches!(result, ReadConfigEntry::Present(_)),
+            "expected Present from argv-log fake"
+        );
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        // The describe call must include these args (resolve call args
+        // are also captured but we only assert the describe shape here).
+        assert!(
+            captured.contains("config-store-entry"),
+            "must invoke config-store-entry; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("describe"),
+            "must pass describe subcommand; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("--store-id=store-abc123"),
+            "must pass resolved store id; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("--key=greeting"),
+            "must pass --key=<key>; got:\n{captured}"
+        );
+        assert!(
+            captured.contains("--json"),
+            "must pass --json flag; got:\n{captured}"
+        );
+    }
+
+    // ---------- chunked push integration tests ----------
+
+    /// Build a valid `BlobEnvelope` JSON string of approximately `target_len` bytes.
+    #[cfg(unix)]
+    fn make_test_envelope(target_len: usize) -> String {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let pad = "x".repeat(target_len.saturating_add(64));
+        let data = json!({ "pad": pad });
+        let raw =
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".into())).unwrap();
+        if raw.len() >= target_len {
+            let overhead = raw.len().saturating_sub(pad.len());
+            let adjusted = "x".repeat(target_len.saturating_sub(overhead));
+            let data2 = json!({ "pad": adjusted });
+            serde_json::to_string(&BlobEnvelope::new(data2, "2026-06-22T00:00:00Z".into())).unwrap()
+        } else {
+            raw
+        }
+    }
+
+    /// Build a fake `fastly` script whose describe response depends on
+    /// the `--key=<k>` argument: `key_responses` maps key names to JSON
+    /// item-value responses. Falls back to exit 1 "not found" for unknown keys.
+    #[cfg(unix)]
+    fn fake_fastly_with_key_dispatch(
+        _dir: &Path,
+        key_responses: &[(String, String)],
+    ) -> tempfile::TempDir {
+        use std::fmt::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let fake_dir = tempdir().expect("tempdir");
+        let list_file = fake_dir.path().join("list.json");
+        let list_json = format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#);
+        fs::write(&list_file, list_json).expect("write list");
+        // Write each key response to a named file.
+        let mut dispatch_lines = String::new();
+        for (key, response) in key_responses {
+            let resp_file = fake_dir.path().join(format!("resp_{key}.json"));
+            fs::write(&resp_file, response).expect("write resp");
+            // Use exact-match: iterate argv and compare each token literally
+            // so that a root key like "app_config" does NOT match a chunk key
+            // like "app_config.__edgezero_chunks.abc.0".
+            writeln!(
+                dispatch_lines,
+                "  for arg in \"$@\"; do if [ \"$arg\" = \"--key={key}\" ]; then cat '{}'; exit 0; fi; done",
+                resp_file.display()
+            )
+            .expect("write to String is infallible");
+        }
+        // Fallback outputs "not found" so fetch_remote_config_store_entry
+        // maps it to Ok(None) rather than Err.
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"config-store\" ]; then\n  cat '{}'\n  exit 0\nfi\n{dispatch_lines}echo 'Error: item not found' >&2\nexit 1\n",
+            list_file.display()
+        );
+        let script_path = fake_dir.path().join("fastly");
+        fs::write(&script_path, &script).expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+        fake_dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_writes_direct_entry_at_exactly_8000_chars() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let fake = fake_fastly_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        assert_eq!(envelope.len(), FASTLY_CONFIG_ENTRY_LIMIT);
+
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must succeed");
+        // One physical entry written (direct).
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        assert!(
+            captured.contains(&format!("--key={TEST_CONFIG_ID}")),
+            "must write root key directly: {captured}"
+        );
+        assert!(
+            out[0].contains("1 physical entries (1 logical)"),
+            "summary reports 1 physical entry: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_writes_chunks_and_root_pointer_for_8001_chars() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let argv_log = dir.path().join("argv.txt");
+        let fake = fake_fastly_argv_log(&argv_log);
+        let _path = PathPrepend::new(fake.path());
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        assert!(envelope.len() > FASTLY_CONFIG_ENTRY_LIMIT);
+
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must succeed");
+        let captured = fs::read_to_string(&argv_log).expect("argv log");
+        // At least one chunk key must appear before the root key.
+        assert!(
+            captured.contains(".__edgezero_chunks."),
+            "chunk keys must be written: {captured}"
+        );
+        // Root pointer must also be written.
+        assert!(
+            captured.contains(&format!("--key={TEST_CONFIG_ID}")),
+            "root pointer must be written: {captured}"
+        );
+        // Root key must be LAST in the log (chunk lines come before it).
+        let root_pos = captured.rfind(&format!("--key={TEST_CONFIG_ID}")).unwrap();
+        let chunk_pos = captured.find(".__edgezero_chunks.").unwrap();
+        assert!(
+            chunk_pos < root_pos,
+            "chunk writes must precede root pointer write: chunk_pos={chunk_pos} root_pos={root_pos}"
+        );
+        assert!(out[0].contains("logical"), "summary line present: {out:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_dry_run_reports_direct_vs_chunked() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+
+        let direct_envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let chunked_envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+
+        let entries = vec![
+            ("cfg_direct".to_owned(), direct_envelope),
+            ("cfg_chunked".to_owned(), chunked_envelope),
+        ];
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run must not error");
+
+        // No shellout happens; output must describe intent.
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("would push `cfg_direct` as direct entry"),
+            "must report direct: {combined}"
+        );
+        assert!(
+            combined.contains("would push `cfg_chunked` as chunked"),
+            "must report chunked: {combined}"
+        );
+    }
+
+    /// Spec 12.7: pushing two blobs under different root keys
+    /// (e.g. `app_config` + `app_config_staging`) must leave both
+    /// keys readable from the local fastly.toml so the runtime
+    /// `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY` override can
+    /// switch between them. Prior to the upsert fix the second
+    /// push wholesale-replaced the per-store contents table.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_preserves_sibling_keys() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+        let store = ResolvedStoreId::from_logical(TEST_CONFIG_ID);
+        let ctx = AdapterPushContext::new();
+
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &store,
+                &[("app_config".to_owned(), "{\"envelope\":\"A\"}".to_owned())],
+                &ctx,
+                false,
+            )
+            .expect("first push");
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &store,
+                &[(
+                    "app_config_staging".to_owned(),
+                    "{\"envelope\":\"B\"}".to_owned(),
+                )],
+                &ctx,
+                false,
+            )
+            .expect("second push (sibling key)");
+
+        let raw = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = raw.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents after sibling push");
+        let app_config = contents
+            .get("app_config")
+            .and_then(toml_edit::Item::as_str)
+            .expect("default key must survive sibling push");
+        assert_eq!(
+            app_config, "{\"envelope\":\"A\"}",
+            "default key value: {raw}"
+        );
+        let staging = contents
+            .get("app_config_staging")
+            .and_then(toml_edit::Item::as_str)
+            .expect("staging key must be present");
+        assert_eq!(staging, "{\"envelope\":\"B\"}", "staging key value: {raw}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_writes_literal_dotted_chunk_keys() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("write");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("local push must succeed");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read back");
+        // Chunk keys contain '.' and must appear as quoted string keys,
+        // not as TOML nested tables (which would look like [table.sub]).
+        assert!(
+            after.contains(".__edgezero_chunks."),
+            "chunk keys written to fastly.toml: {after}"
+        );
+        // Parse with toml_edit and confirm chunk keys are string-keyed entries.
+        let doc: toml_edit::DocumentMut = after.parse().expect("must parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .expect("contents table must exist");
+        // At least one chunk key must be present as a string value (not a table).
+        let has_chunk_string = contents.as_table().is_some_and(|tbl| {
+            tbl.iter()
+                .any(|(key, val)| key.contains(".__edgezero_chunks.") && val.as_value().is_some())
+        });
+        assert!(
+            has_chunk_string,
+            "chunk keys must be literal string-valued entries, not nested tables: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_reports_chunking_and_does_not_edit_fastly_toml() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let original = "name = \"demo\"\n";
+        fs::write(&fastly_toml, original).expect("write");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = vec![(TEST_CONFIG_ID.to_owned(), envelope)];
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &entries,
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("local dry-run must not error");
+
+        // File must be untouched.
+        let after = fs::read_to_string(&fastly_toml).expect("read back");
+        assert_eq!(after, original, "dry-run must not edit fastly.toml");
+
+        // Output must describe chunking intent.
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("would set") && combined.contains("chunked"),
+            "must report chunked intent: {combined}"
+        );
+    }
+
+    // ---------- chunked read integration tests ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_resolves_direct_value_unchanged() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = BlobEnvelope::new(json!({"hello": "world"}), "2026-06-22T00:00:00Z".into());
+        let json_str = serde_json::to_string(&envelope).unwrap();
+        let item_json = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(&json_str).unwrap()
+        );
+        let fake = fake_fastly_returning(&item_json, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, json_str, "direct envelope passes through unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_reconstructs_chunked_envelope() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        let (_, pointer_json) = physical.last().unwrap();
+        // Build a key→response map for every physical entry.
+        let mut key_responses: Vec<(String, String)> = Vec::new();
+        for (pk, pv) in &physical {
+            let resp = format!(r#"{{"item_value":{}}}"#, serde_json::to_string(pv).unwrap());
+            key_responses.push((pk.clone(), resp));
+        }
+        // The root key should return the pointer.
+        let ptr_resp = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(pointer_json).unwrap()
+        );
+        key_responses.push((TEST_CONFIG_ID.to_owned(), ptr_resp));
+
+        let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("chunked read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(
+            value, envelope,
+            "reconstructed envelope must equal original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_errors_on_missing_chunk() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        let (_, pointer_json) = physical.last().unwrap();
+        // Only provide the root pointer; omit chunk responses so chunk fetch returns not-found.
+        let ptr_resp = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(pointer_json).unwrap()
+        );
+        let key_responses = vec![(TEST_CONFIG_ID.to_owned(), ptr_resp)];
+        let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            TEST_CONFIG_ID,
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("missing chunk must error")
+        };
+        assert!(
+            err.contains("missing chunk"),
+            "error must mention missing chunk: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_errors_on_corrupt_chunk_hash() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        let (_, pointer_json) = physical.last().unwrap();
+        let mut key_responses: Vec<(String, String)> = Vec::new();
+        // Corrupt first chunk's content.
+        let (first_chunk_key, first_chunk_val) = &physical[0];
+        let corrupted: String = first_chunk_val.chars().map(|_| 'Z').collect();
+        let corrupt_resp = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(&corrupted).unwrap()
+        );
+        key_responses.push((first_chunk_key.clone(), corrupt_resp));
+        // Remaining chunks as normal.
+        for (pk, pv) in physical
+            .iter()
+            .take(physical.len().saturating_sub(1))
+            .skip(1)
+        {
+            key_responses.push((
+                pk.clone(),
+                format!(r#"{{"item_value":{}}}"#, serde_json::to_string(pv).unwrap()),
+            ));
+        }
+        key_responses.push((
+            TEST_CONFIG_ID.to_owned(),
+            format!(
+                r#"{{"item_value":{}}}"#,
+                serde_json::to_string(pointer_json).unwrap()
+            ),
+        ));
+        let fake = fake_fastly_with_key_dispatch(dir.path(), &key_responses);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            TEST_CONFIG_ID,
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("corrupt chunk must error")
+        };
+        assert!(
+            err.contains("SHA mismatch") || err.contains("mismatch"),
+            "error must mention hash mismatch: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_errors_on_malformed_pointer() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Root value is JSON but neither a BlobEnvelope nor a valid pointer.
+        let bad_json = r#"{"some_field":"not a pointer or envelope"}"#;
+        let item_json = format!(
+            r#"{{"item_value":{}}}"#,
+            serde_json::to_string(bad_json).unwrap()
+        );
+        let fake = fake_fastly_returning(&item_json, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("malformed pointer must error")
+        };
+        assert!(
+            err.contains("neither a valid BlobEnvelope") || err.contains("chunk pointer"),
+            "error must describe parse failure: {err}"
+        );
+    }
+
+    // ---------- local read integration tests ----------
+
+    #[test]
+    fn read_config_entry_local_resolves_direct_value() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+        use serde_json::json;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        let envelope = BlobEnvelope::new(json!({"x": 1_i32}), "2026-06-22T00:00:00Z".into());
+        let json_str = serde_json::to_string(&envelope).unwrap();
+        // Write directly as a single entry (not via push_config_entries_local so we
+        // control the exact TOML content).
+        write_fastly_local_config_store(
+            &fastly_toml,
+            TEST_CONFIG_ID,
+            &[("cfg".to_owned(), json_str.clone())],
+        )
+        .expect("write");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("local read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, json_str, "direct envelope passes through unchanged");
+    }
+
+    #[test]
+    fn read_config_entry_local_reconstructs_chunked_envelope() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
+        // Write all physical entries (chunks + pointer) to the local store.
+        write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &physical).expect("write");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("local chunked read must succeed");
+        let ReadConfigEntry::Present(value) = result else {
+            panic!("expected Present");
+        };
+        assert_eq!(
+            value, envelope,
+            "reconstructed envelope must equal original"
+        );
+    }
+
+    /// Spec 12.3 + 9.3: a second oversized push must converge the
+    /// runtime on the NEW envelope — chunk keys are content-addressed
+    /// by the full-envelope SHA, so push B writes a new chunk-set and
+    /// installs a new root pointer.
+    ///
+    /// The local fastly.toml writer upserts per-key (so a sibling
+    /// `--key app_config_staging` push leaves `app_config` intact per
+    /// spec 12.7). Within the SAME root key, old chunks for envelope
+    /// A remain in the contents table after envelope B's push — they're
+    /// unreferenced (the root pointer at `app_config` now names B's
+    /// chunks), matching the remote Fastly behaviour where the
+    /// per-entry `update --upsert` shell-out has no atomic-delete
+    /// pairing. The runtime-correctness property holds either way: a
+    /// read after push B follows the active pointer and reconstructs
+    /// envelope B, not A.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear test scenario: push A, inspect, push B, inspect, read; splitting would obscure the chunk-set comparison"
+    )]
+    fn second_oversized_push_converges_runtime_on_new_envelope() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        // First push: envelope A. Records the chunk-key set so we can
+        // confirm they survive the second push (no garbage collection
+        // in v1 — spec 9.3 + Q6).
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_a.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("first push must succeed");
+
+        let after_a = fs::read_to_string(&fastly_toml).expect("read");
+        let doc_a: toml_edit::DocumentMut = after_a.parse().expect("parse");
+        let contents_a = doc_a
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents table after push A");
+        let chunks_a: Vec<String> = contents_a
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .filter(|key| key.contains(".__edgezero_chunks."))
+            .collect();
+        assert!(
+            !chunks_a.is_empty(),
+            "push A must have produced chunk entries: {after_a}"
+        );
+
+        // Second push: a DIFFERENT oversized envelope B. The
+        // content-addressed chunk keys must shift to B's sha; old
+        // A-chunks may remain in the table (v1 doesn't GC). Build
+        // envelope B with a distinct payload key so its SHA differs
+        // from A's even at the same total length.
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:01Z".to_owned()))
+                .expect("envelope B serialises")
+        };
+        assert_ne!(envelope_a, envelope_b, "test fixtures must differ");
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("second push must succeed");
+
+        let after_b = fs::read_to_string(&fastly_toml).expect("read");
+        let doc_b: toml_edit::DocumentMut = after_b.parse().expect("parse");
+        let contents_b = doc_b
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents table after push B");
+        let chunks_b: Vec<String> = contents_b
+            .iter()
+            .map(|(key, _)| key.to_owned())
+            .filter(|key| key.contains(".__edgezero_chunks."))
+            .collect();
+        assert!(
+            !chunks_b.is_empty(),
+            "push B must have produced chunk entries: {after_b}"
+        );
+
+        // Chunk keys are content-addressed by envelope SHA, so the B
+        // push installs a fresh chunk-set whose keys are all distinct
+        // from A's. Under the upsert semantic the A-chunks remain in
+        // the contents table (no GC in v1); B's chunks are simply added.
+        let new_b_chunks: Vec<&String> = chunks_b
+            .iter()
+            .filter(|key| !chunks_a.contains(*key))
+            .collect();
+        assert!(
+            !new_b_chunks.is_empty(),
+            "push B must have added at least one new content-addressed chunk: A-set={chunks_a:?} B-set={chunks_b:?}"
+        );
+        // Old A-chunks remain in the table (orphan-but-present —
+        // matches the remote Fastly write-only-upsert semantic).
+        for chunk_key in &chunks_a {
+            assert!(
+                chunks_b.contains(chunk_key),
+                "old A-chunk `{chunk_key}` must remain in the local table after push B (v1 has no GC); B-set={chunks_b:?}"
+            );
+        }
+
+        // Runtime-correctness property: a fresh read after push B
+        // reconstructs envelope B (NOT envelope A).
+        let read = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("local read after push B");
+        let ReadConfigEntry::Present(value) = read else {
+            panic!("expected Present after push B");
+        };
+        assert_eq!(
+            value, envelope_b,
+            "read after second push must reconstruct envelope B, not A"
+        );
+        assert_ne!(
+            value, envelope_a,
+            "old envelope A's chunks must be inert -- read must NOT return A"
         );
     }
 }

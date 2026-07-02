@@ -20,7 +20,7 @@ use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
-    BoundSecretStore, ConfigRegistry, KvRegistry, SecretRegistry, StoreRegistry,
+    BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
 use spin_sdk::http::body::IncomingBodyExt as _;
 use spin_sdk::http::Request as SpinRequest;
@@ -220,9 +220,15 @@ fn synthesise_store_registries(
     Option<SecretRegistry>,
 ) {
     let config_registry = stores.config_registry.or_else(|| {
-        stores
-            .config_store
-            .map(|handle| ConfigRegistry::single_id("default".to_owned(), handle))
+        stores.config_store.map(|handle| {
+            ConfigRegistry::single_id(
+                "default".to_owned(),
+                ConfigStoreBinding {
+                    handle,
+                    default_key: "default".to_owned(),
+                },
+            )
+        })
     });
     let kv_registry = stores.kv_registry.or_else(|| {
         stores
@@ -290,13 +296,19 @@ async fn build_config_registry(
     // label not declared / registered) from `Unavailable` (transient
     // hostcall failure). `with_context` chains rather than
     // stringifying.
-    let mut by_id: BTreeMap<String, ConfigStoreHandle> = BTreeMap::new();
+    let mut by_id: BTreeMap<String, ConfigStoreBinding> = BTreeMap::new();
     for id in meta.ids {
         let label = env.store_name("config", id);
         let store = SpinConfigStore::open(label.clone())
             .await
             .with_context(|| format!("config store id `{id}` (label `{label}`) failed to open"))?;
-        by_id.insert((*id).to_owned(), ConfigStoreHandle::new(Arc::new(store)));
+        by_id.insert(
+            (*id).to_owned(),
+            ConfigStoreBinding {
+                handle: ConfigStoreHandle::new(Arc::new(store)),
+                default_key: env.store_key("config", id),
+            },
+        );
     }
     // Every id is required to open (any failure returns Err above), so
     // `from_parts` is guaranteed to have the default id present.
@@ -470,6 +482,26 @@ mod synthesis_tests {
             secret_registry.default().expect("bound").store_name(),
             "default",
             "bound name copied verbatim"
+        );
+    }
+
+    /// Spec 12.7 / plan line 1526: `EDGEZERO__STORES__CONFIG__<ID>__KEY`
+    /// must surface as `ConfigStoreBinding.default_key`.
+    ///
+    /// `build_config_registry` calls `SpinConfigStore::open` which requires
+    /// the Spin executor and cannot be unit-tested here; this test exercises
+    /// the env-resolution layer that `build_config_registry` reads from.
+    /// Platform-integration coverage relies on the E2 smoke scripts.
+    #[test]
+    fn config_default_key_env_override_resolved() {
+        let env = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        assert_eq!(
+            env.store_key("config", "app_config"),
+            "app_config_staging",
+            "env override must propagate to the key resolved by build_config_registry"
         );
     }
 }

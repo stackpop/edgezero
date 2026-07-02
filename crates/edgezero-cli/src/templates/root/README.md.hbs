@@ -3,17 +3,17 @@
 This workspace demonstrates a multi-target EdgeZero app.
 
 - `crates/{{proj_core}}`: reusable application logic built with `edgezero-core`.
-- `crates/{{proj_cli}}`: your project's CLI binary, built on the reusable `edgezero-cli` library. Extend it with your own subcommands here — `edgezero` itself stays generic.
+- `crates/{{proj_cli}}`: your project's CLI binary, built on the reusable `edgezero-cli` library. Extend it with your own subcommands here -- `edgezero` itself stays generic.
 {{{readme_adapter_crates}}}
 
 ## Routes
 
-- `GET /` – simple text health check
-- `GET /echo/{name}` – path parameter echo
-- `GET /headers` – prints the incoming `user-agent`
-- `GET /stream` – emits a short streamed response body
-- `POST /echo` – echoes JSON payloads
-- `GET|POST /proxy/{*rest}` – forwards requests to `API_BASE_URL`, falling back to a 501 when the active adapter does not expose a proxy client
+- `GET /` - simple text health check
+- `GET /echo/{name}` - path parameter echo
+- `GET /headers` - prints the incoming `user-agent`
+- `GET /stream` - emits a short streamed response body
+- `POST /echo` - echoes JSON payloads
+- `GET|POST /proxy/{*rest}` - forwards requests to `API_BASE_URL`, falling back to a 501 when the active adapter does not expose a proxy client
 
 ## Dev
 
@@ -22,3 +22,41 @@ This workspace demonstrates a multi-target EdgeZero app.
 ## Configuration
 
 Environment variables are declared in `edgezero.toml`. Set `API_BASE_URL` to the upstream origin you want `/proxy/...` to target. Adapter-specific secrets are opt-in: uncomment the `#[secret]` field in `crates/{{proj_core}}/src/config.rs` and the matching `[stores.secrets]` block in `edgezero.toml`, then provide the secret value through the wired backend (Cloudflare Worker secret, Fastly Secret Store, Spin secret variable, ...).
+
+### Typed app config (`{{name}}.toml`)
+
+`{{name}}.toml` maps onto `{{NameUpperCamel}}Config` in
+`crates/{{proj_core}}/src/config.rs`. Handlers receive it via the
+`AppConfig<{{NameUpperCamel}}Config>` extractor -- no manual config-store
+or secret-store calls needed. The `{{proj_cli}}` binary wires the typed
+push and validate commands:
+
+```sh
+# Validate the manifest + typed config (skips secret-field rules at
+# push time; runtime validates the resolved secret values per spec 3.3.8):
+cargo run -p {{proj_cli}} -- config validate
+
+# Push `{{name}}.toml` as a single blob envelope into the adapter's
+# config store. The blob carries every field verbatim -- including
+# `#[secret]` fields, whose value at rest is the key NAME (Model A
+# per spec 3.3); the runtime extractor swaps each name for the
+# resolved secret value at request time.
+cargo run -p {{proj_cli}} -- config push --adapter <axum|cloudflare|fastly|spin>
+
+# Compare the local TOML against the deployed remote. `--exit-code`
+# turns it into a CI gate: exit 1 if changes exist.
+cargo run -p {{proj_cli}} -- config diff --adapter <name> --format json --exit-code
+```
+
+Uncomment `[stores.config]` in `edgezero.toml` (and the matching
+adapter binding in the per-adapter manifest) before running `config push`.
+
+Use `--key <name>` for per-environment overrides (staging / canary):
+the same `{{name}}.toml` can land under multiple keys, and the runtime
+picks one via `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=<name>`.
+Where you set that override depends on the adapter -- Axum reads it
+from process env, Cloudflare from worker vars, Spin from application
+variables, and Fastly from a dedicated `edgezero_runtime_env` Config
+Store that `edgezero provision --adapter fastly` creates. See the
+[blob app-config migration guide](https://stackpop.github.io/edgezero/guide/blob-app-config-migration)
+for the per-adapter steps and the full operator runbook.

@@ -65,7 +65,7 @@
   `&[String]` shape). Landed as one-adapter-per-commit:
   `9a0369b` (trait + axum no-op + CLI delegate + stubs for the
   other three), `d905e42` (cloudflare `wrangler kv namespace
-  create` + `wrangler.toml` `[[kv_namespaces]]` writeback),
+create` + `wrangler.toml` `[[kv_namespaces]]` writeback),
   `79a54b6` (fastly `fastly <kind>-store create` +
   `[setup.*]`/`[local_server.*]` `fastly.toml` writeback),
   `0933440` (spin pure `spin.toml` editing — appends KV labels
@@ -150,7 +150,7 @@
   collapsed into a single `FastlyService` / `CloudflareService`
   builder. Per-request store wiring uses the fluent form
   `Service::new(&app).with_kv("name").require_kv()
-  .with_config("name").with_secrets().dispatch(req[, env, ctx])`.
+.with_config("name").with_secrets().dispatch(req[, env, ctx])`.
   The manifest-driven `run_app` remains the recommended
   entrypoint and now internally builds a Service.
 
@@ -254,7 +254,7 @@ substrate Stage 3 builds on.)
   opens a KV namespace and `get(key)` is async.
 - `examples/app-demo` is a **separate workspace**, excluded from the
   root workspace. CI now runs `cd examples/app-demo && cargo test
-  --workspace --all-targets` as a dedicated job (see `format.yml` /
+--workspace --all-targets` as a dedicated job (see `format.yml` /
   `test.yml`); previous revisions of this plan noted it was uncovered,
   which is no longer true. The opt-in
   `cargo test -p edgezero-cli --test generated_project_builds -- --ignored`

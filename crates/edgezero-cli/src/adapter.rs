@@ -140,7 +140,7 @@ fn manifest_command<'manifest>(
     adapter_name: &str,
     action: Action,
 ) -> Option<&'manifest str> {
-    let cfg = manifest.adapters.get(adapter_name)?;
+    let (_canonical, cfg) = manifest.adapter_entry(adapter_name)?;
     match action {
         Action::AuthLogin => cfg.commands.auth_login.as_deref(),
         Action::AuthLogout => cfg.commands.auth_logout.as_deref(),
@@ -159,7 +159,7 @@ fn adapter_bind_from_manifest(
     manifest: &Manifest,
     adapter_name: &str,
 ) -> (Option<String>, Option<u16>) {
-    let Some(cfg) = manifest.adapters.get(adapter_name) else {
+    let Some((_canonical, cfg)) = manifest.adapter_entry(adapter_name) else {
         return (None, None);
     };
     (cfg.adapter.host.clone(), cfg.adapter.port)

@@ -110,6 +110,17 @@ impl EnvConfig {
         self.get(&["logging", "level"])
     }
 
+    /// Key for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__KEY` —
+    /// falling back to `id` itself when unset, blank, whitespace-only, or
+    /// containing control characters. Mirrors [`store_name`]'s filter exactly.
+    #[must_use]
+    #[inline]
+    pub fn store_key(&self, kind: &str, id: &str) -> String {
+        self.get(&["stores", kind, id, "key"])
+            .filter(|value| !is_blank_or_control(value))
+            .map_or_else(|| id.to_owned(), str::to_owned)
+    }
+
     /// Platform name for a logical store — `EDGEZERO__STORES__<KIND>__<ID>__NAME`
     /// — falling back to `id` itself when the variable is unset OR when
     /// the value is empty / whitespace-only. `kind` is `"kv"` /
@@ -237,6 +248,35 @@ mod tests {
             "prod-app_v2.sessions",
         )]);
         assert_eq!(cfg.store_name("kv", "sessions"), "prod-app_v2.sessions");
+    }
+
+    #[test]
+    fn store_key_returns_env_var_when_set() {
+        let cfg = EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY",
+            "app_config_staging",
+        )]);
+        assert_eq!(cfg.store_key("config", "app_config"), "app_config_staging");
+    }
+
+    #[test]
+    fn store_key_falls_back_to_id_when_unset() {
+        let empty: [(&str, &str); 0] = [];
+        let cfg = EnvConfig::from_vars(empty);
+        assert_eq!(cfg.store_key("config", "app_config"), "app_config");
+    }
+
+    #[test]
+    fn store_key_falls_back_on_blank_value() {
+        let cfg = EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "   ")]);
+        assert_eq!(cfg.store_key("config", "app_config"), "app_config");
+    }
+
+    #[test]
+    fn store_key_falls_back_on_control_chars() {
+        let cfg =
+            EnvConfig::from_vars([("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY", "bad\x01key")]);
+        assert_eq!(cfg.store_key("config", "app_config"), "app_config");
     }
 
     #[test]

@@ -117,6 +117,7 @@ we shell out to it.
 ### CLI surface changes
 
 **Deleted:**
+
 - `--seed-url`, `--seed-token` flags on `ConfigPushArgs`.
 - `EDGEZERO__ADAPTERS__SPIN__SEED_URL`,
   `EDGEZERO__ADAPTERS__SPIN__LOCAL_SEED_URL`,
@@ -128,10 +129,12 @@ we shell out to it.
   route).
 
 **Added:**
+
 - `--runtime-config <path>` flag on `ConfigPushArgs` (default:
   `runtime-config.toml` next to the spin manifest).
 
 **Survivor (unchanged):**
+
 - `--local` flag retains its general meaning across adapters
   (push to the local emulator). For Spin specifically `--local`
   becomes informational: the per-backend dispatch in `runtime-config.toml`
@@ -171,17 +174,17 @@ Tasks 2-3 stall.
   duplicate `err.contains("api-token")` assertion to actually check
   the field name (`api_token`, underscore). (H5)
 - **T1.2** — `crates/edgezero-adapter-spin/src/config_store.rs:62`
-  + `crates/edgezero-adapter-spin/src/request.rs:289`: map
-  `SpinSdkKvStore::open` failure to `ConfigStoreError::internal`
-  (structural / permanent), preserve the error chain via
-  `anyhow::Context` instead of stringifying. (M4)
+  - `crates/edgezero-adapter-spin/src/request.rs:289`: map
+    `SpinSdkKvStore::open` failure to `ConfigStoreError::internal`
+    (structural / permanent), preserve the error chain via
+    `anyhow::Context` instead of stringifying. (M4)
 - **T1.3** — `Cargo.toml:62`: pin `spin-sdk = "~6.0"` to catch
   upstream schema or signature breaks at build time. (M6)
 - **T1.4** — `crates/edgezero-adapter/src/registry.rs`: add
   `merged_id_kinds()` trait method (default `&[]`). Spin overrides
   to `&["kv", "config"]`. Add
   `crates/edgezero-cli/src/config.rs::reject_merged_id_collisions`
-  + 2 tests. (M7)
+  - 2 tests. (M7)
 - **T1.5** — `crates/edgezero-adapter/src/registry.rs`: drop the
   dead `_config_keys` parameter from
   `Adapter::validate_typed_secrets`. Update Spin's impl + 3 unit
@@ -248,7 +251,7 @@ Drop everything the per-backend redesign makes obsolete.
 cloudflare (no expected change), app-demo workspace tests with
 the spin push tests `#[ignore]`d.
 
-**Commit:** "spin: drop /__edgezero/config/seed handler in favor
+**Commit:** "spin: drop /\_\_edgezero/config/seed handler in favor
 of per-backend writers (architecture pivot)".
 
 ### Task 3 — Add per-backend writers
@@ -257,7 +260,7 @@ Implement the SQLite-direct writer and the Fermyon Cloud
 shellout. This is the core of the redesign.
 
 - **T3.1** — `Cargo.toml`: add `rusqlite = { version = "0.32",
-  default-features = false, features = ["bundled"] }` to
+default-features = false, features = ["bundled"] }` to
   `[workspace.dependencies]`. Add to
   `crates/edgezero-adapter-spin/Cargo.toml` under
   `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]` —
@@ -281,6 +284,7 @@ shellout. This is the core of the redesign.
 - **T3.3** —
   `crates/edgezero-adapter-spin/src/cli/push_sqlite.rs` (new
   file). The SQLite-direct writer:
+
   ```rust
   const SPIN_KV_SCHEMA: &str = "
       CREATE TABLE IF NOT EXISTS spin_key_value (
@@ -303,10 +307,12 @@ shellout. This is the core of the redesign.
       entries: &[(String, String)],
   ) -> Result<(), String>;
   ```
+
   Default `db_path` resolution if `runtime-config.toml` has no
   explicit `path`: `<spin.toml dir>/.spin/sqlite_key_value.db`.
   Auto-create parent dir if missing. Single transaction for the
   whole batch (rollback on per-entry failure).
+
 - **T3.4** —
   `crates/edgezero-adapter-spin/src/cli/push_cloud.rs` (new
   file). Fermyon Cloud shellout:
@@ -377,17 +383,20 @@ shellout. This is the core of the redesign.
   doc comment.
 
 **Gates:** all Task 1 + Task 2 gates plus
+
 - `cargo build -p edgezero-adapter-spin --target wasm32-wasip2
-  --no-default-features --features spin` — proves rusqlite
+--no-default-features --features spin` — proves rusqlite
   isn't accidentally linked into the wasm artifact.
 - The `config_flow.rs` integration tests pass.
 
 **Commit:** "spin: implement per-backend writers (SQLite-direct
-+ Fermyon Cloud shellout)".
+
+- Fermyon Cloud shellout)".
 
 ## Open questions
 
 None at v1. User has confirmed:
+
 - Delete the seed handler entirely (no local-only fallback).
 - Schema-drift test = vendored CREATE TABLE byte-compare (T3.8).
 - Auto-detect Fermyon Cloud from deploy command (T3.5).

@@ -52,7 +52,7 @@ log = "0.4"
 log-fastly = "0.12"
 matchit = "0.9"
 once_cell = "1"
-redb = "4.1"
+redb = "4.1.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking", "json"] }
 # `bundled` ships SQLite source so operators don't need a system
 # `libsqlite3-sys` install. Used by `edgezero-adapter-spin`'s CLI-only
@@ -60,11 +60,17 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "b
 # file (`<spin.toml dir>/.spin/sqlite_key_value.db`) using the schema
 # vendored from spinframework/spin's `crates/key-value-spin/src/store.rs`.
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+ryu = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-subtle = "2"
+serde_path_to_error = "0.1"
 serde_urlencoded = "0.7"
+sha2 = "0.10"
+similar = "2"
 simple_logger = "5"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+subtle = "2"
 # Pinned to the `~6.0` range (allows 6.0.x, blocks 6.1+) so a minor
 # bump that touches `key_value::Store::open`'s async signature or the
 # wasi-http import surface fails at build time rather than at `spin

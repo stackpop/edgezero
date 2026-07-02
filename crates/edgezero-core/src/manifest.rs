@@ -84,6 +84,7 @@ impl ManifestLoader {
 }
 
 #[derive(Debug, Deserialize, Validate)]
+#[validate(schema(function = "validate_manifest_adapter_keys_case_unique"))]
 #[expect(
     clippy::partial_pub_fields,
     reason = "deserialized fields are pub for the public API; internal state is private"
@@ -114,6 +115,27 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Look up a `[adapters.<name>]` entry by adapter name, matching
+    /// case-insensitively against the manifest's declared keys.
+    ///
+    /// Returns `(canonical_key, config)` where `canonical_key` is the
+    /// EXACT spelling the operator wrote in `edgezero.toml` — callers
+    /// use it for error messages and downstream lookups so the
+    /// surface presented to the user matches the manifest text.
+    ///
+    /// Case-folded duplicates (e.g. both `[adapters.fastly]` and
+    /// `[adapters.Fastly]` declared) are rejected at manifest load
+    /// time by `validate_manifest_adapter_keys_case_unique`, so this
+    /// helper sees at most one match.
+    #[must_use]
+    #[inline]
+    pub fn adapter_entry(&self, name: &str) -> Option<(&String, &ManifestAdapter)> {
+        let needle = name.to_ascii_lowercase();
+        self.adapters
+            .iter()
+            .find(|(key, _cfg)| key.to_ascii_lowercase() == needle)
+    }
+
     #[must_use]
     #[inline]
     pub fn environment(&self) -> &ManifestEnvironment {
@@ -426,7 +448,17 @@ pub struct ManifestAdapterCommands {
 // ---------------------------------------------------------------------------
 
 /// Top-level `[stores]` section.
+///
+/// `deny_unknown_fields` catches typos like `[stores.secret]` (vs.
+/// the correct `[stores.secrets]`) at manifest load time. Without
+/// it, a typo passes parsing silently — the runtime sees no
+/// declaration for that kind and the app starts without a wired
+/// store. The known declarations (`StoreDeclaration` itself,
+/// adapter sections, etc.) already reject legacy fields below this
+/// level, so adding the rejection HERE seals the only remaining
+/// silent-typo path.
 #[derive(Debug, Default, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ManifestStores {
     #[serde(default)]
@@ -765,6 +797,34 @@ fn validate_manifest_adapter(adapter: &ManifestAdapter) -> Result<(), Validation
     Ok(())
 }
 
+/// Reject case-fold duplicate `[adapters.*]` keys at manifest load
+/// time so the case-insensitive `adapter_entry` lookup is never
+/// ambiguous.
+///
+/// Pre-fix, an operator could declare BOTH `[adapters.fastly]` AND
+/// `[adapters.Fastly]` in the same manifest. TOML treats them as
+/// distinct keys, and the downstream code's mix of exact-case
+/// `get()` and case-insensitive lookups would resolve them
+/// inconsistently. Catch the collision once, at load time, instead
+/// of leaving every consumer to decide which spelling wins.
+fn validate_manifest_adapter_keys_case_unique(manifest: &Manifest) -> Result<(), ValidationError> {
+    let mut seen_ci: BTreeMap<String, &String> = BTreeMap::new();
+    for key in manifest.adapters.keys() {
+        let folded = key.to_ascii_lowercase();
+        if let Some(prior) = seen_ci.insert(folded.clone(), key) {
+            let mut error = ValidationError::new("adapters_case_duplicate");
+            error.message = Some(
+                format!(
+                    "manifest declares `[adapters.{prior}]` AND `[adapters.{key}]`, which differ only in case; adapter names are looked up case-insensitively at runtime so the two would alias to the same registry entry. Pick one spelling."
+                )
+                .into(),
+            );
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Validates a single `[stores.<kind>]` declaration against the portable
 /// schema.
 ///
@@ -811,10 +871,64 @@ fn validate_store_declaration(declaration: &StoreDeclaration) -> Result<(), Vali
         return Err(error);
     }
 
+    // Enforce a portable segment shape: each id is later used as
+    // - an `EDGEZERO__STORES__<KIND>__<ID>__NAME` env-var path segment
+    //   (`__` is the SEGMENT SEPARATOR, so an id containing `__` would
+    //   make `<ID>__NAME` ambiguous);
+    // - a filename component (e.g. axum's
+    //   `.edgezero/local-config-<id>.json`, so `/` would escape the
+    //   intended directory);
+    // - a registry key and TOML table label.
+    //
+    // Permit only `[A-Za-z0-9_]` and reject `__` — strict enough to
+    // be safe across all four consumers and POSIX-shell-exportable so
+    // the `EDGEZERO__STORES__<KIND>__<ID>__KEY` env overrides work.
+    // All ids in the scaffold and example suite already use this form
+    // (`app_config`, `feature_flags`, `sessions`, …).
+    if let Some(bad) = declaration.ids.iter().find(|id| {
+        let chars_bad = id
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'));
+        let double_underscore = id.contains("__");
+        chars_bad || double_underscore
+    }) {
+        let mut error = ValidationError::new("store_id_format");
+        error.message = Some(
+            format!(
+                "`[stores.<kind>].ids` entry `{bad}` contains a character outside `[A-Za-z0-9_]`. Store ids must be POSIX-shell-exportable so the `EDGEZERO__STORES__<KIND>__<ID>__NAME` / `__KEY` env overrides work; hyphens and other characters are not permitted. Rename it (e.g. `feature-flags` → `feature_flags`)."
+            )
+            .into(),
+        );
+        return Err(error);
+    }
+
+    // Exact-duplicate check (preserved for the simple case).
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     if let Some(dup) = declaration.ids.iter().find(|id| !seen.insert(id.as_str())) {
         let mut error = ValidationError::new("store_id_duplicate");
         error.message = Some(format!("`[stores.<kind>].ids` contains duplicate id `{dup}`").into());
+        return Err(error);
+    }
+
+    // Case-insensitive duplicate check: env-var lookup
+    // (`EDGEZERO__STORES__<KIND>__<ID>__NAME` with `<ID>` upper-cased)
+    // would alias `foo` and `FOO`, and several downstream consumers
+    // lower-case segments before lookup. Reject ASCII case-only
+    // duplicates so the operator sees a manifest error instead of
+    // silent shadowing at runtime.
+    let mut seen_ci: BTreeSet<String> = BTreeSet::new();
+    if let Some(dup_ci) = declaration
+        .ids
+        .iter()
+        .find(|id| !seen_ci.insert(id.to_ascii_lowercase()))
+    {
+        let mut error = ValidationError::new("store_id_case_duplicate");
+        error.message = Some(
+            format!(
+                "`[stores.<kind>].ids` contains case-insensitive duplicate id `{dup_ci}`; ids must be unique under ASCII case-folding because `EDGEZERO__STORES__<KIND>__<ID>__NAME` env-var lookup upper-cases the id and several downstream consumers lower-case it again. Pick distinct names."
+            )
+            .into(),
+        );
         return Err(error);
     }
 
@@ -1545,6 +1659,137 @@ ids = ["default"]
     }
 
     #[test]
+    fn manifest_rejects_case_fold_duplicate_adapter_keys() {
+        // PR #269 round 4: case-fold dup detection. `[adapters.xenon]`
+        // and `[adapters.Xenon]` are distinct TOML keys but resolve
+        // to the same `adapter_entry` lookup at runtime — reject at
+        // load time so the case-insensitive lookup is never
+        // ambiguous.
+        //
+        // Uses a synthetic adapter name (`xenon`) so the test
+        // exercises the manifest validator without coupling to any
+        // real adapter crate's identity.
+        let manifest: Manifest =
+            toml::from_str("[adapters.xenon]\n[adapters.Xenon]\n").expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("case-fold dup adapter keys must fail validation");
+        assert!(
+            err.to_string().contains("case"),
+            "error must call out the case collision: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_adapter_entry_matches_case_insensitively_returning_canonical_key() {
+        // Lookup helper used everywhere in the CLI: takes a name
+        // and returns the manifest's spelling so error messages
+        // surface the operator's exact text. Confirm the lookup
+        // works for both upper-case AND mixed-case needles
+        // against a lower-case stored key.
+        //
+        // Synthetic adapter name (`xenon`) keeps this manifest-
+        // level test independent of any specific adapter crate.
+        let manifest: Manifest = toml::from_str("[adapters.xenon]\n").expect("should parse");
+        let (upper_match, _ignored_upper) = manifest
+            .adapter_entry("XENON")
+            .expect("uppercase needle must match");
+        assert_eq!(upper_match, "xenon", "returns the manifest's spelling");
+        let (mixed_match, _ignored_mixed) = manifest
+            .adapter_entry("Xenon")
+            .expect("mixed-case needle must match");
+        assert_eq!(mixed_match, "xenon");
+        assert!(
+            manifest.adapter_entry("krypton").is_none(),
+            "absent name returns None"
+        );
+    }
+
+    #[test]
+    fn manifest_stores_rejects_unknown_kind_at_parse_time() {
+        // PR #269 round 4 / F2: `deny_unknown_fields` on
+        // ManifestStores catches typos like `[stores.secret]` (vs
+        // the correct `[stores.secrets]`). Pre-fix, a typo passed
+        // parsing silently and the runtime saw no secrets
+        // declaration.
+        let err = toml::from_str::<Manifest>("[stores.secret]\nids = [\"default\"]\n")
+            .expect_err("unknown `secret` kind must fail at parse time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("secret") && msg.contains("unknown field"),
+            "error must call out the typo: {msg}"
+        );
+    }
+
+    #[test]
+    fn store_declaration_rejects_id_with_path_separator() {
+        // `foo/bar` would let the axum config writer create
+        // `.edgezero/local-config-foo/bar.json`, which traverses
+        // into a subdirectory. Reject at manifest load.
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"foo/bar\"]\n").expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("non-portable id `foo/bar` must fail validation");
+        assert!(
+            err.to_string().contains("[A-Za-z0-9_]"),
+            "error must explain the charset rule: {err}"
+        );
+    }
+
+    #[test]
+    fn store_declaration_rejects_double_underscore_in_id() {
+        // `foo__bar` would collide with `EDGEZERO__STORES__KV__FOO`
+        // + segment `BAR__NAME` parsing on the env-overlay side.
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"foo__bar\"]\n").expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("`__` is reserved as the env-var segment separator");
+        assert!(
+            err.to_string().contains("POSIX") || err.to_string().contains("env"),
+            "error must call out the env-export constraint: {err}"
+        );
+    }
+
+    #[test]
+    fn store_declaration_rejects_case_only_duplicates() {
+        // `foo` and `FOO` upper-case to the same
+        // `EDGEZERO__STORES__KV__FOO` env-var path; reject the
+        // shadow at manifest load instead of letting one silently
+        // win at runtime.
+        let manifest: Manifest =
+            toml::from_str("[stores.kv]\nids = [\"foo\", \"FOO\"]\ndefault = \"foo\"\n")
+                .expect("should parse");
+        let err = manifest
+            .validate()
+            .expect_err("ASCII case-folded duplicates must fail validation");
+        assert!(
+            err.to_string().contains("case-insensitive duplicate"),
+            "error must call out the case-fold collision: {err}"
+        );
+    }
+
+    #[test]
+    fn store_declaration_accepts_portable_alphanumeric_ids() {
+        // Sanity: the new format check doesn't accidentally reject
+        // the canonical scaffold shapes — single underscore, mixed
+        // case, digits.
+        for ids in [
+            "[\"app_config\"]",
+            "[\"feature_flags\"]",
+            "[\"appConfig\"]",
+            "[\"v1\", \"v2\"]\ndefault = \"v1\"",
+        ] {
+            let toml = format!("[stores.kv]\nids = {ids}\n");
+            let manifest: Manifest = toml::from_str(&toml).expect("should parse");
+            manifest
+                .validate()
+                .unwrap_or_else(|err| panic!("portable ids must validate: {ids} -> {err}"));
+        }
+    }
+
+    #[test]
     fn store_declaration_requires_default_with_multiple_ids() {
         let manifest: Manifest =
             toml::from_str("[stores.kv]\nids = [\"a\", \"b\"]\n").expect("should parse");
@@ -1741,5 +1986,61 @@ runtime_threads = 4
             msg.contains("docs/guide/manifest-store-migration.md"),
             "error should reference the migration guide, got: {msg}"
         );
+    }
+
+    #[test]
+    fn rejects_hyphenated_store_id() {
+        let manifest = r#"
+[app]
+name = "demo"
+
+[stores.config]
+ids = ["feature-flags"]
+default = "feature-flags"
+
+[adapters.axum]
+"#;
+        let err = ManifestLoader::try_load_from_str(manifest)
+            .err()
+            .expect("hyphenated store id must fail validation");
+        let rendered = format!("{err}");
+        assert!(rendered.contains("feature-flags"), "{rendered}");
+        assert!(
+            rendered.contains("POSIX") || rendered.contains("env") || rendered.contains("hyphen"),
+            "error should mention the env-export constraint; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn accepts_underscore_only_store_id() {
+        let manifest = r#"
+[app]
+name = "demo"
+
+[stores.config]
+ids = ["feature_flags"]
+default = "feature_flags"
+
+[adapters.axum]
+"#;
+        ManifestLoader::try_load_from_str(manifest)
+            .expect("underscore-only store id must be accepted");
+    }
+
+    #[test]
+    fn rejects_double_underscore_in_store_id() {
+        let manifest = r#"
+[app]
+name = "demo"
+
+[stores.config]
+ids = ["feature__flags"]
+default = "feature__flags"
+
+[adapters.axum]
+"#;
+        ManifestLoader::try_load_from_str(manifest)
+            .err()
+            .expect("double-underscore store id must fail validation");
     }
 }
