@@ -515,6 +515,15 @@ fn run_local_dry_run(
                 adapter_cfg.adapter.component.as_deref(),
             )?;
             let owned_stores = build_stores_against(staged_root, args, adapter, manifest)?;
+            // Spec §"Dry-run" step 3: pass `dry_run = false` to the
+            // adapter even though `args.dry_run == true`. The tempdir
+            // IS the dry-run mechanism — the adapter takes its real
+            // write branch against the staged tree so operators can
+            // preview the actual files that would land. If we passed
+            // `true`, adapters would early-return from their dry-run
+            // branches (cloudflare cli.rs:263, spin cli.rs:223) and
+            // leave the staged tree empty of the content the diff
+            // report is supposed to show.
             adapter.provision(
                 staged_root,
                 adapter_cfg.adapter.manifest.as_deref(),
@@ -522,7 +531,7 @@ fn run_local_dry_run(
                 &owned_stores.as_refs(),
                 deployed,
                 adapter_registry::ProvisionMode::Local,
-                true,
+                false,
             )
         },
     )?;
@@ -1877,6 +1886,48 @@ ids = ["default"]
         assert!(
             !SYNTH_CALLED.load(Ordering::SeqCst),
             "cloud must never invoke synthesise_baseline_manifest"
+        );
+    }
+
+    #[test]
+    fn provision_local_dry_run_passes_dry_run_false_to_adapter() {
+        // Spec §"Dry-run" step 3: local dry-run stages a tempdir and
+        // dispatches with `dry_run = false` so adapters take their
+        // real-write branches against the staged tree. If the CLI
+        // hardcoded `true` here, adapters would early-return from
+        // their dry-run branches (cloudflare cli.rs:263, spin
+        // cli.rs:223) and leave the staged tree empty — the diff
+        // report would then miss the very files operators want to
+        // preview.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, FAKE_MANIFEST_BODY).unwrap();
+        // Local dry-run stages into a tempdir, so crates/spin/ must
+        // exist under the source tree for run_with_staging to copy
+        // it. The fake's synthesiser writes spin.toml INSIDE the
+        // staged tree, so we do NOT need to pre-create spin.toml
+        // here.
+        fs::create_dir_all(temp.path().join("crates/spin")).unwrap();
+
+        run_provision(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path,
+        })
+        .expect("local dry-run should succeed with fake adapter");
+
+        assert!(
+            !RECORDED_DRY_RUN.load(Ordering::SeqCst),
+            "adapter.provision must be called with dry_run = false: \
+             the tempdir IS the dry-run mechanism, not the boolean"
+        );
+        assert!(
+            SYNTH_CALLED.load(Ordering::SeqCst),
+            "local dry-run must invoke synthesise_baseline_manifest"
         );
     }
 
