@@ -9,7 +9,7 @@
 //! here.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use similar::{ChangeTag, TextDiff};
 use toml_edit::{table, value, DocumentMut};
@@ -224,6 +224,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
             &args.manifest,
             canonical_adapter_key,
             deployed_writeback,
+            adapter.deployed_fields(),
             args.dry_run,
         )?;
     }
@@ -249,10 +250,32 @@ fn resolve_kind(
 /// Write each `(rel, contents)` baseline pair under `root`, skipping
 /// files that already exist. Preserves operator content and earlier
 /// synthesis output. Used for worktree writes (real-write local) and
-/// tempdir writes (dry-run staging, Task 10+) — the only difference
-/// is which root is passed in.
+/// tempdir writes (dry-run staging) — the only difference is which
+/// root is passed in.
+///
+/// **Path containment**: each `rel_path` MUST be relative and MUST NOT
+/// contain a `..` component. Adapter-returned baseline paths are trusted
+/// less than manifest-declared paths (which `assert_provision_paths
+/// _contained` gates upstream); a buggy or hostile synthesiser
+/// returning an absolute path or `../../etc/passwd` would otherwise
+/// escape the project tree. Reject before `root.join()`.
 fn write_baseline_to_disk(root: &Path, pairs: &[(PathBuf, String)]) -> Result<(), String> {
     for (rel_path, contents) in pairs {
+        if rel_path.is_absolute() {
+            return Err(format!(
+                "baseline path must be project-relative, got `{}`",
+                rel_path.display()
+            ));
+        }
+        if rel_path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(format!(
+                "baseline path must not contain `..` traversal: `{}`",
+                rel_path.display()
+            ));
+        }
         let abs = root.join(rel_path);
         if abs.exists() {
             continue;
@@ -323,12 +346,57 @@ fn deployed_state_for(
 /// returns without writing — used by callers who want the write
 /// gated on the same `--dry-run` semantic as the surrounding
 /// dispatch.
+///
+/// **Adapter-emitted schema check**: every key in `state.fields` and
+/// `state.sub_tables` MUST be in the known `ManifestAdapterDeployed`
+/// schema AND in `owned_fields`. `validate_deployed_field_ownership`
+/// gates operator-written manifests before dispatch; this gate does
+/// the same for adapter-emitted output before writing back. Without
+/// it, a buggy adapter's `AdapterDeployedState` could persist
+/// unknown or non-owned keys into `edgezero.toml`, breaking future
+/// manifest loads.
 pub(crate) fn merge_deployed_into_manifest(
     manifest_path: &Path,
     adapter_name: &str,
     state: &adapter_registry::AdapterDeployedState,
+    owned_fields: &[&str],
     dry_run: bool,
 ) -> Result<(), String> {
+    // The canonical `ManifestAdapterDeployed` schema. If the struct
+    // gains a field, add it here too — the check is the ONLY defense
+    // against adapter-emitted unknown fields corrupting the writeback.
+    const KNOWN_SCALAR_FIELDS: &[&str] = &["service_id"];
+    const KNOWN_SUB_TABLE_FIELDS: &[&str] = &["kv_namespaces", "preview_kv_namespaces"];
+
+    for key in state.fields.keys() {
+        if !KNOWN_SCALAR_FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "adapter `{adapter_name}` returned unknown deployed field `{key}` (known scalar fields: [{}])",
+                KNOWN_SCALAR_FIELDS.join(", ")
+            ));
+        }
+        if !owned_fields.contains(&key.as_str()) {
+            return Err(format!(
+                "adapter `{adapter_name}` returned deployed field `{key}` it does not own (owned: [{}])",
+                owned_fields.join(", ")
+            ));
+        }
+    }
+    for key in state.sub_tables.keys() {
+        if !KNOWN_SUB_TABLE_FIELDS.contains(&key.as_str()) {
+            return Err(format!(
+                "adapter `{adapter_name}` returned unknown deployed sub-table `{key}` (known sub-tables: [{}])",
+                KNOWN_SUB_TABLE_FIELDS.join(", ")
+            ));
+        }
+        if !owned_fields.contains(&key.as_str()) {
+            return Err(format!(
+                "adapter `{adapter_name}` returned deployed sub-table `{key}` it does not own (owned: [{}])",
+                owned_fields.join(", ")
+            ));
+        }
+    }
+
     let raw = fs::read_to_string(manifest_path)
         .map_err(|err| format!("read {}: {err}", manifest_path.display()))?;
     let mut doc: DocumentMut = raw
@@ -676,7 +744,21 @@ fn run_local_dry_run(
     if !report.is_empty() {
         log::info!("{report}");
     }
-    Ok(outcome)
+    // Clear status_lines: the sanitized report already includes the
+    // rewritten "would write ..." lines with staged-tempdir paths
+    // swapped back to project-relative form. If we returned them
+    // untouched, `run_provision`'s trailing `for line in
+    // outcome.status_lines` loop would re-log the raw versions —
+    // leaking `/var/folders/…` tempdir paths to operators. Spec §"Dry-
+    // run": stdout must NEVER contain raw tempdir paths. The
+    // `deployed` payload is intentionally kept: cloud writeback under
+    // (false, _) uses it, and local dry-run today always sees `None`
+    // there (adapters populate `deployed` only when writing real
+    // cloud state).
+    Ok(adapter_registry::ProvisionOutcome {
+        status_lines: Vec::new(),
+        deployed: outcome.deployed,
+    })
 }
 
 /// Stage a real recursive copy of the adapter crate dir AND the
@@ -2367,7 +2449,16 @@ manifest = "crates/cf/wrangler.toml"
         state.sub_tables.insert("kv_namespaces".to_owned(), kv);
 
         // Canonical key is "Cloudflare" (as written in the manifest).
-        merge_deployed_into_manifest(&manifest_path, "Cloudflare", &state, false).unwrap();
+        // owned_fields = &["kv_namespaces", "preview_kv_namespaces"] matches
+        // Cloudflare's real deployed_fields() surface.
+        merge_deployed_into_manifest(
+            &manifest_path,
+            "Cloudflare",
+            &state,
+            &["kv_namespaces", "preview_kv_namespaces"],
+            false,
+        )
+        .unwrap();
 
         let raw = fs::read_to_string(&manifest_path).unwrap();
         // Must land under the operator's spelling; NO lowercased sibling.
@@ -2413,7 +2504,19 @@ manifest = "crates/cf/wrangler.toml"
         state
             .fields
             .insert("service_id".to_owned(), "SVC1".to_owned());
-        merge_deployed_into_manifest(&manifest_path, "cloudflare", &state, false).unwrap();
+        // owned_fields for the cloudflare-shaped comment test needs
+        // to include service_id (the Fastly-only field the test uses
+        // here) — this is a unit test of the toml_edit writeback,
+        // not the ownership gate. Passing a superset keeps the test's
+        // focus on comment preservation.
+        merge_deployed_into_manifest(
+            &manifest_path,
+            "cloudflare",
+            &state,
+            &["service_id", "kv_namespaces", "preview_kv_namespaces"],
+            false,
+        )
+        .unwrap();
 
         let raw = fs::read_to_string(&manifest_path).unwrap();
         assert!(
@@ -2443,9 +2546,123 @@ manifest = "crates/cf/wrangler.toml"
         kv.insert("sessions".to_owned(), "abc".to_owned());
         state.sub_tables.insert("kv_namespaces".to_owned(), kv);
 
-        merge_deployed_into_manifest(&manifest_path, "cloudflare", &state, true).unwrap();
+        merge_deployed_into_manifest(
+            &manifest_path,
+            "cloudflare",
+            &state,
+            &["kv_namespaces", "preview_kv_namespaces"],
+            true,
+        )
+        .unwrap();
 
         let after = fs::read_to_string(&manifest_path).unwrap();
         assert_eq!(before, after, "dry-run must leave file byte-identical");
+    }
+
+    #[test]
+    fn merge_deployed_rejects_adapter_emitted_unknown_field() {
+        // A buggy adapter returning a deployed key that isn't in the
+        // `ManifestAdapterDeployed` schema must be rejected BEFORE we
+        // write anything to edgezero.toml. Otherwise the manifest
+        // would fail future loads via `deny_unknown_fields`.
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, "[app]\nname = \"demo\"\n").unwrap();
+
+        let mut state = AdapterDeployedState::default();
+        state
+            .fields
+            .insert("nonsense_key".to_owned(), "x".to_owned());
+
+        let err = merge_deployed_into_manifest(
+            &manifest_path,
+            "cloudflare",
+            &state,
+            &["service_id", "kv_namespaces", "preview_kv_namespaces"],
+            false,
+        )
+        .expect_err("unknown deployed field must be rejected before writeback");
+        assert!(
+            err.contains("nonsense_key") && err.contains("unknown"),
+            "error must name the offending field: {err}"
+        );
+        // File must be untouched — write never happened.
+        assert_eq!(
+            fs::read_to_string(&manifest_path).unwrap(),
+            "[app]\nname = \"demo\"\n"
+        );
+    }
+
+    #[test]
+    fn merge_deployed_rejects_adapter_emitted_non_owned_field() {
+        // A buggy adapter that emits a known deployed field it does
+        // NOT own must be rejected. Symmetric to
+        // `validate_deployed_field_ownership`, which gates operator-
+        // written manifests before dispatch.
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, "[app]\nname = \"demo\"\n").unwrap();
+
+        let mut state = AdapterDeployedState::default();
+        state
+            .fields
+            .insert("service_id".to_owned(), "SVC1".to_owned());
+
+        // Cloudflare owns kv_namespaces + preview_kv_namespaces, NOT
+        // service_id. A Cloudflare adapter emitting service_id is a
+        // bug the writeback must catch.
+        let err = merge_deployed_into_manifest(
+            &manifest_path,
+            "cloudflare",
+            &state,
+            &["kv_namespaces", "preview_kv_namespaces"],
+            false,
+        )
+        .expect_err("known-but-non-owned deployed field must be rejected");
+        assert!(
+            err.contains("service_id") && err.contains("does not own"),
+            "error must name the offending field: {err}"
+        );
+    }
+
+    // ---------- write_baseline_to_disk containment ----------
+
+    #[test]
+    fn write_baseline_rejects_absolute_path() {
+        // An adapter's `synthesise_baseline_manifest` returning an
+        // absolute path would escape the project tree via
+        // `root.join(abs)` (Rust replaces `root` when the joined
+        // path is absolute).
+        let temp = TempDir::new().unwrap();
+        let pairs = vec![(PathBuf::from("/tmp/x.toml"), "content".to_owned())];
+        let err = write_baseline_to_disk(temp.path(), &pairs)
+            .expect_err("absolute baseline path must be rejected");
+        assert!(
+            err.contains("project-relative") && err.contains("/tmp/x.toml"),
+            "error must name the violation + offending path: {err}"
+        );
+        assert!(
+            !temp.path().join("tmp/x.toml").exists(),
+            "no file must have been written"
+        );
+    }
+
+    #[test]
+    fn write_baseline_rejects_parent_traversal() {
+        // `../` in the adapter-returned rel path would let a buggy
+        // synthesiser write outside the staged root or the project
+        // crate. Reject before touching disk.
+        let temp = TempDir::new().unwrap();
+        let pairs = vec![(PathBuf::from("../outside.toml"), "content".to_owned())];
+        let err = write_baseline_to_disk(temp.path(), &pairs)
+            .expect_err("`..` traversal in baseline path must be rejected");
+        assert!(
+            err.contains("`..` traversal") && err.contains("../outside.toml"),
+            "error must name the violation + offending path: {err}"
+        );
+        assert!(
+            !temp.path().parent().unwrap().join("outside.toml").exists(),
+            "no file must have been written outside the root"
+        );
     }
 }
