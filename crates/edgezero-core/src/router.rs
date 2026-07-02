@@ -64,6 +64,15 @@ impl RouteInfo {
     }
 }
 
+/// Per-request introspection payload injected by [`RouterInner::dispatch`].
+#[derive(Clone)]
+pub struct IntrospectionData {
+    /// The app manifest serialized to JSON at compile time by `app!`.
+    pub manifest_json: Option<Arc<str>>,
+    /// Every registered route, in registration order.
+    pub routes: Arc<[RouteInfo]>,
+}
+
 #[derive(Serialize)]
 struct RouteListingEntry {
     method: String,
@@ -78,6 +87,7 @@ enum RouteMatch<'route> {
 
 #[derive(Default)]
 pub struct RouterBuilder {
+    manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
     route_info: Vec<RouteInfo>,
     route_listing_path: Option<String>,
@@ -157,7 +167,12 @@ impl RouterBuilder {
                 .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
         }
 
-        RouterService::new(self.routes, self.middlewares, route_index)
+        RouterService::new(
+            self.routes,
+            self.middlewares,
+            route_index,
+            self.manifest_json,
+        )
     }
 
     #[must_use]
@@ -255,16 +270,29 @@ impl RouterBuilder {
         self.add_route(path, method, handler);
         self
     }
+
+    #[must_use]
+    #[inline]
+    pub fn with_manifest_json<S: Into<Arc<str>>>(mut self, json: S) -> Self {
+        self.manifest_json = Some(json.into());
+        self
+    }
 }
 
 struct RouterInner {
+    manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
     route_index: Arc<[RouteInfo]>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
 }
 
 impl RouterInner {
-    async fn dispatch(&self, request: Request) -> Result<Response, EdgeError> {
+    async fn dispatch(&self, mut request: Request) -> Result<Response, EdgeError> {
+        request.extensions_mut().insert(IntrospectionData {
+            manifest_json: self.manifest_json.clone(),
+            routes: Arc::clone(&self.route_index),
+        });
+
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
 
@@ -344,9 +372,11 @@ impl RouterService {
         routes: HashMap<Method, PathRouter<RouteEntry>>,
         middlewares: Vec<BoxMiddleware>,
         route_index: Arc<[RouteInfo]>,
+        manifest_json: Option<Arc<str>>,
     ) -> Self {
         Self {
             inner: Arc::new(RouterInner {
+                manifest_json,
                 middlewares,
                 route_index,
                 routes,
@@ -762,6 +792,73 @@ mod tests {
         let mut cx = Context::from_waker(waker);
         let ready = Service::<Request>::poll_ready(&mut service, &mut cx);
         assert!(matches!(ready, Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn dispatch_injects_introspection_data() {
+        let seen: Arc<Mutex<Option<(bool, usize)>>> = Arc::new(Mutex::new(None));
+        let seen_capture = Arc::clone(&seen);
+
+        let handler = move |ctx: RequestContext| {
+            let seen_inner = Arc::clone(&seen_capture);
+            async move {
+                let data = ctx.introspection().expect("introspection data present");
+                *seen_inner.lock().unwrap() =
+                    Some((data.manifest_json.is_some(), data.routes.len()));
+                Ok::<_, EdgeError>("ok")
+            }
+        };
+
+        let router = RouterService::builder()
+            .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
+            .get("/", handler)
+            .build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        block_on(router.oneshot(request)).unwrap();
+
+        let (had_manifest, route_count) = seen.lock().unwrap().expect("handler ran");
+        assert!(had_manifest, "manifest_json should be injected");
+        assert_eq!(route_count, 1);
+    }
+
+    #[test]
+    fn middleware_sees_introspection_data() {
+        struct Probe(Arc<Mutex<bool>>);
+        #[async_trait::async_trait(?Send)]
+        impl Middleware for Probe {
+            async fn handle(
+                &self,
+                ctx: RequestContext,
+                next: Next<'_>,
+            ) -> Result<Response, EdgeError> {
+                *self.0.lock().unwrap() = ctx.introspection().is_some();
+                next.run(ctx).await
+            }
+        }
+
+        let saw = Arc::new(Mutex::new(false));
+        let router = RouterService::builder()
+            .with_manifest_json("{}")
+            .middleware(Probe(Arc::clone(&saw)))
+            .get("/", |_ctx: RequestContext| async {
+                Ok::<_, EdgeError>("ok")
+            })
+            .build();
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        block_on(router.oneshot(request)).unwrap();
+        assert!(
+            *saw.lock().unwrap(),
+            "middleware should see introspection data"
+        );
     }
 
     #[test]

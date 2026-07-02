@@ -3,6 +3,7 @@ use crate::error::EdgeError;
 use crate::http::Request;
 use crate::params::PathParams;
 use crate::proxy::ProxyHandle;
+use crate::router::IntrospectionData;
 use crate::store_registry::{
     BoundConfigStore, BoundKvStore, BoundSecretStore, ConfigRegistry, ConfigStoreBinding,
     KvRegistry, SecretRegistry, StoreRegistry,
@@ -88,6 +89,13 @@ impl RequestContext {
     #[inline]
     pub fn into_request(self) -> Request {
         self.request
+    }
+
+    /// The per-request [`IntrospectionData`] injected by the router, if any.
+    #[must_use]
+    #[inline]
+    pub fn introspection(&self) -> Option<&IntrospectionData> {
+        self.request.extensions().get::<IntrospectionData>()
     }
 
     /// # Errors
