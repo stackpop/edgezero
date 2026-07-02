@@ -12,6 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use similar::{ChangeTag, TextDiff};
+use toml_edit::{table, value, DocumentMut};
 
 use crate::args::ProvisionArgs;
 use crate::config::{
@@ -213,7 +214,17 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     for line in outcome.status_lines {
         log::info!("{line}");
     }
-    // outcome.deployed wiring lands in Task 16.
+    if let Some(deployed_writeback) = outcome.deployed.as_ref() {
+        let (canonical_adapter_key, _) = manifest
+            .adapter_entry(&args.adapter)
+            .ok_or_else(|| format!("adapter `{}` vanished from manifest", args.adapter))?;
+        merge_deployed_into_manifest(
+            &args.manifest,
+            canonical_adapter_key,
+            deployed_writeback,
+            args.dry_run,
+        )?;
+    }
     Ok(())
 }
 
@@ -264,6 +275,82 @@ fn deployed_state_for(
     _canonical_adapter_name: &str,
 ) -> Option<AdapterDeployedState> {
     None
+}
+
+/// Merge `state` into `[adapters.<adapter_name>.deployed]` inside
+/// `manifest_path`, preserving all sibling content and adjacent
+/// operator comments via `toml_edit`. `adapter_name` MUST be the
+/// canonical operator-spelled key (result of
+/// `manifest.adapter_entry(...)`); passing the raw `args.adapter`
+/// risks creating a parallel lowercased `[adapters.cloudflare.deployed]`
+/// beside an operator-spelled `[adapters.Cloudflare]` table.
+///
+/// `state.fields` become scalar leaves; `state.sub_tables` become
+/// nested `[<sub_name>]` sub-tables under `.deployed`. When
+/// `dry_run` is true the helper builds the doc in memory then
+/// returns without writing — used by callers who want the write
+/// gated on the same `--dry-run` semantic as the surrounding
+/// dispatch.
+pub(crate) fn merge_deployed_into_manifest(
+    manifest_path: &Path,
+    adapter_name: &str,
+    state: &adapter_registry::AdapterDeployedState,
+    dry_run: bool,
+) -> Result<(), String> {
+    let raw = fs::read_to_string(manifest_path)
+        .map_err(|err| format!("read {}: {err}", manifest_path.display()))?;
+    let mut doc: DocumentMut = raw
+        .parse()
+        .map_err(|err| format!("parse {}: {err}", manifest_path.display()))?;
+
+    // `entry(...).or_insert_with(table)` avoids the `IndexMut` lint
+    // (`clippy::indexing_slicing`) that fires on `doc["adapters"]`.
+    // If a sibling exists but isn't a table, we bail cleanly instead
+    // of clobbering it — mirrors the fastly adapter's editor pattern.
+    let adapters_item = doc.entry("adapters").or_insert_with(table);
+    let adapters_tbl = adapters_item.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `adapters` exists but is not a table; refusing to edit in place",
+            manifest_path.display()
+        )
+    })?;
+    let named_item = adapters_tbl.entry(adapter_name).or_insert_with(table);
+    let named_tbl = named_item.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `adapters.{adapter_name}` exists but is not a table; refusing to edit in place",
+            manifest_path.display()
+        )
+    })?;
+    let deployed_item = named_tbl.entry("deployed").or_insert_with(table);
+    let deployed_tbl = deployed_item.as_table_mut().ok_or_else(|| {
+        format!(
+            "{}: `adapters.{adapter_name}.deployed` exists but is not a table; refusing to edit in place",
+            manifest_path.display()
+        )
+    })?;
+
+    for (key, val) in &state.fields {
+        deployed_tbl.insert(key, value(val.clone()));
+    }
+    for (sub_name, sub_map) in &state.sub_tables {
+        let sub_item = deployed_tbl.entry(sub_name).or_insert_with(table);
+        let sub_tbl = sub_item.as_table_mut().ok_or_else(|| {
+            format!(
+                "{}: `adapters.{adapter_name}.deployed.{sub_name}` exists but is not a table; refusing to edit in place",
+                manifest_path.display()
+            )
+        })?;
+        for (key, val) in sub_map {
+            sub_tbl.insert(key, value(val.clone()));
+        }
+    }
+
+    if dry_run {
+        return Ok(());
+    }
+    fs::write(manifest_path, doc.to_string())
+        .map_err(|err| format!("write {}: {err}", manifest_path.display()))?;
+    Ok(())
 }
 
 /// Shared validate + env-overlay + collision-check + resolve-stores +
@@ -638,6 +725,7 @@ mod tests {
     use edgezero_adapter::registry::{
         register_adapter, Adapter, AdapterAction, ProvisionMode, ProvisionOutcome,
     };
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     use std::io;
@@ -2095,5 +2183,118 @@ ids = ["default"]
             err.contains("service_id") && err.contains("__test_no_fields_fake__"),
             "error must name the offending field and adapter: {err}"
         );
+    }
+
+    // ---------- merge_deployed_into_manifest ----------
+
+    #[test]
+    fn merge_deployed_round_trips_cloudflare_namespaces_with_canonical_key() {
+        // Fixture declares mixed-case [adapters.Cloudflare]. Merger
+        // MUST use the canonical operator-spelled key — not a
+        // lowercased sibling — otherwise a parallel
+        // [adapters.cloudflare.deployed] table would appear beside
+        // the operator's [adapters.Cloudflare] one.
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(
+            &manifest_path,
+            r#"
+[app]
+name = "demo"
+
+[adapters.Cloudflare]
+[adapters.Cloudflare.adapter]
+crate = "crates/cf"
+manifest = "crates/cf/wrangler.toml"
+"#,
+        )
+        .unwrap();
+
+        let mut state = AdapterDeployedState::default();
+        let mut kv = BTreeMap::new();
+        kv.insert("sessions".to_owned(), "abc123".to_owned());
+        state.sub_tables.insert("kv_namespaces".to_owned(), kv);
+
+        // Canonical key is "Cloudflare" (as written in the manifest).
+        merge_deployed_into_manifest(&manifest_path, "Cloudflare", &state, false).unwrap();
+
+        let raw = fs::read_to_string(&manifest_path).unwrap();
+        // Must land under the operator's spelling; NO lowercased sibling.
+        assert!(
+            raw.contains("[adapters.Cloudflare.deployed"),
+            "must land under operator spelling: {raw}"
+        );
+        assert!(
+            !raw.contains("[adapters.cloudflare.deployed"),
+            "must NOT create a lowercased parallel: {raw}"
+        );
+        // Value present.
+        assert!(
+            raw.contains("sessions = \"abc123\""),
+            "kv id must round-trip: {raw}"
+        );
+    }
+
+    #[test]
+    fn merge_deployed_preserves_adjacent_operator_comments() {
+        // Non-touched adapter sections must survive byte-for-byte,
+        // including their comments.
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let source = r#"
+[app]
+name = "demo"
+
+# operator note about spin ordering
+[adapters.spin]
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.cloudflare]
+[adapters.cloudflare.adapter]
+crate = "crates/cf"
+manifest = "crates/cf/wrangler.toml"
+"#;
+        fs::write(&manifest_path, source).unwrap();
+
+        let mut state = AdapterDeployedState::default();
+        state
+            .fields
+            .insert("service_id".to_owned(), "SVC1".to_owned());
+        merge_deployed_into_manifest(&manifest_path, "cloudflare", &state, false).unwrap();
+
+        let raw = fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            raw.contains("# operator note about spin ordering"),
+            "operator comment must survive writeback: {raw}"
+        );
+    }
+
+    #[test]
+    fn merge_deployed_dry_run_does_not_mutate_file() {
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let source = r#"
+[app]
+name = "demo"
+
+[adapters.cloudflare]
+[adapters.cloudflare.adapter]
+crate = "crates/cf"
+manifest = "crates/cf/wrangler.toml"
+"#;
+        fs::write(&manifest_path, source).unwrap();
+        let before = fs::read_to_string(&manifest_path).unwrap();
+
+        let mut state = AdapterDeployedState::default();
+        let mut kv = BTreeMap::new();
+        kv.insert("sessions".to_owned(), "abc".to_owned());
+        state.sub_tables.insert("kv_namespaces".to_owned(), kv);
+
+        merge_deployed_into_manifest(&manifest_path, "cloudflare", &state, true).unwrap();
+
+        let after = fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(before, after, "dry-run must leave file byte-identical");
     }
 }
