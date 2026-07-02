@@ -1,6 +1,12 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{spanned::Spanned as _, Error, FnArg, ItemFn, Pat, PathArguments, Type};
+use syn::parse::Parser as _;
+use syn::punctuated::Punctuated;
+use syn::{spanned::Spanned as _, Error, FnArg, ItemFn, Pat, PathArguments, Token, Type};
+
+/// `(extract_stmts, arg_idents)` produced from a handler's argument list — the
+/// `FromRequest` extraction statements and the idents passed to the inner fn.
+type ArgExtractors = (Vec<proc_macro2::TokenStream>, Vec<proc_macro2::TokenStream>);
 
 pub fn expand_action(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand_action_impl(&attr.into(), item.into()).into()
@@ -10,10 +16,15 @@ fn expand_action_impl(
     attr: &proc_macro2::TokenStream,
     item: proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
-    if !attr.is_empty() {
-        return syn::Error::new(attr.span(), "#[action] does not accept arguments")
-            .to_compile_error();
-    }
+    // `#[action]` takes an optional atomic capability list, e.g.
+    // `#[action(manifest)]` / `#[action(routes)]` / `#[action(manifest, routes)]`.
+    // Each names an introspection payload the handler needs injected; a handler
+    // that opts in is emitted as a capability-carrying struct (see below).
+    let (manifest_cap, routes_cap) = match parse_action_params(attr) {
+        Ok(caps) => caps,
+        Err(err) => return err.to_compile_error(),
+    };
+    let is_capability_handler = manifest_cap || routes_cap;
 
     let func: ItemFn = match syn::parse2(item) {
         Ok(func) => func,
@@ -52,6 +63,93 @@ fn expand_action_impl(
         return err.to_compile_error();
     }
 
+    let (extract_stmts, arg_idents) = match build_arg_extractors(&func) {
+        Ok(parts) => parts,
+        Err(err) => return err.to_compile_error(),
+    };
+
+    let output = if is_capability_handler {
+        // A fn can't carry per-handler data past type-erasure into
+        // `Arc<dyn DynHandler>`, so an opt-in handler becomes a unit struct with
+        // its own `DynHandler` impl whose `introspection_needs()` reports which
+        // payloads the router must inject for its route.
+        quote! {
+            #inner_fn
+
+            #(#attrs)*
+            #[allow(non_camel_case_types)]
+            #vis struct #ident;
+
+            impl ::edgezero_core::handler::DynHandler for #ident {
+                #[inline]
+                fn call(
+                    &self,
+                    __ctx: ::edgezero_core::context::RequestContext,
+                ) -> ::edgezero_core::http::HandlerFuture {
+                    ::std::boxed::Box::pin(async move {
+                        #(#extract_stmts)*
+                        let result = #inner_ident(#(#arg_idents),*).await;
+                        ::edgezero_core::responder::Responder::respond(result)
+                    })
+                }
+
+                #[inline]
+                fn introspection_needs(&self) -> ::edgezero_core::handler::IntrospectionNeeds {
+                    ::edgezero_core::handler::IntrospectionNeeds {
+                        manifest: #manifest_cap,
+                        routes: #routes_cap,
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            #inner_fn
+
+            #(#attrs)*
+            #vis async fn #ident(
+                __ctx: ::edgezero_core::context::RequestContext,
+            ) -> ::std::result::Result<::edgezero_core::http::Response, ::edgezero_core::error::EdgeError> {
+                #(#extract_stmts)*
+                let result = #inner_ident(#(#arg_idents),*).await;
+                ::edgezero_core::responder::Responder::respond(result)
+            }
+        }
+    };
+
+    output
+}
+
+/// Parse the optional `#[action(...)]` capability list into
+/// `(needs_manifest, needs_routes)`. Empty attr → `(false, false)`. Unknown
+/// idents are a compile error. Extend the known set as new capabilities land.
+fn parse_action_params(attr: &proc_macro2::TokenStream) -> Result<(bool, bool), Error> {
+    if attr.is_empty() {
+        return Ok((false, false));
+    }
+    let params = Punctuated::<syn::Ident, Token![,]>::parse_terminated.parse2(attr.clone())?;
+    let mut manifest_cap = false;
+    let mut routes_cap = false;
+    for param in &params {
+        if param == "manifest" {
+            manifest_cap = true;
+        } else if param == "routes" {
+            routes_cap = true;
+        } else {
+            return Err(Error::new(
+                param.span(),
+                format!("unknown #[action] parameter `{param}`; supported: manifest, routes"),
+            ));
+        }
+    }
+    Ok((manifest_cap, routes_cap))
+}
+
+/// Build the per-argument extractor statements and the argument idents passed to
+/// the inner fn. `RequestContext` arguments map to `__ctx`; every other argument
+/// is extracted via `FromRequest`. Returns the `(extract_stmts, arg_idents)`
+/// used by both the fn and struct codegen forms.
+fn build_arg_extractors(func: &ItemFn) -> Result<ArgExtractors, Error> {
     let mut extract_stmts = Vec::new();
     let mut arg_idents = Vec::new();
     let mut has_request_context = false;
@@ -60,22 +158,20 @@ fn expand_action_impl(
         let pat_type = match arg {
             FnArg::Typed(pat_type) => pat_type,
             FnArg::Receiver(receiver) => {
-                return syn::Error::new(
+                return Err(Error::new(
                     receiver.span(),
                     "#[action] functions cannot have a `self` receiver",
-                )
-                .to_compile_error();
+                ));
             }
         };
 
         let ty = &pat_type.ty;
         if is_request_context_type(ty) {
             if has_request_context {
-                return syn::Error::new(
+                return Err(Error::new(
                     ty.span(),
                     "#[action] functions support at most one RequestContext argument",
-                )
-                .to_compile_error();
+                ));
             }
             has_request_context = true;
             arg_idents.push(quote! { __ctx });
@@ -89,20 +185,7 @@ fn expand_action_impl(
         arg_idents.push(quote! { #var_ident });
     }
 
-    let output = quote! {
-        #inner_fn
-
-        #(#attrs)*
-        #vis async fn #ident(
-            __ctx: ::edgezero_core::context::RequestContext,
-        ) -> ::std::result::Result<::edgezero_core::http::Response, ::edgezero_core::error::EdgeError> {
-            #(#extract_stmts)*
-            let result = #inner_ident(#(#arg_idents),*).await;
-            ::edgezero_core::responder::Responder::respond(result)
-        }
-    };
-
-    output
+    Ok((extract_stmts, arg_idents))
 }
 
 fn is_request_context_type(ty: &Type) -> bool {
@@ -209,15 +292,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_attribute_arguments() {
+    fn rejects_unknown_param() {
         let input = quote! {
             async fn demo(ctx: ::edgezero_core::context::RequestContext) -> ::edgezero_core::http::Response {
                 unimplemented!()
             }
         };
-        let output = expand_action_impl(&quote!(path = "/demo"), input);
+        let output = expand_action_impl(&quote!(bogus), input);
         let rendered = render(&output);
-        assert!(rendered.contains("does not accept arguments"));
+        assert!(rendered.contains("unknown #[action] parameter"));
+    }
+
+    #[test]
+    fn manifest_param_emits_capability_struct() {
+        let input = quote! {
+            async fn manifest(
+                ManifestJson(json): ManifestJson,
+            ) -> ::std::result::Result<
+                ::edgezero_core::http::Response,
+                ::edgezero_core::error::EdgeError,
+            > {
+                let _ = json;
+                unimplemented!()
+            }
+        };
+        let output = expand_action_impl(&quote!(manifest), input);
+        let collapsed = collapse_whitespace(&render(&output));
+        // Opt-in handlers become a capability-carrying struct, not a fn.
+        assert!(collapsed.contains("structmanifest"));
+        assert!(collapsed.contains("DynHandlerformanifest"));
+        assert!(collapsed.contains("fnintrospection_needs"));
+        // The `manifest` capability field is set true; `routes` false.
+        assert!(collapsed.contains("manifest:true"));
+        assert!(collapsed.contains("routes:false"));
     }
 
     #[test]
