@@ -204,8 +204,9 @@ mod tests {
 
     #[test]
     fn manifest_without_baked_json_is_500() {
-        // No `with_manifest_json`: IntrospectionData is still injected, but
-        // `manifest_json` is None, so the `ManifestJson` extractor errors 500.
+        // The route opts into `manifest`, but no manifest was baked
+        // (`with_manifest_json` not called), so `dispatch` injects nothing and
+        // the `ManifestJson` extractor errors 500.
         let router = RouterService::builder().get("/m", manifest).build();
         let req = request_builder()
             .method(Method::GET)

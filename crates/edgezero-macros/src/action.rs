@@ -277,8 +277,12 @@ mod tests {
         let output = expand_action_impl(&TokenStream::new(), input);
         let rendered = render(&output);
         assert!(rendered.contains("__demo_inner"));
-        assert!(rendered.contains("fn demo"));
         assert!(rendered.contains("responder :: Responder :: respond"));
+        // No params → a plain `async fn`, NOT a capability-carrying struct.
+        let collapsed = collapse_whitespace(&rendered);
+        assert!(collapsed.contains("asyncfndemo"));
+        assert!(!collapsed.contains("structdemo"));
+        assert!(!collapsed.contains("introspection_needs"));
     }
 
     #[test]

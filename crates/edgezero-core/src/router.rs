@@ -361,6 +361,19 @@ mod tests {
         }
 
         #[test]
+        fn manifest_and_routes_route_injects_both() {
+            // Combined `#[action(manifest, routes)]` → both payloads injected.
+            let seen = run_probe(
+                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                IntrospectionNeeds {
+                    manifest: true,
+                    routes: true,
+                },
+            );
+            assert_eq!(seen, (true, true));
+        }
+
+        #[test]
         fn manifest_route_injects_only_manifest() {
             // Manifest available AND requested → ManifestJson present, RouteTable absent.
             let seen = run_probe(
