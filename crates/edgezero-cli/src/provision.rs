@@ -1879,4 +1879,80 @@ ids = ["default"]
             "cloud must never invoke synthesise_baseline_manifest"
         );
     }
+
+    // ---------- Section-5 lock-in: dry-run cleanliness against the real
+    // in-tree fixture, across every adapter. Ignored until Section 5's
+    // per-adapter local writers land (Tasks 17-28); today the adapters'
+    // Local-mode `provision` impls return
+    // `Err("local mode lands in Section 5")` before touching disk, so
+    // the assertions can't yet drive real behavior. This test defines
+    // the contract now so the eventual implementation doesn't drift.
+    //
+    // Contract A (worktree byte-identical after dry-run) is asserted
+    // via the existing `snapshot_dir` helper.
+    //
+    // Contract B (no tempdir path leakage into stdout) is left as a
+    // `TODO(section-5)` comment: the CLI uses `log::info!` for status
+    // lines, but `log::set_logger` is a process-wide one-shot and
+    // installing a capturing logger here would race the other tests
+    // that share the crate's default logger initialization. Adding a
+    // per-thread capture shim would require workspace-scope churn
+    // that this task explicitly declines. When Section 5 lands, a
+    // follow-up task can retrofit either a subprocess-based capture
+    // or a `tracing`-subscriber swap.
+    #[test]
+    #[ignore = "re-enable after Section 5 lands per-adapter local provision"]
+    fn provision_local_dry_run_worktree_clean_and_no_tempdir_paths_in_stdout() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+
+        // Resolve the repo root from the crate's manifest dir:
+        // `<repo>/crates/edgezero-cli` → `<repo>`. `CARGO_MANIFEST_DIR`
+        // is always set for `cargo test`.
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .expect("CARGO_MANIFEST_DIR must be set under cargo test");
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("resolve repo root from CARGO_MANIFEST_DIR")
+            .to_path_buf();
+        let manifest_path = repo_root.join("examples/app-demo/edgezero.toml");
+        let app_demo_root = manifest_path.parent().expect("app-demo dir").to_path_buf();
+        assert!(
+            manifest_path.exists(),
+            "fixture missing: {}",
+            manifest_path.display()
+        );
+
+        for adapter in ["cloudflare", "fastly", "spin", "axum"] {
+            let before = snapshot_dir(&app_demo_root);
+
+            // Ignore the Result — today's stub adapters return
+            // `Err("local mode lands in Section 5")`. Contract A is
+            // the "was the worktree modified?" claim, and it holds
+            // regardless of whether the adapter succeeded. Explicit
+            // type annotation quiets `let_underscore_untyped` /
+            // `let_underscore_must_use`.
+            let _result: Result<(), String> = run_provision(&ProvisionArgs {
+                adapter: (*adapter).to_owned(),
+                dry_run: true,
+                local: true,
+                manifest: manifest_path.clone(),
+            });
+
+            let after = snapshot_dir(&app_demo_root);
+            assert_eq!(
+                before, after,
+                "adapter {adapter}: dry-run must leave the worktree byte-identical"
+            );
+
+            // TODO(section-5): assert no tempdir path leakage in
+            // stdout via captured log. The `log::info!` output from
+            // `render_dry_run_report` should never contain
+            // `/var/folders/`, `/private/var/folders/`, or `/tmp/`
+            // — only project-relative paths under the manifest
+            // root. Capture strategy TBD (see the module comment
+            // above this test).
+        }
+    }
 }
