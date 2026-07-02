@@ -166,7 +166,7 @@ enum ConfigStoreLookup {
 // `&[]` for documentation, matching the inherited default.
 #[expect(
     clippy::missing_trait_methods,
-    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`)."
+    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `fastly.toml` for the Task 8b clean-clone bootstrap, threading `[adapters.fastly.deployed].service_id` through when present)."
 )]
 impl Adapter for FastlyCliAdapter {
     fn deployed_fields(&self) -> &'static [&'static str] {
@@ -666,6 +666,29 @@ impl Adapter for FastlyCliAdapter {
         // support multiple distinct platform resources per kind,
         // unlike spin's flat-namespace single-store model.
         &[]
+    }
+
+    fn synthesise_baseline_manifest(
+        &self,
+        _manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        app_name: &str,
+        deployed: Option<&AdapterDeployedState>,
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        // The CLI's `deployed_state_for` translator (Task 8b) copies
+        // `[adapters.fastly.deployed].service_id` into
+        // `deployed.fields["service_id"]` before calling this override,
+        // so the adapter reads the flat field bag and never links to
+        // `edgezero-core`.
+        let deployed_service_id = deployed
+            .and_then(|state| state.fields.get("service_id"))
+            .map(String::as_str);
+        let rel = adapter_manifest_path.map_or_else(|| PathBuf::from("fastly.toml"), PathBuf::from);
+        Ok(vec![(
+            rel,
+            synthesise_fastly_toml(app_name, deployed_service_id),
+        )])
     }
 }
 
@@ -1374,6 +1397,50 @@ pub fn register() {
 #[ctor(unsafe)]
 fn register_ctor() {
     register();
+}
+
+/// Synthesised baseline `fastly.toml` for clean clones. Built via
+/// `toml_edit::DocumentMut` (NOT raw `format!`) so any legal
+/// `[app].name` — including names with TOML-significant characters
+/// like `"`, `\`, or newlines — is escaped correctly. Manifest
+/// validation today only length-bounds the name; raw interpolation
+/// would produce invalid TOML for legal inputs.
+///
+/// `service_id` from `[adapters.fastly.deployed]` is threaded
+/// through as `Option<&str>`; when `None` the key is OMITTED so the
+/// operator's first `fastly compute deploy` populates it (per spec
+/// §"Writeback ownership" — we deliberately don't emit
+/// `service_id = ""`).
+pub(crate) fn synthesise_fastly_toml(app_name: &str, service_id: Option<&str>) -> String {
+    use toml_edit::{value, DocumentMut, Item, Table};
+
+    let mut doc = DocumentMut::new();
+    doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
+    // `Table::insert` returns the previous value (if any). We build a
+    // fresh document from `DocumentMut::new()`, so nothing to displace
+    // -- but the return is discarded intentionally. Using `insert`
+    // instead of `doc["..."] = ...` sidesteps `clippy::indexing_slicing`
+    // (the index form panics if the key is missing; `insert` doesn't).
+    doc.insert("manifest_version", value(3));
+    doc.insert("name", value(app_name));
+    doc.insert("language", value("rust"));
+    if let Some(sid) = service_id {
+        doc.insert("service_id", value(sid));
+    }
+    // `[scripts]` and `[local_server]` are the standard Fastly Compute
+    // scaffold tables. `scripts.build` pins the cargo target so
+    // `fastly compute build` reproduces the wasm artifact; the empty
+    // `[local_server]` header is a placeholder the operator fills in
+    // when seeding local viceroy state (config-store contents,
+    // per-request backends, etc.).
+    let mut scripts = Table::new();
+    scripts.insert(
+        "build",
+        value("cargo build --profile release --target wasm32-wasip1"),
+    );
+    doc.insert("scripts", Item::Table(scripts));
+    doc.insert("local_server", Item::Table(Table::new()));
+    doc.to_string()
 }
 
 /// # Errors
@@ -3498,5 +3565,53 @@ build = \"cargo build --release\"
             value, envelope_a,
             "old envelope A's chunks must be inert -- read must NOT return A"
         );
+    }
+
+    // ---------- synthesise_fastly_toml ----------
+
+    #[test]
+    fn synthesises_minimal_fastly_toml_with_header_and_no_service_id() {
+        let out = synthesise_fastly_toml("demo", None);
+        assert!(out.starts_with("# edgezero-provision: v1"));
+        assert!(out.contains("manifest_version = 3"));
+        assert!(out.contains(r#"name = "demo""#));
+        assert!(out.contains(r#"language = "rust""#));
+        assert!(out.contains("[scripts]"));
+        assert!(out.contains("[local_server]"));
+        assert!(
+            !out.contains("service_id"),
+            "no service_id key when None: {out}"
+        );
+    }
+
+    #[test]
+    fn synthesises_fastly_toml_pins_service_id_when_deployed_present() {
+        let out = synthesise_fastly_toml("demo", Some("SVC1"));
+        assert!(out.contains(r#"service_id = "SVC1""#));
+    }
+
+    #[test]
+    fn synthesise_fastly_toml_escapes_pathological_app_names() {
+        for name in [
+            r#"has"quote"#,
+            r"has\backslash",
+            "has\nnewline",
+            "has = equals",
+        ] {
+            let out = synthesise_fastly_toml(name, None);
+            // Re-parsing must succeed AND round-trip the name.
+            let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
+        }
+    }
+
+    #[test]
+    fn synthesise_fastly_toml_escapes_pathological_service_ids() {
+        // `fastly compute deploy` may return arbitrary strings.
+        for sid in [r#"has"quote"#, r"has\slash", "has\nnewline"] {
+            let out = synthesise_fastly_toml("demo", Some(sid));
+            let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            assert_eq!(doc["service_id"].as_str(), Some(sid), "input: {sid:?}");
+        }
     }
 }
