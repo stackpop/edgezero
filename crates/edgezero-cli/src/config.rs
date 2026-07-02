@@ -1287,6 +1287,13 @@ fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
 /// typo in the section name), skip the check — `ensure_adapter_defined`
 /// surfaces the missing adapter separately.
 ///
+/// **Case handling:** `adapter_registry::get_adapter` normalises the
+/// lookup key to `to_ascii_lowercase()` at registration and lookup
+/// time, so operator spellings like `[adapters.Fastly.deployed]`,
+/// `[adapters.FASTLY.deployed]`, and `[adapters.fastly.deployed]`
+/// all resolve to the same registered adapter and cross-check
+/// against the same `deployed_fields()` list.
+///
 /// Runs at manifest-shape validation time via `run_shared_checks`
 /// so `config validate --strict`, `provision`, `config push --local`,
 /// and `config diff` all see the same rejection.

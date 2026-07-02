@@ -715,7 +715,7 @@ serve = "echo"
 
     #[expect(
         clippy::missing_trait_methods,
-        reason = "the fake only exercises name/provision/synthesise_baseline_manifest/validate_adapter_manifest; every other trait method inherits its default (no-op or Unsupported)"
+        reason = "the fake overrides name/deployed_fields/provision/synthesise_baseline_manifest/validate_adapter_manifest; every other trait method inherits its default (no-op or Unsupported)"
     )]
     impl Adapter for FakeBootstrapAdapter {
         fn deployed_fields(&self) -> &'static [&'static str] {
@@ -781,7 +781,7 @@ serve = "echo"
 
     #[expect(
         clippy::missing_trait_methods,
-        reason = "the no-fields fake exercises deployed_fields default; every other trait method inherits its default (no-op or Unsupported)"
+        reason = "the no-fields fake overrides execute/name/provision (required by the trait) and inherits every defaulted method — including deployed_fields, whose default `&[]` is the intent this fake exercises"
     )]
     impl Adapter for NoFieldsFakeAdapter {
         fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
