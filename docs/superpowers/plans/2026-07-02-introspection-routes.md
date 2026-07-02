@@ -122,13 +122,16 @@ level = "info"
     let manifest: Manifest = toml::from_str(toml).unwrap();
     let json = serde_json::to_value(&manifest).unwrap();
     assert_eq!(json["triggers"]["http"][0]["methods"][0], "POST");
-    assert_eq!(json["triggers"]["http"][0]["body_mode"], "buffered");
+    // `body_mode` is serde-renamed to `body-mode` (manifest.rs:243), so the
+    // serialized key is `body-mode`, NOT `body_mode`.
+    assert_eq!(json["triggers"]["http"][0]["body-mode"], "buffered");
     assert_eq!(json["logging"]["axum"]["level"], "info");
 }
 ```
 
-(Adjust the `[logging.axum]`/`body-mode` key spellings to match the manifest's
-actual serde field renames — verify against manifest.rs before running.)
+(The `body-mode` key matches the `#[serde(rename = "body-mode")]` on
+`ManifestHttpTrigger::body_mode`. Verify the `[logging.<adapter>]` shape against
+manifest.rs before running.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -490,9 +493,7 @@ struct RouteView {
 mod tests {
     use super::*;
     use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
-    use crate::context::RequestContext;
     use crate::http::{request_builder, Method};
-    use crate::params::PathParams;
     use crate::router::RouterService;
     use crate::store_registry::{ConfigRegistry, ConfigStoreBinding, StoreRegistry};
     use async_trait::async_trait;
@@ -520,8 +521,16 @@ mod tests {
         }
     }
 
-    // Build a request carrying a default ConfigRegistry backed by `store`,
-    // run it through the `config` handler, and return the response.
+    // Collect a buffered response body into JSON (introspection responses are
+    // always `Body::Once`). `Body::to_json` works on the buffered variant.
+    fn body_json(resp: crate::http::Response) -> serde_json::Value {
+        resp.into_body().to_json().expect("buffered JSON body")
+    }
+
+    // Build a request carrying a default ConfigRegistry backed by `store`, and
+    // drive it THROUGH THE ROUTER via `oneshot` (which maps handler `EdgeError`
+    // to a response internally — so we neither import `IntoResponse` nor unwrap
+    // an error path by hand).
     fn run_config(store: StubStore) -> crate::http::Response {
         let registry: ConfigRegistry = StoreRegistry::new(
             [(
@@ -535,14 +544,14 @@ mod tests {
             .collect::<BTreeMap<_, _>>(),
             "default".to_owned(),
         );
+        let router = RouterService::builder().get("/c", config).build();
         let mut request = request_builder()
             .method(Method::GET)
             .uri("/c")
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(registry);
-        let ctx = RequestContext::new(request, PathParams::default());
-        block_on(super::config(ctx)).unwrap_or_else(|e| e.into_response().unwrap())
+        block_on(router.oneshot(request)).unwrap()
     }
 
     fn valid_envelope_json(data: serde_json::Value) -> String {
@@ -560,6 +569,8 @@ mod tests {
         let resp = block_on(router.oneshot(req)).unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+        // Body is the injected manifest JSON verbatim.
+        assert_eq!(body_json(resp), serde_json::json!({ "app": { "name": "t" } }));
     }
 
     #[test]
@@ -568,6 +579,10 @@ mod tests {
         let req = request_builder().method(Method::GET).uri("/r").body(Body::empty()).unwrap();
         let resp = block_on(router.oneshot(req)).unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        // Shape: [{ "method", "path" }] — the /r route itself is present.
+        let body = body_json(resp);
+        let arr = body.as_array().expect("routes array");
+        assert!(arr.iter().any(|e| e["method"] == "GET" && e["path"] == "/r"));
     }
 
     #[test]
@@ -583,10 +598,11 @@ mod tests {
         let data = serde_json::json!({ "greeting": "hi", "api_token": "demo_api_token" });
         let resp = run_config(StubStore(Ok(Some(valid_envelope_json(data)))));
         assert_eq!(resp.status(), StatusCode::OK);
-        // Raw envelope `data` is returned verbatim: the secret field holds the
-        // KEY NAME, never a resolved value.
-        // (Read the body via the crate's test body helper and assert the JSON
-        // contains "api_token":"demo_api_token".)
+        // Raw envelope `data` verbatim: the secret field holds the KEY NAME,
+        // never a resolved value.
+        let body = body_json(resp);
+        assert_eq!(body["greeting"], "hi");
+        assert_eq!(body["api_token"], "demo_api_token");
     }
 
     #[test]
@@ -605,6 +621,12 @@ mod tests {
     fn config_invalid_key_maps_400() {
         let resp = run_config(StubStore(Err(ConfigStoreError::invalid_key("x"))));
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn config_backend_internal_maps_500() {
+        let resp = run_config(StubStore(Err(ConfigStoreError::internal(anyhow::anyhow!("x")))));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -630,11 +652,11 @@ mod tests {
 }
 ```
 
-Notes: verify `ConfigStoreError` variant/constructor names (`unavailable`,
-`invalid_key`, `internal`) against config_store.rs:177-199, and the
-`crate::http::Response` / body-reading test helper the crate already uses. The
-happy-path body assertion should use whatever body-collection helper the other
-core tests use (e.g. a `block_on` over the body) — match existing conventions.
+Notes: the `StubStore::0 = Err(...)` arm is matched by variant, so the three
+`ConfigStoreError` constructors (`unavailable`, `invalid_key`, `internal`) must
+match config_store.rs:177-199. `body_json` relies on `Body::to_json` (body.rs)
+and `http::Response::into_body`; both exist. The malformed/sha/version cases are
+driven by raw strings so they don't depend on the stub's error arm.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
@@ -900,13 +922,21 @@ fn introspection_routes_are_wired() {
 
     let router = crate::build_router();
 
-    // manifest + routes need no config store.
-    for path in ["/_app-demo/manifest", "/_app-demo/routes"] {
-        let req = request_builder().method(Method::GET).uri(path).body(Body::empty()).unwrap();
-        let resp = block_on(router.oneshot(req)).unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{path} should be 200");
-        assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
-    }
+    // manifest: 200 + JSON body whose [app].name is "app-demo".
+    let req = request_builder().method(Method::GET).uri("/_app-demo/manifest").body(Body::empty()).unwrap();
+    let resp = block_on(router.oneshot(req)).unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "application/json");
+    let manifest_body: serde_json::Value = resp.into_body().to_json().unwrap();
+    assert_eq!(manifest_body["app"]["name"], "app-demo");
+
+    // routes: 200 + [{method,path}] including the root route.
+    let req = request_builder().method(Method::GET).uri("/_app-demo/routes").body(Body::empty()).unwrap();
+    let resp = block_on(router.oneshot(req)).unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let routes_body: serde_json::Value = resp.into_body().to_json().unwrap();
+    let arr = routes_body.as_array().expect("routes array");
+    assert!(arr.iter().any(|e| e["method"] == "GET" && e["path"] == "/"));
 
     // /config: seed a default config store with a valid envelope so a wired
     // route returns 200 (a routing miss would be 404, proving nothing).
@@ -933,9 +963,10 @@ fn introspection_routes_are_wired() {
     req.extensions_mut().insert(registry);
     let resp = block_on(router.oneshot(req)).unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "/config should be wired and 200 with a store");
-    // (Collect the body and assert it contains "api_token":"demo_api_token" —
-    // the raw key-name — and NOT a resolved secret value. Use the app-demo
-    // test suite's existing body-collection helper.)
+    // Raw envelope `data`: secret field holds the KEY NAME, not a resolved value.
+    let config_body: serde_json::Value = resp.into_body().to_json().unwrap();
+    assert_eq!(config_body["api_token"], "demo_api_token");
+    assert_eq!(config_body["greeting"], "hi");
 }
 ```
 
@@ -1073,6 +1104,22 @@ app-demo tests — those are covered by Step 3b (matching CI's separate job).
 Run: `cd examples/app-demo && cargo test --workspace --all-targets`
 Expected: all pass, including `introspection_routes_are_wired`.
 
+- [ ] **Step 3c: Generated-project build (template surface)**
+
+Task 6 edits the generated-app template, so exercise CI's ignored end-to-end
+scaffold-and-build test (test.yml):
+
+Run: `cargo test -p edgezero-cli --test generated_project_builds -- --ignored`
+Expected: a project scaffolded from the template (now with the three
+introspection triggers) compiles.
+
+- [ ] **Step 3d: Nested AppConfig audit (template + app-demo surface)**
+
+The template and app-demo are both audited by CI (test.yml):
+
+Run: `cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates`
+Expected: passes (the introspection triggers add no nested `AppConfig`).
+
 - [ ] **Step 4: Feature compilation**
 
 Run: `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
@@ -1116,7 +1163,9 @@ gh pr ready 300
 - Docs update: Task 7 (cli-doc drift flagged out-of-scope). ✓
 - CI gates incl. separate app-demo workspace: Task 8. ✓
 
-**Review findings applied (2026-07-02):** enum serialization + casing test (blocking); owned `RedactedBinding` + removed nonexistent `ManifestAdapterDeployed` (blocking); `Response` from `crate::http` (blocking); full config status-code tests (high); app-demo config test seeds a registry and asserts 200 (high); `cd examples/app-demo` for excluded-workspace commands (high); middleware-visibility test (medium); cli-doc drift flagged, not silently absorbed (medium).
+**Review findings applied (round 1):** enum serialization + casing test (blocking); owned `RedactedBinding` + removed nonexistent `ManifestAdapterDeployed` (blocking); `Response` from `crate::http` (blocking); full config status-code tests (high); app-demo config test seeds a registry and asserts 200 (high); `cd examples/app-demo` for excluded-workspace commands (high); middleware-visibility test (medium); cli-doc drift flagged, not silently absorbed (medium).
+
+**Review findings applied (round 2):** real body assertions for manifest (equality), routes (`[{method,path}]` shape), and config (`api_token` key-name present, secret-safe) in Tasks 3 & 6 (high); `run_config` now routes through `oneshot` so no `IntoResponse` import is needed, and unused test imports dropped (high); `body-mode` serde-rename fixed in the casing test (high); `ConfigStoreError::Internal → 500` test added (medium); Task 8 gains generated-project-build (`--ignored`) and nested-AppConfig-audit steps matching CI's template-surface jobs (medium).
 
 **Placeholder scan:** No TBD/TODO; every code step shows real code. Verification notes ("confirm `ConfigStoreError` constructor names", "verify `{{{adapter_list}}}` name", "match body-collection helper") are drift guardrails, not missing content.
 
