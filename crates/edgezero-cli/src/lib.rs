@@ -25,10 +25,7 @@ mod adapter;
 mod auth;
 #[cfg(feature = "cli")]
 mod config;
-// Gated on `test` for now: the only callers today live in the module's
-// own test suite. Task 10's `run_with_staging` will drop the gate when
-// it adds the first production caller.
-#[cfg(all(test, feature = "cli"))]
+#[cfg(feature = "cli")]
 mod copy_tree;
 #[cfg(all(feature = "cli", feature = "demo-example"))]
 mod demo_server;

@@ -15,12 +15,34 @@ use crate::args::ProvisionArgs;
 use crate::config::{
     enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
 };
+use crate::copy_tree::copy_dir_recursive;
 use crate::ensure_adapter_defined;
 use crate::path_safety::assert_provision_paths_contained;
 use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
 use edgezero_adapter::AdapterDeployedState;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestAdapter, ManifestLoader, StoreDeclaration};
+
+/// Owned counterpart to the borrowed `ProvisionStores<'_>`. Used by
+/// dispatch arms that need to build resolved store ids per-root
+/// (e.g. inside the `run_with_staging` closure where a borrowed
+/// return would dangle when the `Vec` locals dropped). Task 29
+/// (typed provision) consumes this too.
+pub(crate) struct OwnedProvisionStores {
+    pub config: Vec<ResolvedStoreId>,
+    pub kv: Vec<ResolvedStoreId>,
+    pub secrets: Vec<ResolvedStoreId>,
+}
+
+impl OwnedProvisionStores {
+    pub(crate) fn as_refs(&self) -> ProvisionStores<'_> {
+        ProvisionStores {
+            config: &self.config,
+            kv: &self.kv,
+            secrets: &self.secrets,
+        }
+    }
+}
 
 /// # Errors
 ///
@@ -155,10 +177,15 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
                 false,
             )?
         }
-        (true, true) => {
-            // Local dry-run: staging harness lands in Task 10/11.
-            return Err("local dry-run staging lands in Task 10/11".to_owned());
-        }
+        (true, true) => run_local_dry_run(
+            adapter,
+            manifest,
+            adapter_cfg,
+            manifest_root,
+            args,
+            &app_name,
+            deployed.as_ref(),
+        )?,
     };
 
     if args.dry_run {
@@ -266,6 +293,91 @@ fn validate_and_dispatch(
     )
 }
 
+/// Same store-construction pattern `validate_and_dispatch` runs
+/// inline, but returns the owned form so the caller can hold it
+/// across a closure and `.as_refs()` immediately before dispatch.
+/// Used by the `(true, true)` arm today; Task 29 (typed provision)
+/// consumes it too.
+///
+/// The `_root` parameter is unused today — reserved for future
+/// per-root state (e.g. reading a synthesised sidecar file).
+///
+/// `adapter` is `&'static dyn` to match `validate_and_dispatch` and
+/// `reject_merged_id_collisions`, both of which take `'static`
+/// trait objects because the registry only hands out `&'static`
+/// references.
+fn build_stores_against(
+    _root: &Path,
+    args: &ProvisionArgs,
+    adapter: &'static dyn adapter_registry::Adapter,
+    manifest: &Manifest,
+) -> Result<OwnedProvisionStores, String> {
+    let env_config = EnvConfig::from_env();
+    reject_merged_id_collisions(&args.adapter, adapter, manifest, &env_config)?;
+    Ok(OwnedProvisionStores {
+        config: resolve_kind(manifest.stores.config.as_ref(), &env_config, "config"),
+        kv: resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv"),
+        secrets: resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets"),
+    })
+}
+
+/// The `(true, true)` dispatch arm: synthesise the baseline manifest
+/// (bytes only — no I/O against the real worktree), then stage the
+/// adapter crate + `.edgezero/` + `edgezero.toml` into a tempdir and
+/// run validate + build stores + dispatch entirely against the staged
+/// root. The real worktree is never mutated.
+///
+/// The synthesiser runs against the REAL `manifest_root` because it
+/// produces bytes only; every subsequent filesystem-touching call
+/// (`write_baseline_to_disk`, `validate_adapter_manifest`,
+/// `build_stores_against`, `adapter.provision`) receives
+/// `staged_root` from inside the `run_with_staging` closure.
+fn run_local_dry_run(
+    adapter: &'static dyn adapter_registry::Adapter,
+    manifest: &Manifest,
+    adapter_cfg: &ManifestAdapter,
+    manifest_root: &Path,
+    args: &ProvisionArgs,
+    app_name: &str,
+    deployed: Option<&AdapterDeployedState>,
+) -> Result<adapter_registry::ProvisionOutcome, String> {
+    let baseline_pairs = adapter.synthesise_baseline_manifest(
+        manifest_root,
+        adapter_cfg.adapter.manifest.as_deref(),
+        adapter_cfg.adapter.component.as_deref(),
+        app_name,
+        deployed,
+    )?;
+    let adapter_crate_rel = adapter_cfg
+        .adapter
+        .crate_path
+        .as_deref()
+        .map_or_else(|| Path::new("."), Path::new);
+    let (outcome, _tempdir) = run_with_staging(
+        manifest_root,
+        adapter_crate_rel,
+        |staged_root, _staged_crate| {
+            write_baseline_to_disk(staged_root, &baseline_pairs)?;
+            adapter.validate_adapter_manifest(
+                staged_root,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.component.as_deref(),
+            )?;
+            let owned_stores = build_stores_against(staged_root, args, adapter, manifest)?;
+            adapter.provision(
+                staged_root,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.component.as_deref(),
+                &owned_stores.as_refs(),
+                deployed,
+                adapter_registry::ProvisionMode::Local,
+                true,
+            )
+        },
+    )?;
+    Ok(outcome)
+}
+
 /// Stage a real recursive copy of the adapter crate dir AND the
 /// `.edgezero/` dir (if present) under a fresh `TempDir`, then invoke
 /// `body` with the staged paths. The original project worktree is
@@ -273,11 +385,9 @@ fn validate_and_dispatch(
 /// against the project tree before the returned `TempDir` drops. See
 /// spec §"Dry-run".
 ///
-/// Gated on `#[cfg(test)]` for now: the only callers are the
-/// same-file tests. Task 11 lifts this gate (and `lib.rs`'s
-/// `mod copy_tree;` gate) together when the `(true, true)` dispatch
-/// arm gains a real caller.
-#[cfg(test)]
+/// Called by the `(true, true)` arm of the `run_provision` dispatch
+/// matrix — local dry-run stages everything into a tempdir and
+/// discards it after `body` completes.
 pub(crate) fn run_with_staging<F, R>(
     project_root: &Path,
     adapter_crate_rel: &Path,
@@ -286,8 +396,6 @@ pub(crate) fn run_with_staging<F, R>(
 where
     F: FnOnce(&Path, &Path) -> Result<R, String>,
 {
-    use crate::copy_tree::copy_dir_recursive;
-
     let tempdir = tempfile::TempDir::new()
         .map_err(|err| format!("failed to create staging tempdir: {err}"))?;
     let staged_root = tempdir.path();
@@ -388,6 +496,7 @@ serve = "echo"
 "#;
 
     static FAKE_ADAPTER: FakeBootstrapAdapter = FakeBootstrapAdapter;
+    static RECORDED_DRY_RUN: AtomicBool = AtomicBool::new(false);
     static SYNTH_CALLED: AtomicBool = AtomicBool::new(false);
     static VALIDATE_SAW_FILE: AtomicBool = AtomicBool::new(false);
 
@@ -439,8 +548,9 @@ serve = "echo"
             _stores: &ProvisionStores<'_>,
             _deployed: Option<&AdapterDeployedState>,
             _mode: ProvisionMode,
-            _dry_run: bool,
+            dry_run: bool,
         ) -> Result<ProvisionOutcome, String> {
+            RECORDED_DRY_RUN.store(dry_run, Ordering::SeqCst);
             Ok(ProvisionOutcome::default())
         }
 
@@ -480,8 +590,42 @@ serve = "echo"
     }
 
     fn reset_fake_state() {
+        RECORDED_DRY_RUN.store(false, Ordering::SeqCst);
         SYNTH_CALLED.store(false, Ordering::SeqCst);
         VALIDATE_SAW_FILE.store(false, Ordering::SeqCst);
+    }
+
+    /// Walks the tree at `root` and returns a sorted `Vec<(relative
+    /// path, content bytes)>`. Two calls yield equal `Vec`s iff the
+    /// tree is byte-identical. Used by the dry-run cleanliness
+    /// assertion — any staging leak that writes into the worktree
+    /// flips one of the pairs.
+    fn snapshot_dir(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        snapshot_walk(root, root, &mut out).expect("snapshot walk");
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
+    fn snapshot_walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) -> io::Result<()> {
+        for read_result in fs::read_dir(dir)? {
+            let entry = read_result?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                snapshot_walk(base, &path, out)?;
+            } else if !file_type.is_symlink() {
+                // Regular files only — symlinks are intentionally
+                // skipped so the snapshot mirrors `copy_dir_recursive`'s
+                // regular-files-only semantics.
+                let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
+                let content = fs::read(&path)?;
+                out.push((rel, content));
+            } else {
+                // Symlink — skip.
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -1038,6 +1182,12 @@ ids = ["default"]
         let _lock = manifest_guard().lock().expect("manifest guard");
         let temp = TempDir::new().expect("temp dir");
         fs::write(temp.path().join("edgezero.toml"), PROVISION_MANIFEST).expect("write manifest");
+        // Task 11 wires the (true, true) arm through `run_with_staging`,
+        // which recursively copies the adapter crate dir into the
+        // staging tempdir. The fixture must pre-create the crate dir
+        // referenced by PROVISION_MANIFEST or staging errors before
+        // dispatch reaches the axum Section-5 stub.
+        fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
         let _cwd = CwdGuard::set(temp.path()).expect("chdir into tempdir");
 
         let err = run_provision(&ProvisionArgs {
@@ -1046,14 +1196,15 @@ ids = ["default"]
             local: true,
             manifest: PathBuf::from("edgezero.toml"),
         })
-        .expect_err("must reach the (true, true) dispatch stub");
-        // Positive assertion: the (true, true) arm's stub error
-        // proves the manifest loaded AND path-safety passed. Without
-        // this, a manifest-load failure would silently satisfy the
+        .expect_err("axum's Section-5 stub errs from inside the staged dispatch");
+        // Positive assertion: reaching axum's Section-5 stub proves
+        // the manifest loaded, path-safety passed, AND `run_with_staging`
+        // routed the closure through validate + build_stores + provision.
+        // Without this, an earlier failure would silently satisfy the
         // negative assertions below and give false-positive coverage.
         assert!(
-            err.contains("local dry-run staging lands in Task 10/11"),
-            "must reach dispatch matrix, not fail on manifest load: {err}"
+            err.contains("local mode lands in Section 5"),
+            "must reach axum's Section-5 stub through staging: {err}"
         );
         assert!(
             !err.contains("must not contain `..` traversal")
@@ -1072,6 +1223,7 @@ ids = ["default"]
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
 
         let err = run_provision(&ProvisionArgs {
             adapter: "axum".to_owned(),
@@ -1079,10 +1231,10 @@ ids = ["default"]
             local: true,
             manifest: manifest_path.clone(),
         })
-        .expect_err("must reach the (true, true) dispatch stub");
+        .expect_err("axum's Section-5 stub errs from inside the staged dispatch");
         assert!(
-            err.contains("local dry-run staging lands in Task 10/11"),
-            "must reach dispatch matrix, not fail on manifest load: {err}"
+            err.contains("local mode lands in Section 5"),
+            "must reach axum's Section-5 stub through staging: {err}"
         );
         assert!(
             !err.contains("must not contain `..` traversal")
@@ -1266,5 +1418,126 @@ ids = ["default"]
         )
         .unwrap();
         assert_eq!(observed.0, "real-project-bytes\n");
+    }
+
+    // ---------- (local, dry-run) dispatch matrix ----------
+
+    #[test]
+    fn provision_local_dry_run_leaves_worktree_clean() {
+        // Snapshot the tempdir contents (relative path → content
+        // bytes) before the call. Run run_provision with local=true,
+        // dry_run=true. The axum adapter's Section-5 stub will Err
+        // — that's fine. The core claim is: after the call, EVERY
+        // file in the tempdir is byte-identical to its pre-call
+        // snapshot. Any staging leak (a file written into the
+        // worktree instead of the tempdir) would flip the assertion.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).unwrap();
+        // Pre-create the axum adapter crate dir + a canary file so
+        // the staging copy has real content to work with. This also
+        // proves the crate dir itself is not clobbered.
+        let axum_crate = temp.path().join("crates/demo-axum");
+        fs::create_dir_all(&axum_crate).unwrap();
+        fs::write(axum_crate.join("Cargo.toml"), "# stub").unwrap();
+
+        let before = snapshot_dir(temp.path());
+
+        // Ignore the Result — axum's Section-5 stub Errs today; the
+        // core assertion is that the worktree is unchanged either way.
+        // Explicit type annotation quiets `let_underscore_untyped`
+        // and `let_underscore_must_use` — the Result is genuinely
+        // irrelevant to the assertion below.
+        let _result: Result<(), String> = run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path,
+        });
+
+        let after = snapshot_dir(temp.path());
+        assert_eq!(
+            before, after,
+            "dry-run must leave the worktree byte-identical"
+        );
+    }
+
+    #[test]
+    fn provision_local_no_dry_run_writes_to_worktree() {
+        // Non-dry-run local mode DOES write. axum can't demonstrate
+        // that until Section 5 lands, so use the fake adapter — its
+        // synthesise_baseline_manifest returns a stub file at the
+        // configured manifest path. In (true, false) mode, the CLI
+        // calls write_baseline_to_disk which materialises that file
+        // into the worktree before validate_adapter_manifest runs.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, FAKE_MANIFEST_BODY).unwrap();
+        // Pre-create the crate dir the fake references so the
+        // manifest validates.
+        fs::create_dir_all(temp.path().join("crates/spin")).unwrap();
+        let synthesised = temp.path().join("crates/spin/spin.toml");
+        assert!(
+            !synthesised.exists(),
+            "pre-condition: synthesised file absent"
+        );
+
+        run_provision(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: false,
+            local: true,
+            manifest: manifest_path,
+        })
+        .expect("(true, false) arm should succeed with the fake adapter");
+
+        assert!(
+            synthesised.exists(),
+            "(true, false) arm must write synthesised baseline into the worktree"
+        );
+        let bytes = fs::read_to_string(&synthesised).expect("read synthesised file");
+        assert!(
+            bytes.contains("# stub"),
+            "content should match fake's synthesiser output"
+        );
+    }
+
+    #[test]
+    fn provision_cloud_dry_run_passes_dry_run_true_to_adapter() {
+        // Cloud dry-run must not synthesise (Task 8b covers that) and
+        // must pass dry_run=true down to the adapter. Use the fake and
+        // read back RECORDED_DRY_RUN to confirm the boolean rode
+        // through the dispatch matrix untouched.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, FAKE_MANIFEST_BODY).unwrap();
+        // Cloud validates the real worktree, so the fake's synthesised
+        // file must already be present or validate_adapter_manifest
+        // will Err before dispatch.
+        fs::create_dir_all(temp.path().join("crates/spin")).unwrap();
+        fs::write(temp.path().join("crates/spin/spin.toml"), "# stub\n").unwrap();
+
+        run_provision(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: true,
+            local: false,
+            manifest: manifest_path,
+        })
+        .expect("cloud dry-run should succeed with fake adapter");
+
+        assert!(
+            RECORDED_DRY_RUN.load(Ordering::SeqCst),
+            "adapter.provision must have been called with dry_run = true"
+        );
+        assert!(
+            !SYNTH_CALLED.load(Ordering::SeqCst),
+            "cloud must never invoke synthesise_baseline_manifest"
+        );
     }
 }
