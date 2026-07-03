@@ -16,6 +16,15 @@ DEMO_DIR="$ROOT_DIR/examples/app-demo"
 ADAPTER="${1:-axum}"
 SERVER_PID=""
 
+# Warm up per-adapter local state — provision --local synthesises
+# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
+# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
+# this because Task 33 gitignored those files.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
+smoke_warmup_provision_local "$ADAPTER"
+
 cleanup() {
   if [ -n "$SERVER_PID" ]; then
     echo ""
