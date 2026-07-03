@@ -1339,17 +1339,27 @@ mod tests {
         }
 
         // Typed dispatch — the whole reason a downstream CLI
-        // exists. Raw push/validate would defeat the point.
+        // exists. Raw push/validate would defeat the point. Provision
+        // routes through the typed variant so #[secret] fields on the
+        // downstream config reach adapter provision_typed impls.
         for call in [
             "run_config_push_typed::<DemoAppConfig>",
             "run_config_validate_typed::<DemoAppConfig>",
+            "run_provision_typed::<DemoAppConfig>",
             "edgezero_cli::run_auth",
-            "edgezero_cli::run_provision",
         ] {
             assert!(
                 main.contains(call),
                 "<name>-cli main.rs must dispatch via `{call}`: {main}"
             );
         }
+        // Negative: the untyped variant must not survive template
+        // regeneration — Task 30's whole point was to eliminate the
+        // bypass where scaffolded CLIs would silently skip typed
+        // secret writeback.
+        assert!(
+            !main.contains("edgezero_cli::run_provision(&args)"),
+            "<name>-cli main.rs must NOT call untyped run_provision: {main}"
+        );
     }
 }

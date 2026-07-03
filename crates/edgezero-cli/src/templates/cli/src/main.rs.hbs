@@ -95,7 +95,7 @@ fn main() {
         }
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
         Cmd::New(args) => edgezero_cli::run_new(&args),
-        Cmd::Provision(args) => edgezero_cli::run_provision(&args),
+        Cmd::Provision(args) => edgezero_cli::run_provision_typed::<{{NameUpperCamel}}Config>(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),
     };
     if let Err(err) = result {
