@@ -254,24 +254,27 @@ Today this fails to compile (`enforce_scalar_string_type` rejects the containing
 
 ### 4.2 Metadata model: path-qualified secret fields
 
-Extend `SecretField` (`crates/edgezero-core/src/app_config.rs`) to carry a **path** instead of a single `name`. The path is a sequence of segments; each segment is either a named field or an array wildcard:
+Extend `SecretField` (`crates/edgezero-core/src/app_config.rs`) to carry a **path** instead of a single `name`. The path is a sequence of segments; each segment is either a named field or an array wildcard. **Segments are owned** (`Cow<'static, str>` / `Vec<_>`), not `&'static`, and the field carries an `optional` flag — both settled by §8 (cross-crate recursion cannot build `&'static` paths, and the runtime must tell "required-missing → error" from "optional-absent → skip"):
 
 ```rust
 pub enum SecretPathSegment {
-    Field(&'static str),   // object key (Rust field name, verbatim)
-    ArrayEach,             // every element of an array
+    Field(std::borrow::Cow<'static, str>),   // object key (Rust field name, verbatim)
+    ArrayEach,                               // every element of an array
 }
 
 pub struct SecretField {
     pub kind: SecretKind,
-    pub path: &'static [SecretPathSegment],   // was: name: &'static str
+    pub path: Vec<SecretPathSegment>,        // was: name: &'static str
+    pub optional: bool,                      // #[secret] on Option<String>
 }
 ```
 
-- A top-level scalar keeps working: its path is `&[Field("api_token")]` (length 1) — **backward compatible in behavior**, though the struct field changes shape (see 4.6 for the compat call-out).
+Because paths are owned and must compose across crates, `AppConfigMeta` changes from an associated `const SECRET_FIELDS` to a method `fn secret_fields() -> Vec<SecretField>` (§8 / B-3): a parent prepends its `Field`/`ArrayEach` segment onto each child's `secret_fields()`.
+
+- A top-level scalar keeps working: its path is `vec![Field("api_token")]` (length 1) — **backward compatible in behavior**, though the struct/trait shape changes (see 4.6 for the compat call-out).
 - `store_ref` siblings referenced by `SecretKind::KeyInNamedStore { store_ref_field }` are resolved **relative to the same parent object** as the secret field (i.e. sibling within the innermost containing object). Document this scoping rule explicitly.
 
-**Open design question (B-1):** array support (`ArrayEach`) adds real complexity to both the derive and the walk. If trusted-server's Phase 3 audit finds **no secrets inside arrays** (only nested objects), we can ship object-only nesting first (`SecretPathSegment::Field` only) and defer `ArrayEach`. Recommendation: **confirm the secret inventory against `Settings` before implementing arrays**; design the enum to allow `ArrayEach` from day one but gate its implementation on a real need.
+**Array support (B-1) — resolved: implement `ArrayEach` from day one.** The problem statement's own inventory includes an array secret (`partners[*].api_key`), and §8 [B, HIGH] requires an object-only plan *only* if trusted-server's `Settings` audit confirms no secret leaves inside arrays. Absent that confirmation, arrays are in scope from the start; the derive and the runtime walk both handle `ArrayEach` (see the implementation plan `docs/superpowers/plans/2026-07-02-edgezero-nested-secrets.md`).
 
 ### 4.3 Derive changes (`crates/edgezero-macros/src/app_config.rs`)
 
@@ -374,9 +377,8 @@ Replace the top-level-only loop with a **path navigator**:
 ## 7. Files to touch (edgezero repo)
 
 **Workstream A**
-- `crates/edgezero-core/src/router.rs` — `RouterBuilder::with_state`, `RouterInner.state_inserters`, dispatch insertion.
-- `crates/edgezero-core/src/extractor.rs` — `State<T>` extractor (+ `Deref`/`into_inner`).
-- `crates/edgezero-core/src/lib.rs` — re-export `State`.
+- `crates/edgezero-core/src/router.rs` — `RouterBuilder::with_state`, `RouterInner.state_inserters`, dispatch insertion (before `RequestContext::new`, alongside the introspection injects from PR #300).
+- `crates/edgezero-core/src/extractor.rs` — `State<T>` extractor (+ `Deref`/`DerefMut`/`into_inner`). Making `State` `pub` here is sufficient; **no `lib.rs` crate-root re-export** (§8 [A, minor] — no extractor is re-exported at the crate root today; consumers use `edgezero_core::extractor::State`).
 - `docs/guide/handlers.md`.
 
 **Workstream B**
