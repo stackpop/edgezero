@@ -1208,8 +1208,11 @@ fn provision_local(
             .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
     }
     if rc_changed && !dry_run {
-        fs::write(&rc_path, rc_doc.to_string())
-            .map_err(|err| format!("failed to write {}: {err}", rc_path.display()))?;
+        fs::write(
+            &rc_path,
+            normalise_runtime_config_header(rc_doc.to_string()),
+        )
+        .map_err(|err| format!("failed to write {}: {err}", rc_path.display()))?;
     }
     append_lines_dedup_with_header(
         &env_path,
@@ -1555,6 +1558,37 @@ fn append_key_value_store_block(
     inner.insert("path", value(".spin/sqlite_key_value.db"));
     parent_tbl.insert(platform, Item::Table(inner));
     Ok(true)
+}
+
+/// Ensure the schema-version header is the first content of a
+/// serialised `runtime-config.toml`. `toml_edit` stores the bare
+/// comment-only baseline from [`synthesise_runtime_config_toml`]
+/// as the document's trailing decor; inserting the first
+/// `[key_value_store.<label>]` table then shuffles that header
+/// to the BOTTOM of the emitted string. Force it back to the
+/// top so `runtime-config.toml` reliably starts with the schema-
+/// version line, matching the invariant every other provision-
+/// written file honours.
+fn normalise_runtime_config_header(serialised: String) -> String {
+    if serialised.starts_with(EDGEZERO_PROVISION_HEADER) {
+        return serialised;
+    }
+    let mut out = String::with_capacity(
+        serialised
+            .len()
+            .saturating_add(EDGEZERO_PROVISION_HEADER.len())
+            .saturating_add(1),
+    );
+    out.push_str(EDGEZERO_PROVISION_HEADER);
+    out.push('\n');
+    for line in serialised.lines() {
+        if line.trim() == EDGEZERO_PROVISION_HEADER {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Build the `.env` line set emitted by [`provision_local`].
@@ -4130,5 +4164,550 @@ mod tests {
                 "component table missing key {cid:?}: {out}"
             );
         }
+    }
+
+    // ---------- provision_local contract suite — Task 40 ----------
+    //
+    // Eight tests locking the local-mode provision contract:
+    // four common tests shared with sibling adapters (first-run
+    // shape, byte-identical re-provision, operator-edit
+    // survival, no cloud calls) plus four Spin-specific
+    // env-label alignment tests (spec §"Per-adapter test
+    // contract" item 4) that guarantee Spin's three-file
+    // cross-references (`.env`, `runtime-config.toml`,
+    // `spin.toml`) can never drift. If any of the three sets
+    // diverges, the Spin runtime lookup fails at boot with
+    // "unknown key_value_stores label X".
+
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Process-wide mutex serialising tests that mutate the
+    /// process environment (PATH prepend + arbitrary env vars).
+    /// Parallel test threads share process env, so any test
+    /// touching it must hold this guard for its whole lifetime.
+    fn env_mutation_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RAII guard: prepends `extra` to `$PATH` on construct,
+    /// restores the original value on drop. Must be held while
+    /// `env_mutation_guard()` is locked.
+    #[cfg(unix)]
+    struct PathPrepend {
+        original: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl PathPrepend {
+        fn new(extra: &Path) -> Self {
+            let original = env::var_os("PATH");
+            let new_path = match &original {
+                Some(prev) => {
+                    let mut accum = OsString::from(extra);
+                    accum.push(":");
+                    accum.push(prev);
+                    accum
+                }
+                None => OsString::from(extra),
+            };
+            env::set_var("PATH", new_path);
+            Self { original }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PathPrepend {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(prev) => env::set_var("PATH", prev),
+                None => env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// RAII guard for a single arbitrary env var. Sets on
+    /// construct, restores the previous value (or removes) on
+    /// drop. Must be held while `env_mutation_guard()` is
+    /// locked.
+    struct SetVar {
+        key: String,
+        original: Option<OsString>,
+    }
+
+    impl SetVar {
+        fn new(key: &str, value: &str) -> Self {
+            let original = env::var_os(key);
+            env::set_var(key, value);
+            Self {
+                key: key.to_owned(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for SetVar {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(prev) => env::set_var(&self.key, prev),
+                None => env::remove_var(&self.key),
+            }
+        }
+    }
+
+    /// Shell-script shim named `spin` that fails loudly if ever
+    /// invoked. The Spin local-mode provision path is pure file
+    /// editing — no shell-out — so this fake must never fire.
+    /// `zero_cloud_calls` prepends the shim's directory to PATH
+    /// and asserts provision still returns Ok.
+    #[cfg(unix)]
+    fn fake_spin_panicking() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script = dir.path().join("spin");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho 'spin was called during local provision' >&2\nexit 42\n",
+        )
+        .expect("write fake spin");
+        let mut perms = fs::metadata(&script).expect("stat").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod");
+        dir
+    }
+
+    /// Extract `EDGEZERO__STORES__*__NAME=<value>` values from
+    /// `.env` into a set. Commented lines are skipped so the
+    /// commented `__KEY` placeholders don't inflate the set.
+    fn extract_env_names(env_content: &str) -> BTreeSet<String> {
+        env_content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .filter(|(key, _)| key.contains("__NAME"))
+            .map(|(_, val)| val.trim().to_owned())
+            .collect()
+    }
+
+    /// Extract `[key_value_store.<name>]` block names from
+    /// `runtime-config.toml` into a set.
+    fn extract_runtime_config_store_names(doc: &toml_edit::DocumentMut) -> BTreeSet<String> {
+        doc.get("key_value_store")
+            .and_then(toml_edit::Item::as_table)
+            .map(|tbl| tbl.iter().map(|(key, _)| key.to_owned()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Extract `[component.<id>].key_value_stores = [...]`
+    /// array entries from `spin.toml` into a set.
+    fn extract_spin_component_bindings(
+        doc: &toml_edit::DocumentMut,
+        component_id: &str,
+    ) -> BTreeSet<String> {
+        doc.get("component")
+            .and_then(|item| item.get(component_id))
+            .and_then(|item| item.get("key_value_stores"))
+            .and_then(toml_edit::Item::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(toml_edit::Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Run `SpinCliAdapter::provision(Local, dry_run=false)`
+    /// with the given kv / config / secrets logical ids
+    /// (platform names default to the logical ids).
+    fn run_local_provision(dir: &Path, kv: &[&str], config: &[&str], secrets: &[&str]) {
+        let kv_ids = ResolvedStoreId::from_logicals(kv);
+        let config_ids = ResolvedStoreId::from_logicals(config);
+        let secret_ids = ResolvedStoreId::from_logicals(secrets);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        SpinCliAdapter
+            .provision(
+                dir,
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+    }
+
+    // ---- Common tests (shared shape with sibling adapters) ----
+
+    #[test]
+    fn provision_local_first_run_writes_expected_files() {
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        run_local_provision(dir.path(), &[TEST_KV_ID], &[TEST_CONFIG_ID], &[]);
+
+        let spin_path = dir.path().join("spin.toml");
+        let rc_path = dir.path().join("runtime-config.toml");
+        let env_path = dir.path().join(".env");
+        assert!(spin_path.exists(), "spin.toml must exist");
+        assert!(rc_path.exists(), "runtime-config.toml must exist");
+        assert!(env_path.exists(), ".env must exist");
+
+        let spin_after = fs::read_to_string(&spin_path).unwrap();
+        let rc_after = fs::read_to_string(&rc_path).unwrap();
+        let env_after = fs::read_to_string(&env_path).unwrap();
+
+        for (label, content) in [
+            ("spin.toml", &spin_after),
+            ("runtime-config.toml", &rc_after),
+            (".env", &env_after),
+        ] {
+            assert!(
+                content.starts_with("# edgezero-provision: v1"),
+                "{label} must start with schema header: {content}"
+            );
+        }
+
+        // spin.toml has both labels in [component.demo].key_value_stores.
+        let spin_doc: toml_edit::DocumentMut = spin_after.parse().unwrap();
+        let bindings = extract_spin_component_bindings(&spin_doc, TEST_COMPONENT_ID);
+        let expected: BTreeSet<String> = [TEST_KV_ID, TEST_CONFIG_ID]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(bindings, expected, "spin.toml component bindings");
+
+        // runtime-config.toml has [key_value_store.<label>] blocks
+        // with the Spin SQLite backend defaults.
+        for label in [TEST_KV_ID, TEST_CONFIG_ID] {
+            assert!(
+                rc_after.contains(&format!("[key_value_store.{label}]")),
+                "runtime-config missing stanza for {label}: {rc_after}"
+            );
+        }
+        assert!(
+            rc_after.contains(r#"type = "spin""#),
+            r#"runtime-config missing type = "spin": {rc_after}"#
+        );
+        assert!(
+            rc_after.contains(r#"path = ".spin/sqlite_key_value.db""#),
+            "runtime-config missing default SQLite path: {rc_after}"
+        );
+
+        // .env has the __NAME lines for both kinds.
+        assert!(
+            env_after.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=sessions"),
+            "KV __NAME line: {env_after}"
+        );
+        assert!(
+            env_after.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config"),
+            "config __NAME line: {env_after}"
+        );
+    }
+
+    #[test]
+    fn provision_local_re_provision_is_byte_identical() {
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        run_local_provision(dir.path(), &[TEST_KV_ID], &[TEST_CONFIG_ID], &[]);
+        let spin_first = fs::read(dir.path().join("spin.toml")).unwrap();
+        let rc_first = fs::read(dir.path().join("runtime-config.toml")).unwrap();
+        let env_first = fs::read(dir.path().join(".env")).unwrap();
+
+        run_local_provision(dir.path(), &[TEST_KV_ID], &[TEST_CONFIG_ID], &[]);
+        let spin_second = fs::read(dir.path().join("spin.toml")).unwrap();
+        let rc_second = fs::read(dir.path().join("runtime-config.toml")).unwrap();
+        let env_second = fs::read(dir.path().join(".env")).unwrap();
+
+        assert_eq!(spin_first, spin_second, "spin.toml byte-identical");
+        assert_eq!(rc_first, rc_second, "runtime-config.toml byte-identical");
+        assert_eq!(env_first, env_second, ".env byte-identical");
+    }
+
+    #[test]
+    fn provision_local_push_after_provision_preserves_local_state() {
+        // Operator installs a real secret value into a
+        // `SPIN_VARIABLE_<UPPER>=…` line; a subsequent
+        // provision_typed run must NOT clobber it. Key-normalised
+        // dedup in append_lines_dedup_with_header collapses the
+        // empty placeholder against the operator's value so the
+        // operator edit survives byte-for-byte.
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("spin.toml"),
+            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+        )
+        .unwrap();
+
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "API_TOKEN",
+            "demo_api_token",
+        )];
+        SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+
+        let env_path = dir.path().join(".env");
+        let after_first = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            after_first
+                .lines()
+                .any(|line| line == "SPIN_VARIABLE_DEMO_API_TOKEN="),
+            "first provision emits the empty SPIN_VARIABLE_ placeholder: {after_first}"
+        );
+
+        // Operator uncomments-value: fills in the real value.
+        let operator_edited = after_first.replace(
+            "SPIN_VARIABLE_DEMO_API_TOKEN=",
+            "SPIN_VARIABLE_DEMO_API_TOKEN=real_secret_value",
+        );
+        fs::write(&env_path, &operator_edited).unwrap();
+
+        SpinCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+
+        let after_second = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            after_second.contains("SPIN_VARIABLE_DEMO_API_TOKEN=real_secret_value"),
+            "operator value survives re-provision: {after_second}"
+        );
+        assert!(
+            !after_second
+                .lines()
+                .any(|line| line == "SPIN_VARIABLE_DEMO_API_TOKEN="),
+            "empty placeholder must NOT be re-added: {after_second}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_local_zero_cloud_calls() {
+        // Local mode is pure file editing. A fake `spin` on
+        // PATH that panics on invocation must never fire — if
+        // it did, the exit-42 would surface via subprocess
+        // status or file-side effects (there are none).
+        let _lock = env_mutation_guard().lock().expect("guard");
+        let fake = fake_spin_panicking();
+        let _path = PathPrepend::new(fake.path());
+
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        run_local_provision(
+            dir.path(),
+            &[TEST_KV_ID],
+            &[TEST_CONFIG_ID],
+            &[TEST_SECRET_ID],
+        );
+
+        // Success is the assertion — provision returned Ok
+        // (no shell-out to the panicking shim happened).
+        assert!(dir.path().join("spin.toml").exists());
+        assert!(dir.path().join("runtime-config.toml").exists());
+        assert!(dir.path().join(".env").exists());
+    }
+
+    // ---- Spin-specific env-label alignment tests ----
+
+    #[test]
+    fn provision_local_writes_expected_env_lines() {
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        run_local_provision(
+            dir.path(),
+            &[TEST_KV_ID],
+            &[TEST_CONFIG_ID],
+            &[TEST_SECRET_ID],
+        );
+        let env_after = fs::read_to_string(dir.path().join(".env")).unwrap();
+        for expected in [
+            "EDGEZERO__STORES__KV__SESSIONS__NAME=sessions",
+            "EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config",
+            "EDGEZERO__STORES__SECRETS__DEFAULT__NAME=default",
+        ] {
+            assert!(
+                env_after.contains(expected),
+                "missing expected line `{expected}`: {env_after}"
+            );
+        }
+    }
+
+    /// THE contract: `.env` __NAME values, runtime-config
+    /// store names, and spin.toml component bindings MUST
+    /// reference the exact same set of labels. If any of the
+    /// three sets diverges, the Spin runtime lookup fails at
+    /// boot with "unknown `key_value_stores` label X".
+    ///
+    /// Only KV + config are declared here — secrets land in
+    /// `.env` only (no runtime-config stanza, no spin.toml
+    /// binding), so including them would break set equality
+    /// by construction.
+    #[test]
+    fn provision_local_labels_line_up() {
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        run_local_provision(
+            dir.path(),
+            &[TEST_KV_ID, TEST_KV_ID_ALT],
+            &[TEST_CONFIG_ID],
+            &[],
+        );
+
+        let env_after = fs::read_to_string(dir.path().join(".env")).unwrap();
+        let rc_after = fs::read_to_string(dir.path().join("runtime-config.toml")).unwrap();
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).unwrap();
+        let rc_doc: toml_edit::DocumentMut = rc_after.parse().unwrap();
+        let spin_doc: toml_edit::DocumentMut = spin_after.parse().unwrap();
+
+        let env_names = extract_env_names(&env_after);
+        let runtime_config_stores = extract_runtime_config_store_names(&rc_doc);
+        let spin_bindings = extract_spin_component_bindings(&spin_doc, TEST_COMPONENT_ID);
+
+        let expected: BTreeSet<String> = [TEST_KV_ID, TEST_KV_ID_ALT, TEST_CONFIG_ID]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(env_names, expected, ".env __NAME values: {env_after}");
+        assert_eq!(
+            runtime_config_stores, expected,
+            "runtime-config stores: {rc_after}"
+        );
+        assert_eq!(
+            spin_bindings, expected,
+            "spin.toml component bindings: {spin_after}"
+        );
+        // The load-bearing set-equality assertion: any drift
+        // between the three files means the runtime lookup
+        // fails at boot.
+        assert_eq!(env_names, runtime_config_stores);
+        assert_eq!(runtime_config_stores, spin_bindings);
+    }
+
+    #[test]
+    fn provision_local_env_overlay_round_trips() {
+        // Simulate the CLI's env-overlay resolution: the
+        // process env carries the __NAME override AND the
+        // constructed ResolvedStoreId reflects the resolved
+        // platform binding the CLI would compute. The env
+        // var itself does not drive the adapter code (which
+        // consumes ProvisionStores) — the guard is there
+        // because the process env is shared with parallel
+        // test threads.
+        let _lock = env_mutation_guard().lock().expect("guard");
+        let _var = SetVar::new("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "prod_config");
+
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        let config_ids = vec![ResolvedStoreId::new(TEST_CONFIG_ID, "prod_config")];
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision with overlay ok");
+
+        let env_after = fs::read_to_string(dir.path().join(".env")).unwrap();
+        let rc_after = fs::read_to_string(dir.path().join("runtime-config.toml")).unwrap();
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).unwrap();
+        let rc_doc: toml_edit::DocumentMut = rc_after.parse().unwrap();
+        let spin_doc: toml_edit::DocumentMut = spin_after.parse().unwrap();
+
+        let env_names = extract_env_names(&env_after);
+        let runtime_config_stores = extract_runtime_config_store_names(&rc_doc);
+        let spin_bindings = extract_spin_component_bindings(&spin_doc, TEST_COMPONENT_ID);
+
+        let expected: BTreeSet<String> = ["prod_config".to_owned()].into_iter().collect();
+        assert_eq!(env_names, expected, ".env carries prod_config: {env_after}");
+        assert_eq!(runtime_config_stores, expected, "runtime-config stores");
+        assert_eq!(spin_bindings, expected, "spin.toml bindings");
+        assert_eq!(env_names, runtime_config_stores);
+        assert_eq!(runtime_config_stores, spin_bindings);
+    }
+
+    #[test]
+    fn re_provision_preserves_operator_uncommented_override() {
+        // Task 16c dedup contract: first provision writes a
+        // commented `# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=<logical>_staging`
+        // placeholder. Operator uncomments AND changes the value.
+        // Re-run provision must:
+        //   1. leave the operator line byte-for-byte,
+        //   2. NOT re-add the commented placeholder (key-normalised
+        //      dedup: commented and uncommented forms collapse).
+        let dir = tempdir().expect("tempdir");
+        seed_baseline(dir.path(), TEST_COMPONENT_ID);
+        run_local_provision(dir.path(), &[], &[TEST_CONFIG_ID], &[]);
+
+        let env_path = dir.path().join(".env");
+        let after_first = fs::read_to_string(&env_path).unwrap();
+        let placeholder = "# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging";
+        assert!(
+            after_first.contains(placeholder),
+            "first provision writes the commented placeholder: {after_first}"
+        );
+
+        // Operator uncomments AND edits.
+        let operator_line = "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=my_custom_override";
+        let operator_edited = after_first.replace(placeholder, operator_line);
+        fs::write(&env_path, &operator_edited).unwrap();
+
+        run_local_provision(dir.path(), &[], &[TEST_CONFIG_ID], &[]);
+
+        let after_second = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            after_second.contains(operator_line),
+            "operator uncommented + edited __KEY line preserved: {after_second}"
+        );
+        assert!(
+            !after_second.contains(placeholder),
+            "commented placeholder must NOT be re-added: {after_second}"
+        );
+
+        // Exactly one line whose normalised key is the __KEY
+        // env var — the uncommented operator override wins,
+        // proving key-normalised dedup collapses the two forms.
+        let key_lines = after_second
+            .lines()
+            .filter(|line| {
+                let after_hash = line.trim_start().strip_prefix('#').unwrap_or(line);
+                after_hash
+                    .trim_start()
+                    .starts_with("EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=")
+            })
+            .count();
+        assert_eq!(
+            key_lines, 1,
+            "exactly one __KEY line after dedup: {after_second}"
+        );
     }
 }
