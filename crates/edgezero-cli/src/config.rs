@@ -25,7 +25,8 @@ use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
 use edgezero_core::app_config::{
-    self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind, SecretPathSegment,
+    self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretField, SecretKind,
+    SecretPathSegment,
 };
 use edgezero_core::blob_envelope::BlobEnvelope;
 use edgezero_core::env_config::EnvConfig;
@@ -165,6 +166,22 @@ enum RecheckOutcome {
     Skip,
     /// Proceed to write (any warnings already emitted).
     Write,
+}
+
+/// One resolved `#[secret]` leaf located in the raw app-config TOML.
+///
+/// `label` carries concrete `[n]` array indices (the runtime dotted
+/// form used in CLI output and errors). `store_ref_value` is the sibling
+/// store id resolved from the leaf's INNERMOST parent table — populated
+/// only for `KeyInNamedStore` leaves.
+#[derive(Debug)]
+struct ResolvedTomlLeaf<'raw> {
+    /// Dotted runtime label, e.g. `partners[1].api_key`.
+    label: String,
+    /// Sibling store id for `KeyInNamedStore`; `None` otherwise.
+    store_ref_value: Option<&'raw str>,
+    /// The secret leaf's string value (a secret-store KEY NAME).
+    value: &'raw str,
 }
 
 /// Raw flow — no typed `C`. Runs every check the typed flow runs
@@ -1287,17 +1304,93 @@ pub(crate) fn reject_merged_id_collisions(
     Ok(())
 }
 
+/// Collect every concrete secret leaf a `SecretField` resolves to in the
+/// raw app-config TOML, navigating `Field` (table descent) and `ArrayEach`
+/// (per-element) segments. `label` uses concrete `[n]` indices and, for a
+/// `KeyInNamedStore` leaf, `store_ref_value` is resolved from the leaf's
+/// innermost parent table. Absent optional leaves yield nothing; a missing
+/// required leaf yields an `Err` carrying the dotted label.
+fn collect_secret_leaves<'raw>(
+    root: &'raw Value,
+    field: &SecretField,
+) -> Result<Vec<ResolvedTomlLeaf<'raw>>, String> {
+    fn walk<'raw>(
+        node: &'raw Value,
+        field: &SecretField,
+        remaining: &[SecretPathSegment],
+        rendered: &str,
+        out: &mut Vec<ResolvedTomlLeaf<'raw>>,
+    ) -> Result<(), String> {
+        match remaining.split_first() {
+            Some((SecretPathSegment::Field(name), [])) => {
+                let parent = node.as_table().ok_or_else(|| {
+                    format!("expected a table containing `{name}` at `{rendered}`")
+                })?;
+                let leaf_label = if rendered.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{rendered}.{name}")
+                };
+                match parent.get(name.as_ref()).and_then(Value::as_str) {
+                    Some(value) => {
+                        let store_ref_value = match field.kind {
+                            SecretKind::KeyInNamedStore { store_ref_field } => {
+                                parent.get(store_ref_field).and_then(Value::as_str)
+                            }
+                            SecretKind::KeyInDefault | SecretKind::StoreRef => None,
+                        };
+                        out.push(ResolvedTomlLeaf {
+                            label: leaf_label,
+                            store_ref_value,
+                            value,
+                        });
+                        Ok(())
+                    }
+                    None if field.optional && parent.get(name.as_ref()).is_none() => Ok(()),
+                    None => Err(format!(
+                        "`#[secret]` field `{leaf_label}` is missing or not a string"
+                    )),
+                }
+            }
+            Some((SecretPathSegment::Field(name), rest)) => {
+                let table = node
+                    .as_table()
+                    .ok_or_else(|| format!("expected a table at `{rendered}`"))?;
+                let next_rendered = if rendered.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{rendered}.{name}")
+                };
+                match table.get(name.as_ref()) {
+                    Some(child) => walk(child, field, rest, &next_rendered, out),
+                    None if field.optional => Ok(()),
+                    None => Err(format!("missing `{next_rendered}`")),
+                }
+            }
+            Some((SecretPathSegment::ArrayEach, rest)) => {
+                let arr = node
+                    .as_array()
+                    .ok_or_else(|| format!("expected an array at `{rendered}`"))?;
+                for (idx, item) in arr.iter().enumerate() {
+                    let indexed = format!("{rendered}[{idx}]");
+                    walk(item, field, rest, &indexed, out)?;
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, field, &field.path, "", &mut out)?;
+    Ok(out)
+}
+
 /// Typed-only adapter dispatch: feed each adapter the `#[secret]`
 /// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
 /// runtime store ids, not flat-namespace candidates) so adapters
 /// whose secret store has a flat-namespace constraint (Spin) can
 /// detect within-secrets collisions.
 fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
-    let raw_table = ctx
-        .raw_config
-        .as_table()
-        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
-
     let default_store_id = ctx
         .manifest()
         .stores
@@ -1306,28 +1399,24 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
         .map(StoreDeclaration::default_id);
     let mut entries: Vec<TypedSecretEntry<'_>> = Vec::new();
     for field in C::secret_fields() {
-        // Task 1: flat/length-1 paths only — the leaf is the single Field
-        // segment. Task 6 makes this a full TOML path navigator.
-        let leaf = field.dotted_path();
-        let key = match field.path.last() {
-            Some(SecretPathSegment::Field(name)) => name.as_ref(),
-            _ => continue,
-        };
-        match field.kind {
-            SecretKind::KeyInDefault => {
-                let opt_value = raw_table.get(key).and_then(Value::as_str);
-                if let (Some(key_value), Some(store_id)) = (opt_value, default_store_id) {
-                    entries.push(TypedSecretEntry::new(store_id, leaf.clone(), key_value));
+        for leaf in collect_secret_leaves(&ctx.raw_config, &field)? {
+            match field.kind {
+                SecretKind::KeyInDefault => {
+                    if let Some(store_id) = default_store_id {
+                        entries.push(TypedSecretEntry::new(store_id, leaf.label, leaf.value));
+                    }
                 }
-            }
-            SecretKind::KeyInNamedStore { store_ref_field } => {
-                let opt_store = raw_table.get(store_ref_field).and_then(Value::as_str);
-                let opt_value = raw_table.get(key).and_then(Value::as_str);
-                if let (Some(store_id), Some(key_value)) = (opt_store, opt_value) {
-                    entries.push(TypedSecretEntry::new(store_id, leaf.clone(), key_value));
+                SecretKind::KeyInNamedStore { .. } => {
+                    let store_id = leaf.store_ref_value.ok_or_else(|| {
+                        format!(
+                            "`#[secret(store_ref = \"...\")]` field `{}` is missing its store_ref sibling",
+                            leaf.label
+                        )
+                    })?;
+                    entries.push(TypedSecretEntry::new(store_id, leaf.label, leaf.value));
                 }
+                SecretKind::StoreRef => {}
             }
-            SecretKind::StoreRef => {}
         }
     }
 
@@ -1347,74 +1436,59 @@ fn typed_secret_checks<C: AppConfigMeta>(
     _typed: &C,
     ctx: &ValidationContext,
 ) -> Result<(), String> {
-    let raw_table = ctx
-        .raw_config
-        .as_table()
-        .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
-
     for field in C::secret_fields() {
-        // Task 1: flat/length-1 paths only — the leaf is the single Field
-        // segment. Task 6 makes this a full TOML path navigator.
-        let leaf = field.dotted_path();
-        let key = match field.path.last() {
-            Some(SecretPathSegment::Field(name)) => name.as_ref(),
-            _ => continue,
-        };
-        let value = raw_table.get(key).and_then(Value::as_str).ok_or_else(|| {
-            format!(
-                "{}: `#[secret]` field `{}` is missing or not a string at the top level",
-                ctx.app_config_path.display(),
-                leaf
-            )
-        })?;
-        if value.is_empty() {
-            return Err(format!(
-                "{}: `#[secret]` field `{}` must be non-empty",
-                ctx.app_config_path.display(),
-                leaf
-            ));
-        }
-        match field.kind {
-            SecretKind::KeyInDefault => {
-                if ctx.manifest().stores.secrets.is_none() {
-                    return Err(format!(
-                        "{}: `#[secret]` field `{}` requires `[stores.secrets]` to be declared in {}",
-                        ctx.app_config_path.display(),
-                        leaf,
-                        ctx.manifest_path.display()
-                    ));
-                }
+        for leaf in collect_secret_leaves(&ctx.raw_config, &field)? {
+            let label = leaf.label;
+            let value = leaf.value;
+            if value.is_empty() {
+                return Err(format!(
+                    "{}: `#[secret]` field `{}` must be non-empty",
+                    ctx.app_config_path.display(),
+                    label
+                ));
             }
-            SecretKind::KeyInNamedStore { .. } => {
-                // The field value is a key within a named store; the named
-                // store is identified by the sibling `#[secret(store_ref)]`
-                // field. Verify the store section is at least declared.
-                if ctx.manifest().stores.secrets.is_none() {
-                    return Err(format!(
-                        "{}: `#[secret(store_ref = \"...\")]` field `{}` requires `[stores.secrets]` to be declared in {}",
-                        ctx.app_config_path.display(),
-                        leaf,
-                        ctx.manifest_path.display()
-                    ));
+            match field.kind {
+                SecretKind::KeyInDefault => {
+                    if ctx.manifest().stores.secrets.is_none() {
+                        return Err(format!(
+                            "{}: `#[secret]` field `{}` requires `[stores.secrets]` to be declared in {}",
+                            ctx.app_config_path.display(),
+                            label,
+                            ctx.manifest_path.display()
+                        ));
+                    }
                 }
-            }
-            SecretKind::StoreRef => {
-                let secrets = ctx.manifest().stores.secrets.as_ref().ok_or_else(|| {
-                    format!(
-                        "{}: `#[secret(store_ref)]` field `{}` requires `[stores.secrets]` to be declared in {}",
-                        ctx.app_config_path.display(),
-                        leaf,
-                        ctx.manifest_path.display()
-                    )
-                })?;
-                if !secrets.ids.iter().any(|id| id == value) {
-                    return Err(format!(
-                        "{}: `#[secret(store_ref)]` field `{}` = {:?} is not in [stores.secrets].ids ({:?})",
-                        ctx.app_config_path.display(),
-                        leaf,
-                        value,
-                        secrets.ids
-                    ));
+                SecretKind::KeyInNamedStore { .. } => {
+                    // The field value is a key within a named store; the named
+                    // store is identified by the sibling `#[secret(store_ref)]`
+                    // field. Verify the store section is at least declared.
+                    if ctx.manifest().stores.secrets.is_none() {
+                        return Err(format!(
+                            "{}: `#[secret(store_ref = \"...\")]` field `{}` requires `[stores.secrets]` to be declared in {}",
+                            ctx.app_config_path.display(),
+                            label,
+                            ctx.manifest_path.display()
+                        ));
+                    }
+                }
+                SecretKind::StoreRef => {
+                    let secrets = ctx.manifest().stores.secrets.as_ref().ok_or_else(|| {
+                        format!(
+                            "{}: `#[secret(store_ref)]` field `{}` requires `[stores.secrets]` to be declared in {}",
+                            ctx.app_config_path.display(),
+                            label,
+                            ctx.manifest_path.display()
+                        )
+                    })?;
+                    if !secrets.ids.iter().any(|id| id == value) {
+                        return Err(format!(
+                            "{}: `#[secret(store_ref)]` field `{}` = {:?} is not in [stores.secrets].ids ({:?})",
+                            ctx.app_config_path.display(),
+                            label,
+                            value,
+                            secrets.ids
+                        ));
+                    }
                 }
             }
         }
@@ -1554,7 +1628,6 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 mod tests {
     use super::*;
     use crate::test_support::{manifest_guard, EnvOverride};
-    use edgezero_core::app_config::SecretField;
     use serde::{Deserialize, Serialize};
     use std::borrow::Cow;
     #[cfg(unix)]
@@ -1912,6 +1985,224 @@ ids = ["default"]
         // path but MUST PASS with validate_excluding_secrets.
         run_config_validate_typed::<SecretValidatorConfig>(&args_for(&manifest_path))
             .expect("secret-field validator must be skipped on typed validate");
+    }
+
+    // ---------- Task 6: path-aware nested / array secret reflection ----------
+
+    // Real nested derive: integrations.datadome.server_side_key (KeyInDefault),
+    // partners[*].api_key (KeyInDefault).
+    #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct DataDome {
+        #[secret]
+        server_side_key: String,
+    }
+    #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct Integrations {
+        #[app_config(nested)]
+        #[validate(nested)]
+        datadome: DataDome,
+    }
+    #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct Partner {
+        #[secret]
+        api_key: String,
+    }
+    #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct NestedCliConfig {
+        #[app_config(nested)]
+        #[validate(nested)]
+        integrations: Integrations,
+        #[app_config(nested)]
+        #[validate(nested)]
+        partners: Vec<Partner>,
+    }
+
+    const NESTED_MANIFEST: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+
+    #[test]
+    fn validate_typed_accepts_well_formed_nested_and_array_secrets() {
+        let app_config = r#"
+[integrations.datadome]
+server_side_key = "dd_key"
+
+[[partners]]
+api_key = "p0"
+
+[[partners]]
+api_key = "p1"
+"#;
+        let (_dir, manifest_path, _) = setup_project(NESTED_MANIFEST, app_config);
+        run_config_validate_typed::<NestedCliConfig>(&args_for(&manifest_path))
+            .expect("well-formed nested + array secret config validates");
+    }
+
+    #[test]
+    fn validate_typed_reports_dotted_path_for_empty_array_secret() {
+        // partners[1].api_key is empty -> typed_secret_checks must reject it and
+        // name the INDEXED dotted path.
+        let app_config = r#"
+[integrations.datadome]
+server_side_key = "dd_key"
+
+[[partners]]
+api_key = "p0"
+
+[[partners]]
+api_key = ""
+"#;
+        let (_dir, manifest_path, _) = setup_project(NESTED_MANIFEST, app_config);
+        let err = run_config_validate_typed::<NestedCliConfig>(&args_for(&manifest_path))
+            .expect_err("empty array secret must be rejected");
+        assert!(
+            err.contains("partners[1].api_key"),
+            "error names the indexed dotted path: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_typed_rejects_missing_required_nested_leaf_at_deserialize() {
+        // A MISSING required nested leaf fails serde DESERIALIZATION
+        // before `typed_secret_checks`/`run_adapter_typed_checks` ever run — so
+        // this is deserialize-path coverage, NOT proof of the path-aware
+        // collector. The direct collector test below covers that.
+        let app_config = r#"
+[integrations.datadome]
+
+[[partners]]
+api_key = "p0"
+"#;
+        let (_dir, manifest_path, _) = setup_project(NESTED_MANIFEST, app_config);
+        let err = run_config_validate_typed::<NestedCliConfig>(&args_for(&manifest_path))
+            .expect_err("missing nested leaf must be rejected");
+        assert!(
+            err.contains("server_side_key"),
+            "error names the missing nested leaf: {err}"
+        );
+    }
+
+    // Direct coverage of the path-aware TOML collector (the new logic).
+    // Bypasses `run_config_validate_typed` so deserialization does not preempt
+    // it — proves the collector itself resolves array indices and reports the
+    // dotted label for a present-but-invalid / missing leaf.
+    #[test]
+    fn collect_secret_leaves_resolves_array_indices_and_dotted_labels() {
+        let raw: Value = toml::from_str(
+            r#"
+[[partners]]
+api_key = "p0"
+
+[[partners]]
+api_key = "p1"
+"#,
+        )
+        .expect("toml");
+
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(Cow::Borrowed("partners")),
+                SecretPathSegment::ArrayEach,
+                SecretPathSegment::Field(Cow::Borrowed("api_key")),
+            ],
+            optional: false,
+        };
+        let leaves = collect_secret_leaves(&raw, &field).expect("collect");
+        let labels: Vec<&str> = leaves.iter().map(|leaf| leaf.label.as_str()).collect();
+        assert_eq!(labels, vec!["partners[0].api_key", "partners[1].api_key"]);
+        let values: Vec<&str> = leaves.iter().map(|leaf| leaf.value).collect();
+        assert_eq!(values, vec!["p0", "p1"]);
+    }
+
+    #[test]
+    fn collect_secret_leaves_errors_on_missing_required_leaf_with_dotted_label() {
+        let raw: Value = toml::from_str(
+            r#"
+[integrations.datadome]
+other = "x"
+"#,
+        )
+        .expect("toml");
+
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                SecretPathSegment::Field(Cow::Borrowed("datadome")),
+                SecretPathSegment::Field(Cow::Borrowed("server_side_key")),
+            ],
+            optional: false,
+        };
+        let err = collect_secret_leaves(&raw, &field).expect_err("missing required leaf");
+        assert!(
+            err.contains("integrations.datadome.server_side_key"),
+            "collector error names the dotted path: {err}"
+        );
+    }
+
+    #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct Vaulted {
+        #[secret(store_ref = "vault")]
+        token: String,
+        #[secret(store_ref)]
+        vault: String,
+    }
+    #[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct NamedStoreCliConfig {
+        #[app_config(nested)]
+        #[validate(nested)]
+        vaulted: Vaulted,
+    }
+
+    #[test]
+    fn validate_typed_accepts_nested_named_store_with_sibling() {
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default", "named"]
+default = "default"
+"#;
+        let app_config = r#"
+[vaulted]
+token = "tok_key"
+vault = "named"
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, app_config);
+        run_config_validate_typed::<NamedStoreCliConfig>(&args_for(&manifest_path))
+            .expect("nested named-store secret with a declared store validates");
     }
 
     // ---------- Spin checks ----------
