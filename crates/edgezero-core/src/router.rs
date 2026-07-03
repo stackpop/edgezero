@@ -8,7 +8,7 @@ use tower_service::Service;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
 use crate::handler::{BoxHandler, IntoHandler, IntrospectionNeeds};
-use crate::http::{HandlerFuture, Method, Request, Response};
+use crate::http::{Extensions, HandlerFuture, Method, Request, Response};
 use crate::introspection::{ManifestJson, RouteTable};
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
@@ -67,12 +67,17 @@ enum RouteMatch<'route> {
     NotFound,
 }
 
+/// Type-erased closure that clones a registered state value into a request's
+/// extensions at dispatch. See [`RouterBuilder::with_state`].
+type StateInserter = Arc<dyn Fn(&mut Extensions) + Send + Sync>;
+
 #[derive(Default)]
 pub struct RouterBuilder {
     manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
     route_info: Vec<RouteInfo>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
+    state_inserters: Vec<StateInserter>,
 }
 
 impl RouterBuilder {
@@ -115,6 +120,7 @@ impl RouterBuilder {
             self.middlewares,
             route_index,
             self.manifest_json,
+            self.state_inserters,
         )
     }
 
@@ -193,6 +199,28 @@ impl RouterBuilder {
         self.manifest_json = Some(json.into());
         self
     }
+
+    /// Register a value cloned into every request's extensions before
+    /// dispatch, making it available to the [`State<T>`] extractor and to
+    /// `RequestContext`-based handlers.
+    ///
+    /// Typically `T = Arc<AppState>`. Registering the same `T` twice is
+    /// last-write-wins. Cost is one `T::clone` (an `Arc` bump for
+    /// `Arc<AppState>`) per registered state per request.
+    ///
+    /// [`State<T>`]: crate::extractor::State
+    #[must_use]
+    #[inline]
+    pub fn with_state<T>(mut self, value: T) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.state_inserters
+            .push(Arc::new(move |ext: &mut Extensions| {
+                ext.insert(value.clone());
+            }));
+        self
+    }
 }
 
 struct RouterInner {
@@ -200,6 +228,7 @@ struct RouterInner {
     middlewares: Vec<BoxMiddleware>,
     route_index: Arc<[RouteInfo]>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
+    state_inserters: Vec<StateInserter>,
 }
 
 impl RouterInner {
@@ -223,6 +252,12 @@ impl RouterInner {
                     request
                         .extensions_mut()
                         .insert(RouteTable(Arc::clone(&self.route_index)));
+                }
+                // App-owned state registered via RouterBuilder::with_state.
+                // Runs after introspection inserts; distinct TypeIds, so no
+                // collision. Last registered wins for a given `T`.
+                for inserter in &self.state_inserters {
+                    inserter(request.extensions_mut());
                 }
                 let ctx = RequestContext::new(request, params);
                 let next = Next::new(&self.middlewares, entry.handler.as_ref());
@@ -299,6 +334,7 @@ impl RouterService {
         middlewares: Vec<BoxMiddleware>,
         route_index: Arc<[RouteInfo]>,
         manifest_json: Option<Arc<str>>,
+        state_inserters: Vec<StateInserter>,
     ) -> Self {
         Self {
             inner: Arc::new(RouterInner {
@@ -306,6 +342,7 @@ impl RouterService {
                 middlewares,
                 route_index,
                 routes,
+                state_inserters,
             }),
         }
     }
@@ -771,5 +808,147 @@ mod tests {
             acc
         });
         assert_eq!(collected, b"chunk-one\nchunk-two\n");
+    }
+
+    #[test]
+    fn with_state_exposes_value_to_handler() {
+        use crate::extractor::{FromRequest as _, State};
+
+        #[derive(Clone)]
+        struct Counter(u32);
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let State(counter) = State::<Counter>::from_request(&ctx).await?;
+            Ok(format!("count={}", counter.0))
+        }
+
+        let service = RouterService::builder()
+            .with_state(Counter(9))
+            .get("/count", handler)
+            .build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/count")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"count=9");
+    }
+
+    #[test]
+    fn with_state_last_write_wins_for_same_type() {
+        use crate::extractor::{FromRequest as _, State};
+
+        #[derive(Clone)]
+        struct Counter(u32);
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let State(counter) = State::<Counter>::from_request(&ctx).await?;
+            Ok(format!("count={}", counter.0))
+        }
+
+        let service = RouterService::builder()
+            .with_state(Counter(1))
+            .with_state(Counter(2))
+            .get("/c", handler)
+            .build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/c")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"count=2");
+    }
+
+    #[test]
+    fn with_state_no_cross_request_bleed() {
+        use crate::extractor::{FromRequest as _, State};
+        use std::future::Future as _;
+
+        #[derive(Clone)]
+        struct Tag(&'static str);
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let State(tag) = State::<Tag>::from_request(&ctx).await?;
+            Ok(tag.0.to_owned())
+        }
+
+        let service = RouterService::builder()
+            .with_state(Tag("shared"))
+            .get("/t", handler)
+            .build();
+
+        let req1 = request_builder()
+            .method(Method::GET)
+            .uri("/t")
+            .body(Body::empty())
+            .expect("req1");
+        let req2 = request_builder()
+            .method(Method::GET)
+            .uri("/t")
+            .body(Body::empty())
+            .expect("req2");
+
+        // Two independent in-flight requests, polled interleaved on one thread.
+        let mut f1 = Box::pin(service.oneshot(req1));
+        let mut f2 = Box::pin(service.oneshot(req2));
+        let mut cx = Context::from_waker(noop_waker_ref());
+
+        let mut r1 = None;
+        let mut r2 = None;
+        while r1.is_none() || r2.is_none() {
+            if r1.is_none() {
+                if let Poll::Ready(value) = f1.as_mut().poll(&mut cx) {
+                    r1 = Some(value);
+                }
+            }
+            if r2.is_none() {
+                if let Poll::Ready(value) = f2.as_mut().poll(&mut cx) {
+                    r2 = Some(value);
+                }
+            }
+        }
+
+        let resp1 = r1.unwrap().expect("resp1");
+        let resp2 = r2.unwrap().expect("resp2");
+        assert_eq!(resp1.body().as_bytes().expect("buffered"), b"shared");
+        assert_eq!(resp2.body().as_bytes().expect("buffered"), b"shared");
+    }
+
+    #[test]
+    fn with_state_supports_multiple_distinct_types() {
+        use crate::extractor::{FromRequest as _, State};
+
+        #[derive(Clone)]
+        struct First(u32);
+        #[derive(Clone)]
+        struct Second(&'static str);
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let State(first) = State::<First>::from_request(&ctx).await?;
+            let State(second) = State::<Second>::from_request(&ctx).await?;
+            Ok(format!("{}-{}", first.0, second.0))
+        }
+
+        let service = RouterService::builder()
+            .with_state(First(7))
+            .with_state(Second("hi"))
+            .get("/both", handler)
+            .build();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/both")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"7-hi");
     }
 }
