@@ -16,16 +16,23 @@ use toml_edit::{table, value, DocumentMut};
 
 use crate::args::ProvisionArgs;
 use crate::config::{
-    enforce_single_store_capability, reject_merged_id_collisions, strict_handler_paths,
-    validate_deployed_field_ownership,
+    build_typed_secret_entries, enforce_single_store_capability,
+    load_validation_context_with_options, reject_merged_id_collisions,
+    resolve_app_config_path_primitive, run_typed_preflight, strict_handler_paths,
+    validate_deployed_field_ownership, ValidationContext,
 };
 use crate::copy_tree::copy_dir_recursive;
 use crate::ensure_adapter_defined;
 use crate::path_safety::assert_provision_paths_contained;
-use edgezero_adapter::registry::{self as adapter_registry, ProvisionStores, ResolvedStoreId};
+use edgezero_adapter::registry::{
+    self as adapter_registry, ProvisionOutcome, ProvisionStores, ResolvedStoreId, TypedSecretEntry,
+};
 use edgezero_adapter::AdapterDeployedState;
+use edgezero_core::app_config::{self, AppConfigLoadOptions, AppConfigMeta};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestAdapter, ManifestLoader, StoreDeclaration};
+use serde::de::DeserializeOwned;
+use validator::Validate;
 
 /// Owned counterpart to the borrowed `ProvisionStores<'_>`. Used by
 /// dispatch arms that need to build resolved store ids per-root
@@ -86,6 +93,17 @@ fn run_manifest_shape_gates(manifest: &Manifest, adapter_name: &str) -> Result<(
     Ok(())
 }
 
+/// Resolve the project root that hosts the manifest file. Returns
+/// `.` when the manifest path has an empty parent (bare
+/// `--manifest edgezero.toml`), matching `run_with_staging`'s
+/// project-relative expectations.
+fn manifest_root_from(manifest_path: &Path) -> &Path {
+    manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// # Errors
 ///
 /// Returns an error string if the manifest can't be loaded, the
@@ -118,11 +136,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // gating on `args.local` also preserves the existing cloud
     // fixtures where `manifest` lives at project root outside `crate`.
     if args.local {
-        let manifest_root_for_check = args
-            .manifest
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let manifest_root_for_check = manifest_root_from(&args.manifest);
         assert_provision_paths_contained(
             manifest_root_for_check,
             adapter_cfg.adapter.manifest.as_deref(),
@@ -143,11 +157,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
 
     run_manifest_shape_gates(manifest, &args.adapter)?;
 
-    let manifest_root = args
-        .manifest
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let manifest_root = manifest_root_from(&args.manifest);
 
     // Fallback to "" when [app].name is unset: today's synthesiser
     // default is a no-op so the value isn't consulted; per-adapter
@@ -229,6 +239,229 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
         )?;
     }
     Ok(())
+}
+
+/// Typed-secret companion to [`run_provision`]. Only meaningful in
+/// local mode — cloud provisioning short-circuits to the base
+/// `run_provision` (typed handling flows through vendor CLIs like
+/// `wrangler secret put` at deploy time).
+///
+/// Combines `run_provision` (base) + `Adapter::provision_typed`
+/// (secret placeholders) under a shared preflight. In dry-run,
+/// both dispatch calls execute inside a single `run_with_staging`
+/// tempdir so the typed merge sees the baseline manifest the base
+/// step wrote.
+///
+/// # Errors
+///
+/// Returns an error string if the manifest can't be loaded, the
+/// adapter isn't declared, the app-config fails validation, or any
+/// adapter dispatch reports a failure.
+#[inline]
+pub fn run_provision_typed<C>(args: &ProvisionArgs) -> Result<(), String>
+where
+    C: DeserializeOwned + Validate + AppConfigMeta,
+{
+    // Cloud: delegate. No typed writeback in cloud mode.
+    if !args.local {
+        return run_provision(args);
+    }
+
+    // 1. Validation context (env_overlay=false — provision captures
+    //    operator-typed values, not env-overridden ones).
+    let ctx = load_validation_context_with_options(&args.manifest, None, false, false)?;
+
+    // 2. Base preflight gates — must fire BEFORE any tempdir work
+    //    so dry-run can't bypass expensive-mistake protection.
+    //    Real-write inherits these from run_provision's own call
+    //    below; dry-run inlines base+typed inside staging.
+    enforce_single_store_capability(ctx.manifest(), &args.adapter)?;
+    strict_handler_paths(ctx.manifest())?;
+
+    // 3. Canonical adapter lookup (case-insensitive on the key).
+    //    Clone the canonical spelling so the borrow from
+    //    `adapter_entry` frees before later re-borrows of
+    //    `ctx.manifest()` inside the staging closure.
+    let (canonical_borrow, adapter_cfg) = ctx
+        .manifest()
+        .adapter_entry(&args.adapter)
+        .ok_or_else(|| format!("adapter `{}` not declared in manifest", args.adapter))?;
+    let canonical_adapter_name = canonical_borrow.clone();
+    let adapter_manifest_rel_owned = adapter_cfg.adapter.manifest.clone();
+    let adapter_component_owned = adapter_cfg.adapter.component.clone();
+    let adapter_crate_rel_owned = adapter_cfg.adapter.crate_path.clone();
+    let manifest_root = manifest_root_from(&args.manifest);
+
+    // 4. Path containment (mirrors run_provision's local-mode gate).
+    assert_provision_paths_contained(
+        manifest_root,
+        adapter_manifest_rel_owned.as_deref(),
+        adapter_crate_rel_owned.as_deref(),
+    )?;
+
+    // 5. Typed deserialise + non-secret validate. Reconstruct the
+    //    app-config path + app name from the manifest instead of
+    //    calling `ctx.app_config_path()` / `ctx.app_name()` — those
+    //    accessors carry a `#[cfg_attr(not(test), expect(dead_code,
+    //    ...))]` marker that would flip to `unfulfilled_lint
+    //    _expectations` the moment this lib code exercised them.
+    //    `load_validation_context_with_options` already guaranteed
+    //    `manifest.app.name` is `Some`, so `unwrap_or_default` is
+    //    load-bearing only for the impossible-shape case.
+    let manifest = ctx.manifest();
+    let app_name = manifest.app.name.clone().unwrap_or_default();
+    let app_config_path = resolve_app_config_path_primitive(None, &args.manifest, &app_name);
+    let mut opts = AppConfigLoadOptions::default();
+    opts.env_overlay = false;
+    let cfg: C =
+        app_config::deserialize_app_config_with_options::<C>(&app_config_path, &app_name, &opts)
+            .map_err(|err| format!("app config load failed: {err}"))?;
+    app_config::validate_excluding_secrets(&cfg)
+        .map_err(|err| format!("app config validation failed: {err}"))?;
+
+    // 6. Shared typed preflight (typed_secret_checks + per-adapter
+    //    validate_typed_secrets).
+    run_typed_preflight(&cfg, &ctx)?;
+
+    // 7. Build the TypedSecretEntry slice.
+    let entries = build_typed_secret_entries::<C>(&ctx)?;
+
+    // 8. Dispatch.
+    let adapter = adapter_registry::get_adapter(&canonical_adapter_name).ok_or_else(|| {
+        format!("adapter `{canonical_adapter_name}` is not registered in this build")
+    })?;
+
+    if !args.dry_run {
+        // Real-write: base then typed against the live worktree.
+        run_provision(args)?;
+        let outcome = adapter.provision_typed(
+            manifest_root,
+            adapter_manifest_rel_owned.as_deref(),
+            adapter_component_owned.as_deref(),
+            &entries,
+            adapter_registry::ProvisionMode::Local,
+            false,
+        )?;
+        for line in outcome.status_lines {
+            log::info!("{line}");
+        }
+        return Ok(());
+    }
+
+    let report = run_local_dry_run_typed(
+        adapter,
+        &ctx,
+        &canonical_adapter_name,
+        adapter_manifest_rel_owned.as_deref(),
+        adapter_component_owned.as_deref(),
+        adapter_crate_rel_owned.as_deref(),
+        args,
+        &entries,
+        manifest_root,
+    )?;
+    if !report.is_empty() {
+        log::info!("{report}");
+    }
+    Ok(())
+}
+
+/// Dry-run arm of [`run_provision_typed`]. Extracted so the parent
+/// function stays under the workspace `too_many_lines` lint. Stages
+/// a tempdir that hosts BOTH `adapter.provision` (base) AND
+/// `adapter.provision_typed` (secret placeholders) so the typed
+/// merge sees the baseline manifest the base step wrote. The report
+/// is rendered inside the closure — `staged_root` is only valid
+/// until the tempdir drops.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dry-run typed arm needs adapter, validation context, canonical name, adapter manifest / component / crate paths, args, entries, and manifest root — same distinct-arg shape as `validate_and_dispatch` above"
+)]
+fn run_local_dry_run_typed(
+    adapter: &'static dyn adapter_registry::Adapter,
+    ctx: &ValidationContext,
+    canonical_adapter_name: &str,
+    adapter_manifest_rel: Option<&str>,
+    adapter_component: Option<&str>,
+    adapter_crate_rel: Option<&str>,
+    args: &ProvisionArgs,
+    entries: &[TypedSecretEntry<'_>],
+    manifest_root: &Path,
+) -> Result<String, String> {
+    let adapter_crate_rel_path = adapter_crate_rel.map_or_else(|| Path::new("."), Path::new);
+    let deployed_state = deployed_state_for(ctx.manifest(), canonical_adapter_name);
+    let app_name = ctx.manifest().app.name.clone().unwrap_or_default();
+    let baseline_pairs = adapter.synthesise_baseline_manifest(
+        manifest_root,
+        adapter_manifest_rel,
+        adapter_component,
+        &app_name,
+        deployed_state.as_ref(),
+    )?;
+
+    let (report, _tempdir) = run_with_staging(
+        manifest_root,
+        adapter_crate_rel_path,
+        |staged_root, _staged_crate| {
+            write_baseline_to_disk(staged_root, &baseline_pairs)?;
+            adapter.validate_adapter_manifest(
+                staged_root,
+                adapter_manifest_rel,
+                adapter_component,
+            )?;
+            let owned_stores = build_stores_against(staged_root, args, adapter, ctx.manifest())?;
+            let stores = owned_stores.as_refs();
+            // Spec §"Dry-run" step 3: pass `dry_run = false` — the
+            // tempdir IS the dry-run mechanism, not the flag.
+            let base = adapter.provision(
+                staged_root,
+                adapter_manifest_rel,
+                adapter_component,
+                &stores,
+                deployed_state.as_ref(),
+                adapter_registry::ProvisionMode::Local,
+                false,
+            )?;
+            let typed = adapter.provision_typed(
+                staged_root,
+                adapter_manifest_rel,
+                adapter_component,
+                entries,
+                adapter_registry::ProvisionMode::Local,
+                false,
+            )?;
+            let combined = ProvisionOutcome {
+                status_lines: base
+                    .status_lines
+                    .into_iter()
+                    .chain(typed.status_lines)
+                    .collect(),
+                deployed: base.deployed.or(typed.deployed),
+            };
+            // Render INSIDE the closure — the allow-list builder /
+            // `default_adapter_manifest_for` both match on lowercase,
+            // so canonical (possibly mixed-case) names MUST be
+            // lowercased before dispatch.
+            let adapter_lower = canonical_adapter_name.to_ascii_lowercase();
+            let adapter_manifest_rel_or_default = adapter_manifest_rel.map_or_else(
+                || default_adapter_manifest_for(&adapter_lower).to_owned(),
+                String::from,
+            );
+            let adapter_manifest_abs = staged_root.join(&adapter_manifest_rel_or_default);
+            let allow_list = build_dry_run_allow_list(
+                manifest_root,
+                staged_root,
+                &adapter_lower,
+                &adapter_manifest_abs,
+            );
+            Ok(render_dry_run_report(
+                manifest_root,
+                staged_root,
+                &allow_list,
+                &combined,
+            ))
+        },
+    )?;
+    Ok(report)
 }
 
 /// Pair each declared id in `declaration` with its platform name
@@ -832,13 +1065,19 @@ where
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::arbitrary_source_item_ordering,
+    clippy::default_numeric_fallback,
+    reason = "test module groups items by subject (typed-provision fixtures next to their tests) rather than strict item-kind buckets; validator bounds like `length(min = 1)` fall through to the annotated field's integer type"
+)]
 mod tests {
     use super::*;
     use crate::args::ProvisionArgs;
     use crate::test_support::{manifest_guard, EnvOverride, PROVISION_MANIFEST};
     use edgezero_adapter::registry::{
-        register_adapter, Adapter, AdapterAction, ProvisionMode, ProvisionOutcome,
+        get_adapter, register_adapter, Adapter, AdapterAction, ProvisionMode, ProvisionOutcome,
     };
+    use edgezero_core::app_config::{SecretField, SecretKind};
     use std::collections::BTreeMap;
     use std::env;
     use std::fs;
@@ -847,7 +1086,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use tempfile::TempDir;
-    use validator::Validate as _;
 
     // ----- fixtures for CLI-owned first-run bootstrap synthesis -----
     //
@@ -890,6 +1128,12 @@ serve = "echo"
     // real `[adapters.<name>.deployed]` block and threaded it
     // through — not left it silently `None`.
     static RECORDED_SYNTH_DEPLOYED: Mutex<Option<AdapterDeployedState>> = Mutex::new(None);
+    // Task 29: captures the `TypedSecretEntry` slice the CLI passes
+    // into `FakeBootstrapAdapter::provision_typed`. Recorded as
+    // `(store_id, field_name, key_value)` triples because the entry
+    // itself borrows from the `ValidationContext`'s raw config; the
+    // owned form outlives the closure so tests can read it back.
+    static RECORDED_TYPED_ENTRIES: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
     static SYNTH_CALLED: AtomicBool = AtomicBool::new(false);
     static VALIDATE_SAW_FILE: AtomicBool = AtomicBool::new(false);
 
@@ -924,7 +1168,7 @@ serve = "echo"
 
     #[expect(
         clippy::missing_trait_methods,
-        reason = "the fake overrides name/deployed_fields/provision/synthesise_baseline_manifest/validate_adapter_manifest; every other trait method inherits its default (no-op or Unsupported)"
+        reason = "the fake overrides name/deployed_fields/provision/provision_typed/single_store_kinds/synthesise_baseline_manifest/validate_adapter_manifest; every other trait method inherits its default (no-op or Unsupported)"
     )]
     impl Adapter for FakeBootstrapAdapter {
         fn deployed_fields(&self) -> &'static [&'static str] {
@@ -951,6 +1195,38 @@ serve = "echo"
         ) -> Result<ProvisionOutcome, String> {
             RECORDED_DRY_RUN.store(dry_run, Ordering::SeqCst);
             Ok(ProvisionOutcome::default())
+        }
+
+        fn provision_typed(
+            &self,
+            _manifest_root: &Path,
+            _adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+            typed_secrets: &[TypedSecretEntry<'_>],
+            _mode: ProvisionMode,
+            _dry_run: bool,
+        ) -> Result<ProvisionOutcome, String> {
+            if let Ok(mut slot) = RECORDED_TYPED_ENTRIES.lock() {
+                slot.clear();
+                slot.extend(typed_secrets.iter().map(|entry| {
+                    (
+                        entry.store_id.to_owned(),
+                        entry.field_name.to_owned(),
+                        entry.key_value.to_owned(),
+                    )
+                }));
+            }
+            Ok(ProvisionOutcome::default())
+        }
+
+        fn single_store_kinds(&self) -> &'static [&'static str] {
+            // The fake advertises `secrets` as Single-capable so the
+            // Task 29 capability-gate test can drive
+            // `enforce_single_store_capability` without leaning on a
+            // real adapter's registration. Existing fake fixtures
+            // declare zero or one secret id, so this override does
+            // not regress the other test cases.
+            &["secrets"]
         }
 
         fn synthesise_baseline_manifest(
@@ -1022,6 +1298,9 @@ serve = "echo"
         RECORDED_DRY_RUN.store(false, Ordering::SeqCst);
         if let Ok(mut slot) = RECORDED_SYNTH_DEPLOYED.lock() {
             *slot = None;
+        }
+        if let Ok(mut slot) = RECORDED_TYPED_ENTRIES.lock() {
+            slot.clear();
         }
         SYNTH_CALLED.store(false, Ordering::SeqCst);
         VALIDATE_SAW_FILE.store(false, Ordering::SeqCst);
@@ -2676,6 +2955,377 @@ manifest = "crates/cf/wrangler.toml"
         assert!(
             !temp.path().parent().unwrap().join("outside.toml").exists(),
             "no file must have been written outside the root"
+        );
+    }
+
+    // ---------- run_provision_typed ----------
+    //
+    // Task 29 wires the CLI's typed-secret companion to `run_provision`.
+    // The public entry cloud-short-circuits (delegates to
+    // `run_provision`) and only performs typed-secret handling in local
+    // mode. Local mode runs the shared preflight (capability +
+    // handler-path gates) BEFORE any staging, then dispatches
+    // `provision` + `provision_typed` inside the same tempdir so the
+    // typed merge sees the baseline manifest the base step wrote.
+
+    /// Small `AppConfigMeta` fixture used across the
+    /// `run_provision_typed` tests. Mirrors the shape of production
+    /// configs: one non-secret field with a `validator` rule
+    /// (`greeting`) so the "malformed non-secret" test can trigger
+    /// `validate_excluding_secrets`, and one `#[secret]` field with
+    /// `KeyInDefault` so `build_typed_secret_entries` produces a
+    /// single entry against `[stores.secrets].default`.
+    #[derive(Debug, serde::Deserialize, serde::Serialize, validator::Validate)]
+    struct TypedTestConfig {
+        api_token: String,
+        #[validate(length(min = 1))]
+        greeting: String,
+    }
+
+    impl AppConfigMeta for TypedTestConfig {
+        const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
+            kind: SecretKind::KeyInDefault,
+            name: "api_token",
+        }];
+    }
+
+    const TYPED_APP_CONFIG: &str = r#"
+api_token = "demo_api_token"
+greeting = "hello"
+"#;
+
+    /// Manifest the local-mode typed-provision tests share. Uses the
+    /// fake adapter so `provision` + `provision_typed` are observable
+    /// via the module-scope statics. Declares a single-id secret store
+    /// so the fake's `single_store_kinds = &["secrets"]` capability
+    /// gate passes.
+    const TYPED_FAKE_MANIFEST_BODY: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.__test_bootstrap_fake__.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.__test_bootstrap_fake__.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+
+    #[test]
+    fn run_provision_typed_cloud_short_circuits_without_loading_app_config() {
+        // Cloud mode has no typed writeback (Cloudflare's `wrangler
+        // secret put` and Fastly's compute deploy handle secrets via
+        // their own flows). The typed entry point MUST short-circuit
+        // to `run_provision` BEFORE touching the app-config file —
+        // otherwise a cloud call with a missing <app>.toml would fail
+        // where it never used to.
+        //
+        // Fixture: valid edgezero.toml, deliberately NO `demo-app.toml`.
+        // Cloud short-circuit = Ok. A regression that loaded the typed
+        // config unconditionally would surface as an "io" / "not
+        // found" error naming `demo-app.toml`.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        assert!(
+            !temp.path().join("demo-app.toml").exists(),
+            "pre-condition: no <app>.toml"
+        );
+
+        run_provision_typed::<TypedTestConfig>(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: false,
+            local: false,
+            manifest: manifest_path.clone(),
+        })
+        .expect("cloud short-circuit must succeed without touching <app>.toml");
+    }
+
+    #[test]
+    fn run_provision_typed_local_fails_loud_on_malformed_app_config() {
+        // Local mode runs `validate_excluding_secrets` on the typed
+        // config. A validator-rejected NON-secret value must surface
+        // as our fn's wrapped `app config validation failed: …` error.
+        // (Secret fields skip validators here; the check is in the
+        // shared `run_typed_preflight` typed_secret_checks that we
+        // gate on separately.)
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, TYPED_FAKE_MANIFEST_BODY).expect("write manifest");
+        // `greeting = ""` violates `#[validate(length(min = 1))]` on
+        // TypedTestConfig; `api_token` is non-empty so
+        // typed_secret_checks would pass on its own.
+        let malformed_app_config = "api_token = \"tok\"\ngreeting = \"\"\n";
+        fs::write(temp.path().join("demo-app.toml"), malformed_app_config)
+            .expect("write app config");
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+
+        let err = run_provision_typed::<TypedTestConfig>(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("malformed non-secret value must be rejected");
+        assert!(
+            err.contains("app config validation failed"),
+            "error must be the wrapped validator failure: {err}"
+        );
+    }
+
+    #[test]
+    fn run_provision_typed_local_builds_typed_secret_entries_from_raw_table() {
+        // The public typed entry point must feed adapters a slice of
+        // `TypedSecretEntry` values derived from the raw app-config
+        // table via `build_typed_secret_entries`. This test locks the
+        // raw-table → `TypedSecretEntry` translation end-to-end: the
+        // fake's `provision_typed` captures the slice, and we assert
+        // (store_id, field_name, key_value) matches what the fixture
+        // wrote.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, TYPED_FAKE_MANIFEST_BODY).expect("write manifest");
+        fs::write(temp.path().join("demo-app.toml"), TYPED_APP_CONFIG).expect("write app config");
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+
+        run_provision_typed::<TypedTestConfig>(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: false,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("typed real-write path must succeed with the fake adapter");
+
+        let recorded = RECORDED_TYPED_ENTRIES
+            .lock()
+            .expect("recorded typed entries lock")
+            .clone();
+        assert_eq!(
+            recorded,
+            vec![(
+                "default".to_owned(),
+                "api_token".to_owned(),
+                "demo_api_token".to_owned()
+            )],
+            "typed secret entry must map (default store, api_token field, demo_api_token key): {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn run_provision_typed_local_dry_run_runs_capability_preflight() {
+        // The capability gate MUST fire BEFORE any staging so dry-run
+        // can't bypass expensive-mistake protection. Fake declares
+        // `single_store_kinds = &["secrets"]`, so a manifest with two
+        // secret ids trips the gate. Assert the wording matches
+        // `enforce_single_store_capability`'s existing message and
+        // that `SYNTH_CALLED` is still false (the gate short-circuited
+        // before the tempdir + baseline synthesis fired).
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.__test_bootstrap_fake__.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.__test_bootstrap_fake__.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default", "other"]
+default = "default"
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(temp.path().join("demo-app.toml"), TYPED_APP_CONFIG).expect("write app config");
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+
+        let err = run_provision_typed::<TypedTestConfig>(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("capability gate must reject multi-id declaration");
+        assert!(
+            err.contains("Single-capable for secrets"),
+            "error must match `enforce_single_store_capability`: {err}"
+        );
+        assert!(
+            !SYNTH_CALLED.load(Ordering::SeqCst),
+            "capability gate must fire BEFORE staging (synth not called)"
+        );
+    }
+
+    #[test]
+    fn run_provision_typed_local_dry_run_runs_handler_paths_preflight() {
+        // Symmetric to the capability-gate test but for
+        // `strict_handler_paths`. A malformed trigger handler must
+        // reject BEFORE the tempdir + synthesis fire. Uses the fake
+        // adapter so we can observe `SYNTH_CALLED` staying false.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        reset_fake_state();
+        register_adapter(&FAKE_ADAPTER);
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.__test_bootstrap_fake__.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.__test_bootstrap_fake__.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+
+[[triggers.http]]
+path = "/"
+methods = ["GET"]
+handler = "not a valid path"
+adapters = ["__test_bootstrap_fake__"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(temp.path().join("demo-app.toml"), TYPED_APP_CONFIG).expect("write app config");
+        fs::create_dir_all(temp.path().join("crates/spin")).expect("create adapter crate dir");
+
+        let err = run_provision_typed::<TypedTestConfig>(&ProvisionArgs {
+            adapter: "__test_bootstrap_fake__".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect_err("handler-path gate must reject malformed handler");
+        assert!(
+            err.contains("handler") && err.contains("Rust path"),
+            "error must match `strict_handler_paths`: {err}"
+        );
+        assert!(
+            !SYNTH_CALLED.load(Ordering::SeqCst),
+            "handler-path gate must fire BEFORE staging (synth not called)"
+        );
+    }
+
+    #[test]
+    fn run_provision_typed_local_dry_run_handles_case_preserving_adapter_key() {
+        // The allow-list builder / `default_adapter_manifest_for` both
+        // match on lowercase — the CLI MUST lowercase the canonical
+        // adapter name (as spelled in `[adapters.<name>]`) before
+        // dispatch, or nested paths like `.edgezero/.env` would never
+        // appear in the dry-run diff for a manifest that spells the
+        // adapter with a leading capital.
+        //
+        // Fixture: `[adapters.Axum]` mixed case (canonical returned
+        // from `adapter_entry("axum")` = "Axum"). If our code fails to
+        // lowercase, the axum arm in `build_dry_run_allow_list` misses,
+        // the allow-list stays empty, and `.edgezero/.env` never
+        // appears in the rendered diff. Asserting the report contains
+        // the `--- ` header for `.edgezero/.env` proves the lowercase
+        // step happened. Call `run_local_dry_run_typed` directly (not
+        // `run_provision_typed`) so the report is inspectable — the
+        // public entry only `log::info!`s it.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.Axum.adapter]
+crate = "crates/demo-axum"
+
+[adapters.Axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+        fs::write(temp.path().join("demo-app.toml"), TYPED_APP_CONFIG).expect("write app config");
+        fs::create_dir_all(temp.path().join("crates/demo-axum")).expect("create adapter crate dir");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        let args = ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: true,
+            local: true,
+            manifest: manifest_path.clone(),
+        };
+
+        // First: prove the public entry point returns Ok end-to-end.
+        run_provision_typed::<TypedTestConfig>(&args)
+            .expect("typed dry-run must succeed with a mixed-case adapter key");
+
+        // Second: re-run the dry-run helper directly so we can inspect
+        // the rendered report. Reconstruct the same context the public
+        // fn built — this is the CLI's own private path and the test
+        // module is in the same crate.
+        let ctx = load_validation_context_with_options(&args.manifest, None, false, false)
+            .expect("load validation context");
+        let (canonical_borrow, adapter_cfg) = ctx
+            .manifest()
+            .adapter_entry(&args.adapter)
+            .expect("adapter_entry lookup");
+        assert_eq!(
+            canonical_borrow, "Axum",
+            "sentinel: canonical spelling stays mixed-case"
+        );
+        let canonical_name = canonical_borrow.clone();
+        let adapter_manifest_rel = adapter_cfg.adapter.manifest.clone();
+        let adapter_component = adapter_cfg.adapter.component.clone();
+        let adapter_crate_rel = adapter_cfg.adapter.crate_path.clone();
+        let adapter = get_adapter(&canonical_name).expect("registry lookup case-insensitive");
+        let entries = build_typed_secret_entries::<TypedTestConfig>(&ctx)
+            .expect("build typed secret entries");
+        let manifest_root = manifest_root_from(&args.manifest);
+        let report = run_local_dry_run_typed(
+            adapter,
+            &ctx,
+            &canonical_name,
+            adapter_manifest_rel.as_deref(),
+            adapter_component.as_deref(),
+            adapter_crate_rel.as_deref(),
+            &args,
+            &entries,
+            manifest_root,
+        )
+        .expect("dry-run helper must succeed");
+
+        assert!(
+            report.contains("--- "),
+            "diff section must be present (allow-list arm matched via lowercase): {report}"
+        );
+        assert!(
+            report.contains(".edgezero/.env"),
+            "axum's `.edgezero/.env` file must appear in the diff: {report}"
         );
     }
 }

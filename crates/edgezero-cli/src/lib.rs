@@ -56,7 +56,7 @@ pub use config::{
     run_config_validate_typed, DiffExit,
 };
 #[cfg(feature = "cli")]
-pub use provision::run_provision;
+pub use provision::{run_provision, run_provision_typed};
 
 #[cfg(feature = "cli")]
 use args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
