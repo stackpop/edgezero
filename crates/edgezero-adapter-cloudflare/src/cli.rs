@@ -3318,4 +3318,264 @@ id = "00112233445566778899aabbccddeeff"
             "exactly one demo_api_token line remains: {dev_vars}"
         );
     }
+
+    // ---------- provision_local_ contract suite (spec §"Per-adapter test contract") ----------
+
+    /// A wrangler shim that fails loudly if invoked. Used by
+    /// `provision_local_zero_cloud_calls` to prove local-mode
+    /// provision never shells out to the real Cloudflare CLI:
+    /// if provision returns `Ok(_)` with THIS script on PATH,
+    /// the shim was NEVER called.
+    #[cfg(unix)]
+    fn fake_wrangler_panicking() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script_path = dir.path().join("wrangler");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\necho 'wrangler was called during local provision' >&2\nexit 42\n",
+        )
+        .expect("write fake wrangler");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        dir
+    }
+
+    #[test]
+    fn provision_local_first_run_writes_expected_files() {
+        // First-run fixture: empty crate dir, no wrangler.toml, no
+        // .dev.vars. The CLI's bootstrap layer (Task 8b's
+        // `write_baseline_to_disk`) normally primes wrangler.toml via
+        // `synthesise_baseline_manifest` BEFORE provision runs; this
+        // test mirrors that step directly, then calls
+        // `provision(Local)` on the seed.
+        //
+        // Contract: `wrangler.toml` lands at the resolved path;
+        // `.dev.vars` lands next to it; BOTH files carry the
+        // `# edgezero-provision: v1` schema header (Section 5 review
+        // fix); wrangler.toml has a `[[kv_namespaces]]` entry bound to
+        // `sessions`; `.dev.vars` has the __NAME overlay line.
+        let dir = tempdir().expect("tempdir");
+        let wrangler_path = dir.path().join("wrangler.toml");
+        fs::write(&wrangler_path, synthesise_wrangler_toml("demo"))
+            .expect("bootstrap wrangler.toml");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first-run local provision succeeds");
+        assert!(
+            wrangler_path.exists(),
+            "wrangler.toml exists at resolved path"
+        );
+        let dev_vars_path = dir.path().join(".dev.vars");
+        assert!(
+            dev_vars_path.exists(),
+            ".dev.vars lands next to wrangler.toml: {}",
+            dev_vars_path.display()
+        );
+        let wrangler = fs::read_to_string(&wrangler_path).expect("read wrangler.toml");
+        assert!(
+            wrangler.starts_with(EDGEZERO_PROVISION_HEADER),
+            "wrangler.toml starts with schema header: {wrangler}"
+        );
+        assert!(
+            wrangler.contains("[[kv_namespaces]]"),
+            "wrangler.toml has [[kv_namespaces]]: {wrangler}"
+        );
+        assert!(
+            wrangler.contains("binding = \"sessions\""),
+            "wrangler.toml binds `sessions`: {wrangler}"
+        );
+        let dev_vars = fs::read_to_string(&dev_vars_path).expect("read .dev.vars");
+        assert!(
+            dev_vars.starts_with(EDGEZERO_PROVISION_HEADER),
+            ".dev.vars starts with schema header: {dev_vars}"
+        );
+        assert!(
+            dev_vars.contains(r#"EDGEZERO__STORES__KV__SESSIONS__NAME="sessions""#),
+            ".dev.vars carries the __NAME overlay: {dev_vars}"
+        );
+    }
+
+    #[test]
+    fn provision_local_re_provision_is_byte_identical() {
+        // Re-running provision on an already-provisioned fixture must
+        // produce byte-identical wrangler.toml and .dev.vars — the
+        // second run is a no-op at the file level. Any drift here
+        // (rewriting a differently-formatted TOML, re-appending the
+        // header, appending a duplicate __NAME line) would surface as
+        // a byte mismatch.
+        let dir = tempdir().expect("tempdir");
+        let wrangler_path = dir.path().join("wrangler.toml");
+        fs::write(&wrangler_path, synthesise_wrangler_toml("demo"))
+            .expect("bootstrap wrangler.toml");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first local provision succeeds");
+        let dev_vars_path = dir.path().join(".dev.vars");
+        let wrangler_first = fs::read(&wrangler_path).expect("read wrangler.toml (first run)");
+        let dev_vars_first = fs::read(&dev_vars_path).expect("read .dev.vars (first run)");
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("second local provision succeeds");
+        let wrangler_second = fs::read(&wrangler_path).expect("read wrangler.toml (second run)");
+        let dev_vars_second = fs::read(&dev_vars_path).expect("read .dev.vars (second run)");
+        assert_eq!(
+            wrangler_first, wrangler_second,
+            "wrangler.toml must be byte-identical across two provision runs"
+        );
+        assert_eq!(
+            dev_vars_first, dev_vars_second,
+            ".dev.vars must be byte-identical across two provision runs"
+        );
+    }
+
+    #[test]
+    fn provision_local_push_after_provision_preserves_dev_vars_secret_value() {
+        // First run seeds `SECRET_KEY=""` (empty placeholder) into
+        // `.dev.vars`. The operator hand-edits the file to
+        // `SECRET_KEY="real_value_operator_set"`. A subsequent
+        // `provision_typed` MUST NOT overwrite the operator's value
+        // with the empty placeholder — append_lines_dedup collapses
+        // commented + uncommented forms by normalised key, so the
+        // uncommented real value survives byte-for-byte.
+        let dir = tempdir().expect("tempdir");
+        let entries = [TypedSecretEntry::new(
+            TEST_SECRET_ID,
+            "api_token",
+            "SECRET_KEY",
+        )];
+        CloudflareCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first provision_typed writes empty placeholder");
+        let dev_vars_path = dir.path().join(".dev.vars");
+        let first = fs::read_to_string(&dev_vars_path).expect("read .dev.vars (first run)");
+        assert!(
+            first.contains(r#"SECRET_KEY="""#),
+            "empty placeholder present after first run: {first}"
+        );
+        // Simulate the operator's hand-edit. Rewrite just the
+        // SECRET_KEY line; everything else stays as provision wrote it.
+        let edited = first.replace(
+            r#"SECRET_KEY="""#,
+            r#"SECRET_KEY="real_value_operator_set""#,
+        );
+        assert_ne!(edited, first, "operator edit actually mutated the file");
+        fs::write(&dev_vars_path, &edited).expect("operator hand-edit");
+        CloudflareCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("re-run provision_typed after operator edit");
+        let after = fs::read_to_string(&dev_vars_path).expect("read .dev.vars (second run)");
+        assert!(
+            after.contains(r#"SECRET_KEY="real_value_operator_set""#),
+            "operator's value survives byte-for-byte: {after}"
+        );
+        assert!(
+            !after.contains(r#"SECRET_KEY="""#),
+            "empty placeholder must NOT be re-appended: {after}"
+        );
+        // Exactly one SECRET_KEY line remains after dedup.
+        let key_lines = after
+            .lines()
+            .filter(|line| {
+                let after_hash = line.trim_start().strip_prefix('#').unwrap_or(line);
+                after_hash.trim_start().starts_with("SECRET_KEY=")
+            })
+            .count();
+        assert_eq!(
+            key_lines, 1,
+            "exactly one SECRET_KEY line remains after dedup: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provision_local_zero_cloud_calls() {
+        // Install a panicking `wrangler` shim on PATH: if ever
+        // invoked, it prints to stderr and exits 42, which surfaces
+        // as an `Err` out of any `Command::new("wrangler").output()`
+        // caller. `provision(Local)` MUST NOT shell out — it operates
+        // purely on local files (wrangler.toml + .dev.vars). A
+        // successful `Ok(_)` here is the proof: had a regression
+        // routed Local through a shell-out path, the shim would have
+        // failed loudly instead.
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let wrangler_path = dir.path().join("wrangler.toml");
+        fs::write(&wrangler_path, synthesise_wrangler_toml("demo"))
+            .expect("bootstrap wrangler.toml");
+        let fake = fake_wrangler_panicking();
+        let _path = PathPrepend::new(fake.path());
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let secret_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_SECRET_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision must not shell out to wrangler");
+    }
 }
