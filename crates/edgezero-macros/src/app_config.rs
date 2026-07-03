@@ -3,7 +3,7 @@
 //! Scans the input struct for `#[secret]` / `#[secret(store_ref)]`
 //! field annotations, enforces the compile-time constraints, and
 //! emits `impl ::edgezero_core::app_config::AppConfigMeta` with the
-//! `SECRET_FIELDS` array.
+//! `secret_fields()` method.
 
 use std::collections::{HashMap, HashSet};
 
@@ -53,7 +53,7 @@ struct NestedDescriptor<'field> {
 }
 
 /// Inspect the input struct, emit `impl AppConfigMeta` with the
-/// `SECRET_FIELDS` array. Errors surface as `compile_error!` tokens
+/// `secret_fields()` method. Errors surface as `compile_error!` tokens
 /// substituted in place of the impl.
 #[inline]
 pub fn derive(tokens: TokenStream) -> TokenStream {
@@ -381,14 +381,27 @@ fn nested_optin(field: &Field) -> syn::Result<bool> {
         if !attr.path().is_ident("app_config") {
             continue;
         }
+        // Track whether THIS attribute actually named `nested`. A bare
+        // `#[app_config]` / empty `#[app_config()]` parses Ok with the closure
+        // never firing; without this guard it would leave `found` false and the
+        // field would be silently NOT recursed, dropping the child's secrets.
+        let mut this_attr_nested = false;
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("nested") {
-                found = true;
+                this_attr_nested = true;
                 Ok(())
             } else {
                 Err(meta.error("`#[app_config(...)]` only accepts `nested`"))
             }
         })?;
+        if !this_attr_nested {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "`#[app_config]` requires an option; the only supported one is \
+                 `nested` (e.g. `#[app_config(nested)]`)",
+            ));
+        }
+        found = true;
     }
     Ok(found)
 }
@@ -530,13 +543,14 @@ fn enforce_no_disallowed_serde_attrs_on_all_fields(
     Ok(())
 }
 
-/// Container-level guard: a struct that carries any `#[secret]` field
-/// must not also carry `#[serde(rename_all = ...)]`. The derive emits
-/// `SECRET_FIELDS` with Rust field names verbatim, but `rename_all`
-/// would translate the on-the-wire key name (e.g. `kebab-case` →
-/// `api-token`), silently desyncing the typed `config validate` secret
-/// checks from what the deserialiser actually accepts. Reject this at
-/// compile time so the desync can't ship.
+/// Container-level guard: a struct that carries any `#[secret]` field or
+/// any `#[app_config(nested)]` child must not also carry
+/// `#[serde(rename_all = ...)]`. The derive emits `secret_fields()` paths
+/// with Rust field names verbatim, but `rename_all` would translate the
+/// on-the-wire key name (e.g. `kebab-case` → `api-token`), silently
+/// desyncing the typed `config validate` secret checks from what the
+/// deserialiser actually accepts. Reject this at compile time so the
+/// desync can't ship.
 fn enforce_no_container_rename_all(attrs: &[Attribute]) -> Result<(), syn::Error> {
     for attr in attrs {
         if !attr.path().is_ident("serde") {
@@ -552,7 +566,7 @@ fn enforce_no_container_rename_all(attrs: &[Attribute]) -> Result<(), syn::Error
         if offending {
             return Err(syn::Error::new_spanned(
                 attr,
-                "`#[derive(AppConfig)]` rejects `#[serde(rename_all = ...)]` on structs with `#[secret]` fields: SECRET_FIELDS uses Rust field names verbatim, so a container rename would silently desync `config validate` from runtime deserialisation",
+                "`#[derive(AppConfig)]` rejects `#[serde(rename_all = ...)]` on structs with `#[secret]` fields or `#[app_config(nested)]` children: secret_fields() uses Rust field names verbatim, so a container rename would silently desync `config validate` from runtime deserialisation",
             ));
         }
     }
@@ -584,7 +598,7 @@ fn enforce_no_disallowed_serde_attrs(field: &Field) -> Result<(), syn::Error> {
                     "skip_serializing" => Some("skip_serializing"),
                     // `skip_serializing_if = "..."` also omits the
                     // field from round-trips (config push reads
-                    // SECRET_FIELDS, then serialises the typed
+                    // secret_fields(), then serialises the typed
                     // struct), so reject it alongside the
                     // unconditional skip family.
                     "skip_serializing_if" => Some("skip_serializing_if"),
