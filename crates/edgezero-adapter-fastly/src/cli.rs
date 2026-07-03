@@ -4672,4 +4672,306 @@ build = \"cargo build --release\"
             assert_eq!(doc["service_id"].as_str(), Some(sid), "input: {sid:?}");
         }
     }
+
+    // ---------- Section 9: provision_local_* contract suite ----------
+    //
+    // Cross-adapter contract for `provision(mode=Local)`. Mirrors the
+    // Cloudflare/Spin/Axum suites so the four adapters share a single
+    // observable specification: the first run writes an expected set
+    // of files, re-provision is byte-identical, operator hand-edits to
+    // sibling entries survive a subsequent write, and Local mode never
+    // shells out to the platform CLI.
+    //
+    // Test #5 (additive merge of a new store into the existing
+    // `edgezero_runtime_env` block) is already covered by
+    // `fastly_local_provision_additively_merges_new_stores_into_existing_runtime_env`
+    // above — not re-implemented here to avoid duplicate coverage.
+
+    /// A shell script named `fastly` that exits non-zero and prints an
+    /// unambiguous diagnostic to stderr — installed on `$PATH` to
+    /// detect any (forbidden) invocation of the platform CLI during a
+    /// Local-mode provision. Any call fails the test with `exit 42`.
+    #[cfg(unix)]
+    fn fake_fastly_panicking() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let script = dir.path().join("fastly");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho 'fastly was called during local provision' >&2\nexit 42\n",
+        )
+        .expect("write fake fastly");
+        let mut perms = fs::metadata(&script).expect("stat").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("chmod +x");
+        dir
+    }
+
+    /// Section 9.1 — First run: empty fixture with one KV and one
+    /// CONFIG store yields a `fastly.toml` with the edgezero-provision
+    /// header, per-kind `[local_server.*_stores.*]` blocks in their
+    /// expected shape, and an `edgezero_runtime_env.contents`
+    /// sub-table populated with `__NAME` lines for every declared
+    /// store. `contents` MUST remain a TABLE (spec regression guard).
+    #[test]
+    fn provision_local_first_run_writes_expected_files() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds");
+        assert!(
+            path.exists(),
+            "fastly.toml exists after first-run provision"
+        );
+        let after = fs::read_to_string(&path).expect("read");
+        assert!(
+            after.starts_with("# edgezero-provision: v1"),
+            "manifest starts with edgezero-provision header: {after}"
+        );
+        // KV: array-of-tables with the stub row.
+        assert!(
+            after.contains("[[local_server.kv_stores.sessions]]"),
+            "kv block present: {after}"
+        );
+        assert!(
+            after.contains(r#"key = "__init__""#),
+            "kv stub key present: {after}"
+        );
+        assert!(
+            after.contains(r#"data = """#),
+            "kv stub data present: {after}"
+        );
+        // CONFIG: table block with `format = "inline-toml"` plus an
+        // empty `contents` SUB-TABLE (never `contents = ""`).
+        assert!(
+            after.contains("[local_server.config_stores.app_config]"),
+            "config-store block header present: {after}"
+        );
+        assert!(
+            after.contains(r#"format = "inline-toml""#),
+            "config-store format key present: {after}"
+        );
+        assert!(
+            after.contains("[local_server.config_stores.app_config.contents]"),
+            "config-store contents sub-table header present: {after}"
+        );
+        assert!(
+            !after.contains(r#"contents = """#),
+            "contents MUST NOT be an empty string (spec regression guard): {after}"
+        );
+        // Runtime-env: __NAME line for every declared store.
+        assert!(
+            after.contains("[local_server.config_stores.edgezero_runtime_env.contents]"),
+            "runtime-env contents sub-table header present: {after}"
+        );
+        assert!(
+            after.contains(r#"EDGEZERO__STORES__KV__SESSIONS__NAME = "sessions""#),
+            "KV __NAME line: {after}"
+        );
+        assert!(
+            after.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME = "app_config""#),
+            "CONFIG __NAME line: {after}"
+        );
+        // Re-parse to confirm both `contents` slots are tables (the
+        // shape Viceroy + `config push --local` expect).
+        let doc: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        assert!(
+            doc["local_server"]["config_stores"]["app_config"]["contents"]
+                .as_table()
+                .is_some(),
+            "app_config.contents parses as a table"
+        );
+        assert!(
+            doc["local_server"]["config_stores"]["edgezero_runtime_env"]["contents"]
+                .as_table()
+                .is_some(),
+            "edgezero_runtime_env.contents parses as a table"
+        );
+    }
+
+    /// Section 9.2 — Re-provision must be byte-identical. This is the
+    /// operator's contract that `provision --adapter fastly` is safe
+    /// to re-run: no drift in whitespace, no reordering, no re-emit of
+    /// entries that were already present.
+    #[test]
+    fn provision_local_re_provision_is_byte_identical() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("first provision succeeds");
+        let after_first = fs::read_to_string(&path).expect("read after first");
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("second provision succeeds");
+        let after_second = fs::read_to_string(&path).expect("read after second");
+        assert_eq!(
+            after_first, after_second,
+            "second provision is byte-identical to the first"
+        );
+    }
+
+    /// Section 9.3 — Fastly-specific: after the base `fastly.toml` is
+    /// provisioned and the operator hand-edits a
+    /// `[[local_server.secret_stores.default]]` entry with a custom
+    /// `env` mapping, a subsequent `provision_typed` call that adds a
+    /// DIFFERENT key must land the new entry as a sibling in the same
+    /// array-of-tables — WITHOUT rewriting the operator's `env`
+    /// mapping on the pre-existing row (idempotent-append semantics).
+    ///
+    /// Fastly is the only adapter where the operator maps a secret
+    /// store `key` to an OS env var via the `env` field; the writer
+    /// MUST NOT clobber that mapping when appending new keys.
+    #[test]
+    fn provision_local_push_after_provision_preserves_local_server_secret_stores_entry() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // Base manifest + the operator's hand-edited entry. The
+        // operator maps their secret's local `key = "custom_key"` to
+        // the real-world OS env var `REAL_ENV_MAPPING` — an override
+        // that must survive future writer runs.
+        let mut seed = synthesise_fastly_toml("demo", None);
+        seed.push_str(
+            "\n[[local_server.secret_stores.default]]\nkey = \"custom_key\"\nenv = \"REAL_ENV_MAPPING\"\n",
+        );
+        fs::write(&path, &seed).expect("write");
+        // A new secret arrives — a DIFFERENT key under the same store.
+        let entries = [TypedSecretEntry::new(
+            "default",
+            "api_token",
+            "different_key",
+        )];
+        FastlyCliAdapter
+            .provision_typed(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &entries,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision_typed succeeds");
+        let after = fs::read_to_string(&path).expect("read");
+        // Operator's exact env mapping survives byte-for-byte.
+        assert!(
+            after.contains(r#"env = "REAL_ENV_MAPPING""#),
+            "operator's `env = \"REAL_ENV_MAPPING\"` mapping preserved verbatim: {after}"
+        );
+        assert!(
+            after.contains(r#"key = "custom_key""#),
+            "operator's original key row still present: {after}"
+        );
+        // The new entry lands as a sibling row with the default
+        // key→env uppercasing.
+        assert!(
+            after.contains(r#"key = "different_key""#),
+            "new key row appended: {after}"
+        );
+        assert!(
+            after.contains(r#"env = "DIFFERENT_KEY""#),
+            "new entry defaults to `env = \"<KEY_UPPER>\"`: {after}"
+        );
+        // Re-parse: the array-of-tables now holds both rows, with the
+        // operator's row untouched.
+        let doc: toml_edit::DocumentMut = after.parse().expect("re-parse");
+        let arr = doc["local_server"]["secret_stores"]["default"]
+            .as_array_of_tables()
+            .expect("default is array-of-tables");
+        assert_eq!(arr.len(), 2, "two sibling entries after append: {after}");
+        let custom = arr
+            .iter()
+            .find(|tbl| tbl.get("key").and_then(|item| item.as_str()) == Some("custom_key"))
+            .expect("custom_key row present");
+        assert_eq!(
+            custom.get("env").and_then(|item| item.as_str()),
+            Some("REAL_ENV_MAPPING"),
+            "custom_key row's env mapping locked to the operator's value"
+        );
+        let different = arr
+            .iter()
+            .find(|tbl| tbl.get("key").and_then(|item| item.as_str()) == Some("different_key"))
+            .expect("different_key row present");
+        assert_eq!(
+            different.get("env").and_then(|item| item.as_str()),
+            Some("DIFFERENT_KEY"),
+            "different_key row's env defaults to KEY_UPPER"
+        );
+    }
+
+    /// Section 9.4 — Zero cloud calls. Local-mode provision is a pure
+    /// file writer; it must NEVER shell out to `fastly`. Install
+    /// `fake_fastly_panicking()` (a script that exits 42 on any call)
+    /// on `$PATH` before invoking provision. If provision ever calls
+    /// the platform CLI, the fake short-circuits and the invocation
+    /// bubbles up as an error — so `Ok(...)` is the load-bearing
+    /// signal that no cloud call happened.
+    #[cfg(unix)]
+    #[test]
+    fn provision_local_zero_cloud_calls() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let fake = fake_fastly_panicking();
+        let _path = PathPrepend::new(fake.path());
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(&path, synthesise_fastly_toml("demo", None)).expect("write");
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let config_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_CONFIG_ID]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("local provision succeeds with a panicking fake fastly on PATH");
+    }
 }
