@@ -378,6 +378,20 @@ fn register_ctor() {
     register();
 }
 
+// Shared process-wide mutex serialising PATH-mutating tests across every
+// submodule test suite in this crate. Tests in `provision_local`, `provision_cloud`,
+// and `push_cloud` all install shell shims via `PathPrepend` and would otherwise
+// race on the environment variable.
+#[cfg(all(test, unix))]
+use std::sync::Mutex as PathMutationMutex;
+
+#[cfg(all(test, unix))]
+pub(crate) fn path_mutation_guard() -> &'static PathMutationMutex<()> {
+    use std::sync::OnceLock;
+    static GUARD: OnceLock<PathMutationMutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| PathMutationMutex::new(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

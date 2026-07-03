@@ -414,6 +414,8 @@ fn upsert_kv_namespace_entry(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::path_mutation_guard;
     use super::super::run::synthesise_wrangler_toml;
     use super::super::CloudflareCliAdapter;
     use super::*;
@@ -427,8 +429,6 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::path::PathBuf;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     const TEST_KV_ID: &str = "sessions";
@@ -466,13 +466,6 @@ mod tests {
                 None => env::remove_var("PATH"),
             }
         }
-    }
-
-    #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     /// A wrangler shim that fails loudly if invoked. Used by

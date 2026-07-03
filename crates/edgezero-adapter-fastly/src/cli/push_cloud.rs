@@ -419,6 +419,8 @@ fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::path_mutation_guard;
     use super::super::FastlyCliAdapter;
     use super::*;
     use edgezero_adapter::registry::{Adapter as _, AdapterPushContext};
@@ -430,8 +432,6 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::path::Path;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     // Shared fixture names.
@@ -470,15 +470,6 @@ mod tests {
                 None => env::remove_var("PATH"),
             }
         }
-    }
-
-    /// Process-wide mutex serialising PATH-mutating tests so parallel
-    /// test threads don't race on the environment variable.
-    #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     /// Build a tempdir containing a `fastly` shim script that:

@@ -318,6 +318,8 @@ pub(super) fn find_namespace_id(wrangler_path: &Path, binding: &str) -> Result<S
 // against the parsed namespace id).
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::path_mutation_guard;
     use super::super::CloudflareCliAdapter;
     use super::*;
     use edgezero_adapter::registry::{
@@ -329,8 +331,6 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     const TEST_KV_ID: &str = "sessions";
@@ -395,13 +395,6 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod +x");
         dir
-    }
-
-    #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     fn write_wrangler(dir: &Path, contents: &str) -> PathBuf {

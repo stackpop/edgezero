@@ -306,6 +306,8 @@ pub(super) fn read_wrangler_kv_key(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::path_mutation_guard;
     use super::super::CloudflareCliAdapter;
     use super::*;
     use edgezero_adapter::registry::{
@@ -316,8 +318,6 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::path::PathBuf;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     const TEST_CONFIG_ID: &str = "app_config";
@@ -395,13 +395,6 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod +x");
         dir
-    }
-
-    #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     fn write_wrangler(dir: &Path, contents: &str) -> PathBuf {

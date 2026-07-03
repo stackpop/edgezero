@@ -514,6 +514,8 @@ pub(super) fn write_fastly_local_config_store(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::path_mutation_guard;
     use super::super::run::synthesise_fastly_toml;
     use super::super::FastlyCliAdapter;
     use super::*;
@@ -524,8 +526,6 @@ mod tests {
     use std::env;
     #[cfg(unix)]
     use std::ffi::OsString;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     // Shared fixture names. Pinning these as consts (instead of
@@ -570,15 +570,6 @@ mod tests {
                 None => env::remove_var("PATH"),
             }
         }
-    }
-
-    /// Process-wide mutex serialising PATH-mutating tests so parallel
-    /// test threads don't race on the environment variable.
-    #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
     }
 
     /// A shell script named `fastly` that exits non-zero and prints an
