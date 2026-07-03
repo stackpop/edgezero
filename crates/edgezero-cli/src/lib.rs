@@ -32,6 +32,8 @@ mod demo_server;
 #[cfg(feature = "cli")]
 mod diff;
 #[cfg(feature = "cli")]
+mod env_file;
+#[cfg(feature = "cli")]
 mod generator;
 #[cfg(feature = "cli")]
 mod path_safety;
@@ -61,13 +63,13 @@ pub use provision::{run_provision, run_provision_typed};
 #[cfg(feature = "cli")]
 use args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
 #[cfg(feature = "cli")]
-use edgezero_core::manifest::ManifestLoader;
+use edgezero_core::manifest::{Manifest, ManifestLoader};
 #[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
 use std::io::ErrorKind;
 #[cfg(feature = "cli")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI output logger: prints `record.args()` verbatim with no
 /// timestamps, levels, or module prefixes — the CLI's output IS
@@ -183,12 +185,62 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
 pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+
+    // Adapter-scoped env-file load: `axum` reads `.edgezero/.env`,
+    // `spin` reads `<crate>/.env`. `cloudflare` and `fastly` read
+    // their own files (`.dev.vars`, `[local_server.*]`) via their
+    // emulators and need no CLI-side help.
+    if let Some(loader) = manifest.as_ref() {
+        if let Some(root) = loader.manifest().root() {
+            if let Some(env_path) = resolve_serve_env_file(loader.manifest(), &args.adapter, root) {
+                if env_path.exists() {
+                    env_file::load_into_process_env(&env_path)?;
+                }
+            }
+        }
+    }
+
     adapter::execute(
         &args.adapter,
         adapter::Action::Serve,
         manifest.as_ref(),
         &[],
     )
+}
+
+/// Return the `.env` file `run_serve` should pre-load into the
+/// process environment for the selected adapter, or `None` if the
+/// adapter reads its env file directly (cloudflare, fastly) or the
+/// adapter is unknown.
+///
+/// `axum` maps to `<manifest_root>/.edgezero/.env` (Task 27's
+/// writer target). `spin` maps to `<crate>/.env` where `<crate>` is
+/// the `[adapters.spin.adapter] crate = "..."` sub-path joined with
+/// `manifest_root` (Task 25's writer target); a missing `crate`
+/// falls back to `manifest_root`.
+///
+/// The adapter name is matched case-insensitively so `--adapter Spin`
+/// or `SPIN` resolves the same as `spin`.
+#[cfg(feature = "cli")]
+fn resolve_serve_env_file(
+    manifest: &Manifest,
+    adapter_name: &str,
+    manifest_root: &Path,
+) -> Option<PathBuf> {
+    let adapter_lower = adapter_name.to_ascii_lowercase();
+    match adapter_lower.as_str() {
+        "axum" => Some(manifest_root.join(".edgezero").join(".env")),
+        "spin" => {
+            let (_key, adapter_cfg) = manifest.adapter_entry(adapter_name)?;
+            let crate_dir = adapter_cfg
+                .adapter
+                .crate_path
+                .as_deref()
+                .map_or_else(|| manifest_root.to_path_buf(), |cp| manifest_root.join(cp));
+            Some(crate_dir.join(".env"))
+        }
+        _ => None,
+    }
 }
 
 /// Create a new `EdgeZero` app skeleton.
@@ -296,6 +348,32 @@ mod tests {
     use edgezero_core::manifest::ManifestLoader;
     use std::fs;
     use tempfile::TempDir;
+
+    const SPIN_MANIFEST_LOWER: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+
+    const SPIN_MANIFEST_MIXED_CASE: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.Spin.adapter]
+crate = "crates/spin"
+
+[adapters.Spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
 
     #[test]
     fn load_manifest_optional_hard_errors_when_explicit_env_path_missing() {
@@ -463,5 +541,111 @@ ids = ["MY_SECRETS"]
     fn store_bindings_message_is_absent_without_secret_store() {
         let loader = ManifestLoader::load_from_str("[app]\nname = \"x\"\n");
         assert!(store_bindings_message("fastly", &loader).is_none());
+    }
+
+    #[test]
+    fn resolve_serve_env_file_axum_returns_dot_edgezero_dot_env() {
+        // axum's `.env` lives under `<manifest_root>/.edgezero/.env`
+        // — the target Task 27's line writer produces.
+        let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
+        let root = PathBuf::from("/tmp/proj");
+        let resolved = resolve_serve_env_file(loader.manifest(), "axum", &root)
+            .expect("axum arm returns Some");
+        assert_eq!(resolved, root.join(".edgezero").join(".env"));
+    }
+
+    #[test]
+    fn resolve_serve_env_file_spin_returns_spin_crate_dot_env() {
+        // spin's `.env` lives under `<spin_crate>/.env` — the target
+        // Task 25's line writer produces.
+        let loader = ManifestLoader::load_from_str(SPIN_MANIFEST_LOWER);
+        let root = PathBuf::from("/tmp/proj");
+        let resolved = resolve_serve_env_file(loader.manifest(), "spin", &root)
+            .expect("spin arm returns Some");
+        assert_eq!(resolved, root.join("crates/spin").join(".env"));
+    }
+
+    #[test]
+    fn resolve_serve_env_file_cloudflare_returns_none() {
+        // Wrangler reads `.dev.vars` itself; run_serve does not touch it.
+        let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
+        let root = PathBuf::from("/tmp/proj");
+        assert!(resolve_serve_env_file(loader.manifest(), "cloudflare", &root).is_none());
+    }
+
+    #[test]
+    fn resolve_serve_env_file_fastly_returns_none() {
+        // Fastly's emulator reads `[local_server.*]` blocks in
+        // `fastly.toml`; run_serve does not touch it.
+        let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
+        let root = PathBuf::from("/tmp/proj");
+        assert!(resolve_serve_env_file(loader.manifest(), "fastly", &root).is_none());
+    }
+
+    #[test]
+    fn resolve_serve_env_file_adapter_name_is_case_insensitive() {
+        // Manifest declares `[adapters.Spin]` (mixed case). Passing
+        // `--adapter spin` (or SPIN) must still resolve to the Spin
+        // arm's `<crate>/.env` — the arm lowercases once and matches
+        // on the lowercase form.
+        let loader = ManifestLoader::load_from_str(SPIN_MANIFEST_MIXED_CASE);
+        let root = PathBuf::from("/tmp/proj");
+        let expected = root.join("crates/spin").join(".env");
+        assert_eq!(
+            resolve_serve_env_file(loader.manifest(), "spin", &root),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            resolve_serve_env_file(loader.manifest(), "SPIN", &root),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn load_into_process_env_reads_key_equals_value_lines() {
+        // Process-env is global; serialise with the manifest guard
+        // (which every other env-mutating test in this module already
+        // uses) and rely on EnvOverride::remove's Drop to restore any
+        // prior value the parent shell may have set.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _foo = EnvOverride::remove("EDGEZERO_TEST_ENV_LOAD_FOO");
+        let _baz = EnvOverride::remove("EDGEZERO_TEST_ENV_LOAD_BAZ");
+        let temp = TempDir::new().expect("temp dir");
+        let env_path = temp.path().join(".env");
+        fs::write(
+            &env_path,
+            "EDGEZERO_TEST_ENV_LOAD_FOO=bar\n\
+             # comment line -- ignored\n\
+             \n\
+             EDGEZERO_TEST_ENV_LOAD_BAZ=\"quoted value\"\n\
+             malformed line without equals sign\n",
+        )
+        .expect("write env file");
+        env_file::load_into_process_env(&env_path).expect("load ok");
+        assert_eq!(
+            env::var("EDGEZERO_TEST_ENV_LOAD_FOO").ok().as_deref(),
+            Some("bar")
+        );
+        assert_eq!(
+            env::var("EDGEZERO_TEST_ENV_LOAD_BAZ").ok().as_deref(),
+            Some("quoted value")
+        );
+    }
+
+    #[test]
+    fn load_into_process_env_existing_env_wins() {
+        // Pre-set the key to a caller value; a `.env` line with the
+        // same key must NOT overwrite it. The `.env` file supplies
+        // defaults; the caller's env is the source of truth.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _keep = EnvOverride::set("EDGEZERO_TEST_ENV_LOAD_KEEP", "caller_value");
+        let temp = TempDir::new().expect("temp dir");
+        let env_path = temp.path().join(".env");
+        fs::write(&env_path, "EDGEZERO_TEST_ENV_LOAD_KEEP=file_value\n").expect("write env file");
+        env_file::load_into_process_env(&env_path).expect("load ok");
+        assert_eq!(
+            env::var("EDGEZERO_TEST_ENV_LOAD_KEEP").ok().as_deref(),
+            Some("caller_value")
+        );
     }
 }
