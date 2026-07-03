@@ -170,43 +170,35 @@ pub async fn handle_auction(
 
 ### 3.2 Router plumbing
 
-> **Implemented design (simpler than this sketch):** rather than a `Vec` of
-> type-erased closures, `RouterBuilder`/`RouterInner` hold a single
-> `state_extensions: crate::http::Extensions` bag. `with_state<T>` calls
-> `self.state_extensions.insert(value)` and dispatch calls
-> `request.extensions_mut().extend(self.state_extensions.clone())` after the
-> introspection inserts — same `Clone + Send + Sync + 'static` bound, same
-> last-write-wins-by-`TypeId`, no closure/vtable machinery. The sketch below is
-> the original idea; the shipped code (router.rs) uses the `Extensions` bag.
+> **Note:** an earlier draft used a `Vec` of type-erased closures
+> (`StateInserter = Arc<dyn Fn(&mut Extensions)>`). The shipped design below is
+> simpler — a single `Extensions` bag — with the same `Clone + Send + Sync +
+> 'static` bound and last-write-wins-by-`TypeId` semantics, and no closure/vtable
+> machinery.
 
-Add to `RouterBuilder` a list of type-erased inserters and thread them into `RouterInner`:
+Store the registered state in an `Extensions` bag on `RouterBuilder` and thread it into `RouterInner`:
 
 ```rust
-type StateInserter = Arc<dyn Fn(&mut http::Extensions) + Send + Sync>;
-
 #[derive(Default)]
 pub struct RouterBuilder {
     // ... existing fields ...
-    state_inserters: Vec<StateInserter>,
+    state_extensions: crate::http::Extensions,
 }
 
 pub fn with_state<T>(mut self, value: T) -> Self
 where T: Clone + Send + Sync + 'static {
-    self.state_inserters.push(Arc::new(move |ext: &mut http::Extensions| {
-        ext.insert(value.clone());
-    }));
+    self.state_extensions.insert(value);
     self
 }
 ```
 
-In `RouterInner::dispatch`, apply inserters to the owned request **before** building the context:
+In `RouterInner::dispatch`, extend the owned request's extensions with the state bag **before** building the context:
 
 ```rust
 RouteMatch::Found(entry, params) => {
     let mut request = request;
-    for inserter in &self.state_inserters {
-        inserter(request.extensions_mut());
-    }
+    // ... introspection inserts (manifest/routes) run first ...
+    request.extensions_mut().extend(self.state_extensions.clone());
     let ctx = RequestContext::new(request, params);
     let next = Next::new(&self.middlewares, entry.handler.as_ref());
     next.run(ctx).await
@@ -214,9 +206,9 @@ RouteMatch::Found(entry, params) => {
 ```
 
 Notes:
-- `RouterInner` gains a `state_inserters: Vec<StateInserter>` field; `RouterService::new` takes it from the builder.
-- Insertion happens **after** the adapter has already inserted the store registries into the same extensions map (different `TypeId`s, no collision). If an app ever registers a `T` that an adapter also inserts, last-write-wins and the router runs last — document this; it is not expected in practice.
-- Cost is one `Arc` clone (or one `T::clone`) per registered state per request — negligible for `Arc<AppState>`.
+- `RouterInner` gains a `state_extensions: Extensions` field; `RouterService::new` takes it from the builder.
+- Insertion happens **after** the introspection inserts into the same extensions map (different `TypeId`s, no collision). `Extensions::extend` is last-write-wins by `TypeId`, and the router runs last — document this; a `T` collision with an adapter/introspection value is not expected in practice.
+- Cost is one `Extensions::clone` (which clones each registered `T`) per request — negligible for `Arc<AppState>` (a refcount bump per entry).
 - The route-listing internal handler and middleware are unaffected.
 
 ### 3.3 Naming decision (needs maintainer sign-off)
@@ -335,7 +327,7 @@ Replace the top-level-only loop with a **path navigator**:
 
 ### 4.5 CLI touchpoints (`edgezero-cli`)
 
-`run_config_validate_typed` / `run_config_push_typed` / `run_config_diff_typed` reflect over `SECRET_FIELDS` (now paths) to know which fields hold key-names vs. values. Update those reflections to walk paths. `build_config_envelope` is unchanged (it serializes the typed struct verbatim; secret leaves already hold key names at push time). Verify the Spin lowercase-secret-name collision check still operates over the new path metadata.
+`run_config_validate_typed` / `run_config_push_typed` / `run_config_diff_typed` reflect over `secret_fields()` (now paths) to know which fields hold key-names vs. values. Update those reflections to walk paths. `build_config_envelope` is unchanged (it serializes the typed struct verbatim; secret leaves already hold key names at push time). Verify the Spin lowercase-secret-name collision check still operates over the new path metadata.
 
 ### 4.6 Backward compatibility
 
@@ -390,7 +382,7 @@ Replace the top-level-only loop with a **path navigator**:
 ## 7. Files to touch (edgezero repo)
 
 **Workstream A**
-- `crates/edgezero-core/src/router.rs` — `RouterBuilder::with_state`, `RouterInner.state_inserters`, dispatch insertion (before `RequestContext::new`, alongside the introspection injects from PR #300).
+- `crates/edgezero-core/src/router.rs` — `RouterBuilder::with_state`, `RouterInner.state_extensions` (an `Extensions` bag), dispatch `extend` (before `RequestContext::new`, alongside the introspection injects from PR #300).
 - `crates/edgezero-core/src/extractor.rs` — `State<T>` extractor (+ `Deref`/`DerefMut`/`into_inner`). Making `State` `pub` here is sufficient; **no `lib.rs` crate-root re-export** (§8 [A, minor] — no extractor is re-exported at the crate root today; consumers use `edgezero_core::extractor::State`).
 - `docs/guide/handlers.md`.
 

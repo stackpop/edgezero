@@ -13,14 +13,13 @@ mod tests {
     }
 
     // The `#[secret]`-annotated fields below are exercised only via the
-    // `SECRET_FIELDS` associated constant the derive emits — Rust still
-    // counts them as "never read", so silence the dead-code lint at the
-    // struct level.
+    // `secret_fields()` method the derive emits — Rust still counts them
+    // as "never read", so silence the dead-code lint at the struct level.
     #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
     #[serde(deny_unknown_fields)]
     #[expect(
         dead_code,
-        reason = "fields exist only to feed `#[derive(AppConfig)]`; the SECRET_FIELDS array reads them via the derive, not via Rust field access"
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; secret_fields() reads them via the derive, not via Rust field access"
     )]
     struct ConfigKeyInDefault {
         _greeting: String,
@@ -32,7 +31,7 @@ mod tests {
     #[serde(deny_unknown_fields)]
     #[expect(
         dead_code,
-        reason = "fields exist only to feed `#[derive(AppConfig)]`; the SECRET_FIELDS array reads them via the derive, not via Rust field access"
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; secret_fields() reads them via the derive, not via Rust field access"
     )]
     struct ConfigStoreRef {
         _greeting: String,
@@ -44,7 +43,7 @@ mod tests {
     #[serde(deny_unknown_fields)]
     #[expect(
         dead_code,
-        reason = "fields exist only to feed `#[derive(AppConfig)]`; the SECRET_FIELDS array reads them via the derive, not via Rust field access"
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; secret_fields() reads them via the derive, not via Rust field access"
     )]
     struct ConfigBothKinds {
         _greeting: String,
@@ -58,7 +57,7 @@ mod tests {
     #[serde(deny_unknown_fields)]
     #[expect(
         dead_code,
-        reason = "fields exist only to feed `#[derive(AppConfig)]`; the SECRET_FIELDS array reads them via the derive, not via Rust field access"
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; secret_fields() reads them via the derive, not via Rust field access"
     )]
     struct ConfigKeyInNamedStore {
         #[secret(store_ref = "vault")]
