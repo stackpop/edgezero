@@ -9,7 +9,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
-use edgezero_adapter::env_file::append_lines_dedup;
+use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
@@ -378,8 +378,13 @@ impl Adapter for CloudflareCliAdapter {
             .iter()
             .map(|entry| format!(r#"{}="""#, entry.key_value))
             .collect();
-        append_lines_dedup(&dev_vars_path, &lines, dry_run)
-            .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
+        append_lines_dedup_with_header(
+            &dev_vars_path,
+            Some(EDGEZERO_PROVISION_HEADER),
+            &lines,
+            dry_run,
+        )
+        .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
         let status_lines = vec![format!(
             "cloudflare: wrote {} secret placeholders to {}",
             typed_secrets.len(),
@@ -1042,8 +1047,13 @@ fn provision_local(
         .unwrap_or(manifest_root)
         .join(".dev.vars");
     let dev_vars_lines = build_dev_vars_lines(stores);
-    append_lines_dedup(&dev_vars_path, &dev_vars_lines, dry_run)
-        .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
+    append_lines_dedup_with_header(
+        &dev_vars_path,
+        Some(EDGEZERO_PROVISION_HEADER),
+        &dev_vars_lines,
+        dry_run,
+    )
+    .map_err(|err| format!("write {}: {err}", dev_vars_path.display()))?;
     status_lines.push(format!(
         "cloudflare: wrote {} .dev.vars entries to {}",
         dev_vars_lines.len(),

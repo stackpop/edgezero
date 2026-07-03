@@ -8,6 +8,13 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
+/// Schema-version header prepended to every provision-written
+/// line-oriented file (`.env`, `.dev.vars`). Matches the header
+/// synthesised TOML files (`wrangler.toml`, `fastly.toml`,
+/// `spin.toml`, `runtime-config.toml`) carry. Kept as a single
+/// crate-level constant so a future spec bump touches one line.
+pub const EDGEZERO_PROVISION_HEADER: &str = "# edgezero-provision: v1";
+
 /// Append each `<key>=<value>` line iff its normalised key does
 /// NOT already appear in the file (commented OR uncommented).
 /// Existing lines are preserved byte-for-byte. Creates the file
@@ -19,12 +26,45 @@ use std::path::Path;
 /// fails.
 #[inline]
 pub fn append_lines_dedup(path: &Path, new_lines: &[String], dry_run: bool) -> Result<(), String> {
+    append_lines_dedup_with_header(path, None, new_lines, dry_run)
+}
+
+/// Same as [`append_lines_dedup`], but also ensures the file's first
+/// content line is `header`. When `Some(hdr)` and the existing file
+/// does not already contain a trimmed line matching `hdr`, the header
+/// is prepended to the write output. Matches the spec's schema-
+/// version-header contract: each provision-written line-oriented
+/// file starts with `# edgezero-provision: v1` (or the equivalent
+/// version comment), and re-provision does not duplicate it.
+///
+/// The header is compared to existing lines via trimmed-equality —
+/// `normalised_key` returns `None` for comment-only lines like the
+/// header, so the ordinary dedup path can't self-check it.
+///
+/// # Errors
+/// Same as [`append_lines_dedup`].
+#[inline]
+pub fn append_lines_dedup_with_header(
+    path: &Path,
+    header: Option<&str>,
+    new_lines: &[String],
+    dry_run: bool,
+) -> Result<(), String> {
     let mut existing = String::new();
     if path.exists() {
         existing =
             fs::read_to_string(path).map_err(|err| format!("read {}: {err}", path.display()))?;
     }
     let existing_keys: BTreeSet<String> = existing.lines().filter_map(normalised_key).collect();
+
+    // Header decision: prepend only when the caller asked for one AND
+    // the existing file has no trimmed-equal line already. Empty files
+    // ("" plus absent) count as "no header present" so a fresh
+    // provision writes it.
+    let header_needed = header.filter(|hdr| {
+        let trimmed_hdr = hdr.trim();
+        !existing.lines().any(|line| line.trim() == trimmed_hdr)
+    });
 
     let mut to_append = String::new();
     for line in new_lines {
@@ -39,7 +79,10 @@ pub fn append_lines_dedup(path: &Path, new_lines: &[String], dry_run: bool) -> R
             to_append.push('\n');
         }
     }
-    if to_append.is_empty() || dry_run {
+
+    // Nothing to do when there are neither new dedup'd lines nor a
+    // missing header to prepend. `dry_run` short-circuits any write.
+    if (to_append.is_empty() && header_needed.is_none()) || dry_run {
         return Ok(());
     }
     if let Some(parent) = path.parent() {
@@ -48,7 +91,15 @@ pub fn append_lines_dedup(path: &Path, new_lines: &[String], dry_run: bool) -> R
                 .map_err(|err| format!("create {}: {err}", parent.display()))?;
         }
     }
-    let mut combined = existing;
+
+    let mut combined = String::new();
+    if let Some(hdr) = header_needed {
+        combined.push_str(hdr);
+        if !hdr.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+    combined.push_str(&existing);
     if !combined.is_empty() && !combined.ends_with('\n') {
         combined.push('\n');
     }
@@ -166,5 +217,106 @@ mod tests {
         append_lines_dedup(&path, &["NEW=x".to_owned()], false).unwrap();
         assert!(path.exists());
         assert_eq!(fs::read_to_string(&path).unwrap(), "NEW=x\n");
+    }
+
+    #[test]
+    fn header_is_prepended_on_first_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        append_lines_dedup_with_header(
+            &path,
+            Some("# edgezero-provision: v1"),
+            &["AAA=1".to_owned()],
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.starts_with("# edgezero-provision: v1"),
+            "header must be first line: {after}"
+        );
+        assert!(after.contains("AAA=1"));
+    }
+
+    #[test]
+    fn header_is_not_reprepended_when_already_present() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(&path, "# edgezero-provision: v1\nAAA=existing\n").unwrap();
+        append_lines_dedup_with_header(
+            &path,
+            Some("# edgezero-provision: v1"),
+            &["BBB=NEW".to_owned()],
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        let header_count = after
+            .lines()
+            .filter(|line| line.trim() == "# edgezero-provision: v1")
+            .count();
+        assert_eq!(header_count, 1, "header must appear exactly once: {after}");
+        assert!(after.contains("AAA=existing"));
+        assert!(after.contains("BBB=NEW"));
+    }
+
+    #[test]
+    fn header_is_prepended_when_operator_file_has_no_header() {
+        // Operator wrote the file by hand before provision ever ran;
+        // a subsequent provision must prepend the header.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(&path, "AAA=operator_set\n").unwrap();
+        append_lines_dedup_with_header(
+            &path,
+            Some("# edgezero-provision: v1"),
+            &["BBB=NEW".to_owned()],
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.starts_with("# edgezero-provision: v1"),
+            "header must be prepended above operator content: {after}"
+        );
+        assert!(after.contains("AAA=operator_set"));
+        assert!(after.contains("BBB=NEW"));
+    }
+
+    #[test]
+    fn header_matches_ignore_leading_and_trailing_whitespace() {
+        // If the operator hand-indented the header, we still count
+        // it as present and don't add a second one.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        fs::write(&path, "  # edgezero-provision: v1  \nAAA=x\n").unwrap();
+        append_lines_dedup_with_header(
+            &path,
+            Some("# edgezero-provision: v1"),
+            &["BBB=x".to_owned()],
+            false,
+        )
+        .unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        let header_count = after
+            .lines()
+            .filter(|line| line.trim() == "# edgezero-provision: v1")
+            .count();
+        assert_eq!(header_count, 1, "trim-equality must dedup: {after}");
+    }
+
+    #[test]
+    fn header_dry_run_does_not_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        // File missing entirely — dry-run must NOT create it.
+        append_lines_dedup_with_header(
+            &path,
+            Some("# edgezero-provision: v1"),
+            &["AAA=x".to_owned()],
+            true,
+        )
+        .unwrap();
+        assert!(!path.exists(), "dry-run must not create file");
     }
 }

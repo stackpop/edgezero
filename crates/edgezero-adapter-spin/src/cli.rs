@@ -16,7 +16,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
-use edgezero_adapter::env_file::append_lines_dedup;
+use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
@@ -1192,7 +1192,7 @@ fn provision_local(
         .map_err(|err| format!("failed to parse {}: {err}", rc_path.display()))?;
     let mut rc_changed = false;
     for store in stores.kv.iter().chain(stores.config.iter()) {
-        if append_key_value_store_block(&mut rc_doc, &store.platform) {
+        if append_key_value_store_block(&mut rc_doc, &store.platform)? {
             rc_changed = true;
         }
     }
@@ -1211,8 +1211,13 @@ fn provision_local(
         fs::write(&rc_path, rc_doc.to_string())
             .map_err(|err| format!("failed to write {}: {err}", rc_path.display()))?;
     }
-    append_lines_dedup(&env_path, &env_lines, dry_run)
-        .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+    append_lines_dedup_with_header(
+        &env_path,
+        Some(EDGEZERO_PROVISION_HEADER),
+        &env_lines,
+        dry_run,
+    )
+    .map_err(|err| format!("write {}: {err}", env_path.display()))?;
 
     let total = stores
         .kv
@@ -1353,8 +1358,13 @@ fn provision_typed_local(
         fs::write(&spin_path, spin_doc.to_string())
             .map_err(|err| format!("failed to write {}: {err}", spin_path.display()))?;
     }
-    append_lines_dedup(&env_path, &env_lines, dry_run)
-        .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+    append_lines_dedup_with_header(
+        &env_path,
+        Some(EDGEZERO_PROVISION_HEADER),
+        &env_lines,
+        dry_run,
+    )
+    .map_err(|err| format!("write {}: {err}", env_path.display()))?;
 
     Ok(ProvisionOutcome {
         status_lines,
@@ -1506,7 +1516,10 @@ fn append_kv_store_to_component(
 /// The parent `[key_value_store]` table is set implicit so
 /// `toml_edit` emits only `[key_value_store.<platform>]` section
 /// headers, matching the shape `spin up` reads.
-fn append_key_value_store_block(doc: &mut toml_edit::DocumentMut, platform: &str) -> bool {
+fn append_key_value_store_block(
+    doc: &mut toml_edit::DocumentMut,
+    platform: &str,
+) -> Result<bool, String> {
     use toml_edit::{value, Item, Table};
 
     // Fast-path idempotency check: if a stanza for this platform
@@ -1516,7 +1529,7 @@ fn append_key_value_store_block(doc: &mut toml_edit::DocumentMut, platform: &str
         .and_then(toml_edit::Item::as_table)
         .is_some_and(|tbl| tbl.contains_key(platform))
     {
-        return false;
+        return Ok(false);
     }
 
     let parent = doc.entry("key_value_store").or_insert_with(|| {
@@ -1524,18 +1537,24 @@ fn append_key_value_store_block(doc: &mut toml_edit::DocumentMut, platform: &str
         parent_tbl.set_implicit(true);
         Item::Table(parent_tbl)
     });
+    // `key_value_store` exists but is not a table (e.g. the file has
+    // `key_value_store = "oops"`). Refuse to edit — mirrors the
+    // "refusing to edit malformed local state" pattern the Fastly and
+    // Cloudflare local arms use. Silently returning `Ok(false)` here
+    // would let the caller write `spin.toml` with a
+    // `key_value_stores = ["<platform>"]` binding that
+    // `runtime-config.toml` never declares, leaving the runtime
+    // unable to resolve the store at boot.
     let Some(parent_tbl) = parent.as_table_mut() else {
-        // `key_value_store` exists but is not a table -- extremely
-        // unlikely in a Spin-managed runtime-config.toml. Return
-        // false so the caller sees "nothing changed" rather than
-        // clobbering a malformed file.
-        return false;
+        return Err(format!(
+            "runtime-config.toml: `key_value_store` exists but is not a table; refusing to edit in place (offending platform: `{platform}`)"
+        ));
     };
     let mut inner = Table::new();
     inner.insert("type", value("spin"));
     inner.insert("path", value(".spin/sqlite_key_value.db"));
     parent_tbl.insert(platform, Item::Table(inner));
-    true
+    Ok(true)
 }
 
 /// Build the `.env` line set emitted by [`provision_local`].
@@ -3576,6 +3595,62 @@ mod tests {
         assert!(
             err.contains("runtime-config.toml"),
             "error names runtime-config.toml specifically: {err}"
+        );
+    }
+
+    #[test]
+    fn spin_local_provision_errors_when_runtime_config_key_value_store_is_not_a_table() {
+        // Regression: if runtime-config.toml declares
+        // `key_value_store = "oops"` (a scalar instead of a table),
+        // `append_key_value_store_block` used to return `false`
+        // silently — the caller then wrote spin.toml with a
+        // `key_value_stores = ["sessions"]` binding that pointed at a
+        // store label runtime-config.toml never declared. Spin would
+        // fail to boot with a confusing lookup error. Now it errors
+        // at provision time, matching the "refusing to edit malformed
+        // local state" pattern the other adapters use.
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("spin.toml"),
+            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+        )
+        .expect("seed spin.toml");
+        // Malformed runtime-config.toml: scalar where a table
+        // (or absence) is expected.
+        fs::write(
+            dir.path().join("runtime-config.toml"),
+            "# edgezero-provision: v1\nkey_value_store = \"oops\"\n",
+        )
+        .expect("seed malformed runtime-config.toml");
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        let err = SpinCliAdapter
+            .provision(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect_err("malformed key_value_store must error");
+        assert!(
+            err.contains("key_value_store") && err.contains("not a table"),
+            "error must name the malformed field and its shape: {err}"
+        );
+        // Sibling `spin.toml` and `.env` must NOT be written on the
+        // error path — otherwise we'd corrupt the tree even if we
+        // errored.
+        let spin_after = fs::read_to_string(dir.path().join("spin.toml")).expect("read spin.toml");
+        assert!(
+            !spin_after.contains(&format!("\"{TEST_KV_ID}\"")),
+            "spin.toml must NOT list the KV binding when provision errored: {spin_after}"
         );
     }
 

@@ -10,7 +10,7 @@ use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
-use edgezero_adapter::env_file::append_lines_dedup;
+use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
     ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
@@ -237,7 +237,7 @@ impl Adapter for AxumCliAdapter {
             .iter()
             .map(|entry| format!("{}=", entry.key_value))
             .collect();
-        append_lines_dedup(&env_path, &lines, dry_run)
+        append_lines_dedup_with_header(&env_path, Some(EDGEZERO_PROVISION_HEADER), &lines, dry_run)
             .map_err(|err| format!("write {}: {err}", env_path.display()))?;
         let status_lines = vec![format!(
             "axum: wrote {} secret placeholders to {}",
@@ -759,8 +759,13 @@ fn provision_local(
     }
     let env_path = dot_edgezero.join(".env");
     let env_lines = build_axum_env_lines(stores);
-    append_lines_dedup(&env_path, &env_lines, dry_run)
-        .map_err(|err| format!("write {}: {err}", env_path.display()))?;
+    append_lines_dedup_with_header(
+        &env_path,
+        Some(EDGEZERO_PROVISION_HEADER),
+        &env_lines,
+        dry_run,
+    )
+    .map_err(|err| format!("write {}: {err}", env_path.display()))?;
     let status_lines = vec![format!(
         "axum: ensured {} + appended {} .env lines",
         dot_edgezero.display(),
