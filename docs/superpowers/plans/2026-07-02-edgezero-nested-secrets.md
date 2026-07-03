@@ -1372,7 +1372,10 @@ mod tests {
         let file = syn::parse_file(src).expect("parse");
         let mut collector = AppConfigStructCollector::default();
         syn::visit::visit_file(&mut collector, &file);
-        let mut visitor = NestedAppConfigVisitor::new(&collector.app_config_structs, std::path::Path::new("t.rs"));
+        // NB: `new(source_path, app_config_structs)` — path FIRST, per the
+        // real signature at check_no_nested_app_config.rs:127.
+        let mut visitor =
+            NestedAppConfigVisitor::new(std::path::Path::new("t.rs"), &collector.app_config_structs);
         syn::visit::visit_file(&mut visitor, &file);
         visitor.violations
     }
@@ -1430,16 +1433,21 @@ In `NestedAppConfigVisitor::visit_item_struct` (`check_no_nested_app_config.rs:1
 // malformed `#[app_config(...)]` before this binary ever runs.
 fn field_has_nested_optin(field: &syn::Field) -> bool {
     field.attrs.iter().any(|attr| {
-        attr.path().is_ident("app_config")
-            && attr
-                .parse_nested_meta(|meta| {
-                    if meta.path.is_ident("nested") {
-                        Ok(())
-                    } else {
-                        Err(meta.error("unknown app_config option"))
-                    }
-                })
-                .is_ok()
+        if !attr.path().is_ident("app_config") {
+            return false;
+        }
+        // Must actually see `nested`. A bare `#[app_config()]` parses Ok but
+        // never sets `found`, so `.is_ok()` alone would wrongly report opt-in.
+        let mut found = false;
+        let parsed = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("nested") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown app_config option"))
+            }
+        });
+        parsed.is_ok() && found
     })
 }
 ```
@@ -1583,10 +1591,11 @@ api_key = ""
     }
 
     #[test]
-    fn validate_typed_reports_dotted_path_for_missing_nested_leaf() {
-        // integrations.datadome table present but server_side_key missing.
-        // (Note: serde deny_unknown_fields + required String means this also
-        //  fails deserialization; assert the dotted path appears either way.)
+    fn validate_typed_rejects_missing_required_nested_leaf_at_deserialize() {
+        // A MISSING required nested leaf fails serde DESERIALIZATION
+        // (config.rs:207) before `typed_secret_checks`/`run_adapter_typed_checks`
+        // ever run — so this is deserialize-path coverage, NOT proof of the
+        // path-aware collector. The direct collector test below covers that.
         let app_config = r#"
 [integrations.datadome]
 
@@ -1599,6 +1608,63 @@ api_key = "p0"
         assert!(
             err.contains("server_side_key"),
             "error names the missing nested leaf: {err}"
+        );
+    }
+
+    // Direct coverage of the path-aware TOML collector (the new logic).
+    // Bypasses `run_config_validate_typed` so deserialization does not preempt
+    // it — proves the collector itself resolves array indices and reports the
+    // dotted label for a present-but-invalid / missing leaf.
+    #[test]
+    fn collect_secret_leaves_resolves_array_indices_and_dotted_labels() {
+        let raw: toml::Value = r#"
+[[partners]]
+api_key = "p0"
+
+[[partners]]
+api_key = "p1"
+"#
+        .parse()
+        .expect("toml");
+
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(std::borrow::Cow::Borrowed("partners")),
+                SecretPathSegment::ArrayEach,
+                SecretPathSegment::Field(std::borrow::Cow::Borrowed("api_key")),
+            ],
+            optional: false,
+        };
+        let leaves = collect_secret_leaves(&raw, &field).expect("collect");
+        let labels: Vec<&str> = leaves.iter().map(|leaf| leaf.label.as_str()).collect();
+        assert_eq!(labels, vec!["partners[0].api_key", "partners[1].api_key"]);
+        let values: Vec<&str> = leaves.iter().map(|leaf| leaf.value).collect();
+        assert_eq!(values, vec!["p0", "p1"]);
+    }
+
+    #[test]
+    fn collect_secret_leaves_errors_on_missing_required_leaf_with_dotted_label() {
+        let raw: toml::Value = r#"
+[integrations.datadome]
+other = "x"
+"#
+        .parse()
+        .expect("toml");
+
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(std::borrow::Cow::Borrowed("integrations")),
+                SecretPathSegment::Field(std::borrow::Cow::Borrowed("datadome")),
+                SecretPathSegment::Field(std::borrow::Cow::Borrowed("server_side_key")),
+            ],
+            optional: false,
+        };
+        let err = collect_secret_leaves(&raw, &field).expect_err("missing required leaf");
+        assert!(
+            err.contains("integrations.datadome.server_side_key"),
+            "collector error names the dotted path: {err}"
         );
     }
 ```
@@ -1869,3 +1935,11 @@ git commit -m "test(secrets): end-to-end nested + named-store resolution; docs: 
 - **Array pruning all-secret success:** added `validate_excluding_secrets_prunes_array_all_secret_failures_to_ok`, proving an array branch whose every element's only failure is the secret leaf collapses to `Ok(())` (the `items.retain(..)`/`items.is_empty()` path), complementing the sibling-survives test (Task 3).
 - **Task 6 CLI tests made concrete:** replaced the pseudo-code with real tests driven through the public `run_config_validate_typed::<C>` entry point using the existing `setup_project`/`args_for` harness (`config.rs:1662/1671`) and real nested `#[derive(AppConfig)]` fixtures — with concrete TOML, `partners[1].api_key` indexed-label assertion, missing-leaf assertion, and the nested `KeyInNamedStore` case (Task 6 Step 1).
 - **Removed the obsolete pruning sketch:** Task 3 Step 3 now shows a single `prune_secret_leaf` (the peek-next-segment form); the earlier draft referencing the undefined `list_children_mut` is deleted.
+
+## Review round 4 — fixes folded in
+
+- **`field_has_nested_optin` false-positive on `#[app_config()]`:** the CI-guard helper checked only `parse_nested_meta(..).is_ok()`, so a bare `#[app_config()]` (no `nested`) reported opt-in. Now tracks a `found` flag and returns `parsed.is_ok() && found` (Task 5 Step 3). (The derive's `nested_optin` already did this correctly.)
+- **`NestedAppConfigVisitor::new` arg order:** the Task 5 test helper had the args reversed; the real signature is `new(source_path, app_config_structs)` (`check_no_nested_app_config.rs:127`). Fixed.
+- **Missing-nested-leaf CLI test was deserialize coverage, not collector coverage:** in `run_config_validate_typed`, serde deserialization (`config.rs:207`) runs before `typed_secret_checks`/`run_adapter_typed_checks`, so a *missing required* leaf fails deserialization first and never reaches the path collector. Retitled that test `..._rejects_missing_required_nested_leaf_at_deserialize` and added two **direct** `collect_secret_leaves` unit tests (array-index labels + missing-required-leaf dotted error) that bypass the entry point (Task 6 Step 1).
+- **State plan stale snippet:** the State extractor plan's missing-registration test used `expect_err` (needs `State<T>: Debug`); updated to `.err().expect(..)` to match the committed code.
+- **Spec §4.3 reconciled:** the B-3 note and the recursion sketch now reference `secret_fields()` (owned `Vec`) instead of child `SECRET_FIELDS` / `Cow` const shapes.

@@ -289,15 +289,19 @@ Recurse into fields whose type is itself an `AppConfig`-derived struct (or a `Ve
 - **(Recommended) Explicit opt-in attribute**, e.g. `#[app_config(nested)]` on the containing field (and `#[app_config(nested)]` on a `Vec<T>` field for array recursion). Mirrors `#[validate(nested)]`, is unambiguous, and keeps the derive purely syntactic. The sub-struct must itself derive `AppConfig` (enforced at runtime via the `AppConfigRoot` marker / a generated const assertion).
 - **(Alternative) Type-name heuristic** — recurse into any field whose type path "looks like" a struct. Rejected: brittle, silently wrong for third-party types, and can't see through aliases.
 
-With explicit opt-in, the derive emits, for each nested field, code that references the sub-struct's own `SECRET_FIELDS` and prefixes the path — so recursion composes without the parent macro needing the child's fields:
+With explicit opt-in, the derive emits, for each nested field, code that calls the sub-struct's own `secret_fields()` and prefixes the path — so recursion composes without the parent macro needing the child's fields:
 
 ```rust
-// sketch of emitted metadata for `integrations: IntegrationSettings` (#[app_config(nested)])
-// concatenate, at const-eval where possible, or via a generated fn:
-//   prefix [Field("integrations")] onto each of <IntegrationSettings as AppConfigMeta>::SECRET_FIELDS
+// emitted metadata for `integrations: IntegrationSettings` (#[app_config(nested)]):
+// for each SecretField the child returns, prepend Field("integrations") to its path.
+//   for mut f in <IntegrationSettings as AppConfigMeta>::secret_fields() {
+//       f.path.insert(0, SecretPathSegment::Field(Cow::Borrowed("integrations")));
+//       out.push(f);
+//   }
+// (a Vec<Child> field prepends Field("field"), then ArrayEach.)
 ```
 
-> Implementation note: `&'static [SecretField]` concatenation across crates is not trivial at `const` if paths must be `&'static [SecretPathSegment]`. Two viable lowerings: (a) generate a `const` block per struct that hand-builds the full flattened array literal by inlining child segments the macro can see through the opt-in type path; or (b) change `AppConfigMeta` from an associated `const` to an associated `fn secret_fields() -> Vec<SecretField>` (owned, path segments `Vec<...>`), letting recursion build owned vectors at runtime. **Recommendation:** prefer (b) — a `fn secret_fields() -> Cow<'static, [SecretField]>` — because it makes cross-crate recursion straightforward and the walk runs once per request anyway (allocation cost negligible vs. the network fetch). Flag this as **B-3** for maintainer decision, since it changes the `AppConfigMeta` trait shape.
+> **B-3 — resolved (§8).** Cross-crate `const` concatenation of `&'static [SecretPathSegment]` with a parent-prepended prefix is not expressible in stable `const` (the macro cannot see the child's segments). So `AppConfigMeta` becomes an associated **`fn secret_fields() -> Vec<SecretField>`** (owned segments), and recursion builds owned vectors at runtime — allocation cost is negligible vs. the per-request network fetch. Every in-tree `impl AppConfigMeta` / `SECRET_FIELDS` site flips to the `fn`, including the ~10 hand-rolled test impls. See the implementation plan for the concrete emission.
 
 Also relax `enforce_scalar_string_type` to additionally accept `Option<String>` on `#[secret]` fields (optional secrets are common in real config); an absent/`None` optional secret is skipped by the walk rather than erroring. Keep rejecting non-string scalar types.
 

@@ -89,8 +89,11 @@ Append to the `#[cfg(test)] mod tests` block at the end of `crates/edgezero-core
             .expect("request");
         let ctx = RequestContext::new(request, PathParams::default());
 
+        // `.err().expect(..)` (not `expect_err`) so we don't require
+        // `State<T>: Debug` — extractors here mirror Json/Path and omit it.
         let err = block_on(State::<Arc<AppStateFixture>>::from_request(&ctx))
-            .expect_err("missing state must surface as an error, not a default");
+            .err()
+            .expect("missing state must surface as an error, not a default");
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
