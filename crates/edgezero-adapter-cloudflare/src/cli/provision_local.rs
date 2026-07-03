@@ -338,7 +338,7 @@ fn build_dev_vars_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
         let logical_upper = store.logical.to_ascii_uppercase();
         let logical = &store.logical;
         lines.push(format!(
-            r#"# EDGEZERO__STORES__CONFIG__{logical_upper}__KEY="<placeholder-{logical}-key>""#
+            r#"# EDGEZERO__STORES__CONFIG__{logical_upper}__KEY="{logical}_staging""#
         ));
     }
     lines
@@ -1056,9 +1056,8 @@ mod tests {
             "CONFIG __NAME line present: {dev_vars}"
         );
         assert!(
-            dev_vars.contains(
-                r#"# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="<placeholder-app_config-key>""#
-            ),
+            dev_vars
+                .contains(r#"# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="app_config_staging""#),
             "commented CONFIG __KEY placeholder present: {dev_vars}"
         );
     }
@@ -1101,7 +1100,8 @@ mod tests {
             "operator's uncommented KEY line survives: {dev_vars}"
         );
         assert!(
-            !dev_vars.contains("<placeholder-app_config-key>"),
+            !dev_vars
+                .contains(r#"# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="app_config_staging""#),
             "commented placeholder must NOT be re-added: {dev_vars}"
         );
         // Exactly one line whose normalised key matches the KEY
