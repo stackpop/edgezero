@@ -27,5 +27,6 @@ validator = { workspace = true, features = ["derive"] }
 # users will. Cargo allows dev-dep cycles (only the main dep edge
 # matters for build ordering).
 edgezero-core = { workspace = true }
+futures = { workspace = true }
 tempfile = { workspace = true }
 trybuild = { workspace = true }

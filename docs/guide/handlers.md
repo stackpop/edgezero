@@ -214,6 +214,58 @@ async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
 | `into_request()` | `Request` - consume context, take request  |
 | `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
 
+## Sharing app state
+
+Request-derived extractors (`Json`, `Query`, `Path`, …) cover per-request data.
+For app-owned state that outlives a single request — a settings object, a
+connection registry, an orchestrator — register it once on the router and read
+it back with the `State<T>` extractor.
+
+Register the value with `RouterBuilder::with_state`. It is cloned into every
+request's extensions before dispatch, so `T` must be `Clone + Send + Sync +
+'static` — typically an `Arc<AppState>`, where the clone is a cheap refcount
+bump:
+
+```rust
+use std::sync::Arc;
+use edgezero_core::extractor::State;
+use edgezero_core::router::RouterService;
+
+#[derive(Clone)]
+struct AppState {
+    greeting: String,
+}
+
+let state = Arc::new(AppState { greeting: "hello".into() });
+
+let service = RouterService::builder()
+    .with_state(Arc::clone(&state))
+    .get("/greet", greet)
+    .build();
+```
+
+Read it in any `#[action]` handler by adding a `State<T>` argument — it composes
+with the other extractors:
+
+```rust
+use edgezero_core::action;
+use edgezero_core::error::EdgeError;
+use edgezero_core::extractor::State;
+use std::sync::Arc;
+
+#[action]
+async fn greet(
+    State(state): State<Arc<AppState>>,
+) -> Result<String, EdgeError> {
+    Ok(state.greeting.clone())
+}
+```
+
+Register different types independently (`with_state(a).with_state(b)`); each is
+resolved by its own type. Registering the same `T` twice is last-write-wins. If
+a handler asks for a `State<T>` that was never registered, extraction fails with
+a `500` — register it before `build()`.
+
 ## Response Types
 
 ### Text Responses
