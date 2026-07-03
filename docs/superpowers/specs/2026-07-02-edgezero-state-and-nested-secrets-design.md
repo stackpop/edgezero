@@ -170,6 +170,15 @@ pub async fn handle_auction(
 
 ### 3.2 Router plumbing
 
+> **Implemented design (simpler than this sketch):** rather than a `Vec` of
+> type-erased closures, `RouterBuilder`/`RouterInner` hold a single
+> `state_extensions: crate::http::Extensions` bag. `with_state<T>` calls
+> `self.state_extensions.insert(value)` and dispatch calls
+> `request.extensions_mut().extend(self.state_extensions.clone())` after the
+> introspection inserts — same `Clone + Send + Sync + 'static` bound, same
+> last-write-wins-by-`TypeId`, no closure/vtable machinery. The sketch below is
+> the original idea; the shipped code (router.rs) uses the `Extensions` bag.
+
 Add to `RouterBuilder` a list of type-erased inserters and thread them into `RouterInner`:
 
 ```rust

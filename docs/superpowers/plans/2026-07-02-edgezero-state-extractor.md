@@ -35,7 +35,7 @@
 | File | Responsibility | Change |
 | ---- | -------------- | ------ |
 | `crates/edgezero-core/src/extractor.rs` | The `State<T>` extractor + `Deref`/`DerefMut`/`into_inner` + unit tests | Modify (append) |
-| `crates/edgezero-core/src/router.rs` | `StateInserter` alias, `RouterBuilder::with_state`, thread `state_inserters` through `build()` → `RouterService::new` → `RouterInner`, apply in `dispatch` + router tests | Modify |
+| `crates/edgezero-core/src/router.rs` | `state_extensions: Extensions` bag on `RouterBuilder`/`RouterInner`, `RouterBuilder::with_state` (inserts into it), thread through `build()` → `RouterService::new` → `RouterInner`, `extend` in `dispatch` + router tests | Modify |
 | `crates/edgezero-macros/tests/action_state.rs` | Integration test proving `#[action]` composes `State<T>` with `Query<T>` end-to-end | Create |
 | `crates/edgezero-macros/Cargo.toml` | Add `futures` dev-dependency (for `block_on` in the integration test) | Modify |
 | `docs/guide/handlers.md` | "Sharing app state" section | Modify (append) |
@@ -218,8 +218,20 @@ git commit -m "feat(core): add State<T> extractor for app-owned shared state"
 
 ## Task 2: `RouterBuilder::with_state` + dispatch plumbing
 
+> **Superseded design note (post-review refactor):** the shipped implementation
+> is simpler than the `StateInserter` closure approach the steps below describe.
+> Instead of `state_inserters: Vec<Arc<dyn Fn(&mut Extensions)>>`, the builder and
+> `RouterInner` hold a single **`state_extensions: Extensions`** bag;
+> `with_state<T>` is `self.state_extensions.insert(value)`, and dispatch does
+> `request.extensions_mut().extend(self.state_extensions.clone())` after the
+> introspection inserts. This removes the alias, the `Vec`, one closure
+> allocation per registered state, and one vtable call per state per request —
+> identical behavior (`http::Extensions::insert` bound is `Clone + Send + Sync +
+> 'static`; `extend` is last-write-wins by `TypeId`). The step-by-step code below
+> reflects the original closure approach; follow router.rs for the final shape.
+
 **Files:**
-- Modify: `crates/edgezero-core/src/router.rs` (add `StateInserter` alias, `state_inserters` field on `RouterBuilder` and `RouterInner`, `with_state` method, 5th arg through `build()`/`RouterService::new`, apply in `dispatch`; add router tests in the existing `#[cfg(test)] mod tests`)
+- Modify: `crates/edgezero-core/src/router.rs` (add `state_extensions: Extensions` field on `RouterBuilder` and `RouterInner`, `with_state` method inserting into it, 5th arg through `build()`/`RouterService::new`, `extend` in `dispatch`; add router tests in the existing `#[cfg(test)] mod tests`)
 
 **Interfaces:**
 - Consumes: `State<T>` from Task 1 (`crate::extractor::State`), `crate::http::Extensions` (facade alias), `std::sync::Arc` (imported at `router.rs:2`).
@@ -785,8 +797,8 @@ git commit -m "test(macros): prove #[action] composes State<T>; docs: sharing ap
 ## Self-review notes (mapping to spec §3)
 
 - §3.1 `State<T>` extractor + `Deref`/`into_inner` → Task 1.
-- §3.2 router plumbing (`state_inserters` field, `with_state`, dispatch insertion) → Task 2, mirroring PR #300's `manifest_json` column exactly.
+- §3.2 router plumbing (`state_extensions: Extensions` bag, `with_state`, dispatch `extend`) → Task 2, mirroring PR #300's `manifest_json` column; simplified from the spec's `StateInserter` closure sketch.
 - §3.3 naming → `State<T>` only (no `Extension` alias), per locked decision.
 - §3.4 tests: resolves registered / 500 unregistered / Deref (Task 1); handler sees value / two `T`s coexist / last-write-wins (Task 2); `#[action]` composition (Task 3); concurrency/no-bleed (Task 2).
 - §3.5 docs: `docs/guide/handlers.md` + rustdoc → Task 3.
-- §8 corrections folded in: facade `crate::http::Extensions` (not bare `http::Extensions`); no `lib.rs` re-export; `state_inserters` threaded through `RouterInner` + `RouterService::new` + `build()`.
+- §8 corrections folded in: facade `crate::http::Extensions` (not bare `http::Extensions`); no `lib.rs` re-export; `state_extensions` bag threaded through `RouterInner` + `RouterService::new` + `build()`.

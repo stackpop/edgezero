@@ -67,17 +67,15 @@ enum RouteMatch<'route> {
     NotFound,
 }
 
-/// Type-erased closure that clones a registered state value into a request's
-/// extensions at dispatch. See [`RouterBuilder::with_state`].
-type StateInserter = Arc<dyn Fn(&mut Extensions) + Send + Sync>;
-
 #[derive(Default)]
 pub struct RouterBuilder {
     manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
     route_info: Vec<RouteInfo>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
-    state_inserters: Vec<StateInserter>,
+    /// App state registered via [`RouterBuilder::with_state`], keyed by type.
+    /// Cloned into every request's extensions at dispatch.
+    state_extensions: Extensions,
 }
 
 impl RouterBuilder {
@@ -120,7 +118,7 @@ impl RouterBuilder {
             self.middlewares,
             route_index,
             self.manifest_json,
-            self.state_inserters,
+            self.state_extensions,
         )
     }
 
@@ -215,10 +213,7 @@ impl RouterBuilder {
     where
         T: Clone + Send + Sync + 'static,
     {
-        self.state_inserters
-            .push(Arc::new(move |ext: &mut Extensions| {
-                ext.insert(value.clone());
-            }));
+        self.state_extensions.insert(value);
         self
     }
 }
@@ -228,7 +223,7 @@ struct RouterInner {
     middlewares: Vec<BoxMiddleware>,
     route_index: Arc<[RouteInfo]>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
-    state_inserters: Vec<StateInserter>,
+    state_extensions: Extensions,
 }
 
 impl RouterInner {
@@ -254,11 +249,11 @@ impl RouterInner {
                         .insert(RouteTable(Arc::clone(&self.route_index)));
                 }
                 // App-owned state registered via RouterBuilder::with_state.
-                // Runs after introspection inserts; distinct TypeIds, so no
-                // collision. Last registered wins for a given `T`.
-                for inserter in &self.state_inserters {
-                    inserter(request.extensions_mut());
-                }
+                // Runs after introspection inserts; `extend` overwrites by
+                // TypeId, so app state wins last-write on any collision.
+                request
+                    .extensions_mut()
+                    .extend(self.state_extensions.clone());
                 let ctx = RequestContext::new(request, params);
                 let next = Next::new(&self.middlewares, entry.handler.as_ref());
                 next.run(ctx).await
@@ -334,7 +329,7 @@ impl RouterService {
         middlewares: Vec<BoxMiddleware>,
         route_index: Arc<[RouteInfo]>,
         manifest_json: Option<Arc<str>>,
-        state_inserters: Vec<StateInserter>,
+        state_extensions: Extensions,
     ) -> Self {
         Self {
             inner: Arc::new(RouterInner {
@@ -342,7 +337,7 @@ impl RouterService {
                 middlewares,
                 route_index,
                 routes,
-                state_inserters,
+                state_extensions,
             }),
         }
     }
