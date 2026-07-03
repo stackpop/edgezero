@@ -113,31 +113,48 @@ RouterService::builder()
 
 EdgeZero automatically returns `405 Method Not Allowed` for requests that match a path but use an unsupported method.
 
-## Route Listing
+## Introspection Routes
 
-Enable route listing for debugging:
+EdgeZero provides three bindable handlers in `edgezero_core::introspection` for debugging and runtime inspection:
 
-```rust
-let router = RouterService::builder()
-    .enable_route_listing()
-    .get("/hello", hello)
-    .build();
+- **`manifest`**: Returns the full manifest JSON with secret values redacted.
+- **`config`**: Returns the effective app config from the default config store, with secret fields appearing as unresolved key-name references (secret-safe).
+- **`routes`**: Returns the registered route table as `[{method, path}]`.
+
+Bind them in your manifest's `[[triggers.http]]` like any handler. By default, generated apps and app-demo mount them under `/_<app-name>/{manifest,config,routes}`:
+
+```toml
+[[triggers.http]]
+id = "manifest"
+path = "/_my-app/manifest"
+methods = ["GET"]
+handler = "edgezero_core::introspection::manifest"
+
+[[triggers.http]]
+id = "config"
+path = "/_my-app/config"
+methods = ["GET"]
+handler = "edgezero_core::introspection::config"
+
+[[triggers.http]]
+id = "routes"
+path = "/_my-app/routes"
+methods = ["GET"]
+handler = "edgezero_core::introspection::routes"
 ```
 
-This exposes a JSON endpoint at `/__edgezero/routes`:
+::: warning Security
+These endpoints are unauthenticated wherever they are bound — restrict access at the network or middleware layer before exposing them publicly. Note that `/manifest` emits `environment.variables[].value` verbatim; only `environment.secrets` values are redacted. Do not store secrets in `[environment.variables]`.
+:::
+
+The `routes` handler returns JSON like:
 
 ```json
 [
-  { "method": "GET", "path": "/hello" },
-  { "method": "GET", "path": "/__edgezero/routes" }
+  { "method": "GET", "path": "/_my-app/manifest" },
+  { "method": "GET", "path": "/_my-app/config" },
+  { "method": "GET", "path": "/_my-app/routes" }
 ]
-```
-
-Customize the listing path:
-
-```rust
-RouterService::builder()
-    .enable_route_listing_at("/debug/routes")
 ```
 
 ## Path Syntax

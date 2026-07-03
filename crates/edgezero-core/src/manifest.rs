@@ -1,6 +1,6 @@
 use log::LevelFilter;
 use serde::de::Error as DeError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,7 +83,7 @@ impl ManifestLoader {
     }
 }
 
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[validate(schema(function = "validate_manifest_adapter_keys_case_unique"))]
 #[expect(
     clippy::partial_pub_fields,
@@ -214,20 +214,26 @@ impl Manifest {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestApp {
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(length(min = 1_u64))]
+    pub kind: Option<String>,
     #[serde(default)]
     pub middleware: Vec<String>,
     #[serde(default)]
     #[validate(length(min = 1_u64))]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(length(min = 1_u64))]
+    pub version: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestTriggers {
     #[serde(default)]
@@ -235,7 +241,7 @@ pub struct ManifestTriggers {
     pub http: Vec<ManifestHttpTrigger>,
 }
 
-#[derive(Clone, Debug, Deserialize, Validate)]
+#[derive(Clone, Debug, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestHttpTrigger {
     #[serde(default)]
@@ -273,10 +279,10 @@ impl ManifestHttpTrigger {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestEnvironment {
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_secrets")]
     #[validate(nested)]
     pub secrets: Vec<ManifestBinding>,
     #[serde(default)]
@@ -284,7 +290,7 @@ pub struct ManifestEnvironment {
     pub variables: Vec<ManifestBinding>,
 }
 
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestBinding {
     #[serde(default)]
@@ -316,6 +322,14 @@ impl ManifestBinding {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ResolvedEnvironmentBinding {
+    pub description: Option<String>,
+    pub env: String,
+    pub name: String,
+    pub value: Option<String>,
+}
+
 impl ResolvedEnvironmentBinding {
     fn from_manifest(binding: &ManifestBinding) -> Self {
         Self {
@@ -327,21 +341,13 @@ impl ResolvedEnvironmentBinding {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ResolvedEnvironmentBinding {
-    pub description: Option<String>,
-    pub env: String,
-    pub name: String,
-    pub value: Option<String>,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedEnvironment {
     pub secrets: Vec<ResolvedEnvironmentBinding>,
     pub variables: Vec<ResolvedEnvironmentBinding>,
 }
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 #[validate(schema(function = "validate_manifest_adapter"))]
 pub struct ManifestAdapter {
@@ -365,7 +371,7 @@ pub struct ManifestAdapter {
     pub logging: ManifestLoggingConfig,
 }
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 #[validate(schema(function = "validate_manifest_adapter_definition"))]
 pub struct ManifestAdapterDefinition {
@@ -402,7 +408,7 @@ pub struct ManifestAdapterDefinition {
     pub port: Option<u16>,
 }
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestAdapterBuild {
     #[serde(default)]
@@ -415,7 +421,7 @@ pub struct ManifestAdapterBuild {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestAdapterCommands {
     /// Per-project override for `edgezero auth login --adapter <name>`.
@@ -457,7 +463,7 @@ pub struct ManifestAdapterCommands {
 /// adapter sections, etc.) already reject legacy fields below this
 /// level, so adding the rejection HERE seals the only remaining
 /// silent-typo path.
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ManifestStores {
@@ -479,7 +485,7 @@ pub struct ManifestStores {
 /// tuning. Platform-specific runtime config (store names, tuning) is supplied
 /// out of band; in this interim model a store's name resolves to its logical
 /// [`StoreDeclaration::default_id`].
-#[derive(Debug, Deserialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 #[validate(schema(function = "validate_store_declaration"))]
 pub struct StoreDeclaration {
@@ -516,7 +522,7 @@ impl StoreDeclaration {
 // Logging (unchanged)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Deserialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 #[non_exhaustive]
 pub struct ManifestLogging {
     #[serde(flatten)]
@@ -524,7 +530,7 @@ pub struct ManifestLogging {
     pub adapters: BTreeMap<String, ManifestLoggingConfig>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Validate)]
 #[non_exhaustive]
 pub struct ManifestLoggingConfig {
     #[serde(default)]
@@ -634,6 +640,13 @@ impl<'de> Deserialize<'de> for HttpMethod {
     }
 }
 
+impl serde::Serialize for HttpMethod {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum BodyMode {
@@ -661,6 +674,16 @@ impl<'de> Deserialize<'de> for BodyMode {
             "stream" => Ok(Self::Stream),
             other => Err(DeError::custom(format!("unsupported body mode `{other}`"))),
         }
+    }
+}
+
+impl serde::Serialize for BodyMode {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Buffered => "buffered",
+            Self::Stream => "stream",
+        })
     }
 }
 
@@ -732,6 +755,46 @@ impl<'de> Deserialize<'de> for LogLevel {
             ))),
         }
     }
+}
+
+impl serde::Serialize for LogLevel {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Serialize a `[[environment.secrets]]` list without exposing `value`.
+/// Secret bindings share `ManifestBinding` with variables, whose `value`
+/// is safe to emit; secret values must never appear in manifest output.
+fn serialize_secrets<S>(secrets: &[ManifestBinding], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq as _;
+
+    #[derive(Serialize)]
+    struct RedactedBinding {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        adapters: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        env: Option<String>,
+        name: String,
+        // `value` intentionally omitted.
+    }
+
+    let mut seq = serializer.serialize_seq(Some(secrets.len()))?;
+    for binding in secrets {
+        seq.serialize_element(&RedactedBinding {
+            adapters: binding.adapters.clone(),
+            description: binding.description.clone(),
+            env: binding.env.clone(),
+            name: binding.name.clone(),
+        })?;
+    }
+    seq.end()
 }
 
 fn resolve_root_path(path: &Path, cwd: &Path) -> PathBuf {
@@ -994,6 +1057,72 @@ env = "APP_TOKEN"
         let manifest = loader.manifest();
         assert_eq!(manifest.triggers.http.len(), 2);
         assert_eq!(manifest.app.name.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn serializes_manifest_and_redacts_secret_values() {
+        let toml = r#"
+[app]
+name = "t"
+version = "0.1.0"
+kind = "http"
+
+[[triggers.http]]
+id = "root"
+path = "/"
+methods = ["GET"]
+handler = "t::handlers::root"
+
+[[environment.variables]]
+name = "LOG_LEVEL"
+value = "info"
+
+[[environment.secrets]]
+name = "API_TOKEN"
+value = "super-secret-value"
+"#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        let json = serde_json::to_value(&manifest).unwrap();
+
+        // [app] version/kind round-trip
+        assert_eq!(json["app"]["version"], "0.1.0");
+        assert_eq!(json["app"]["kind"], "http");
+        // variables keep their value
+        assert_eq!(json["environment"]["variables"][0]["value"], "info");
+        // secrets NEVER expose value
+        let secret = &json["environment"]["secrets"][0];
+        assert_eq!(secret["name"], "API_TOKEN");
+        assert!(
+            secret.get("value").is_none(),
+            "secret value must be redacted"
+        );
+        // Enums serialize to their wire strings, not Rust variant names.
+        assert_eq!(json["triggers"]["http"][0]["methods"][0], "GET");
+    }
+
+    #[test]
+    fn serializes_enums_with_wire_casing() {
+        let toml = r#"
+[app]
+name = "t"
+
+[[triggers.http]]
+id = "r"
+path = "/"
+methods = ["POST"]
+handler = "t::h::r"
+body-mode = "buffered"
+
+[logging.axum]
+level = "info"
+"#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(json["triggers"]["http"][0]["methods"][0], "POST");
+        // `body_mode` is serde-renamed to `body-mode` (manifest.rs:243), so the
+        // serialized key is `body-mode`, NOT `body_mode`.
+        assert_eq!(json["triggers"]["http"][0]["body-mode"], "buffered");
+        assert_eq!(json["logging"]["axum"]["level"], "info");
     }
 
     #[test]
