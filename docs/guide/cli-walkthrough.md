@@ -60,6 +60,27 @@ auth-status = "wrangler whoami --json"
 
 ## 3. Provision platform resources
 
+`provision` has two modes:
+
+- **`provision --local`** — synthesises each adapter's baseline
+  manifest (Cloudflare `wrangler.toml`, Fastly `fastly.toml`, Spin
+  `spin.toml` + `runtime-config.toml`, Axum `axum.toml`) and merges
+  per-store `[[kv_namespaces]]` / `[local_server.*]` /
+  `key_value_stores` bindings + writes line-oriented `.env` /
+  `.dev.vars` / `.edgezero/.env` files. **No cloud shell-outs.** The
+  scaffolder runs this for every selected adapter as part of
+  `edgezero new`, so you rarely invoke it by hand for a first-run
+  project.
+- **`provision` (no `--local`)** — creates the backing platform
+  resources for real: `wrangler kv namespace create` (Cloudflare),
+  `fastly <kind>-store create` (Fastly), or the Spin-manifest edits
+  described below.
+
+Cloudflare / Fastly / Spin manifests are gitignored — teammates
+regenerate them via `<app>-cli provision --adapter <name> --local`
+after cloning. **Axum's `axum.toml` stays tracked** because it's the
+operator-authored manifest for the native dev server.
+
 Once you've declared store ids in `edgezero.toml`:
 
 ```toml
@@ -79,6 +100,10 @@ ids = ["default"]
 ```bash
 myapp-cli provision --adapter cloudflare --dry-run
 myapp-cli provision --adapter cloudflare
+
+# Regenerate the local manifest + env files (no cloud calls) —
+# what the scaffolder ran for you on `edgezero new`.
+myapp-cli provision --adapter cloudflare --local
 ```
 
 Per-adapter behaviour:

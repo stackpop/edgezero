@@ -152,20 +152,29 @@ local testing.
 The Cloudflare config store used to read one `[vars]` string binding
 containing a JSON object. It now reads from a **KV namespace** binding
 asynchronously. To migrate, replace each `[vars] app_config = '{ … }'`
-entry with a KV namespace binding:
+entry in your local copy of `wrangler.toml` with a KV namespace binding:
 
 ```toml
-# wrangler.toml — before
+# your local copy of wrangler.toml — before
 [vars]
 app_config = '{"greeting":"hello","feature.new_checkout":"false"}'
 
-# wrangler.toml — after
+# your local copy of wrangler.toml — after
 [[kv_namespaces]]
 binding = "app_config"
 id      = "abc123…"
 ```
 
-Populate the namespace via `wrangler kv:key put`. The binding name
-becomes the platform name resolved by
+`<app>-cli provision --adapter cloudflare` writes the `[[kv_namespaces]]`
+binding for you. Populate the namespace via `wrangler kv:key put`. The
+binding name becomes the platform name resolved by
 `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME` (with the default being
 the literal id `app_config`).
+
+::: tip Cloudflare / Fastly / Spin manifests are gitignored
+Your local copy of `wrangler.toml`, `fastly.toml`, `spin.toml`, and
+`runtime-config.toml` is not tracked — regenerate it with
+`<app>-cli provision --adapter <name> --local` and re-apply any
+operator edits after cloning. **Axum's `axum.toml` stays tracked**
+because it's the operator-authored manifest for the native dev server.
+:::

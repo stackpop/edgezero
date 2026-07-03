@@ -6,6 +6,29 @@ The `edgezero.toml` manifest describes an EdgeZero application, providing a sing
 
 New workspaces scaffolded with `edgezero new` include this manifest by default. The manifest drives both runtime routing and CLI commands.
 
+### Where does each setting live?
+
+`edgezero.toml` (plus the typed `<name>.toml` app-config sitting next to
+it) is the durable, portable, **tracked** source of truth — durable
+settings such as adapter selection, store declarations, routes, and
+middleware belong here. Everything else is generated:
+
+- `edgezero.toml` and `<name>.toml` — tracked. The portable manifest and
+  the typed app-config the runtime reads.
+- `wrangler.toml` / `fastly.toml` / `spin.toml` / `runtime-config.toml`
+  / `.dev.vars` — **operator-modifiable but gitignored**. Each is
+  synthesised by `<app>-cli provision --adapter <name> --local`
+  (which the scaffolder runs for you on `edgezero new`) and merged
+  with per-store bindings drawn from `edgezero.toml`. Teammates
+  regenerate them after cloning; hand-edits stay local until you
+  hand-share.
+- **Axum's `axum.toml` stays tracked** — the native dev server's
+  manifest is authored by the operator, not synthesised, so `provision
+--local` leaves it untouched.
+- `.edgezero/.env` (Axum) and `<spin_crate>/.env` (Spin) — gitignored.
+  `provision --local` appends `#[secret]` placeholder lines that
+  `run_serve` sources on startup.
+
 ```toml
 [app]
 name = "my-app"

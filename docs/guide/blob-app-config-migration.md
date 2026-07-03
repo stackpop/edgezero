@@ -95,6 +95,15 @@ with the same data produce blobs with identical `sha256` and different
 
 ## Per-adapter mechanics
 
+::: tip Cloudflare / Fastly / Spin manifests are gitignored
+Every mechanics section below refers to **your local `wrangler.toml` /
+`fastly.toml` / `spin.toml`** — these are not committed; regenerate
+them via `<app-cli> provision --adapter <name> --local` after cloning
+and re-apply any operator edits locally. **Axum's `axum.toml` stays
+tracked** because it's the operator-authored manifest for the native
+dev server.
+:::
+
 ### Axum
 
 The push writes to `.edgezero/local-config-<id>.json` next to your
@@ -109,7 +118,8 @@ with one entry: `(<key>, <envelope_json>)`. With `--local`, the same
 command runs against `.wrangler/state` instead.
 
 The bundled `edgezero` binary calls `wrangler` from your shell; your
-project's `wrangler.toml` selects the namespace.
+local `wrangler.toml` selects the namespace (it's not committed —
+regenerate via `<app-cli> provision --adapter cloudflare --local`).
 
 ### Fastly
 
@@ -136,16 +146,20 @@ configs), push hard-errors before any platform write and asks you
 to restructure into multiple typed config structs.
 
 `config push --adapter fastly --local` mirrors the same shape into
-`fastly.toml`'s `[local_server.config_stores.<id>.contents]` table.
-Dotted chunk keys are written as literal TOML keys (quoted strings),
-NOT nested dotted-path tables — so the local store layout matches
-the remote store layout.
+your local `fastly.toml`'s `[local_server.config_stores.<id>.contents]`
+table (the file is not committed — regenerate via `<app-cli>
+provision --adapter fastly --local`). Dotted chunk keys are written
+as literal TOML keys (quoted strings), NOT nested dotted-path tables
+— so the local store layout matches the remote store layout.
 
 ### Spin
 
 `config push --adapter spin --local` writes SQLite-directly into
 `<spin.toml dir>/.spin/sqlite_key_value.db`, using the vendored
 `spin_key_value` schema, at `(store=<platform>, key=<key>)`.
+Your local `spin.toml` + `runtime-config.toml` (which pin the label
+routing) are not committed — regenerate via `<app-cli> provision
+--adapter spin --local` after cloning.
 
 Without `--local`, the push targets whatever the Spin runtime config
 declares for the store. The adapter mirrors the writer's four-branch
@@ -167,13 +181,23 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
 
 ### First push of a new project
 
-1. Provision the backing stores. Each adapter has its own:
+1. Provision the backing stores. Each adapter has its own; `edgezero
+new` already ran the `--local` form for you when scaffolding, so
+   the cloud form is only needed the first time you point at real
+   platform resources:
 
    ```sh
+   # Local form — regenerates the adapter manifest + env files.
+   <app-cli> provision --adapter axum --local
+   <app-cli> provision --adapter cloudflare --local
+   <app-cli> provision --adapter fastly --local
+   <app-cli> provision --adapter spin --local
+
+   # Cloud form — creates real platform resources.
    <app-cli> provision --adapter axum         # no-op (file-based)
    <app-cli> provision --adapter cloudflare   # wrangler kv namespace create
    <app-cli> provision --adapter fastly       # fastly config-store create
-   <app-cli> provision --adapter spin         # edits spin.toml in place
+   <app-cli> provision --adapter spin         # edits your local spin.toml in place
    ```
 
 2. Pre-populate `[stores.secrets]`. Push doesn't write secret values
