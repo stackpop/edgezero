@@ -390,7 +390,15 @@ Append to `crates/edgezero-core/src/router.rs`'s main `#[cfg(test)] mod tests` (
 Run: `cargo test -p edgezero-core --lib with_state 2>&1 | tail -20`
 Expected: FAIL — `no method named with_state found for struct RouterBuilder`.
 
-- [ ] **Step 3: Add the `StateInserter` type alias**
+> ⚠️ **Steps 3–8 below are the ORIGINAL closure approach and were superseded**
+> (see the banner at the top of Task 2). The shipped code has **no `StateInserter`
+> alias**: `RouterBuilder`/`RouterInner` hold a `state_extensions: Extensions`
+> bag, `with_state<T>` is `self.state_extensions.insert(value)`, and dispatch is
+> `request.extensions_mut().extend(self.state_extensions.clone())`. Read
+> `crates/edgezero-core/src/router.rs` for the final shape; don't follow the
+> `state_inserters`/`StateInserter` snippets below literally.
+
+- [ ] **Step 3: Add the `StateInserter` type alias** *(superseded — see note above)*
 
 In `crates/edgezero-core/src/router.rs`, add just above `pub struct RouterBuilder` (which is at `router.rs:71`, under its `#[derive(Default)]` at `router.rs:70`):
 
