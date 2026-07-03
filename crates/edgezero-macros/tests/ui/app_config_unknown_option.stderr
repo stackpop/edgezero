@@ -1,0 +1,5 @@
+error: `#[app_config(...)]` only accepts `nested`
+ --> tests/ui/app_config_unknown_option.rs:6:18
+  |
+6 |     #[app_config(bogus)]
+  |                  ^^^^^

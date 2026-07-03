@@ -4,6 +4,7 @@
 #[cfg(test)]
 mod tests {
     use edgezero_core::app_config::{AppConfigMeta, AppConfigRoot, SecretKind};
+    use validator::Validate as _;
 
     #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
     #[serde(deny_unknown_fields)]
@@ -66,6 +67,62 @@ mod tests {
         vault: String,
     }
 
+    // Optional secret: `#[secret]` on `Option<String>` -> `optional: true`.
+    #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    #[expect(
+        dead_code,
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; secret_fields() reads them via the derive, not via Rust field access"
+    )]
+    struct ConfigOptionalSecret {
+        #[secret]
+        api_token: Option<String>,
+    }
+
+    // Nested object + array recursion.
+    #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    #[expect(
+        dead_code,
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; secret_fields() reads them via the derive, not via Rust field access"
+    )]
+    struct DataDome {
+        #[secret]
+        server_side_key: String,
+    }
+
+    #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct Integrations {
+        #[app_config(nested)]
+        #[validate(nested)]
+        datadome: DataDome,
+    }
+
+    #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    #[expect(
+        dead_code,
+        reason = "fields exist only to feed `#[derive(AppConfig)]`; secret_fields() reads them via the derive, not via Rust field access"
+    )]
+    struct Partner {
+        #[secret]
+        api_key: String,
+        #[secret]
+        maybe: Option<String>,
+    }
+
+    #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+    #[serde(deny_unknown_fields)]
+    struct Settings {
+        #[app_config(nested)]
+        #[validate(nested)]
+        integrations: Integrations,
+        #[app_config(nested)]
+        #[validate(nested)]
+        partners: Vec<Partner>,
+    }
+
     /// Reflect each derived `SecretField` down to the tuple the
     /// assertions compare: `(dotted_path, kind, optional)`.
     fn reflect<C: AppConfigMeta>() -> Vec<(String, SecretKind, bool)> {
@@ -125,6 +182,40 @@ mod tests {
     }
 
     #[test]
+    fn optional_string_secret_sets_optional_flag() {
+        assert_eq!(
+            reflect::<ConfigOptionalSecret>(),
+            vec![("api_token".to_owned(), SecretKind::KeyInDefault, true)]
+        );
+    }
+
+    #[test]
+    fn nested_and_array_paths_are_emitted() {
+        let mut paths = reflect::<Settings>();
+        paths.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            paths,
+            vec![
+                (
+                    "integrations.datadome.server_side_key".to_owned(),
+                    SecretKind::KeyInDefault,
+                    false,
+                ),
+                (
+                    "partners[*].api_key".to_owned(),
+                    SecretKind::KeyInDefault,
+                    false
+                ),
+                (
+                    "partners[*].maybe".to_owned(),
+                    SecretKind::KeyInDefault,
+                    true
+                ),
+            ],
+        );
+    }
+
+    #[test]
     fn derive_emits_app_config_root_impl() {
         // The trait is a marker; we just need it to compile and the
         // blanket impl to be reachable via the trait object.
@@ -150,6 +241,13 @@ mod tests {
         cases.compile_fail("tests/ui/non_secret_with_serde_flatten.rs");
         cases.compile_fail("tests/ui/non_secret_with_serde_skip_serializing.rs");
         cases.compile_fail("tests/ui/non_secret_with_serde_skip_serializing_if.rs");
+        // `#[app_config(nested)]` recursion + `Option<String>` secret guards.
+        // The `secret_*.rs` glob above already covers
+        // `secret_on_option_non_string.rs` and `secret_store_ref_optional.rs`.
+        cases.compile_fail("tests/ui/app_config_nested_on_non_appconfig.rs");
+        cases.compile_fail("tests/ui/app_config_unknown_option.rs");
+        cases.compile_fail("tests/ui/nested_field_serde_rename.rs");
+        cases.compile_fail("tests/ui/nested_parent_rename_all.rs");
         cases.pass("tests/ui/secret_with_store_ref_named.rs");
     }
 }

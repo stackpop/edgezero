@@ -12,8 +12,8 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::{
-    parse_macro_input, Attribute, Data, DeriveInput, Expr, ExprLit, Field, Fields, Ident, Lit,
-    Meta, MetaNameValue, Path, Type,
+    parse_macro_input, Attribute, Data, DeriveInput, Expr, ExprLit, Field, Fields, GenericArgument,
+    Ident, Lit, Meta, MetaNameValue, Path, PathArguments, Type,
 };
 
 /// Recognised `#[secret(...)]` annotation kinds.
@@ -36,6 +36,20 @@ enum SecretAnnotation {
 struct FieldAnnotation {
     kind: SecretAnnotation,
     name: Ident,
+    /// `true` when the annotated field is `Option<String>`.
+    optional: bool,
+}
+
+/// A `#[app_config(nested)]` field to recurse into when emitting
+/// `secret_fields()`.
+struct NestedDescriptor<'field> {
+    /// The element type whose `secret_fields()` are prepended: the field
+    /// type for an object, or the `Vec`/slice element type for an array.
+    child_ty: &'field Type,
+    /// The Rust field name, emitted verbatim as a `Field` path segment.
+    field_name: Ident,
+    /// `true` when the field is `Vec<T>` / `[T]` (emit `Field` + `ArrayEach`).
+    is_array: bool,
 }
 
 /// Inspect the input struct, emit `impl AppConfigMeta` with the
@@ -50,29 +64,21 @@ pub fn derive(tokens: TokenStream) -> TokenStream {
 }
 
 fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
-    let struct_ident = &input.ident;
-    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
-
     let fields = struct_fields(input)?;
 
     // Enforce serde skip/flatten bans on EVERY field (not just secret ones).
     enforce_no_disallowed_serde_attrs_on_all_fields(fields)?;
 
-    let mut annotations: Vec<FieldAnnotation> = Vec::new();
-    for field in fields {
-        if let Some(annotation) = scan_field(field)? {
-            annotations.push(annotation);
-        }
-    }
+    let (annotations, nested_descriptors) = classify_fields(fields)?;
 
-    // SECRET_FIELDS emits the Rust field name verbatim. A container-
+    // secret_fields() emits the Rust field name verbatim. A container-
     // level `#[serde(rename_all = ...)]` would desync that metadata
     // from what `config validate` (and the Spin collision check) sees
-    // on the wire — silently — so reject it whenever any
-    // secret field is present. Structs with no secret fields are
-    // unaffected: SECRET_FIELDS is empty and the validator never
-    // compares names.
-    if !annotations.is_empty() {
+    // on the wire — silently — so reject it whenever any secret field is
+    // present, whether direct or reached through a nested child. Structs
+    // with no secret paths are unaffected: secret_fields() is empty and
+    // the validator never compares names.
+    if !annotations.is_empty() || !nested_descriptors.is_empty() {
         enforce_no_container_rename_all(&input.attrs)?;
     }
 
@@ -125,8 +131,67 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
         }
     }
 
-    let entries = annotations.iter().map(|annotation| {
+    Ok(emit_impl(input, &annotations, &nested_descriptors))
+}
+
+/// Classify every field as a direct `#[secret]` annotation or a
+/// `#[app_config(nested)]` recursion descriptor. A field may not be both.
+fn classify_fields(
+    fields: &Punctuated<Field, syn::Token![,]>,
+) -> syn::Result<(Vec<FieldAnnotation>, Vec<NestedDescriptor<'_>>)> {
+    let mut annotations: Vec<FieldAnnotation> = Vec::new();
+    let mut nested_descriptors: Vec<NestedDescriptor> = Vec::new();
+    for field in fields {
+        let is_nested = nested_optin(field)?;
+        match scan_field(field)? {
+            Some(_) if is_nested => {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "a field may not be both `#[secret]` and `#[app_config(nested)]`",
+                ));
+            }
+            Some(annotation) => annotations.push(annotation),
+            None if is_nested => {
+                // The emitter writes `Field(field_name)` verbatim, so a
+                // `#[serde(rename/flatten/skip*)]` on the nested parent would
+                // desync the path segment from the serialized key — banned on
+                // any secret path.
+                enforce_no_disallowed_serde_attrs(field)?;
+                let Some(field_name) = field.ident.clone() else {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "`#[app_config(nested)]` requires a named field",
+                    ));
+                };
+                let (child_ty, is_array) = nested_child_type(&field.ty);
+                nested_descriptors.push(NestedDescriptor {
+                    child_ty,
+                    field_name,
+                    is_array,
+                });
+            }
+            None => {}
+        }
+    }
+    Ok((annotations, nested_descriptors))
+}
+
+/// Emit `impl AppConfigMeta` (with the `secret_fields()` body), the
+/// `AppConfigRoot` marker impl, and a per-child `AppConfigRoot` bound
+/// assertion.
+fn emit_impl(
+    input: &DeriveInput,
+    annotations: &[FieldAnnotation],
+    nested_descriptors: &[NestedDescriptor<'_>],
+) -> TokenStream2 {
+    let struct_ident = &input.ident;
+    let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
+
+    // Direct `#[secret]` leaves: length-1 `Field` path, `optional` set from
+    // `Option<String>`.
+    let direct_entries = annotations.iter().map(|annotation| {
         let name_lit = annotation.name.to_string();
+        let optional = annotation.optional;
         let kind_tokens = match &annotation.kind {
             SecretAnnotation::KeyInDefault => {
                 quote!(::edgezero_core::app_config::SecretKind::KeyInDefault)
@@ -141,26 +206,89 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
                 })
             }
         };
-        // Task 1: length-1 Field path, non-optional. Task 4 sets `optional`
-        // from Option<String> and prepends nested/array segments.
         quote! {
             ::edgezero_core::app_config::SecretField {
                 kind: #kind_tokens,
                 path: ::std::vec![::edgezero_core::app_config::SecretPathSegment::Field(
                     ::std::borrow::Cow::Borrowed(#name_lit)
                 )],
-                optional: false,
+                optional: #optional,
             }
         }
     });
 
-    Ok(quote! {
+    // Nested children: prepend `Field(field)` (object) or `Field(field)` +
+    // `ArrayEach` (`Vec`/slice) onto every leaf the child reports.
+    let nested_pushes = nested_descriptors.iter().map(|descriptor| {
+        let field_lit = descriptor.field_name.to_string();
+        let child_ty = descriptor.child_ty;
+        let prefix = if descriptor.is_array {
+            quote! {
+                ::std::vec![
+                    ::edgezero_core::app_config::SecretPathSegment::Field(
+                        ::std::borrow::Cow::Borrowed(#field_lit)
+                    ),
+                    ::edgezero_core::app_config::SecretPathSegment::ArrayEach,
+                ]
+            }
+        } else {
+            quote! {
+                ::std::vec![
+                    ::edgezero_core::app_config::SecretPathSegment::Field(
+                        ::std::borrow::Cow::Borrowed(#field_lit)
+                    ),
+                ]
+            }
+        };
+        quote! {
+            for mut __f in <#child_ty as ::edgezero_core::app_config::AppConfigMeta>::secret_fields() {
+                let mut __p = #prefix;
+                __p.append(&mut __f.path);
+                __f.path = __p;
+                __out.push(__f);
+            }
+        }
+    });
+
+    let secret_fields_body = if nested_descriptors.is_empty() {
+        quote! { ::std::vec![#(#direct_entries),*] }
+    } else {
+        quote! {
+            let mut __out: ::std::vec::Vec<::edgezero_core::app_config::SecretField> =
+                ::std::vec![#(#direct_entries),*];
+            #(#nested_pushes)*
+            __out
+        }
+    };
+
+    // A nested child must go through `#[derive(AppConfig)]` — the
+    // `AppConfigRoot` marker — not merely impl `AppConfigMeta` by hand.
+    // The closure is never called, but coercing it to `fn()` type-checks
+    // its body, enforcing the bound with a clear error span per child.
+    let nested_child_tys: Vec<&Type> = nested_descriptors
+        .iter()
+        .map(|descriptor| descriptor.child_ty)
+        .collect();
+    let root_assertion = if nested_child_tys.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            const _: fn() = || {
+                fn __assert_app_config_root<__T: ::edgezero_core::app_config::AppConfigRoot>() {}
+                #( __assert_app_config_root::<#nested_child_tys>(); )*
+            };
+        }
+    };
+
+    quote! {
+        #root_assertion
+
         #[automatically_derived]
         impl #impl_generics ::edgezero_core::app_config::AppConfigMeta
             for #struct_ident #type_generics #where_clause
         {
             fn secret_fields() -> ::std::vec::Vec<::edgezero_core::app_config::SecretField> {
-                ::std::vec![#(#entries),*]
+                #secret_fields_body
             }
         }
 
@@ -168,7 +296,7 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
         impl #impl_generics ::edgezero_core::app_config::AppConfigRoot
             for #struct_ident #type_generics #where_clause
         {}
-    })
+    }
 }
 
 /// Borrow the struct's named fields, or error with a clear message.
@@ -218,10 +346,71 @@ fn scan_field(field: &Field) -> Result<Option<FieldAnnotation>, syn::Error> {
     }
     let kind = parse_secret_kind(first)?;
 
-    enforce_scalar_string_type(field)?;
+    let optional = secret_string_optionality(&field.ty).ok_or_else(|| {
+        syn::Error::new_spanned(
+            &field.ty,
+            "`#[secret]` may only annotate `String` or `Option<String>`",
+        )
+    })?;
+    // A `#[secret(store_ref)]` value is a store id — structural, always
+    // present. `Option<String>` there is undefined (an absent store cannot
+    // resolve its dependent `KeyInNamedStore` sibling), so reject it.
+    if optional && matches!(kind, SecretAnnotation::StoreRef) {
+        return Err(syn::Error::new_spanned(
+            &field.ty,
+            "`#[secret(store_ref)]` may not be `Option<String>`: a store id is structural and must always be present",
+        ));
+    }
     enforce_no_disallowed_serde_attrs(field)?;
 
-    Ok(Some(FieldAnnotation { kind, name }))
+    Ok(Some(FieldAnnotation {
+        kind,
+        name,
+        optional,
+    }))
+}
+
+/// Whether `field` carries `#[app_config(nested)]`. Returns `Err` (not
+/// `false`) on a malformed `#[app_config(...)]` such as `#[app_config(bogus)]`
+/// or an empty `#[app_config()]`, so a typo is a hard compile error rather
+/// than a silently-ignored non-recursion (which would drop the child's
+/// secrets).
+fn nested_optin(field: &Field) -> syn::Result<bool> {
+    let mut found = false;
+    for attr in &field.attrs {
+        if !attr.path().is_ident("app_config") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("nested") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("`#[app_config(...)]` only accepts `nested`"))
+            }
+        })?;
+    }
+    Ok(found)
+}
+
+/// The child element type to recurse into and whether it is an array element.
+/// `Vec<T>` / `[T]` -> (T, true); otherwise (`field_ty`, false).
+fn nested_child_type(ty: &Type) -> (&Type, bool) {
+    if let Type::Path(type_path) = ty {
+        if let Some(last) = type_path.path.segments.last() {
+            if last.ident == "Vec" {
+                if let PathArguments::AngleBracketed(bracketed) = &last.arguments {
+                    if let Some(GenericArgument::Type(inner)) = bracketed.args.first() {
+                        return (inner, true);
+                    }
+                }
+            }
+        }
+    }
+    if let Type::Slice(slice) = ty {
+        return (&slice.elem, true);
+    }
+    (ty, false)
 }
 
 /// Decode `#[secret]` (`KeyInDefault`), `#[secret(store_ref)]`
@@ -264,18 +453,27 @@ fn parse_secret_kind(attr: &Attribute) -> Result<SecretAnnotation, syn::Error> {
     }
 }
 
-/// `#[secret]` may only annotate a scalar string field. Per we
-/// accept bare `String` only — generic or qualified forms (e.g.
-/// `Option<String>`, `Cow<'_, str>`) are intentionally rejected so
-/// `cfg.api_token` resolves to a value at every call site.
-fn enforce_scalar_string_type(field: &Field) -> Result<(), syn::Error> {
-    if !is_scalar_string_type(&field.ty) {
-        return Err(syn::Error::new_spanned(
-            &field.ty,
-            "`#[secret]` / `#[secret(store_ref)]` may only annotate a scalar string field (e.g. `String`)",
-        ));
+/// Classify a `#[secret]` field's type: `String` -> `Some(false)`,
+/// `Option<String>` -> `Some(true)`, anything else (e.g. `Vec<String>`,
+/// `Cow<'_, str>`, non-string scalars) -> `None`.
+fn secret_string_optionality(ty: &Type) -> Option<bool> {
+    if is_scalar_string_type(ty) {
+        return Some(false);
     }
-    Ok(())
+    if let Type::Path(type_path) = ty {
+        if let Some(last) = type_path.path.segments.last() {
+            if last.ident == "Option" {
+                if let PathArguments::AngleBracketed(bracketed) = &last.arguments {
+                    if let Some(GenericArgument::Type(inner)) = bracketed.args.first() {
+                        if is_scalar_string_type(inner) {
+                            return Some(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_scalar_string_type(ty: &Type) -> bool {

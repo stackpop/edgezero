@@ -1,0 +1,5 @@
+error: `#[derive(AppConfig)]` rejects `#[serde(rename_all = ...)]` on structs with `#[secret]` fields: SECRET_FIELDS uses Rust field names verbatim, so a container rename would silently desync `config validate` from runtime deserialisation
+  --> tests/ui/nested_parent_rename_all.rs:12:1
+   |
+12 | #[serde(rename_all = "kebab-case")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
