@@ -1,3 +1,4 @@
+use std::any;
 use std::ops::{Deref, DerefMut};
 
 use async_trait::async_trait;
@@ -528,6 +529,66 @@ impl Kv {
     }
 }
 
+/// Extractor for app-owned shared state registered via
+/// [`RouterBuilder::with_state`]. Resolves by type from request extensions.
+///
+/// Typically `T = Arc<AppState>`. The registered value is cloned into every
+/// request's extensions before dispatch; registering the same `T` twice is
+/// last-write-wins.
+///
+/// ```ignore
+/// use edgezero_core::extractor::State;
+/// use std::sync::Arc;
+///
+/// #[edgezero_core::action]
+/// async fn handle(State(state): State<Arc<AppState>>) -> Result<String, edgezero_core::error::EdgeError> {
+///     Ok(state.greeting.clone())
+/// }
+/// ```
+///
+/// [`RouterBuilder::with_state`]: crate::router::RouterBuilder::with_state
+pub struct State<T>(pub T);
+
+#[async_trait(?Send)]
+impl<T> FromRequest for State<T>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    #[inline]
+    async fn from_request(ctx: &RequestContext) -> Result<Self, EdgeError> {
+        ctx.extension::<T>().map(State).ok_or_else(|| {
+            EdgeError::internal(anyhow::anyhow!(
+                "no `State<{}>` registered -- call RouterBuilder::with_state(..) before build()",
+                any::type_name::<T>()
+            ))
+        })
+    }
+}
+
+impl<T> Deref for State<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for State<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> State<T> {
+    /// Consume the extractor and return the inner value.
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
 /// Extractor that yields the per-request [`SecretRegistry`].
 ///
 /// The returned [`BoundSecretStore`] is pre-bound to a platform store name
@@ -990,6 +1051,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use validator::Validate;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct AppStateFixture {
+        name: String,
+    }
 
     #[derive(Debug, Deserialize, PartialEq)]
     struct FormData {
@@ -2399,5 +2465,68 @@ mod tests {
                 "field_path names the violating secret field: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn state_extractor_resolves_registered_value() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(Arc::new(AppStateFixture {
+            name: "demo".to_owned(),
+        }));
+        let ctx = RequestContext::new(request, PathParams::default());
+
+        let state =
+            block_on(State::<Arc<AppStateFixture>>::from_request(&ctx)).expect("state present");
+
+        // Deref: State<Arc<AppStateFixture>> -> Arc<AppStateFixture> -> AppStateFixture
+        assert_eq!(state.name, "demo");
+    }
+
+    #[test]
+    fn state_extractor_missing_registration_is_internal_error() {
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        let ctx = RequestContext::new(request, PathParams::default());
+
+        // `.err().expect(..)` (not `expect_err`) so we don't require
+        // `State<T>: Debug` — extractors here mirror Json/Path and omit it.
+        let err = block_on(State::<Arc<AppStateFixture>>::from_request(&ctx))
+            .err()
+            .expect("missing state must surface as an error, not a default");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn state_extractor_deref_and_into_inner() {
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(AppStateFixture {
+            name: "x".to_owned(),
+        });
+        let ctx = RequestContext::new(request, PathParams::default());
+
+        let state = block_on(State::<AppStateFixture>::from_request(&ctx)).expect("state present");
+        assert_eq!(
+            *state,
+            AppStateFixture {
+                name: "x".to_owned()
+            }
+        ); // Deref
+        assert_eq!(
+            state.into_inner(),
+            AppStateFixture {
+                name: "x".to_owned()
+            }
+        );
     }
 }
