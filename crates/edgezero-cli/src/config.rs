@@ -2789,6 +2789,70 @@ deep = true
     /// the resolved value in the secret store. Stripping the field would
     /// cause `ConfigOutOfDate` on every request after a push.
     #[test]
+    fn build_config_envelope_preserves_nested_and_array_secret_names() {
+        use edgezero_core::blob_envelope::BlobEnvelope;
+
+        // Push serialises the typed struct verbatim, so nested + array secret
+        // KEY NAMES must survive into envelope.data at their full path — the
+        // runtime walk reads them there. (`build_config_envelope` only needs
+        // `Serialize`.)
+        #[derive(Debug, Serialize)]
+        struct DataDome {
+            server_side_key: String,
+        }
+        #[derive(Debug, Serialize)]
+        struct Integrations {
+            datadome: DataDome,
+        }
+        #[derive(Debug, Serialize)]
+        struct Partner {
+            api_key: String,
+        }
+        #[derive(Debug, Serialize)]
+        struct NestedPushConfig {
+            integrations: Integrations,
+            partners: Vec<Partner>,
+        }
+
+        let typed = NestedPushConfig {
+            integrations: Integrations {
+                datadome: DataDome {
+                    server_side_key: "dd_key".to_owned(),
+                },
+            },
+            partners: vec![
+                Partner {
+                    api_key: "p0".to_owned(),
+                },
+                Partner {
+                    api_key: "p1".to_owned(),
+                },
+            ],
+        };
+
+        let json = build_config_envelope(&typed).expect("envelope serialises");
+        let envelope: BlobEnvelope = serde_json::from_str(&json).expect("envelope parses");
+        assert_eq!(
+            envelope.data["integrations"]["datadome"]["server_side_key"].as_str(),
+            Some("dd_key"),
+            "nested secret key name must survive at its path: {:?}",
+            envelope.data
+        );
+        assert_eq!(
+            envelope.data["partners"][0]["api_key"].as_str(),
+            Some("p0"),
+            "array secret key name (element 0) must survive: {:?}",
+            envelope.data
+        );
+        assert_eq!(
+            envelope.data["partners"][1]["api_key"].as_str(),
+            Some("p1"),
+            "array secret key name (element 1) must survive: {:?}",
+            envelope.data
+        );
+    }
+
+    #[test]
     fn build_config_envelope_preserves_secret_field_values() {
         use edgezero_core::blob_envelope::BlobEnvelope;
 
@@ -3611,6 +3675,82 @@ ids = ["default"]
     // -------------------------------------------------------------------
     // Medium 1 — diff runs typed_secret_checks + adapter_typed_checks
     // -------------------------------------------------------------------
+
+    /// A NESTED `#[secret]` that is present but empty must be caught by the
+    /// path-aware `typed_secret_checks` on `diff` — before any remote read —
+    /// and the error must name the dotted path.
+    #[test]
+    fn diff_typed_rejects_empty_nested_secret() {
+        #[derive(Debug, Deserialize, Serialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct DiffInner {
+            server_side_key: String,
+        }
+        #[derive(Debug, Deserialize, Serialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct DiffNestedConfig {
+            greeting: String,
+            #[validate(nested)]
+            integrations: DiffInner,
+        }
+        impl AppConfigMeta for DiffNestedConfig {
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![
+                        SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                        SecretPathSegment::Field(Cow::Borrowed("server_side_key")),
+                    ],
+                    optional: false,
+                }]
+            }
+        }
+
+        let app_config = r#"
+greeting = "hello"
+
+[integrations]
+server_side_key = ""
+"#;
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, app_config);
+        let diff_args = ConfigDiffArgs {
+            adapter: "axum".to_owned(),
+            app_config: None,
+            exit_code: false,
+            format: DiffFormat::Unified,
+            key: None,
+            local: false,
+            manifest: manifest_path.clone(),
+            no_env: true,
+            runtime_config: None,
+            store: None,
+        };
+        // The nested empty secret must be rejected by the path-aware
+        // typed_secret_checks before the remote-read step, naming the path.
+        let err = run_config_diff_typed::<DiffNestedConfig>(&diff_args)
+            .expect_err("empty nested #[secret] must be rejected by diff typed_secret_checks");
+        assert!(
+            err.contains("integrations.server_side_key") && err.contains("non-empty"),
+            "error names the nested dotted secret path: {err}"
+        );
+    }
 
     /// Medium 1 — spec 3.3.2: `run_config_diff_typed` must run the same
     /// structural checks as push, including `typed_secret_checks`.  A
