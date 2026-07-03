@@ -1,4 +1,5 @@
-use crate::args::NewArgs;
+use crate::args::{NewArgs, ProvisionArgs};
+use crate::provision::run_provision;
 use crate::scaffold::{
     register_templates, resolve_dep_line, sanitize_crate_name, write_tmpl, ResolvedDependency,
     ScaffoldError,
@@ -41,6 +42,19 @@ pub enum GeneratorError {
     /// The target output directory already exists; refusing to overwrite.
     #[error("directory '{}' already exists", .0.display())]
     OutputDirExists(PathBuf),
+    /// The scaffold's per-adapter local-provision step failed. Emitted
+    /// when [`generate_new`] calls [`crate::run_provision`] for each
+    /// adapter declared in the newly generated `edgezero.toml` and one
+    /// of those calls returns an error. Carries the failing adapter's
+    /// id so operators can tell WHICH adapter's synthesise / line
+    /// writer blew up without having to re-run the loop by hand.
+    ///
+    /// The wrapped payload is a `String` (matching `run_provision`'s
+    /// error type) rather than a `Box<dyn Error>`; that lets us name
+    /// it as a distinct field (`reason`, not `source`) so thiserror
+    /// doesn't try to treat it as a nested `std::error::Error`.
+    #[error("scaffold provision failed for adapter `{adapter}`: {reason}")]
+    ProvisionFailed { adapter: String, reason: String },
     /// A template under the workspace scaffold could not be rendered or
     /// written. Wraps [`ScaffoldError`] for context.
     #[error(transparent)]
@@ -234,6 +248,7 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
     let data_value = Value::Object(data_map);
 
     render_templates(&layout, &adapter_artifacts.contexts, &data_value)?;
+    provision_all_selected_adapters(&layout.out_dir, &adapter_artifacts.adapter_ids)?;
     initialize_git_repo(&layout.out_dir);
 
     log::info!(
@@ -776,6 +791,48 @@ fn render_templates(
         }
     }
 
+    Ok(())
+}
+
+/// Run `run_provision --local` once per adapter declared in the
+/// newly generated project's manifest.
+///
+/// This is the scaffold-time counterpart of the operator running
+/// `edgezero provision --adapter <id> --local` after the fact: it
+/// drives each adapter's `synthesise_baseline_manifest` +
+/// local-provision writers so a fresh `edgezero new` output has its
+/// per-adapter local files populated (wrangler.toml, .dev.vars,
+/// spin.toml, runtime-config.toml, spin's `.env`, axum's
+/// `.edgezero/.env`, fastly's `[local_server.*]` entries) without a
+/// second command.
+///
+/// Uses the UNTYPED [`run_provision`] on purpose. The generator has
+/// no downstream `C` type in scope — typed-secret placeholders
+/// (`SPIN_VARIABLE_*` etc.) land later, when the operator first runs
+/// the generated downstream CLI's `provision` (which routes through
+/// `run_provision_typed`).
+///
+/// `ProvisionArgs` is `#[non_exhaustive]`. We build it via
+/// `Default::default()` + per-field assignment (using `clone_from`
+/// where the source is a reference, per `assigning_clones`) rather
+/// than struct-update syntax so a future field addition doesn't
+/// silently regress the default-value contract.
+fn provision_all_selected_adapters(
+    project_root: &Path,
+    adapter_ids: &[String],
+) -> Result<(), GeneratorError> {
+    let manifest_path = project_root.join("edgezero.toml");
+    for adapter_id in adapter_ids {
+        let mut prov_args = ProvisionArgs::default();
+        prov_args.adapter.clone_from(adapter_id);
+        prov_args.local = true;
+        prov_args.dry_run = false;
+        prov_args.manifest.clone_from(&manifest_path);
+        run_provision(&prov_args).map_err(|reason| GeneratorError::ProvisionFailed {
+            adapter: adapter_id.clone(),
+            reason,
+        })?;
+    }
     Ok(())
 }
 
@@ -1360,6 +1417,106 @@ mod tests {
         assert!(
             !main.contains("edgezero_cli::run_provision(&args)"),
             "<name>-cli main.rs must NOT call untyped run_provision: {main}"
+        );
+    }
+
+    /// Task 31: after `generate_new` returns, every adapter declared
+    /// in the generated `edgezero.toml` must have already run its
+    /// local-mode `provision`, so the Cloudflare and Spin per-crate
+    /// files (synthesised platform manifests + `.env`-style line
+    /// writers) exist on disk without a second command.
+    #[test]
+    fn generate_new_provisions_cloudflare_and_spin_scaffold_artifacts() {
+        let temp = TempDir::new().expect("temp dir");
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+        };
+
+        generate_new(&args).expect("scaffold succeeds");
+
+        let project_dir = temp.path().join("demo-app");
+        let cf_crate = project_dir.join("crates/demo-app-adapter-cloudflare");
+        let spin_crate = project_dir.join("crates/demo-app-adapter-spin");
+
+        assert!(
+            cf_crate.join("wrangler.toml").exists(),
+            "cloudflare wrangler.toml must be synthesised at scaffold time"
+        );
+        assert!(
+            cf_crate.join(".dev.vars").exists(),
+            "cloudflare .dev.vars must be created at scaffold time (line writer)"
+        );
+        assert!(
+            spin_crate.join("spin.toml").exists(),
+            "spin spin.toml must be synthesised at scaffold time"
+        );
+        assert!(
+            spin_crate.join("runtime-config.toml").exists(),
+            "spin runtime-config.toml must be synthesised at scaffold time"
+        );
+        assert!(
+            spin_crate.join(".env").exists(),
+            "spin per-crate .env must be created at scaffold time (line writer)"
+        );
+    }
+
+    /// Task 31: after `generate_new` returns, the axum adapter's
+    /// local-state directory (`.edgezero/`) and its `.env`
+    /// placeholder file must already exist at the project root,
+    /// courtesy of the scaffold-time provision loop dispatching to
+    /// the axum adapter's local writer.
+    #[test]
+    fn generate_new_provisions_axum_dot_edgezero_env() {
+        let temp = TempDir::new().expect("temp dir");
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+        };
+
+        generate_new(&args).expect("scaffold succeeds");
+
+        let project_dir = temp.path().join("demo-app");
+        assert!(
+            project_dir.join(".edgezero").is_dir(),
+            ".edgezero/ must exist post-scaffold when axum is in the adapter set"
+        );
+        assert!(
+            project_dir.join(".edgezero/.env").exists(),
+            ".edgezero/.env must be seeded by axum's local provision writer"
+        );
+    }
+
+    /// Task 31: when any adapter's provision call fails, the error
+    /// bubbles out of the loop with the failing adapter's id, so
+    /// operators can tell WHICH adapter blew up. Exercised via a
+    /// direct call to the helper with a project root that has no
+    /// `edgezero.toml` — `run_provision`'s manifest loader fails
+    /// immediately and the loop wraps the error in
+    /// `GeneratorError::ProvisionFailed { adapter, .. }`.
+    #[test]
+    fn provision_all_selected_adapters_surfaces_adapter_name_on_failure() {
+        let temp = TempDir::new().expect("temp dir");
+        let project_root = temp.path();
+        // Deliberately do NOT create edgezero.toml — `run_provision`
+        // will fail at `ManifestLoader::from_path`.
+        let err = provision_all_selected_adapters(project_root, &["axum".to_owned()])
+            .expect_err("provision must fail without a manifest");
+        let GeneratorError::ProvisionFailed { adapter, reason } = &err else {
+            panic!("expected ProvisionFailed, got {err:?}");
+        };
+        assert_eq!(adapter, "axum", "must name the failing adapter");
+        assert!(
+            !reason.is_empty(),
+            "wrapped reason must carry the underlying error"
+        );
+        // Display string also carries the adapter name.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("axum"),
+            "Display must surface failing adapter name: {msg}"
         );
     }
 }
