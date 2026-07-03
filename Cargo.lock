@@ -825,6 +825,7 @@ name = "edgezero-macros"
 version = "0.1.0"
 dependencies = [
  "edgezero-core",
+ "futures",
  "log",
  "proc-macro2",
  "quote",
