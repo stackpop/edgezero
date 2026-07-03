@@ -2486,7 +2486,7 @@ ids = ["default"]
         // Regression: `#[secret(store_ref)]` values are logical
         // store ids (resolved at runtime), not Spin variable names —
         // they must not enter the Spin collision set. Earlier the
-        // walker treated every SECRET_FIELDS entry as a potential
+        // walker treated every secret_fields() entry as a potential
         // Spin var, so a perfectly valid `vault = "default"` plus a
         // config key whose flattened name happened to be `default`
         // would falsely trip a collision.
