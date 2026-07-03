@@ -6,7 +6,7 @@ use http::header;
 use serde::de::DeserializeOwned;
 use validator::Validate;
 
-use crate::app_config::{AppConfigMeta, SecretKind};
+use crate::app_config::{AppConfigMeta, SecretKind, SecretPathSegment};
 use crate::blob_envelope::BlobEnvelope;
 use crate::config_store::ConfigStoreHandle;
 use crate::context::RequestContext;
@@ -881,7 +881,7 @@ where
     Ok(cfg)
 }
 
-/// Walk `C::SECRET_FIELDS` and replace each `#[secret]` key NAME in `data`
+/// Walk `C::secret_fields()` and replace each `#[secret]` key NAME in `data`
 /// with the resolved secret VALUE from the appropriate secret store.
 ///
 /// `StoreRef` fields are skipped — their value is a store id, not a key.
@@ -892,14 +892,25 @@ where
     let data_obj = data
         .as_object_mut()
         .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("blob `data` is not a JSON object")))?;
-    for field in C::SECRET_FIELDS {
+    for field in C::secret_fields() {
+        // Task 1: top-level only — the leaf is the single Field segment.
+        let leaf_key = match field.path.last() {
+            Some(SecretPathSegment::Field(name)) => name.clone().into_owned(),
+            _ => {
+                return Err(EdgeError::internal(anyhow::anyhow!(
+                    "secret field `{}` has no field leaf",
+                    field.dotted_path()
+                )))
+            }
+        };
+        let hint = field.dotted_path();
         let key_name = data_obj
-            .get(field.name)
+            .get(leaf_key.as_str())
             .and_then(|val| val.as_str())
             .ok_or_else(|| {
                 EdgeError::config_out_of_date(
-                    format!("missing or non-string value at `{}`", field.name),
-                    field.name.to_owned(),
+                    format!("missing or non-string value at `{hint}`"),
+                    hint.clone(),
                 )
             })?
             .to_owned();
@@ -908,11 +919,10 @@ where
                 let bound = ctx.secret_store_default().ok_or_else(|| {
                     EdgeError::config_out_of_date(
                         format!(
-                            "secret field `{}` has kind KeyInDefault but no default secret \
+                            "secret field `{hint}` has kind KeyInDefault but no default secret \
                              store is registered",
-                            field.name,
                         ),
-                        field.name.to_owned(),
+                        hint.clone(),
                     )
                 })?;
                 let id = bound.store_name().to_owned();
@@ -926,10 +936,9 @@ where
                     .ok_or_else(|| {
                         EdgeError::config_out_of_date(
                             format!(
-                                "missing store_ref `{store_ref_field}` for secret field `{}`",
-                                field.name
+                                "missing store_ref `{store_ref_field}` for secret field `{hint}`"
                             ),
-                            field.name.to_owned(),
+                            hint.clone(),
                         )
                     })?
                     .to_owned();
@@ -939,7 +948,7 @@ where
                             "blob declared store_ref `{store_id_str}` but \
                              [stores.secrets] has no such id"
                         ),
-                        field.name.to_owned(),
+                        hint.clone(),
                     )
                 })?;
                 (bound, store_id_str)
@@ -948,8 +957,8 @@ where
         let secret = bound
             .require_str(&key_name)
             .await
-            .map_err(|err| map_secret_error(err, field.name, &resolved_store_id, &key_name))?;
-        data_obj.insert(field.name.to_owned(), serde_json::Value::String(secret));
+            .map_err(|err| map_secret_error(err, &hint, &resolved_store_id, &key_name))?;
+        data_obj.insert(leaf_key, serde_json::Value::String(secret));
     }
     Ok(())
 }
@@ -1037,7 +1046,7 @@ fn first_violating_field(errors: &validator::ValidationErrors) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_config::{AppConfigMeta, SecretField, SecretKind};
+    use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
     use crate::blob_envelope::BlobEnvelope;
     use crate::body::Body;
     use crate::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
@@ -1048,6 +1057,7 @@ mod tests {
     use crate::store_registry::StoreRegistry;
     use futures::executor::block_on;
     use serde::{Deserialize, Serialize};
+    use std::borrow::Cow;
     use std::collections::HashMap;
     use std::sync::Arc;
     use validator::Validate;
@@ -1113,7 +1123,9 @@ mod tests {
     }
 
     impl AppConfigMeta for FixtureCfg {
-        const SECRET_FIELDS: &'static [SecretField] = &[];
+        fn secret_fields() -> Vec<SecretField> {
+            vec![]
+        }
     }
 
     // Fixture config type with one KeyInDefault secret field. Used by AppConfig<C> tests.
@@ -1126,10 +1138,13 @@ mod tests {
     }
 
     impl AppConfigMeta for SecretCfg {
-        const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-            name: "api_token",
-            kind: SecretKind::KeyInDefault,
-        }];
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInDefault,
+                path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                optional: false,
+            }]
+        }
     }
 
     fn ctx(body: Body, params: PathParams) -> RequestContext {
@@ -2393,10 +2408,13 @@ mod tests {
         }
 
         impl AppConfigMeta for SecretLen {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "api_token",
-                kind: SecretKind::KeyInDefault,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
 
         struct BlobStore(String);
@@ -2434,10 +2452,13 @@ mod tests {
         }
 
         impl AppConfigMeta for SecretLen {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "api_token",
-                kind: SecretKind::KeyInDefault,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
 
         struct BlobStore(String);

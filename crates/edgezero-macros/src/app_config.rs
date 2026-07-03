@@ -141,10 +141,15 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
                 })
             }
         };
+        // Task 1: length-1 Field path, non-optional. Task 4 sets `optional`
+        // from Option<String> and prepends nested/array segments.
         quote! {
             ::edgezero_core::app_config::SecretField {
-                name: #name_lit,
                 kind: #kind_tokens,
+                path: ::std::vec![::edgezero_core::app_config::SecretPathSegment::Field(
+                    ::std::borrow::Cow::Borrowed(#name_lit)
+                )],
+                optional: false,
             }
         }
     });
@@ -154,8 +159,9 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
         impl #impl_generics ::edgezero_core::app_config::AppConfigMeta
             for #struct_ident #type_generics #where_clause
         {
-            const SECRET_FIELDS: &'static [::edgezero_core::app_config::SecretField] =
-                &[#(#entries),*];
+            fn secret_fields() -> ::std::vec::Vec<::edgezero_core::app_config::SecretField> {
+                ::std::vec![#(#entries),*]
+            }
         }
 
         #[automatically_derived]

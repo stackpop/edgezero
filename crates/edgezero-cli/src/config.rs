@@ -25,7 +25,7 @@ use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
 use edgezero_core::app_config::{
-    self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind,
+    self, AppConfigError, AppConfigLoadOptions, AppConfigMeta, SecretKind, SecretPathSegment,
 };
 use edgezero_core::blob_envelope::BlobEnvelope;
 use edgezero_core::env_config::EnvConfig;
@@ -1305,19 +1305,26 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
         .as_ref()
         .map(StoreDeclaration::default_id);
     let mut entries: Vec<TypedSecretEntry<'_>> = Vec::new();
-    for field in C::SECRET_FIELDS {
+    for field in C::secret_fields() {
+        // Task 1: flat/length-1 paths only — the leaf is the single Field
+        // segment. Task 6 makes this a full TOML path navigator.
+        let leaf = field.dotted_path();
+        let key = match field.path.last() {
+            Some(SecretPathSegment::Field(name)) => name.as_ref(),
+            _ => continue,
+        };
         match field.kind {
             SecretKind::KeyInDefault => {
-                let opt_value = raw_table.get(field.name).and_then(Value::as_str);
+                let opt_value = raw_table.get(key).and_then(Value::as_str);
                 if let (Some(key_value), Some(store_id)) = (opt_value, default_store_id) {
-                    entries.push(TypedSecretEntry::new(store_id, field.name, key_value));
+                    entries.push(TypedSecretEntry::new(store_id, leaf.clone(), key_value));
                 }
             }
             SecretKind::KeyInNamedStore { store_ref_field } => {
                 let opt_store = raw_table.get(store_ref_field).and_then(Value::as_str);
-                let opt_value = raw_table.get(field.name).and_then(Value::as_str);
+                let opt_value = raw_table.get(key).and_then(Value::as_str);
                 if let (Some(store_id), Some(key_value)) = (opt_store, opt_value) {
-                    entries.push(TypedSecretEntry::new(store_id, field.name, key_value));
+                    entries.push(TypedSecretEntry::new(store_id, leaf.clone(), key_value));
                 }
             }
             SecretKind::StoreRef => {}
@@ -1345,22 +1352,26 @@ fn typed_secret_checks<C: AppConfigMeta>(
         .as_table()
         .ok_or_else(|| "raw app-config was not a TOML table after load".to_owned())?;
 
-    for field in C::SECRET_FIELDS {
-        let value = raw_table
-            .get(field.name)
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "{}: `#[secret]` field `{}` is missing or not a string at the top level",
-                    ctx.app_config_path.display(),
-                    field.name
-                )
-            })?;
+    for field in C::secret_fields() {
+        // Task 1: flat/length-1 paths only — the leaf is the single Field
+        // segment. Task 6 makes this a full TOML path navigator.
+        let leaf = field.dotted_path();
+        let key = match field.path.last() {
+            Some(SecretPathSegment::Field(name)) => name.as_ref(),
+            _ => continue,
+        };
+        let value = raw_table.get(key).and_then(Value::as_str).ok_or_else(|| {
+            format!(
+                "{}: `#[secret]` field `{}` is missing or not a string at the top level",
+                ctx.app_config_path.display(),
+                leaf
+            )
+        })?;
         if value.is_empty() {
             return Err(format!(
                 "{}: `#[secret]` field `{}` must be non-empty",
                 ctx.app_config_path.display(),
-                field.name
+                leaf
             ));
         }
         match field.kind {
@@ -1369,7 +1380,7 @@ fn typed_secret_checks<C: AppConfigMeta>(
                     return Err(format!(
                         "{}: `#[secret]` field `{}` requires `[stores.secrets]` to be declared in {}",
                         ctx.app_config_path.display(),
-                        field.name,
+                        leaf,
                         ctx.manifest_path.display()
                     ));
                 }
@@ -1382,7 +1393,7 @@ fn typed_secret_checks<C: AppConfigMeta>(
                     return Err(format!(
                         "{}: `#[secret(store_ref = \"...\")]` field `{}` requires `[stores.secrets]` to be declared in {}",
                         ctx.app_config_path.display(),
-                        field.name,
+                        leaf,
                         ctx.manifest_path.display()
                     ));
                 }
@@ -1392,7 +1403,7 @@ fn typed_secret_checks<C: AppConfigMeta>(
                     format!(
                         "{}: `#[secret(store_ref)]` field `{}` requires `[stores.secrets]` to be declared in {}",
                         ctx.app_config_path.display(),
-                        field.name,
+                        leaf,
                         ctx.manifest_path.display()
                     )
                 })?;
@@ -1400,7 +1411,7 @@ fn typed_secret_checks<C: AppConfigMeta>(
                     return Err(format!(
                         "{}: `#[secret(store_ref)]` field `{}` = {:?} is not in [stores.secrets].ids ({:?})",
                         ctx.app_config_path.display(),
-                        field.name,
+                        leaf,
                         value,
                         secrets.ids
                     ));
@@ -1545,6 +1556,7 @@ mod tests {
     use crate::test_support::{manifest_guard, EnvOverride};
     use edgezero_core::app_config::SecretField;
     use serde::{Deserialize, Serialize};
+    use std::borrow::Cow;
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::fs;
@@ -1647,16 +1659,20 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     }
 
     impl AppConfigMeta for FixtureConfig {
-        const SECRET_FIELDS: &'static [SecretField] = &[
-            SecretField {
-                kind: SecretKind::KeyInDefault,
-                name: "api_token",
-            },
-            SecretField {
-                kind: SecretKind::StoreRef,
-                name: "vault",
-            },
-        ];
+        fn secret_fields() -> Vec<SecretField> {
+            vec![
+                SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                },
+                SecretField {
+                    kind: SecretKind::StoreRef,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("vault"))],
+                    optional: false,
+                },
+            ]
+        }
     }
 
     fn setup_project(manifest: &str, app_config: &str) -> (TempDir, PathBuf, PathBuf) {
@@ -1864,10 +1880,13 @@ serve = "echo"
             greeting: String,
         }
         impl AppConfigMeta for SecretValidatorConfig {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                kind: SecretKind::KeyInDefault,
-                name: "api_token",
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
 
         let app_config = r#"
@@ -2202,16 +2221,20 @@ ids = ["default"]
             vault: String,
         }
         impl AppConfigMeta for StoreRefRegressionConfig {
-            const SECRET_FIELDS: &'static [SecretField] = &[
-                SecretField {
-                    kind: SecretKind::KeyInDefault,
-                    name: "api_token",
-                },
-                SecretField {
-                    kind: SecretKind::StoreRef,
-                    name: "vault",
-                },
-            ];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![
+                    SecretField {
+                        kind: SecretKind::KeyInDefault,
+                        path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                        optional: false,
+                    },
+                    SecretField {
+                        kind: SecretKind::StoreRef,
+                        path: vec![SecretPathSegment::Field(Cow::Borrowed("vault"))],
+                        optional: false,
+                    },
+                ]
+            }
         }
 
         let manifest = r#"
@@ -2744,10 +2767,13 @@ default = "one"
             greeting: String,
         }
         impl AppConfigMeta for SecretValidatorConfig {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                kind: SecretKind::KeyInDefault,
-                name: "api_token",
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
 
         let app_config = r#"
@@ -3313,10 +3339,13 @@ ids = ["default"]
             greeting: String,
         }
         impl AppConfigMeta for DiffSecretConfig {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                kind: SecretKind::KeyInDefault,
-                name: "api_token",
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
 
         let app_config_empty_secret = r#"

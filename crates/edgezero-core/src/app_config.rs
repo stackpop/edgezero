@@ -14,6 +14,7 @@
 //!   [`load_app_config_raw_with_options`].
 
 use std::any;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -27,24 +28,61 @@ use toml::value::Datetime;
 use toml::Value;
 use validator::{Validate, ValidationErrors};
 
-/// Per-field metadata emitted by `#[derive(AppConfig)]`. The
-/// derive enumerates every field annotated with `#[secret]` /
-/// `#[secret(store_ref)]`; `config validate` and `config push`
-/// reflect over this array to gate secret-aware behaviour.
-pub trait AppConfigMeta {
-    /// Every `#[secret]` / `#[secret(store_ref)]` field on the struct.
-    const SECRET_FIELDS: &'static [SecretField];
+/// One segment of a [`SecretField`] path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecretPathSegment {
+    /// Every element of an array/`Vec` at this position.
+    ArrayEach,
+    /// An object key — a Rust field name, verbatim (no `serde(rename)`).
+    Field(Cow<'static, str>),
 }
 
 /// One field's worth of secret-annotation metadata.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The `path` locates the secret leaf from the config root. A top-level
+/// scalar has a length-1 path `[Field("api_token")]`.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretField {
-    /// Whether the field's value is a key in the default secret store
-    /// or the logical id of a `[stores.secrets]` entry.
+    /// Which secret-store resolution this field participates in.
     pub kind: SecretKind,
-    /// Rust field name verbatim (no `serde(rename)` translation —
-    /// `#[secret]` rejects renames at compile time).
-    pub name: &'static str,
+    /// `true` for `#[secret]` on `Option<String>`: an absent leaf is
+    /// skipped by the runtime walk instead of erroring.
+    pub optional: bool,
+    /// Path from the config root to the secret leaf.
+    pub path: Vec<SecretPathSegment>,
+}
+
+impl SecretField {
+    /// Human-readable dotted path for error messages and CLI output.
+    /// `ArrayEach` renders as `[*]` (the static form); the runtime walk
+    /// renders per-index `[n]` as it descends.
+    #[inline]
+    #[must_use]
+    pub fn dotted_path(&self) -> String {
+        let mut out = String::new();
+        for segment in &self.path {
+            match segment {
+                SecretPathSegment::Field(name) => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(name);
+                }
+                SecretPathSegment::ArrayEach => out.push_str("[*]"),
+            }
+        }
+        out
+    }
+}
+
+/// Per-field metadata emitted by `#[derive(AppConfig)]`. `config validate`
+/// / `config push` and the runtime secret walk reflect over this to gate
+/// secret-aware behaviour.
+pub trait AppConfigMeta {
+    /// Every `#[secret]` / `#[secret(store_ref)]` leaf on the struct,
+    /// including those reached through `#[app_config(nested)]` children,
+    /// each carrying its full path from this struct's root.
+    fn secret_fields() -> Vec<SecretField>;
 }
 
 /// Discriminator on a [`SecretField`] capturing which secret-store
@@ -209,15 +247,16 @@ pub fn validate_excluding_secrets<C: validator::Validate + AppConfigMeta>(
         return Ok(());
     };
     // validator 0.20 exposes errors_mut() -> &mut HashMap<Cow<'static, str>, ValidationErrorsKind>.
-    // `bag.remove(field.name)` works because `field.name` is `&'static str`
-    // and `Cow<'static, str>: Borrow<str>` (the earlier comment cited the
-    // wrong key type — this is the corrected form).
     let bag = errors.errors_mut();
-    for field in C::SECRET_FIELDS {
+    for field in C::secret_fields() {
         if matches!(field.kind, SecretKind::StoreRef) {
             continue; // store_id field; validator stays
         }
-        bag.remove(field.name);
+        // Task 1: flat removal by the first path segment (length-1 paths only
+        // exist until the derive emits nesting). Task 3 makes this nested-aware.
+        if let Some(SecretPathSegment::Field(name)) = field.path.first() {
+            bag.remove(name.as_ref());
+        }
     }
     if bag.is_empty() {
         return Ok(());
@@ -618,7 +657,9 @@ mod tests {
     }
 
     impl AppConfigMeta for FixtureConfig {
-        const SECRET_FIELDS: &'static [SecretField] = &[];
+        fn secret_fields() -> Vec<SecretField> {
+            vec![]
+        }
     }
 
     fn write_fixture(contents: &str) -> NamedTempFile {
@@ -1104,7 +1145,9 @@ greeting = "hello"
         }
         // Hand-rolled AppConfigMeta — matches the same shape as the rest of this test.
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![]
+            }
         }
         impl validator::Validate for Fixture {
             fn validate(&self) -> Result<(), validator::ValidationErrors> {
@@ -1136,7 +1179,9 @@ greeting = "hello"
             greeting: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![]
+            }
         }
         let cfg = Fixture {
             greeting: "hello".into(),
@@ -1154,10 +1199,13 @@ greeting = "hello"
             greeting: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "api_token",
-                kind: SecretKind::KeyInDefault,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
         let cfg = Fixture {
             api_token: "short".into(),
@@ -1179,10 +1227,13 @@ greeting = "hello"
             greeting: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "api_token",
-                kind: SecretKind::KeyInDefault,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
         let cfg = Fixture {
             api_token: "x".into(),
@@ -1199,15 +1250,56 @@ greeting = "hello"
             store_id: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "store_id",
-                kind: SecretKind::StoreRef,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::StoreRef,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("store_id"))],
+                    optional: false,
+                }]
+            }
         }
         let cfg = Fixture {
             store_id: "short".into(),
         };
         // StoreRef keeps its validator — short store_id still fails.
         validate_excluding_secrets(&cfg).unwrap_err();
+    }
+
+    #[test]
+    fn dotted_path_renders_nested_and_array_segments() {
+        use super::{SecretField, SecretKind, SecretPathSegment::*};
+        use std::borrow::Cow;
+
+        let top = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![Field(Cow::Borrowed("api_token"))],
+            optional: false,
+        };
+        assert_eq!(top.dotted_path(), "api_token");
+
+        let nested = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                Field(Cow::Borrowed("integrations")),
+                Field(Cow::Borrowed("datadome")),
+                Field(Cow::Borrowed("server_side_key")),
+            ],
+            optional: false,
+        };
+        assert_eq!(
+            nested.dotted_path(),
+            "integrations.datadome.server_side_key"
+        );
+
+        let array = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                Field(Cow::Borrowed("partners")),
+                ArrayEach,
+                Field(Cow::Borrowed("api_key")),
+            ],
+            optional: false,
+        };
+        assert_eq!(array.dotted_path(), "partners[*].api_key");
     }
 }

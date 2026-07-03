@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod tests {
-    use edgezero_core::app_config::{AppConfigMeta as _, AppConfigRoot, SecretField, SecretKind};
+    use edgezero_core::app_config::{AppConfigMeta, AppConfigRoot, SecretKind};
 
     #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
     #[serde(deny_unknown_fields)]
@@ -66,46 +66,43 @@ mod tests {
         vault: String,
     }
 
+    /// Reflect each derived `SecretField` down to the tuple the
+    /// assertions compare: `(dotted_path, kind, optional)`.
+    fn reflect<C: AppConfigMeta>() -> Vec<(String, SecretKind, bool)> {
+        C::secret_fields()
+            .into_iter()
+            .map(|field| (field.dotted_path(), field.kind, field.optional))
+            .collect()
+    }
+
     #[test]
     fn no_secret_annotation_yields_empty_secret_fields() {
-        assert!(ConfigNoSecrets::SECRET_FIELDS.is_empty());
+        assert!(ConfigNoSecrets::secret_fields().is_empty());
     }
 
     #[test]
     fn plain_secret_attribute_yields_key_in_default() {
         assert_eq!(
-            ConfigKeyInDefault::SECRET_FIELDS,
-            &[SecretField {
-                name: "api_token",
-                kind: SecretKind::KeyInDefault,
-            }]
+            reflect::<ConfigKeyInDefault>(),
+            vec![("api_token".to_owned(), SecretKind::KeyInDefault, false)]
         );
     }
 
     #[test]
     fn secret_store_ref_attribute_yields_store_ref() {
         assert_eq!(
-            ConfigStoreRef::SECRET_FIELDS,
-            &[SecretField {
-                name: "vault",
-                kind: SecretKind::StoreRef,
-            }]
+            reflect::<ConfigStoreRef>(),
+            vec![("vault".to_owned(), SecretKind::StoreRef, false)]
         );
     }
 
     #[test]
     fn both_secret_kinds_are_collected_in_source_order() {
         assert_eq!(
-            ConfigBothKinds::SECRET_FIELDS,
-            &[
-                SecretField {
-                    name: "api_token",
-                    kind: SecretKind::KeyInDefault,
-                },
-                SecretField {
-                    name: "vault",
-                    kind: SecretKind::StoreRef,
-                },
+            reflect::<ConfigBothKinds>(),
+            vec![
+                ("api_token".to_owned(), SecretKind::KeyInDefault, false),
+                ("vault".to_owned(), SecretKind::StoreRef, false),
             ]
         );
     }
@@ -113,18 +110,16 @@ mod tests {
     #[test]
     fn key_in_named_store_attribute_yields_correct_secret_fields() {
         assert_eq!(
-            ConfigKeyInNamedStore::SECRET_FIELDS,
-            &[
-                SecretField {
-                    name: "api_token",
-                    kind: SecretKind::KeyInNamedStore {
+            reflect::<ConfigKeyInNamedStore>(),
+            vec![
+                (
+                    "api_token".to_owned(),
+                    SecretKind::KeyInNamedStore {
                         store_ref_field: "vault",
                     },
-                },
-                SecretField {
-                    name: "vault",
-                    kind: SecretKind::StoreRef,
-                },
+                    false,
+                ),
+                ("vault".to_owned(), SecretKind::StoreRef, false),
             ]
         );
     }
