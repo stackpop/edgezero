@@ -2005,4 +2005,206 @@ mod tests {
             );
         }
     }
+
+    // ---------- Task 41: per-adapter provision_local_ contract suite ----------
+    //
+    // These four tests pin the Axum-specific contract for Section 9's
+    // "local provision" arm. Unlike the other adapters, Axum has no
+    // synthesised adapter manifest to assert against — axum.toml is
+    // operator-owned. The load-bearing regression is test #2:
+    // `provision_local_does_not_touch_axum_toml`. If a future refactor
+    // ever starts synthesising or merging axum.toml, that assertion
+    // flips and the CI signal is immediate.
+
+    #[test]
+    fn provision_local_creates_dot_edgezero_dir() {
+        // Empty fixture: `.edgezero/` does not pre-exist and no stores
+        // are declared. Local provision must still create the directory
+        // so the runtime has a well-known location to read the `.env`
+        // file from at boot.
+        let dir = tempdir().unwrap();
+        assert!(
+            !dir.path().join(".edgezero").exists(),
+            "sanity: .edgezero/ must NOT pre-exist"
+        );
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        AxumCliAdapter
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        assert!(
+            dir.path().join(".edgezero").is_dir(),
+            ".edgezero/ must exist as a directory after local provision"
+        );
+    }
+
+    #[test]
+    fn provision_local_does_not_touch_axum_toml() {
+        // Load-bearing invariant: unlike cloudflare/fastly/spin, Axum's
+        // adapter manifest (`axum.toml`) is operator-owned and tracked.
+        // Provision MUST NOT synthesise, merge, or otherwise rewrite
+        // it. The assertion is a byte-identical comparison against a
+        // distinctive sentinel — a regression that silently starts
+        // touching axum.toml will flip this.
+        let dir = tempdir().unwrap();
+        let axum_toml = dir.path().join("axum.toml");
+        let sentinel =
+            b"[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\n# operator-authored do not touch\n";
+        fs::write(&axum_toml, sentinel).unwrap();
+        let config_ids = ResolvedStoreId::from_logicals(&["app_config"]);
+        let kv_ids = ResolvedStoreId::from_logicals(&["sessions"]);
+        let secret_ids = ResolvedStoreId::from_logicals(&["default"]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        AxumCliAdapter
+            .provision(
+                dir.path(),
+                Some("axum.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let after = fs::read(&axum_toml).unwrap();
+        assert_eq!(
+            after,
+            sentinel.to_vec(),
+            "axum.toml must be byte-for-byte unchanged (Axum-exception invariant)"
+        );
+    }
+
+    #[test]
+    fn provision_local_writes_env_name_lines() {
+        // Fixture: one store per kind. Local provision must:
+        //   - write `.edgezero/.env` starting with the provenance
+        //     header (Section 5 review fix — `# edgezero-provision: v1`);
+        //   - emit one `__NAME` line per kind (KV / CONFIG / SECRETS);
+        //   - emit a commented `__KEY` placeholder for CONFIG only.
+        let dir = tempdir().unwrap();
+        let config_ids = ResolvedStoreId::from_logicals(&["app_config"]);
+        let kv_ids = ResolvedStoreId::from_logicals(&["sessions"]);
+        let secret_ids = ResolvedStoreId::from_logicals(&["default"]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &kv_ids,
+            secrets: &secret_ids,
+        };
+        AxumCliAdapter
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env = fs::read_to_string(dir.path().join(".edgezero/.env")).unwrap();
+        assert!(
+            env.starts_with("# edgezero-provision: v1"),
+            ".env must start with the provenance header: {env}"
+        );
+        assert!(
+            env.contains("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME=app_config"),
+            "config __NAME line present: {env}"
+        );
+        assert!(
+            env.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=sessions"),
+            "kv __NAME line present: {env}"
+        );
+        assert!(
+            env.contains("EDGEZERO__STORES__SECRETS__DEFAULT__NAME=default"),
+            "secrets __NAME line present: {env}"
+        );
+        assert!(
+            env.contains("# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging"),
+            "commented __KEY placeholder present for CONFIG only: {env}"
+        );
+    }
+
+    #[test]
+    fn re_provision_preserves_operator_env_edits() {
+        // First provision writes the base `.edgezero/.env` (including
+        // the commented `__KEY` placeholder). The operator uncomments
+        // AND edits the line to point at their own override value.
+        // Re-running provision must NOT re-add the commented form and
+        // MUST leave the operator's uncommented line byte-identical
+        // (Task 16c dedup semantics — key-normalised uncommented
+        // form wins over any commented sibling).
+        let dir = tempdir().unwrap();
+        let config_ids = ResolvedStoreId::from_logicals(&["app_config"]);
+        let stores = ProvisionStores {
+            config: &config_ids,
+            kv: &[],
+            secrets: &[],
+        };
+        AxumCliAdapter
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let env_path = dir.path().join(".edgezero/.env");
+        let first = fs::read_to_string(&env_path).unwrap();
+        assert!(
+            first.contains("# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging"),
+            "first-run must seed the commented placeholder: {first}"
+        );
+
+        // Operator uncomments AND edits the value.
+        let operator_line = "EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=my_local_override";
+        let edited = first.replace(
+            "# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=app_config_staging",
+            operator_line,
+        );
+        fs::write(&env_path, &edited).unwrap();
+
+        AxumCliAdapter
+            .provision(
+                dir.path(),
+                None,
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .unwrap();
+        let after = fs::read_to_string(&env_path).unwrap();
+        let matching: Vec<&str> = after
+            .lines()
+            .filter(|line| *line == operator_line)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "operator's uncommented override line must survive byte-identical: {after}"
+        );
+        assert!(
+            !after.contains("# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY="),
+            "commented placeholder must NOT be re-added when uncommented form exists: {after}"
+        );
+    }
 }
