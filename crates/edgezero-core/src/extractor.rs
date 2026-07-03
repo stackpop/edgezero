@@ -1,12 +1,14 @@
 use std::any;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 
 use async_trait::async_trait;
 use http::header;
 use serde::de::DeserializeOwned;
 use validator::Validate;
 
-use crate::app_config::{AppConfigMeta, SecretKind, SecretPathSegment};
+use crate::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use crate::blob_envelope::BlobEnvelope;
 use crate::config_store::ConfigStoreHandle;
 use crate::context::RequestContext;
@@ -889,77 +891,159 @@ async fn secret_walk<C>(ctx: &RequestContext, data: &mut serde_json::Value) -> R
 where
     C: AppConfigMeta,
 {
-    let data_obj = data
-        .as_object_mut()
-        .ok_or_else(|| EdgeError::internal(anyhow::anyhow!("blob `data` is not a JSON object")))?;
     for field in C::secret_fields() {
-        // Task 1: top-level only — the leaf is the single Field segment.
-        let leaf_key = match field.path.last() {
-            Some(SecretPathSegment::Field(name)) => name.clone().into_owned(),
-            _ => {
-                return Err(EdgeError::internal(anyhow::anyhow!(
-                    "secret field `{}` has no field leaf",
-                    field.dotted_path()
-                )))
-            }
-        };
-        let hint = field.dotted_path();
-        let key_name = data_obj
-            .get(leaf_key.as_str())
-            .and_then(|val| val.as_str())
-            .ok_or_else(|| {
-                EdgeError::config_out_of_date(
-                    format!("missing or non-string value at `{hint}`"),
-                    hint.clone(),
-                )
-            })?
-            .to_owned();
-        let (bound, resolved_store_id) = match field.kind {
-            SecretKind::KeyInDefault => {
-                let bound = ctx.secret_store_default().ok_or_else(|| {
-                    EdgeError::config_out_of_date(
-                        format!(
-                            "secret field `{hint}` has kind KeyInDefault but no default secret \
-                             store is registered",
-                        ),
-                        hint.clone(),
-                    )
-                })?;
-                let id = bound.store_name().to_owned();
-                (bound, id)
-            }
-            SecretKind::StoreRef => continue,
-            SecretKind::KeyInNamedStore { store_ref_field } => {
-                let store_id_str = data_obj
-                    .get(store_ref_field)
-                    .and_then(|val| val.as_str())
-                    .ok_or_else(|| {
-                        EdgeError::config_out_of_date(
-                            format!(
-                                "missing store_ref `{store_ref_field}` for secret field `{hint}`"
-                            ),
-                            hint.clone(),
-                        )
-                    })?
-                    .to_owned();
-                let bound = ctx.secret_store(&store_id_str).ok_or_else(|| {
-                    EdgeError::config_out_of_date(
-                        format!(
-                            "blob declared store_ref `{store_id_str}` but \
-                             [stores.secrets] has no such id"
-                        ),
-                        hint.clone(),
-                    )
-                })?;
-                (bound, store_id_str)
-            }
-        };
-        let secret = bound
-            .require_str(&key_name)
-            .await
-            .map_err(|err| map_secret_error(err, &hint, &resolved_store_id, &key_name))?;
-        data_obj.insert(leaf_key, serde_json::Value::String(secret));
+        resolve_secret_field(ctx, data, &field, &field.path, String::new()).await?;
     }
+    Ok(())
+}
+
+/// Recursively descend `remaining` path segments from `node`, resolving the
+/// secret leaf(s). `rendered` is the dotted path so far (with concrete `[n]`
+/// indices) for error hints.
+fn resolve_secret_field<'walk>(
+    ctx: &'walk RequestContext,
+    node: &'walk mut serde_json::Value,
+    field: &'walk SecretField,
+    remaining: &'walk [SecretPathSegment],
+    rendered: String,
+) -> Pin<Box<dyn Future<Output = Result<(), EdgeError>> + 'walk>> {
+    Box::pin(async move {
+        match remaining.split_first() {
+            // Leaf reached: `node` is the PARENT object; the last Field is the key.
+            Some((SecretPathSegment::Field(name), [])) => {
+                resolve_leaf(ctx, node, field, name.as_ref(), &rendered).await
+            }
+            // Descend into an object key.
+            Some((SecretPathSegment::Field(name), rest)) => {
+                let next_rendered = join_field(&rendered, name.as_ref());
+                match node.get_mut(name.as_ref()) {
+                    // Absent optional subtree: key missing OR serialized as null.
+                    None | Some(serde_json::Value::Null) if field.optional => Ok(()),
+                    Some(child) => {
+                        resolve_secret_field(ctx, child, field, rest, next_rendered).await
+                    }
+                    None => Err(EdgeError::config_out_of_date(
+                        format!("missing or non-object value at `{next_rendered}`"),
+                        next_rendered,
+                    )),
+                }
+            }
+            // Iterate every array element.
+            Some((SecretPathSegment::ArrayEach, rest)) => {
+                let Some(items) = node.as_array_mut() else {
+                    if field.optional {
+                        return Ok(());
+                    }
+                    return Err(EdgeError::config_out_of_date(
+                        format!("expected an array at `{rendered}`"),
+                        rendered,
+                    ));
+                };
+                for (idx, item) in items.iter_mut().enumerate() {
+                    let indexed = format!("{rendered}[{idx}]");
+                    resolve_secret_field(ctx, item, field, rest, indexed).await?;
+                }
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    })
+}
+
+fn join_field(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+/// Resolve one leaf: `parent` is the innermost containing object; `key` is the
+/// secret field name; `store_ref_field` (for `KeyInNamedStore`) is a sibling
+/// within `parent`.
+async fn resolve_leaf(
+    ctx: &RequestContext,
+    parent: &mut serde_json::Value,
+    field: &SecretField,
+    key: &str,
+    rendered_parent: &str,
+) -> Result<(), EdgeError> {
+    if matches!(field.kind, SecretKind::StoreRef) {
+        return Ok(()); // store id, not a secret key
+    }
+    let leaf_path = join_field(rendered_parent, key);
+
+    let Some(parent_obj) = parent.as_object_mut() else {
+        if field.optional {
+            return Ok(());
+        }
+        return Err(EdgeError::config_out_of_date(
+            format!("expected an object containing `{key}` at `{rendered_parent}`"),
+            leaf_path,
+        ));
+    };
+
+    let key_name = match parent_obj.get(key) {
+        Some(serde_json::Value::String(name)) => name.clone(),
+        // An optional secret is absent when the key is MISSING *or* serialized
+        // as JSON `null`. serde emits `Option::None` as `null` (and `#[secret]`
+        // bans `skip_serializing_if`, so the key is never omitted), so both
+        // cases must skip — not just the missing-key case.
+        None | Some(serde_json::Value::Null) if field.optional => return Ok(()),
+        _ => {
+            return Err(EdgeError::config_out_of_date(
+                format!("missing or non-string value at `{leaf_path}`"),
+                leaf_path,
+            ))
+        }
+    };
+
+    let (bound, resolved_store_id) = match field.kind {
+        SecretKind::KeyInDefault => {
+            let bound = ctx.secret_store_default().ok_or_else(|| {
+                EdgeError::config_out_of_date(
+                    format!(
+                        "secret field `{leaf_path}` has kind KeyInDefault but no default secret \
+                         store is registered"
+                    ),
+                    leaf_path.clone(),
+                )
+            })?;
+            let id = bound.store_name().to_owned();
+            (bound, id)
+        }
+        SecretKind::StoreRef => return Ok(()),
+        SecretKind::KeyInNamedStore { store_ref_field } => {
+            let store_id_str = parent_obj
+                .get(store_ref_field)
+                .and_then(|val| val.as_str())
+                .ok_or_else(|| {
+                    EdgeError::config_out_of_date(
+                        format!(
+                            "missing store_ref `{store_ref_field}` for secret field `{leaf_path}`"
+                        ),
+                        leaf_path.clone(),
+                    )
+                })?
+                .to_owned();
+            let bound = ctx.secret_store(&store_id_str).ok_or_else(|| {
+                EdgeError::config_out_of_date(
+                    format!(
+                        "blob declared store_ref `{store_id_str}` but \
+                         [stores.secrets] has no such id"
+                    ),
+                    leaf_path.clone(),
+                )
+            })?;
+            (bound, store_id_str)
+        }
+    };
+
+    let secret = bound
+        .require_str(&key_name)
+        .await
+        .map_err(|err| map_secret_error(err, &leaf_path, &resolved_store_id, &key_name))?;
+    parent_obj.insert(key.to_owned(), serde_json::Value::String(secret));
     Ok(())
 }
 
@@ -1143,6 +1227,68 @@ mod tests {
                 kind: SecretKind::KeyInDefault,
                 path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
                 optional: false,
+            }]
+        }
+    }
+
+    // Array leaf: partners[*].api_key
+    struct ArrayCfg;
+    impl AppConfigMeta for ArrayCfg {
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInDefault,
+                path: vec![
+                    SecretPathSegment::Field(Cow::Borrowed("partners")),
+                    SecretPathSegment::ArrayEach,
+                    SecretPathSegment::Field(Cow::Borrowed("api_key")),
+                ],
+                optional: false,
+            }]
+        }
+    }
+
+    // Nested KeyInNamedStore: vaulted.token resolves against the store named by
+    // its SIBLING vaulted.vault (the sibling-in-innermost-parent scoping rule).
+    struct NamedStoreCfg;
+    impl AppConfigMeta for NamedStoreCfg {
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInNamedStore {
+                    store_ref_field: "vault",
+                },
+                path: vec![
+                    SecretPathSegment::Field(Cow::Borrowed("vaulted")),
+                    SecretPathSegment::Field(Cow::Borrowed("token")),
+                ],
+                optional: false,
+            }]
+        }
+    }
+
+    // Nested object leaf: integrations.datadome.server_side_key
+    struct NestedCfg;
+    impl AppConfigMeta for NestedCfg {
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInDefault,
+                path: vec![
+                    SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                    SecretPathSegment::Field(Cow::Borrowed("datadome")),
+                    SecretPathSegment::Field(Cow::Borrowed("server_side_key")),
+                ],
+                optional: false,
+            }]
+        }
+    }
+
+    // Optional top-level leaf: maybe_key
+    struct OptionalCfg;
+    impl AppConfigMeta for OptionalCfg {
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInDefault,
+                path: vec![SecretPathSegment::Field(Cow::Borrowed("maybe_key"))],
+                optional: true,
             }]
         }
     }
@@ -2303,6 +2449,126 @@ mod tests {
                 "field_path names the secret field: {err:?}"
             );
         }
+    }
+
+    // Build a RequestContext whose default secret store maps `default/{key}` ->
+    // `value`, for exercising `secret_walk` directly.
+    fn ctx_with_default_secret_store(key: &str, value: &str) -> RequestContext {
+        ctx_with_default_secret_store_map(&[(key, value)])
+    }
+
+    // Multi-entry variant of `ctx_with_default_secret_store`.
+    fn ctx_with_default_secret_store_map(entries: &[(&str, &str)]) -> RequestContext {
+        let store = InMemorySecretStore::new(entries.iter().map(|(key, value)| {
+            (
+                format!("default/{key}"),
+                bytes::Bytes::from((*value).to_owned()),
+            )
+        }));
+        let bound = BoundSecretStore::new(SecretHandle::new(Arc::new(store)), "default".to_owned());
+        let registry: SecretRegistry = StoreRegistry::single_id("default".to_owned(), bound);
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/cfg")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+        RequestContext::new(request, PathParams::default())
+    }
+
+    // Build a RequestContext whose secret store `store_id` maps
+    // `{store_id}/{key}` -> `value`, resolvable via `ctx.secret_store(store_id)`.
+    fn ctx_with_named_secret_store(store_id: &str, key: &str, value: &str) -> RequestContext {
+        let store = InMemorySecretStore::new([(
+            format!("{store_id}/{key}"),
+            bytes::Bytes::from(value.to_owned()),
+        )]);
+        let bound = BoundSecretStore::new(SecretHandle::new(Arc::new(store)), store_id.to_owned());
+        let registry: SecretRegistry = StoreRegistry::single_id(store_id.to_owned(), bound);
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/cfg")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(registry);
+        RequestContext::new(request, PathParams::default())
+    }
+
+    #[test]
+    fn secret_walk_resolves_nested_object_leaf() {
+        let ctx = ctx_with_default_secret_store("dd_key", "resolved-dd");
+        let mut data = serde_json::json!({
+            "integrations": { "datadome": { "server_side_key": "dd_key" } }
+        });
+        block_on(secret_walk::<NestedCfg>(&ctx, &mut data)).expect("walk");
+        assert_eq!(
+            data["integrations"]["datadome"]["server_side_key"],
+            serde_json::json!("resolved-dd")
+        );
+    }
+
+    #[test]
+    fn secret_walk_resolves_each_array_element() {
+        let ctx = ctx_with_default_secret_store_map(&[("k0", "v0"), ("k1", "v1")]);
+        let mut data = serde_json::json!({
+            "partners": [ { "api_key": "k0" }, { "api_key": "k1" } ]
+        });
+        block_on(secret_walk::<ArrayCfg>(&ctx, &mut data)).expect("walk");
+        assert_eq!(data["partners"][0]["api_key"], serde_json::json!("v0"));
+        assert_eq!(data["partners"][1]["api_key"], serde_json::json!("v1"));
+    }
+
+    #[test]
+    fn secret_walk_resolves_nested_named_store_via_sibling_in_parent() {
+        let ctx = ctx_with_named_secret_store("named", "tok_key", "TOK");
+        let mut data = serde_json::json!({
+            "vaulted": { "token": "tok_key", "vault": "named" }
+        });
+        block_on(secret_walk::<NamedStoreCfg>(&ctx, &mut data)).expect("walk");
+        assert_eq!(data["vaulted"]["token"], serde_json::json!("TOK"));
+        // The store_ref sibling is left intact (it names a store, not a secret).
+        assert_eq!(data["vaulted"]["vault"], serde_json::json!("named"));
+    }
+
+    #[test]
+    fn secret_walk_nested_named_store_missing_sibling_errors_with_dotted_path() {
+        let ctx = ctx_with_named_secret_store("named", "tok_key", "TOK");
+        let mut data = serde_json::json!({ "vaulted": { "token": "tok_key" } }); // no `vault`
+        let err = block_on(secret_walk::<NamedStoreCfg>(&ctx, &mut data))
+            .expect_err("missing store_ref sibling");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.to_string().contains("vaulted.token"));
+    }
+
+    #[test]
+    fn secret_walk_skips_absent_optional_leaf() {
+        let ctx = ctx_with_default_secret_store("unused", "unused");
+        let mut data = serde_json::json!({ "greeting": "hi" }); // no maybe_key
+        block_on(secret_walk::<OptionalCfg>(&ctx, &mut data)).expect("absent optional is fine");
+        assert!(data.get("maybe_key").is_none());
+    }
+
+    #[test]
+    fn secret_walk_skips_null_optional_leaf() {
+        // serde serializes `Option::None` as JSON `null` (the key is present,
+        // not omitted). The walk must skip a null optional leaf, not error it.
+        let ctx = ctx_with_default_secret_store("unused", "unused");
+        let mut data = serde_json::json!({ "maybe_key": null });
+        block_on(secret_walk::<OptionalCfg>(&ctx, &mut data))
+            .expect("null optional is skipped, not treated as non-string");
+        assert_eq!(data["maybe_key"], serde_json::json!(null)); // left untouched
+    }
+
+    #[test]
+    fn secret_walk_missing_required_nested_leaf_errors_with_dotted_path() {
+        let ctx = ctx_with_default_secret_store("dd_key", "resolved-dd");
+        let mut data = serde_json::json!({ "integrations": { "datadome": {} } });
+        let err = block_on(secret_walk::<NestedCfg>(&ctx, &mut data))
+            .expect_err("missing required nested leaf");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err
+            .to_string()
+            .contains("integrations.datadome.server_side_key"));
     }
 
     #[test]
