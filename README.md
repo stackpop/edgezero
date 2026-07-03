@@ -28,6 +28,7 @@ Full documentation is available at **[stackpop.github.io/edgezero](https://stack
 - [Configuration](https://stackpop.github.io/edgezero/guide/configuration) - `edgezero.toml` reference
 - [CLI Reference](https://stackpop.github.io/edgezero/guide/cli-reference) - All CLI commands
 - [Blob App-Config Migration](https://stackpop.github.io/edgezero/guide/blob-app-config-migration) - Typed `AppConfig<C>` extractor + `config push` / `config diff` workflow
+- [Deploy with GitHub Actions](https://stackpop.github.io/edgezero/guide/deploy-github-actions) - Full-SHA-pinned Fastly deploy action
 
 ## Supported Platforms
 

@@ -27,6 +27,10 @@ export default defineConfig({
           { text: 'What is EdgeZero?', link: '/guide/what-is-edgezero' },
           { text: 'Getting Started', link: '/guide/getting-started' },
           { text: 'Architecture', link: '/guide/architecture' },
+          {
+            text: 'Deploy with GitHub Actions',
+            link: '/guide/deploy-github-actions',
+          },
           { text: 'Roadmap', link: '/guide/roadmap' },
         ],
       },
