@@ -279,12 +279,13 @@ edgezero provision --adapter <name> [--manifest <path>] [--local] [--dry-run]
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--local` — synthesise/refresh the adapter's local manifest
   (Cloudflare `wrangler.toml`, Fastly `fastly.toml`, Spin
-  `spin.toml` + `runtime-config.toml`, Axum `axum.toml`) plus its
-  companion `.env` / `.dev.vars` / `.edgezero/.env` files, merging
-  per-store bindings from `edgezero.toml`. **No cloud shell-outs.**
-  Safe to re-run: bindings are upserted, existing operator edits
-  are preserved. `edgezero new` runs this for every selected
-  adapter as part of scaffolding, so fresh clones only need
+  `spin.toml` + `runtime-config.toml`) plus its companion `.env` /
+  `.dev.vars` / `.edgezero/.env` files, merging per-store bindings
+  from `edgezero.toml`. Axum's `axum.toml` is scaffolded from the
+  template and is never touched by `provision`. **No cloud
+  shell-outs.** Safe to re-run: bindings are upserted, existing
+  operator edits are preserved. `edgezero new` runs this for every
+  selected adapter as part of scaffolding, so fresh clones only need
   `provision --local` (not the cloud-touching form) to get back to
   a runnable local state.
 - `--dry-run` — print what each adapter _would_ do without

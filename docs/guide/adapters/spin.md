@@ -44,17 +44,21 @@ edits (extra bindings, tuned scheduler settings, etc.) stay local
 until you hand-share them. **Axum's `axum.toml` stays tracked**
 because it's the operator-authored manifest for the native dev server.
 
-To run Spin directly with the crate-local `.env` picked up, cd into
-the Spin adapter crate so `spin up` sources it from the working
-directory:
+The `edgezero serve --adapter spin` path loads
+`<spin_crate>/.env` into the parent process environment before
+spawning `spin up`, so the placeholders reach the child. If you
+prefer to invoke `spin up` yourself, export the crate-local `.env`
+into your shell first — `spin up` does not itself source dotenv
+files:
 
 ```bash
 cd crates/my-app-adapter-spin
+set -a && source .env && set +a
 spin up --runtime-config-file runtime-config.toml
 ```
 
-(`spin up` reads `.env` from its cwd — running from the workspace
-root without `cd` would miss the placeholders.)
+(Or use a dotenv-aware wrapper like `direnv` / `dotenvx`. `edgezero
+serve` handles this for you.)
 :::
 
 ### Entrypoint

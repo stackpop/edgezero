@@ -40,16 +40,18 @@ This generates a workspace with:
 As part of `edgezero new`, the scaffolder runs `provision --adapter <name> --local`
 for every selected adapter, so the fresh workspace already has each adapter's
 baseline local manifest (`wrangler.toml`, `fastly.toml`, `spin.toml` +
-`runtime-config.toml`, `axum.toml`) and its accompanying `.env` /
-`.dev.vars` / `.edgezero/.env` files written out. You don't need to run
+`runtime-config.toml`) and its accompanying `.env` / `.dev.vars` /
+`.edgezero/.env` files written out. Axum's `axum.toml` is scaffolded from
+the template (not by `provision`) and stays tracked. You don't need to run
 `provision` manually before the first `serve`.
 
 ::: tip Cloudflare / Fastly / Spin manifests are gitignored
 The generated `.gitignore` excludes `wrangler.toml`, `fastly.toml`,
-`spin.toml`, `runtime-config.toml`, and `.dev.vars` — teammates
-regenerate them by running `my-app-cli provision --adapter <name> --local`
+`spin.toml`, `runtime-config.toml`, `.dev.vars`, `.env`, and `.edgezero/`
+— teammates regenerate them by running `my-app-cli provision --adapter <name> --local`
 after cloning. **Axum's `axum.toml` stays tracked** because it's the
-operator-authored manifest for the native dev server.
+operator-authored manifest for the native dev server; `provision` never
+touches it.
 :::
 
 ## Run Your App Locally
