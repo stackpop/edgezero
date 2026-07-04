@@ -614,17 +614,17 @@ pub(crate) fn merge_deployed_into_manifest(
     owned_fields: &[&str],
     dry_run: bool,
 ) -> Result<(), String> {
-    // The canonical `ManifestAdapterDeployed` schema. If the struct
-    // gains a field, add it here too — the check is the ONLY defense
-    // against adapter-emitted unknown fields corrupting the writeback.
-    const KNOWN_SCALAR_FIELDS: &[&str] = &["service_id"];
-    const KNOWN_SUB_TABLE_FIELDS: &[&str] = &["kv_namespaces", "preview_kv_namespaces"];
+    // The canonical `ManifestAdapterDeployed` schema — the field
+    // arrays live on the struct itself in `edgezero_core::manifest`
+    // so this check tracks the schema without a hand-copied duplicate
+    // list to drift.
+    use edgezero_core::manifest::ManifestAdapterDeployed;
 
     for key in state.fields.keys() {
-        if !KNOWN_SCALAR_FIELDS.contains(&key.as_str()) {
+        if !ManifestAdapterDeployed::SCALAR_FIELDS.contains(&key.as_str()) {
             return Err(format!(
                 "adapter `{adapter_name}` returned unknown deployed field `{key}` (known scalar fields: [{}])",
-                KNOWN_SCALAR_FIELDS.join(", ")
+                ManifestAdapterDeployed::SCALAR_FIELDS.join(", ")
             ));
         }
         if !owned_fields.contains(&key.as_str()) {
@@ -635,10 +635,10 @@ pub(crate) fn merge_deployed_into_manifest(
         }
     }
     for key in state.sub_tables.keys() {
-        if !KNOWN_SUB_TABLE_FIELDS.contains(&key.as_str()) {
+        if !ManifestAdapterDeployed::SUB_TABLE_FIELDS.contains(&key.as_str()) {
             return Err(format!(
                 "adapter `{adapter_name}` returned unknown deployed sub-table `{key}` (known sub-tables: [{}])",
-                KNOWN_SUB_TABLE_FIELDS.join(", ")
+                ManifestAdapterDeployed::SUB_TABLE_FIELDS.join(", ")
             ));
         }
         if !owned_fields.contains(&key.as_str()) {

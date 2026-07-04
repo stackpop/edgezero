@@ -394,6 +394,18 @@ pub struct ManifestAdapterDeployed {
 }
 
 impl ManifestAdapterDeployed {
+    /// Scalar field names in this schema. Consumed by the CLI writeback
+    /// path to reject adapter-emitted unknown scalar keys before they
+    /// land in `edgezero.toml`. Adding a new scalar field to the struct
+    /// above REQUIRES adding it here — the two arrays live in the same
+    /// impl block deliberately so the coupling is unmissable.
+    pub const SCALAR_FIELDS: &'static [&'static str] = &["service_id"];
+
+    /// Sub-table field names in this schema. Same rule as
+    /// [`Self::SCALAR_FIELDS`].
+    pub const SUB_TABLE_FIELDS: &'static [&'static str] =
+        &["kv_namespaces", "preview_kv_namespaces"];
+
     /// Return the names of fields that are populated (non-empty
     /// map, or `Some` value). Used by the CLI to cross-check
     /// against `Adapter::deployed_fields` — but the mapping of
