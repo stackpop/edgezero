@@ -30,7 +30,7 @@ pub(super) fn provision(
     deployed: Option<&AdapterDeployedState>,
     dry_run: bool,
 ) -> Result<ProvisionOutcome, String> {
-    use toml_edit::{value, DocumentMut};
+    use toml_edit::DocumentMut;
 
     let fastly_rel = adapter_manifest_path.unwrap_or("fastly.toml");
     let fastly_path = manifest_root.join(fastly_rel);
@@ -53,8 +53,16 @@ pub(super) fn provision(
     //    fastly.toml from a stale template still get the cloud-
     //    authoritative id pinned. No cloud authority => leave any
     //    existing operator-set value alone.
+    //
+    // TOML root-key positioning matters here: once the parsed doc has
+    // any headed sub-table (`[scripts]`, `[local_server]`, …), a naive
+    // `doc.insert("service_id", …)` appends the scalar AFTER those
+    // headers, and the re-serialised file parses the value as
+    // `local_server.service_id`. `upsert_root_scalar_before_tables`
+    // preserves the "scalars before sub-tables" TOML rule regardless
+    // of insertion order.
     if let Some(sid) = deployed.and_then(|state| state.fields.get("service_id")) {
-        doc.insert("service_id", value(sid.as_str()));
+        upsert_root_scalar_before_tables(&mut doc, "service_id", sid.as_str());
         status_lines.push(format!(
             "fastly: pinned service_id = \"{sid}\" from deployed"
         ));
@@ -148,6 +156,47 @@ pub(super) fn provision_typed(
         status_lines,
         deployed: None,
     })
+}
+
+/// Upsert a scalar key at the root of `doc`, guaranteeing it lands
+/// BEFORE any headed sub-table.
+///
+/// TOML root-key rule: once a `[header]` opens a sub-table, every
+/// subsequent `key = "value"` line is parsed as a child of that header.
+/// `toml_edit::DocumentMut::insert` appends at end-of-order, so
+/// inserting a root scalar after the doc has picked up any `[scripts]`
+/// / `[local_server]` header from parse silently produces
+/// `local_server.<key>` on re-emit.
+///
+/// If the key already exists, `insert` preserves its position (the
+/// value cell is overwritten in place), so we only need the reorder
+/// dance in the fresh-insert case: hoist every root-level sub-table
+/// / array-of-tables out, insert the scalar, then re-attach the
+/// tables in original order. Preserves comments and decor on both
+/// the scalar's neighbours and the sub-tables via `toml_edit`'s
+/// per-item decor tracking.
+fn upsert_root_scalar_before_tables(doc: &mut toml_edit::DocumentMut, key: &str, val: &str) {
+    use toml_edit::value;
+    let table = doc.as_table_mut();
+    if table.contains_key(key) {
+        table.insert(key, value(val));
+        return;
+    }
+    let sub_table_keys: Vec<String> = table
+        .iter()
+        .filter(|(_, item)| item.is_table() || item.is_array_of_tables())
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    let mut removed: Vec<(String, toml_edit::Item)> = Vec::with_capacity(sub_table_keys.len());
+    for name in sub_table_keys {
+        if let Some(item) = table.remove(&name) {
+            removed.push((name, item));
+        }
+    }
+    table.insert(key, value(val));
+    for (name, item) in removed {
+        table.insert(&name, item);
+    }
 }
 
 /// Append `[[local_server.kv_stores.<platform_name>]]` with a stub
@@ -870,6 +919,19 @@ mod tests {
         assert!(
             after.contains(r#"service_id = "SVC1""#),
             "deployed service_id pinned into merged manifest: {after}"
+        );
+        // Regression: `toml_edit::DocumentMut::insert` on a doc that
+        // already parsed `[local_server]` was appending `service_id`
+        // AFTER the header, so re-parse read it as
+        // `local_server.service_id` — a silent divergence that
+        // `.contains("service_id = \"SVC1\"")` never caught. Parse the
+        // re-emitted file and assert the key lives at the ROOT.
+        let reparsed: toml_edit::DocumentMut =
+            after.parse().expect("re-parse must succeed after upsert");
+        assert_eq!(
+            reparsed.get("service_id").and_then(toml_edit::Item::as_str),
+            Some("SVC1"),
+            "service_id must live at the TOML root (not as local_server.service_id): {after}"
         );
     }
 

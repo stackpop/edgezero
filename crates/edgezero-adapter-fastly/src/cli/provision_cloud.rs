@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 
-use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores};
+use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
 
 use super::FASTLY_INSTALL_HINT;
 
@@ -155,9 +155,27 @@ pub(super) fn provision(
     if out.is_empty() {
         out.push("fastly has no declared stores to provision".to_owned());
     }
+    // Read-back the service_id from fastly.toml (if the operator has
+    // already run `fastly compute deploy` at least once) and thread it
+    // into ProvisionOutcome.deployed so the CLI's writeback path lands
+    // `[adapters.fastly.deployed].service_id` in `edgezero.toml`.
+    // deployed_fields() advertises ownership of `service_id`; without
+    // this population the writeback is silently dropped and the
+    // operator has to hand-copy from fastly.toml. Dry-run still
+    // populates: the CLI's `merge_deployed_into_manifest` respects
+    // its own dry_run flag and will only report (not write) the
+    // pending edgezero.toml change.
+    let deployed = match read_fastly_service_id(&fastly_path)? {
+        Some(sid) => {
+            let mut state = AdapterDeployedState::default();
+            state.fields.insert("service_id".to_owned(), sid);
+            Some(state)
+        }
+        None => None,
+    };
     Ok(ProvisionOutcome {
         status_lines: out,
-        deployed: None,
+        deployed,
     })
 }
 
@@ -634,6 +652,87 @@ mod tests {
         // Manifest untouched.
         let after = fs::read_to_string(&path).expect("read");
         assert_eq!(after, "name = \"demo\"\n", "dry-run mutated fastly.toml");
+    }
+
+    /// Cloud provision must populate `ProvisionOutcome.deployed` with
+    /// `service_id` when fastly.toml declares it. `deployed_fields()`
+    /// claims ownership of `service_id`; without this the writeback to
+    /// `[adapters.fastly.deployed]` in edgezero.toml is silently
+    /// dropped and the operator has to hand-copy from fastly.toml.
+    ///
+    /// Regression test: pre-`Adapters` fix, the cloud arm unconditionally
+    /// returned `deployed: None`.
+    #[test]
+    fn provision_populates_deployed_service_id_from_fastly_toml() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        // fastly.toml declares a service_id (as it would after a first
+        // successful `fastly compute deploy`).
+        fs::write(
+            &path,
+            "manifest_version = 3\nname = \"demo\"\nservice_id = \"SVC_ALREADY_DEPLOYED\"\n\n[local_server]\n",
+        )
+        .expect("write");
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        let outcome = FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true, // dry-run avoids invoking the real fastly CLI
+            )
+            .expect("dry-run succeeds");
+        let deployed = outcome
+            .deployed
+            .as_ref()
+            .expect("deployed must be Some when fastly.toml declares service_id");
+        assert_eq!(
+            deployed.fields.get("service_id").map(String::as_str),
+            Some("SVC_ALREADY_DEPLOYED"),
+            "service_id must flow into ProvisionOutcome.deployed"
+        );
+    }
+
+    /// Inverse: when `fastly.toml` has no `service_id` (fresh project,
+    /// not yet deployed), cloud provision returns `deployed: None`.
+    /// Nothing to write back -- the operator hasn't picked a service
+    /// yet.
+    #[test]
+    fn provision_returns_none_deployed_when_fastly_toml_has_no_service_id() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("fastly.toml");
+        fs::write(
+            &path,
+            "manifest_version = 3\nname = \"demo\"\n\n[local_server]\n",
+        )
+        .expect("write");
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &[],
+            secrets: &[],
+        };
+        let outcome = FastlyCliAdapter
+            .provision(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
+            .expect("dry-run succeeds");
+        assert!(
+            outcome.deployed.is_none(),
+            "no service_id in fastly.toml means deployed must be None"
+        );
     }
 
     #[test]
