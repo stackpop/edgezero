@@ -345,6 +345,25 @@ where
         for line in outcome.status_lines {
             log::info!("{line}");
         }
+        // Same writeback path as the base run_provision: if the typed
+        // arm surfaced any deployed fields (e.g. cloud secret store
+        // ids captured during typed placeholder emission), merge them
+        // into `[adapters.<name>.deployed]` in edgezero.toml. Today
+        // every impl returns deployed: None so this is a no-op; the
+        // hook exists so a future secrets-store-id capture doesn't
+        // silently leak out the side.
+        if let Some(deployed_writeback) = outcome.deployed.as_ref() {
+            let (canonical_adapter_key, _) = manifest
+                .adapter_entry(&args.adapter)
+                .ok_or_else(|| format!("adapter `{}` vanished from manifest", args.adapter))?;
+            merge_deployed_into_manifest(
+                &args.manifest,
+                canonical_adapter_key,
+                deployed_writeback,
+                adapter.deployed_fields(),
+                args.dry_run,
+            )?;
+        }
         return Ok(());
     }
 
