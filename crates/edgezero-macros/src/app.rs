@@ -14,6 +14,7 @@ struct AppArgs {
     app_ident: Option<Ident>,
     owns_logging: Option<bool>,
     path: LitStr,
+    state: Option<syn::Expr>,
 }
 
 impl Parse for AppArgs {
@@ -21,6 +22,7 @@ impl Parse for AppArgs {
         let path: LitStr = input.parse()?;
         let mut app_ident: Option<Ident> = None;
         let mut owns_logging: Option<bool> = None;
+        let mut state: Option<syn::Expr> = None;
         let mut seen_keyword = false;
 
         while input.peek(Token![,]) {
@@ -42,10 +44,18 @@ impl Parse for AppArgs {
                         let value: syn::LitBool = input.parse()?;
                         owns_logging = Some(value.value);
                     }
+                    "state" => {
+                        if state.is_some() {
+                            return Err(syn::Error::new(key.span(), "duplicate `state` argument"));
+                        }
+                        state = Some(input.parse::<syn::Expr>()?);
+                    }
                     other => {
                         return Err(syn::Error::new(
                             key.span(),
-                            format!("unknown `app!` argument `{other}`; expected `owns_logging`"),
+                            format!(
+                                "unknown `app!` argument `{other}`; expected `state` or `owns_logging`"
+                            ),
                         ));
                     }
                 }
@@ -73,6 +83,7 @@ impl Parse for AppArgs {
             app_ident,
             owns_logging,
             path,
+            state,
         })
     }
 }
@@ -198,6 +209,11 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
     let manifest_path_lit = LitStr::new(&manifest_path.to_string_lossy(), Span::call_site());
     let owns_logging_lit = args.owns_logging.unwrap_or(false);
+    // Emitted only when `state = <expr>` is given; `Option<TokenStream2>: ToTokens`
+    // renders `None` as nothing, so an app without `state` is unchanged.
+    let state_call = args.state.as_ref().map(|state_expr| {
+        quote! { builder = builder.with_state(#state_expr); }
+    });
 
     // The emitted `Hooks` impl below explicitly defines `configure`,
     // `owns_logging`, and `build_app` even though their bodies mirror the trait
@@ -237,6 +253,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
         pub fn build_router() -> edgezero_core::router::RouterService {
             let mut builder = edgezero_core::router::RouterService::builder();
             builder = builder.with_manifest_json(#manifest_json_lit);
+            #state_call
             #(#middleware_tokens)*
             #(#route_tokens)*
             builder.build()
@@ -355,6 +372,37 @@ mod tests {
         assert_eq!(args.path.value(), "edgezero.toml");
         assert!(args.app_ident.is_none());
         assert_eq!(args.owns_logging, None);
+        assert!(args.state.is_none());
+    }
+
+    #[test]
+    fn app_args_parses_state_expr() {
+        let args: AppArgs =
+            parse_str(r#""edgezero.toml", state = crate::app_state()"#).expect("parse");
+        let rendered = args.state.map(|expr| quote::quote!(#expr).to_string());
+        assert_eq!(rendered, Some("crate :: app_state ()".to_owned()));
+        assert!(args.app_ident.is_none());
+        assert_eq!(args.owns_logging, None);
+    }
+
+    #[test]
+    fn app_args_parses_state_with_app_ident_and_owns_logging() {
+        let args: AppArgs =
+            parse_str(r#""edgezero.toml", MyApp, state = crate::app_state(), owns_logging = true"#)
+                .expect("parse");
+        assert_eq!(
+            args.app_ident.map(|ident| ident.to_string()),
+            Some("MyApp".to_owned())
+        );
+        assert_eq!(args.owns_logging, Some(true));
+        assert!(args.state.is_some());
+    }
+
+    #[test]
+    fn app_args_rejects_duplicate_state() {
+        let err = parse_str::<AppArgs>(r#""edgezero.toml", state = a(), state = b()"#)
+            .expect_err("duplicate state");
+        assert!(err.to_string().contains("duplicate `state`"), "got: {err}");
     }
 
     #[test]
