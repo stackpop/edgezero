@@ -31,6 +31,23 @@ struct EdgezeroAxumConfig {
     port: Option<u16>,
 }
 
+/// Emit the baseline `axum.toml` contents for a fresh scaffold /
+/// clean-clone bootstrap. `crate_name` is the adapter crate's
+/// package name (typically `<app>-adapter-axum`). All other fields
+/// use dev-server defaults the operator can edit; provision's
+/// merge path never touches this file after the first write, so
+/// operator edits (custom host, non-default port) survive.
+pub(super) fn synthesise_axum_toml(crate_name: &str) -> String {
+    format!(
+        "# edgezero-provision: v1\n\
+         [adapter]\n\
+         crate = \"{crate_name}\"\n\
+         crate_dir = \".\"\n\
+         host = \"127.0.0.1\"\n\
+         port = 8787\n"
+    )
+}
+
 pub(super) fn build(extra_args: &[String]) -> Result<(), String> {
     let project = locate_project()?;
     run_cargo(&project, "build", extra_args)

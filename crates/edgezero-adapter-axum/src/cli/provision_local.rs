@@ -127,16 +127,20 @@ mod tests {
     }
 
     #[test]
-    fn axum_local_provision_does_not_touch_axum_toml() {
-        // Load-bearing invariant: unlike cloudflare/fastly/spin,
-        // axum's manifest is operator-owned and tracked. Provision
-        // MUST NOT rewrite it. A regression here would silently
-        // start editing files the operator manages by hand.
+    fn axum_local_provision_preserves_existing_axum_toml_content() {
+        // Contract: when axum.toml already exists (operator has
+        // edited host/port or other fields), provision's MERGE path
+        // must NOT rewrite it. The synthesise_baseline_manifest hook
+        // only writes when the file is missing (write_baseline_to_disk
+        // skips existing files); the provision merge itself is a
+        // no-op on axum.toml because Axum has no cloud identifiers
+        // to weave in. Operator edits therefore survive re-runs
+        // byte-identical.
         let dir = tempdir().unwrap();
         let axum_toml = dir.path().join("axum.toml");
-        let sentinel =
-            "[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\n# operator-owned sentinel\n";
-        fs::write(&axum_toml, sentinel).unwrap();
+        let operator_content =
+            "# operator-edited\n[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"0.0.0.0\"\nport = 3000\n";
+        fs::write(&axum_toml, operator_content).unwrap();
         let config_ids = ResolvedStoreId::from_logicals(&["app_config"]);
         let stores = ProvisionStores {
             config: &config_ids,
@@ -155,7 +159,10 @@ mod tests {
             )
             .unwrap();
         let after = fs::read_to_string(&axum_toml).unwrap();
-        assert_eq!(after, sentinel, "axum.toml must be byte-for-byte unchanged");
+        assert_eq!(
+            after, operator_content,
+            "existing axum.toml must be byte-for-byte unchanged after re-provision"
+        );
     }
 
     #[test]
@@ -353,17 +360,19 @@ mod tests {
     }
 
     #[test]
-    fn provision_local_does_not_touch_axum_toml() {
-        // Load-bearing invariant: unlike cloudflare/fastly/spin, Axum's
-        // adapter manifest (`axum.toml`) is operator-owned and tracked.
-        // Provision MUST NOT synthesise, merge, or otherwise rewrite
-        // it. The assertion is a byte-identical comparison against a
-        // distinctive sentinel — a regression that silently starts
-        // touching axum.toml will flip this.
+    fn provision_local_preserves_existing_axum_toml() {
+        // Renamed from `provision_local_does_not_touch_axum_toml`
+        // (2026-07 refactor). Axum's manifest joined the provision-
+        // generated set when `synthesise_baseline_manifest` was wired
+        // up. Provision synthesises a baseline `axum.toml` only when
+        // the file is missing (via `write_baseline_to_disk`); the
+        // adapter's merge path is a no-op because Axum has no cloud
+        // identifiers. Operator edits therefore survive re-runs
+        // byte-identical -- lock this with a distinctive sentinel.
         let dir = tempdir().unwrap();
         let axum_toml = dir.path().join("axum.toml");
         let sentinel =
-            b"[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\n# operator-authored do not touch\n";
+            b"# operator-edited\n[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"0.0.0.0\"\nport = 9090\n";
         fs::write(&axum_toml, sentinel).unwrap();
         let config_ids = ResolvedStoreId::from_logicals(&["app_config"]);
         let kv_ids = ResolvedStoreId::from_logicals(&["sessions"]);
@@ -388,7 +397,7 @@ mod tests {
         assert_eq!(
             after,
             sentinel.to_vec(),
-            "axum.toml must be byte-for-byte unchanged (Axum-exception invariant)"
+            "existing axum.toml must be byte-for-byte unchanged after re-provision"
         );
     }
 

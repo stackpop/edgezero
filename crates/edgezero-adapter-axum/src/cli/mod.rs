@@ -1,16 +1,7 @@
-#![expect(
-    clippy::mod_module_files,
-    reason = "Workspace lint policy denies BOTH `self_named_module_files` (wants `cli/mod.rs`) and `mod_module_files` (wants `cli.rs`) -- they contradict, so any file with submodules must opt out of one. This crate's cli directory uses the `cli/mod.rs` form; allow accordingly."
-)]
-#![expect(
-    clippy::arbitrary_source_item_ordering,
-    reason = "submodule declarations sit between the `use` block and the rest of the file's items by Rust convention; the strict-ordering lint disagrees but no human convention puts `mod` blocks AFTER trait impls"
-)]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ctor::ctor;
 use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
@@ -116,7 +107,7 @@ struct AxumCliAdapter;
 
 #[expect(
     clippy::missing_trait_methods,
-    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `provision_typed` IS overridden below (Local mode appends `<key_value>=` secret placeholders to `.edgezero/.env`; Cloud is a no-op — axum has no cloud secret store)."
+    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `axum.toml` for the clean-clone bootstrap; provision merge is a no-op because Axum has no per-machine identifiers to weave in). `provision_typed` IS overridden below (Local mode appends `<key_value>=` secret placeholders to `.edgezero/.env`; Cloud is a no-op — axum has no cloud secret store)."
 )]
 impl Adapter for AxumCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
@@ -382,6 +373,35 @@ impl Adapter for AxumCliAdapter {
         //: axum is Multi for KV (local file dirs) and Config
         // (local JSON files), Single for Secrets (env vars).
         &["secrets"]
+    }
+
+    fn synthesise_baseline_manifest(
+        &self,
+        _manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        app_name: &str,
+        _deployed: Option<&AdapterDeployedState>,
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        // Axum's manifest is pure operator-facing dev-server config
+        // (host, port, crate name, crate dir). There are no cloud
+        // identifiers to weave in, and provision's merge path is a
+        // no-op on the file. The baseline is emitted so a fresh
+        // clone's `provision --local` gets a runnable `axum.toml`
+        // without needing the operator to hand-author one -- same
+        // model as Cloudflare / Fastly / Spin.
+        let rel = adapter_manifest_path.map_or_else(|| PathBuf::from("axum.toml"), PathBuf::from);
+        // `app_name` is the top-level `[app].name` from
+        // `edgezero.toml`. If the operator hasn't set it yet we fall
+        // back to a placeholder so the file parses; provision will
+        // overwrite the value on the next run (see the shape at
+        // `run::synthesise_axum_toml`).
+        let crate_name = if app_name.is_empty() {
+            "app-adapter-axum".to_owned()
+        } else {
+            format!("{app_name}-adapter-axum")
+        };
+        Ok(vec![(rel, run::synthesise_axum_toml(&crate_name))])
     }
 }
 

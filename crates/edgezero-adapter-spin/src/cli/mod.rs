@@ -1,12 +1,3 @@
-#![expect(
-    clippy::mod_module_files,
-    reason = "Workspace lint policy denies BOTH `self_named_module_files` (wants `cli/mod.rs`) and `mod_module_files` (wants `cli.rs`) -- they contradict, so any file with submodules must opt out of one. This crate's cli directory uses the `cli/mod.rs` form; allow accordingly."
-)]
-#![expect(
-    clippy::arbitrary_source_item_ordering,
-    reason = "submodule declarations sit between the `use` block and the rest of the file's items by Rust convention; the strict-ordering lint disagrees but no human convention puts `mod` blocks AFTER trait impls"
-)]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]

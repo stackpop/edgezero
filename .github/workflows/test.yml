@@ -58,17 +58,16 @@ jobs:
       - name: Nested AppConfig audit
         run: cargo run -q --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates
 
-      # Enforce spec §"Cloudflare / Fastly / Spin manifests are gitignored"
-      # + §"Migration for downstream projects". The four generated adapter
-      # manifests (`wrangler.toml`, `fastly.toml`, `spin.toml`,
+      # Enforce spec §"Adapter manifests are gitignored" + §"Migration for
+      # downstream projects". All five generated adapter manifests
+      # (`axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`,
       # `runtime-config.toml`) and Cloudflare's `.dev.vars` MUST NOT be
       # tracked -- teammates regenerate them locally via
-      # `provision --local`. `axum.toml` is intentionally exempt:
-      # Axum owns its manifest and it stays tracked.
-      - name: Enforce Cloudflare/Fastly/Spin manifests and .dev.vars are not tracked
+      # `provision --local`.
+      - name: Enforce adapter manifests and .dev.vars are not tracked
         run: |
-          if git ls-files | grep -E '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$'; then
-            echo "::error::These adapter manifests AND Cloudflare's .dev.vars must be gitignored (spec §'Cloudflare / Fastly / Spin manifests are gitignored' + §'Migration for downstream projects'). axum.toml is the only adapter manifest that stays tracked. .dev.vars carries operator secret values and must NEVER be committed."
+          if git ls-files | grep -E '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$'; then
+            echo "::error::These adapter manifests AND Cloudflare's .dev.vars must be gitignored (spec §'Adapter manifests are gitignored' + §'Migration for downstream projects'). .dev.vars carries operator secret values and must NEVER be committed."
             exit 1
           fi
 

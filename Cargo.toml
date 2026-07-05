@@ -171,5 +171,25 @@ exhaustive_enums = "allow"
 std_instead_of_alloc = "allow"
 std_instead_of_core = "allow"
 
+# --- Layout / ordering restrictions that fight standard Rust conventions ---
+#
+# `mod_module_files` (deny) requires `cli.rs` sibling to `cli/` (2018
+# layout). We use the `cli/mod.rs` form because it groups the module + its
+# submodules under one directory — more grep-friendly and matches the
+# codebase's four adapter crates. `self_named_module_files` (the opposite
+# lint) would fire the other way. This workspace picks the `mod.rs` form
+# and allows the lint globally with one line here rather than sprinkling
+# a `#![expect]` in every adapter's `cli/mod.rs`.
+mod_module_files = "allow"
+#
+# `arbitrary_source_item_ordering` (deny) enforces a strict order among 5
+# item kinds (module/struct/enum/trait/impl) and its config API can't be
+# tuned for the common patterns this workspace uses: cfg-gated `use` in
+# the middle of a file for test-only helpers, the "declare struct then
+# immediately impl it" convention, and interleaved trait impls between
+# module declarations and statics. Reordering the ~15k lines across four
+# adapter crates to satisfy the lint would be pure churn.
+arbitrary_source_item_ordering = "allow"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
