@@ -451,6 +451,9 @@ Expected: FAIL — the current `AppArgs` has no `owns_logging` field and rejects
 Replace `crates/edgezero-macros/src/app.rs:12-31` with:
 
 ```rust
+// `#[derive(Debug)]` is required: the `app_args_rejects_*` unit tests use
+// `.expect_err(..)`, whose `Ok` arm (`AppArgs`) must be `Debug`.
+#[derive(Debug)]
 struct AppArgs {
     app_ident: Option<Ident>,
     owns_logging: Option<bool>,
@@ -555,15 +558,23 @@ Then create the integration test `crates/edgezero-macros/tests/app_macro.rs`:
 ```rust
 //! Integration coverage: `app!(..., owns_logging = true)` emits a `Hooks` impl
 //! whose `owns_logging()` returns `true`. The manifest path resolves against
-//! this crate's CARGO_MANIFEST_DIR, so the fixture is `tests/fixtures/...`.
+//! this crate's `CARGO_MANIFEST_DIR` (backticks required — `doc_markdown`), so
+//! the fixture is `tests/fixtures/...`.
 
 // The macro emits `pub struct OwnedLoggingApp;`, a `Hooks` impl, and a free
 // `build_router()` at this module scope.
 edgezero_core::app!("tests/fixtures/owns_logging.toml", OwnedLoggingApp, owns_logging = true);
 
-#[test]
-fn app_macro_emits_owns_logging_true() {
-    assert!(<OwnedLoggingApp as edgezero_core::app::Hooks>::owns_logging());
+// `#[test]` must live in a `#[cfg(test)] mod tests` (the `tests_outside_test_module`
+// restriction lint), and `Hooks` must be imported (not a 3-segment path — `absolute_paths`).
+#[cfg(test)]
+mod tests {
+    use edgezero_core::app::Hooks as _;
+
+    #[test]
+    fn app_macro_emits_owns_logging_true() {
+        assert!(super::OwnedLoggingApp::owns_logging());
+    }
 }
 ```
 
