@@ -32,6 +32,10 @@ use fs4::fs_std::FileExt;
 pub(crate) struct ProvisionLock {
     // Kept alive; drop calls `unlock` implicitly via the OS.
     file: File,
+    // Read by the cfg(test) `path()` getter only. In non-test builds
+    // the field is still needed so error diagnostics can name the
+    // lockfile path -- silence dead_code accordingly.
+    #[cfg_attr(not(test), expect(dead_code, reason = "diagnostics-only field"))]
     path: PathBuf,
 }
 
@@ -79,7 +83,7 @@ impl Drop for ProvisionLock {
         // The OS releases the lock on descriptor close, but call
         // `unlock` explicitly so double-close-in-drop doesn't leave a
         // stray flock reference in error paths.
-        let _ = FileExt::unlock(&self.file);
+        drop(FileExt::unlock(&self.file));
         // Note: we do NOT delete the lock file. Deletion races with
         // a peer that has the descriptor open (they'd hold a lock on
         // a nameless file for the rest of their lifetime). Leaving
@@ -92,7 +96,7 @@ mod tests {
     use super::ProvisionLock;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     #[test]
@@ -126,7 +130,7 @@ mod tests {
         });
         // Wait until A has definitely acquired.
         rx.recv().expect("await A");
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         // Thread B tries; must block until A releases.
         let lock_b = ProvisionLock::acquire(&root_b).expect("B acquire");
         let elapsed = start.elapsed();
@@ -144,7 +148,7 @@ mod tests {
         let lock = ProvisionLock::acquire(temp.path()).expect("acquire 1");
         drop(lock);
         // Should be immediately available.
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let _lock2 = ProvisionLock::acquire(temp.path()).expect("acquire 2");
         assert!(
             start.elapsed() < Duration::from_millis(100),

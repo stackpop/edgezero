@@ -862,8 +862,12 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::shared_test_guards::path_mutation_guard;
     use edgezero_core::app_config::app_name_prefix;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     // `super::*` re-exports `env` and `fs` from outer `use` lines, so they're
@@ -872,10 +876,11 @@ mod tests {
     // Holds the shared crate-level PATH guard for the lifetime of the
     // override so scaffold tests running concurrently with config's
     // push-shim tests can't stomp each other's PATH restores.
+
     #[cfg(unix)]
     struct PathOverride {
+        _guard: MutexGuard<'static, ()>,
         original: Option<String>,
-        _guard: std::sync::MutexGuard<'static, ()>,
     }
     #[cfg(not(unix))]
     struct PathOverride {
@@ -885,7 +890,7 @@ mod tests {
     impl PathOverride {
         fn prepend(path: &Path) -> Self {
             #[cfg(unix)]
-            let guard = crate::path_mutation_guard()
+            let guard = path_mutation_guard()
                 .lock()
                 .expect("PATH mutation guard poisoned");
             let original = env::var("PATH").ok();
@@ -1452,9 +1457,8 @@ mod tests {
     /// re-emit" class of bug and only TOML has empty-placeholder
     /// semantics we care about.
     fn walk_toml_templates(root: &Path, visit: &mut dyn FnMut(&Path, &str)) {
-        let entries = match fs::read_dir(root) {
-            Ok(entries) => entries,
-            Err(_) => return,
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1465,7 +1469,9 @@ mod tests {
                     continue;
                 }
                 walk_toml_templates(&path, visit);
-            } else if name_str.ends_with(".toml.hbs") {
+                continue;
+            }
+            if name_str.ends_with(".toml.hbs") {
                 if let Ok(body) = fs::read_to_string(&path) {
                     visit(&path, &body);
                 }

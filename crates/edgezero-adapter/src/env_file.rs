@@ -68,6 +68,21 @@ pub fn append_lines_dedup_with_header(
 
     let mut to_append = String::new();
     for line in new_lines {
+        // Reject embedded newlines: a KEY=VALUE with a `\n` in the
+        // VALUE would split into TWO lines in the emitted file, the
+        // second of which the runtime env-loader picks up as an
+        // arbitrary KEY=VALUE injection (spec §"env-file format
+        // integrity"). The value is either an operator-provided env
+        // override or a placeholder we control; both must be single-
+        // line by contract.
+        if line.contains('\n') || line.contains('\r') {
+            return Err(format!(
+                "refusing to write line-oriented entry with embedded newline/carriage-return to {} -- \
+                 an env-var value with `\\n` or `\\r` would split into multiple lines and let a \
+                 downstream reader see an unintended KEY=VALUE injection",
+                path.display()
+            ));
+        }
         let Some(key) = normalised_key(line) else {
             continue;
         };
@@ -105,7 +120,28 @@ pub fn append_lines_dedup_with_header(
     }
     combined.push_str(&to_append);
     fs::write(path, combined).map_err(|err| format!("write {}: {err}", path.display()))?;
+
+    // Restrictive permissions: `.env` / `.dev.vars` / `.edgezero/.env`
+    // are the operator's secret-carriage files (Cloudflare runtime
+    // secrets, Spin SPIN_VARIABLE_* placeholders, Axum
+    // `<key_value>=` seeds). fs::write creates with mode 0666 & ~umask
+    // which is typically 0644 on Unix -- readable by every other UID
+    // on the host. Tighten to 0600 after the write so only the
+    // invoking user can read the placeholders and any real values the
+    // operator later fills in. Best-effort: a permission-set failure
+    // is not fatal (some filesystems, e.g. NFS mounts, may reject
+    // chmod), but we surface the error string so the operator can
+    // investigate.
+    #[cfg(unix)]
+    set_restrictive_mode(path)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn set_restrictive_mode(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| format!("chmod 0600 {}: {err}", path.display()))
 }
 
 /// Strip at most ONE leading `#` + adjacent whitespace, then
@@ -207,6 +243,57 @@ mod tests {
         assert_eq!(normalised_key("# comment"), None);
         assert_eq!(normalised_key("### header"), None);
         assert_eq!(normalised_key(""), None);
+    }
+
+    #[test]
+    fn rejects_new_lines_with_embedded_newline_to_prevent_env_injection() {
+        // An operator whose env-overlay value contains `\n` would
+        // otherwise split into a second `KEY=VALUE` line on emit,
+        // silently injecting an unintended env-var into the runtime.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        let injection = "EDGEZERO__STORES__KV__SESSIONS__NAME=sess\nMALICIOUS=1".to_owned();
+        let err = append_lines_dedup(&path, &[injection], false)
+            .expect_err("newline in value must be rejected");
+        assert!(
+            err.contains("embedded newline"),
+            "error names the defect: {err}"
+        );
+        // File must not have been written.
+        assert!(
+            !path.exists(),
+            "no file created on rejection: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn rejects_new_lines_with_embedded_carriage_return() {
+        // CR-only injection would work on Windows-style parsers; also
+        // reject so the contract is line-terminator-agnostic.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env");
+        let injection = "KEY=value\rSECOND=2".to_owned();
+        let err = append_lines_dedup(&path, &[injection], false).expect_err("CR must be rejected");
+        assert!(
+            err.contains("carriage-return"),
+            "error names the defect: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn written_file_has_mode_0600_to_protect_operator_secrets() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".dev.vars");
+        append_lines_dedup(&path, &["SECRET_KEY=placeholder".to_owned()], false).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "provision-written env files must be owner-read/write only; got {mode:o}"
+        );
     }
 
     #[test]

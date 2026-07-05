@@ -22,6 +22,7 @@ use crate::args::{ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat
 use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
 use crate::path_safety::{assert_provision_paths_contained, assert_provision_paths_safe};
+use crate::provision_lock::ProvisionLock;
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
@@ -326,10 +327,8 @@ where
             .manifest_path()
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        Some(crate::provision_lock::ProvisionLock::acquire(
-            manifest_root_for_lock,
-        )?)
+            .unwrap_or_else(|| Path::new("."));
+        Some(ProvisionLock::acquire(manifest_root_for_lock)?)
     };
 
     // Path containment: reject `..` traversal and absolute paths in
@@ -1742,8 +1741,6 @@ mod tests {
     #[cfg(unix)]
     use std::ffi::OsString;
     use std::fs;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
     // ---------- shared fixtures ----------
@@ -3245,16 +3242,14 @@ ids = ["default"]
         }
     }
 
-    /// Process-wide mutex serialising PATH-mutating tests so parallel
-    /// Re-export of the crate-level shared guard. Every PATH-mutating
+    /// Alias for the crate-level shared guard. Every PATH-mutating
     /// test module inside this crate MUST take the same mutex, not a
     /// local copy -- `generator.rs::PathOverride` uses this same
-    /// static (via `crate::path_mutation_guard`), so running its
-    /// scaffold test in parallel with our push-shim tests is safe.
+    /// static (via `crate::shared_test_guards::path_mutation_guard`),
+    /// so running its scaffold test in parallel with our push-shim
+    /// tests is safe.
     #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        crate::path_mutation_guard()
-    }
+    use crate::shared_test_guards::path_mutation_guard;
 
     /// Build a tempdir containing a `spin` script that emits fixed
     /// stdout/stderr and exits with the given code. Payloads are written

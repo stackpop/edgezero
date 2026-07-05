@@ -257,13 +257,14 @@ fn shell_join(args: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{apply_environment, ResolvedEnvironment};
+    use crate::shared_test_guards::env_mutation_guard;
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
     use std::env;
     use std::process::Command;
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {
-        let _lock = crate::env_mutation_guard()
+        let _lock = env_mutation_guard()
             .lock()
             .expect("env mutation guard poisoned");
         env::remove_var("EDGEZERO_TEST_SECRET");
@@ -309,10 +310,10 @@ mod tests {
         // not stomp it. Without the precedence guard, `cmd.env(...)`
         // would inject the manifest value and the parent override
         // would be lost.
-        let _lock = crate::env_mutation_guard()
+        const KEY: &str = "EDGEZERO_TEST_PARENT_WINS";
+        let _lock = env_mutation_guard()
             .lock()
             .expect("env mutation guard poisoned");
-        const KEY: &str = "EDGEZERO_TEST_PARENT_WINS";
         env::set_var(KEY, "from_parent_shell");
 
         let env = ResolvedEnvironment {
@@ -345,12 +346,12 @@ mod tests {
 
     #[test]
     fn apply_environment_uses_manifest_default_when_parent_env_unset() {
-        let _lock = crate::env_mutation_guard()
-            .lock()
-            .expect("env mutation guard poisoned");
         // Mirror of the above: when the parent shell has NOT set the
         // env var, the manifest default fills it in.
         const KEY: &str = "EDGEZERO_TEST_MANIFEST_FILLS";
+        let _lock = env_mutation_guard()
+            .lock()
+            .expect("env mutation guard poisoned");
         env::remove_var(KEY);
 
         let env = ResolvedEnvironment {

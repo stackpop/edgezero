@@ -24,6 +24,7 @@ use crate::config::{
 use crate::copy_tree::copy_dir_recursive;
 use crate::ensure_adapter_defined;
 use crate::path_safety::assert_provision_paths_contained;
+use crate::provision_lock::ProvisionLock;
 use edgezero_adapter::registry::{
     self as adapter_registry, ProvisionOutcome, ProvisionStores, ResolvedStoreId, TypedSecretEntry,
 };
@@ -114,25 +115,30 @@ fn manifest_root_from(manifest_path: &Path) -> &Path {
 /// Acquire the cross-process provision lock when the invocation
 /// will actually write. Returns `None` for dry-run so a long
 /// staging + diff doesn't starve real writers.
-fn acquire_provision_lock(
-    args: &ProvisionArgs,
-) -> Result<Option<crate::provision_lock::ProvisionLock>, String> {
+fn acquire_provision_lock(args: &ProvisionArgs) -> Result<Option<ProvisionLock>, String> {
     if args.dry_run {
         Ok(None)
     } else {
-        Ok(Some(crate::provision_lock::ProvisionLock::acquire(
-            manifest_root_from(&args.manifest),
-        )?))
+        Ok(Some(ProvisionLock::acquire(manifest_root_from(
+            &args.manifest,
+        ))?))
     }
 }
 
+/// # Errors
+///
+/// Returns an error string when the manifest fails to load, the
+/// adapter isn't declared, path containment rejects a poisoned
+/// manifest path, adapter dispatch fails, or the deployed-writeback
+/// merge fails.
+#[inline]
 pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
     // Serialise concurrent invocations against the same tree so
     // read-modify-write on `.env` / `.dev.vars` / `edgezero.toml`
     // never silently drops a competing writer's edits. Dry-run
     // skips: nothing is written, and holding the lock during a
     // long staging + diff would starve real writers. See
-    // provision_lock.rs for the design rationale.
+    // `provision_lock.rs` for the design rationale.
     let _lock = acquire_provision_lock(args)?;
     run_provision_inner(args)
 }
@@ -141,7 +147,7 @@ pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
 /// `.edgezero-provision.lock` before invoking (see
 /// [`acquire_provision_lock`]). Extracted so `run_provision_typed`
 /// can hold a single lock across the base run + typed writeback +
-/// deployed merge, without run_provision's inner acquisition
+/// deployed merge, without `run_provision`'s inner acquisition
 /// re-entering flock (which is per-descriptor on Linux/macOS and
 /// would deadlock a second acquire from the same process).
 fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
@@ -995,13 +1001,25 @@ fn run_local_dry_run(
         manifest_root,
         adapter_crate_rel,
         |staged_root, _staged_crate| {
-            write_baseline_to_disk(staged_root, &baseline_pairs)?;
-            adapter.validate_adapter_manifest(
-                staged_root,
-                adapter_cfg.adapter.manifest.as_deref(),
-                adapter_cfg.adapter.component.as_deref(),
-            )?;
-            let owned_stores = build_stores_against(staged_root, args, adapter, manifest)?;
+            // Errors surfaced from within the staging closure carry
+            // raw `/var/folders/.../edgezero-staging-*` paths in the
+            // formatted messages. Rewrite those back to the project
+            // root's display form BEFORE bubbling -- spec §"Dry-run":
+            // stdout must NEVER contain raw tempdir paths, in either
+            // the success (status_lines) or error path.
+            let staged_str = staged_root.to_string_lossy().into_owned();
+            let project_str = manifest_root.to_string_lossy().into_owned();
+            let sanitize = |err: String| err.replace(&staged_str, &project_str);
+            write_baseline_to_disk(staged_root, &baseline_pairs).map_err(sanitize)?;
+            adapter
+                .validate_adapter_manifest(
+                    staged_root,
+                    adapter_cfg.adapter.manifest.as_deref(),
+                    adapter_cfg.adapter.component.as_deref(),
+                )
+                .map_err(sanitize)?;
+            let owned_stores =
+                build_stores_against(staged_root, args, adapter, manifest).map_err(sanitize)?;
             // Spec §"Dry-run" step 3: pass `dry_run = false` to the
             // adapter even though `args.dry_run == true`. The tempdir
             // IS the dry-run mechanism — the adapter takes its real
@@ -1011,15 +1029,17 @@ fn run_local_dry_run(
             // branches (cloudflare cli.rs:263, spin cli.rs:223) and
             // leave the staged tree empty of the content the diff
             // report is supposed to show.
-            adapter.provision(
-                staged_root,
-                adapter_cfg.adapter.manifest.as_deref(),
-                adapter_cfg.adapter.component.as_deref(),
-                &owned_stores.as_refs(),
-                deployed,
-                adapter_registry::ProvisionMode::Local,
-                false,
-            )
+            adapter
+                .provision(
+                    staged_root,
+                    adapter_cfg.adapter.manifest.as_deref(),
+                    adapter_cfg.adapter.component.as_deref(),
+                    &owned_stores.as_refs(),
+                    deployed,
+                    adapter_registry::ProvisionMode::Local,
+                    false,
+                )
+                .map_err(sanitize)
         },
     )?;
 
@@ -3445,5 +3465,30 @@ ids = ["default"]
             report.contains(".edgezero/.env"),
             "axum's `.edgezero/.env` file must appear in the diff: {report}"
         );
+    }
+
+    /// Reverse of the sibling test: manifest declares
+    /// `[adapters.axum]` (lowercase, canonical form) and the
+    /// operator passes `--adapter AXUM` (all-caps). Both directions
+    /// of the case-insensitive lookup MUST work -- prior coverage only
+    /// tested (Axum manifest, "axum" arg), leaving a code path that
+    /// lowercased only ONE side untested.
+    #[test]
+    fn run_provision_local_handles_all_caps_adapter_arg_against_lowercase_manifest_key() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+
+        // All-caps arg against the lowercase manifest key `axum`.
+        run_provision(&ProvisionArgs {
+            adapter: "AXUM".to_owned(),
+            dry_run: false,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("case-insensitive arg lookup must succeed");
     }
 }

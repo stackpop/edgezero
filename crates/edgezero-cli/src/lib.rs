@@ -44,35 +44,9 @@ mod provision_lock;
 #[cfg(feature = "cli")]
 mod scaffold;
 #[cfg(all(test, feature = "cli"))]
-mod test_support;
-
-// Shared process-wide mutex serialising `$PATH`-mutating tests across
-// every test module in this crate. `generator.rs::PathOverride` and
-// `config.rs`'s push-shim tests both mutate PATH; without a shared
-// guard, running the same `edgezero-cli` test binary in parallel can
-// interleave PATH restores between the two callsites and lose one of
-// their prefixes, producing intermittent "git not found" /
-// "spin: command not found" flakes.
-#[cfg(all(test, unix, feature = "cli"))]
-pub(crate) fn path_mutation_guard() -> &'static std::sync::Mutex<()> {
-    use std::sync::{Mutex, OnceLock};
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD.get_or_init(|| Mutex::new(()))
-}
-
-// Shared guard for tests that mutate arbitrary process env vars
-// (adapter.rs's apply_environment tests, and any future test that
-// calls env::set_var / env::remove_var outside of PathPrepend).
-// libc's setenv/getenv are NOT thread-safe; Rust 1.80+ marked
-// env::set_var unsafe for exactly this reason. Serialise the tests
-// so a concurrent `env::var()` in another test can't observe a
-// half-written env block.
+mod shared_test_guards;
 #[cfg(all(test, feature = "cli"))]
-pub(crate) fn env_mutation_guard() -> &'static std::sync::Mutex<()> {
-    use std::sync::{Mutex, OnceLock};
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD.get_or_init(|| Mutex::new(()))
-}
+mod test_support;
 
 /// CLI argument structs (`Args`, `Command`, and the per-command `*Args`
 /// types). A `pub mod` so downstream binaries can reuse the built-in

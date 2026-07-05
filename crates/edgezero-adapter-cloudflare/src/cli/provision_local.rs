@@ -1228,6 +1228,60 @@ mod tests {
         );
     }
 
+    /// Locks the header-preservation contract for the case the sibling
+    /// first-run test misses. The seeded fixture there uses
+    /// `synthesise_wrangler_toml("demo")` which ALREADY carries the
+    /// header at line 1 -- a merge bug that stripped the header on
+    /// re-serialisation would pass `starts_with(EDGEZERO_PROVISION_HEADER)`
+    /// only because the seed matched, not because provision preserved it.
+    /// This test starts from a wrangler.toml with the schema header at
+    /// line 1 AND a couple of operator-added TOML lines, runs provision,
+    /// and asserts the header STILL sits at line 1 on the output.
+    #[test]
+    fn provision_local_preserves_schema_header_at_line_1_after_merge() {
+        let dir = tempdir().expect("tempdir");
+        let wrangler_path = dir.path().join("wrangler.toml");
+        // Seed matches the synthesiser shape, then adds an operator's
+        // `main =` line below the header. If provision's toml_edit
+        // round-trip re-orders root decor or drops the leading comment,
+        // the header slides down.
+        fs::write(
+            &wrangler_path,
+            "# edgezero-provision: v1\nname = \"demo\"\ncompatibility_date = \"2024-01-01\"\nmain = \"src/index.ts\"\n",
+        )
+        .expect("seed wrangler.toml");
+
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Local,
+                false,
+            )
+            .expect("provision must succeed on a seeded wrangler.toml with operator edits");
+
+        let wrangler = fs::read_to_string(&wrangler_path).expect("read wrangler.toml");
+        let first_line = wrangler.lines().next().unwrap_or_default();
+        assert_eq!(
+            first_line, "# edgezero-provision: v1",
+            "schema header must sit at line 1 after merge (bare `.starts_with(...)` masks a merge bug that slides the header down): {wrangler}"
+        );
+        // Operator's line still present.
+        assert!(
+            wrangler.contains("main = \"src/index.ts\""),
+            "operator's `main` key must survive the merge: {wrangler}"
+        );
+    }
+
     #[test]
     fn provision_local_re_provision_is_byte_identical() {
         // Re-running provision on an already-provisioned fixture must
