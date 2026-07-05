@@ -42,9 +42,10 @@ pub(super) fn provision(
     )
     .map_err(|err| format!("write {}: {err}", env_path.display()))?;
     let status_lines = vec![format!(
-        "axum: ensured {} + appended {} .env lines",
+        "axum: ensured {} + appended {} lines to {}",
         dot_edgezero.display(),
-        env_lines.len()
+        env_lines.len(),
+        env_path.display()
     )];
     Ok(ProvisionOutcome::from_status_lines(status_lines))
 }

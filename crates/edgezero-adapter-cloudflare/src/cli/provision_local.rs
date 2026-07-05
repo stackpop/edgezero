@@ -269,8 +269,11 @@ pub(super) fn provision(
             &placeholder,
         )?;
         status_lines.push(format!(
-            "cloudflare: kv binding `{}` -> id `{}` (logical id `{}`)",
-            store.platform, resolved_id, store.logical,
+            "cloudflare: kv binding `{}` -> id `{}` (logical id `{}`) in {}",
+            store.platform,
+            resolved_id,
+            store.logical,
+            wrangler_path.display(),
         ));
     }
 

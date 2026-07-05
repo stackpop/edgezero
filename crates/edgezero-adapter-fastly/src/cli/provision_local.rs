@@ -68,11 +68,18 @@ pub(super) fn provision(
         ));
     }
 
+    // Path suffix threaded into each status line so the operator sees
+    // exactly which file each mutation landed in. Cheap to include
+    // per-line and load-bearing when the manifest lives in a nested
+    // adapter crate (`crates/demo-fastly/fastly.toml`) rather than at
+    // the project root.
+    let path_display = fastly_path.display().to_string();
+
     // 2. [[local_server.kv_stores.<platform>]] per KV store.
     for store in stores.kv {
         upsert_local_kv_store(&mut doc, &store.platform)?;
         status_lines.push(format!(
-            "fastly: local kv_store `{}` (logical id `{}`)",
+            "fastly: local kv_store `{}` (logical id `{}`) in {path_display}",
             store.platform, store.logical
         ));
     }
@@ -84,7 +91,7 @@ pub(super) fn provision(
     for store in stores.config {
         upsert_local_config_store(&mut doc, &store.platform)?;
         status_lines.push(format!(
-            "fastly: local config_store `{}` (logical id `{}`)",
+            "fastly: local config_store `{}` (logical id `{}`) in {path_display}",
             store.platform, store.logical
         ));
     }
@@ -93,7 +100,9 @@ pub(super) fn provision(
     //    commented __KEY placeholders for CONFIG stores. Same
     //    discipline as Cloudflare `.dev.vars`.
     if upsert_runtime_env_config_store(&mut doc, stores)? {
-        status_lines.push("fastly: wrote edgezero_runtime_env block".to_owned());
+        status_lines.push(format!(
+            "fastly: wrote edgezero_runtime_env block in {path_display}"
+        ));
     }
 
     if !dry_run {
@@ -131,13 +140,14 @@ pub(super) fn provision_typed(
     let mut status_lines: Vec<String> = Vec::new();
     let mut appended = 0_usize;
 
+    let path_display = fastly_path.display().to_string();
     for entry in typed_secrets {
         let added = upsert_secret_store_entry(&mut doc, entry.store_id, entry.key_value)?;
         if added {
             appended = appended.saturating_add(1);
         }
         status_lines.push(format!(
-            "fastly: secret_store `{}` key `{}` (env `{}`)",
+            "fastly: secret_store `{}` key `{}` (env `{}`) in {path_display}",
             entry.store_id,
             entry.key_value,
             entry.key_value.to_ascii_uppercase(),

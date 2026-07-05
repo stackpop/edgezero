@@ -244,7 +244,8 @@ pub(super) fn provision_typed(
 
         env_lines.push(format!("{env_var}="));
         status_lines.push(format!(
-            "spin: variable `{spin_var}` on component `{component_id}` (env `{env_var}`)"
+            "spin: variable `{spin_var}` on component `{component_id}` (env `{env_var}`) in {}",
+            spin_path.display()
         ));
     }
 
