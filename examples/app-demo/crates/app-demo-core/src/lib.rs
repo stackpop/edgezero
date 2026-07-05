@@ -8,4 +8,23 @@ pub mod config;
 // internally; pub visibility is purely additive.
 pub mod handlers;
 
-edgezero_core::app!("../../edgezero.toml");
+use std::sync::Arc;
+
+/// App-owned shared state for the `app!(..., state = ...)` demonstration,
+/// handed to handlers via `State<Arc<DemoState>>`.
+#[derive(Debug)]
+pub struct DemoState {
+    /// A greeting the handler echoes, proving the value reached the handler.
+    pub greeting: String,
+}
+
+/// Constructs the shared app state. Referenced by `app!(..., state = crate::app_state())`.
+#[must_use]
+#[inline]
+pub fn app_state() -> Arc<DemoState> {
+    Arc::new(DemoState {
+        greeting: "hello from app state".to_owned(),
+    })
+}
+
+edgezero_core::app!("../../edgezero.toml", state = crate::app_state());
