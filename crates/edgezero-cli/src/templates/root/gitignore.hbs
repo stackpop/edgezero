@@ -35,6 +35,11 @@ runtime-config.toml
 # the KEY line to point at a preferred local variant.
 .env
 
+# Provision advisory lock -- created next to edgezero.toml by
+# `edgezero provision` / `edgezero config push` to serialise
+# concurrent invocations against the same tree. Per-machine.
+.edgezero-provision.lock
+
 # OS
 .DS_Store
 

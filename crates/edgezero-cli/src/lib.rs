@@ -40,6 +40,8 @@ mod path_safety;
 #[cfg(feature = "cli")]
 mod provision;
 #[cfg(feature = "cli")]
+mod provision_lock;
+#[cfg(feature = "cli")]
 mod scaffold;
 #[cfg(all(test, feature = "cli"))]
 mod test_support;

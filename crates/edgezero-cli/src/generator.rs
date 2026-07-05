@@ -1287,6 +1287,7 @@ mod tests {
             ".spin/",
             ".dev.vars",
             ".env",
+            ".edgezero-provision.lock",
         ] {
             assert!(
                 gitignore.contains(entry),

@@ -33,6 +33,13 @@ runtime-config.toml
 # (Task 27) too. Operator overrides live here.
 .env
 
+# Provision advisory lock -- created next to edgezero.toml by
+# `edgezero provision` / `edgezero config push` to serialise
+# concurrent invocations against the same tree. Auto-released on
+# process exit; the sentinel file itself is not deleted so peers
+# can share it across invocations. Per-machine, never committed.
+.edgezero-provision.lock
+
 # OS
 .DS_Store
 

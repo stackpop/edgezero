@@ -111,7 +111,40 @@ fn manifest_root_from(manifest_path: &Path) -> &Path {
 /// registered in this build, or the adapter's `provision` impl
 /// reports a failure.
 #[inline]
+/// Acquire the cross-process provision lock when the invocation
+/// will actually write. Returns `None` for dry-run so a long
+/// staging + diff doesn't starve real writers.
+fn acquire_provision_lock(
+    args: &ProvisionArgs,
+) -> Result<Option<crate::provision_lock::ProvisionLock>, String> {
+    if args.dry_run {
+        Ok(None)
+    } else {
+        Ok(Some(crate::provision_lock::ProvisionLock::acquire(
+            manifest_root_from(&args.manifest),
+        )?))
+    }
+}
+
 pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
+    // Serialise concurrent invocations against the same tree so
+    // read-modify-write on `.env` / `.dev.vars` / `edgezero.toml`
+    // never silently drops a competing writer's edits. Dry-run
+    // skips: nothing is written, and holding the lock during a
+    // long staging + diff would starve real writers. See
+    // provision_lock.rs for the design rationale.
+    let _lock = acquire_provision_lock(args)?;
+    run_provision_inner(args)
+}
+
+/// Lock-agnostic body of [`run_provision`]. Callers MUST hold the
+/// `.edgezero-provision.lock` before invoking (see
+/// [`acquire_provision_lock`]). Extracted so `run_provision_typed`
+/// can hold a single lock across the base run + typed writeback +
+/// deployed merge, without run_provision's inner acquisition
+/// re-entering flock (which is per-descriptor on Linux/macOS and
+/// would deadlock a second acquire from the same process).
+fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
     let manifest_loader = ManifestLoader::from_path(&args.manifest)
         .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
     let manifest = manifest_loader.manifest();
@@ -267,6 +300,13 @@ where
         return run_provision(args);
     }
 
+    // Acquire the cross-process lock ONCE and hold it for the entire
+    // typed local flow: base run + typed writeback + deployed merge
+    // are all read-modify-write against the same set of files, so a
+    // peer sneaking in between the base and the typed step would
+    // silently drop one of their appends. Dry-run skips (no writes).
+    let _lock = acquire_provision_lock(args)?;
+
     // 1. Validation context (env_overlay=false — provision captures
     //    operator-typed values, not env-overridden ones).
     let ctx = load_validation_context_with_options(&args.manifest, None, false, false)?;
@@ -333,7 +373,11 @@ where
 
     if !args.dry_run {
         // Real-write: base then typed against the live worktree.
-        run_provision(args)?;
+        // Call the lock-agnostic inner so we don't re-acquire flock
+        // from the same process (which would deadlock -- flock is
+        // per-descriptor on Linux/macOS and a second descriptor from
+        // this process would block waiting for ourselves).
+        run_provision_inner(args)?;
         let outcome = adapter.provision_typed(
             manifest_root,
             adapter_manifest_rel_owned.as_deref(),

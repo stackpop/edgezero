@@ -311,6 +311,27 @@ where
     // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
 
+    // Cross-process advisory lock (shared with `provision`) --
+    // config push --local writes into `fastly.toml` /
+    // `.dev.vars` / spin's local SQLite key-value store, all of
+    // which provision also reads/writes. Cloud push writes to the
+    // remote store; hold the same lock so we don't race with a
+    // concurrent provision's edgezero.toml deployed writeback.
+    // Dry-run skips the lock.
+    let _lock = if args.dry_run {
+        None
+    } else {
+        let manifest_root_for_lock = ctx
+            .validation
+            .manifest_path()
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Some(crate::provision_lock::ProvisionLock::acquire(
+            manifest_root_for_lock,
+        )?)
+    };
+
     // Path containment: reject `..` traversal and absolute paths in
     // every declared adapter's manifest / crate strings BEFORE
     // `run_shared_checks` dispatches per-adapter validation. Spin's
