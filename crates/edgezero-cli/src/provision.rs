@@ -214,12 +214,15 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
         (false, dry_run) => {
             // Cloud: no synthesis. Validate + build stores against the
             // real worktree, dispatch with mode=Cloud, deployed=None.
-            validate_and_dispatch(
+            let dispatch = DispatchContext {
                 adapter,
-                manifest,
                 adapter_cfg,
+                adapter_name: &args.adapter,
                 manifest_root,
-                &args.adapter,
+            };
+            validate_and_dispatch(
+                &dispatch,
+                manifest,
                 None,
                 adapter_registry::ProvisionMode::Cloud,
                 dry_run,
@@ -236,17 +239,21 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
                 &app_name,
                 deployed.as_ref(),
             )?;
-            write_baseline_to_disk(manifest_root, &baseline_pairs)?;
-            validate_and_dispatch(
+            let synthesised = write_baseline_to_disk(manifest_root, &baseline_pairs)?;
+            let dispatch = DispatchContext {
                 adapter,
-                manifest,
                 adapter_cfg,
+                adapter_name: &args.adapter,
                 manifest_root,
-                &args.adapter,
+            };
+            let merged = validate_and_dispatch(
+                &dispatch,
+                manifest,
                 deployed.as_ref(),
                 adapter_registry::ProvisionMode::Local,
                 false,
-            )?
+            )?;
+            prepend_baseline_status_lines_worktree(&args.adapter, &synthesised, merged)
         }
         (true, true) => run_local_dry_run(
             adapter,
@@ -471,7 +478,7 @@ fn run_local_dry_run_typed(
         manifest_root,
         adapter_crate_rel_path,
         |staged_root, _staged_crate| {
-            write_baseline_to_disk(staged_root, &baseline_pairs)?;
+            let synthesised = write_baseline_to_disk(staged_root, &baseline_pairs)?;
             adapter.validate_adapter_manifest(
                 staged_root,
                 adapter_manifest_rel,
@@ -498,15 +505,29 @@ fn run_local_dry_run_typed(
                 adapter_registry::ProvisionMode::Local,
                 false,
             )?;
-            let combined_status: Vec<String> = base
-                .status_lines
-                .into_iter()
-                .chain(typed.status_lines)
-                .collect();
-            let combined = match base.deployed.or(typed.deployed) {
-                Some(state) => ProvisionOutcome::with_deployed(combined_status, state),
-                None => ProvisionOutcome::from_status_lines(combined_status),
+            // Base + typed status merged; baseline "wrote …" lines
+            // prepended after with staged tempdir paths rewritten to
+            // the project root's display form (spec §"Dry-run":
+            // stdout must NEVER carry raw tempdir paths).
+            let base_status = base.status_lines;
+            let typed_status = typed.status_lines;
+            let merged_status: Vec<String> = base_status.into_iter().chain(typed_status).collect();
+            let merged_outcome = match base.deployed.or(typed.deployed) {
+                Some(state) => ProvisionOutcome::with_deployed(merged_status, state),
+                None => ProvisionOutcome::from_status_lines(merged_status),
             };
+            let staged_str = staged_root.to_string_lossy().into_owned();
+            let project_str = manifest_root.to_string_lossy().into_owned();
+            let combined = prepend_baseline_status_lines_with_rewrite(
+                canonical_adapter_name,
+                &synthesised,
+                merged_outcome,
+                |path| {
+                    path.display()
+                        .to_string()
+                        .replace(&staged_str, &project_str)
+                },
+            );
             // Render INSIDE the closure — the allow-list builder /
             // `default_adapter_manifest_for` both match on lowercase,
             // so canonical (possibly mixed-case) names MUST be
@@ -562,7 +583,48 @@ fn resolve_kind(
 /// _contained` gates upstream); a buggy or hostile synthesiser
 /// returning an absolute path or `../../etc/passwd` would otherwise
 /// escape the project tree. Reject before `root.join()`.
-fn write_baseline_to_disk(root: &Path, pairs: &[(PathBuf, String)]) -> Result<(), String> {
+/// Prepend one `"<adapter>: wrote baseline <path>"` status line per
+/// file the synthesiser step actually created (`write_baseline_to_disk`
+/// skips existing files, so `synthesised` only lists first-write
+/// events, not re-provision no-ops). Gives the operator a visible
+/// confirmation for every adapter manifest -- notably `axum.toml`,
+/// whose merge path is a no-op and wouldn't otherwise appear in the
+/// status output.
+fn prepend_baseline_status_lines_worktree(
+    adapter_name: &str,
+    synthesised: &[PathBuf],
+    outcome: adapter_registry::ProvisionOutcome,
+) -> adapter_registry::ProvisionOutcome {
+    prepend_baseline_status_lines_with_rewrite(adapter_name, synthesised, outcome, |path| {
+        path.display().to_string()
+    })
+}
+
+fn prepend_baseline_status_lines_with_rewrite(
+    adapter_name: &str,
+    synthesised: &[PathBuf],
+    outcome: adapter_registry::ProvisionOutcome,
+    rewrite: impl Fn(&Path) -> String,
+) -> adapter_registry::ProvisionOutcome {
+    let baseline_lines: Vec<String> = synthesised
+        .iter()
+        .map(|path| format!("{adapter_name}: wrote baseline {}", rewrite(path.as_path())))
+        .collect();
+    let combined: Vec<String> = baseline_lines
+        .into_iter()
+        .chain(outcome.status_lines)
+        .collect();
+    match outcome.deployed {
+        Some(state) => adapter_registry::ProvisionOutcome::with_deployed(combined, state),
+        None => adapter_registry::ProvisionOutcome::from_status_lines(combined),
+    }
+}
+
+fn write_baseline_to_disk(
+    root: &Path,
+    pairs: &[(PathBuf, String)],
+) -> Result<Vec<PathBuf>, String> {
+    let mut written = Vec::new();
     for (rel_path, contents) in pairs {
         if rel_path.is_absolute() {
             return Err(format!(
@@ -588,8 +650,9 @@ fn write_baseline_to_disk(root: &Path, pairs: &[(PathBuf, String)]) -> Result<()
                 .map_err(|err| format!("create {}: {err}", parent.display()))?;
         }
         fs::write(&abs, contents).map_err(|err| format!("write {}: {err}", abs.display()))?;
+        written.push(abs);
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Translate the parent manifest's `[adapters.<name>.deployed]` block
@@ -762,27 +825,33 @@ pub(crate) fn merge_deployed_into_manifest(
 /// synthesis is identical between the two arms, so factoring it here
 /// keeps `run_provision` under the module's function-length lint AND
 /// removes the copy-paste risk of two arms drifting out of sync.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the shared tail needs adapter, manifest, adapter cfg, manifest root, adapter name, deployed state, mode, and dry-run — same 8 argument shape as `Adapter::provision` itself, whose lint annotation applies for the same reason"
-)]
-fn validate_and_dispatch(
+/// Bundles the adapter identity + paths + root that both
+/// `validate_and_dispatch` and its dry-run typed sibling need. Cuts
+/// their argument lists from 8-9 down to a single ctx + the arm-
+/// specific bits (deployed / mode / dry-run for the base tail;
+/// entries / typed context for the dry-run typed tail).
+struct DispatchContext<'dispatch> {
     adapter: &'static dyn adapter_registry::Adapter,
+    adapter_cfg: &'dispatch ManifestAdapter,
+    adapter_name: &'dispatch str,
+    manifest_root: &'dispatch Path,
+}
+
+fn validate_and_dispatch(
+    ctx: &DispatchContext<'_>,
+
     manifest: &Manifest,
-    adapter_cfg: &ManifestAdapter,
-    manifest_root: &Path,
-    adapter_name: &str,
     deployed: Option<&AdapterDeployedState>,
     mode: adapter_registry::ProvisionMode,
     dry_run: bool,
 ) -> Result<adapter_registry::ProvisionOutcome, String> {
-    adapter.validate_adapter_manifest(
-        manifest_root,
-        adapter_cfg.adapter.manifest.as_deref(),
-        adapter_cfg.adapter.component.as_deref(),
+    ctx.adapter.validate_adapter_manifest(
+        ctx.manifest_root,
+        ctx.adapter_cfg.adapter.manifest.as_deref(),
+        ctx.adapter_cfg.adapter.component.as_deref(),
     )?;
     let env_config = EnvConfig::from_env();
-    reject_merged_id_collisions(adapter_name, adapter, manifest, &env_config)?;
+    reject_merged_id_collisions(ctx.adapter_name, ctx.adapter, manifest, &env_config)?;
     let config_ids = resolve_kind(manifest.stores.config.as_ref(), &env_config, "config");
     let kv_ids = resolve_kind(manifest.stores.kv.as_ref(), &env_config, "kv");
     let secret_ids = resolve_kind(manifest.stores.secrets.as_ref(), &env_config, "secrets");
@@ -791,10 +860,10 @@ fn validate_and_dispatch(
         kv: &kv_ids,
         secrets: &secret_ids,
     };
-    adapter.provision(
-        manifest_root,
-        adapter_cfg.adapter.manifest.as_deref(),
-        adapter_cfg.adapter.component.as_deref(),
+    ctx.adapter.provision(
+        ctx.manifest_root,
+        ctx.adapter_cfg.adapter.manifest.as_deref(),
+        ctx.adapter_cfg.adapter.component.as_deref(),
         &stores,
         deployed,
         mode,
@@ -1010,7 +1079,8 @@ fn run_local_dry_run(
             let staged_str = staged_root.to_string_lossy().into_owned();
             let project_str = manifest_root.to_string_lossy().into_owned();
             let sanitize = |err: String| err.replace(&staged_str, &project_str);
-            write_baseline_to_disk(staged_root, &baseline_pairs).map_err(sanitize)?;
+            let synthesised =
+                write_baseline_to_disk(staged_root, &baseline_pairs).map_err(sanitize)?;
             adapter
                 .validate_adapter_manifest(
                     staged_root,
@@ -1029,7 +1099,7 @@ fn run_local_dry_run(
             // branches (cloudflare cli.rs:263, spin cli.rs:223) and
             // leave the staged tree empty of the content the diff
             // report is supposed to show.
-            adapter
+            let outcome = adapter
                 .provision(
                     staged_root,
                     adapter_cfg.adapter.manifest.as_deref(),
@@ -1039,7 +1109,20 @@ fn run_local_dry_run(
                     adapter_registry::ProvisionMode::Local,
                     false,
                 )
-                .map_err(sanitize)
+                .map_err(sanitize)?;
+            // Prepend baseline-write lines with staged paths rewritten
+            // back to project-relative form (spec §"Dry-run": stdout
+            // must NEVER carry raw tempdir paths).
+            Ok(prepend_baseline_status_lines_with_rewrite(
+                &args.adapter,
+                &synthesised,
+                outcome,
+                |path| {
+                    path.display()
+                        .to_string()
+                        .replace(&staged_str, &project_str)
+                },
+            ))
         },
     )?;
 
@@ -1152,11 +1235,6 @@ where
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::arbitrary_source_item_ordering,
-    clippy::default_numeric_fallback,
-    reason = "test module groups items by subject (typed-provision fixtures next to their tests) rather than strict item-kind buckets; validator bounds like `length(min = 1)` fall through to the annotated field's integer type"
-)]
 mod tests {
     use super::*;
     use crate::args::ProvisionArgs;
@@ -3116,7 +3194,7 @@ manifest = "crates/cf/wrangler.toml"
     #[derive(Debug, serde::Deserialize, serde::Serialize, validator::Validate)]
     struct TypedTestConfig {
         api_token: String,
-        #[validate(length(min = 1))]
+        #[validate(length(min = 1_u64))]
         greeting: String,
     }
 
