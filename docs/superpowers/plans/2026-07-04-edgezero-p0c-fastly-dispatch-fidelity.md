@@ -274,7 +274,7 @@ Expected: FAIL — `no method named owns_logging found`.
 
 - [ ] **Step 3: Add `owns_logging()` to the `Hooks` trait**
 
-In `crates/edgezero-core/src/app.rs`, add to the `Hooks` trait (after `configure`, keeping methods in the existing order — insert where it reads best; the trait is not alphabetized, but place it adjacent to `configure`):
+In `crates/edgezero-core/src/app.rs`, add to the `Hooks` trait. **`arbitrary_source_item_ordering` (restriction = deny) enforces alphabetical trait methods**, so place `owns_logging` between `name` and `routes` (order: `build_app`, `configure`, `name`, `owns_logging`, `routes`, `stores`) — not adjacent to `configure`:
 
 ```rust
     /// When `true`, an adapter's `run_app` skips its own logger initialization;
@@ -857,8 +857,11 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
 # fastly adapter is wasm-only: run its tests via Viceroy FROM THE CRATE DIR
-# (root `cargo test -p edgezero-adapter-fastly --features fastly` fails to link):
-(cd crates/edgezero-adapter-fastly && cargo test --features fastly --lib)
+# (root `cargo test -p edgezero-adapter-fastly --features fastly` fails to link).
+# Use TARGETED module filters — a blanket `--lib` run aborts (exit 134) on
+# pre-existing store/hostcall tests that need specific Viceroy backend config:
+(cd crates/edgezero-adapter-fastly && cargo test --features fastly --lib -- response:: proxy::)
+(cd crates/edgezero-adapter-fastly && cargo test --features fastly --lib -- synthesis apply_request_extend extended_request_extensions)
 (cd crates/edgezero-adapter-fastly && cargo test --features fastly --target wasm32-wasip1 --test contract)  # if Viceroy present
 cargo check --workspace --all-targets --features "fastly cloudflare spin"
 cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
