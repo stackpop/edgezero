@@ -6,18 +6,21 @@ use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores};
 
 /// Local-mode `provision` arm.
 ///
-/// Axum is the odd one out: its adapter manifest (`axum.toml`) stays
-/// tracked and operator-owned, so provision must NEVER edit it. The
-/// only thing to synthesise is the `.edgezero/.env` file the runtime
-/// reads at boot: `__NAME` lines seed the store->platform-name map
-/// for every declared kind (KV / CONFIG / SECRETS), and commented
-/// `__KEY` placeholders for CONFIG stores let the operator uncomment
-/// them to switch to a staging blob without hand-remembering the
-/// full env-var name.
+/// Axum's baseline `axum.toml` is written by
+/// `Adapter::synthesise_baseline_manifest` (see `cli/mod.rs`); the
+/// merge path here doesn't touch the manifest because Axum has no
+/// per-machine identifiers to weave in on re-provision. Once
+/// synthesised, operator edits (custom host / port / `crate_dir`)
+/// survive re-runs byte-identical.
 ///
-/// The `.edgezero/` directory anchors at `manifest_root` — Axum has
-/// no adapter-specific manifest worth anchoring on (there is one, but
-/// it's operator-owned and we've promised not to touch it).
+/// The only thing this fn writes is the `.edgezero/.env` file the
+/// runtime reads at boot: `__NAME` lines seed the
+/// store->platform-name map for every declared kind (KV / CONFIG /
+/// SECRETS), and commented `__KEY` placeholders for CONFIG stores
+/// let the operator uncomment them to switch to a staging blob
+/// without hand-remembering the full env-var name.
+///
+/// The `.edgezero/` directory anchors at `manifest_root`.
 ///
 /// Dedup — including commented/uncommented cross-form dedup — is
 /// delegated to [`append_lines_dedup`] so operator overrides survive

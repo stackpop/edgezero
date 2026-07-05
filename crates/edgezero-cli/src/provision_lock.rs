@@ -14,12 +14,13 @@
 //! either explicitly (via drop) or automatically on process exit --
 //! so a crashed run never leaves the lock stuck.
 //!
-//! Lock file: `<manifest-parent>/.edgezero-provision.lock`. Kept
-//! alongside `edgezero.toml` (which is always at the manifest root
-//! by construction) rather than inside `.edgezero/` so we don't
-//! need to create that directory just to acquire the lock. The
-//! file is created lazily and never truncated so multiple runs can
-//! share the sentinel across time.
+//! Lock file: `<manifest-parent>/.edgezero/provision.lock`. Kept
+//! inside `.edgezero/` so all per-machine CLI state (Axum's
+//! `.edgezero/.env`, `.edgezero/local-config-<id>.json`, the
+//! advisory lock) shares one gitignored directory. The parent dir
+//! is created lazily on first acquire. The file is created lazily
+//! and never truncated so multiple runs can share the sentinel
+//! across time.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};

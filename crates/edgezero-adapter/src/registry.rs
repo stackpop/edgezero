@@ -391,16 +391,12 @@ pub trait Adapter: Sync + Send {
     /// The default impl never errors. Adapter overrides may return
     /// human-readable error strings if local placeholder setup fails.
     #[inline]
-    #[expect(
-        clippy::elidable_lifetime_names,
-        reason = "lifetime name 'entry explicitly documents the secret entry lifetime for clarity"
-    )]
-    fn provision_typed<'entry>(
+    fn provision_typed(
         &self,
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _typed_secrets: &[TypedSecretEntry<'entry>],
+        _typed_secrets: &[TypedSecretEntry<'_>],
         _mode: ProvisionMode,
         _dry_run: bool,
     ) -> Result<ProvisionOutcome, String> {

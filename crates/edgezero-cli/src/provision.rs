@@ -61,7 +61,7 @@ impl OwnedProvisionStores {
 /// static filename) so nested paths like
 /// `crates/cf/config/wrangler.toml` resolve correctly. Spec §"Per-
 /// adapter local state" defines membership per adapter:
-/// - Axum: project-root `.edgezero/.env` only.
+/// - Axum: resolved `axum.toml` + project-root `.edgezero/.env`.
 /// - Cloudflare: resolved `wrangler.toml` + sibling `.dev.vars`.
 /// - Fastly: resolved `fastly.toml`.
 /// - Spin: resolved `spin.toml` + sibling `runtime-config.toml` +
@@ -444,15 +444,17 @@ where
     }
 
     let report = run_local_dry_run_typed(
-        adapter,
-        &ctx,
-        &canonical_adapter_name,
-        adapter_manifest_rel_owned.as_deref(),
-        adapter_component_owned.as_deref(),
-        adapter_crate_rel_owned.as_deref(),
+        &DryRunTypedRequest {
+            adapter,
+            ctx: &ctx,
+            canonical_adapter_name: &canonical_adapter_name,
+            adapter_manifest_rel: adapter_manifest_rel_owned.as_deref(),
+            adapter_component: adapter_component_owned.as_deref(),
+            adapter_crate_rel: adapter_crate_rel_owned.as_deref(),
+            manifest_root,
+        },
         args,
         &entries,
-        manifest_root,
     )?;
     if !report.is_empty() {
         log::info!("{report}");
@@ -467,21 +469,33 @@ where
 /// merge sees the baseline manifest the base step wrote. The report
 /// is rendered inside the closure — `staged_root` is only valid
 /// until the tempdir drops.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "dry-run typed arm needs adapter, validation context, canonical name, adapter manifest / component / crate paths, args, entries, and manifest root — same distinct-arg shape as `validate_and_dispatch` above"
-)]
-fn run_local_dry_run_typed(
+/// Bundle for [`run_local_dry_run_typed`]. Reduces the arg list from
+/// 9 to 3 by grouping the adapter identity + dispatch paths under
+/// one struct.
+struct DryRunTypedRequest<'req> {
     adapter: &'static dyn adapter_registry::Adapter,
-    ctx: &ValidationContext,
-    canonical_adapter_name: &str,
-    adapter_manifest_rel: Option<&str>,
-    adapter_component: Option<&str>,
-    adapter_crate_rel: Option<&str>,
+    ctx: &'req ValidationContext,
+    canonical_adapter_name: &'req str,
+    adapter_manifest_rel: Option<&'req str>,
+    adapter_component: Option<&'req str>,
+    adapter_crate_rel: Option<&'req str>,
+    manifest_root: &'req Path,
+}
+
+fn run_local_dry_run_typed(
+    req: &DryRunTypedRequest<'_>,
     args: &ProvisionArgs,
     entries: &[TypedSecretEntry<'_>],
-    manifest_root: &Path,
 ) -> Result<String, String> {
+    let &DryRunTypedRequest {
+        adapter,
+        ctx,
+        canonical_adapter_name,
+        adapter_manifest_rel,
+        adapter_component,
+        adapter_crate_rel,
+        manifest_root,
+    } = req;
     let adapter_crate_rel_path = adapter_crate_rel.map_or_else(|| Path::new("."), Path::new);
     let deployed_state = deployed_state_for(ctx.manifest(), canonical_adapter_name);
     let app_name = ctx.manifest().app.name.clone().unwrap_or_default();
@@ -497,33 +511,46 @@ fn run_local_dry_run_typed(
         manifest_root,
         adapter_crate_rel_path,
         |staged_root, _staged_crate| {
-            let synthesised = write_baseline_to_disk(staged_root, &baseline_pairs)?;
-            adapter.validate_adapter_manifest(
-                staged_root,
-                adapter_manifest_rel,
-                adapter_component,
-            )?;
-            let owned_stores = build_stores_against(staged_root, args, adapter, ctx.manifest())?;
+            // Sanitiser: rewrite raw staged tempdir paths back to the
+            // project root's display form before bubbling any error
+            // to the operator (spec §"Dry-run": stdout must NEVER
+            // carry raw tempdir paths, in either the success OR
+            // error paths). Mirrors the untyped dry-run arm's
+            // treatment.
+            let staged_str = staged_root.to_string_lossy().into_owned();
+            let project_str = manifest_root.to_string_lossy().into_owned();
+            let sanitize = |err: String| err.replace(&staged_str, &project_str);
+            let synthesised =
+                write_baseline_to_disk(staged_root, &baseline_pairs).map_err(&sanitize)?;
+            adapter
+                .validate_adapter_manifest(staged_root, adapter_manifest_rel, adapter_component)
+                .map_err(&sanitize)?;
+            let owned_stores = build_stores_against(staged_root, args, adapter, ctx.manifest())
+                .map_err(&sanitize)?;
             let stores = owned_stores.as_refs();
             // Spec §"Dry-run" step 3: pass `dry_run = false` — the
             // tempdir IS the dry-run mechanism, not the flag.
-            let base = adapter.provision(
-                staged_root,
-                adapter_manifest_rel,
-                adapter_component,
-                &stores,
-                deployed_state.as_ref(),
-                adapter_registry::ProvisionMode::Local,
-                false,
-            )?;
-            let typed = adapter.provision_typed(
-                staged_root,
-                adapter_manifest_rel,
-                adapter_component,
-                entries,
-                adapter_registry::ProvisionMode::Local,
-                false,
-            )?;
+            let base = adapter
+                .provision(
+                    staged_root,
+                    adapter_manifest_rel,
+                    adapter_component,
+                    &stores,
+                    deployed_state.as_ref(),
+                    adapter_registry::ProvisionMode::Local,
+                    false,
+                )
+                .map_err(&sanitize)?;
+            let typed = adapter
+                .provision_typed(
+                    staged_root,
+                    adapter_manifest_rel,
+                    adapter_component,
+                    entries,
+                    adapter_registry::ProvisionMode::Local,
+                    false,
+                )
+                .map_err(&sanitize)?;
             // Base + typed status merged; baseline "wrote …" lines
             // prepended after with staged tempdir paths rewritten to
             // the project root's display form (spec §"Dry-run":
@@ -535,8 +562,6 @@ fn run_local_dry_run_typed(
                 Some(state) => ProvisionOutcome::with_deployed(merged_status, state),
                 None => ProvisionOutcome::from_status_lines(merged_status),
             };
-            let staged_str = staged_root.to_string_lossy().into_owned();
-            let project_str = manifest_root.to_string_lossy().into_owned();
             let combined = prepend_baseline_status_lines_with_rewrite(
                 canonical_adapter_name,
                 &synthesised,
@@ -948,6 +973,12 @@ pub(crate) fn build_dry_run_allow_list(
     let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
     match adapter_lower {
         "axum" => {
+            // Axum's synthesised axum.toml + the .edgezero/.env file
+            // provision writes for the runtime store->platform-name
+            // map. The manifest lives at the resolved
+            // `[adapters.axum.adapter].manifest` path (or default
+            // `axum.toml` if unset -- see `default_adapter_manifest_for`).
+            pairs.push((project_manifest.clone(), adapter_manifest_abs.to_path_buf()));
             pairs.push((
                 project_root.join(".edgezero/.env"),
                 staged_root.join(".edgezero/.env"),
@@ -984,10 +1015,11 @@ pub(crate) fn build_dry_run_allow_list(
 /// adapter crate's default.
 pub(crate) fn default_adapter_manifest_for(adapter_lower: &str) -> &'static str {
     match adapter_lower {
+        "axum" => "axum.toml",
         "cloudflare" => "wrangler.toml",
         "fastly" => "fastly.toml",
         "spin" => "spin.toml",
-        _ => "", // axum has no per-adapter manifest in the allow-list
+        _ => "",
     }
 }
 
@@ -2473,16 +2505,21 @@ ids = ["default"]
             "axum.toml must not appear in cloudflare diff"
         );
 
-        // Axum fixture: .edgezero/.env only
+        // Axum fixture: axum.toml (provision-synthesised) + .edgezero/.env
         let axum_project = TempDir::new().expect("axum project");
         let axum_staged = TempDir::new().expect("axum staged");
         fs::create_dir_all(axum_staged.path().join(".edgezero")).unwrap();
         fs::write(axum_staged.path().join(".edgezero/.env"), "K=V\n").unwrap();
+        fs::write(
+            axum_staged.path().join("axum.toml"),
+            "[adapter]\ncrate=\"demo\"\n",
+        )
+        .unwrap();
         let axum_allow = build_dry_run_allow_list(
             axum_project.path(),
             axum_staged.path(),
             "axum",
-            &axum_staged.path().join("axum.toml"), // adapter manifest not used for axum
+            &axum_staged.path().join("axum.toml"),
         );
         let axum_report = render_dry_run_report(
             axum_project.path(),
@@ -2493,6 +2530,10 @@ ids = ["default"]
         assert!(
             axum_report.contains(".edgezero/.env"),
             "axum must diff .edgezero/.env: {axum_report}"
+        );
+        assert!(
+            axum_report.contains("axum.toml"),
+            "axum must diff axum.toml (provision-synthesised): {axum_report}"
         );
         // Negative: cloudflare-only paths
         assert!(
@@ -3542,15 +3583,17 @@ ids = ["default"]
             .expect("build typed secret entries");
         let manifest_root = manifest_root_from(&args.manifest);
         let report = run_local_dry_run_typed(
-            adapter,
-            &ctx,
-            &canonical_name,
-            adapter_manifest_rel.as_deref(),
-            adapter_component.as_deref(),
-            adapter_crate_rel.as_deref(),
+            &DryRunTypedRequest {
+                adapter,
+                ctx: &ctx,
+                canonical_adapter_name: &canonical_name,
+                adapter_manifest_rel: adapter_manifest_rel.as_deref(),
+                adapter_component: adapter_component.as_deref(),
+                adapter_crate_rel: adapter_crate_rel.as_deref(),
+                manifest_root,
+            },
             &args,
             &entries,
-            manifest_root,
         )
         .expect("dry-run helper must succeed");
 
