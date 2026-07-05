@@ -23,7 +23,7 @@ use crate::config::{
 };
 use crate::copy_tree::copy_dir_recursive;
 use crate::ensure_adapter_defined;
-use crate::path_safety::assert_provision_paths_contained;
+use crate::path_safety::{assert_provision_paths_contained, assert_provision_paths_safe};
 use crate::provision_lock::ProvisionLock;
 use edgezero_adapter::registry::{
     self as adapter_registry, ProvisionOutcome, ProvisionStores, ResolvedStoreId, TypedSecretEntry,
@@ -115,6 +115,40 @@ fn manifest_root_from(manifest_path: &Path) -> &Path {
 /// Acquire the cross-process provision lock when the invocation
 /// will actually write. Returns `None` for dry-run so a long
 /// staging + diff doesn't starve real writers.
+/// Reject absolute paths + `..` traversal in the adapter-declared
+/// manifest / crate strings UNCONDITIONALLY. Cloud provision also
+/// joins `manifest_root` with the adapter-declared manifest path to
+/// write local files (Cloudflare's `wrangler.toml`, Fastly's
+/// `fastly.toml`), so a poisoned `manifest = "../outside/foo.toml"`
+/// in `edgezero.toml` would escape the tree in cloud mode too.
+///
+/// The stricter "manifest must sit inside the adapter crate dir"
+/// step is `--local`-only: existing cloud fixtures legitimately use
+/// e.g. `manifest = "wrangler.toml"` at the project root with
+/// `crate = "crates/demo-cf"`, and the strict-local rule would
+/// reject them. Cloud paths go through `assert_provision_paths_safe`
+/// (Step 1 only); local paths get `assert_provision_paths_contained`
+/// (Steps 1+2).
+fn enforce_adapter_path_guard(
+    args: &ProvisionArgs,
+    adapter_cfg: &ManifestAdapter,
+) -> Result<(), String> {
+    let manifest_root_for_check = manifest_root_from(&args.manifest);
+    if args.local {
+        assert_provision_paths_contained(
+            manifest_root_for_check,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.crate_path.as_deref(),
+        )
+    } else {
+        assert_provision_paths_safe(
+            manifest_root_for_check,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.crate_path.as_deref(),
+        )
+    }
+}
+
 fn acquire_provision_lock(args: &ProvisionArgs) -> Result<Option<ProvisionLock>, String> {
     if args.dry_run {
         Ok(None)
@@ -166,22 +200,7 @@ fn run_provision_inner(args: &ProvisionArgs) -> Result<(), String> {
         )
     })?;
 
-    // Path containment: reject `..` traversal and absolute paths in
-    // the manifest-declared adapter paths before any adapter dispatch
-    // or file resolution. Mirrors the `config push --local` guard
-    // (Task 7); the same helper closes the spec's "local provision
-    // never writes outside the adapter crate" promise. Cloud mode
-    // still targets remote SDKs so containment isn't load-bearing;
-    // gating on `args.local` also preserves the existing cloud
-    // fixtures where `manifest` lives at project root outside `crate`.
-    if args.local {
-        let manifest_root_for_check = manifest_root_from(&args.manifest);
-        assert_provision_paths_contained(
-            manifest_root_for_check,
-            adapter_cfg.adapter.manifest.as_deref(),
-            adapter_cfg.adapter.crate_path.as_deref(),
-        )?;
-    }
+    enforce_adapter_path_guard(args, adapter_cfg)?;
 
     // Linked in this build? Adapters are feature-gated; a release
     // built without `--features cloudflare` won't have it

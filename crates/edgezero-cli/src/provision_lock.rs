@@ -21,7 +21,7 @@
 //! file is created lazily and never truncated so multiple runs can
 //! share the sentinel across time.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use fs4::fs_std::FileExt;
@@ -40,17 +40,29 @@ pub(crate) struct ProvisionLock {
 }
 
 impl ProvisionLock {
-    /// Acquire an exclusive lock on `<manifest_root>/.edgezero-provision.lock`.
+    /// Acquire an exclusive lock on `<manifest_root>/.edgezero/provision.lock`.
     /// Blocks until another concurrent invocation releases; the block
     /// is a bounded wait -- provision writes are fast (single-digit
     /// milliseconds to seconds for large fixtures), so the block is
     /// bounded by the peer's work.
     ///
+    /// The `.edgezero/` parent dir is created lazily if absent (it's
+    /// the same dir Axum writes `.edgezero/.env` and the local config
+    /// JSON blobs into; nesting the lock inside keeps
+    /// operator-visible provision state in one place).
+    ///
     /// Returns Ok on lock acquisition. Errors surface the underlying
     /// filesystem error with the lockfile path so operators can
     /// diagnose disk-full / permission issues.
     pub(crate) fn acquire(manifest_root: &Path) -> Result<Self, String> {
-        let path = manifest_root.join(".edgezero-provision.lock");
+        let dot_edgezero = manifest_root.join(".edgezero");
+        fs::create_dir_all(&dot_edgezero).map_err(|err| {
+            format!(
+                "failed to create {} for provision lock: {err}",
+                dot_edgezero.display()
+            )
+        })?;
+        let path = dot_edgezero.join("provision.lock");
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -94,13 +106,15 @@ impl Drop for ProvisionLock {
 #[cfg(test)]
 mod tests {
     use super::ProvisionLock;
+    use std::ffi::OsStr;
+    use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     #[test]
-    fn acquire_creates_lockfile_next_to_edgezero_toml() {
+    fn acquire_creates_lockfile_under_dot_edgezero_dir() {
         let temp = TempDir::new().expect("tempdir");
         let lock = ProvisionLock::acquire(temp.path()).expect("acquire");
         assert!(
@@ -110,7 +124,12 @@ mod tests {
         );
         assert_eq!(
             lock.path().file_name().and_then(|name| name.to_str()),
-            Some(".edgezero-provision.lock")
+            Some("provision.lock")
+        );
+        assert!(
+            lock.path().parent().and_then(Path::file_name) == Some(OsStr::new(".edgezero")),
+            "lockfile must sit inside .edgezero/: {}",
+            lock.path().display()
         );
     }
 

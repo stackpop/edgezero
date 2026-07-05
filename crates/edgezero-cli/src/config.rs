@@ -309,27 +309,32 @@ pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String>
 where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
-    // Pre-flight: load + validate.
-    let ctx = load_push_context(args)?;
-
     // Cross-process advisory lock (shared with `provision`) --
-    // config push --local writes into `fastly.toml` /
-    // `.dev.vars` / spin's local SQLite key-value store, all of
-    // which provision also reads/writes. Cloud push writes to the
-    // remote store; hold the same lock so we don't race with a
-    // concurrent provision's edgezero.toml deployed writeback.
-    // Dry-run skips the lock.
+    // config push --local writes into `fastly.toml` / `.dev.vars` /
+    // spin's local SQLite key-value store, all of which provision
+    // also reads/writes. Cloud push writes to the remote store;
+    // hold the same lock so we don't race with a concurrent
+    // provision's edgezero.toml deployed writeback.
+    //
+    // Acquire BEFORE `load_push_context` -- that call reads
+    // edgezero.toml, the typed app-config, env overlay, adapter
+    // paths, and store context. A concurrent provision write could
+    // otherwise race with those reads before we start waiting on
+    // the lock. Derive the lock's manifest root from the CLI arg's
+    // parent (not from ctx, which we haven't loaded yet).
     let _lock = if args.dry_run {
         None
     } else {
-        let manifest_root_for_lock = ctx
-            .validation
-            .manifest_path()
+        let manifest_root_for_lock = args
+            .manifest
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         Some(ProvisionLock::acquire(manifest_root_for_lock)?)
     };
+
+    // Pre-flight: load + validate.
+    let ctx = load_push_context(args)?;
 
     // Path containment: reject `..` traversal and absolute paths in
     // every declared adapter's manifest / crate strings BEFORE
