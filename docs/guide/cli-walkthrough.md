@@ -128,9 +128,11 @@ Per-adapter behaviour:
   fastly <kind>-store create --name=<platform-name>
   ```
 
-  using the same `<platform-name>` resolution, then appends
-  `[setup.<kind>_stores.<platform-name>]` + `[local_server.<kind>_stores.<platform-name>]`
-  tables to `fastly.toml`. Idempotent on the `[setup.*]` block presence.
+  using the same `<platform-name>` resolution, then appends the
+  `[setup.<kind>_stores.<platform-name>]` block to `fastly.toml`.
+  Idempotent on the `[setup.*]` block presence. Local-mode Viceroy
+  state (`[local_server.<kind>_stores.<platform-name>]`) is owned by
+  `provision --local`; the cloud form doesn't touch it.
 
 - **spin** — pure `spin.toml` editing (no shell-out — Spin KV stores are runtime-resolved
   by the Fermyon stack). For each KV id AND each `[stores.config]` id (both KV-backed

@@ -131,20 +131,17 @@ manifest for the native dev server.
 :::
 
 - **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. Each declared KV id gets its own derived file; data persists across restarts (the scaffolder's `.gitignore` already excludes `.edgezero/`).
-- **Fastly (Viceroy)**: Requires a `[local_server.kv_stores]` and `[setup.kv_stores]` entry per declared KV id. `<app-cli> provision --adapter fastly --local` writes both blocks into your local `fastly.toml` for you; the example below assumes a `sessions` id.
+- **Fastly (Viceroy)**: Requires a `[[local_server.kv_stores]]` entry per declared KV id for local development. `<app-cli> provision --adapter fastly --local` writes it into your local `fastly.toml`. The cloud-mode counterpart (`provision --adapter fastly`, no `--local`) writes the `[setup.kv_stores.<name>]` block that `fastly compute deploy` consumes on first deploy — split responsibilities so operators can iterate locally without touching setup metadata.
 
   ```toml
   [[local_server.kv_stores.sessions]]
   key = "__init__"
   data = ""
-
-  [setup.kv_stores.sessions]
-  description = "Application KV store"
   ```
 
   Override the platform name per environment via
   `EDGEZERO__STORES__KV__SESSIONS__NAME=<other-name>`; provision honours
-  the override when it writes the setup blocks.
+  the override when it writes the block.
 
 - **Cloudflare (Workerd)**: `<app-cli> provision --adapter cloudflare` creates the namespace and appends the `[[kv_namespaces]]` binding to your local `wrangler.toml` using the env-resolved platform name (`EDGEZERO__STORES__KV__<ID>__NAME` or the logical id by default). The example below shows what provision writes for a `sessions` id with no override:
 

@@ -47,12 +47,15 @@ my-app-cli provision --adapter fastly --local
 ```
 
 `provision --local` synthesises `fastly.toml` if it's missing and
-upserts `[setup.<kind>_stores.*]` + `[local_server.<kind>_stores.*]`
-tables from `edgezero.toml`'s `[stores.*]` declarations. Any
-operator edits (extra `[local_server.backends.*]`, tuned build
-flags, etc.) stay local until you hand-share them. **Axum's
-`axum.toml` stays tracked** because it's the operator-authored
-manifest for the native dev server.
+upserts the Viceroy `[local_server.kv_stores.*]` and
+`[local_server.config_stores.*]` tables from `edgezero.toml`'s
+`[stores.*]` declarations. The `[setup.*]` tables that
+`fastly compute deploy` reads on first cloud deploy are owned by the
+cloud-mode `provision --adapter fastly` — they're not touched in
+local mode. Any operator edits (extra `[local_server.backends.*]`,
+tuned build flags, etc.) stay local until you hand-share them.
+**Axum's `axum.toml` stays tracked** because it's the
+operator-authored manifest for the native dev server.
 
 `provision_typed` (Task 23) additionally writes
 `[[local_server.secret_stores.<store_id>]]` entries — one per

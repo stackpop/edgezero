@@ -1284,6 +1284,23 @@ mod tests {
 
         let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
         assert!(clippy.contains("allow-expect-in-tests = true"));
+
+        // Regression: the pre-fix `fastly.toml.hbs` template shipped a
+        // literal `service_id = ""` line. `write_baseline_to_disk` skips
+        // existing files, so the scaffold-then-provision flow left the
+        // empty string in place — bypassing the synthesiser's "omit
+        // service_id until deployed" invariant. Assert no
+        // scaffolded/provisioned fastly.toml carries an empty
+        // `service_id` after `edgezero new`.
+        let fastly_toml_path = project_dir.join("crates/demo-app-adapter-fastly/fastly.toml");
+        if fastly_toml_path.exists() {
+            let fastly_toml = fs::read_to_string(&fastly_toml_path).expect("read fastly.toml");
+            assert!(
+                !fastly_toml.contains("service_id = \"\""),
+                "fastly.toml must not carry an empty service_id placeholder \
+                 (synthesise_fastly_toml omits it when None): {fastly_toml}"
+            );
+        }
     }
 
     fn assert_scaffold_crate_lints(project_dir: &Path) {

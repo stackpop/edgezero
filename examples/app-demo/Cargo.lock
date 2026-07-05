@@ -828,8 +828,10 @@ dependencies = [
  "serde_json",
  "similar",
  "simple_logger 5.2.0",
+ "tempfile",
  "thiserror 2.0.18",
  "toml",
+ "toml_edit",
  "validator",
 ]
 
