@@ -671,13 +671,29 @@ mod tests {
             after.contains("[[local_server.kv_stores.sessions]]"),
             "kv block present: {after}"
         );
-        assert!(
-            after.contains(r#"key = "__init__""#),
-            "kv stub key present: {after}"
+        // Reparse-and-index instead of `.contains("key = \"__init__\"")`
+        // + `.contains("data = \"\"")`: those substrings would pass for
+        // BOTH the correct nested-row form AND the scenario where the
+        // stub keys land at the doc root (same class as the shipped
+        // service_id bug). Lock the row on the actual
+        // `[[local_server.kv_stores.sessions]]` block.
+        let after_doc: toml_edit::DocumentMut = after.parse().expect("re-parse merged fastly.toml");
+        let kv_row = after_doc
+            .get("local_server")
+            .and_then(|item| item.get("kv_stores"))
+            .and_then(|item| item.get("sessions"))
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .and_then(|arr| arr.get(0))
+            .expect("[[local_server.kv_stores.sessions]] with at least one row");
+        assert_eq!(
+            kv_row.get("key").and_then(toml_edit::Item::as_str),
+            Some("__init__"),
+            "kv stub `key = \"__init__\"` must sit inside [[local_server.kv_stores.sessions]]: {after}"
         );
-        assert!(
-            after.contains(r#"data = """#),
-            "kv stub data present: {after}"
+        assert_eq!(
+            kv_row.get("data").and_then(toml_edit::Item::as_str),
+            Some(""),
+            "kv stub `data = \"\"` must sit inside [[local_server.kv_stores.sessions]]: {after}"
         );
         // CONFIG: table block plus empty contents SUB-TABLE (not
         // `contents = ""`). Re-parse to confirm shape.
@@ -1288,18 +1304,27 @@ mod tests {
             after.starts_with("# edgezero-provision: v1"),
             "manifest starts with edgezero-provision header: {after}"
         );
-        // KV: array-of-tables with the stub row.
-        assert!(
-            after.contains("[[local_server.kv_stores.sessions]]"),
-            "kv block present: {after}"
+        // KV: array-of-tables with the stub row. Reparse-and-index --
+        // see the sibling test's rationale (bare `.contains(...)`
+        // passes for both correct-nested and shipped root-drift bug).
+        let after_doc: toml_edit::DocumentMut =
+            after.parse().expect("re-parse first-run fastly.toml");
+        let kv_row = after_doc
+            .get("local_server")
+            .and_then(|item| item.get("kv_stores"))
+            .and_then(|item| item.get("sessions"))
+            .and_then(toml_edit::Item::as_array_of_tables)
+            .and_then(|arr| arr.get(0))
+            .expect("[[local_server.kv_stores.sessions]] with at least one row");
+        assert_eq!(
+            kv_row.get("key").and_then(toml_edit::Item::as_str),
+            Some("__init__"),
+            "kv stub `key` inside the sessions block: {after}"
         );
-        assert!(
-            after.contains(r#"key = "__init__""#),
-            "kv stub key present: {after}"
-        );
-        assert!(
-            after.contains(r#"data = """#),
-            "kv stub data present: {after}"
+        assert_eq!(
+            kv_row.get("data").and_then(toml_edit::Item::as_str),
+            Some(""),
+            "kv stub `data` inside the sessions block: {after}"
         );
         // CONFIG: table block with `format = "inline-toml"` plus an
         // empty `contents` SUB-TABLE (never `contents = ""`).
@@ -1406,8 +1431,14 @@ mod tests {
     /// Fastly is the only adapter where the operator maps a secret
     /// store `key` to an OS env var via the `env` field; the writer
     /// MUST NOT clobber that mapping when appending new keys.
+    ///
+    /// Renamed 2026-07 (deep self-review finding P1-f): the prior
+    /// name `provision_local_push_after_provision_preserves_*`
+    /// promised a push→provision integration test but the body only
+    /// re-runs `provision_typed` twice; the invariant is
+    /// re-provision idempotency, not push semantics.
     #[test]
-    fn provision_local_push_after_provision_preserves_local_server_secret_stores_entry() {
+    fn provision_typed_local_re_run_preserves_operator_env_mapping_on_secret_store_entry() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("fastly.toml");
         // Base manifest + the operator's hand-edited entry. The

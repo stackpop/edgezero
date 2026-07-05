@@ -1668,8 +1668,12 @@ mod tests {
         assert_eq!(env_first, env_second, ".env byte-identical");
     }
 
+    /// Renamed 2026-07 (deep self-review finding P1-f): the prior
+    /// name `provision_local_push_after_provision_preserves_*`
+    /// promised a push→provision integration test but the body
+    /// re-runs `provision_typed` twice.
     #[test]
-    fn provision_local_push_after_provision_preserves_local_state() {
+    fn provision_typed_local_re_run_preserves_operator_spin_variable_value() {
         // Operator installs a real secret value into a
         // `SPIN_VARIABLE_<UPPER>=…` line; a subsequent
         // provision_typed run must NOT clobber it. Key-normalised

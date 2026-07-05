@@ -578,8 +578,15 @@ mod tests {
         );
     }
 
+    /// Renamed 2026-07 (deep self-review finding P1-f): the prior
+    /// name (`provision_local_push_after_provision_preserves_*`)
+    /// promised a push→provision integration test but the body only
+    /// re-runs `provision_typed` twice. The real invariant this
+    /// locks is: re-running provision_typed after an operator
+    /// hand-edits the placeholder MUST NOT clobber the edit. That
+    /// is the append_lines_dedup contract, not the push contract.
     #[test]
-    fn provision_local_push_after_provision_preserves_dev_vars_secret_value() {
+    fn provision_typed_local_re_run_preserves_operator_edit_to_dev_vars_secret() {
         // First run seeds `SECRET_KEY=""` (empty placeholder) into
         // `.dev.vars`. The operator hand-edits the file to
         // `SECRET_KEY="real_value_operator_set"`. A subsequent

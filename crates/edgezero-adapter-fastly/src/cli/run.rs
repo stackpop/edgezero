@@ -303,7 +303,27 @@ mod tests {
     #[test]
     fn synthesises_fastly_toml_pins_service_id_when_deployed_present() {
         let out = synthesise_fastly_toml("demo", Some("SVC1"));
-        assert!(out.contains(r#"service_id = "SVC1""#));
+        // Reparse-and-index: substring `service_id = "SVC1"` passes
+        // for both the correct root form AND the shipped bug where
+        // service_id landed inside `[local_server]`. Explicitly assert
+        // it's at the ROOT of the doc.
+        let doc: toml_edit::DocumentMut = out.parse().expect("re-parse synthesised fastly.toml");
+        assert_eq!(
+            doc.get("service_id").and_then(toml_edit::Item::as_str),
+            Some("SVC1"),
+            "service_id must live at the TOML root, not nested under a section: {out}"
+        );
+        // Also assert no `local_server.service_id` -- that would be
+        // the exact silent-drift bug we're guarding against.
+        let local_server_carries_it = doc
+            .get("local_server")
+            .and_then(|item| item.as_table())
+            .and_then(|tbl| tbl.get("service_id"))
+            .is_some();
+        assert!(
+            !local_server_carries_it,
+            "service_id must NOT appear under `[local_server]`: {out}"
+        );
     }
 
     #[test]

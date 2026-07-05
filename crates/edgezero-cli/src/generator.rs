@@ -1386,6 +1386,93 @@ mod tests {
         );
     }
 
+    /// Walker regression guarding the class of bug that shipped
+    /// `service_id = ""` in `fastly.toml.hbs` for months undetected.
+    ///
+    /// Every `*.toml.hbs` scaffold template that goes through
+    /// `provision --local` is checked for empty-string placeholders on
+    /// keys that provision would upsert. A `key = ""` line at the top
+    /// of the template gets past `write_baseline_to_disk` (skips
+    /// existing files) and reaches the emitted project's manifest
+    /// unchanged -- the synthesiser's "omit key until real" invariant
+    /// is silently bypassed. Any template that intentionally ships a
+    /// blank value must comment the line (`# key = ""`) or add an
+    /// exception below with an explicit reason.
+    ///
+    /// Rule: for every non-comment, non-blank line of the form
+    /// `<key> = ""` (double or single quotes, optional whitespace),
+    /// flag it. `authors = [""]` (empty-string-in-array, standard Cargo
+    /// idiom) is allowed because `[...]` is the containing token, not
+    /// `""`.
+    #[test]
+    fn adapter_hbs_templates_have_no_empty_string_placeholders() {
+        // Resolve the workspace root from CARGO_MANIFEST_DIR
+        // (crates/edgezero-cli) -> ../..
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        let mut offenders: Vec<String> = Vec::new();
+        let crates_dir = workspace_root.join("crates");
+        walk_toml_templates(&crates_dir, &mut |path, body| {
+            for (idx, raw_line) in body.lines().enumerate() {
+                let trimmed = raw_line.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                // `key = ""` or `key = ''` (permit optional spaces
+                // around the =). Bail on any array / table forms.
+                let empty_double = trimmed.contains("= \"\"") || trimmed.ends_with("=\"\"");
+                let empty_single = trimmed.contains("= ''") || trimmed.ends_with("=''");
+                if empty_double || empty_single {
+                    offenders.push(format!(
+                        "{}:{} — `{}`",
+                        path.display(),
+                        idx + 1,
+                        raw_line.trim_end()
+                    ));
+                }
+            }
+        });
+
+        assert!(
+            offenders.is_empty(),
+            "Template hygiene violation: `key = \"\"` lines below would ship as empty placeholders through `provision --local` because write_baseline_to_disk skips existing files. Comment the line, remove it, or fill in a real default:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Depth-first walk of every `*.toml.hbs` file under `root`. Skips
+    /// `target/` and `.git/` on principle even though they shouldn't
+    /// contain templates. Reads each hit into memory and invokes
+    /// `visit(path, body)`. Non-toml `.hbs` files are ignored -- only
+    /// TOML has the "root scalar becomes nested under a header on
+    /// re-emit" class of bug and only TOML has empty-placeholder
+    /// semantics we care about.
+    fn walk_toml_templates(root: &Path, visit: &mut dyn FnMut(&Path, &str)) {
+        let entries = match fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if path.is_dir() {
+                if name_str == "target" || name_str == ".git" {
+                    continue;
+                }
+                walk_toml_templates(&path, visit);
+            } else if name_str.ends_with(".toml.hbs") {
+                if let Ok(body) = fs::read_to_string(&path) {
+                    visit(&path, &body);
+                }
+            }
+        }
+    }
+
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
         let temp = TempDir::new().expect("temp dir");

@@ -263,6 +263,9 @@ mod tests {
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {
+        let _lock = crate::env_mutation_guard()
+            .lock()
+            .expect("env mutation guard poisoned");
         env::remove_var("EDGEZERO_TEST_SECRET");
 
         let env = ResolvedEnvironment {
@@ -306,6 +309,9 @@ mod tests {
         // not stomp it. Without the precedence guard, `cmd.env(...)`
         // would inject the manifest value and the parent override
         // would be lost.
+        let _lock = crate::env_mutation_guard()
+            .lock()
+            .expect("env mutation guard poisoned");
         const KEY: &str = "EDGEZERO_TEST_PARENT_WINS";
         env::set_var(KEY, "from_parent_shell");
 
@@ -339,6 +345,9 @@ mod tests {
 
     #[test]
     fn apply_environment_uses_manifest_default_when_parent_env_unset() {
+        let _lock = crate::env_mutation_guard()
+            .lock()
+            .expect("env mutation guard poisoned");
         // Mirror of the above: when the parent shell has NOT set the
         // env var, the manifest default fills it in.
         const KEY: &str = "EDGEZERO_TEST_MANIFEST_FILLS";
