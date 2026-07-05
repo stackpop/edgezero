@@ -45,6 +45,8 @@ mod provision_lock;
 mod scaffold;
 #[cfg(all(test, feature = "cli"))]
 mod shared_test_guards;
+#[cfg(feature = "cli")]
+mod stream;
 #[cfg(all(test, feature = "cli"))]
 mod test_support;
 

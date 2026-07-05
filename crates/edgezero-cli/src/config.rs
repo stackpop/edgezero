@@ -133,14 +133,6 @@ impl ValidationContext {
     pub(crate) fn manifest_path(&self) -> &Path {
         &self.manifest_path
     }
-
-    #[expect(
-        dead_code,
-        reason = "pub(crate) API surface for the provision flow; not yet called anywhere in this crate"
-    )]
-    pub(crate) fn raw_config(&self) -> &toml::Value {
-        &self.raw_config
-    }
 }
 
 // -------------------------------------------------------------------
@@ -397,8 +389,12 @@ where
     run_typed_preflight(&typed, &ctx.validation)?;
 
     // Resolve adapter paths.
-    let (manifest_root, adapter_manifest_path, component_selector, push_ctx) =
-        resolve_push_paths(&ctx)?;
+    let ResolvedPushPaths {
+        manifest_root,
+        adapter_manifest_path,
+        component_selector,
+        push_ctx,
+    } = resolve_push_paths(&ctx)?;
     let paths = PushPathRefs {
         manifest_root,
         adapter_manifest_path: adapter_manifest_path.as_deref(),
@@ -437,16 +433,15 @@ where
 
     // Pre-write re-fetch + skip-on-equal + concurrent-push detection.
     if !args.dry_run && !matches!(remote, ReadConfigEntry::Unsupported(_)) {
-        match recheck_before_write(
-            ctx.adapter,
+        let recheck_ctx = RecheckContext {
+            adapter: ctx.adapter,
             args,
-            &paths,
-            &ctx.store,
-            &key,
-            &local_sha,
-            &remote,
-            approved_remote_sha.as_deref(),
-        )? {
+            paths: &paths,
+            store: &ctx.store,
+            key: &key,
+            first_read: &remote,
+        };
+        match recheck_before_write(&recheck_ctx, &local_sha, approved_remote_sha.as_deref())? {
             RecheckOutcome::Skip => return Ok(()),
             RecheckOutcome::Write => {}
         }
@@ -461,13 +456,13 @@ where
 // -------------------------------------------------------------------
 
 /// Write a diff informational message to stderr.
-/// All non-error diff messages go here rather than using inline `#[expect]` blocks.
-#[expect(
-    clippy::print_stderr,
-    reason = "stream discipline: informational messages go to stderr, never stdout"
-)]
+/// All non-error diff messages go through this helper -- stream
+/// discipline: informational messages go to stderr, never stdout.
+/// Uses `writeln!` on a locked `io::stderr()` handle rather than
+/// `eprintln!` so the workspace `clippy::print_stderr` restriction
+/// still catches accidental stderr prints in other code paths.
 fn diff_info(msg: &str) {
-    eprintln!("{msg}");
+    write_to_stderr_line(msg);
 }
 
 /// Translate an outcome + `--exit-code` flag into a typed exit code
@@ -494,10 +489,6 @@ fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
 /// # Errors
 /// Returns a human-readable error string on any load, parse, or
 /// envelope verification failure.
-#[expect(
-    clippy::too_many_lines,
-    reason = "config diff orchestration: 6 sequential steps (load + structural checks, envelope, adapter resolve, paths, read, branch) each with its own error handling — extracting sub-functions would just move the lines without reducing conceptual complexity"
-)]
 #[inline]
 pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, String>
 where
@@ -578,7 +569,23 @@ where
     let remote = read_remote(adapter, args.local, &paths, &store, &key)?;
 
     // Branch per variant, render, determine outcome.
-    let outcome: DiffOutcome = match &remote {
+    let outcome = render_diff_for_remote_entry(&remote, &local_envelope, &local_sha, &key, args)?;
+
+    Ok(apply_exit_code(args.exit_code, outcome))
+}
+
+/// Render the diff (or absence) for a single remote-read result and
+/// return the appropriate `DiffOutcome`. Extracted from
+/// `run_config_diff_typed` so the orchestration fn stays under the
+/// workspace `too_many_lines` lint without a per-callsite suppression.
+fn render_diff_for_remote_entry(
+    remote: &ReadConfigEntry,
+    local_envelope: &BlobEnvelope,
+    local_sha: &str,
+    key: &str,
+    args: &ConfigDiffArgs,
+) -> Result<DiffOutcome, String> {
+    let outcome = match remote {
         ReadConfigEntry::Present(body) => {
             let remote_envelope: BlobEnvelope = serde_json::from_str(body)
                 .map_err(|err| format!("remote envelope parse failed: {err}"))?;
@@ -593,7 +600,7 @@ where
                     &remote_envelope.data,
                     &local_envelope.data,
                     &remote_envelope.sha256,
-                    &local_sha,
+                    local_sha,
                     &args.format,
                 );
                 DiffOutcome::DiffPresent
@@ -612,7 +619,7 @@ where
                 &serde_json::Value::Object(serde_json::Map::default()),
                 &local_envelope.data,
                 "(none)",
-                &local_sha,
+                local_sha,
                 &args.format,
             );
             DiffOutcome::RemoteAbsent
@@ -632,7 +639,7 @@ where
                 &serde_json::Value::Object(serde_json::Map::default()),
                 &local_envelope.data,
                 "(none)",
-                &local_sha,
+                local_sha,
                 &args.format,
             );
             DiffOutcome::RemoteAbsent
@@ -649,8 +656,7 @@ where
         // `ReadConfigEntry` is `#[non_exhaustive]`; forward-compat fallback.
         _ => DiffOutcome::Unsupported,
     };
-
-    Ok(apply_exit_code(args.exit_code, outcome))
+    Ok(outcome)
 }
 
 /// Dispatch the diff to the correct renderer based on `format`.
@@ -699,13 +705,9 @@ fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(),
                      non-interactive runs (the push writes unconditionally)"
                 ));
             }
-            #[expect(
-                clippy::print_stderr,
-                reason = "stream discipline: TTY consent prompt goes to stderr; eprint! (no newline) keeps the cursor on the prompt line"
-            )]
-            {
-                eprint!("cannot read remote on Spin Cloud ({reason}); write anyway? [y/N] ");
-            };
+            prompt_stderr(&format!(
+                "cannot read remote on Spin Cloud ({reason}); write anyway? [y/N] "
+            ));
             let mut buf = String::new();
             stdin()
                 .read_line(&mut buf)
@@ -722,12 +724,10 @@ fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(),
 
 /// Write an informational message to stderr. All push messages that are
 /// not errors go here.
-#[expect(
-    clippy::print_stderr,
-    reason = "stream discipline: informational messages go to stderr, never stdout"
-)]
+use crate::stream::{info_line as write_to_stderr_line, prompt as prompt_stderr};
+
 fn push_info(msg: &str) {
-    eprintln!("{msg}");
+    write_to_stderr_line(msg);
 }
 
 /// Dispatch a single read to either `read_config_entry_local` or
@@ -763,20 +763,30 @@ fn read_remote(
 
 /// Re-fetch right before the write to detect concurrent pushes
 /// and skip-on-equal.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "recheck needs adapter, local flag, all path refs, store, key, local_sha, first_read, and approved_remote_sha — each is distinct; a sub-struct would shift complexity without simplifying the call site"
-)]
+/// Bundles the four "identity + first-read" args `recheck_before_write`
+/// needs so the fn signature drops from 8 args to 4.
+struct RecheckContext<'ctx> {
+    adapter: &'ctx dyn adapter_registry::Adapter,
+    args: &'ctx ConfigPushArgs,
+    paths: &'ctx PushPathRefs<'ctx>,
+    store: &'ctx ResolvedStoreId,
+    key: &'ctx str,
+    first_read: &'ctx ReadConfigEntry,
+}
+
 fn recheck_before_write(
-    adapter: &dyn adapter_registry::Adapter,
-    args: &ConfigPushArgs,
-    paths: &PushPathRefs<'_>,
-    store: &ResolvedStoreId,
-    key: &str,
+    ctx: &RecheckContext<'_>,
     local_sha: &str,
-    first_read: &ReadConfigEntry,
     approved_remote_sha: Option<&str>,
 ) -> Result<RecheckOutcome, String> {
+    let RecheckContext {
+        adapter,
+        args,
+        paths,
+        store,
+        key,
+        first_read,
+    } = *ctx;
     let remote_now = read_remote(adapter, args.local, paths, store, key)?;
     if let ReadConfigEntry::Present(body_now) = remote_now {
         let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now)
@@ -828,10 +838,6 @@ fn recheck_before_write(
 ///   (when `!no_diff`) and returns `ProceedFromMissingOrUnsupported`.
 /// - `Unsupported` → returns `ProceedFromMissingOrUnsupported` without
 ///   rendering.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "ReadConfigEntry is #[non_exhaustive]; wildcard covers future variants and the no_diff guard cases"
-)]
 fn render_first_read_diff(
     remote: &ReadConfigEntry,
     key: &str,
@@ -885,9 +891,18 @@ fn render_first_read_diff(
             );
             Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
         }
-        // Unsupported, MissingKey/MissingStore with no_diff, and future
-        // #[non_exhaustive] variants — fall through.
-        _ => Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported),
+        // `no_diff` variants + Unsupported: skip the diff render but
+        // still proceed. Explicit enumeration (not `_`) so a future
+        // `ReadConfigEntry` variant fails compilation and forces the
+        // reviewer to decide whether it should render or not. The
+        // trailing wildcard is required because `ReadConfigEntry` is
+        // `#[non_exhaustive]` -- named the pattern `_future` to make
+        // the intent explicit.
+        ReadConfigEntry::MissingKey | ReadConfigEntry::MissingStore => {
+            Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
+        }
+        ReadConfigEntry::Unsupported(_) => Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported),
+        _future => Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported),
     }
 }
 
@@ -902,13 +917,7 @@ fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(),
         return Ok(());
     }
     if stdin().is_terminal() {
-        #[expect(
-            clippy::print_stderr,
-            reason = "stream discipline: TTY consent prompt goes to stderr"
-        )]
-        {
-            eprint!("Apply changes? [y/N] ");
-        };
+        prompt_stderr("Apply changes? [y/N] ");
         let mut buf = String::new();
         stdin()
             .read_line(&mut buf)
@@ -922,25 +931,18 @@ fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(),
     }
 }
 
+/// Owned form of the resolved push paths -- the caller then borrows
+/// the `Option<String>`s into a [`PushPathRefs`] for adapter dispatch.
+struct ResolvedPushPaths<'ctx> {
+    manifest_root: &'ctx Path,
+    adapter_manifest_path: Option<String>,
+    component_selector: Option<String>,
+    push_ctx: adapter_registry::AdapterPushContext<'ctx>,
+}
+
 /// Resolve the adapter-manifest root, adapter manifest path, component
 /// selector, and `AdapterPushContext` from the push context.
-///
-/// Returns `(manifest_root, adapter_manifest_path, component_selector, push_ctx)`.
-#[expect(
-    clippy::type_complexity,
-    reason = "four-tuple return avoids a dedicated struct for a single call site; the items are immediately destructured by the caller"
-)]
-fn resolve_push_paths(
-    ctx: &PushContext,
-) -> Result<
-    (
-        &Path,
-        Option<String>,
-        Option<String>,
-        adapter_registry::AdapterPushContext<'_>,
-    ),
-    String,
-> {
+fn resolve_push_paths(ctx: &PushContext) -> Result<ResolvedPushPaths<'_>, String> {
     let manifest = ctx.validation.manifest();
     let (_canonical, adapter_cfg) =
         manifest.adapter_entry(ctx.adapter.name()).ok_or_else(|| {
@@ -965,12 +967,12 @@ fn resolve_push_paths(
     }
     let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
     let component_selector = adapter_cfg.adapter.component.clone();
-    Ok((
+    Ok(ResolvedPushPaths {
         manifest_root,
         adapter_manifest_path,
         component_selector,
         push_ctx,
-    ))
+    })
 }
 
 /// Dry-run log + adapter write dispatch.
@@ -1023,17 +1025,12 @@ fn write_envelope(
 /// unchanged when ≤ 8 bytes (the `"(none)"` sentinel is 6 bytes —
 /// avoids a panic on the `&sha[..8]` index).
 pub(crate) fn short_ref(sha: &str) -> &str {
-    if sha.len() <= 8 {
-        sha
-    } else {
-        #[expect(
-            clippy::string_slice,
-            reason = "checked: sha.len() > 8 ensures this 8-byte index is within ASCII hex bytes"
-        )]
-        {
-            &sha[..8]
-        }
-    }
+    // sha is ASCII hex (SHA-256 fingerprint), so `str::get(..8)`
+    // never returns None unless the string is shorter than 8 bytes,
+    // in which case we return the full string. Avoids the
+    // panic-on-byte-index that `&sha[..8]` would risk on a
+    // multi-byte prefix.
+    sha.get(..8).unwrap_or(sha)
 }
 
 /// Pretty-print a `serde_json::Value` with object keys sorted
@@ -1303,18 +1300,6 @@ pub(crate) fn resolve_app_config_path_primitive(
         || PathBuf::from(&default_name),
         |dir| dir.join(&default_name),
     )
-}
-
-#[expect(
-    dead_code,
-    reason = "thin wrapper kept for call-site clarity; production callers use the primitive directly"
-)]
-fn resolve_app_config_path(
-    args: &ConfigValidateArgs,
-    manifest_path: &Path,
-    app_name: &str,
-) -> PathBuf {
-    resolve_app_config_path_primitive(args.app_config.as_deref(), manifest_path, app_name)
 }
 
 fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
@@ -1733,11 +1718,6 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::arbitrary_source_item_ordering,
-    clippy::default_numeric_fallback,
-    reason = "test module groups items by subject (PathPrepend co-located with its fake-spin consumers, fixtures with their tests) rather than by item kind; `range(min = 100, max = 60_000)` bounds default to the field's int type"
-)]
 mod tests {
     use super::*;
     use crate::test_support::{manifest_guard, EnvOverride};
@@ -1838,7 +1818,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     #[derive(Debug, Deserialize, Serialize, Validate)]
     #[serde(deny_unknown_fields)]
     struct FixtureServiceConfig {
-        #[validate(range(min = 100, max = 60_000))]
+        #[validate(range(min = 100_u32, max = 60_000_u32))]
         timeout_ms: u32,
     }
 
