@@ -21,10 +21,15 @@
   - `impl_trait_in_params` — use named generics, not `impl Trait` params.
   - `assertions_on_result_states` — in tests use `.unwrap()/.unwrap_err()/.expect()` or `assert_eq!`, not `assert!(x.is_ok())`.
   - `needless_raw_strings` — plain string unless it needs `"`/`#`.
-- **Test targets/features (critical — the crate compiles almost nothing on default features):**
-  - The `response`/`proxy`/`request`/`lib` modules are all `#[cfg(feature = "fastly")]`. **Host unit tests run only under `cargo test -p edgezero-adapter-fastly --features fastly`.**
-  - `crates/edgezero-adapter-fastly/tests/contract.rs` is `#![cfg(all(feature = "fastly", target_arch = "wasm32"))]` — **Viceroy/wasm-only; it does NOT run under host `cargo test`** and is out of scope for this plan's verification commands.
-  - Fastly **hostcalls** (`get_client_ip_addr`, `get_tls_ja4`, `send_async_streaming`, `Backend::builder`, `ConfigStore::try_open`) panic/abort off-platform. Host unit tests must avoid them. `FastlyResponse::from_status`, `set_body`/`append_header`/`get_header_all`, and `FastlyRequest::new`/`get_method`/`get_url_str`/`get_headers` work host-side.
+- **Test targets/features (CRITICAL — the fastly adapter is a wasm-only crate; verified empirically):**
+  - `--features fastly` pulls in `libfastly`, which references undefined Compute@Edge hostcall symbols on the host. **`cargo test -p edgezero-adapter-fastly --features fastly` from the workspace root FAILS TO LINK** (`ld: symbol(s) not found`). Do not use it.
+  - The crate ships a per-package `crates/edgezero-adapter-fastly/.cargo/config.toml` that sets `build.target = "wasm32-wasip1"` and a **Viceroy** runner — **but only when cargo is invoked from inside the crate directory.** So run all fastly-adapter tests as:
+    ```
+    (cd crates/edgezero-adapter-fastly && cargo test --features fastly --lib <filter>)
+    ```
+    This builds to `wasm32-wasip1` and runs the test binary under Viceroy (0.17.0, pinned in `.tool-versions`), which provides the hostcalls — so `FastlyResponse::from_status`/`append_header`/`get_header_all`, `FastlyRequest::new`/`get_url_str`, and even `get_client_ip_addr` all work at runtime. **Every `cargo test -p edgezero-adapter-fastly --features fastly …` command in the tasks below MUST be run in this `(cd crates/edgezero-adapter-fastly && cargo test --features fastly …)` form** — the commands are written the short way for brevity.
+  - `crates/edgezero-adapter-fastly/tests/contract.rs` is `#![cfg(all(feature = "fastly", target_arch = "wasm32"))]` (the same wasm/Viceroy path). CI runs it via `cargo test -p edgezero-adapter-fastly --features fastly --target wasm32-wasip1 --test contract`.
+  - `cargo clippy`/`cargo check --features fastly` type-check on the **host** (no link), so clippy runs from the workspace root as usual.
 - **CI gates (all must pass):**
   1. `cargo fmt --all -- --check`
   2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
@@ -602,9 +607,9 @@ Add a Fastly `run_app` variant taking an app closure that reads the raw `fastly:
 
 - [ ] **Step 1: Write the failing host unit test (the scratch-bag mechanism)**
 
-The full end-to-end (closure value reaching a handler) requires `into_core_request`, which calls the `get_client_ip_addr()` **hostcall** — so it is Viceroy/wasm-only and lives in `contract.rs` (out of scope here). Host-test the closure/scratch-bag plumbing directly via a small extracted helper.
+Unit-test the closure/scratch-bag seam directly via a small extracted helper. (This runs under Viceroy from the crate dir, per Global Constraints; the *full* `run_app_with_request_extensions` → `into_core_request` → handler integration is best covered by a `contract.rs` test — see the note after the handler-visible test.)
 
-Add to the `#[cfg(test)] mod synthesis_tests` in `crates/edgezero-adapter-fastly/src/request.rs` (host-side, runs under `--features fastly`). It builds a `FastlyRequest` host-side (`FastlyRequest::new` is not a hostcall) and asserts the closure populated the scratch bag:
+Add to the `#[cfg(test)] mod synthesis_tests` in `crates/edgezero-adapter-fastly/src/request.rs`. It builds a `FastlyRequest` and asserts the closure populated the scratch bag:
 
 ```rust
     #[test]
@@ -851,7 +856,10 @@ git commit -m "feat(fastly): run_app_with_request_extensions pre-dispatch hook f
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
-cargo test -p edgezero-adapter-fastly --features fastly        # host unit tests for the gated modules
+# fastly adapter is wasm-only: run its tests via Viceroy FROM THE CRATE DIR
+# (root `cargo test -p edgezero-adapter-fastly --features fastly` fails to link):
+(cd crates/edgezero-adapter-fastly && cargo test --features fastly --lib)
+(cd crates/edgezero-adapter-fastly && cargo test --features fastly --target wasm32-wasip1 --test contract)  # if Viceroy present
 cargo check --workspace --all-targets --features "fastly cloudflare spin"
 cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 (cd examples/app-demo && cargo test)
