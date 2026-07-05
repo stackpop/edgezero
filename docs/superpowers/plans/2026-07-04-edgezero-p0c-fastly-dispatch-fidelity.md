@@ -592,7 +592,7 @@ Add a Fastly `run_app` variant taking an app closure that reads the raw `fastly:
 
 **Files:**
 - Modify: `crates/edgezero-adapter-fastly/src/request.rs` (thread the closure through `dispatch_with_registries`/`dispatch_with_handles`; scratch-`extend` around `into_core_request` at `request.rs:284`; update the OTHER `dispatch_with_handles` caller `FastlyService::dispatch` at `request.rs:145` to pass a no-op; add a host unit test)
-- Modify: `crates/edgezero-adapter-fastly/src/lib.rs` (`run_app_with_request_extensions`; `run_app` + `run_app_with_config` delegate with a no-op)
+- Modify: `crates/edgezero-adapter-fastly/src/lib.rs` (`run_app_with_request_extensions`; `run_app` delegates to it with a no-op). `run_app_with_config` is unaffected by the closure threading — it dispatches via `FastlyService::dispatch` (updated in Step 3), not `dispatch_with_registries`.
 
 **Interfaces:**
 - Consumes: `into_core_request(req: FastlyRequest) -> Result<Request, EdgeError>` (`request.rs:445`, consumes `req` by value); `edgezero_core::http::Extensions`.
@@ -815,21 +815,21 @@ where
 }
 ```
 
-(The logger gate here is the Task-3 `&& !A::owns_logging()`. `run_app_with_config` at `lib.rs:200` also calls `dispatch_with_registries` — update that call to pass a no-op closure `|_req, _extensions| {}` as the final arg so it compiles.)
+(The logger gate here is the Task-3 `&& !A::owns_logging()`. Note: `run_app_with_config` (`lib.rs:200`) does **not** call `dispatch_with_registries` — it builds a `FastlyService` and calls `service.dispatch(req)` (`lib.rs:210-214`), which routes through `FastlyService::dispatch` → `dispatch_with_handles`, already updated with a no-op in Step 3. So `run_app_with_config` needs no change here beyond its own Task-3 logger gate. The **only** direct caller of `dispatch_with_registries` is `run_app` — now delegating through `run_app_with_request_extensions`.)
 
 - [ ] **Step 5: Confirm every caller was updated, then run the host test + build**
 
 `dispatch_with_handles` and `dispatch_with_registries` are internal to the fastly crate but each has multiple callers. Grep to confirm none was missed before building:
 
 Run: `grep -rn "dispatch_with_handles\|dispatch_with_registries" crates/edgezero-adapter-fastly/src/`
-Expected callers, all now passing an `extend` closure: `dispatch_with_handles` ← `FastlyService::dispatch` (`request.rs:145`, no-op) and `dispatch_with_registries` (`request.rs`); `dispatch_with_registries` ← `run_app`/`run_app_with_request_extensions` and `run_app_with_config` (`lib.rs`). If grep shows any call without a trailing closure arg, fix it.
+Expected callers, all now passing an `extend` closure: `dispatch_with_handles` ← `FastlyService::dispatch` (`request.rs:145`, no-op) and `dispatch_with_registries` (`request.rs`); `dispatch_with_registries` ← only `run_app_with_request_extensions` (`lib.rs`; `run_app` delegates to it). `run_app_with_config` reaches dispatch via `FastlyService::dispatch`, so it needs no closure change. If grep shows any `dispatch_with_handles`/`dispatch_with_registries` call without a trailing closure arg, fix it.
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib apply_request_extend 2>&1 | tail -8`
 Expected: PASS.
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib 2>&1 | tail -8`
 Expected: all host unit tests PASS (existing `synthesis_tests`, response, proxy, lib).
 Run: `cargo check --workspace --all-targets --features "fastly cloudflare spin" 2>&1 | tail -5`
-Expected: succeeds (the signature changes are internal to the fastly crate; the three callers — `FastlyService::dispatch`, `run_app`/variants, `run_app_with_config` — are all updated).
+Expected: succeeds (the signature changes are internal to the fastly crate; the two `dispatch_with_handles` callers — `FastlyService::dispatch` and `dispatch_with_registries` — and the one `dispatch_with_registries` caller, `run_app_with_request_extensions`, are all updated. `run_app_with_config` compiles unchanged: it dispatches via `FastlyService::dispatch`).
 
 - [ ] **Step 6: Lint + commit**
 
