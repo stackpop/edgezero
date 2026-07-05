@@ -51,7 +51,7 @@
 - Consumes: `crate::context::RequestContext` (has `pub(crate) fn extension<T>(&self) -> Option<T> where T: Clone + Send + Sync + 'static` at `context.rs:77`), `crate::error::EdgeError` (`EdgeError::internal(anyhow::Error) -> 500`; `err.status() -> StatusCode`), the `FromRequest` trait (`extractor.rs:21`), `std::ops::{Deref, DerefMut}` (already imported at `extractor.rs:1`).
 - Produces: `pub struct State<T>(pub T)` with `impl<T: Clone + Send + Sync + 'static> FromRequest for State<T>`, plus `Deref`/`DerefMut`/`into_inner`. Consumed by Task 2 (router tests) and Task 3 (macro composition).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `#[cfg(test)] mod tests` block at the end of `crates/edgezero-core/src/extractor.rs`. The module already imports `request_builder, Method, StatusCode` (from `crate::http`), `RequestContext`, `PathParams`, `Body`, `block_on`, and `std::sync::Arc`.
 
@@ -126,12 +126,12 @@ Append to the `#[cfg(test)] mod tests` block at the end of `crates/edgezero-core
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p edgezero-core --lib state_extractor 2>&1 | tail -20`
 Expected: FAIL — compile error `cannot find type/struct State in this scope` (the extractor does not exist yet).
 
-- [ ] **Step 3: Write the extractor**
+- [x] **Step 3: Write the extractor**
 
 Insert into `crates/edgezero-core/src/extractor.rs` immediately after the `Kv` extractor block (after the `impl Kv { ... }` that ends around `extractor.rs:529`), before the next extractor. `anyhow` is already used in this file; `core::any::type_name` needs no import.
 
@@ -197,17 +197,17 @@ impl<T> State<T> {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p edgezero-core --lib state_extractor 2>&1 | tail -20`
 Expected: PASS — 3 tests (`state_extractor_resolves_registered_value`, `state_extractor_missing_registration_is_internal_error`, `state_extractor_deref_and_into_inner`).
 
-- [ ] **Step 5: Lint**
+- [x] **Step 5: Lint**
 
 Run: `cargo clippy -p edgezero-core --all-targets --all-features -- -D warnings 2>&1 | tail -20`
 Expected: no warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/edgezero-core/src/extractor.rs
@@ -237,7 +237,7 @@ git commit -m "feat(core): add State<T> extractor for app-owned shared state"
 - Consumes: `State<T>` from Task 1 (`crate::extractor::State`), `crate::http::Extensions` (facade alias), `std::sync::Arc` (imported at `router.rs:2`).
 - Produces: `RouterBuilder::with_state<T>(self, value: T) -> Self where T: Clone + Send + Sync + 'static`. Consumed by Task 3.
 
-- [ ] **Step 1: Write the failing router tests**
+- [x] **Step 1: Write the failing router tests**
 
 Append to `crates/edgezero-core/src/router.rs`'s main `#[cfg(test)] mod tests` (the block whose imports are at `router.rs:476`, which already imports `Arc, Mutex`, `block_on`, `noop_waker_ref`, `Context, Poll`, `request_builder, Method, StatusCode`, `Body`, `RequestContext`, `EdgeError`).
 
@@ -385,7 +385,7 @@ Append to `crates/edgezero-core/src/router.rs`'s main `#[cfg(test)] mod tests` (
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p edgezero-core --lib with_state 2>&1 | tail -20`
 Expected: FAIL — `no method named with_state found for struct RouterBuilder`.
@@ -398,7 +398,7 @@ Expected: FAIL — `no method named with_state found for struct RouterBuilder`.
 > `crates/edgezero-core/src/router.rs` for the final shape; don't follow the
 > `state_inserters`/`StateInserter` snippets below literally.
 
-- [ ] **Step 3: Add the `StateInserter` type alias** *(superseded — see note above)*
+- [x] **Step 3: Add the `StateInserter` type alias** *(superseded — see note above)*
 
 In `crates/edgezero-core/src/router.rs`, add just above `pub struct RouterBuilder` (which is at `router.rs:71`, under its `#[derive(Default)]` at `router.rs:70`):
 
@@ -408,7 +408,7 @@ In `crates/edgezero-core/src/router.rs`, add just above `pub struct RouterBuilde
 type StateInserter = Arc<dyn Fn(&mut crate::http::Extensions) + Send + Sync>;
 ```
 
-- [ ] **Step 4: Add the `state_inserters` field to `RouterBuilder`**
+- [x] **Step 4: Add the `state_inserters` field to `RouterBuilder`**
 
 Change the struct at `router.rs:70-76` from:
 
@@ -435,7 +435,7 @@ pub struct RouterBuilder {
 }
 ```
 
-- [ ] **Step 5: Add the `with_state` method**
+- [x] **Step 5: Add the `with_state` method**
 
 In the `impl RouterBuilder` block, add immediately after `with_manifest_json` (which is at `router.rs:190-195`):
 
@@ -463,7 +463,7 @@ In the `impl RouterBuilder` block, add immediately after `with_manifest_json` (w
     }
 ```
 
-- [ ] **Step 6: Thread `state_inserters` through `build()`**
+- [x] **Step 6: Thread `state_inserters` through `build()`**
 
 Change `build()` at `router.rs:108-119` from:
 
@@ -496,7 +496,7 @@ to (add the 5th argument):
     }
 ```
 
-- [ ] **Step 7: Add the field to `RouterInner` and the param to `RouterService::new`**
+- [x] **Step 7: Add the field to `RouterInner` and the param to `RouterService::new`**
 
 Change `RouterInner` at `router.rs:198-203` from:
 
@@ -563,7 +563,7 @@ to:
     }
 ```
 
-- [ ] **Step 8: Apply the inserters in `dispatch`**
+- [x] **Step 8: Apply the inserters in `dispatch`**
 
 In `RouterInner::dispatch` (`router.rs:206-237`), inside the `RouteMatch::Found(entry, params)` arm, add the state-insertion loop after the `needs.routes` block and before `let ctx = RequestContext::new(request, params);` (currently `router.rs:227`). The arm becomes:
 
@@ -596,17 +596,17 @@ In `RouterInner::dispatch` (`router.rs:206-237`), inside the `RouteMatch::Found(
             }
 ```
 
-- [ ] **Step 9: Run tests to verify they pass**
+- [x] **Step 9: Run tests to verify they pass**
 
 Run: `cargo test -p edgezero-core --lib with_state 2>&1 | tail -20`
 Expected: PASS — 4 tests (`with_state_exposes_value_to_handler`, `with_state_supports_multiple_distinct_types`, `with_state_same_type_is_last_write_wins`, `with_state_no_cross_request_bleed`).
 
-- [ ] **Step 10: Full crate test + lint**
+- [x] **Step 10: Full crate test + lint**
 
 Run: `cargo test -p edgezero-core 2>&1 | tail -20 && cargo clippy -p edgezero-core --all-targets --all-features -- -D warnings 2>&1 | tail -20`
 Expected: all existing + new tests PASS; clippy clean (proves the router restructure did not regress introspection tests).
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add crates/edgezero-core/src/router.rs
@@ -626,7 +626,7 @@ git commit -m "feat(core): RouterBuilder::with_state injects app state into requ
 - Consumes: `State<T>` (Task 1), `RouterBuilder::with_state` (Task 2), `#[action]` (unchanged — `crates/edgezero-macros/src/action.rs:183` emits `<#ty as ::edgezero_core::extractor::FromRequest>::from_request(&__ctx).await?` for every non-`RequestContext` arg), `RouterService::oneshot` (`router.rs:316`), `Query<T>` extractor (`edgezero_core::extractor::Query`).
 - Produces: nothing consumed downstream; this is the acceptance proof that the macro composes `State<T>` with another extractor.
 
-- [ ] **Step 1: Add the `futures` dev-dependency to the macros crate**
+- [x] **Step 1: Add the `futures` dev-dependency to the macros crate**
 
 Confirm `futures` is a workspace dependency:
 
@@ -649,7 +649,7 @@ trybuild = { workspace = true }
 
 (If `grep` shows `futures` is not workspace-managed, use `futures = "0.3"` with `features = ["std", "executor"]` instead.)
 
-- [ ] **Step 2: Write the failing integration test**
+- [x] **Step 2: Write the failing integration test**
 
 Create `crates/edgezero-macros/tests/action_state.rs`:
 
@@ -712,12 +712,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the integration test**
+- [x] **Step 3: Run the integration test**
 
 Run: `cargo test -p edgezero-macros --test action_state 2>&1 | tail -20`
 Expected: PASS — `action_composes_state_and_query`. (This simultaneously proves the macro needs no change: `State<T>` is dispatched by the same generic `FromRequest` line as `Query<T>`.)
 
-- [ ] **Step 4: Add the docs section**
+- [x] **Step 4: Add the docs section**
 
 Append to `docs/guide/handlers.md` a new section (place it after the existing extractor documentation, before any "Next steps"/footer):
 
@@ -774,7 +774,7 @@ a handler asks for a `State<T>` that was never registered, extraction fails with
 a `500` — register it before `build()`.
 ```
 
-- [ ] **Step 5: Full verification**
+- [x] **Step 5: Full verification**
 
 Run: `cargo test --workspace --all-targets 2>&1 | tail -20`
 Expected: PASS.
@@ -785,7 +785,7 @@ Expected: formatted; clippy clean.
 Run: `cargo check --workspace --all-targets --features "fastly cloudflare spin" 2>&1 | tail -5 && cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin 2>&1 | tail -5`
 Expected: both succeed (proves the core change is WASM-clean across adapters).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/edgezero-macros/tests/action_state.rs crates/edgezero-macros/Cargo.toml docs/guide/handlers.md

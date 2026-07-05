@@ -370,9 +370,9 @@ fn main() {
     if violations > 0 {
         eprintln!(
             "\n{violations} nested-AppConfig violation(s). \
-             A struct with #[derive(AppConfig)] must not contain fields whose \
-             type resolves to another #[derive(AppConfig)] struct, even through \
-             Option/Vec/Box wrappers (spec \u{00a7}3.3)."
+             A field whose type resolves to another #[derive(AppConfig)] struct \
+             (even through Option/Vec/Box wrappers) must opt in with \
+             #[app_config(nested)]; otherwise nesting is rejected (spec \u{00a7}3.3)."
         );
         process::exit(1);
     }

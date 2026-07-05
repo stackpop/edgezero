@@ -64,7 +64,7 @@
 - Consumes: `from_core_response(response: edgezero_core::http::Response) -> Result<fastly::Response, EdgeError>` (existing); `response_builder()`, `Body` (test-module imports already present).
 - Produces: unchanged signature; behavior now preserves duplicate header values.
 
-- [ ] **Step 1: Write the failing host test**
+- [x] **Step 1: Write the failing host test**
 
 Add to the `#[cfg(test)] mod tests` in `crates/edgezero-adapter-fastly/src/response.rs`, placed in alphabetical position among the test fns (before `stream_body_is_written_to_fastly_response`). The module already imports `super::*`, `Body`, `response_builder`.
 
@@ -89,12 +89,12 @@ Add to the `#[cfg(test)] mod tests` in `crates/edgezero-adapter-fastly/src/respo
     }
 ```
 
-- [ ] **Step 2: Run it — verify it fails**
+- [x] **Step 2: Run it — verify it fails**
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib multi_value_set_cookie 2>&1 | tail -20`
 Expected: FAIL — the collected `cookies` is `["b=2"]` (the loop's `set_header` replaced the first value).
 
-- [ ] **Step 3: Swap `set_header` → `append_header`**
+- [x] **Step 3: Swap `set_header` → `append_header`**
 
 In `crates/edgezero-adapter-fastly/src/response.rs`, change the header loop (`response.rs:28-30`):
 
@@ -115,17 +115,17 @@ to:
     }
 ```
 
-- [ ] **Step 4: Run it — verify it passes**
+- [x] **Step 4: Run it — verify it passes**
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib multi_value_set_cookie 2>&1 | tail -8`
 Expected: PASS. Also run the whole module: `cargo test -p edgezero-adapter-fastly --features fastly --lib response 2>&1 | tail -8` → all pass.
 
-- [ ] **Step 5: Lint**
+- [x] **Step 5: Lint**
 
 Run: `cargo clippy -p edgezero-adapter-fastly --all-targets --features fastly -- -D warnings 2>&1 | tail -5`
 Expected: clean.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/edgezero-adapter-fastly/src/response.rs
@@ -143,7 +143,7 @@ git commit -m "fix(fastly): preserve multi-value response headers (Set-Cookie) i
 - Consumes: `convert_response(fastly_response: &mut fastly::Response) -> edgezero_core::proxy::ProxyResponse` (existing, private); `HeaderName` from `edgezero_core::http`.
 - Produces: `convert_response` preserving duplicate origin response headers.
 
-- [ ] **Step 1: Write the failing host test**
+- [x] **Step 1: Write the failing host test**
 
 Add to the `#[cfg(test)] mod tests` in `crates/edgezero-adapter-fastly/src/proxy.rs` (module already imports `super::*`, `block_on`). Place alphabetically among the existing `stream_handles_*` tests (before `stream_handles_brotli`).
 
@@ -166,12 +166,12 @@ Add to the `#[cfg(test)] mod tests` in `crates/edgezero-adapter-fastly/src/proxy
     }
 ```
 
-- [ ] **Step 2: Run it — verify it fails**
+- [x] **Step 2: Run it — verify it fails**
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib convert_response_preserves 2>&1 | tail -20`
 Expected: FAIL — `cookies` is `["a=1"]` (or one value): `get_header` returns the first value and `HeaderMap::insert` replaces.
 
-- [ ] **Step 3: Fix `convert_response` to append every value**
+- [x] **Step 3: Fix `convert_response` to append every value**
 
 In `crates/edgezero-adapter-fastly/src/proxy.rs`, change the header loop (`proxy.rs:67-71`):
 
@@ -199,12 +199,12 @@ to:
 
 (If the installed `fastly` SDK's `get_header_names()` yields owned `HeaderName` rather than `&HeaderName`, bind `for name in …` then call `get_header_all(&name)` / `append(&name, …)`. Confirm by the compiler; behavior is identical.)
 
-- [ ] **Step 4: Run it — verify it passes**
+- [x] **Step 4: Run it — verify it passes**
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib convert_response_preserves 2>&1 | tail -8`
 Expected: PASS. Run the module: `cargo test -p edgezero-adapter-fastly --features fastly --lib proxy 2>&1 | tail -8` → all pass.
 
-- [ ] **Step 5: Request-side audit — switch to `append_header` for consistency**
+- [x] **Step 5: Request-side audit — switch to `append_header` for consistency**
 
 Origin-bound request duplicate headers are rare, but for consistency and to remove the same class of latent bug, change the request-build loop in `build_fastly_request` (`proxy.rs:53`):
 
@@ -225,14 +225,14 @@ Leave the explicit `Host` line (`proxy.rs:57`) as `set_header` — it is a singl
     // set explicitly as a single value.
 ```
 
-- [ ] **Step 6: Run + lint**
+- [x] **Step 6: Run + lint**
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib proxy 2>&1 | tail -8`
 Expected: PASS.
 Run: `cargo clippy -p edgezero-adapter-fastly --all-targets --features fastly -- -D warnings 2>&1 | tail -5`
 Expected: clean.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/edgezero-adapter-fastly/src/proxy.rs
@@ -256,7 +256,7 @@ This task adds the trait method and wires it everywhere **atomically** — becau
 **Interfaces:**
 - Produces: `Hooks::owns_logging() -> bool` (default `false`). Consumed by all four `run_app` entrypoints and by Task 4 (macro argument).
 
-- [ ] **Step 1: Write the failing trait test**
+- [x] **Step 1: Write the failing trait test**
 
 Add to the `#[cfg(test)] mod tests` in `crates/edgezero-core/src/app.rs`, placed alphabetically among the existing test fns. `DefaultHooks` (defined in that module, `app.rs:163`) overrides only `routes`/`stores`, so it should report the default.
 
@@ -267,12 +267,12 @@ Add to the `#[cfg(test)] mod tests` in `crates/edgezero-core/src/app.rs`, placed
     }
 ```
 
-- [ ] **Step 2: Run it — verify it fails**
+- [x] **Step 2: Run it — verify it fails**
 
 Run: `cargo test -p edgezero-core --lib default_hooks_do_not_own_logging 2>&1 | tail -15`
 Expected: FAIL — `no method named owns_logging found`.
 
-- [ ] **Step 3: Add `owns_logging()` to the `Hooks` trait**
+- [x] **Step 3: Add `owns_logging()` to the `Hooks` trait**
 
 In `crates/edgezero-core/src/app.rs`, add to the `Hooks` trait. **`arbitrary_source_item_ordering` (restriction = deny) enforces alphabetical trait methods**, so place `owns_logging` between `name` and `routes` (order: `build_app`, `configure`, `name`, `owns_logging`, `routes`, `stores`) — not adjacent to `configure`:
 
@@ -286,7 +286,7 @@ In `crates/edgezero-core/src/app.rs`, add to the `Hooks` trait. **`arbitrary_sou
     }
 ```
 
-- [ ] **Step 4: Emit `owns_logging` from the `app!` macro**
+- [x] **Step 4: Emit `owns_logging` from the `app!` macro**
 
 In `crates/edgezero-macros/src/app.rs`, add to the emitted `impl edgezero_core::app::Hooks` block (`app.rs:165-183`) — after `configure`, mirroring the explicit-defaults pattern the file already documents at `app.rs:154-158`:
 
@@ -308,7 +308,7 @@ Update the `missing_trait_methods` comment at `app.rs:154-158` to include `owns_
     // defaults change, update these emitted bodies to match.
 ```
 
-- [ ] **Step 5: Gate the four adapter logger-init sites**
+- [x] **Step 5: Gate the four adapter logger-init sites**
 
 Each adapter's `run_app` (and Fastly's `run_app_with_config`) must skip its logger init when `A::owns_logging()`:
 
@@ -342,21 +342,21 @@ and the identical block in `run_app_with_config` (`lib.rs:205-208`) — same `&&
     }
 ```
 
-- [ ] **Step 6: Run the trait test + workspace build**
+- [x] **Step 6: Run the trait test + workspace build**
 
 Run: `cargo test -p edgezero-core --lib default_hooks_do_not_own_logging 2>&1 | tail -8`
 Expected: PASS.
 Run: `cargo check --workspace --all-targets --features "fastly cloudflare spin" 2>&1 | tail -5`
 Expected: succeeds (macro emission satisfies `missing_trait_methods`; all four adapters compile).
 
-- [ ] **Step 7: Lint + WASM checks**
+- [x] **Step 7: Lint + WASM checks**
 
 Run: `cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -5`
 Expected: clean (the two `Hooks` test stubs already carry `#[expect(clippy::missing_trait_methods)]`, so the new defaulted method needs no change there).
 Run: `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin 2>&1 | tail -3`
 Expected: succeeds.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/edgezero-core/src/app.rs crates/edgezero-macros/src/app.rs \
@@ -382,7 +382,7 @@ Rework `AppArgs` from "path + optional ident" into the keyword-argument grammar 
 - Consumes: `syn::{LitStr, Ident, LitBool, Token}`, `syn::parse::{Parse, ParseStream}`.
 - Produces: `struct AppArgs { path: LitStr, app_ident: Option<Ident>, owns_logging: Option<bool> }` with a keyword-arg parser. **P0-D adds `state: Option<syn::Expr>` to this same struct and parser.**
 
-- [ ] **Step 1: Write the failing `AppArgs` unit tests**
+- [x] **Step 1: Write the failing `AppArgs` unit tests**
 
 Add a focused unit-test module for the parser. Put it in the existing `#[cfg(test)] mod tests` in `crates/edgezero-macros/src/app.rs` (which currently imports only `parse_handler_path`). Add `use super::AppArgs;` and `use syn::parse_str;`. Tests (place alphabetically among the existing `parse_handler_path_*` fns):
 
@@ -441,12 +441,12 @@ Add a focused unit-test module for the parser. Put it in the existing `#[cfg(tes
     }
 ```
 
-- [ ] **Step 2: Run — verify they fail**
+- [x] **Step 2: Run — verify they fail**
 
 Run: `cargo test -p edgezero-macros --lib app_args_ 2>&1 | tail -20`
 Expected: FAIL — the current `AppArgs` has no `owns_logging` field and rejects `owns_logging = true` with "unexpected tokens".
 
-- [ ] **Step 3: Rework `AppArgs` + `impl Parse`**
+- [x] **Step 3: Rework `AppArgs` + `impl Parse`**
 
 Replace `crates/edgezero-macros/src/app.rs:12-31` with:
 
@@ -519,7 +519,7 @@ Add `LitBool` isn't needed as an import (used as `syn::LitBool`); ensure `Ident`
 
 > **Note for P0-D:** the `match key.to_string()` arm is the extension point — P0-D adds a `"state" => { … }` arm and a `state: Option<syn::Expr>` field. The "expected `owns_logging`" message becomes "expected `state` or `owns_logging`" then.
 
-- [ ] **Step 4: Emit the parsed `owns_logging` value**
+- [x] **Step 4: Emit the parsed `owns_logging` value**
 
 In `expand_app`, before the `quote!` block, compute the bool literal (default `false`). Near the other `let …_lit` bindings (around `app.rs:130-152`):
 
@@ -537,12 +537,12 @@ Change the emitted `fn owns_logging()` (added in Task 3, currently `{ false }`) 
 
 (`bool` implements `quote::ToTokens`, so `#owns_logging_lit` emits `true`/`false`.)
 
-- [ ] **Step 5: Run the unit tests — verify they pass**
+- [x] **Step 5: Run the unit tests — verify they pass**
 
 Run: `cargo test -p edgezero-macros --lib app_args_ 2>&1 | tail -12`
 Expected: PASS — all seven `app_args_*` tests.
 
-- [ ] **Step 6: Add a real-`app!` macro-emission integration test (spec requirement)**
+- [x] **Step 6: Add a real-`app!` macro-emission integration test (spec requirement)**
 
 The spec's C2 acceptance requires proving the macro *emits* `owns_logging() == true` for `app!(…, owns_logging = true)` — not just that the grammar parses. `edgezero-macros` dev-depends on `edgezero-core` (`crates/edgezero-macros/Cargo.toml:31`) which re-exports `app!` (`crates/edgezero-core/src/lib.rs:42`), and the macro resolves the manifest path against the invoking crate's `CARGO_MANIFEST_DIR` (`app.rs:243`), so an integration test can invoke `app!` with a checked-in fixture manifest.
 
@@ -581,14 +581,14 @@ mod tests {
 Run: `cargo test -p edgezero-macros --test app_macro 2>&1 | tail -12`
 Expected: PASS — proves the macro emitted `fn owns_logging() -> bool { true }`. (Only one `app!` per test file — it emits a free `build_router()` that would collide across invocations; the default `owns_logging() == false` path is covered by app-demo below.)
 
-- [ ] **Step 7: Verify app-demo (real `app!`, no keyword args) still emits owns_logging=false**
+- [x] **Step 7: Verify app-demo (real `app!`, no keyword args) still emits owns_logging=false**
 
 app-demo's `app!("../../edgezero.toml")` (`examples/app-demo/crates/app-demo-core/src/lib.rs:11`) uses no keyword args, so its generated `owns_logging()` returns `false`.
 
 Run: `(cd examples/app-demo && cargo test -p app-demo-core 2>&1 | tail -5)`
 Expected: PASS. (Do NOT add a process-global logger "call run_app twice" test — the macro-emission test above + the gate code review are the deterministic coverage.)
 
-- [ ] **Step 8: Lint + commit**
+- [x] **Step 8: Lint + commit**
 
 Run: `cargo clippy -p edgezero-macros --all-targets --all-features -- -D warnings 2>&1 | tail -5`
 Expected: clean.
@@ -616,7 +616,7 @@ Add a Fastly `run_app` variant taking an app closure that reads the raw `fastly:
   - `request.rs`: `dispatch_with_registries<F>(app, req, config_meta, kv_meta, secret_meta, env, extend: F) where F: FnOnce(&FastlyRequest, &mut Extensions)` — an added final `extend` parameter; `dispatch_with_handles<F>` likewise.
   - `lib.rs`: `pub fn run_app_with_request_extensions<A, F>(req: fastly::Request, extend: F) -> Result<fastly::Response, fastly::Error> where A: Hooks, F: FnOnce(&fastly::Request, &mut Extensions)`.
 
-- [ ] **Step 1: Write the failing host unit test (the scratch-bag mechanism)**
+- [x] **Step 1: Write the failing host unit test (the scratch-bag mechanism)**
 
 Unit-test the closure/scratch-bag seam directly via a small extracted helper. (This runs under Viceroy from the crate dir, per Global Constraints; the *full* `run_app_with_request_extensions` → `into_core_request` → handler integration is best covered by a `contract.rs` test — see the note after the handler-visible test.)
 
@@ -690,12 +690,12 @@ Also add a **handler-visible** host test — this proves the spec's requirement 
 
 > **Complete-path coverage (wasm/Viceroy, optional in this plan):** the *full* raw-`fastly::Request` → `run_app_with_request_extensions` → `into_core_request` → handler path can only run under Viceroy (`into_core_request`'s `get_client_ip_addr()` hostcall). If a Viceroy toolchain is available, add a test to `crates/edgezero-adapter-fastly/tests/contract.rs` (already `#![cfg(all(feature = "fastly", target_arch = "wasm32"))]`) that dispatches a request through `run_app_with_request_extensions::<TestApp, _>(req, |raw, ext| ext.insert(Ja4(raw.get_url_str().into())))` and asserts a handler read the value. Mark it clearly as wasm/Viceroy-only; it is not run by the host `cargo test` gate.
 
-- [ ] **Step 2: Run — verify they fail**
+- [x] **Step 2: Run — verify they fail**
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib apply_request_extend 2>&1 | tail -15`
 Expected: FAIL — `apply_request_extend` does not exist. (The `extended_request_extensions_are_visible_to_handler` test also compiles against the same feature set; it exercises only public core APIs and will pass once the crate builds — its value is documenting/locking the handler-visible contract.)
 
-- [ ] **Step 3: Add the `apply_request_extend` helper + thread the closure through dispatch**
+- [x] **Step 3: Add the `apply_request_extend` helper + thread the closure through dispatch**
 
 In `crates/edgezero-adapter-fastly/src/request.rs`, add the helper near `dispatch_with_handles` (import `Extensions`: add `Extensions` to the existing `use edgezero_core::http::{request_builder, Request};` line at `request.rs:11`):
 
@@ -785,7 +785,7 @@ where
 }
 ```
 
-- [ ] **Step 4: Add `run_app_with_request_extensions` + make `run_app` delegate**
+- [x] **Step 4: Add `run_app_with_request_extensions` + make `run_app` delegate**
 
 In `crates/edgezero-adapter-fastly/src/lib.rs`, replace the `run_app` body's `dispatch_with_registries(...)` call (`lib.rs:122`) so `run_app` delegates to the new variant with a no-op closure, and add the new public fn. Import `Extensions`: add `use edgezero_core::http::Extensions;` near the other imports (guarded under the same `#[cfg(feature = "fastly")]` scope as `run_app`).
 
@@ -833,7 +833,7 @@ where
 
 (The logger gate here is the Task-3 `&& !A::owns_logging()`. Note: `run_app_with_config` (`lib.rs:200`) does **not** call `dispatch_with_registries` — it builds a `FastlyService` and calls `service.dispatch(req)` (`lib.rs:210-214`), which routes through `FastlyService::dispatch` → `dispatch_with_handles`, already updated with a no-op in Step 3. So `run_app_with_config` needs no change here beyond its own Task-3 logger gate. The **only** direct caller of `dispatch_with_registries` is `run_app` — now delegating through `run_app_with_request_extensions`.)
 
-- [ ] **Step 5: Confirm every caller was updated, then run the host test + build**
+- [x] **Step 5: Confirm every caller was updated, then run the host test + build**
 
 `dispatch_with_handles` and `dispatch_with_registries` are internal to the fastly crate but each has multiple callers. Grep to confirm none was missed before building:
 
@@ -847,7 +847,7 @@ Expected: all host unit tests PASS (existing `synthesis_tests`, response, proxy,
 Run: `cargo check --workspace --all-targets --features "fastly cloudflare spin" 2>&1 | tail -5`
 Expected: succeeds (the signature changes are internal to the fastly crate; the two `dispatch_with_handles` callers — `FastlyService::dispatch` and `dispatch_with_registries` — and the one `dispatch_with_registries` caller, `run_app_with_request_extensions`, are all updated. `run_app_with_config` compiles unchanged: it dispatches via `FastlyService::dispatch`).
 
-- [ ] **Step 6: Lint + commit**
+- [x] **Step 6: Lint + commit**
 
 Run: `cargo clippy -p edgezero-adapter-fastly --all-targets --features fastly -- -D warnings 2>&1 | tail -5`
 Expected: clean.
@@ -861,7 +861,7 @@ git commit -m "feat(fastly): run_app_with_request_extensions pre-dispatch hook f
 
 ## Final verification (all P0-C tasks)
 
-- [ ] **Run every CI gate:**
+- [x] **Run every CI gate:**
 
 ```bash
 cargo fmt --all -- --check

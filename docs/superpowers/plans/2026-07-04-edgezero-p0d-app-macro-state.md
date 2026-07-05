@@ -40,7 +40,7 @@
 - Consumes (from P0-C): the `AppArgs` keyword-arg parser with its `match key.to_string()` dispatch.
 - Produces: `AppArgs.state: Option<syn::Expr>`; `build_router()` emits `builder = builder.with_state(#state_expr);` when `state` is present.
 
-- [ ] **Step 1: Write the failing `AppArgs` state unit tests**
+- [x] **Step 1: Write the failing `AppArgs` state unit tests**
 
 Add to the `#[cfg(test)] mod tests` in `crates/edgezero-macros/src/app.rs` (which after P0-C already has `use super::AppArgs;`, `use syn::parse_str;`, and the `app_args_*` tests). Place alphabetically among the `app_args_*` fns. To assert the parsed expression, render it with `quote`:
 
@@ -73,12 +73,12 @@ Add to the `#[cfg(test)] mod tests` in `crates/edgezero-macros/src/app.rs` (whic
     }
 ```
 
-- [ ] **Step 2: Run — verify they fail**
+- [x] **Step 2: Run — verify they fail**
 
 Run: `cargo test -p edgezero-macros --lib app_args_parses_state 2>&1 | tail -20`
 Expected: FAIL — `AppArgs` has no `state` field, and `state = …` hits the unknown-key arm ("unknown `app!` argument `state`").
 
-- [ ] **Step 3: Add the `state` field + parser arm**
+- [x] **Step 3: Add the `state` field + parser arm**
 
 In `crates/edgezero-macros/src/app.rs`, add `state` to the `AppArgs` struct (alphabetical field order: `app_ident`, `owns_logging`, `path`, `state`):
 
@@ -121,7 +121,7 @@ and the constructor:
         Ok(Self { app_ident, owns_logging, path, state })
 ```
 
-- [ ] **Step 4: Emit `.with_state(...)` in `build_router()`**
+- [x] **Step 4: Emit `.with_state(...)` in `build_router()`**
 
 In `expand_app`, before the `quote!` block, turn the optional state expression into optional emitted tokens (place near the other `let …` bindings). Use `Option<&Expr>` mapped to a `TokenStream2` so the call is emitted only when present:
 
@@ -146,19 +146,19 @@ Then insert `#state_call` into the emitted `build_router()` (`app.rs:185-191`), 
 
 (`Option<TokenStream2>` implements `ToTokens` — `None` emits nothing, so omitting `state` leaves `build_router()` unchanged.)
 
-- [ ] **Step 5: Run the unit tests — verify they pass**
+- [x] **Step 5: Run the unit tests — verify they pass**
 
 Run: `cargo test -p edgezero-macros --lib app_args_ 2>&1 | tail -12`
 Expected: PASS — the new `app_args_parses_state*` / `app_args_rejects_duplicate_state` plus the P0-C `app_args_*` tests.
 
-- [ ] **Step 6: Confirm app-demo (no `state`) is unchanged + lint**
+- [x] **Step 6: Confirm app-demo (no `state`) is unchanged + lint**
 
 Run: `(cd examples/app-demo && cargo test -p app-demo-core 2>&1 | tail -5)`
 Expected: PASS (app-demo's `app!` has no `state` yet, so `build_router()` is byte-identical).
 Run: `cargo clippy -p edgezero-macros --all-targets --all-features -- -D warnings 2>&1 | tail -5`
 Expected: clean.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/edgezero-macros/src/app.rs
@@ -182,7 +182,7 @@ Prove the whole chain: `app!(state = crate::app_state())` → generated `build_r
 
 > **Design note (why crate root, not a `state` module):** app-demo is its own workspace with a stricter lint set — `pub_use` and `module_name_repetitions` are **denied** (unlike the root workspace which allows them). A `pub mod state;` + `pub use crate::state::app_state;` trips `pub_use`, and `DemoState`/`app_state` inside a module named `state` trip `module_name_repetitions`. Defining both at the crate root (in `lib.rs`) avoids all three with no `#[allow]`, and `crate::app_state()` / `crate::DemoState` resolve directly where the macro emits them.
 
-- [ ] **Step 1: Define `DemoState` + `app_state()` at the crate root and wire `app!`**
+- [x] **Step 1: Define `DemoState` + `app_state()` at the crate root and wire `app!`**
 
 In `examples/app-demo/crates/app-demo-core/src/lib.rs`, add the state types at the crate root (after the `pub mod` declarations) and add the `state` argument to the `app!` invocation (`lib.rs:11`):
 
@@ -213,7 +213,7 @@ edgezero_core::app!("../../edgezero.toml", state = crate::app_state());
 
 (`#[inline]` is required by `missing_inline_in_public_items`; `#[derive(Debug)]` keeps the public struct debuggable.)
 
-- [ ] **Step 2: Add the `State` handler**
+- [x] **Step 2: Add the `State` handler**
 
 In `examples/app-demo/crates/app-demo-core/src/handlers.rs`, add `State` to the existing `edgezero_core::extractor::{…}` import and `use std::sync::Arc;`, then add the handler (`crate::DemoState` is a 2-segment path — fine under `absolute_paths`). The return type is `Result<Text<String>, EdgeError>` to match the file's other text handlers (e.g. `secrets_echo`); `#[action]` wraps it via `Responder`:
 
@@ -228,7 +228,7 @@ pub async fn state_demo(
 
 (If `handlers.rs` already imports `Arc` / an `action` alias, reuse those rather than re-importing — keep the file's existing style.)
 
-- [ ] **Step 3: Register the route in the manifest**
+- [x] **Step 3: Register the route in the manifest**
 
 In `examples/app-demo/edgezero.toml`, add an HTTP trigger for the handler, matching the existing `[[triggers.http]]` entries' exact keys (`id`, `path`, `methods`, `handler`, `adapters`):
 
@@ -242,7 +242,7 @@ adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Reads app-owned state via State<Arc<DemoState>> (app!(state = ...))"
 ```
 
-- [ ] **Step 4: Write the end-to-end host test**
+- [x] **Step 4: Write the end-to-end host test**
 
 Add to the `#[cfg(test)] mod tests` in `examples/app-demo/crates/app-demo-core/src/handlers.rs` (the module that already contains the `crate::build_router()` test at `handlers.rs:436`; reuse its imports for `request_builder`/`Body`/`block_on` — mirror that test). Place the fn alphabetically.
 
@@ -271,12 +271,12 @@ Add to the `#[cfg(test)] mod tests` in `examples/app-demo/crates/app-demo-core/s
     }
 ```
 
-- [ ] **Step 5: Run the e2e test**
+- [x] **Step 5: Run the e2e test**
 
 Run: `(cd examples/app-demo && cargo test -p app-demo-core state_demo_handler_reads_app_state 2>&1 | tail -12)`
 Expected: PASS — the macro-generated router injected `Arc<DemoState>`, the `State` extractor resolved it, and the handler echoed `greeting`. (First run may FAIL if the route/handler/state wiring is incomplete; fix until green.)
 
-- [ ] **Step 6: Full app-demo + workspace verification**
+- [x] **Step 6: Full app-demo + workspace verification**
 
 Run: `(cd examples/app-demo && cargo test 2>&1 | tail -8)`
 Expected: PASS (all four adapter example crates still build; app-demo-core tests green).
@@ -289,7 +289,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 Expected: both clean (the new handler's fields are read by the assertion, so no `dead_code` suppression is needed).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add examples/app-demo/crates/app-demo-core/src/lib.rs \
@@ -302,7 +302,7 @@ git commit -m "docs(app-demo): app!(state = ...) + State<T> handler example with
 
 ## Final verification (all P0-D tasks)
 
-- [ ] **Run every CI gate:**
+- [x] **Run every CI gate:**
 
 ```bash
 cargo fmt --all -- --check

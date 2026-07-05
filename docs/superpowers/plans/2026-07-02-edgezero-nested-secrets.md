@@ -76,7 +76,7 @@ pub trait AppConfigMeta { fn secret_fields() -> Vec<SecretField>; } // was: cons
 // SecretKind is UNCHANGED (still Copy, store_ref_field: &'static str).
 ```
 
-- [ ] **Step 1: Write the failing metadata unit tests**
+- [x] **Step 1: Write the failing metadata unit tests**
 
 Append to `crates/edgezero-core/src/app_config.rs`'s `#[cfg(test)] mod tests` (module starts near `app_config.rs:599`; it already imports `SecretField`, `SecretKind`):
 
@@ -117,12 +117,12 @@ Append to `crates/edgezero-core/src/app_config.rs`'s `#[cfg(test)] mod tests` (m
     }
 ```
 
-- [ ] **Step 2: Run it (fails to compile)**
+- [x] **Step 2: Run it (fails to compile)**
 
 Run: `cargo test -p edgezero-core --lib dotted_path_renders 2>&1 | tail -15`
 Expected: FAIL — `SecretPathSegment` / `SecretField.path` / `dotted_path` do not exist.
 
-- [ ] **Step 3: Reshape the metadata types + trait in `app_config.rs`**
+- [x] **Step 3: Reshape the metadata types + trait in `app_config.rs`**
 
 Add `use std::borrow::Cow;` near the top of `crates/edgezero-core/src/app_config.rs` (with the other `use`s). Replace the `AppConfigMeta` trait (`app_config.rs:34-37`), the `SecretField` struct (`app_config.rs:41-48`), and add `SecretPathSegment` + `dotted_path`. `SecretKind` (`app_config.rs:53-69`) is **unchanged**.
 
@@ -186,12 +186,12 @@ pub trait AppConfigMeta {
 
 Note: `SecretField` and `SecretPathSegment` are **no longer `Copy`** (they own a `Vec`/`Cow`). This is intentional per §8 [B, BLOCKER]. `SecretKind` stays `Copy`.
 
-- [ ] **Step 4: Run the metadata test (passes)**
+- [x] **Step 4: Run the metadata test (passes)**
 
 Run: `cargo test -p edgezero-core --lib dotted_path_renders 2>&1 | tail -15`
 Expected: PASS. (The crate will not fully build yet — consumers still reference the old shape. Fix them in the next steps.)
 
-- [ ] **Step 5: Update `validate_excluding_secrets` to the new shape (flat behavior preserved)**
+- [x] **Step 5: Update `validate_excluding_secrets` to the new shape (flat behavior preserved)**
 
 In `crates/edgezero-core/src/app_config.rs:204-226`, the loop currently does `bag.remove(field.name)`. For Task 1, keep flat removal but source the key from the length-1 path. (Task 3 replaces this with nested/list-aware pruning.) Change the loop body:
 
@@ -211,7 +211,7 @@ In `crates/edgezero-core/src/app_config.rs:204-226`, the loop currently does `ba
 
 Add `use SecretPathSegment` access (it's in the same module, reference as `SecretPathSegment::Field`).
 
-- [ ] **Step 6: Update `secret_walk` to the new shape (top-level behavior preserved)**
+- [x] **Step 6: Update `secret_walk` to the new shape (top-level behavior preserved)**
 
 In `crates/edgezero-core/src/extractor.rs:827-894`, change the import at `extractor.rs:8` to also bring in the path segment, and change the loop to source the key/field name from the length-1 path. (Task 2 replaces the whole body with a recursive navigator.) Minimal Task-1 change: replace `for field in C::SECRET_FIELDS` with `for field in C::secret_fields()`, and replace each `field.name` use with a locally computed `let leaf = field.dotted_path();` for error hints and `let leaf_key = match field.path.last() { Some(SecretPathSegment::Field(n)) => n.as_ref(), _ => /* length-1 guaranteed in Task 1 */ };` for the `data_obj.get(...)`/`insert(...)` calls. Concretely, at the top of the loop:
 
@@ -234,7 +234,7 @@ In `crates/edgezero-core/src/extractor.rs:827-894`, change the import at `extrac
 
 Update `crates/edgezero-core/src/extractor.rs:8` from `use crate::app_config::{AppConfigMeta, SecretKind};` to `use crate::app_config::{AppConfigMeta, SecretKind, SecretPathSegment};`. Apply the `leaf_key`/`hint` substitution throughout the existing loop body (the `data_obj.get(field.name)`, the `data_obj.insert(field.name.to_owned(), ...)`, and every `field.name.to_owned()` error arg become `leaf_key.as_str()` / `hint.clone()` respectively; `store_ref_field` handling is unchanged — it's still a top-level sibling in Task 1).
 
-- [ ] **Step 7: Flip the emitter in `edgezero-macros/src/app_config.rs` to `fn` + length-1 paths**
+- [x] **Step 7: Flip the emitter in `edgezero-macros/src/app_config.rs` to `fn` + length-1 paths**
 
 In `crates/edgezero-macros/src/app_config.rs`, change the per-entry emission (`app_config.rs:128-150`) and the impl block (`app_config.rs:152-166`). The entries currently emit `SecretField { name: #name_lit, kind: #kind_tokens }`; change to owned length-1 paths:
 
@@ -290,7 +290,7 @@ And the impl block (`app_config.rs:152-166`) — change the `const` to a `fn`:
 }
 ```
 
-- [ ] **Step 8: Make `TypedSecretEntry.field_name` owned**
+- [x] **Step 8: Make `TypedSecretEntry.field_name` owned**
 
 In `crates/edgezero-adapter/src/registry.rs:174-198`, change `field_name: &'entry str` to owned `String`. **Keep `new`'s param generic as `impl Into<String>`** so the 7 existing `&str`-literal call sites in the Spin tests (`adapter-spin/src/cli.rs:1292/1307/1327/1328/1344/1345/1357/1389/1390`) keep compiling unchanged, while the CLI callers pass owned dotted labels:
 
@@ -324,7 +324,7 @@ impl<'entry> TypedSecretEntry<'entry> {
 
 Because `&str: Into<String>` and `String: Into<String>`, no `TypedSecretEntry::new` call site needs editing for the signature change (only the CLI callers change *what* they pass — a dotted label — in Task 6).
 
-- [ ] **Step 9: Update the Spin collision check to the owned label**
+- [x] **Step 9: Update the Spin collision check to the owned label**
 
 In `crates/edgezero-adapter-spin/src/cli.rs:514-552`, the logic keys on `entry.key_value` (the secret value) — unchanged. Only the `seen` map value type shifts from `&str` (borrowing a `&'static` name) to a borrow of the owned `String`. Change the map value binding so it borrows `entry.field_name`:
 
@@ -352,7 +352,7 @@ In `crates/edgezero-adapter-spin/src/cli.rs:514-552`, the logic keys on `entry.k
 
 (Only two edits vs. today: `entry.field_name` is now a `String` so it interpolates the same in `format!`, and the `seen.insert(..., entry.field_name)` becomes `entry.field_name.as_str()`.)
 
-- [ ] **Step 10: Update the CLI consumers + all test `impl AppConfigMeta` sites**
+- [x] **Step 10: Update the CLI consumers + all test `impl AppConfigMeta` sites**
 
 In `crates/edgezero-cli/src/config.rs`, update the two runtime consumers to the new shape (still flat/length-1 in Task 1 — full path navigation lands in Task 6):
 
@@ -410,7 +410,7 @@ App-demo assertion at `examples/app-demo/crates/app-demo-core/src/config.rs:124-
 
 The derive assertions in `app_config_derive.rs:71-126` change from comparing `SECRET_FIELDS` slices to comparing `secret_fields()` `Vec`s against `SecretField { kind, path: vec![SecretPathSegment::Field(Cow::Borrowed("..."))], optional: false }` literals (or, more simply, assert `dotted_path()` + `kind` + `optional` per entry).
 
-- [ ] **Step 11: Build + test the whole workspace (green, behavior identical)**
+- [x] **Step 11: Build + test the whole workspace (green, behavior identical)**
 
 Run: `cargo build --workspace --all-targets 2>&1 | tail -20`
 Expected: compiles.
@@ -421,7 +421,7 @@ Expected: PASS — all existing secret tests still green (top-level behavior unc
 Run: `(cd examples/app-demo && cargo test 2>&1 | tail -15)`
 Expected: PASS (`secret_fields_metadata_matches_declarations`, round-trip, config-flow).
 
-- [ ] **Step 12: Lint + commit**
+- [x] **Step 12: Lint + commit**
 
 Run: `cargo fmt --all && cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -15`
 Expected: clean.
@@ -448,7 +448,7 @@ Replace `secret_walk`'s top-level loop with a recursive navigator that descends 
 - Consumes: `SecretField { kind, path, optional }`, `SecretPathSegment` (Task 1); `SecretKind` (unchanged); `ctx.secret_store_default()` / `ctx.secret_store(id)` / `bound.require_str(key)` / `map_secret_error` (existing, `extractor.rs:896`); `first_violating_field`'s `[{idx}]` convention.
 - Produces: a `secret_walk::<C>` that resolves nested/array leaves. Consumed by Task 7 (E2E).
 
-- [ ] **Step 1: Write failing nested/array `secret_walk` tests**
+- [x] **Step 1: Write failing nested/array `secret_walk` tests**
 
 Append to `crates/edgezero-core/src/extractor.rs` `#[cfg(test)] mod tests`. Mirror the existing `app_config_secret_walk_resolves_key_in_default_store` test (`extractor.rs:2170`) for store setup (`InMemorySecretStore`, `StoreRegistry`, inserting the secret registry into request extensions, building `ctx`). Add three fixtures + tests:
 
@@ -592,12 +592,12 @@ Append to `crates/edgezero-core/src/extractor.rs` `#[cfg(test)] mod tests`. Mirr
 
 Add the small test helpers near the existing secret-walk test scaffolding (mirror `extractor.rs:2170`'s store construction). `ctx_with_default_secret_store(key, value)` builds an `InMemorySecretStore` mapping `default/{key}` → `value`, wraps it in a `StoreRegistry` with default id `"default"`, inserts the registry into a request's extensions, and returns the `RequestContext`. `ctx_with_default_secret_store_map(&[(k, v), ...])` is the multi-entry variant. `ctx_with_named_secret_store(store_id, key, value)` registers an `InMemorySecretStore` under `store_id` (mapping `{store_id}/{key}` → `value`) in the registry so `ctx.secret_store(store_id)` resolves — used by the `KeyInNamedStore` tests. (`EdgeError::config_out_of_date` → `StatusCode::SERVICE_UNAVAILABLE` per `error.rs:183`, confirmed.)
 
-- [ ] **Step 2: Run (fails)**
+- [x] **Step 2: Run (fails)**
 
 Run: `cargo test -p edgezero-core --lib secret_walk_ 2>&1 | tail -25`
 Expected: FAIL — nested/array data is not navigated (current walk only reads/writes top-level keys); missing-leaf message lacks the dotted path.
 
-- [ ] **Step 3: Rewrite `secret_walk` as a recursive navigator**
+- [x] **Step 3: Rewrite `secret_walk` as a recursive navigator**
 
 Replace the body of `secret_walk` (`crates/edgezero-core/src/extractor.rs:827-894`) with a path navigator. Keep the signature (`async fn secret_walk<C>(ctx: &RequestContext, data: &mut serde_json::Value) -> Result<(), EdgeError> where C: AppConfigMeta`). New body:
 
@@ -756,7 +756,7 @@ Notes:
 - The recursion uses a boxed future (WASM-safe; matches the crate's `?Send` async style) because async fns can't recurse directly.
 - `KeyInNamedStore` resolves `store_ref_field` in `parent_obj` — the **innermost** parent, satisfying the sibling scoping rule for nested secrets.
 
-- [ ] **Step 4: Run (passes)**
+- [x] **Step 4: Run (passes)**
 
 Run: `cargo test -p edgezero-core --lib secret_walk_ 2>&1 | tail -25`
 Expected: PASS (nested object, array-each, absent-optional-skip, missing-nested-dotted-error). Also confirm the pre-existing top-level walk tests (`extractor.rs:2170`, `:2198`) still pass:
@@ -764,7 +764,7 @@ Expected: PASS (nested object, array-each, absent-optional-skip, missing-nested-
 Run: `cargo test -p edgezero-core --lib app_config_secret_walk 2>&1 | tail -15`
 Expected: PASS.
 
-- [ ] **Step 5: Lint + commit**
+- [x] **Step 5: Lint + commit**
 
 Run: `cargo clippy -p edgezero-core --all-targets --all-features -- -D warnings 2>&1 | tail -15`
 
@@ -786,7 +786,7 @@ Push time must skip the per-field validator of a nested/array secret leaf, whose
 - Consumes: `C::secret_fields()`, `SecretField.path`, `SecretPathSegment`, validator 0.20 `ValidationErrors`/`ValidationErrorsKind`.
 - Produces: nested-aware pruning. Consumed by Task 6 (CLI push over nested config) + Task 7.
 
-- [ ] **Step 1: Write failing nested-pruning tests**
+- [x] **Step 1: Write failing nested-pruning tests**
 
 Append to `app_config.rs` `#[cfg(test)] mod tests`. Model on `validate_excluding_secrets_skips_secret_field_rules` (`app_config.rs:1148`) but with a nested struct fixture whose nested secret leaf has a failing validator (e.g. `#[validate(length(min = 100))]` on the key-name string, which is short at push time). Assert `validate_excluding_secrets` returns `Ok(())` (the nested secret's validator was pruned) while a **non-secret** nested failure still surfaces `Err`.
 
@@ -958,12 +958,12 @@ Append to `app_config.rs` `#[cfg(test)] mod tests`. Model on `validate_excluding
 
 Note on the array tests: together they prove the `ValidationErrorsKind::List` branch of `prune_secret_leaf` (Step 3) both (a) removes the secret leaf from **each** indexed element while leaving non-secret siblings, and (b) fully collapses to `Ok(())` when every element's only failure is the secret leaf (the `items.retain(..)` + `clear = items.is_empty()` path) — the `#[secret]`-in-`Vec` case the plan commits to from day one.
 
-- [ ] **Step 2: Run (fails)**
+- [x] **Step 2: Run (fails)**
 
 Run: `cargo test -p edgezero-core --lib validate_excluding_secrets_prunes_nested 2>&1 | tail -20`
 Expected: FAIL — the flat `bag.remove(first_segment)` removes the top-level `integrations` entry entirely (over-pruning) or fails to prune the nested leaf, so the assertion is wrong. (Either way the Task-1 flat impl is incorrect for nesting.)
 
-- [ ] **Step 3: Implement nested-aware pruning**
+- [x] **Step 3: Implement nested-aware pruning**
 
 Replace `validate_excluding_secrets`'s loop (`app_config.rs:204-226`) with a path-aware pruner that navigates `ValidationErrorsKind::Struct`/`List` down each secret field's path, removes the leaf validator, and prunes now-empty containers so a fully-cleared branch disappears (rather than leaving an empty `Struct`/`List` marker that would keep `errors` non-empty). The loop:
 
@@ -1030,12 +1030,12 @@ fn prune_secret_leaf(errors: &mut validator::ValidationErrors, path: &[SecretPat
 }
 ```
 
-- [ ] **Step 4: Run (passes)**
+- [x] **Step 4: Run (passes)**
 
 Run: `cargo test -p edgezero-core --lib validate_excluding_secrets 2>&1 | tail -20`
 Expected: PASS — both new tests plus the four pre-existing `validate_excluding_secrets_*` tests (`app_config.rs:1132/1148/1173/1195`).
 
-- [ ] **Step 5: Lint + commit**
+- [x] **Step 5: Lint + commit**
 
 Run: `cargo clippy -p edgezero-core --all-targets --all-features -- -D warnings 2>&1 | tail -15`
 
@@ -1059,7 +1059,7 @@ Make the derive actually emit nested/array/optional metadata: register the `app_
 - Consumes: the Task-1 emitter shape (`fn secret_fields()` returning `Vec<SecretField>` with owned paths + `optional`).
 - Produces: nested/array/optional metadata for real derived structs. Consumed by Tasks 6 & 7 and app-demo (unchanged top-level app-demo still emits length-1).
 
-- [ ] **Step 1: Register the `app_config` helper attribute**
+- [x] **Step 1: Register the `app_config` helper attribute**
 
 In `crates/edgezero-macros/src/lib.rs:20`, change:
 
@@ -1073,7 +1073,7 @@ to:
 #[proc_macro_derive(AppConfig, attributes(secret, app_config))]
 ```
 
-- [ ] **Step 2: Write failing derive/UI tests**
+- [x] **Step 2: Write failing derive/UI tests**
 
 Add happy-path assertions to `crates/edgezero-macros/tests/app_config_derive.rs` (a nested object emits the expected 3-segment path; a `Vec` nested field emits `Field`+`ArrayEach`; `Option<String>` sets `optional: true`). Example:
 
@@ -1143,12 +1143,12 @@ Naming caution: the existing harness globs `compile_fail("tests/ui/secret_*.rs")
 
 Note: `app_config_derive.rs` runs `trybuild` only in that single `#[test]`; also add an `Option<String>` **pass** assertion (that it compiles + sets `optional: true`) inside the happy-path `mod tests` above — not as a UI fixture.
 
-- [ ] **Step 3: Run (fails)**
+- [x] **Step 3: Run (fails)**
 
 Run: `cargo test -p edgezero-macros --test app_config_derive 2>&1 | tail -30`
 Expected: FAIL — `#[app_config(nested)]` is not parsed (unknown attribute or ignored); `Option<String>` rejected by `is_scalar_string_type`; nested paths not emitted.
 
-- [ ] **Step 4: Parse `#[app_config(nested)]` and classify fields**
+- [x] **Step 4: Parse `#[app_config(nested)]` and classify fields**
 
 In `crates/edgezero-macros/src/app_config.rs`, add a helper that detects the opt-in and extracts the recursion child type. A field is a **nested recursion** field iff it carries `#[app_config(nested)]`. Determine object-vs-array from the field type: a `Vec<T>`/`[T]` → array (child `T`, emit `Field(field)` + `ArrayEach`); anything else → object (child = the field type, emit `Field(field)`).
 
@@ -1200,7 +1200,7 @@ Modify the main field loop in `expand` (`app_config.rs:62-66`) so that for each 
 
 **Guard the nested parent field's serde attrs.** The emitter writes `Field(Cow::Borrowed(field_name))` using the Rust field name verbatim, so a `#[serde(rename = "...")]` (or `flatten`/`skip*`) on the `#[app_config(nested)]` field itself would desync the emitted path segment from the serialized key — the exact hazard the spec forbids "anywhere on a secret path" (spec §4.3 point 3, line 282). The existing `enforce_no_disallowed_serde_attrs(field)?` (`app_config.rs:363`) already bans `rename`/`flatten`/`skip`/`skip_deserializing`/`skip_serializing`/`skip_serializing_if`. Call it on every nested-recursion field (it currently runs only on `#[secret]` fields via `scan_field`). Each struct on the path self-enforces this for its own fields, so `rename` at any level along the path is rejected by whichever struct declares that field.
 
-- [ ] **Step 5: Emit recursion into `secret_fields()`**
+- [x] **Step 5: Emit recursion into `secret_fields()`**
 
 Extend the emitter (Task 1's `entries`) to also emit, for each nested descriptor, a loop that prepends segments onto the child's `secret_fields()`. Change the `fn secret_fields()` body emission to build a `Vec` imperatively:
 
@@ -1271,7 +1271,7 @@ Additionally, emit an explicit **`AppConfigRoot`** assertion per nested child (s
 
 where `#nested_child_tys` is the list of the recursion child types (the object field type, or the `Vec`/slice element type). A nested field whose type does not derive `AppConfig` fails with "the trait bound `Child: AppConfigRoot` is not satisfied" — the `app_config_nested_on_non_appconfig.rs` UI fixture pins this message.
 
-- [ ] **Step 6: Relax scalar rule to accept `Option<String>`; set `optional`**
+- [x] **Step 6: Relax scalar rule to accept `Option<String>`; set `optional`**
 
 Change `is_scalar_string_type`/`enforce_scalar_string_type` (`app_config.rs:265-284`) to also accept `Option<String>`, and have `scan_field` (`app_config.rs:195-219`) report whether the secret type was optional so the emitter sets `optional`. Add:
 
@@ -1321,7 +1321,7 @@ Replace `enforce_scalar_string_type(field)?;` (`app_config.rs:215`, called from 
 
 and thread `optional` into `FieldAnnotation` (add a `bool` field), then into the direct-entry emission (`optional: #optional_lit`). Keep rejecting `Vec<String>`, `Cow<'_, str>`, non-string scalars (they yield `None`). Note the runtime walk already early-returns for `StoreRef` regardless of `optional`; this compile-time guard removes the ambiguity at the source so CLI validation and the walk never see an optional store id.
 
-- [ ] **Step 7: Extend the `rename_all` guard to nested-only parents**
+- [x] **Step 7: Extend the `rename_all` guard to nested-only parents**
 
 The guard fires today only when `!annotations.is_empty()` (`app_config.rs:75-77`, direct `#[secret]` fields present). A parent whose secrets are all in `#[app_config(nested)]` children has no direct annotations but its own `rename_all` would still desync the emitted `Field(parent_field)` segment. Change the gate to also fire when any nested descriptor exists:
 
@@ -1331,12 +1331,12 @@ The guard fires today only when `!annotations.is_empty()` (`app_config.rs:75-77`
     }
 ```
 
-- [ ] **Step 8: Run (passes)**
+- [x] **Step 8: Run (passes)**
 
 Run: `cargo test -p edgezero-macros --test app_config_derive 2>&1 | tail -30`
 Expected: PASS — happy-path nested/array/optional emission + all UI compile-fail fixtures match their `.stderr`. Regenerate `.stderr` with `TRYBUILD=overwrite cargo test -p edgezero-macros --test app_config_derive` if messages differ, then inspect the diffs for correctness before committing.
 
-- [ ] **Step 9: Lint + commit**
+- [x] **Step 9: Lint + commit**
 
 Run: `cargo clippy -p edgezero-macros --all-targets --all-features -- -D warnings 2>&1 | tail -15`
 
@@ -1359,7 +1359,7 @@ The `check_no_nested_app_config` binary currently rejects **any** `AppConfig` st
 - Consumes: `syn` field attributes (the binary already parses structs with `syn::visit`).
 - Produces: a guard that permits opted-in nesting; still fails on un-opted-in nesting.
 
-- [ ] **Step 1: Write failing guard tests**
+- [x] **Step 1: Write failing guard tests**
 
 Add a `#[cfg(test)] mod tests` to `crates/edgezero-cli/src/bin/check_no_nested_app_config.rs`. The binary is behind `#![cfg(feature = "nested-app-config-check")]`, so tests run only with that feature. Test the pure helpers by parsing source snippets with `syn::parse_file` and running the collector + visitor:
 
@@ -1414,12 +1414,12 @@ mod tests {
 
 (If the collector/visitor don't currently expose `default()`/`new()`/public fields for construction in tests, add minimal `#[derive(Default)]` / a `new` constructor / `pub(crate)` visibility as part of this task — they're in the same binary crate.)
 
-- [ ] **Step 2: Run (fails)**
+- [x] **Step 2: Run (fails)**
 
 Run: `cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config 2>&1 | tail -20`
 Expected: FAIL — `allows_nesting_with_opt_in` sees 1 violation (the guard flags all nesting today).
 
-- [ ] **Step 3: Teach the visitor to honor `#[app_config(nested)]`**
+- [x] **Step 3: Teach the visitor to honor `#[app_config(nested)]`**
 
 In `NestedAppConfigVisitor::visit_item_struct` (`check_no_nested_app_config.rs:156-181`), before reporting a violation for a field whose type contains an `AppConfig` struct, skip it if the field carries `#[app_config(nested)]`. Add a helper mirroring the macro's detection and guard the report:
 
@@ -1465,7 +1465,7 @@ and in the field loop, wrap the existing `if let Some(inner_name) = type_contain
 
 (Adjust the `report` call to match the current signature at `check_no_nested_app_config.rs:138-149`.)
 
-- [ ] **Step 4: Run (passes) + run the guard over the real trees**
+- [x] **Step 4: Run (passes) + run the guard over the real trees**
 
 Run: `cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config 2>&1 | tail -20`
 Expected: PASS.
@@ -1473,7 +1473,7 @@ Expected: PASS.
 Run: `cargo run -q -p edgezero-cli --bin check_no_nested_app_config --features nested-app-config-check -- examples/app-demo crates/edgezero-cli/src/templates 2>&1 | tail -5`
 Expected: `check_no_nested_app_config: OK` (app-demo has no opted-in nesting yet; still clean).
 
-- [ ] **Step 5: Lint + commit**
+- [x] **Step 5: Lint + commit**
 
 Run: `cargo clippy -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config -- -D warnings 2>&1 | tail -15`
 
@@ -1495,7 +1495,7 @@ Task 1 made the CLI consumers compile against the new shape but only navigate to
 - Consumes: `SecretField.path`/`optional`, `toml::Value`, `TypedSecretEntry::new(store_id, String, key_value)` (Task 1).
 - Produces: path-aware validate/push/diff. Consumed by acceptance (nested config validates/pushes).
 
-- [ ] **Step 1: Write failing CLI navigation tests**
+- [x] **Step 1: Write failing CLI navigation tests**
 
 Add tests to `crates/edgezero-cli/src/config.rs` `#[cfg(test)] mod tests`, driven through the **public** `run_config_validate_typed::<C>` entry point (which calls both `typed_secret_checks` and `run_adapter_typed_checks`). `ValidationContext` has private fields and a `ManifestLoader` that is impractical to build by hand, so mirror the existing harness: write a manifest + `demo-app.toml` to a tempdir with `setup_project(manifest, app_config)` (`config.rs:1662`, returns `(TempDir, manifest_path, app_config_path)`) and pass `args_for(&manifest_path)` (`config.rs:1671`). The config type is a **real** nested `#[derive(AppConfig)]` (Task 4 is complete by Task 6), which also proves derive→CLI integration.
 
@@ -1718,7 +1718,7 @@ vault = "named"
     }
 ```
 
-- [ ] **Step 2: Factor a TOML path leaf-collector**
+- [x] **Step 2: Factor a TOML path leaf-collector**
 
 Add a helper that, given the raw `&toml::Value` table and a `&SecretField`, yields each resolved leaf as `(label: String, value: &str, store_ref_value: Option<&str>)`, where `label` uses concrete `[n]` indices and `store_ref_value` is resolved from the leaf's innermost parent table (for `KeyInNamedStore`). Absent optional leaves yield nothing; missing required leaves yield an error carrying the dotted label.
 
@@ -1790,7 +1790,7 @@ fn collect_secret_leaves<'a>(
 }
 ```
 
-- [ ] **Step 3: Rewrite the two consumers to use the collector**
+- [x] **Step 3: Rewrite the two consumers to use the collector**
 
 Replace the flat lookups in `run_adapter_typed_checks` (`config.rs:1295-1333`) and `typed_secret_checks` (`config.rs:1339-1412`):
 
@@ -1799,12 +1799,12 @@ Replace the flat lookups in `run_adapter_typed_checks` (`config.rs:1295-1333`) a
 
 Note the collector takes `&toml::Value` (the whole raw config) — `run_adapter_typed_checks`/`typed_secret_checks` currently start from `raw_table = ctx.raw_config.as_table()`; pass `&ctx.raw_config` to the collector instead (it does the `as_table` internally).
 
-- [ ] **Step 4: Run (passes) + full CLI tests**
+- [x] **Step 4: Run (passes) + full CLI tests**
 
 Run: `cargo test -p edgezero-cli --lib config 2>&1 | tail -25`
 Expected: PASS — new nested tests + all pre-existing config tests (top-level fixtures still length-1 paths).
 
-- [ ] **Step 5: Lint + commit**
+- [x] **Step 5: Lint + commit**
 
 Run: `cargo clippy -p edgezero-cli --all-targets --all-features -- -D warnings 2>&1 | tail -15`
 
@@ -1827,7 +1827,7 @@ Prove the whole chain with a real `#[derive(AppConfig)]` config that has a 2-lev
 - Consumes: everything from Tasks 1–6.
 - Produces: acceptance evidence; docs.
 
-- [ ] **Step 1: Write the failing E2E test**
+- [x] **Step 1: Write the failing E2E test**
 
 Create `crates/edgezero-macros/tests/nested_secrets_e2e.rs`. Define a real nested config with `#[derive(AppConfig, Deserialize, Validate)]`, including one `KeyInDefault` nested leaf and one `KeyInNamedStore` nested leaf whose `store_ref` sibling lives in the same inner struct. Build a `serde_json::Value` blob holding key NAMES, run `secret_walk` (via the public `AppConfig<C>` extraction path or by calling the crate's extraction entry point), and assert the resolved values.
 
@@ -1867,16 +1867,16 @@ struct Settings {
 // ... run extraction; assert cfg.datadome.server_side_key == "DD" and cfg.vaulted.token == "TOK".
 ```
 
-- [ ] **Step 2: Run (fails, then passes)**
+- [x] **Step 2: Run (fails, then passes)**
 
 Run: `cargo test -p edgezero-macros --test nested_secrets_e2e 2>&1 | tail -25`
 Expected: FAIL first (fixture/wiring), then PASS once assertions match resolved values. (If any Task 1–6 gap surfaces here, fix in the owning task's file and re-run.)
 
-- [ ] **Step 3: Docs**
+- [x] **Step 3: Docs**
 
 Append to `docs/guide/configuration.md` a "Nested and array secrets" section documenting: the `#[app_config(nested)]` opt-in (mirrors `#[validate(nested)]`; the nested type must itself derive `AppConfig`), `#[secret]` on `Option<String>` (absent → skipped at runtime), object nesting and `Vec<_>` arrays (`partners[*].api_key`), the `store_ref` sibling scoping rule (resolved within the innermost containing object), and the dotted-path error format (`integrations.datadome.server_side_key`, `partners[3].api_key`). Include a worked `Settings`/`Integrations`/`Partner` example.
 
-- [ ] **Step 4: Full workspace verification (all CI gates)**
+- [x] **Step 4: Full workspace verification (all CI gates)**
 
 ```bash
 cargo fmt --all -- --check
@@ -1889,7 +1889,7 @@ cargo run -q -p edgezero-cli --bin check_no_nested_app_config --features nested-
 ```
 Expected: all green; app-demo top-level `#[secret]` still resolves; the guard prints `OK`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/edgezero-macros/tests/nested_secrets_e2e.rs docs/guide/configuration.md
