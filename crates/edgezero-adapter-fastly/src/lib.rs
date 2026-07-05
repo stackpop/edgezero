@@ -114,7 +114,7 @@ pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastl
     let stores = A::stores();
     let env = env_config_from_runtime_dictionary(stores);
     let logging = logging_from_env(&env);
-    if logging.use_fastly_logger {
+    if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
@@ -202,7 +202,7 @@ pub fn run_app_with_config<A: Hooks>(
     req: fastly::Request,
     config_store_name: Option<&str>,
 ) -> Result<fastly::Response, fastly::Error> {
-    if logging.use_fastly_logger {
+    if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }

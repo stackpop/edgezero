@@ -151,11 +151,11 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
     let manifest_path_lit = LitStr::new(&manifest_path.to_string_lossy(), Span::call_site());
 
-    // The emitted `Hooks` impl below explicitly defines `configure` and
-    // `build_app` even though their bodies mirror the trait defaults. This is
-    // required because `missing_trait_methods` (restriction = deny) forbids
-    // relying on trait defaults in the impl. If `Hooks::configure` or
-    // `Hooks::build_app` defaults change, update these emitted bodies to match.
+    // The emitted `Hooks` impl below explicitly defines `configure`,
+    // `owns_logging`, and `build_app` even though their bodies mirror the trait
+    // defaults. This is required because `missing_trait_methods` (restriction =
+    // deny) forbids relying on trait defaults in the impl. If those `Hooks`
+    // defaults change, update these emitted bodies to match.
     let output = quote! {
         // Force a rebuild when the manifest file changes (include_bytes tracks it as a build input).
         const _: &[u8] = include_bytes!(#manifest_path_lit);
@@ -168,6 +168,10 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
             }
 
             fn configure(_app: &mut edgezero_core::app::App) {}
+
+            fn owns_logging() -> bool {
+                false
+            }
 
             fn name() -> &'static str {
                 #app_name_lit

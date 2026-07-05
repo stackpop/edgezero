@@ -127,6 +127,14 @@ pub trait Hooks {
         App::default_name()
     }
 
+    /// When `true`, an adapter's `run_app` skips its own logger initialization;
+    /// the app is responsible for installing a `log` backend. Default `false`.
+    #[must_use]
+    #[inline]
+    fn owns_logging() -> bool {
+        false
+    }
+
     /// Build the router service for the application.
     fn routes() -> RouterService;
 
@@ -238,6 +246,11 @@ mod tests {
     fn default_app_uses_constant_name() {
         let app = App::new(empty_router());
         assert_eq!(app.name(), App::default_name());
+    }
+
+    #[test]
+    fn default_hooks_do_not_own_logging() {
+        assert!(!DefaultHooks::owns_logging());
     }
 
     #[test]
