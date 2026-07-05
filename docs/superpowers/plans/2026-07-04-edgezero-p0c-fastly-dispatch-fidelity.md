@@ -370,6 +370,8 @@ Rework `AppArgs` from "path + optional ident" into the keyword-argument grammar 
 
 **Files:**
 - Modify: `crates/edgezero-macros/src/app.rs` (`AppArgs` struct + `impl Parse`, `app.rs:12-31`; emit `fn owns_logging() -> bool { #bool }`, `app.rs:170`; add `AppArgs` unit tests to the `#[cfg(test)] mod tests`)
+- Create: `crates/edgezero-macros/tests/app_macro.rs` (real-`app!` integration test asserting the emitted `owns_logging()`)
+- Create: `crates/edgezero-macros/tests/fixtures/owns_logging.toml` (minimal fixture manifest)
 
 **Interfaces:**
 - Consumes: `syn::{LitStr, Ident, LitBool, Token}`, `syn::parse::{Parse, ParseStream}`.
@@ -532,22 +534,53 @@ Change the emitted `fn owns_logging()` (added in Task 3, currently `{ false }`) 
 Run: `cargo test -p edgezero-macros --lib app_args_ 2>&1 | tail -12`
 Expected: PASS — all seven `app_args_*` tests.
 
-- [ ] **Step 6: Verify app-demo (real `app!`) still builds and emits owns_logging=false**
+- [ ] **Step 6: Add a real-`app!` macro-emission integration test (spec requirement)**
+
+The spec's C2 acceptance requires proving the macro *emits* `owns_logging() == true` for `app!(…, owns_logging = true)` — not just that the grammar parses. `edgezero-macros` dev-depends on `edgezero-core` (`crates/edgezero-macros/Cargo.toml:31`) which re-exports `app!` (`crates/edgezero-core/src/lib.rs:42`), and the macro resolves the manifest path against the invoking crate's `CARGO_MANIFEST_DIR` (`app.rs:243`), so an integration test can invoke `app!` with a checked-in fixture manifest.
+
+First create a minimal fixture manifest, `crates/edgezero-macros/tests/fixtures/owns_logging.toml`:
+
+```toml
+[app]
+name = "owns-logging-fixture"
+```
+
+Then create the integration test `crates/edgezero-macros/tests/app_macro.rs`:
+
+```rust
+//! Integration coverage: `app!(..., owns_logging = true)` emits a `Hooks` impl
+//! whose `owns_logging()` returns `true`. The manifest path resolves against
+//! this crate's CARGO_MANIFEST_DIR, so the fixture is `tests/fixtures/...`.
+
+// The macro emits `pub struct OwnedLoggingApp;`, a `Hooks` impl, and a free
+// `build_router()` at this module scope.
+edgezero_core::app!("tests/fixtures/owns_logging.toml", OwnedLoggingApp, owns_logging = true);
+
+#[test]
+fn app_macro_emits_owns_logging_true() {
+    assert!(<OwnedLoggingApp as edgezero_core::app::Hooks>::owns_logging());
+}
+```
+
+Run: `cargo test -p edgezero-macros --test app_macro 2>&1 | tail -12`
+Expected: PASS — proves the macro emitted `fn owns_logging() -> bool { true }`. (Only one `app!` per test file — it emits a free `build_router()` that would collide across invocations; the default `owns_logging() == false` path is covered by app-demo below.)
+
+- [ ] **Step 7: Verify app-demo (real `app!`, no keyword args) still emits owns_logging=false**
 
 app-demo's `app!("../../edgezero.toml")` (`examples/app-demo/crates/app-demo-core/src/lib.rs:11`) uses no keyword args, so its generated `owns_logging()` returns `false`.
 
 Run: `(cd examples/app-demo && cargo test -p app-demo-core 2>&1 | tail -5)`
-Expected: PASS.
+Expected: PASS. (Do NOT add a process-global logger "call run_app twice" test — the macro-emission test above + the gate code review are the deterministic coverage.)
 
-Optional integration assertion (if you want a real-`app!` check beyond app-demo): the macros crate has no `app!` integration harness today; the `AppArgs` unit tests above are the deterministic coverage. Do not add a process-global logger test.
-
-- [ ] **Step 7: Lint + commit**
+- [ ] **Step 8: Lint + commit**
 
 Run: `cargo clippy -p edgezero-macros --all-targets --all-features -- -D warnings 2>&1 | tail -5`
 Expected: clean.
 
 ```bash
-git add crates/edgezero-macros/src/app.rs
+git add crates/edgezero-macros/src/app.rs \
+        crates/edgezero-macros/tests/app_macro.rs \
+        crates/edgezero-macros/tests/fixtures/owns_logging.toml
 git commit -m "feat(macros): app!(owns_logging = <bool>) keyword argument + AppArgs keyword grammar"
 ```
 
@@ -558,8 +591,8 @@ git commit -m "feat(macros): app!(owns_logging = <bool>) keyword argument + AppA
 Add a Fastly `run_app` variant taking an app closure that reads the raw `fastly::Request` (JA4 / H2 / etc.) into a scratch `Extensions` **before** `into_core_request` consumes the request; the scratch bag is `extend`ed into the core request after conversion. `run_app` becomes the no-hook wrapper.
 
 **Files:**
-- Modify: `crates/edgezero-adapter-fastly/src/request.rs` (thread the closure through `dispatch_with_registries`/`dispatch_with_handles`; scratch-`extend` around `into_core_request` at `request.rs:284`; add a host unit test)
-- Modify: `crates/edgezero-adapter-fastly/src/lib.rs` (`run_app_with_request_extensions`; `run_app` delegates with a no-op)
+- Modify: `crates/edgezero-adapter-fastly/src/request.rs` (thread the closure through `dispatch_with_registries`/`dispatch_with_handles`; scratch-`extend` around `into_core_request` at `request.rs:284`; update the OTHER `dispatch_with_handles` caller `FastlyService::dispatch` at `request.rs:145` to pass a no-op; add a host unit test)
+- Modify: `crates/edgezero-adapter-fastly/src/lib.rs` (`run_app_with_request_extensions`; `run_app` + `run_app_with_config` delegate with a no-op)
 
 **Interfaces:**
 - Consumes: `into_core_request(req: FastlyRequest) -> Result<Request, EdgeError>` (`request.rs:445`, consumes `req` by value); `edgezero_core::http::Extensions`.
@@ -641,6 +674,24 @@ where
 
 (`dispatch_core_request` is unchanged; it already takes `mut core_request` and inserts the registries + runs the router.)
 
+**`dispatch_with_handles` has a SECOND caller** — `FastlyService::dispatch` (`request.rs:145`, the service-builder API used by the wasm/Viceroy contract tests). It calls `dispatch_with_handles` directly and will not compile after the signature change. Update that call site (`request.rs:145-153`) to pass a no-op closure:
+
+```rust
+        dispatch_with_handles(
+            self.app,
+            req,
+            Stores {
+                config_store,
+                kv,
+                secrets,
+                ..Default::default()
+            },
+            |_req, _extensions| {},
+        )
+```
+
+(`FastlyService` is the no-hook service API; it does not expose a raw-request hook, so a no-op is correct. If a service-level hook is ever wanted, add it as a separate change.)
+
 Change `dispatch_with_registries` (`request.rs:288-316`) to take and forward the closure:
 
 ```rust
@@ -721,14 +772,19 @@ where
 
 (The logger gate here is the Task-3 `&& !A::owns_logging()`. `run_app_with_config` at `lib.rs:200` also calls `dispatch_with_registries` — update that call to pass a no-op closure `|_req, _extensions| {}` as the final arg so it compiles.)
 
-- [ ] **Step 5: Run the host test + build**
+- [ ] **Step 5: Confirm every caller was updated, then run the host test + build**
+
+`dispatch_with_handles` and `dispatch_with_registries` are internal to the fastly crate but each has multiple callers. Grep to confirm none was missed before building:
+
+Run: `grep -rn "dispatch_with_handles\|dispatch_with_registries" crates/edgezero-adapter-fastly/src/`
+Expected callers, all now passing an `extend` closure: `dispatch_with_handles` ← `FastlyService::dispatch` (`request.rs:145`, no-op) and `dispatch_with_registries` (`request.rs`); `dispatch_with_registries` ← `run_app`/`run_app_with_request_extensions` and `run_app_with_config` (`lib.rs`). If grep shows any call without a trailing closure arg, fix it.
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib apply_request_extend 2>&1 | tail -8`
 Expected: PASS.
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib 2>&1 | tail -8`
 Expected: all host unit tests PASS (existing `synthesis_tests`, response, proxy, lib).
 Run: `cargo check --workspace --all-targets --features "fastly cloudflare spin" 2>&1 | tail -5`
-Expected: succeeds (the `dispatch_with_registries` signature change is internal to the fastly crate; only `run_app`/`run_app_with_config` call it).
+Expected: succeeds (the signature changes are internal to the fastly crate; the three callers — `FastlyService::dispatch`, `run_app`/variants, `run_app_with_config` — are all updated).
 
 - [ ] **Step 6: Lint + commit**
 
