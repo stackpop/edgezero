@@ -46,10 +46,7 @@ pub(super) fn provision(
         dot_edgezero.display(),
         env_lines.len()
     )];
-    Ok(ProvisionOutcome {
-        status_lines,
-        deployed: None,
-    })
+    Ok(ProvisionOutcome::from_status_lines(status_lines))
 }
 
 /// Build the `.env` line set emitted by [`provision_local`].

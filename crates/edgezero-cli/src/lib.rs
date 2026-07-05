@@ -44,6 +44,20 @@ mod scaffold;
 #[cfg(all(test, feature = "cli"))]
 mod test_support;
 
+// Shared process-wide mutex serialising `$PATH`-mutating tests across
+// every test module in this crate. `generator.rs::PathOverride` and
+// `config.rs`'s push-shim tests both mutate PATH; without a shared
+// guard, running the same `edgezero-cli` test binary in parallel can
+// interleave PATH restores between the two callsites and lose one of
+// their prefixes, producing intermittent "git not found" /
+// "spin: command not found" flakes.
+#[cfg(all(test, unix, feature = "cli"))]
+pub(crate) fn path_mutation_guard() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| Mutex::new(()))
+}
+
 /// CLI argument structs (`Args`, `Command`, and the per-command `*Args`
 /// types). A `pub mod` so downstream binaries can reuse the built-in
 /// command argument types — e.g. `edgezero_cli::args::BuildArgs`.

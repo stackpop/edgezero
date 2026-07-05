@@ -869,12 +869,25 @@ mod tests {
     // `super::*` re-exports `env` and `fs` from outer `use` lines, so they're
     // already in scope here.
 
+    // Holds the shared crate-level PATH guard for the lifetime of the
+    // override so scaffold tests running concurrently with config's
+    // push-shim tests can't stomp each other's PATH restores.
+    #[cfg(unix)]
+    struct PathOverride {
+        original: Option<String>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    #[cfg(not(unix))]
     struct PathOverride {
         original: Option<String>,
     }
 
     impl PathOverride {
         fn prepend(path: &Path) -> Self {
+            #[cfg(unix)]
+            let guard = crate::path_mutation_guard()
+                .lock()
+                .expect("PATH mutation guard poisoned");
             let original = env::var("PATH").ok();
             let sep = if cfg!(windows) { ";" } else { ":" };
             let prefix = path.to_string_lossy();
@@ -883,7 +896,17 @@ mod tests {
                 _ => prefix.into_owned(),
             };
             env::set_var("PATH", &new_path);
-            Self { original }
+            #[cfg(unix)]
+            {
+                Self {
+                    original,
+                    _guard: guard,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                Self { original }
+            }
         }
     }
 

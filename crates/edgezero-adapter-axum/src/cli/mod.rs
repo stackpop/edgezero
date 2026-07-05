@@ -156,6 +156,13 @@ impl Adapter for AxumCliAdapter {
             ProvisionMode::Local => {
                 return provision_local::provision(manifest_root, stores, dry_run)
             }
+            // ProvisionMode is #[non_exhaustive]; explicit error so a
+            // future mode variant doesn't quietly fall through.
+            other => {
+                return Err(format!(
+                    "axum adapter does not implement provision mode {other:?}"
+                ))
+            }
         }
         //: axum has no remote resources. Print one note per
         // declared store id so the operator sees the CLI heard
@@ -193,10 +200,7 @@ impl Adapter for AxumCliAdapter {
         if out.is_empty() {
             out.push("axum has no declared stores to provision".to_owned());
         }
-        Ok(ProvisionOutcome {
-            status_lines: out,
-            deployed: None,
-        })
+        Ok(ProvisionOutcome::from_status_lines(out))
     }
 
     fn provision_typed(
@@ -229,10 +233,7 @@ impl Adapter for AxumCliAdapter {
             typed_secrets.len(),
             env_path.display()
         )];
-        Ok(ProvisionOutcome {
-            status_lines,
-            deployed: None,
-        })
+        Ok(ProvisionOutcome::from_status_lines(status_lines))
     }
 
     fn push_config_entries(

@@ -21,7 +21,7 @@
 use crate::args::{ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat};
 use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
-use crate::path_safety::assert_provision_paths_contained;
+use crate::path_safety::{assert_provision_paths_contained, assert_provision_paths_safe};
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
@@ -321,15 +321,36 @@ where
     // manifest-path use — that means before shared checks, not just
     // before adapter dispatch. Loop over every adapter because shared
     // checks iterate every adapter, not just `ctx.adapter`.
-    if args.local {
-        let manifest_root_for_check = ctx
-            .validation
-            .manifest_path()
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        for adapter_cfg in ctx.validation.manifest().adapters.values() {
+    // Spec §"Path containment (MUST)": absolute paths and `..`
+    // traversal in the adapter-declared manifest / crate are always
+    // rejected, regardless of `--local`. Cloud-mode `config push`
+    // still joins `manifest_root` with those strings and either
+    // hands the resolved path to the vendor CLI or reads it via
+    // `fs::read_to_string` for service-id lookup -- a poisoned
+    // `manifest = "/etc/passwd"` or `../outside/x.toml` in
+    // edgezero.toml must be rejected in EVERY config-push path.
+    //
+    // The stronger "manifest MUST sit inside the adapter crate dir"
+    // check (Step 2) is `--local`-only: existing cloud fixtures
+    // legitimately use e.g. `manifest = "wrangler.toml"` at the
+    // project root with `crate = "crates/demo-cf"`, and vendor-CLI
+    // dispatch doesn't create files -- so the strict-local rule
+    // doesn't apply.
+    let manifest_root_for_check = ctx
+        .validation
+        .manifest_path()
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for adapter_cfg in ctx.validation.manifest().adapters.values() {
+        if args.local {
             assert_provision_paths_contained(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        } else {
+            assert_provision_paths_safe(
                 manifest_root_for_check,
                 adapter_cfg.adapter.manifest.as_deref(),
                 adapter_cfg.adapter.crate_path.as_deref(),
@@ -3204,12 +3225,14 @@ ids = ["default"]
     }
 
     /// Process-wide mutex serialising PATH-mutating tests so parallel
-    /// test threads don't race on the `$PATH` environment variable.
+    /// Re-export of the crate-level shared guard. Every PATH-mutating
+    /// test module inside this crate MUST take the same mutex, not a
+    /// local copy -- `generator.rs::PathOverride` uses this same
+    /// static (via `crate::path_mutation_guard`), so running its
+    /// scaffold test in parallel with our push-shim tests is safe.
     #[cfg(unix)]
     fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
+        crate::path_mutation_guard()
     }
 
     /// Build a tempdir containing a `spin` script that emits fixed

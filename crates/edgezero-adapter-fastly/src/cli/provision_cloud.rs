@@ -173,9 +173,9 @@ pub(super) fn provision(
         }
         None => None,
     };
-    Ok(ProvisionOutcome {
-        status_lines: out,
-        deployed,
+    Ok(match deployed {
+        Some(state) => ProvisionOutcome::with_deployed(out, state),
+        None => ProvisionOutcome::from_status_lines(out),
     })
 }
 

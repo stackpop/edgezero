@@ -125,10 +125,7 @@ pub(super) fn provision(
         "spin: wrote bindings + runtime-config + .env for {total} store(s) at {}",
         spin_path.display()
     )];
-    Ok(ProvisionOutcome {
-        status_lines,
-        deployed: None,
-    })
+    Ok(ProvisionOutcome::from_status_lines(status_lines))
 }
 
 /// Resolve which `[component.<id>]` table `provision` /
@@ -263,10 +260,7 @@ pub(super) fn provision_typed(
     )
     .map_err(|err| format!("write {}: {err}", env_path.display()))?;
 
-    Ok(ProvisionOutcome {
-        status_lines,
-        deployed: None,
-    })
+    Ok(ProvisionOutcome::from_status_lines(status_lines))
 }
 
 /// Insert `[variables].<spin_var> = { default = "", secret = true }`

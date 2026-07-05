@@ -149,9 +149,9 @@ pub(super) fn provision(
             .insert("kv_namespaces".to_owned(), created_kv_ns);
         Some(state)
     };
-    Ok(ProvisionOutcome {
-        status_lines: out,
-        deployed: created_deployed,
+    Ok(match created_deployed {
+        Some(state) => ProvisionOutcome::with_deployed(out, state),
+        None => ProvisionOutcome::from_status_lines(out),
     })
 }
 

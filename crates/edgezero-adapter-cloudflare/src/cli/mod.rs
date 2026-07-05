@@ -217,6 +217,12 @@ impl Adapter for CloudflareCliAdapter {
             ProvisionMode::Cloud => {
                 provision_cloud::provision(manifest_root, adapter_manifest_path, stores, dry_run)
             }
+            // ProvisionMode is #[non_exhaustive]; a future mode variant
+            // gets an explicit error so we don't accidentally dispatch
+            // via one of the two known arms.
+            other => Err(format!(
+                "cloudflare adapter does not implement provision mode {other:?}"
+            )),
         }
     }
 
@@ -266,10 +272,7 @@ impl Adapter for CloudflareCliAdapter {
             typed_secrets.len(),
             dev_vars_path.display()
         )];
-        Ok(ProvisionOutcome {
-            status_lines,
-            deployed: None,
-        })
+        Ok(ProvisionOutcome::from_status_lines(status_lines))
     }
 
     fn push_config_entries(

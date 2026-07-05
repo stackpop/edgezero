@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use similar::{ChangeTag, TextDiff};
+use similar::TextDiff;
 use toml_edit::{table, value, DocumentMut};
 
 use crate::args::ProvisionArgs;
@@ -448,13 +448,14 @@ fn run_local_dry_run_typed(
                 adapter_registry::ProvisionMode::Local,
                 false,
             )?;
-            let combined = ProvisionOutcome {
-                status_lines: base
-                    .status_lines
-                    .into_iter()
-                    .chain(typed.status_lines)
-                    .collect(),
-                deployed: base.deployed.or(typed.deployed),
+            let combined_status: Vec<String> = base
+                .status_lines
+                .into_iter()
+                .chain(typed.status_lines)
+                .collect();
+            let combined = match base.deployed.or(typed.deployed) {
+                Some(state) => ProvisionOutcome::with_deployed(combined_status, state),
+                None => ProvisionOutcome::from_status_lines(combined_status),
             };
             // Render INSIDE the closure — the allow-list builder /
             // `default_adapter_manifest_for` both match on lowercase,
@@ -890,23 +891,26 @@ pub(crate) fn render_dry_run_report(
         if old == new {
             continue;
         }
+        // Unified diff with a small context radius (2 lines around
+        // each hunk). Prior implementation used `iter_all_changes()`
+        // which emits the ENTIRE file body with `Equal` markers on
+        // every unchanged line -- a fine visualisation, but for files
+        // like `.dev.vars` / `.env` that the operator fills in with
+        // real secret values, streaming the full pre-image through
+        // `log::info!` on every `provision --local --dry-run` leaks
+        // those values into CI logs, screen recordings, and terminal
+        // scrollback. `unified_diff` scopes the emission to the
+        // changed hunks plus 2 context lines each side.
         let diff = TextDiff::from_lines(&old, &new);
+        let path_display = proj_path.display().to_string();
         out.push('\n');
-        out.push_str("--- ");
-        out.push_str(&proj_path.display().to_string());
-        out.push('\n');
-        out.push_str("+++ ");
-        out.push_str(&proj_path.display().to_string());
-        out.push('\n');
-        for change in diff.iter_all_changes() {
-            let sign = match change.tag() {
-                ChangeTag::Delete => "-",
-                ChangeTag::Insert => "+",
-                ChangeTag::Equal => " ",
-            };
-            out.push_str(sign);
-            out.push_str(&change.to_string());
-        }
+        out.push_str(
+            &diff
+                .unified_diff()
+                .context_radius(2)
+                .header(&path_display, &path_display)
+                .to_string(),
+        );
     }
     out
 }
@@ -1007,9 +1011,9 @@ fn run_local_dry_run(
     // (false, _) uses it, and local dry-run today always sees `None`
     // there (adapters populate `deployed` only when writing real
     // cloud state).
-    Ok(adapter_registry::ProvisionOutcome {
-        status_lines: Vec::new(),
-        deployed: outcome.deployed,
+    Ok(match outcome.deployed {
+        Some(state) => adapter_registry::ProvisionOutcome::with_deployed(Vec::new(), state),
+        None => adapter_registry::ProvisionOutcome::from_status_lines(Vec::new()),
     })
 }
 
@@ -1671,6 +1675,60 @@ ids = ["default"]
         );
     }
 
+    /// End-to-end lock for spec §"env-overlay precedence": the
+    /// `EDGEZERO__STORES__<KIND>__<LOGICAL>__NAME` env var MUST flow
+    /// through `EnvConfig::store_name()` at `provision.rs::build_stores`
+    /// into every adapter's writeback so the PLATFORM name in the
+    /// emitted file reflects the override, not the raw logical id.
+    ///
+    /// Every adapter-level "env-overlay round-trip" test constructs
+    /// `ResolvedStoreId` directly and bypasses this resolver, so a
+    /// refactor that drops the `env_config.store_name(kind, id)` call
+    /// would silently write logical names into every adapter manifest
+    /// and every adapter test still passes. This test locks the
+    /// integration by driving `run_provision` all the way from env
+    /// var → CLI orchestration → adapter → emitted file.
+    ///
+    /// Uses the axum adapter because it writes a single deterministic
+    /// line-oriented file (`.edgezero/.env`) with no vendor CLI
+    /// dependency.
+    #[test]
+    fn run_provision_local_flows_env_overlay_platform_name_into_emitted_file() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        // The env overlay: for logical id `sessions` in KV, resolve
+        // the platform NAME to `custom_kv_platform`. Provision must
+        // pick this up via `EnvConfig::store_name()` and write it
+        // into `.edgezero/.env`.
+        let _kv_override =
+            EnvOverride::set("EDGEZERO__STORES__KV__SESSIONS__NAME", "custom_kv_platform");
+
+        run_provision(&ProvisionArgs {
+            adapter: "axum".to_owned(),
+            dry_run: false,
+            local: true,
+            manifest: manifest_path.clone(),
+        })
+        .expect("local provision succeeds");
+
+        let env_path = temp.path().join(".edgezero").join(".env");
+        let env_contents = fs::read_to_string(&env_path).expect("read .edgezero/.env");
+        assert!(
+            env_contents.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=custom_kv_platform"),
+            "overlay-resolved platform name must reach .edgezero/.env: {env_contents}"
+        );
+        // Negative: the raw logical id must NOT appear as the platform
+        // value (that would mean the resolver was bypassed).
+        assert!(
+            !env_contents.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=sessions"),
+            ".env still carries the un-overridden logical id — the env overlay was bypassed: {env_contents}"
+        );
+    }
+
     #[test]
     fn run_provision_skips_capability_gate_for_kinds_within_single_id_floor() {
         // Sanity: the capability gate fires ONLY when ids.len() > 1.
@@ -2188,14 +2246,11 @@ ids = ["default"]
         fs::write(&manifest_path, FAKE_MANIFEST_BODY).expect("write manifest");
         fs::create_dir_all(temp.path().join("crates/spin")).expect("create crate dir");
 
-        let outcome = ProvisionOutcome {
-            status_lines: vec![
-                "wrote crates/spin/spin.toml".to_owned(),
-                "created .edgezero/.env".to_owned(),
-                "appended crates/spin/.env".to_owned(),
-            ],
-            ..ProvisionOutcome::default()
-        };
+        let outcome = ProvisionOutcome::from_status_lines(vec![
+            "wrote crates/spin/spin.toml".to_owned(),
+            "created .edgezero/.env".to_owned(),
+            "appended crates/spin/.env".to_owned(),
+        ]);
         let allow_list = DryRunAllowList { pairs: vec![] };
         let report = render_dry_run_report(temp.path(), temp.path(), &allow_list, &outcome);
         assert!(

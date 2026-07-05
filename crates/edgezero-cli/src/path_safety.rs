@@ -18,10 +18,47 @@ use std::path::{Component, Path, PathBuf};
 /// they have it, but the helper defensively normalises so a
 /// relative `args.manifest.parent()` ("" or "examples/app-demo")
 /// compares correctly.
+/// Security-only subset of [`assert_provision_paths_contained`]:
+/// runs Step 1 (absolute-path rejection, `..` traversal rejection,
+/// under-project-root containment) but skips Step 2 (manifest must
+/// sit inside the adapter crate dir). Callers that only care about
+/// path-traversal safety and NOT the "local write stays under the
+/// adapter crate" invariant should use this variant. Notably: cloud
+/// `config push` -- vendor CLI dispatch, no local file writes, but
+/// the adapter still joins `manifest_root` with the declared
+/// manifest path for service-id lookup, so path traversal is still
+/// a real risk.
+pub(crate) fn assert_provision_paths_safe(
+    project_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    adapter_crate_path: Option<&str>,
+) -> Result<(), String> {
+    assert_provision_paths_impl(
+        project_root,
+        adapter_manifest_path,
+        adapter_crate_path,
+        /* strict_local = */ false,
+    )
+}
+
 pub(crate) fn assert_provision_paths_contained(
     project_root: &Path,
     adapter_manifest_path: Option<&str>,
     adapter_crate_path: Option<&str>,
+) -> Result<(), String> {
+    assert_provision_paths_impl(
+        project_root,
+        adapter_manifest_path,
+        adapter_crate_path,
+        /* strict_local = */ true,
+    )
+}
+
+fn assert_provision_paths_impl(
+    project_root: &Path,
+    adapter_manifest_path: Option<&str>,
+    adapter_crate_path: Option<&str>,
+    strict_local: bool,
 ) -> Result<(), String> {
     // Treat "" as ".": Path::parent() returns "" for a bare
     // `--manifest edgezero.toml`, and Path::new("").join(...) does
@@ -82,11 +119,18 @@ pub(crate) fn assert_provision_paths_contained(
         }
     }
 
-    // Step 2: when both are set, manifest MUST sit inside the
-    // adapter crate dir. Closes the spec's stronger promise --
-    // without this, crate = "crates/cf" + manifest =
-    // "tmp/wrangler.toml" would pass step 1 but write to a path
-    // outside the adapter crate.
+    // Step 2 (strict-local only): when both are set, manifest MUST
+    // sit inside the adapter crate dir. Closes the spec's stronger
+    // promise for local-mode writes -- without this, crate =
+    // "crates/cf" + manifest = "tmp/wrangler.toml" would pass step 1
+    // but write to a path outside the adapter crate. Cloud dispatch
+    // does not run this step -- legitimate cloud fixtures use e.g.
+    // `manifest = "wrangler.toml"` at the project root alongside a
+    // crate under `crates/`, which is safe for vendor-CLI dispatch
+    // even though it fails the strict-local containment.
+    if !strict_local {
+        return Ok(());
+    }
     if let (Some(crate_raw), Some(manifest_raw)) = (adapter_crate_path, adapter_manifest_path) {
         let crate_resolved = lexical_normalize(&root.join(Path::new(crate_raw)));
         let manifest_resolved = lexical_normalize(&root.join(Path::new(manifest_raw)));

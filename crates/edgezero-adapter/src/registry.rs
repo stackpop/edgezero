@@ -28,6 +28,7 @@ pub enum AdapterAction {
 /// branches once at the top of its impl. See spec §"CLI / trait
 /// surface".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProvisionMode {
     Cloud,
     Local,
@@ -39,6 +40,7 @@ pub enum ProvisionMode {
 /// `ManifestAdapterDeployed` shape when writing `edgezero.toml`.
 /// See spec §"Writeback ownership".
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct AdapterDeployedState {
     pub fields: BTreeMap<String, String>,
     pub sub_tables: BTreeMap<String, BTreeMap<String, String>>,
@@ -50,9 +52,35 @@ pub struct AdapterDeployedState {
 /// `edgezero.toml`'s `[adapters.<name>.deployed]` block. Local
 /// provision returns `deployed: None`.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct ProvisionOutcome {
     pub deployed: Option<AdapterDeployedState>,
     pub status_lines: Vec<String>,
+}
+
+impl ProvisionOutcome {
+    /// Construct with status lines and no deployed writeback. This is
+    /// the common case for local-mode provision (spec §"Writeback
+    /// ownership": local returns `deployed: None`).
+    #[inline]
+    #[must_use]
+    pub fn from_status_lines(status_lines: Vec<String>) -> Self {
+        Self {
+            deployed: None,
+            status_lines,
+        }
+    }
+
+    /// Construct with status lines AND cloud-returned deployed
+    /// identifiers to persist into `edgezero.toml`.
+    #[inline]
+    #[must_use]
+    pub fn with_deployed(status_lines: Vec<String>, deployed: AdapterDeployedState) -> Self {
+        Self {
+            deployed: Some(deployed),
+            status_lines,
+        }
+    }
 }
 
 /// A single declared store id, paired with the platform name the

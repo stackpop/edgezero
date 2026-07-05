@@ -300,10 +300,7 @@ pub(super) fn provision(
         dev_vars_path.display()
     ));
 
-    Ok(ProvisionOutcome {
-        status_lines,
-        deployed: None,
-    })
+    Ok(ProvisionOutcome::from_status_lines(status_lines))
 }
 
 /// Build the `.dev.vars` line set emitted by [`provision`].

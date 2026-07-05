@@ -194,6 +194,14 @@ impl Adapter for SpinCliAdapter {
                     dry_run,
                 );
             }
+            // ProvisionMode is #[non_exhaustive]; explicit error so a
+            // future mode variant doesn't quietly fall into the cloud
+            // arm below.
+            other => {
+                return Err(format!(
+                    "spin adapter does not implement provision mode {other:?}"
+                ))
+            }
         }
         //: spin provision is pure spin.toml editing — no
         // shell-out (Spin KV stores are provisioned by the Spin
@@ -263,10 +271,7 @@ impl Adapter for SpinCliAdapter {
         if out.is_empty() {
             out.push("spin has no declared stores to provision".to_owned());
         }
-        Ok(ProvisionOutcome {
-            status_lines: out,
-            deployed: None,
-        })
+        Ok(ProvisionOutcome::from_status_lines(out))
     }
 
     fn provision_typed(

@@ -101,10 +101,7 @@ pub(super) fn provision(
             .map_err(|err| format!("failed to write {}: {err}", fastly_path.display()))?;
     }
 
-    Ok(ProvisionOutcome {
-        status_lines,
-        deployed: None,
-    })
+    Ok(ProvisionOutcome::from_status_lines(status_lines))
 }
 
 /// Local-mode `provision_typed`: append `[[local_server.secret_stores.<store_id>]]`
@@ -152,10 +149,7 @@ pub(super) fn provision_typed(
             .map_err(|err| format!("failed to write {}: {err}", fastly_path.display()))?;
     }
 
-    Ok(ProvisionOutcome {
-        status_lines,
-        deployed: None,
-    })
+    Ok(ProvisionOutcome::from_status_lines(status_lines))
 }
 
 /// Upsert a scalar key at the root of `doc`, guaranteeing it lands
