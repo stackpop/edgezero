@@ -266,6 +266,40 @@ resolved by its own type. Registering the same `T` twice is last-write-wins. If
 a handler asks for a `State<T>` that was never registered, extraction fails with
 a `500` — register it before `build()`.
 
+### With the `app!` macro
+
+If your app is fully macro-driven (`app!("edgezero.toml")` builds the router from
+the manifest), you don't hand-write `RouterBuilder::with_state`. Instead pass a
+`state` argument — the macro emits `.with_state(<expr>)` into the generated
+router:
+
+```rust
+// lib.rs
+use std::sync::{Arc, OnceLock};
+
+pub struct AppState { /* settings, registries, orchestrator, … */ }
+
+pub fn app_state() -> Arc<AppState> {
+    static STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+    Arc::clone(STATE.get_or_init(|| Arc::new(AppState { /* … */ })))
+}
+
+edgezero_core::app!("edgezero.toml", state = crate::app_state());
+```
+
+`state = <expr>` is any expression evaluating to the state value — write the call
+(`crate::app_state()`), not a bare function path. Handlers then extract
+`State<Arc<AppState>>` exactly as above. Multiple types: repeat the argument
+(`state = a(), state = b()`).
+
+> **Make `app_state()` cheap.** The macro emits the `state` expression inside the
+> generated `build_router()`, which each adapter's `run_app` calls through
+> `A::build_app()` — **once at startup** for long-lived runtimes (Axum), but
+> **once per request** on Fastly Compute (each request is a fresh Wasm instance).
+> So the `state` expression runs on that cadence: build heavy state **once** and
+> hand out clones (e.g. a `OnceLock<Arc<AppState>>` as above, or a `static`), and
+> let `T = Arc<AppState>` so each call is just a refcount bump. Do **not** > `Arc::new(HeavyThing::build())` directly in the `state` expression.
+
 ## Response Types
 
 ### Text Responses
