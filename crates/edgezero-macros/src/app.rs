@@ -9,24 +9,71 @@ use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Ident, LitStr, Token};
 use validator::Validate as _;
 
+#[derive(Debug)]
 struct AppArgs {
     app_ident: Option<Ident>,
+    owns_logging: Option<bool>,
     path: LitStr,
 }
 
 impl Parse for AppArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let path: LitStr = input.parse()?;
-        let app_ident = if input.peek(Token![,]) {
+        let mut app_ident: Option<Ident> = None;
+        let mut owns_logging: Option<bool> = None;
+        let mut seen_keyword = false;
+
+        while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
-            Some(input.parse::<Ident>()?)
-        } else {
-            None
-        };
+
+            // Keyword argument: `Ident = Value`.
+            if input.peek(Ident) && input.peek2(Token![=]) {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                seen_keyword = true;
+                match key.to_string().as_str() {
+                    "owns_logging" => {
+                        if owns_logging.is_some() {
+                            return Err(syn::Error::new(
+                                key.span(),
+                                "duplicate `owns_logging` argument",
+                            ));
+                        }
+                        let value: syn::LitBool = input.parse()?;
+                        owns_logging = Some(value.value);
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            format!("unknown `app!` argument `{other}`; expected `owns_logging`"),
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            // Bare identifier: the optional custom App type name, only before keywords.
+            if input.peek(Ident) {
+                if seen_keyword || app_ident.is_some() {
+                    return Err(input.error(
+                        "the custom App identifier must come immediately after the manifest path, before keyword arguments",
+                    ));
+                }
+                app_ident = Some(input.parse::<Ident>()?);
+                continue;
+            }
+
+            return Err(input.error("expected a custom App identifier or `key = value` argument"));
+        }
+
         if !input.is_empty() {
             return Err(input.error("unexpected tokens after app! macro arguments"));
         }
-        Ok(Self { app_ident, path })
+        Ok(Self {
+            app_ident,
+            owns_logging,
+            path,
+        })
     }
 }
 
@@ -150,6 +197,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     let stores_tokens = build_stores_tokens(&manifest);
 
     let manifest_path_lit = LitStr::new(&manifest_path.to_string_lossy(), Span::call_site());
+    let owns_logging_lit = args.owns_logging.unwrap_or(false);
 
     // The emitted `Hooks` impl below explicitly defines `configure`,
     // `owns_logging`, and `build_app` even though their bodies mirror the trait
@@ -170,7 +218,7 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
             fn configure(_app: &mut edgezero_core::app::App) {}
 
             fn owns_logging() -> bool {
-                false
+                #owns_logging_lit
             }
 
             fn name() -> &'static str {
@@ -270,7 +318,76 @@ fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> Tok
 
 #[cfg(test)]
 mod tests {
-    use super::parse_handler_path;
+    use super::{parse_handler_path, AppArgs};
+    use syn::parse_str;
+
+    #[test]
+    fn app_args_parses_app_ident_then_keyword() {
+        let args: AppArgs =
+            parse_str(r#""edgezero.toml", MyApp, owns_logging = false"#).expect("parse");
+        assert_eq!(
+            args.app_ident.map(|ident| ident.to_string()),
+            Some("MyApp".to_owned())
+        );
+        assert_eq!(args.owns_logging, Some(false));
+    }
+
+    #[test]
+    fn app_args_parses_owns_logging_true() {
+        let args: AppArgs = parse_str(r#""edgezero.toml", owns_logging = true"#).expect("parse");
+        assert_eq!(args.owns_logging, Some(true));
+        assert!(args.app_ident.is_none());
+    }
+
+    #[test]
+    fn app_args_parses_path_and_app_ident() {
+        let args: AppArgs = parse_str(r#""edgezero.toml", MyApp"#).expect("parse");
+        assert_eq!(
+            args.app_ident.map(|ident| ident.to_string()),
+            Some("MyApp".to_owned())
+        );
+        assert_eq!(args.owns_logging, None);
+    }
+
+    #[test]
+    fn app_args_parses_path_only() {
+        let args: AppArgs = parse_str(r#""edgezero.toml""#).expect("parse");
+        assert_eq!(args.path.value(), "edgezero.toml");
+        assert!(args.app_ident.is_none());
+        assert_eq!(args.owns_logging, None);
+    }
+
+    #[test]
+    fn app_args_rejects_duplicate_key() {
+        let err =
+            parse_str::<AppArgs>(r#""edgezero.toml", owns_logging = true, owns_logging = false"#)
+                .expect_err("duplicate");
+        assert!(
+            err.to_string().contains("duplicate `owns_logging`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn app_args_rejects_ident_after_keyword() {
+        let err = parse_str::<AppArgs>(r#""edgezero.toml", owns_logging = true, MyApp"#)
+            .expect_err("ident after keyword");
+        assert!(
+            err.to_string()
+                .contains("must come immediately after the manifest path"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn app_args_rejects_unknown_key() {
+        let err =
+            parse_str::<AppArgs>(r#""edgezero.toml", bogus = true"#).expect_err("unknown key");
+        assert!(
+            err.to_string().contains("unknown `app!` argument `bogus`"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn parse_handler_path_accepts_absolute_crate_path() {
