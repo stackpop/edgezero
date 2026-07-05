@@ -32,7 +32,7 @@
   4. `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
   5. `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`
 - **No backward-compat constraint** — prefer the cleanest breaking change; update every in-tree call site in the same PR.
-- **Shared with P0-D:** Task 3 reworks the `app!` `AppArgs` grammar into keyword arguments (adding `owns_logging`). The sibling P0-D plan (`2026-07-04-edgezero-p0d-app-macro-state.md`) **extends that same grammar** with a `state` key — execute this P0-C plan first so P0-D builds on the keyword-arg framework.
+- **Shared with P0-D:** Task 4 reworks the `app!` `AppArgs` grammar into keyword arguments (adding `owns_logging`). The sibling P0-D plan (`2026-07-04-edgezero-p0d-app-macro-state.md`) **extends that same grammar** with a `state` key — execute this P0-C plan first so P0-D builds on the keyword-arg framework.
 
 ---
 
@@ -629,10 +629,55 @@ Add to the `#[cfg(test)] mod synthesis_tests` in `crates/edgezero-adapter-fastly
     }
 ```
 
-- [ ] **Step 2: Run — verify it fails**
+Also add a **handler-visible** host test — this proves the spec's requirement (§128) that a value stashed by the pre-dispatch hook is readable by a handler. It exercises the second half of the C3 chain host-side (the scratch bag `extend`ed into a core request → dispatched → handler reads it), which `dispatch_with_handles` can't be host-tested through because `into_core_request` calls the `get_client_ip_addr()` hostcall. Add alongside the test above:
+
+```rust
+    #[test]
+    fn extended_request_extensions_are_visible_to_handler() {
+        use edgezero_core::body::Body;
+        use edgezero_core::context::RequestContext;
+        use edgezero_core::error::EdgeError;
+        use edgezero_core::http::{request_builder, Extensions, Method, StatusCode};
+        use edgezero_core::router::RouterService;
+        use futures::executor::block_on;
+
+        #[derive(Clone)]
+        struct Ja4(String);
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let ja4 = ctx
+                .request()
+                .extensions()
+                .get::<Ja4>()
+                .map_or_else(|| "missing".to_owned(), |value| value.0.clone());
+            Ok(ja4)
+        }
+
+        // Mirror what `dispatch_with_handles` does: a scratch bag built from the
+        // raw request is `extend`ed into the core request before dispatch.
+        let mut scratch = Extensions::default();
+        scratch.insert(Ja4("t13d1516h2".to_owned()));
+
+        let mut request = request_builder()
+            .method(Method::GET)
+            .uri("/ja4")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().extend(scratch);
+
+        let service = RouterService::builder().get("/ja4", handler).build();
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"t13d1516h2");
+    }
+```
+
+> **Complete-path coverage (wasm/Viceroy, optional in this plan):** the *full* raw-`fastly::Request` → `run_app_with_request_extensions` → `into_core_request` → handler path can only run under Viceroy (`into_core_request`'s `get_client_ip_addr()` hostcall). If a Viceroy toolchain is available, add a test to `crates/edgezero-adapter-fastly/tests/contract.rs` (already `#![cfg(all(feature = "fastly", target_arch = "wasm32"))]`) that dispatches a request through `run_app_with_request_extensions::<TestApp, _>(req, |raw, ext| ext.insert(Ja4(raw.get_url_str().into())))` and asserts a handler read the value. Mark it clearly as wasm/Viceroy-only; it is not run by the host `cargo test` gate.
+
+- [ ] **Step 2: Run — verify they fail**
 
 Run: `cargo test -p edgezero-adapter-fastly --features fastly --lib apply_request_extend 2>&1 | tail -15`
-Expected: FAIL — `apply_request_extend` does not exist.
+Expected: FAIL — `apply_request_extend` does not exist. (The `extended_request_extensions_are_visible_to_handler` test also compiles against the same feature set; it exercises only public core APIs and will pass once the crate builds — its value is documenting/locking the handler-visible contract.)
 
 - [ ] **Step 3: Add the `apply_request_extend` helper + thread the closure through dispatch**
 
@@ -810,6 +855,9 @@ cargo test -p edgezero-adapter-fastly --features fastly        # host unit tests
 cargo check --workspace --all-targets --features "fastly cloudflare spin"
 cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 (cd examples/app-demo && cargo test)
+# app-demo is its OWN workspace (root `exclude`s it at Cargo.toml:12); the macro
+# change regenerates its Hooks impl (owns_logging), so lint it separately:
+(cd examples/app-demo && cargo clippy --workspace --all-targets --all-features -- -D warnings)
 ```
 
 Expected: all green. Note: `crates/edgezero-adapter-fastly/tests/contract.rs` (the Viceroy/wasm end-to-end incl. the C3 closure-reaches-handler path and full header round-trips) is `#![cfg(all(feature = "fastly", target_arch = "wasm32"))]` and is **not** run by the above; if a Viceroy toolchain is available, run it separately with `--features fastly --target wasm32-wasip1`.
@@ -818,7 +866,7 @@ Expected: all green. Note: `crates/edgezero-adapter-fastly/tests/contract.rs` (t
 
 1. Multi-value `Set-Cookie` round-trips through `from_core_response` (Task 1) and `convert_response` (Task 2).
 2. `Hooks::owns_logging()` gates logger init in all four adapters (Task 3); `app!(owns_logging = true)` emits `owns_logging() -> bool { true }` (Task 4).
-3. A pre-dispatch closure populates a scratch `Extensions` from the raw `fastly::Request` and it is merged into the core request (Task 5); `run_app` (no-hook) behavior is unchanged.
+3. A pre-dispatch closure populates a scratch `Extensions` from the raw `fastly::Request` (Task 5), the scratch is merged into the core request, and the merged value is **handler-visible** (`extended_request_extensions_are_visible_to_handler`); `run_app` (no-hook) behavior is unchanged. The full raw-request→handler path is additionally covered by an optional wasm/Viceroy `contract.rs` test.
 4. `cargo fmt`/clippy clean; workspace + app-demo tests green; WASM checks pass.
 
 ## Self-review notes (spec coverage)

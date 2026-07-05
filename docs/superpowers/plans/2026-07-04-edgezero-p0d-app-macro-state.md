@@ -290,8 +290,14 @@ Expected: PASS — the macro-generated router injected `Arc<DemoState>`, the `St
 
 Run: `(cd examples/app-demo && cargo test 2>&1 | tail -8)`
 Expected: PASS (all four adapter example crates still build; app-demo-core tests green).
-Run: `cargo test -p edgezero-macros 2>&1 | tail -5 && cargo clippy --workspace --all-targets --all-features -- -D warnings 2>&1 | tail -3`
-Expected: macros tests green; clippy clean (including the app-demo workspace — the new handler's fields are read by the assertion, so no `dead_code` suppression is needed).
+Run: `cargo test -p edgezero-macros 2>&1 | tail -5`
+Expected: macros tests green.
+Run root clippy AND app-demo clippy separately — `examples/app-demo` is its **own workspace**, `exclude`d from the root workspace (`Cargo.toml:12`), so root `--workspace` does NOT lint it:
+```
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+(cd examples/app-demo && cargo clippy --workspace --all-targets --all-features -- -D warnings)
+```
+Expected: both clean (the new handler's fields are read by the assertion, so no `dead_code` suppression is needed).
 
 - [ ] **Step 8: Commit**
 
@@ -316,6 +322,8 @@ cargo test --workspace --all-targets
 cargo check --workspace --all-targets --features "fastly cloudflare spin"
 cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin
 (cd examples/app-demo && cargo test)
+# app-demo is its OWN workspace (root `exclude`s it), so lint it separately:
+(cd examples/app-demo && cargo clippy --workspace --all-targets --all-features -- -D warnings)
 ```
 
 Expected: all green.
