@@ -32,7 +32,7 @@
 - **Spin canonical variable name** is `spin_var = key_value.to_ascii_lowercase()`; env line key is `SPIN_VARIABLE_<spin_var.to_ascii_uppercase()>`.
 - **`run_serve` env-file load is adapter-scoped:** `axum` → `<manifest_root>/.edgezero/.env`; `spin` → `<spin_crate_dir>/.env`; other adapters → none.
 - **`config push --local` table/key ownership boundary** (spec §"Interaction with `config push --local`"): push only mutates its declared keys; provision-owned tables and sibling keys MUST stay byte-for-byte intact.
-- **Axum exception:** `axum.toml` stays tracked and scaffold-owned. Do NOT add `axum.toml` to `.gitignore`, the synthesiser, the dry-run allow-list, or the migration runbook.
+- **All four adapter manifests are provision-generated + gitignored.** `axum.toml` joined the Cloudflare/Fastly/Spin set in the 2026-07 amendment: `AxumCliAdapter::synthesise_baseline_manifest` emits it on missing, `.gitignore` and CI enforce it untracked, and `provision --local --dry-run` includes it in the diff allow-list. Adapter merge paths remain no-ops on operator edits.
 - **Spec reference:** `docs/superpowers/specs/2026-06-23-provision-local.md` is the single source of truth. Every behaviour rule in this plan traces back to a spec section; consult the spec whenever a task's rationale is unclear.
 
 ---

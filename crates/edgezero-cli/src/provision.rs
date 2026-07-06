@@ -66,8 +66,6 @@ impl OwnedProvisionStores {
 /// - Fastly: resolved `fastly.toml`.
 /// - Spin: resolved `spin.toml` + sibling `runtime-config.toml` +
 ///   sibling `.env`.
-///
-/// `axum.toml` is NOT in this list (it stays tracked).
 pub(crate) struct DryRunAllowList {
     /// (`project_path`, `staged_path`) pairs the driver diffs.
     pub pairs: Vec<(PathBuf, PathBuf)>,
