@@ -57,7 +57,7 @@ problems made that untenable as projects grew:
   blob model writes ONE envelope per `[stores.config]` key.
 - **Secret resolution was per-handler.** Every handler that read a
   `#[secret]` field had to remember to call `require_str`. The new
-  `AppConfig<C>` extractor walks `C::SECRET_FIELDS` once and replaces
+  `AppConfig<C>` extractor walks `C::secret_fields()` once and replaces
   each key NAME with the resolved value before handing `cfg` to the
   handler.
 

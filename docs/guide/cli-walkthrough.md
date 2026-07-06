@@ -19,10 +19,12 @@ myapp-cli config validate  # typed validate of edgezero.toml + myapp.toml
 myapp-cli config push      # typed push of myapp.toml to the platform config store
 ```
 
-The default `edgezero` binary exposes the same commands but runs the **raw** validate /
-push paths because it has no typed app-config struct in scope. Downstream CLIs upgrade
-to the typed paths so `validator` rules, `#[secret]` / `#[secret(store_ref)]` checks,
-and Spin's flat-namespace collision check all run.
+The default `edgezero` binary exposes the same commands but has no typed app-config
+struct in scope, so it runs the **raw** `config validate` path and **cannot** run
+`config push` at all (the bundled `config push` errors, pointing you at the downstream
+CLI — the blob model needs the typed `AppConfig<C>`). Downstream CLIs upgrade to the
+typed paths so `validator` rules, `#[secret]` / `#[secret(store_ref)]` checks, and
+Spin's flat-namespace collision check all run.
 
 ## 1. Scaffold
 
@@ -150,19 +152,22 @@ myapp-cli config push --adapter axum --dry-run
 myapp-cli config push --adapter axum
 ```
 
-Typed push runs the strict pre-flight validation, serialises `MyappConfig` via
-`serde_json`, **strips every `#[secret]` and `#[secret(store_ref)]` top-level field**
-(runtime store ids and secret values both belong out of the config-store payload),
-flattens nested structs into dotted keys (`service.timeout_ms`), JSON-encodes arrays as
-single string values, and pushes per-adapter:
+Typed push runs the strict pre-flight validation, then serialises `MyappConfig`
+into a single [`BlobEnvelope`](./blob-app-config-migration.md) — one JSON
+`{ version, generated_at, sha256, data }` value written under one config-store
+key. `data` carries **every field VERBATIM, including `#[secret]` /
+`#[secret(store_ref)]` fields**: their value at rest is the operator-supplied key
+NAME (e.g. `"demo_api_token"`), which the runtime `AppConfig<C>` extractor swaps
+for the resolved secret at request time. Nothing is flattened or stripped, and
+the blob never contains resolved secret bytes. It pushes per-adapter:
 
-- **axum** — writes the flat `string -> string` JSON object to
-  `.edgezero/local-config-<id>.json` (the same file `AxumConfigStore` reads back at
-  runtime).
+- **axum** — writes the envelope JSON to `.edgezero/local-config-<id>.json` (the
+  same file `AxumConfigStore` reads back at runtime).
 - **cloudflare** — reads the namespace id from `wrangler.toml` (matched by binding =
   `<platform-name>`, resolved from `EDGEZERO__STORES__CONFIG__<ID>__NAME` or the
   logical `<id>`; errors with "did you run `provision`?" if absent), writes the
-  entries to a temp file in wrangler's bulk format, then runs:
+  single-entry bulk file (`[{"key": "<key>", "value": "<envelope_json>"}]`), then
+  runs:
 
   ```bash
   wrangler kv bulk put <tempfile> --namespace-id=<id>
@@ -170,15 +175,16 @@ single string values, and pushes per-adapter:
 
 - **fastly** — resolves the platform config-store id on demand via
   `fastly config-store list --json` (matched by `name = <platform-name>`, resolved
-  the same way), then per entry:
+  the same way), then upserts the envelope:
 
   ```bash
-  fastly config-store-entry create --store-id=<id> --key=<k> --value=<v>
+  fastly config-store-entry update --store-id=<id> --key=<key> --upsert --stdin
   ```
 
 - **spin** — reads `runtime-config.toml` (next to `spin.toml` by
   default; override with `--runtime-config <path>`) to dispatch
   per-backend. Decision order:
+
   1. `--local` forces SQLite-direct against
      `<spin.toml dir>/.spin/sqlite_key_value.db`. Non-`default` labels
      still require a `[key_value_store.<label>]` stanza in
@@ -186,10 +192,9 @@ single string values, and pushes per-adapter:
      push and tells you the exact stanza to add, since the file you'd
      write would be unreadable from a running `spin up`.
   2. If the manifest's `[adapters.spin.commands].deploy` shells to
-     `spin deploy` / `spin cloud deploy`, push batches entries into
-     `spin cloud key-value set --app <APP> --label <LABEL>
-KEY=VALUE [KEY=VALUE …]` invocations (one shellout per
-     ≤96 KiB argv chunk, ≥1000 entries per invocation). `<APP>`
+     `spin deploy` / `spin cloud deploy`, push writes the single
+     envelope entry via `spin cloud key-value set --app <APP>
+--label <LABEL> <KEY>=<envelope_json>`. `<APP>`
      comes from `[application].name` in spin.toml; `<LABEL>` is the
      env-resolved platform label per Fermyon's
      [app-scoped label model](https://developer.fermyon.com/cloud/linking-applications-to-resources-using-labels).

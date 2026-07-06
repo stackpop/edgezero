@@ -61,12 +61,14 @@ store metadata. Prefer `run_app` or `dispatch_with_config` for normal use.
 `dispatch_with_config_handle` exists for advanced/manual cases where you already have a prepared
 `ConfigStoreHandle`.
 
-### Capturing raw-request signals (JA4, H2, client IP)
+### Capturing raw-request signals (JA4, H2 fingerprint)
 
 `run_app` converts the `fastly::Request` into a neutral core request before
-dispatch, so Fastly-only signals that are readable only on the raw request
-(`get_tls_ja4()`, `get_client_h2_fingerprint()`, the client-IP getter) aren't
-reachable from handlers by default. Use `run_app_with_request_extensions`, which
+dispatch. The client IP is carried across automatically — read it via
+`FastlyRequestContext` (see [Context Access](#context-access) below). Other
+Fastly-only signals that are readable only on the raw request
+(`get_tls_ja4()`, `get_client_h2_fingerprint()`) aren't reachable from handlers
+by default. Use `run_app_with_request_extensions`, which
 runs an app closure against a scratch `Extensions` **before** conversion and
 merges the values into the core request — so a `State`/extractor or middleware
 can read them:
@@ -224,7 +226,7 @@ Access Fastly-specific APIs via the request context extensions:
 
 ```rust
 use edgezero_core::context::RequestContext;
-use edgezero_adapter_fastly::FastlyRequestContext;
+use edgezero_adapter_fastly::context::FastlyRequestContext;
 
 async fn handler(ctx: RequestContext) -> Result<Response, EdgeError> {
     // Access Fastly context from extensions
