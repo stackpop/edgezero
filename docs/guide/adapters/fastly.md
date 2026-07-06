@@ -79,7 +79,7 @@ struct Ja4(String);
 fn main(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
     edgezero_adapter_fastly::run_app_with_request_extensions::<App, _>(req, |raw, ext| {
         if let Some(ja4) = raw.get_tls_ja4() {
-            ext.insert(Ja4(ja4));
+            ext.insert(Ja4(ja4.to_owned()));
         }
     })
 }
