@@ -24,6 +24,12 @@ pub enum ScaffoldError {
     /// The Handlebars renderer rejected the template or its data.
     #[error("template '{name}' failed to render: {message}")]
     Render { message: String, name: String },
+    /// One of the compile-time-embedded templates failed Handlebars
+    /// parsing. Only possible via a build-time programmer bug --
+    /// `include_str!` sources are validated by the CI test
+    /// `register_templates_registers_all_known_templates`.
+    #[error("template registration failed: {0}")]
+    Registration(#[from] handlebars::TemplateError),
 }
 
 impl ScaffoldError {
@@ -44,88 +50,78 @@ fn crate_name_from_repo_path(path: &str) -> &str {
 
 /// Registers all compile-time-embedded templates.
 ///
-/// Each `register_template_string` call uses `.expect(..)` because the inputs
-/// are static strings via `include_str!` — failure can only happen if the
-/// template source itself has invalid Handlebars syntax, which is a
-/// build-time programmer error caught the moment the binary is run.
-#[expect(
-    clippy::expect_used,
-    reason = "compile-time-embedded templates: parse failure is a build bug"
-)]
-pub fn register_templates(hbs: &mut Handlebars) {
-    // Root
-    hbs.register_template_string(
-        "root_Cargo_toml",
-        include_str!("templates/root/Cargo.toml.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "root_edgezero_toml",
-        include_str!("templates/root/edgezero.toml.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "root_README_md",
-        include_str!("templates/root/README.md.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "root_gitignore",
-        include_str!("templates/root/gitignore.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "root_clippy_toml",
-        include_str!("templates/root/clippy.toml.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "root_tool_versions",
-        include_str!("templates/root/tool-versions.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    // Core
-    hbs.register_template_string(
-        "core_Cargo_toml",
-        include_str!("templates/core/Cargo.toml.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "core_src_lib_rs",
-        include_str!("templates/core/src/lib.rs.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "core_src_handlers_rs",
-        include_str!("templates/core/src/handlers.rs.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "core_src_config_rs",
-        include_str!("templates/core/src/config.rs.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    // App-config (`<name>.toml`)
-    hbs.register_template_string("app_name_toml", include_str!("templates/app/name.toml.hbs"))
-        .expect("compiled-in template is valid");
-    // CLI
-    hbs.register_template_string(
-        "cli_Cargo_toml",
-        include_str!("templates/cli/Cargo.toml.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    hbs.register_template_string(
-        "cli_src_main_rs",
-        include_str!("templates/cli/src/main.rs.hbs"),
-    )
-    .expect("compiled-in template is valid");
-    // Adapter-specific templates
+/// # Errors
+/// Returns the underlying handlebars parse error if any compile-time
+/// template source has invalid Handlebars syntax. This is a
+/// build-time programmer bug -- it cannot happen at runtime for a
+/// released binary, since all inputs are `include_str!` fixtures.
+/// The Result-return shape keeps `clippy::expect_used` /
+/// `clippy::unwrap_used` from firing at every callsite and lets the
+/// caller decide how to surface the error (panic during scaffold,
+/// return via `?` during library init, etc.).
+pub fn register_templates(hbs: &mut Handlebars) -> Result<(), handlebars::TemplateError> {
+    // (name, contents) tuples for every root/core/app/cli template.
+    // Adapter templates come from the registered blueprints, so
+    // they're iterated separately below.
+    for (name, contents) in [
+        (
+            "root_Cargo_toml",
+            include_str!("templates/root/Cargo.toml.hbs"),
+        ),
+        (
+            "root_edgezero_toml",
+            include_str!("templates/root/edgezero.toml.hbs"),
+        ),
+        (
+            "root_README_md",
+            include_str!("templates/root/README.md.hbs"),
+        ),
+        (
+            "root_gitignore",
+            include_str!("templates/root/gitignore.hbs"),
+        ),
+        (
+            "root_clippy_toml",
+            include_str!("templates/root/clippy.toml.hbs"),
+        ),
+        (
+            "root_tool_versions",
+            include_str!("templates/root/tool-versions.hbs"),
+        ),
+        (
+            "core_Cargo_toml",
+            include_str!("templates/core/Cargo.toml.hbs"),
+        ),
+        (
+            "core_src_lib_rs",
+            include_str!("templates/core/src/lib.rs.hbs"),
+        ),
+        (
+            "core_src_handlers_rs",
+            include_str!("templates/core/src/handlers.rs.hbs"),
+        ),
+        (
+            "core_src_config_rs",
+            include_str!("templates/core/src/config.rs.hbs"),
+        ),
+        ("app_name_toml", include_str!("templates/app/name.toml.hbs")),
+        (
+            "cli_Cargo_toml",
+            include_str!("templates/cli/Cargo.toml.hbs"),
+        ),
+        (
+            "cli_src_main_rs",
+            include_str!("templates/cli/src/main.rs.hbs"),
+        ),
+    ] {
+        hbs.register_template_string(name, contents)?;
+    }
     for adapter in scaffold::registered_blueprints() {
         for template in adapter.template_registrations {
-            hbs.register_template_string(template.name, template.contents)
-                .expect("register adapter template");
+            hbs.register_template_string(template.name, template.contents)?;
         }
     }
+    Ok(())
 }
 
 pub fn relative_to(from: &Path, to: &Path) -> Option<String> {
@@ -254,7 +250,7 @@ mod tests {
     #[test]
     fn register_templates_registers_all_known_templates() {
         let mut hbs = Handlebars::new();
-        register_templates(&mut hbs);
+        register_templates(&mut hbs).expect("compile-time template registration");
 
         for name in [
             "root_Cargo_toml",

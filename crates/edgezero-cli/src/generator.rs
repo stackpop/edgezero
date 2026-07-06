@@ -721,7 +721,7 @@ fn render_templates(
     data_value: &Value,
 ) -> Result<(), GeneratorError> {
     let mut hbs = Handlebars::new();
-    register_templates(&mut hbs);
+    register_templates(&mut hbs).map_err(ScaffoldError::from)?;
 
     log::info!("[edgezero] writing workspace files");
     write_root_files(&hbs, layout, data_value)?;

@@ -45,8 +45,14 @@ mod provision_lock;
 mod scaffold;
 #[cfg(all(test, feature = "cli"))]
 mod shared_test_guards;
+/// CLI stream-discipline helpers -- `stdout_line`, `info_line`,
+/// `prompt`. Every stdout/stderr write in the `edgezero` binary
+/// (and in the scaffolded downstream binaries that reuse this
+/// crate) MUST go through these so the workspace
+/// `clippy::print_stderr` / `clippy::print_stdout` restrictions
+/// still catch accidental prints elsewhere as real bugs.
 #[cfg(feature = "cli")]
-mod stream;
+pub mod stream;
 #[cfg(all(test, feature = "cli"))]
 mod test_support;
 
@@ -104,24 +110,16 @@ impl log::Log for CliLogger {
 
     #[inline]
     fn log(&self, record: &log::Record<'_>) {
+        use crate::stream::{info_line, stdout_line};
         if !self.enabled(record.metadata()) {
             return;
         }
         match record.level() {
             log::Level::Error | log::Level::Warn => {
-                #[expect(
-                    clippy::print_stderr,
-                    reason = "CLI UX output goes to stderr for warn/error"
-                )]
-                {
-                    eprintln!("{}", record.args());
-                }
+                info_line(&format!("{}", record.args()));
             }
             log::Level::Info => {
-                #[expect(clippy::print_stdout, reason = "CLI UX output goes to stdout for info")]
-                {
-                    println!("{}", record.args());
-                }
+                stdout_line(&format!("{}", record.args()));
             }
             log::Level::Debug | log::Level::Trace => {}
         }

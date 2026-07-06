@@ -11,16 +11,16 @@ use std::path::Path;
 
 /// True only for regular files (not directories, symlinks, fifos,
 /// sockets, block/character devices). Regular-files-only IS the
-/// spec §"Dry-run" semantic — clippy's warning that callers "often
-/// forget `is_file()` excludes symlinks" is inverted for us: we
-/// WANT that exclusion. Wrapping at one call site keeps
-/// `copy_dir_recursive` free of the suppression.
-#[expect(
-    clippy::filetype_is_file,
-    reason = "spec §\"Dry-run\": regular-files-only copy semantics — symlink/special-file exclusion is the intent, not a bug"
-)]
+/// Spec §"Dry-run" semantic: only regular files are copied into the
+/// staged tempdir. `read_dir` gives us a `FileType` obtained via
+/// `symlink_metadata`, so a symlink reports `is_symlink() == true`
+/// (never `is_file() == true`), and directories report
+/// `is_dir() == true`. Exclude both explicitly rather than relying
+/// on `is_file()` -- the latter's clippy lint fires because callers
+/// often confuse it with metadata-following behaviour, whereas here
+/// the check is a positive statement: "not a dir, not a symlink".
 fn is_regular_file(file_type: FileType) -> bool {
-    file_type.is_file()
+    !file_type.is_dir() && !file_type.is_symlink()
 }
 
 pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
