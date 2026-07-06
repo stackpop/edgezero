@@ -151,31 +151,36 @@ ids     = ["app_config"]
 ```
 
 ```jsonc
-// .edgezero/local-config-app_config.json
+// .edgezero/local-config-app_config.json — what `<your-cli> config push` writes.
+// The outer object maps the logical store id to ONE BlobEnvelope, JSON-encoded
+// as a string (see the blob migration guide for the envelope's fields). `data`
+// holds the typed config verbatim; `#[secret]` fields store their key NAMES,
+// which the runtime resolves at request time — never the secret values.
 {
-  "greeting": "hello from config store",
-  "feature.new_checkout": "false",
-  "service.timeout_ms": "1500",
+  "app_config": "{\"version\":1,\"generated_at\":\"…\",\"sha256\":\"…\",\"data\":{\"greeting\":\"hello\",\"feature\":{\"new_checkout\":false},\"service\":{\"timeout_ms\":1500},\"api_token\":\"demo_api_token\",\"vault\":\"default\"}}",
 }
 ```
 
-Handlers access stores via the `Config` extractor or `ctx.config_store(id)`:
+Typed apps read the whole config in one shot with the `AppConfig<C>` extractor,
+which parses the envelope and resolves `#[secret]` fields before handing you `cfg`:
 
 ```rust
-async fn handler(config: Config) -> Result<Response, EdgeError> {
-    let store = config.default().ok_or_else(|| EdgeError::service_unavailable("no default config"))?;
-    let greeting = store.get("greeting").await?.unwrap_or_default();
+async fn handler(AppConfig(cfg): AppConfig<MyConfig>) -> Result<Response, EdgeError> {
+    let greeting = &cfg.greeting;
     // …
 }
 ```
 
-Do not pass raw user input straight to `store.get(…)` in production
-handlers; validate or allowlist keys first. Seed the per-id JSON
-files with `edgezero config push --adapter axum` (or
-`<your-cli> config push --adapter axum` for the typed flow with
-`#[secret]` stripping), which writes the same
-`.edgezero/local-config-<id>.json` files the runtime reads —
-no shell-out, no server to authenticate against.
+The lower-level `Config` extractor / `ctx.config_store(id)` exposes the raw
+key/value store — `store.get("app_config")` returns the envelope string, and a
+hand-seeded flat file returns individual values. Do not pass raw user input
+straight to `store.get(…)` in production handlers; validate or allowlist keys
+first.
+
+Seed the per-id files with `<your-cli> config push --adapter axum` (the typed
+flow — the bundled `edgezero config push` errors), which writes the same
+`.edgezero/local-config-<id>.json` files the runtime reads — no shell-out, no
+server to authenticate against.
 
 ## Container Deployment
 

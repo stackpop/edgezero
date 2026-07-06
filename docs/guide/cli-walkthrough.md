@@ -219,8 +219,9 @@ SET <key> <value>`).
 
 ### Spin manual secret declarations
 
-`config push` never writes secret variables — `#[secret]` fields are stripped before
-push, and a `#[secret(store_ref)]` field's runtime key is code-local (e.g.
+`config push` never writes secret **values** or Spin secret variables — the blob
+stores each `#[secret]` field's key NAME (not its resolved value), and a
+`#[secret(store_ref)]` field's runtime key is code-local (e.g.
 `ctx.secret_store(&cfg.vault)?.require_str("active")`), so the CLI cannot infer it.
 Declare them manually in `spin.toml`:
 
@@ -247,7 +248,8 @@ and `config push` so the values you see match the runtime:
 ```bash
 # myapp.toml: service.timeout_ms = 1500
 MYAPP__SERVICE__TIMEOUT_MS=5000 myapp-cli config push --adapter axum
-# .edgezero/local-config-app_config.json now has "service.timeout_ms": "5000"
+# the pushed blob's `data` now has service.timeout_ms: 5000 (nested, numeric),
+# and the sha256 changes accordingly
 ```
 
 Pass `--no-env` to skip the overlay (useful when CI builds want the on-disk

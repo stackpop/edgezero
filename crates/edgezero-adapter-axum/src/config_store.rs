@@ -1,9 +1,11 @@
 //! Axum adapter config store: reads from a per-id local JSON file.
 //!
 //! Each declared `[stores.config].ids` id maps to a file at
-//! `.edgezero/local-config-<id>.json`. The file holds a flat object of
-//! `string -> string` pairs — the same shape `edgezero config push
-//! --adapter axum` writes.
+//! `.edgezero/local-config-<id>.json`. The file holds a JSON object of
+//! `string -> string` pairs. Typed `config push --adapter axum` writes ONE
+//! entry — the logical store id keyed to a JSON-encoded `BlobEnvelope` string,
+//! which the runtime `AppConfig<C>` extractor parses; hand-seeded flat
+//! key/value files also work for raw `get`.
 //!
 //! If the file is absent the store is empty (`get` returns `Ok(None)` for
 //! every key). This keeps `edgezero serve --adapter axum` permissive when
@@ -69,20 +71,20 @@ impl AxumConfigStore {
     /// by `config push --adapter axum` to a tempdir, without
     /// changing the process CWD.
     ///
-    /// The file must contain a flat JSON object of `string -> string`
-    /// pairs, matching what `config push --adapter axum` writes:
+    /// The file must be a JSON object of `string -> string` pairs.
+    /// Typed `config push --adapter axum` writes ONE entry — the logical
+    /// store id keyed to a JSON-encoded `BlobEnvelope` string:
     ///
     /// ```json
     /// {
-    ///   "greeting": "hello",
-    ///   "feature.new_checkout": "false",
-    ///   "service.timeout_ms": "1500"
+    ///   "app_config": "{\"version\":1,\"sha256\":\"…\",\"data\":{}}"
     /// }
     /// ```
     ///
-    /// Dotted keys are stored verbatim (no nesting): the runtime
-    /// extractors look up the dotted form as a single key. Non-string
-    /// values (`{"x": 42}`, nested objects, arrays) are rejected.
+    /// The runtime `AppConfig<C>` extractor parses that envelope string;
+    /// hand-seeded flat key/value files also work for raw `get`. Values
+    /// must be strings — non-string values (`{"x": 42}`, nested objects,
+    /// arrays) are rejected.
     ///
     /// Behaviour matches `from_local_file`: a missing file yields
     /// an empty store; a present-but-malformed file yields
