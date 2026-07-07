@@ -43,11 +43,15 @@ pub(crate) enum KeyValueBackend {
     Unknown { type_name: String },
 }
 
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "deserialize_in_place's default body is correct for this enum; overriding adds no value"
-)]
 impl<'de> Deserialize<'de> for KeyValueBackend {
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
+    }
+
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,

@@ -93,19 +93,22 @@ impl ConfigStore for FastlyConfigStore {
 }
 
 fn map_lookup_error(err: &LookupError) -> ConfigStoreError {
-    // `LookupError` is from the `fastly` crate; using a wildcard arm guards
-    // against new variants being added in upstream point releases without
-    // forcing us into a breaking match every bump.
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "external enum; new variants must remain unavailable→unavailable"
-    )]
+    // `LookupError` is #[non_exhaustive] on the fastly side; every current
+    // variant is enumerated so a new upstream variant forces a reviewer
+    // decision here rather than silently landing in the unavailable arm.
     match err {
         LookupError::KeyInvalid | LookupError::KeyTooLong => {
             ConfigStoreError::invalid_key("invalid config key")
         }
-        _ => {
+        LookupError::ConfigStoreInvalid
+        | LookupError::ValueTooLong
+        | LookupError::TooManyLookups
+        | LookupError::Other => {
             log::warn!("Fastly config store lookup failed: {err}");
+            ConfigStoreError::unavailable("config store temporarily unavailable")
+        }
+        _future => {
+            log::warn!("Fastly config store lookup failed (unknown variant): {err}");
             ConfigStoreError::unavailable("config store temporarily unavailable")
         }
     }
