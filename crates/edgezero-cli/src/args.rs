@@ -296,14 +296,26 @@ impl Default for ConfigDiffArgs {
 /// `run_config_push_typed::<C>`.  The bundled `edgezero` binary exposes
 /// a `ConfigCmdStubArgs` catch-all instead and redirects to the typed
 /// CLI at runtime.
+/// "Suppress this default behaviour" flags for `config push`. Hoisted
+/// out of [`ConfigPushArgs`] so that struct stays at 3 bools (the
+/// workspace `clippy::struct_excessive_bools` threshold) without a
+/// per-callsite suppression. Callers reach these via
+/// `args.suppress.no_diff` / `args.suppress.no_env`.
+#[derive(clap::Args, Debug, Default)]
+#[non_exhaustive]
+pub struct ConfigPushSuppressions {
+    /// Skip the inline diff render.
+    #[arg(long)]
+    pub no_diff: bool,
+    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
+    /// typed app-config. The default loads the overlay so the runtime
+    /// and the push see the same resolved values.
+    #[arg(long)]
+    pub no_env: bool,
+}
+
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "clap args struct: each bool is a distinct CLI flag \
-              (dry_run, local, no_diff, no_env, yes); a state machine \
-              would be inappropriate here"
-)]
 pub struct ConfigPushArgs {
     /// Target adapter name.
     #[arg(long, required = true)]
@@ -333,14 +345,6 @@ pub struct ConfigPushArgs {
     /// Path to the manifest (default: `edgezero.toml`).
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
-    /// Skip the inline diff render.
-    #[arg(long)]
-    pub no_diff: bool,
-    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
-    /// typed app-config. The default loads the overlay so the runtime
-    /// and the push see the same resolved values.
-    #[arg(long)]
-    pub no_env: bool,
     /// Path to the adapter's runtime configuration file. Currently
     /// only honoured by Spin, which reads
     /// `[key_value_store.<label>]` stanzas to dispatch
@@ -355,6 +359,13 @@ pub struct ConfigPushArgs {
     /// `[stores.config].ids` has length 1).
     #[arg(long)]
     pub store: Option<String>,
+    /// Suppress-this-default-behaviour flags. Grouped under a nested
+    /// struct via `#[command(flatten)]` so `ConfigPushArgs` stays at
+    /// 3 bool fields (the workspace `clippy::struct_excessive_bools`
+    /// threshold). Clap treats `--no-diff` / `--no-env` as top-level
+    /// flags at the CLI surface.
+    #[command(flatten)]
+    pub suppress: ConfigPushSuppressions,
     /// Skip the inline diff prompt and write unconditionally.
     #[arg(long, short)]
     pub yes: bool,
@@ -371,10 +382,9 @@ impl Default for ConfigPushArgs {
             key: None,
             local: false,
             manifest: default_manifest_path(),
-            no_diff: false,
-            no_env: false,
             runtime_config: None,
             store: None,
+            suppress: ConfigPushSuppressions::default(),
             yes: false,
         }
     }
@@ -489,8 +499,8 @@ mod tests {
         assert!(!args.dry_run);
         assert!(args.key.is_none());
         assert!(!args.local);
-        assert!(!args.no_diff);
-        assert!(!args.no_env);
+        assert!(!args.suppress.no_diff);
+        assert!(!args.suppress.no_env);
         assert!(args.runtime_config.is_none());
         assert!(args.store.is_none());
         assert!(!args.yes);
@@ -751,7 +761,7 @@ mod tests {
 
     #[test]
     fn config_push_args_no_diff_default_is_false() {
-        assert!(!ConfigPushArgs::default().no_diff);
+        assert!(!ConfigPushArgs::default().suppress.no_diff);
     }
 
     #[test]

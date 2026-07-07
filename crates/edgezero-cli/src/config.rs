@@ -377,7 +377,7 @@ where
 
     run_shared_checks(&ctx.validation)?;
     let mut opts = AppConfigLoadOptions::default();
-    opts.env_overlay = !args.no_env;
+    opts.env_overlay = !args.suppress.no_env;
     let typed: C = app_config::deserialize_app_config_with_options::<C>(
         &ctx.validation.app_config_path,
         &ctx.validation.app_name,
@@ -416,17 +416,22 @@ where
 
     // First read + diff.
     let remote = read_remote(ctx.adapter, args.local, &paths, &ctx.store, &key)?;
-    let approved_remote_sha =
-        match render_first_read_diff(&remote, &key, &local_envelope, &local_sha, args.no_diff)? {
-            FirstReadOutcome::NoChange => {
-                push_info(&format!("# no changes (sha256 matches: {local_sha})"));
-                return Ok(());
-            }
-            FirstReadOutcome::ProceedFromPresent {
-                approved_remote_sha,
-            } => Some(approved_remote_sha),
-            FirstReadOutcome::ProceedFromMissingOrUnsupported => None,
-        };
+    let approved_remote_sha = match render_first_read_diff(
+        &remote,
+        &key,
+        &local_envelope,
+        &local_sha,
+        args.suppress.no_diff,
+    )? {
+        FirstReadOutcome::NoChange => {
+            push_info(&format!("# no changes (sha256 matches: {local_sha})"));
+            return Ok(());
+        }
+        FirstReadOutcome::ProceedFromPresent {
+            approved_remote_sha,
+        } => Some(approved_remote_sha),
+        FirstReadOutcome::ProceedFromMissingOrUnsupported => None,
+    };
 
     // Consent gate (8.2 default or 8.3 Spin Cloud Unsupported).
     handle_consent(args, &remote)?;
@@ -1126,7 +1131,7 @@ fn load_push_context(args: &ConfigPushArgs) -> Result<PushContext, String> {
     let validate_args = ConfigValidateArgs {
         app_config: args.app_config.clone(),
         manifest: args.manifest.clone(),
-        no_env: args.no_env,
+        no_env: args.suppress.no_env,
         strict: true,
     };
     let validation = load_validation_context(&validate_args)?;
@@ -1720,6 +1725,7 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::ConfigPushSuppressions;
     use crate::test_support::{manifest_guard, EnvOverride};
     use edgezero_core::app_config::SecretField;
     use serde::{Deserialize, Serialize};
@@ -1861,10 +1867,12 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             key: None,
             local: false,
             manifest: manifest.to_path_buf(),
-            no_diff: false,
-            no_env: true,
             runtime_config: None,
             store: None,
+            suppress: ConfigPushSuppressions {
+                no_diff: false,
+                no_env: true,
+            },
             yes: false,
         }
     }
@@ -3173,7 +3181,7 @@ ids = ["default"]
         let other_data = serde_json::json!({ "greeting": "old" });
         write_remote_envelope(dir.path(), "app_config", &make_envelope_json(other_data));
 
-        args.no_diff = true;
+        args.suppress.no_diff = true;
         args.yes = true;
         run_config_push_typed::<FixtureConfig>(&args)
             .expect("--no-diff --yes typed push must succeed");
