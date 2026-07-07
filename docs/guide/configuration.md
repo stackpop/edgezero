@@ -186,7 +186,10 @@ ids     = ["app_config"]         # one id per logical config store
 
 The portable schema is symmetric across `[stores.kv]`, `[stores.config]`,
 and `[stores.secrets]`: declare logical `ids` only; resolve platform
-names at runtime via `EDGEZERO__STORES__<KIND>__<ID>__NAME`. The
+names at runtime via `EDGEZERO__STORES__<KIND>__<ID>__NAME`. Config
+stores additionally honour `EDGEZERO__STORES__CONFIG__<ID>__KEY` to
+select which pushed blob the runtime reads (the staging/canary selector
+that pairs with `config push --key`; defaults to the logical id). The
 pre-rewrite `name`, `enabled`, `[stores.config.defaults]`, and
 `[stores.config.adapters.*]` fields are a hard load error — see
 [the migration guide](./manifest-store-migration.md).
