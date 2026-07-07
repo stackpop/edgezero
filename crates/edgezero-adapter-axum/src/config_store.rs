@@ -3,7 +3,8 @@
 //! Each declared `[stores.config].ids` id maps to a file at
 //! `.edgezero/local-config-<id>.json`. The file holds a JSON object of
 //! `string -> string` pairs. Typed `config push --adapter axum` writes ONE
-//! entry — the logical store id keyed to a JSON-encoded `BlobEnvelope` string,
+//! entry — the selected config key (defaults to the logical store id,
+//! overridable with `--key`) keyed to a JSON-encoded `BlobEnvelope` string,
 //! which the runtime `AppConfig<C>` extractor parses; hand-seeded flat
 //! key/value files also work for raw `get`.
 //!
@@ -72,12 +73,13 @@ impl AxumConfigStore {
     /// changing the process CWD.
     ///
     /// The file must be a JSON object of `string -> string` pairs.
-    /// Typed `config push --adapter axum` writes ONE entry — the logical
-    /// store id keyed to a JSON-encoded `BlobEnvelope` string:
+    /// Typed `config push --adapter axum` writes ONE entry — the selected
+    /// config key (defaults to the logical store id, overridable with
+    /// `--key`) keyed to a JSON-encoded `BlobEnvelope` string:
     ///
     /// ```json
     /// {
-    ///   "app_config": "{\"version\":1,\"sha256\":\"…\",\"data\":{}}"
+    ///   "app_config": "{\"version\":1,\"generated_at\":\"…\",\"sha256\":\"…\",\"data\":{}}"
     /// }
     /// ```
     ///

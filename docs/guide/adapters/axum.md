@@ -152,10 +152,12 @@ ids     = ["app_config"]
 
 ```jsonc
 // .edgezero/local-config-app_config.json — what `<your-cli> config push` writes.
-// The outer object maps the logical store id to ONE BlobEnvelope, JSON-encoded
-// as a string (see the blob migration guide for the envelope's fields). `data`
-// holds the typed config verbatim; `#[secret]` fields store their key NAMES,
-// which the runtime resolves at request time — never the secret values.
+// The outer object maps the selected config key (defaults to the logical store
+// id; override with `--key`, e.g. for a `staging` blob) to ONE BlobEnvelope,
+// JSON-encoded as a string (see the blob migration guide for the envelope's
+// fields). `data` holds the typed config verbatim; `#[secret]` fields store
+// their key NAMES, which the runtime resolves at request time — never the
+// secret values.
 {
   "app_config": "{\"version\":1,\"generated_at\":\"…\",\"sha256\":\"…\",\"data\":{\"greeting\":\"hello\",\"feature\":{\"new_checkout\":false},\"service\":{\"timeout_ms\":1500},\"api_token\":\"demo_api_token\",\"vault\":\"default\"}}",
 }
