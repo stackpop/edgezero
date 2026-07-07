@@ -119,15 +119,14 @@ Timing logs are limited to derived metadata such as lengths, counts, booleans, a
 
 ### Local Development
 
-::: tip Cloudflare / Fastly / Spin manifests are gitignored
-`wrangler.toml`, `fastly.toml`, `spin.toml`, and `runtime-config.toml`
-are all excluded by the workspace `.gitignore`. Regenerate them
-after cloning — and after adding a new store id — by re-running
-`<app-cli> provision --adapter <name> --local`; the local provisioner
-upserts new `[[kv_namespaces]]` / `[local_server.kv_stores.*]` /
-`key_value_stores` entries and leaves your operator edits in place.
-**Axum's `axum.toml` stays tracked** because it's the operator-authored
-manifest for the native dev server.
+::: tip Adapter manifests are gitignored
+`axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`, and
+`runtime-config.toml` are all excluded by the workspace
+`.gitignore`. Regenerate each after cloning — and after adding a
+new store id — by re-running `<app-cli> provision --adapter <name>
+--local`; the local provisioner upserts new `[[kv_namespaces]]`
+/ `[local_server.kv_stores.*]` / `key_value_stores` entries and
+leaves your operator edits in place.
 :::
 
 - **Axum**: Uses a persistent `redb` embedded database stored under `.edgezero/`. Each declared KV id gets its own derived file; data persists across restarts (the scaffolder's `.gitignore` already excludes `.edgezero/`).

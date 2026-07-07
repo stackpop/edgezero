@@ -294,10 +294,13 @@ edgezero provision --adapter <name> [--manifest <path>] [--local] [--dry-run]
   report; the worktree stays byte-identical. No file writes, no
   shell-outs.
 
-Cloudflare / Fastly / Spin manifests are gitignored, so teammates
+All adapter manifests (`axum.toml`, `wrangler.toml`, `fastly.toml`,
+`spin.toml`, `runtime-config.toml`) are gitignored, so teammates
 regenerate them via `<app>-cli provision --adapter <name> --local`
-after cloning. **Axum's `axum.toml` stays tracked** because it's the
-operator-authored manifest for the native dev server.
+after cloning. The scaffold-time provision loop writes each on
+`edgezero new`, and the single source of truth for each generated
+file is the adapter's `synthesise_baseline_manifest` (no scaffold
+`.hbs` template for the manifest itself).
 
 **Per-adapter behaviour (cloud form — no `--local`):**
 

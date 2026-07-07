@@ -1597,6 +1597,7 @@ mod tests {
         let project_dir = temp.path().join("demo-app");
         let cf_crate = project_dir.join("crates/demo-app-adapter-cloudflare");
         let spin_crate = project_dir.join("crates/demo-app-adapter-spin");
+        let axum_crate = project_dir.join("crates/demo-app-adapter-axum");
 
         assert!(
             cf_crate.join("wrangler.toml").exists(),
@@ -1617,6 +1618,30 @@ mod tests {
         assert!(
             spin_crate.join(".env").exists(),
             "spin per-crate .env must be created at scaffold time (line writer)"
+        );
+
+        // Regression: axum.toml is now generated ONLY by
+        // scaffold-time provision — the scaffold template was
+        // removed to prevent divergence with the synthesiser
+        // (`write_baseline_to_disk` skips existing files, so a
+        // scaffold-written axum.toml would silently override the
+        // synth output at `edgezero new` while the synth output
+        // would win on a clean clone). Assert both: the file
+        // exists AND its contents match the synthesiser
+        // byte-for-byte (i.e. carries the `# edgezero-provision: v1`
+        // header the runtime uses to distinguish provisioned files
+        // from operator-authored ones).
+        let axum_toml_path = axum_crate.join("axum.toml");
+        assert!(
+            axum_toml_path.exists(),
+            "axum.toml must be synthesised at scaffold time"
+        );
+        let axum_toml_body = fs::read_to_string(&axum_toml_path).expect("read axum.toml");
+        assert!(
+            axum_toml_body.starts_with("# edgezero-provision: v1\n"),
+            "scaffolded axum.toml must carry the synthesiser's `# edgezero-provision: v1` \
+             header, proving it came from provision and not a scaffold template: \
+             {axum_toml_body}"
         );
     }
 

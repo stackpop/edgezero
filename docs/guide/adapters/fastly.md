@@ -54,8 +54,9 @@ upserts the Viceroy `[local_server.kv_stores.*]` and
 cloud-mode `provision --adapter fastly` — they're not touched in
 local mode. Any operator edits (extra `[local_server.backends.*]`,
 tuned build flags, etc.) stay local until you hand-share them.
-**Axum's `axum.toml` stays tracked** because it's the
-operator-authored manifest for the native dev server.
+All adapter manifests follow the same gitignored-generated model
+— `axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`, and
+`runtime-config.toml` are all treated as regenerable local state.
 
 `provision_typed` (Task 23) additionally writes
 `[[local_server.secret_stores.<store_id>]]` entries — one per

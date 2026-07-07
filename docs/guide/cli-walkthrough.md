@@ -76,10 +76,13 @@ auth-status = "wrangler whoami --json"
   `fastly <kind>-store create` (Fastly), or the Spin-manifest edits
   described below.
 
-Cloudflare / Fastly / Spin manifests are gitignored — teammates
+All adapter manifests (`axum.toml`, `wrangler.toml`, `fastly.toml`,
+`spin.toml`, `runtime-config.toml`) are gitignored — teammates
 regenerate them via `<app>-cli provision --adapter <name> --local`
-after cloning. **Axum's `axum.toml` stays tracked** because it's the
-operator-authored manifest for the native dev server.
+after cloning. The scaffold-time provision loop writes each on
+`edgezero new`, and provision is the single source of truth for
+each generated file (no scaffold `.hbs` template for any adapter
+manifest).
 
 Once you've declared store ids in `edgezero.toml`:
 

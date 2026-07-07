@@ -18,6 +18,17 @@ use edgezero_adapter::scaffold::{
 mod provision_local;
 mod run;
 
+// `axum.toml` is intentionally absent from the scaffold registration.
+// It is written by the scaffold-time provision loop that runs
+// immediately after file emission (see `generator.rs`
+// `provision_all_selected_adapters` -> `Adapter::synthesise_baseline_manifest`
+// -> `run::synthesise_axum_toml`). Registering a scaffold template
+// here would cause `axum.toml` to be created before provision runs;
+// provision's `write_baseline_to_disk` skips files that already
+// exist (spec § "Adapter manifests are gitignored"), so the two
+// baselines would diverge — the scaffold template would win at
+// `edgezero new`, but the synthesiser would win on a clean clone.
+// Keep this single-source: only the synthesiser writes `axum.toml`.
 static AXUM_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     TemplateRegistration {
         name: "axum_Cargo_toml",
@@ -26,10 +37,6 @@ static AXUM_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     TemplateRegistration {
         name: "axum_src_main_rs",
         contents: include_str!("../templates/src/main.rs.hbs"),
-    },
-    TemplateRegistration {
-        name: "axum_axum_toml",
-        contents: include_str!("../templates/axum.toml.hbs"),
     },
 ];
 
@@ -41,10 +48,6 @@ static AXUM_FILE_SPECS: &[AdapterFileSpec] = &[
     AdapterFileSpec {
         template: "axum_src_main_rs",
         output: "src/main.rs",
-    },
-    AdapterFileSpec {
-        template: "axum_axum_toml",
-        output: "axum.toml",
     },
 ];
 

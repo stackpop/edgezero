@@ -171,10 +171,11 @@ binding name becomes the platform name resolved by
 `EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME` (with the default being
 the literal id `app_config`).
 
-::: tip Cloudflare / Fastly / Spin manifests are gitignored
-Your local copy of `wrangler.toml`, `fastly.toml`, `spin.toml`, and
-`runtime-config.toml` is not tracked — regenerate it with
-`<app>-cli provision --adapter <name> --local` and re-apply any
-operator edits after cloning. **Axum's `axum.toml` stays tracked**
-because it's the operator-authored manifest for the native dev server.
+::: tip Adapter manifests are gitignored
+Your local copy of `axum.toml`, `wrangler.toml`, `fastly.toml`,
+`spin.toml`, and `runtime-config.toml` is not tracked — regenerate
+each with `<app>-cli provision --adapter <name> --local` and
+re-apply any operator edits after cloning. All five adapter
+manifests follow the same gitignored-generated model, so the
+source of truth is `edgezero.toml` (which stays tracked).
 :::

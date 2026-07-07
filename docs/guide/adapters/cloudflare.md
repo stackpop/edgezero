@@ -48,8 +48,10 @@ my-app-cli provision --adapter cloudflare --local
 upserts `[[kv_namespaces]]` bindings from `edgezero.toml`'s
 `[stores.*]` declarations. Any operator edits (custom
 `compatibility_flags`, extra `[[services]]` bindings, etc.) stay
-local until you hand-share them. **Axum's `axum.toml` stays tracked**
-because it's the operator-authored manifest for the native dev server.
+local until you hand-share them. All adapter manifests follow the
+same gitignored-generated model — `axum.toml`, `wrangler.toml`,
+`fastly.toml`, `spin.toml`, and `runtime-config.toml` are all
+treated as regenerable local state.
 
 `provision_typed` (Task 20) additionally writes `.dev.vars`
 placeholders — one line per `#[secret]` field on your typed

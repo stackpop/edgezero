@@ -4,7 +4,7 @@
 
 **Goal:** Add `provision --local` and a `provision_typed` trait method so a clean clone can materialise per-adapter local emulator state with zero cloud calls, then `config push --local` only mutates the config-blob table.
 
-**Architecture:** A new `ProvisionMode { Cloud, Local }` parameter threads through the existing `Adapter::provision` trait. Cloud mode keeps today's behaviour. Local mode synthesises minimal manifests via `toml_edit::DocumentMut` when absent, merges per-store bindings, writes adapter-local env files, and never shells out. A typed sibling `provision_typed` runs only from the generated `<app-cli>` and adds `#[secret]`-field placeholders. Dry-run stages a real recursive copy into a `tempfile::TempDir`, dispatches the adapter with `dry_run = false` against the staging tree, then diffs the result back. Cloudflare/Fastly/Spin manifests become gitignored generated state; Axum's `axum.toml` stays tracked.
+**Architecture:** A new `ProvisionMode { Cloud, Local }` parameter threads through the existing `Adapter::provision` trait. Cloud mode keeps today's behaviour. Local mode synthesises minimal manifests via `toml_edit::DocumentMut` when absent, merges per-store bindings, writes adapter-local env files, and never shells out. A typed sibling `provision_typed` runs only from the generated `<app-cli>` and adds `#[secret]`-field placeholders. Dry-run stages a real recursive copy into a `tempfile::TempDir`, dispatches the adapter with `dry_run = false` against the staging tree, then diffs the result back. All five adapter manifests (`axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`, `runtime-config.toml`) are gitignored generated state — the scaffold-time provision loop writes each on `edgezero new`, and `provision --local` regenerates any missing baseline on a fresh clone.
 
 **Tech Stack:** Rust 1.95.0, Edition 2021, Resolver 2. `toml_edit::DocumentMut` for TOML-preserving merges, `tempfile::TempDir` for dry-run staging, `similar::TextDiff` for diff output, `validator` for manifest schema. No new workspace dependencies.
 
@@ -32,7 +32,7 @@
 - **Spin canonical variable name** is `spin_var = key_value.to_ascii_lowercase()`; env line key is `SPIN_VARIABLE_<spin_var.to_ascii_uppercase()>`.
 - **`run_serve` env-file load is adapter-scoped:** `axum` → `<manifest_root>/.edgezero/.env`; `spin` → `<spin_crate_dir>/.env`; other adapters → none.
 - **`config push --local` table/key ownership boundary** (spec §"Interaction with `config push --local`"): push only mutates its declared keys; provision-owned tables and sibling keys MUST stay byte-for-byte intact.
-- **All four adapter manifests are provision-generated + gitignored.** `axum.toml` joined the Cloudflare/Fastly/Spin set in the 2026-07 amendment: `AxumCliAdapter::synthesise_baseline_manifest` emits it on missing, `.gitignore` and CI enforce it untracked, and `provision --local --dry-run` includes it in the diff allow-list. Adapter merge paths remain no-ops on operator edits.
+- **All five adapter manifests are provision-generated + gitignored.** `axum.toml` joined the Cloudflare/Fastly/Spin set in the 2026-07 amendment: `AxumCliAdapter::synthesise_baseline_manifest` emits it on missing, `.gitignore` and CI enforce it untracked, and `provision --local --dry-run` includes it in the diff allow-list. Adapter merge paths remain no-ops on operator edits. The Axum blueprint has NO scaffold template for `axum.toml` — the scaffold-time provision loop (`generator::provision_all_selected_adapters`) is the single writer, so scaffold and clean-clone produce byte-identical output.
 - **Spec reference:** `docs/superpowers/specs/2026-06-23-provision-local.md` is the single source of truth. Every behaviour rule in this plan traces back to a spec section; consult the spec whenever a task's rationale is unclear.
 
 ---
@@ -1181,7 +1181,9 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
   /// `mode == Local` AND the adapter manifest (or related local
   /// files like `runtime-config.toml`) is absent. Returns
   /// `Ok(Vec::new())` for adapters that own no synthesised local
-  /// state (e.g. Axum — `axum.toml` stays tracked).
+  /// state. All four bundled adapters (axum, cloudflare, fastly,
+  /// spin) override this — a `Vec::new()` default is retained
+  /// only for downstream / experimental adapters.
   ///
   /// Each `(relative_path, contents)` tuple is written by the CLI
   /// under `manifest_root` BEFORE `validate_adapter_manifest`
@@ -1918,12 +1920,11 @@ Task 8b lays the structural reorder (synthesis + validation + dispatch all see t
   /// path (NOT a static filename) so nested paths like
   /// `crates/cf/wrangler.toml` resolve correctly. Spec §"Per-
   /// adapter local state" defines membership per adapter:
-  /// - Axum: project-root `.edgezero/.env` only.
+  /// - Axum: resolved `axum.toml` + project-root `.edgezero/.env`.
   /// - Cloudflare: resolved `wrangler.toml` + sibling `.dev.vars`.
   /// - Fastly: resolved `fastly.toml`.
   /// - Spin: resolved `spin.toml` + sibling `runtime-config.toml`
   ///   + sibling `.env`.
-  /// `axum.toml` is NOT in this list (it stays tracked).
   pub(crate) struct DryRunAllowList {
       /// (project_path, staged_path) pairs the driver diffs.
       pub pairs: Vec<(PathBuf, PathBuf)>,
@@ -4441,8 +4442,9 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
   Append (only the entries Step 1 confirmed missing) — keep existing entries / comments / whitespace untouched. Suggested section to add:
 
   ```
-  # Cloudflare / Fastly / Spin manifests — regenerated by `edgezero provision --local`.
-  # axum.toml is INTENTIONALLY NOT in this list (it stays tracked).
+  # All adapter manifests — regenerated by `edgezero provision --local`.
+  # axum.toml joined the gitignored set in the 2026-07 amendment.
+  axum.toml
   fastly.toml
   spin.toml
   wrangler.toml
@@ -4521,15 +4523,15 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
   Run: `ls examples/app-demo/crates/app-demo-adapter-{fastly,cloudflare,spin}/`
   Expected: each adapter's manifest is still present in the worktree.
 
-- [ ] **Step 4: Sanity-check the gitignore covered ALL five gated paths**
+- [ ] **Step 4: Sanity-check the gitignore covered ALL six gated paths**
 
-  Run the SAME regex the CI gate (Task 37) installs — match the four generated manifests AND `.dev.vars`. The regex MUST stay byte-identical to Task 37's so the two checks can never drift; if you find yourself changing one, change the other in the same commit.
+  Run the SAME regex the CI gate (Task 37) installs — match the five generated manifests AND `.dev.vars`. The regex MUST stay byte-identical to Task 37's so the two checks can never drift; if you find yourself changing one, change the other in the same commit.
 
   ```sh
-  git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' && exit 1 || true
+  git ls-files | rg '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' && exit 1 || true
   ```
 
-  Expected: no output. (`axum.toml` is intentionally NOT in the regex; it stays tracked.) Task 37 lands the same check as a permanent CI step; this step is the local pre-flight verification that the `git rm --cached` in Step 2 caught every tracked instance.
+  Expected: no output. Task 37 lands the same check as a permanent CI step; this step is the local pre-flight verification that the `git rm --cached` in Step 2 caught every tracked instance, including `axum.toml` which the 2026-07 amendment moved into the gitignored set.
 
 - [ ] **Step 5: Commit**
 
@@ -4746,7 +4748,7 @@ This task lands the warm-up AND drops the obsolete `backup_in_tree` calls in a s
 
   Run: `grep -n 'backup_in_tree' scripts/smoke_test_*.sh`
 
-  Note every line backing up `fastly.toml` / `spin.toml` / `wrangler.toml` / `runtime-config.toml` / `.dev.vars`. Lines for `axum.toml` (or anything still tracked) stay.
+  Note every line backing up `axum.toml` / `fastly.toml` / `spin.toml` / `wrangler.toml` / `runtime-config.toml` / `.dev.vars`. All five adapter manifests are gitignored generated state; no lines remain "tracked".
 
 - [ ] **Step 2: Create the warm-up helper**
 
@@ -4839,8 +4841,7 @@ This task lands the warm-up AND drops the obsolete `backup_in_tree` calls in a s
 - Build: `cd docs && npm run build` to regenerate `docs/.vitepress/dist/`
 
 - [ ] **Step 1: Apply per-file updates** as the spec's documentation impact table prescribes. Key wording rules:
-  - "Cloudflare / Fastly / Spin manifests are gitignored" — NOT "per-adapter manifests."
-  - "Axum's `axum.toml` stays tracked" wherever the gitignore split is mentioned.
+  - "All adapter manifests are gitignored" — the five files are `axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`, `runtime-config.toml`. Do NOT single Axum out; the scaffold-time provision loop writes it too, and the scaffold template for `axum.toml.hbs` was removed to keep the synthesiser as the single source (see the "Generated Axum" note in the Axum subsection under "Primitive synthesiser output").
   - For each per-adapter page, document the `provision --adapter <name> --local` invocation + the manual `cd <adapter_crate>; spin up ...` sourcing pattern for the Spin direct-run case (path-explicit, NOT bare `source .env`).
 
 - [ ] **Step 2: Run docs lint**
@@ -4873,10 +4874,10 @@ The spec gitignores FOUR manifest filenames: `fastly.toml`, `spin.toml`, `wrangl
   In the existing test workflow, after dependency install + before `cargo test`, add:
 
   ```yaml
-  - name: Enforce Cloudflare/Fastly/Spin manifests and .dev.vars are not tracked
+  - name: Enforce all adapter manifests and .dev.vars are not tracked
     run: |
-      if git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$'; then
-        echo "::error::These adapter manifests AND Cloudflare's .dev.vars must be gitignored (spec §'Cloudflare / Fastly / Spin manifests are gitignored' + §'Migration for downstream projects'). axum.toml is the only adapter manifest that stays tracked. .dev.vars carries operator secret values and must NEVER be committed."
+      if git ls-files | rg '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$'; then
+        echo "::error::These adapter manifests AND Cloudflare's .dev.vars must be gitignored (spec §'Adapter manifests are gitignored' + §'Migration for downstream projects'). All five adapter manifests (axum.toml, wrangler.toml, fastly.toml, spin.toml, runtime-config.toml) are provision-generated local state. .dev.vars carries operator secret values and must NEVER be committed."
         exit 1
       fi
   ```
@@ -5108,7 +5109,7 @@ This is the largest test task — Spin's env-label alignment (spec §"Per-adapte
 After Task 43, the branch satisfies every spec MUST:
 
 - `--local` is wired through CLI, trait, dispatch matrix, dry-run staging, scaffold, run_serve, and four adapters.
-- Cloudflare/Fastly/Spin manifests are gitignored generated state; Axum's `axum.toml` stays tracked.
+- All five adapter manifests (`axum.toml`, `wrangler.toml`, `fastly.toml`, `spin.toml`, `runtime-config.toml`) are gitignored generated state; the scaffold-time provision loop is the single writer, and no scaffold `.hbs` template exists for any adapter manifest.
 - Path containment is enforced on both `provision --local` and `config push --local`.
 - Typed validation is the single `run_typed_preflight` helper called from validate, push, diff, and provision.
 - Spin's `.env` carries `__NAME` lines AND lowercased `SPIN_VARIABLE_*` placeholders; runtime-config / spin.toml labels are asserted aligned.

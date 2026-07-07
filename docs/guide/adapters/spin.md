@@ -41,8 +41,8 @@ resolved `[component.<id>]`, and appends `[variables]` + matching
 — one line per `#[secret]` field on your typed `MyAppConfig`.
 `[variables]` lives inside the generated `spin.toml`, so any operator
 edits (extra bindings, tuned scheduler settings, etc.) stay local
-until you hand-share them. **Axum's `axum.toml` stays tracked**
-because it's the operator-authored manifest for the native dev server.
+until you hand-share them. All adapter manifests follow the same
+gitignored-generated model — `axum.toml` included.
 
 The `edgezero serve --adapter spin` path loads
 `<spin_crate>/.env` into the parent process environment before
