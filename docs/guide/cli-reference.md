@@ -236,7 +236,7 @@ edgezero config push --adapter <name> [--manifest <path>] [--app-config <path>] 
 - `--runtime-config <path>` — adapter runtime configuration file. Currently only consumed by Spin, which reads `[key_value_store.<label>]` stanzas to dispatch per-backend (`type = "spin"` → SQLite-direct, `redis` / `azure_cosmos` / other → error pointing at the native backend CLI). Default: `runtime-config.toml` next to the adapter manifest. Ignored by the Fermyon Cloud branch — cloud pushes consult only `spin.toml`'s `[application].name`.
 - `--no-diff` — skip the inline diff render of local-vs-remote before writing. By default the push reads back the current remote blob and shows what would change.
 - `--yes` / `-y` — skip the confirmation prompt and write unconditionally (for non-interactive/CI use). Without it, an interactive push prompts before overwriting a differing remote blob.
-- `--dry-run` — print the would-be operations without performing them. No file writes, no shell-outs.
+- `--dry-run` — print the would-be operations without performing them. No file writes, no shell-outs. Because dry-run's contract is to show the diff, it needs a remote read-back — so it errors against **Spin Cloud** (whose read-back is unsupported); use `--local` for the on-disk SQLite write, or drop `--dry-run` and write unconditionally with `--yes`.
 
 **Two flavours (same split as `config validate`):**
 

@@ -204,7 +204,8 @@ non-zero on a non-TTY (per spec §8.3's four-branch UX).
    The CLI prints an inline unified diff against the current remote
    state. `--yes` (`-y`) skips the consent prompt; `--no-diff`
    suppresses the render; `--dry-run` shows the diff and exits without
-   writing.
+   writing — except against **Spin Cloud**, whose read-back is
+   unsupported, so dry-run errors there (use `--local` or `--yes`).
 
 ### Per-environment key override
 
