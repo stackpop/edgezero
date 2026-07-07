@@ -98,18 +98,18 @@ steps:
 
 ## Inputs
 
-| Input               | Required    | Default  | Description                                                                                            |
-| ------------------- | ----------- | -------- | ------------------------------------------------------------------------------------------------------ |
-| `adapter`           | Yes         | none     | Must be `fastly`.                                                                                      |
-| `working-directory` | No          | `.`      | App directory relative to `github.workspace`.                                                          |
-| `manifest`          | No          | empty    | Optional `edgezero.toml` path relative to `working-directory`.                                         |
-| `rust-toolchain`    | No          | `auto`   | Explicit Rust toolchain or automatic discovery.                                                        |
-| `build-mode`        | No          | `auto`   | `auto`, `always`, or `never`. Fastly `auto` resolves to `never`.                                       |
-| `build-args`        | No          | `[]`     | JSON array passed after `edgezero-cli build --adapter fastly --`.                                      |
-| `deploy-args`       | No          | `[]`     | JSON array appended after the action-owned Fastly `--service-id` and `--non-interactive` deploy flags. |
-| `cache`             | No          | `false`  | Enables exact-key application `target/` caching.                                                       |
-| `fastly-api-token`  | Yes         | none     | Fastly token, scoped to the deploy step.                                                               |
-| `fastly-service-id` | Yes         | none     | Fastly service ID used by the action-owned deploy flag.                                                |
+| Input               | Required | Default | Description                                                                     |
+| ------------------- | -------- | ------- | ------------------------------------------------------------------------------- |
+| `adapter`           | Yes      | none    | Must be `fastly`.                                                               |
+| `working-directory` | No       | `.`     | App directory relative to `github.workspace`.                                   |
+| `manifest`          | No       | empty   | Optional `edgezero.toml` path relative to `working-directory`.                  |
+| `rust-toolchain`    | No       | `auto`  | Explicit Rust toolchain or automatic discovery.                                 |
+| `build-mode`        | No       | `auto`  | `auto`, `always`, or `never`. Fastly `auto` resolves to `never`.                |
+| `build-args`        | No       | `[]`    | JSON array passed after `edgezero build --adapter fastly --`.                   |
+| `deploy-args`       | No       | `[]`    | JSON array of Fastly comment args appended after the action-owned deploy flags. |
+| `cache`             | No       | `false` | Enables exact-key application `target/` caching.                                |
+| `fastly-api-token`  | Yes      | none    | Fastly token, scoped to the deploy step.                                        |
+| `fastly-service-id` | Yes      | none    | Fastly service ID used by the action-owned deploy flag.                         |
 
 ## Outputs
 
@@ -137,7 +137,7 @@ Application settings may still use workflow `env:` when the app genuinely needs 
 
 ## EdgeZero CLI revision
 
-The action builds and runs `edgezero-cli` from the same EdgeZero commit selected by the `uses:` ref. It does not install the CLI from the application repository or from the application's Cargo dependencies. Pin the action to a full commit SHA to pin the CLI implementation.
+The action builds and runs the `edgezero` binary from the same EdgeZero commit selected by the `uses:` ref. It does not install the CLI from the application repository or from the application's Cargo dependencies. Pin the action to a full commit SHA to pin the CLI implementation.
 
 ## Build behavior
 
@@ -146,7 +146,7 @@ The action builds and runs `edgezero-cli` from the same EdgeZero commit selected
 | Value    | Behavior                                                                                       |
 | -------- | ---------------------------------------------------------------------------------------------- |
 | `auto`   | Uses the Fastly v0 policy.                                                                     |
-| `always` | Runs `edgezero-cli build --adapter fastly` before deploy.                                      |
+| `always` | Runs `edgezero build --adapter fastly` before deploy.                                          |
 | `never`  | Skips the separate build and relies on Fastly deploy/publish to build or consume the artifact. |
 
 For Fastly v0, `auto` resolves to `never` because Fastly `compute deploy`/`compute publish` builds unless a prebuilt package is supplied. Use `always` only when you want a separate validation build and can tolerate a possible second compile during deploy.
@@ -165,6 +165,10 @@ with:
 ```
 
 The action does not guess between multiple `fastly.toml` files in a monorepo. Choose a deterministic `working-directory` or define explicit Fastly commands in `edgezero.toml`.
+
+## Passthrough arguments
+
+`build-args` and `deploy-args` are JSON arrays of strings. For v0, `deploy-args` is intentionally narrow: only Fastly deploy comments are accepted (`--comment VALUE` or `--comment=VALUE`). Service, auth, endpoint, interactive, debug, short override, and unknown future Fastly flags are rejected.
 
 ## Caching
 

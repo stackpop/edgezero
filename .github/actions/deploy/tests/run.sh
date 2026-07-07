@@ -95,7 +95,7 @@ INPUT_FASTLY_API_TOKEN_PRESENT=true \
 INPUT_FASTLY_SERVICE_ID=svc \
 INPUT_DEPLOY_ARGS='["--service-id", "other"]' \
 run_expect_fail reject-service "$ACTION_DIR/scripts/validate-inputs.sh"
-grep -q "rejected Fastly override flag" "$TMP/reject-service.err" || fail "dangerous flag rejection missing"
+grep -q "deploy-args allows only Fastly comment flags" "$TMP/reject-service.err" || fail "dangerous flag rejection missing"
 GITHUB_OUTPUT="$TMP/reject-interactive.out" \
 EDGEZERO_ACTION_STATE_DIR="$TMP/state3" \
 INPUT_ADAPTER=fastly \
@@ -103,7 +103,15 @@ INPUT_FASTLY_API_TOKEN_PRESENT=true \
 INPUT_FASTLY_SERVICE_ID=svc \
 INPUT_DEPLOY_ARGS='["--non-interactive=false"]' \
 run_expect_fail reject-interactive "$ACTION_DIR/scripts/validate-inputs.sh"
-grep -q "rejected Fastly override flag" "$TMP/reject-interactive.err" || fail "non-interactive override rejection missing"
+grep -q "deploy-args allows only Fastly comment flags" "$TMP/reject-interactive.err" || fail "non-interactive override rejection missing"
+GITHUB_OUTPUT="$TMP/reject-short-service.out" \
+EDGEZERO_ACTION_STATE_DIR="$TMP/state4" \
+INPUT_ADAPTER=fastly \
+INPUT_FASTLY_API_TOKEN_PRESENT=true \
+INPUT_FASTLY_SERVICE_ID=svc \
+INPUT_DEPLOY_ARGS='["-s", "other"]' \
+run_expect_fail reject-short-service "$ACTION_DIR/scripts/validate-inputs.sh"
+grep -q "deploy-args allows only Fastly comment flags" "$TMP/reject-short-service.err" || fail "short service override rejection missing"
 
 # annotations escape percent and newlines.
 run_expect_fail escaped-annotation bash -c "source '$ACTION_DIR/scripts/common.sh'; fail \$'bad%line\nnext'"
@@ -205,7 +213,7 @@ git -C "$TMP/workspace" checkout -- file.txt 2>/dev/null || rm -f "$APP/file.txt
 # run-edgezero preserves argument boundaries and keeps deploy credentials scoped.
 FAKEBIN="$TMP/bin"
 mkdir -p "$FAKEBIN"
-cat >"$FAKEBIN/edgezero-cli" <<'SH'
+cat >"$FAKEBIN/edgezero" <<'SH'
 #!/usr/bin/env bash
 printf '%s\0' "$@" >"$EDGEZERO_CAPTURE_ARGS"
 if [[ " ${*} " == *" deploy "* ]]; then
@@ -216,7 +224,7 @@ if [[ " ${*} " == *" deploy "* ]]; then
   [[ -z "${INPUT_FASTLY_API_TOKEN:-}" ]] || exit 68
 fi
 SH
-chmod +x "$FAKEBIN/edgezero-cli"
+chmod +x "$FAKEBIN/edgezero"
 printf '%s\0' '--comment' 'hello world' >"$TMP/args.nul"
 PATH="$FAKEBIN:$PATH" \
 WORKING_DIRECTORY="$APP" \
@@ -229,14 +237,15 @@ FASTLY_TOKEN=caller-leak \
 FASTLY_PROFILE=caller-profile \
 INPUT_FASTLY_API_TOKEN=caller-input-leak \
 run_expect_ok run-deploy "$ACTION_DIR/scripts/run-edgezero.sh" deploy
-python3 - "$TMP/captured.nul" <<'PY'
-import sys
-raw = open(sys.argv[1], 'rb').read().split(b'\0')
-args = [x.decode() for x in raw if x]
-assert args[:3] == ['deploy', '--adapter', 'fastly'], args
-assert args[3:8] == ['--', '--service-id', 'svc', '--non-interactive', '--comment'], args
-assert args[8:] == ['hello world'], args
-PY
+captured=()
+while IFS= read -r -d '' item; do
+  captured+=("$item")
+done <"$TMP/captured.nul"
+expected=(deploy --adapter fastly -- --service-id svc --non-interactive --comment "hello world")
+[[ ${#captured[@]} -eq ${#expected[@]} ]] || fail "captured deploy arg count mismatch"
+for i in "${!expected[@]}"; do
+  [[ "${captured[$i]}" == "${expected[$i]}" ]] || fail "captured deploy arg $i mismatch: expected '${expected[$i]}'"
+done
 
 # build mode must not require Fastly credentials.
 PATH="$FAKEBIN:$PATH" \

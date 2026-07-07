@@ -20,7 +20,7 @@ cargo +"$RUST_TOOLCHAIN" install \
   --force \
   --no-default-features \
   --features cli,edgezero-adapter-fastly
-[[ -x "$TOOL_ROOT/bin/edgezero-cli" ]] || fail "EdgeZero CLI installation did not produce $TOOL_ROOT/bin/edgezero-cli"
+[[ -x "$TOOL_ROOT/bin/edgezero" ]] || fail "EdgeZero CLI installation did not produce $TOOL_ROOT/bin/edgezero"
 printf '%s\n' "$TOOL_ROOT/bin" >>"${GITHUB_PATH:-/dev/null}"
 export PATH="$TOOL_ROOT/bin:$PATH"
-edgezero-cli --help >/dev/null
+edgezero --help >/dev/null

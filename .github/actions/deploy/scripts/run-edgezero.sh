@@ -10,7 +10,7 @@ case "$MODE" in build|deploy) ;; *) fail "mode must be build or deploy" ;; esac
 
 WORKING_DIRECTORY=${WORKING_DIRECTORY:?WORKING_DIRECTORY is required}
 MANIFEST=${MANIFEST:-}
-require_cmd edgezero-cli
+require_cmd edgezero
 
 clear_fastly_aliases() {
   unset FASTLY_API_TOKEN FASTLY_SERVICE_ID FASTLY_TOKEN FASTLY_PROFILE \
@@ -23,7 +23,7 @@ case "$MODE" in
   build)
     ARGS_FILE=${ARGS_FILE:?ARGS_FILE is required}
     clear_fastly_aliases
-    args=(edgezero-cli build --adapter fastly)
+    args=(edgezero build --adapter fastly)
     if [[ -s "$ARGS_FILE" ]]; then
       args+=(--)
       while IFS= read -r -d '' item; do
@@ -40,7 +40,7 @@ case "$MODE" in
     clear_fastly_aliases
     export FASTLY_API_TOKEN="$FASTLY_API_TOKEN_VALUE"
     export FASTLY_SERVICE_ID="$FASTLY_SERVICE_ID_VALUE"
-    args=(edgezero-cli deploy --adapter fastly -- --service-id "$FASTLY_SERVICE_ID_VALUE" --non-interactive)
+    args=(edgezero deploy --adapter fastly -- --service-id "$FASTLY_SERVICE_ID_VALUE" --non-interactive)
     if [[ -s "$ARGS_FILE" ]]; then
       while IFS= read -r -d '' item; do
         args+=("$item")

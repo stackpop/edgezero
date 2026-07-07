@@ -22,11 +22,11 @@ inputs:
     required: false
     default: auto
   build-args:
-    description: JSON array of strings passed to edgezero-cli build after --.
+    description: JSON array of strings passed to edgezero build after --.
     required: false
     default: "[]"
   deploy-args:
-    description: JSON array of caller strings appended after action-owned Fastly deploy flags.
+    description: JSON array of Fastly comment args appended after action-owned deploy flags.
     required: false
     default: "[]"
   cache:

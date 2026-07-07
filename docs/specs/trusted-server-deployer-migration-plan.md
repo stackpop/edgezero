@@ -2,7 +2,7 @@
 
 **Status:** Draft migration plan
 
-**Repository reviewed:** `/Users/christian/Projects/stackpop/trusted-server-deployer`
+**Repository reviewed:** the Trusted Server deployer repository
 
 ## Current deployer behavior
 

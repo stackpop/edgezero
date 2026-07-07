@@ -14,15 +14,17 @@ CACHE=${INPUT_CACHE:-false}
 ACTION_REF=${EDGEZERO_ACTION_REF:-}
 
 WORKSPACE_REAL=$(canonical_path "$WORKSPACE")
-APP_DIR=$(canonical_path "$WORKSPACE/$WORKING_DIRECTORY")
+APP_INPUT="$WORKSPACE/$WORKING_DIRECTORY"
+[[ -d "$APP_INPUT" ]] || fail "working-directory '$WORKING_DIRECTORY' does not exist or is not a directory"
+APP_DIR=$(canonical_path "$APP_INPUT")
 is_under "$WORKSPACE_REAL" "$APP_DIR" || fail "input 'working-directory' must resolve inside github.workspace"
-[[ -d "$APP_DIR" ]] || fail "working-directory '$WORKING_DIRECTORY' does not exist or is not a directory"
 APP_REL=$(relative_to "$WORKSPACE_REAL" "$APP_DIR")
 
 if [[ -n "$MANIFEST" ]]; then
-  MANIFEST_PATH=$(canonical_path "$APP_DIR/$MANIFEST")
+  MANIFEST_INPUT="$APP_DIR/$MANIFEST"
+  [[ -f "$MANIFEST_INPUT" ]] || fail "manifest '$APP_REL/$MANIFEST' does not exist or is not a regular file"
+  MANIFEST_PATH=$(canonical_path "$MANIFEST_INPUT")
   is_under "$WORKSPACE_REAL" "$MANIFEST_PATH" || fail "input 'manifest' must resolve inside github.workspace"
-  [[ -f "$MANIFEST_PATH" ]] || fail "manifest '$APP_REL/$MANIFEST' does not exist or is not a regular file"
   MANIFEST_REL=$(relative_to "$WORKSPACE_REAL" "$MANIFEST_PATH")
 else
   MANIFEST_PATH=""
@@ -40,6 +42,27 @@ if ! git -C "$APP_GIT_ROOT" diff --quiet --ignore-submodules -- || \
   fail "deployments require committed source; working tree for '$APP_REL' is dirty"
 fi
 
+parse_rust_toolchain_file() {
+  local file="$1"
+  local value
+  value=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$file" | awk 'NF { print; exit }')
+  [[ -n "$value" ]] || fail "malformed Rust toolchain file: $file"
+  printf '%s\n' "$value"
+}
+
+parse_rust_toolchain_toml() {
+  local file="$1"
+  local value
+  value=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*["'\''`]([^"'\''`]+)["'\''`][[:space:]]*$/\1/p' "$file" | head -n 1)
+  [[ -n "$value" ]] || fail "malformed Rust toolchain TOML file: $file"
+  printf '%s\n' "$value"
+}
+
+parse_rust_toolchain_from_tool_versions() {
+  local file="$1"
+  awk '$1 == "rust" { found=1; if (NF < 2) exit 2; print $2; exit } END { if (!found) exit 1 }' "$file"
+}
+
 resolve_rust_toolchain() {
   if [[ "$RUST_TOOLCHAIN_INPUT" != "auto" ]]; then
     [[ -n "$RUST_TOOLCHAIN_INPUT" ]] || fail "input 'rust-toolchain' cannot be empty"
@@ -47,68 +70,49 @@ resolve_rust_toolchain() {
     return
   fi
 
-  python3 - "$APP_DIR" "$APP_GIT_ROOT" "$ACTION_ROOT" <<'PY'
-import os, re, sys
-app, git_root, action_root = map(os.path.realpath, sys.argv[1:4])
+  local directory="$APP_DIR"
+  local value status
+  while true; do
+    if [[ -f "$directory/rust-toolchain.toml" ]]; then
+      parse_rust_toolchain_toml "$directory/rust-toolchain.toml"
+      return
+    fi
+    if [[ -f "$directory/rust-toolchain" ]]; then
+      parse_rust_toolchain_file "$directory/rust-toolchain"
+      return
+    fi
+    if [[ -f "$directory/.tool-versions" ]]; then
+      set +e
+      value=$(parse_rust_toolchain_from_tool_versions "$directory/.tool-versions")
+      status=$?
+      set -e
+      case "$status" in
+        0) printf '%s\n' "$value"; return ;;
+        1) ;;
+        2) fail "malformed .tool-versions rust entry: $directory/.tool-versions" ;;
+        *) fail "could not parse .tool-versions rust entry: $directory/.tool-versions" ;;
+      esac
+    fi
+    [[ "$directory" == "$APP_GIT_ROOT" ]] && break
+    local next
+    next=$(dirname "$directory")
+    [[ "$next" == "$directory" ]] && break
+    directory="$next"
+  done
 
-def parents(start, stop):
-    cur = start
-    stop = os.path.realpath(stop)
-    while True:
-        yield cur
-        if cur == stop:
-            break
-        nxt = os.path.dirname(cur)
-        if nxt == cur:
-            break
-        cur = nxt
-
-def parse_rust_toolchain(path):
-    raw = open(path, encoding='utf-8').read().strip()
-    if not raw:
-        raise SystemExit(f"::error::malformed Rust toolchain file: {path}")
-    return raw.splitlines()[0].strip()
-
-def parse_rust_toolchain_toml(path):
-    raw = open(path, encoding='utf-8').read()
-    m = re.search(r'(?m)^\s*channel\s*=\s*["\']([^"\']+)["\']\s*$', raw)
-    if not m:
-        raise SystemExit(f"::error::malformed Rust toolchain TOML file: {path}")
-    return m.group(1)
-
-def parse_tool_versions(path):
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            parts = line.split()
-            if parts and parts[0] == 'rust':
-                if len(parts) < 2 or not parts[1].strip():
-                    raise SystemExit(f"::error::malformed .tool-versions rust entry: {path}")
-                return parts[1]
-    return None
-
-for directory in parents(app, git_root):
-    toml = os.path.join(directory, 'rust-toolchain.toml')
-    plain = os.path.join(directory, 'rust-toolchain')
-    tools = os.path.join(directory, '.tool-versions')
-    if os.path.exists(toml):
-        print(parse_rust_toolchain_toml(toml))
-        sys.exit(0)
-    if os.path.exists(plain):
-        print(parse_rust_toolchain(plain))
-        sys.exit(0)
-    if os.path.exists(tools):
-        value = parse_tool_versions(tools)
-        if value:
-            print(value)
-            sys.exit(0)
-
-fallback = os.path.join(action_root, '.tool-versions')
-value = parse_tool_versions(fallback) if os.path.exists(fallback) else None
-if value:
-    print(value)
-    sys.exit(0)
-raise SystemExit('::error::could not resolve Rust toolchain; checked rust-toolchain.toml, rust-toolchain, and .tool-versions; set input rust-toolchain explicitly')
-PY
+  if [[ -f "$ACTION_ROOT/.tool-versions" ]]; then
+    set +e
+    value=$(parse_rust_toolchain_from_tool_versions "$ACTION_ROOT/.tool-versions")
+    status=$?
+    set -e
+    case "$status" in
+      0) printf '%s\n' "$value"; return ;;
+      1) ;;
+      2) fail "malformed .tool-versions rust entry: $ACTION_ROOT/.tool-versions" ;;
+      *) fail "could not parse .tool-versions rust entry: $ACTION_ROOT/.tool-versions" ;;
+    esac
+  fi
+  fail "could not resolve Rust toolchain; checked rust-toolchain.toml, rust-toolchain, and .tool-versions; set input rust-toolchain explicitly"
 }
 
 RUST_TOOLCHAIN=$(resolve_rust_toolchain)
@@ -121,15 +125,7 @@ if [[ "$CACHE" == "true" && ! -f "$LOCKFILE" ]]; then
 fi
 LOCK_HASH="none"
 if [[ -f "$LOCKFILE" ]]; then
-  LOCK_HASH=$(python3 - "$LOCKFILE" <<'PY'
-import hashlib, sys
-h = hashlib.sha256()
-with open(sys.argv[1], 'rb') as f:
-    for chunk in iter(lambda: f.read(1024 * 1024), b''):
-        h.update(chunk)
-print(h.hexdigest())
-PY
-)
+  LOCK_HASH=$(sha256_file "$LOCKFILE")
 fi
 
 if EDGEZERO_REVISION=$(git -C "$ACTION_ROOT" rev-parse HEAD 2>/dev/null); then

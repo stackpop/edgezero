@@ -21,7 +21,7 @@ The action deploys already checked-out application source. It does not perform c
    - Reject missing/unsupported adapters before setup.
    - Reject Cloudflare, Spin, Axum, and unknown adapters in v0.
    - Validate exact booleans, build mode, JSON array arguments, string-only entries, and NUL bytes.
-   - Reject Fastly deploy args that override service selection, auth, endpoint, profile, debug, or interactive behavior.
+   - Allow only Fastly deploy comment args and reject service selection, auth, endpoint, profile, debug, interactive behavior, short override flags, and unknown future flags.
 
 3. **Project resolution**
    - Canonicalize `working-directory` and optional `manifest` inside `github.workspace`.
@@ -33,7 +33,7 @@ The action deploys already checked-out application source. It does not perform c
 4. **Tool installation**
    - Install application Rust toolchain and `wasm32-wasip1` target.
    - Set `RUSTUP_TOOLCHAIN` for subsequent application build/deploy commands.
-   - Build action-owned `edgezero-cli` from the selected EdgeZero action commit with only Fastly CLI support.
+   - Build the action-owned `edgezero` binary from the selected EdgeZero action commit with only Fastly CLI support.
    - Install pinned Fastly CLI from official release artifact and verify checksum.
 
 5. **Execution**

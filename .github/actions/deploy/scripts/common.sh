@@ -55,45 +55,43 @@ append_env() {
 }
 
 canonical_path() {
-  python3 - "$1" <<'PY'
-import os, sys
-print(os.path.realpath(sys.argv[1]))
-PY
+  require_cmd realpath
+  local path
+  path=$(realpath "$1" 2>/dev/null) || fail "could not resolve path '$1'"
+  printf '%s\n' "$path"
 }
 
 relative_to() {
-  python3 - "$1" "$2" <<'PY'
-import os, sys
-try:
-    print(os.path.relpath(sys.argv[2], sys.argv[1]))
-except ValueError:
-    print(sys.argv[2])
-PY
+  local root="${1%/}"
+  local path="${2%/}"
+  if [[ "$path" == "$root" ]]; then
+    printf '.\n'
+  elif [[ "$path" == "$root"/* ]]; then
+    printf '%s\n' "${path#"$root"/}"
+  else
+    printf '%s\n' "$path"
+  fi
 }
 
 is_under() {
-  python3 - "$1" "$2" <<'PY'
-import os, sys
-root = os.path.realpath(sys.argv[1])
-path = os.path.realpath(sys.argv[2])
-try:
-    common = os.path.commonpath([root, path])
-except ValueError:
-    sys.exit(1)
-sys.exit(0 if common == root else 1)
-PY
+  local root="${1%/}"
+  local path="${2%/}"
+  [[ "$path" == "$root" || "$path" == "$root"/* ]]
 }
 
 json_get() {
-  python3 - "$1" "$2" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding='utf-8') as f:
-    data = json.load(f)
-cur = data
-for part in sys.argv[2].split('.'):
-    cur = cur[part]
-print(cur)
-PY
+  require_cmd jq
+  jq -er ".$2" "$1"
+}
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{ print $1 }'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{ print $1 }'
+  else
+    fail "required command 'sha256sum' or 'shasum' was not found"
+  fi
 }
 
 read_tool_version() {
