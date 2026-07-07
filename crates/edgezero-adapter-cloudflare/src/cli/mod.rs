@@ -130,10 +130,6 @@ pub(super) const WRANGLER_INSTALL_HINT: &str =
 
 struct CloudflareCliAdapter;
 
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "cloudflare has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` and `read_config_entry_local` are both overridden below (wrangler kv key get --remote / --local). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `wrangler.toml` for the Task 8b clean-clone bootstrap). `provision_typed` IS overridden below (appends `<key_value>=\"\"` secret placeholders to `.dev.vars` in Local mode; Cloud is a no-op — `wrangler secret put` is the remote path)."
-)]
 impl Adapter for CloudflareCliAdapter {
     fn deployed_fields(&self) -> &'static [&'static str] {
         &["kv_namespaces", "preview_kv_namespaces"]
@@ -185,6 +181,35 @@ impl Adapter for CloudflareCliAdapter {
 
     fn name(&self) -> &'static str {
         "cloudflare"
+    }
+
+    // Cloudflare's per-adapter manifest is `wrangler.toml`; wrangler
+    // itself validates its own schema at deploy time, and the CLI
+    // has no adapter-specific shape check to layer on top. No-op
+    // matches the trait default.
+    #[inline]
+    fn validate_adapter_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Cloudflare has no adapter-specific key naming constraint on
+    // app-config keys — wrangler-side KV keys accept anything the
+    // runtime encodes. Trait default no-op.
+    #[inline]
+    fn validate_app_config_keys(&self, _keys: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Cloudflare has no adapter-specific canonicalisation rule on
+    // typed secret store bindings. Trait default no-op.
+    #[inline]
+    fn validate_typed_secrets(&self, _entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        Ok(())
     }
 
     fn provision(

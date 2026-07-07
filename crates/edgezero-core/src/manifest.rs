@@ -668,14 +668,6 @@ impl HttpMethod {
     }
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for HttpMethod {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -696,6 +688,15 @@ impl<'de> Deserialize<'de> for HttpMethod {
             ))),
         }
     }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -705,14 +706,6 @@ pub enum BodyMode {
     Stream,
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for BodyMode {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -725,6 +718,15 @@ impl<'de> Deserialize<'de> for BodyMode {
             "stream" => Ok(Self::Stream),
             other => Err(DeError::custom(format!("unsupported body mode `{other}`"))),
         }
+    }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
     }
 }
 
@@ -769,14 +771,6 @@ impl From<LogLevel> for LevelFilter {
     }
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for LogLevel {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -795,6 +789,15 @@ impl<'de> Deserialize<'de> for LogLevel {
                 "logging level must be trace, debug, info, warn, error, or off (got `{other}`)"
             ))),
         }
+    }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
     }
 }
 

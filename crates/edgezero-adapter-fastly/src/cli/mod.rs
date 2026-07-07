@@ -147,7 +147,7 @@ pub(super) enum ConfigStoreLookup {
 // discovery, flat-namespace collision). The trait surface is typed
 // generically so any future adapter with similar constraints can
 // override — but fastly has no equivalent platform requirements,
-// so the no-op defaults are correct:
+// so the no-op impls below match the trait defaults:
 //
 // - `validate_app_config_keys`: Fastly Config Store keys accept
 //   alphanumeric + `-` / `_` / `.` up to 256 chars. Any reasonable
@@ -159,13 +159,6 @@ pub(super) enum ConfigStoreLookup {
 // - `validate_typed_secrets`: Fastly's KV / Config / Secret
 //   stores are independent namespaces — no spin-style flat-
 //   namespace collision risk to detect.
-//
-// `single_store_kinds` IS overridden below — explicitly returns
-// `&[]` for documentation, matching the inherited default.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "see the explanatory block comment immediately above; fastly's no-op defaults for the three validate_* hooks are intentional and documented. `read_config_entry` and `read_config_entry_local` are both overridden below. `single_store_kinds` IS overridden below (returns `&[]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `fastly.toml` for the Task 8b clean-clone bootstrap, threading `[adapters.fastly.deployed].service_id` through when present). `provision_typed` IS overridden below (Local mode appends `[[local_server.secret_stores.<store_id>]]` entries in `fastly.toml`; Cloud is a no-op)."
-)]
 impl Adapter for FastlyCliAdapter {
     fn deployed_fields(&self) -> &'static [&'static str] {
         &["service_id"]
@@ -198,6 +191,40 @@ impl Adapter for FastlyCliAdapter {
 
     fn name(&self) -> &'static str {
         "fastly"
+    }
+
+    // Fastly's KV / Config / Secret stores are independent
+    // namespaces — no flat-namespace merging like Spin.
+    #[inline]
+    fn merged_id_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    // No spin-style multi-component discovery in fastly.toml; the
+    // adapter's per-manifest validation is deferred to
+    // `fastly compute validate` at deploy time.
+    #[inline]
+    fn validate_adapter_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Fastly Config Store keys accept alphanumeric + `-` / `_` /
+    // `.` up to 256 chars — any reasonable Rust field name passes.
+    #[inline]
+    fn validate_app_config_keys(&self, _keys: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Fastly Secret Store keys share Config Store's naming rules;
+    // no adapter-specific canonicalisation collision check.
+    #[inline]
+    fn validate_typed_secrets(&self, _entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        Ok(())
     }
 
     fn provision(

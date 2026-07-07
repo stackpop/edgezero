@@ -122,10 +122,6 @@ const SPIN_INSTALL_HINT: &str = "install the Spin CLI (https://spinframework.dev
 
 struct SpinCliAdapter;
 
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$` key rule and the config-vs-secret collision check, so `validate_app_config_keys` falls back to the trait default `Ok(())`. `validate_typed_secrets` IS overridden below (secret-value canonicalisation + within-secrets uniqueness still apply). `validate_adapter_manifest` IS overridden below (Spin's multi-component disambiguation). `read_config_entry` and `read_config_entry_local` are both overridden below (four-branch SQLite-direct / Fermyon Cloud / non-Spin-backend dispatch). `synthesise_baseline_manifest` IS overridden below (emits a baseline `spin.toml` + a header-only `runtime-config.toml` for the clean-clone bootstrap; runtime-config.toml lands next to spin.toml so nested `adapter_manifest_path` values are honoured). `provision_typed` IS overridden below (local mode emits lowercased `[variables]` + `[component.<id>.variables]` entries and `SPIN_VARIABLE_*` placeholders in `.env`; cloud mode is a no-op)."
-)]
 impl Adapter for SpinCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
@@ -150,6 +146,21 @@ impl Adapter for SpinCliAdapter {
             AdapterAction::Serve => run::serve(args),
             other => Err(format!("spin adapter does not support {other:?}")),
         }
+    }
+
+    // Spin has no cloud identifiers to persist across provisions —
+    // Fermyon Cloud addresses apps by name, not by opaque id.
+    #[inline]
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    // Stage 6: KV-backed config dropped Spin's `^[a-z][a-z0-9_]*$`
+    // key rule and the config-vs-secret collision check. No adapter-
+    // specific check applies to raw config keys.
+    #[inline]
+    fn validate_app_config_keys(&self, _keys: &[&str]) -> Result<(), String> {
+        Ok(())
     }
 
     fn merged_id_kinds(&self) -> &'static [&'static str] {

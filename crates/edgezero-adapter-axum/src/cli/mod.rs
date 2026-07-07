@@ -105,10 +105,6 @@ static AXUM_ADAPTER: AxumCliAdapter = AxumCliAdapter;
 
 struct AxumCliAdapter;
 
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "axum has no validate_app_config_keys / validate_adapter_manifest / validate_typed_secrets requirements; those three trait defaults are intentionally inherited. `read_config_entry` delegates to `read_config_entry_local` (axum is local-only). `single_store_kinds` IS overridden below (returns `&[\"secrets\"]`). `synthesise_baseline_manifest` IS overridden below (emits a baseline `axum.toml` for the clean-clone bootstrap; provision merge is a no-op because Axum has no per-machine identifiers to weave in). `provision_typed` IS overridden below (Local mode appends `<key_value>=` secret placeholders to `.edgezero/.env`; Cloud is a no-op — axum has no cloud secret store)."
-)]
 impl Adapter for AxumCliAdapter {
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
         match action {
@@ -130,6 +126,46 @@ impl Adapter for AxumCliAdapter {
 
     fn name(&self) -> &'static str {
         "axum"
+    }
+
+    // Axum has no cloud identifiers to persist across provisions.
+    #[inline]
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    // Axum's KV / config / secrets each live in their own file — no
+    // logical-id merging across store kinds.
+    #[inline]
+    fn merged_id_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    // Axum has no per-platform adapter manifest to validate — axum.toml
+    // is the runtime's own file, checked at load time by the axum
+    // adapter, not by the CLI. No-op mirrors the trait default.
+    #[inline]
+    fn validate_adapter_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Axum has no adapter-specific key naming constraint on
+    // app-config keys. Trait default no-op.
+    #[inline]
+    fn validate_app_config_keys(&self, _keys: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+
+    // Axum has no adapter-specific canonicalisation rule on typed
+    // secret store bindings. Trait default no-op.
+    #[inline]
+    fn validate_typed_secrets(&self, _entries: &[TypedSecretEntry<'_>]) -> Result<(), String> {
+        Ok(())
     }
 
     fn provision(
