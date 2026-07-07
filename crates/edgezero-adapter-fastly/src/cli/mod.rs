@@ -77,6 +77,16 @@ static FASTLY_DEPENDENCIES: &[DependencySpec] = &[
     },
 ];
 
+// `fastly.toml` is intentionally absent from the scaffold
+// registration — same rationale as Axum, Cloudflare, and Spin.
+// The scaffold-time provision loop
+// (`generator::provision_all_selected_adapters` ->
+// `Adapter::synthesise_baseline_manifest` -> `run::synthesise_fastly_toml`)
+// is the single writer. Registering a scaffold template would
+// make the file exist before provision runs; provision's
+// `write_baseline_to_disk` skips files that already exist (spec §
+// "Adapter manifests are gitignored"), so `edgezero new` and
+// clean-clone `provision --local` would diverge.
 static FASTLY_FILE_SPECS: &[AdapterFileSpec] = &[
     AdapterFileSpec {
         template: "fastly_Cargo_toml",
@@ -89,10 +99,6 @@ static FASTLY_FILE_SPECS: &[AdapterFileSpec] = &[
     AdapterFileSpec {
         template: "fastly_cargo_config_toml",
         output: ".cargo/config.toml",
-    },
-    AdapterFileSpec {
-        template: "fastly_fastly_toml",
-        output: "fastly.toml",
     },
 ];
 
@@ -108,10 +114,6 @@ static FASTLY_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     TemplateRegistration {
         name: "fastly_cargo_config_toml",
         contents: include_str!("../templates/.cargo/config.toml.hbs"),
-    },
-    TemplateRegistration {
-        name: "fastly_fastly_toml",
-        contents: include_str!("../templates/fastly.toml.hbs"),
     },
 ];
 

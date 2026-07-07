@@ -1815,16 +1815,17 @@ not generated.
 
 ### Migration for downstream projects
 
-Operators with existing projects that already track
-`fastly.toml` / `wrangler.toml` / `spin.toml` / `runtime-config.toml`
-follow a one-time runbook:
+Operators with existing projects that already track any of
+`axum.toml` / `fastly.toml` / `wrangler.toml` / `spin.toml` /
+`runtime-config.toml` follow a one-time runbook:
 
 ```sh
-# Add the four manifest patterns + .dev.vars to .gitignore.
+# Add the five manifest patterns + .dev.vars to .gitignore.
 # `.dev.vars` is Cloudflare's per-secret placeholder file
 # (written by `<app-cli> provision --adapter cloudflare --local`);
 # operator values must never be committed.
 cat >> .gitignore <<'EOF'
+axum.toml
 fastly.toml
 spin.toml
 wrangler.toml
@@ -1840,7 +1841,7 @@ EOF
 # GNU `-r` "no-run-if-empty" flag) as well as GNU systems.
 # `.dev.vars` is left untouched -- operators rarely have it
 # tracked, but the same loop will pick it up if they do.
-tracked=$(git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' || true)
+tracked=$(git ls-files | rg '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' || true)
 if [ -n "$tracked" ]; then
   printf '%s\n' "$tracked" | xargs git rm --cached
 fi

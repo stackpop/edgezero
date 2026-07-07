@@ -278,16 +278,14 @@ edgezero provision --adapter <name> [--manifest <path>] [--local] [--dry-run]
 - `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`). Case-insensitive.
 - `--manifest <path>` — manifest path (default: `edgezero.toml`).
 - `--local` — synthesise/refresh the adapter's local manifest
-  (Cloudflare `wrangler.toml`, Fastly `fastly.toml`, Spin
-  `spin.toml` + `runtime-config.toml`) plus its companion `.env` /
+  (Axum `axum.toml`, Cloudflare `wrangler.toml`, Fastly `fastly.toml`,
+  Spin `spin.toml` + `runtime-config.toml`) plus its companion `.env` /
   `.dev.vars` / `.edgezero/.env` files, merging per-store bindings
-  from `edgezero.toml`. Axum's `axum.toml` is scaffolded from the
-  template and is never touched by `provision`. **No cloud
-  shell-outs.** Safe to re-run: bindings are upserted, existing
-  operator edits are preserved. `edgezero new` runs this for every
-  selected adapter as part of scaffolding, so fresh clones only need
-  `provision --local` (not the cloud-touching form) to get back to
-  a runnable local state.
+  from `edgezero.toml`. **No cloud shell-outs.** Safe to re-run:
+  bindings are upserted, existing operator edits are preserved.
+  `edgezero new` runs this for every selected adapter as part of
+  scaffolding, so fresh clones only need `provision --local` (not
+  the cloud-touching form) to get back to a runnable local state.
 - `--dry-run` — print what each adapter _would_ do without
   performing it. Combines with `--local`: `provision --local
 --dry-run` stages every write into a tempdir and prints a diff
@@ -315,7 +313,7 @@ file is the adapter's `synthesise_baseline_manifest` (no scaffold
 
 | `--adapter`  | Behaviour under `--local`                                                                                                                                                                                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `axum`       | Writes `.edgezero/.env` with a `#[secret]` placeholder line per declared field so `run_serve` can source it. `axum.toml` is left untouched (operator-authored).                                                                                                                                                             |
+| `axum`       | Synthesises `axum.toml` if missing (`crate` / `crate_dir` / `host` / `port` defaults) and writes `.edgezero/.env` with a `#[secret]` placeholder line per declared field so `run_serve` can source it. Merge path is a no-op on existing `axum.toml` (operator edits survive).                                                |
 | `cloudflare` | Synthesises `wrangler.toml` if missing and merges `[[kv_namespaces]]` bindings per declared KV / config id. Writes `.dev.vars` with `#[secret]` placeholders (the file `wrangler dev` reads for secret variables).                                                                                                          |
 | `fastly`     | Synthesises `fastly.toml` if missing and merges `[local_server.kv_stores.*]` + `[local_server.config_stores.*]` tables per declared id (Viceroy state — `[setup.*]` belongs to cloud provision). Writes `[[local_server.secret_stores.<store_id>]]` entries with `#[secret]` placeholders so Viceroy resolves them locally. |
 | `spin`       | Synthesises `spin.toml` + `runtime-config.toml` if missing, merges `key_value_stores` labels into the resolved `[component.<id>]`, and appends `[variables]` + `SPIN_VARIABLE_<NAME>` placeholder lines to `<spin_crate>/.env`. Operator edits to `[variables]` stay local until hand-shared.                               |

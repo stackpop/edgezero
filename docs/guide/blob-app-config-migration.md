@@ -95,13 +95,15 @@ with the same data produce blobs with identical `sha256` and different
 
 ## Per-adapter mechanics
 
-::: tip Cloudflare / Fastly / Spin manifests are gitignored
-Every mechanics section below refers to **your local `wrangler.toml` /
-`fastly.toml` / `spin.toml`** — these are not committed; regenerate
-them via `<app-cli> provision --adapter <name> --local` after cloning
-and re-apply any operator edits locally. **Axum's `axum.toml` stays
-tracked** because it's the operator-authored manifest for the native
-dev server.
+::: tip Adapter manifests are gitignored
+Every mechanics section below refers to **your local `axum.toml` /
+`wrangler.toml` / `fastly.toml` / `spin.toml` / `runtime-config.toml`**
+— these are not committed; regenerate each via
+`<app-cli> provision --adapter <name> --local` after cloning and
+re-apply any operator edits locally. All five adapter manifests
+follow the same gitignored-generated model — the scaffold-time
+provision loop writes each on `edgezero new`, and the synthesiser
+is the single source of truth.
 :::
 
 ### Axum

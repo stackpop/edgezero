@@ -777,9 +777,19 @@ mod tests {
 
     /// Seed BOTH baseline files (spin.toml + runtime-config.toml) at
     /// `dir`, matching Task 24's `synthesise_baseline_manifest` output.
-    fn seed_baseline(dir: &Path, app_name: &str) {
-        fs::write(dir.join("spin.toml"), synthesise_spin_toml(app_name, None))
-            .expect("seed spin.toml");
+    ///
+    /// The 2026-07 spin.toml synth derives its component id from
+    /// `<app_name>-adapter-spin` when no explicit component override
+    /// is supplied. Tests want the resulting `[component.<id>]`
+    /// header to be spelt `<component_id>` verbatim (so lookups by
+    /// `TEST_COMPONENT_ID` succeed), so we pass `Some(component_id)`
+    /// as the override rather than passing it as `app_name`.
+    fn seed_baseline(dir: &Path, component_id: &str) {
+        fs::write(
+            dir.join("spin.toml"),
+            synthesise_spin_toml(component_id, Some(component_id)),
+        )
+        .expect("seed spin.toml");
         fs::write(
             dir.join("runtime-config.toml"),
             synthesise_runtime_config_toml(),
@@ -926,7 +936,7 @@ mod tests {
         // re-synthesising an inconsistent tree).
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
         )
         .expect("seed spin.toml");
 
@@ -967,7 +977,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
         )
         .expect("seed spin.toml");
         // Malformed runtime-config.toml: scalar where a table
@@ -1178,7 +1188,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
         )
         .unwrap();
 
@@ -1296,7 +1306,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
         )
         .unwrap();
 
@@ -1684,7 +1694,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, None),
+            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
         )
         .unwrap();
 

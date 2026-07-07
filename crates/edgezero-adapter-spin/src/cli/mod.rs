@@ -80,22 +80,27 @@ static SPIN_DEPENDENCIES: &[DependencySpec] = &[
     },
 ];
 
+// `spin.toml` and `runtime-config.toml` are intentionally absent
+// from the scaffold registration — same rationale as Axum's
+// `axum.toml`. Both are written by the scaffold-time provision
+// loop (see `generator::provision_all_selected_adapters` ->
+// `Adapter::synthesise_baseline_manifest` -> `run::synthesise_spin_toml`
+// + `run::synthesise_runtime_config_toml`). Registering a scaffold
+// template here would cause the file to exist before provision
+// runs; provision's `write_baseline_to_disk` skips existing
+// files (spec § "Adapter manifests are gitignored"), so the two
+// baselines would diverge — the scaffold template would win at
+// `edgezero new`, but the synthesiser would win on a clean clone.
+// Keep this single-source: only the synthesisers write these two
+// files.
 static SPIN_FILE_SPECS: &[AdapterFileSpec] = &[
     AdapterFileSpec {
         template: "spin_Cargo_toml",
         output: "Cargo.toml",
     },
     AdapterFileSpec {
-        template: "spin_runtime_config_toml",
-        output: "runtime-config.toml",
-    },
-    AdapterFileSpec {
         template: "spin_src_lib_rs",
         output: "src/lib.rs",
-    },
-    AdapterFileSpec {
-        template: "spin_spin_toml",
-        output: "spin.toml",
     },
 ];
 
@@ -105,16 +110,8 @@ static SPIN_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
         contents: include_str!("../templates/Cargo.toml.hbs"),
     },
     TemplateRegistration {
-        name: "spin_runtime_config_toml",
-        contents: include_str!("../templates/runtime-config.toml.hbs"),
-    },
-    TemplateRegistration {
         name: "spin_src_lib_rs",
         contents: include_str!("../templates/src/lib.rs.hbs"),
-    },
-    TemplateRegistration {
-        name: "spin_spin_toml",
-        contents: include_str!("../templates/spin.toml.hbs"),
     },
 ];
 

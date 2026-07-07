@@ -77,6 +77,19 @@ static CLOUDFLARE_DEPENDENCIES: &[DependencySpec] = &[
     },
 ];
 
+// `wrangler.toml` is intentionally absent from the scaffold
+// registration — same rationale as Axum's `axum.toml` and Spin's
+// `spin.toml` / `runtime-config.toml`. It is written by the
+// scaffold-time provision loop (see
+// `generator::provision_all_selected_adapters` ->
+// `Adapter::synthesise_baseline_manifest` -> `run::synthesise_wrangler_toml`).
+// Registering a scaffold template would make the file exist
+// before provision runs; provision's `write_baseline_to_disk`
+// skips files that already exist (spec § "Adapter manifests are
+// gitignored"), so the two baselines would diverge — the
+// scaffold template would win at `edgezero new`, but the
+// synthesiser would win on a clean clone. Single-source: only
+// the synthesiser writes `wrangler.toml`.
 static CLOUDFLARE_FILE_SPECS: &[AdapterFileSpec] = &[
     AdapterFileSpec {
         template: "cf_Cargo_toml",
@@ -93,10 +106,6 @@ static CLOUDFLARE_FILE_SPECS: &[AdapterFileSpec] = &[
     AdapterFileSpec {
         template: "cf_cargo_config_toml",
         output: ".cargo/config.toml",
-    },
-    AdapterFileSpec {
-        template: "cf_wrangler_toml",
-        output: "wrangler.toml",
     },
 ];
 
@@ -116,10 +125,6 @@ static CLOUDFLARE_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     TemplateRegistration {
         name: "cf_cargo_config_toml",
         contents: include_str!("../templates/.cargo/config.toml.hbs"),
-    },
-    TemplateRegistration {
-        name: "cf_wrangler_toml",
-        contents: include_str!("../templates/wrangler.toml.hbs"),
     },
 ];
 

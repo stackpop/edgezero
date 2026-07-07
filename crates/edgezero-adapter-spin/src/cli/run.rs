@@ -185,20 +185,45 @@ pub(crate) fn synthesise_runtime_config_toml() -> String {
     String::from("# edgezero-provision: v1\n")
 }
 
-/// Synthesised baseline `spin.toml` for clean clones. Built via
-/// `toml_edit::DocumentMut` (NOT raw `format!`) so any legal
-/// `[app].name` or `[adapters.spin.adapter].component` selector
-/// — including values with TOML-significant characters like `"`,
-/// `\`, or newlines — is escaped correctly.
+/// Synthesised baseline `spin.toml` for scaffold-time and clean-clone
+/// bootstrap (single source — the Spin blueprint has no scaffold
+/// `.hbs` template for `spin.toml`, so scaffold and clean-clone
+/// produce byte-identical output; see the "Generated Adapter
+/// manifests" note in the spec).
 ///
-/// Component-id resolution: `component.unwrap_or(app_name)`. The
-/// wasm source path uses the UNDERSCORED component id because
+/// Built via `toml_edit::DocumentMut` (NOT raw `format!`) so any
+/// legal `[app].name` or `[adapters.spin.adapter].component`
+/// selector — including values with TOML-significant characters
+/// like `"`, `\`, or newlines — is escaped correctly.
+///
+/// Component-id resolution: prefer the explicit
+/// `[adapters.spin.adapter].component` selector when set. When
+/// unset, fall back to the scaffold-convention crate name
+/// `<app_name>-adapter-spin` (matching what
+/// `SPIN_BLUEPRINT.crate_suffix` produces at `edgezero new` time)
+/// so the resolved `[component.<id>].source` path names the
+/// wasm artifact Cargo actually builds. The pre-2026-07 fallback
+/// to bare `app_name` produced e.g. `demo_app.wasm` while Cargo
+/// produced `demo_app_adapter_spin.wasm`, so a clean clone's
+/// regenerated `spin.toml` pointed at a non-existent artifact.
+///
+/// The wasm source path uses the UNDERSCORED component id because
 /// Rust's Cargo output filenames convert hyphens to underscores
 /// (`my-crate` → `my_crate.wasm`).
 pub(crate) fn synthesise_spin_toml(app_name: &str, component: Option<&str>) -> String {
     use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
-    let component_id = component.unwrap_or(app_name);
+    let derived_component;
+    let component_id: &str = if let Some(cid) = component {
+        cid
+    } else {
+        derived_component = if app_name.is_empty() {
+            "app-adapter-spin".to_owned()
+        } else {
+            format!("{app_name}-adapter-spin")
+        };
+        &derived_component
+    };
     let component_under = component_id.replace('-', "_");
 
     let mut doc = DocumentMut::new();
@@ -211,9 +236,11 @@ pub(crate) fn synthesise_spin_toml(app_name: &str, component: Option<&str>) -> S
     // is missing; `insert` doesn't).
     doc.insert("spin_manifest_version", value(2));
 
-    // [application]
+    // [application] — name matches the component id (which is the
+    // adapter crate name) so the emitted application name lines up
+    // with the Cargo package that produces the wasm artifact.
     let mut application = Table::new();
-    application.insert("name", value(app_name));
+    application.insert("name", value(component_id));
     application.insert("version", value("0.1.0"));
     doc.insert("application", Item::Table(application));
 
@@ -242,7 +269,29 @@ pub(crate) fn synthesise_spin_toml(app_name: &str, component: Option<&str>) -> S
             "../../target/wasm32-wasip2/release/{component_under}.wasm"
         )),
     );
+    // Spin defaults outbound HTTP to deny-all; the operator-facing
+    // scaffold historically shipped `["https://*:*"]` so the first
+    // `spin up` doesn't silently refuse outbound calls. Match that
+    // default here so scaffold and clean-clone produce the same file.
+    let mut allowed_hosts = Array::new();
+    allowed_hosts.push("https://*:*");
+    comp.insert("allowed_outbound_hosts", value(allowed_hosts));
     comp.insert("key_value_stores", value(Array::new()));
+
+    // [component.<id>.build] — `spin build` reads this table; without
+    // it the operator has to `cargo build --target wasm32-wasip2 ...`
+    // manually before every `spin up`. Match the scaffold default.
+    let mut build_table = Table::new();
+    build_table.insert(
+        "command",
+        value("cargo build --target wasm32-wasip2 --release"),
+    );
+    let mut watch = Array::new();
+    watch.push("src/**/*.rs");
+    watch.push("Cargo.toml");
+    build_table.insert("watch", value(watch));
+    comp.insert("build", Item::Table(build_table));
+
     let mut component_section = Table::new();
     component_section.set_implicit(true);
     component_section.insert(component_id, Item::Table(comp));
@@ -322,13 +371,23 @@ mod tests {
     // ---------- synthesise_spin_toml / synthesise_runtime_config_toml ----------
 
     #[test]
-    fn synthesises_spin_toml_uses_app_name_when_component_unset() {
+    fn synthesises_spin_toml_derives_crate_name_when_component_unset() {
+        // 2026-07 fix: unset component now derives `<app>-adapter-spin`
+        // (scaffold-convention crate name), not bare `<app>`, so the
+        // resolved wasm source path matches the artifact Cargo emits
+        // (`<app>_adapter_spin.wasm`). Prior behaviour named the
+        // component `demo` and pointed at `/release/demo.wasm`, which
+        // Cargo never produced under a `demo-adapter-spin` package.
         let out = synthesise_spin_toml("demo", None);
         assert!(out.starts_with("# edgezero-provision: v1"));
         assert!(out.contains("spin_manifest_version = 2"));
-        assert!(out.contains(r#"name = "demo""#));
-        assert!(out.contains(r#"component = "demo""#));
-        assert!(out.contains("[component.demo]"));
+        assert!(out.contains(r#"name = "demo-adapter-spin""#));
+        assert!(out.contains(r#"component = "demo-adapter-spin""#));
+        // toml_edit emits the section header as a bare key
+        // (`demo-adapter-spin`) — no quoting needed for TOML bare
+        // keys that only contain `A-Z`, `a-z`, `0-9`, `-`, `_`.
+        assert!(out.contains("[component.demo-adapter-spin]"));
+        assert!(out.contains("/release/demo_adapter_spin.wasm"));
     }
 
     #[test]
@@ -341,6 +400,25 @@ mod tests {
     }
 
     #[test]
+    fn synthesises_spin_toml_includes_allowed_outbound_hosts_and_build_block() {
+        // Scaffold parity: `allowed_outbound_hosts` is a
+        // deny-by-default guard in Spin, and `[component.<id>.build]`
+        // is what `spin build` reads. Both were previously written by
+        // the scaffold `spin.toml.hbs` template; folding them into the
+        // synth keeps `edgezero new` and clean-clone `provision --local`
+        // byte-identical.
+        let out = synthesise_spin_toml("demo", None);
+        assert!(
+            out.contains(r#"allowed_outbound_hosts = ["https://*:*"]"#),
+            "synth must ship the scaffold's outbound-host allow-list: {out}"
+        );
+        assert!(
+            out.contains(r#"command = "cargo build --target wasm32-wasip2 --release""#),
+            "synth must include the [component.<id>.build] command: {out}"
+        );
+    }
+
+    #[test]
     fn synthesises_runtime_config_toml_is_header_only() {
         let out = synthesise_runtime_config_toml();
         assert_eq!(out, "# edgezero-provision: v1\n");
@@ -348,6 +426,10 @@ mod tests {
 
     #[test]
     fn synthesise_spin_toml_escapes_pathological_app_names() {
+        // Post-2026-07 synth derives the component id (and hence
+        // `[application].name`) from `<app_name>-adapter-spin` when
+        // no explicit component override is set. Assert the derived
+        // suffix survives escaping for pathological `app_name`s.
         for name in [
             r#"has"quote"#,
             r"has\backslash",
@@ -356,9 +438,10 @@ mod tests {
         ] {
             let out = synthesise_spin_toml(name, None);
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
+            let expected = format!("{name}-adapter-spin");
             assert_eq!(
                 doc["application"]["name"].as_str(),
-                Some(name),
+                Some(expected.as_str()),
                 "app name round-trip failed for {name:?}: {out}"
             );
         }

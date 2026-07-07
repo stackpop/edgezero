@@ -865,7 +865,7 @@ mod tests {
     #[cfg(unix)]
     use crate::shared_test_guards::path_mutation_guard;
     use edgezero_core::app_config::app_name_prefix;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::sync::MutexGuard;
     use tempfile::TempDir;
@@ -1235,7 +1235,7 @@ mod tests {
         );
     }
 
-    fn assert_scaffold_workspace(project_dir: &Path) {
+    fn assert_scaffold_workspace(project_dir: &Path, real_git: Option<&Path>) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
         for member in [
@@ -1302,6 +1302,24 @@ mod tests {
             );
         }
 
+        // Regression: the scaffold's `bin/` pattern is broad enough
+        // to also match Cargo's `src/bin/` directories, which are
+        // LEGITIMATE Rust source (one file per binary target). The
+        // repo-root `.gitignore` re-includes them via
+        // `!**/src/bin/`; the scaffold-emitted `.gitignore` MUST do
+        // the same or a downstream project can't check in a
+        // `crates/<name>/src/bin/tool.rs`. Verify with
+        // `git check-ignore` against a real path so a future
+        // refactor of the pattern still exercises git's semantics
+        // (a substring check on the gitignore text is not enough —
+        // ordering matters, `!**/src/bin/**` must FOLLOW `bin/`).
+        assert!(
+            gitignore.contains("!**/src/bin/"),
+            ".gitignore must re-include Cargo `src/bin/` dirs \
+             (broad `bin/` pattern above blocks them otherwise): {gitignore}"
+        );
+        assert_scaffold_src_bin_not_ignored(project_dir, real_git);
+
         let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
         assert!(clippy.contains("allow-expect-in-tests = true"));
 
@@ -1321,6 +1339,77 @@ mod tests {
                  (synthesise_fastly_toml omits it when None): {fastly_toml}"
             );
         }
+    }
+
+    /// Init a temporary git repo in `project_dir`, plant a
+    /// `crates/demo-app-cli/src/bin/tool.rs` file, and check the git
+    /// verdict on it (via `git check-ignore -v` output parsing —
+    /// exit 0 means "matched a pattern" for BOTH ignores and
+    /// re-includes, so we inspect the printed rule and require it
+    /// to start with `!`, i.e. a negation / re-include). Passes
+    /// only when the scaffold `.gitignore`'s broad `bin/` pattern is
+    /// followed by an `!**/src/bin/` re-include that wins.
+    fn assert_scaffold_src_bin_not_ignored(project_dir: &Path, real_git: Option<&Path>) {
+        use std::process::Command;
+
+        // Skip only when we couldn't resolve real git in the test's
+        // pre-stub context. On CI runners git is always present, so
+        // this fallback exists purely for defensive local behaviour
+        // and is loudly noted via `eprintln!` so a silent skip
+        // doesn't hide the regression the test guards against.
+        let Some(git) = real_git else {
+            // Fall back to the string-match assertion above when the
+            // real git binary can't be resolved (defensive local
+            // behaviour; CI runners always ship git). No stderr /
+            // stdout emission here because the workspace-wide
+            // print_stderr / print_stdout restrictions apply to test
+            // code too, and the string-match already fires the
+            // regression signal if the re-include line is missing.
+            return;
+        };
+
+        let init = Command::new(git)
+            .args(["init", "--quiet"])
+            .current_dir(project_dir)
+            .status()
+            .expect("git init runs");
+        assert!(init.success(), "git init failed with status {init}");
+
+        // Plant the file so `git check-ignore` has a real path to
+        // reason about (it doesn't require the file to exist, but
+        // creating it makes the test scenario faithful).
+        let bin_dir = project_dir.join("crates/demo-app-cli/src/bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir src/bin");
+        fs::write(bin_dir.join("tool.rs"), "fn main() {}\n").expect("plant tool.rs");
+
+        let probe = "crates/demo-app-cli/src/bin/tool.rs";
+        let output = Command::new(git)
+            .args(["check-ignore", "-v", probe])
+            .current_dir(project_dir)
+            .output()
+            .expect("git check-ignore runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Two outcomes count as "not ignored":
+        //   (a) exit=1 — no rule in .gitignore matched at all
+        //   (b) exit=0 with a `!`-prefixed re-include rule that
+        //       won. `git check-ignore -v` prints the matched rule
+        //       inline: `.gitignore:LINE:PATTERN\tPATH` — a
+        //       re-include's pattern begins with `!`.
+        // Anything else means the ignore pattern won.
+        let matched_line = stdout.lines().next().unwrap_or("");
+        let is_reinclude = matched_line
+            .split('\t')
+            .next()
+            .and_then(|prefix| prefix.rsplit(':').next())
+            .is_some_and(|pattern| pattern.starts_with('!'));
+
+        assert!(
+            !output.status.success() || is_reinclude,
+            "`git check-ignore {probe}` reports the path AS ignored by a non-negation \
+             rule — the scaffold .gitignore's `bin/` pattern is swallowing Cargo's \
+             `src/bin/` directories. Matched rule: {matched_line:?}"
+        );
     }
 
     fn assert_scaffold_crate_lints(project_dir: &Path) {
@@ -1473,6 +1562,11 @@ mod tests {
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
         let temp = TempDir::new().expect("temp dir");
+        // Resolve the REAL git binary BEFORE the PATH stub goes in
+        // so `assert_scaffold_workspace`'s git-check-ignore probe
+        // can bypass the stub script that swallows all git calls.
+        let real_git = resolve_real_git_path();
+
         let bin_dir = temp.path().join("bin");
         write_git_stub(&bin_dir);
         let _path_guard = PathOverride::prepend(&bin_dir);
@@ -1486,10 +1580,29 @@ mod tests {
 
         let project_dir = temp.path().join("demo-app");
         assert_scaffold_files(&project_dir);
-        assert_scaffold_workspace(&project_dir);
+        assert_scaffold_workspace(&project_dir, real_git.as_deref());
         assert_scaffold_app_config(&project_dir);
         assert_scaffold_crate_lints(&project_dir);
         assert_scaffold_cli_full_command_set(&project_dir);
+    }
+
+    /// Look up the current-PATH `git` binary and return an absolute
+    /// path. Returns None on platforms where `which` isn't available
+    /// or the lookup fails - the caller then skips the git-based
+    /// probe so the surrounding test still runs.
+    fn resolve_real_git_path() -> Option<PathBuf> {
+        use std::process::Command;
+        let output = Command::new("which").arg("git").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?;
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
     }
 
     /// The scaffolded `<name>-cli` must
@@ -1620,29 +1733,110 @@ mod tests {
             "spin per-crate .env must be created at scaffold time (line writer)"
         );
 
-        // Regression: axum.toml is now generated ONLY by
-        // scaffold-time provision — the scaffold template was
-        // removed to prevent divergence with the synthesiser
+        // Regression: ALL FIVE adapter manifests are now generated
+        // ONLY by scaffold-time provision — the scaffold templates
+        // were removed to prevent divergence with the synthesisers
         // (`write_baseline_to_disk` skips existing files, so a
-        // scaffold-written axum.toml would silently override the
+        // scaffold-written manifest would silently override the
         // synth output at `edgezero new` while the synth output
-        // would win on a clean clone). Assert both: the file
-        // exists AND its contents match the synthesiser
-        // byte-for-byte (i.e. carries the `# edgezero-provision: v1`
-        // header the runtime uses to distinguish provisioned files
-        // from operator-authored ones).
-        let axum_toml_path = axum_crate.join("axum.toml");
-        assert!(
-            axum_toml_path.exists(),
-            "axum.toml must be synthesised at scaffold time"
-        );
-        let axum_toml_body = fs::read_to_string(&axum_toml_path).expect("read axum.toml");
-        assert!(
-            axum_toml_body.starts_with("# edgezero-provision: v1\n"),
-            "scaffolded axum.toml must carry the synthesiser's `# edgezero-provision: v1` \
-             header, proving it came from provision and not a scaffold template: \
-             {axum_toml_body}"
-        );
+        // would win on a clean clone). Assert each manifest exists
+        // AND carries the `# edgezero-provision: v1` header the
+        // synthesiser emits (proving it came from provision and
+        // not a scaffold template).
+        for manifest in [
+            axum_crate.join("axum.toml"),
+            cf_crate.join("wrangler.toml"),
+            fastly_crate_path(&project_dir).join("fastly.toml"),
+            spin_crate.join("spin.toml"),
+            spin_crate.join("runtime-config.toml"),
+        ] {
+            let body = fs::read_to_string(&manifest)
+                .unwrap_or_else(|err| panic!("read {}: {err}", manifest.display()));
+            assert!(
+                body.starts_with("# edgezero-provision: v1\n"),
+                "scaffolded {} must carry the synthesiser's `# edgezero-provision: v1` \
+                 header, proving it came from provision and not a scaffold template: \
+                 {body}",
+                manifest.display()
+            );
+        }
+
+        // Byte-equality regression: for every generated manifest,
+        // deleting the scaffold artefact and re-running
+        // `provision --local` must reproduce the ORIGINAL bytes.
+        // That is exactly the "single source of truth" invariant:
+        // `edgezero new`'s provision loop and a clean-clone
+        // `provision --local` write identical output. The
+        // pre-2026-07 divergence — most severely on Spin, where
+        // the scaffold template pointed at `<crate>_adapter_spin.wasm`
+        // and the synth pointed at `<app>.wasm` (a non-existent
+        // artefact) — is exactly what this asserts against.
+        assert_regenerated_manifests_match_baseline(&project_dir);
+    }
+
+    fn fastly_crate_path(project_dir: &Path) -> PathBuf {
+        project_dir.join("crates/demo-app-adapter-fastly")
+    }
+
+    /// For each provision-generated adapter manifest, snapshot the
+    /// scaffold-time bytes, delete the file, re-run
+    /// `provision --adapter <id> --local`, and assert the bytes
+    /// come back byte-identical.
+    fn assert_regenerated_manifests_match_baseline(project_dir: &Path) {
+        let manifest_path = project_dir.join("edgezero.toml");
+
+        for (adapter_id, files) in [
+            ("axum", vec!["crates/demo-app-adapter-axum/axum.toml"]),
+            (
+                "cloudflare",
+                vec!["crates/demo-app-adapter-cloudflare/wrangler.toml"],
+            ),
+            ("fastly", vec!["crates/demo-app-adapter-fastly/fastly.toml"]),
+            (
+                "spin",
+                vec![
+                    "crates/demo-app-adapter-spin/spin.toml",
+                    "crates/demo-app-adapter-spin/runtime-config.toml",
+                ],
+            ),
+        ] {
+            let baselines: Vec<(PathBuf, String)> = files
+                .iter()
+                .map(|rel| {
+                    let full = project_dir.join(rel);
+                    let bytes = fs::read_to_string(&full)
+                        .unwrap_or_else(|err| panic!("read {}: {err}", full.display()));
+                    (full, bytes)
+                })
+                .collect();
+
+            for (full, _) in &baselines {
+                fs::remove_file(full)
+                    .unwrap_or_else(|err| panic!("delete {}: {err}", full.display()));
+            }
+
+            let mut prov_args = ProvisionArgs::default();
+            let owned_id = (*adapter_id).to_owned();
+            prov_args.adapter.clone_from(&owned_id);
+            prov_args.local = true;
+            prov_args.dry_run = false;
+            prov_args.manifest.clone_from(&manifest_path);
+            crate::run_provision(&prov_args).unwrap_or_else(|err| {
+                panic!("regenerate provision for `{adapter_id}` failed: {err}")
+            });
+
+            for (full, baseline) in &baselines {
+                let regenerated = fs::read_to_string(full)
+                    .unwrap_or_else(|err| panic!("re-read {}: {err}", full.display()));
+                assert_eq!(
+                    &regenerated,
+                    baseline,
+                    "clean-clone regenerated {} must match scaffold-time bytes exactly \
+                     (single-source invariant): scaffold={baseline:?} regenerated={regenerated:?}",
+                    full.display()
+                );
+            }
+        }
     }
 
     /// Task 31: after `generate_new` returns, the axum adapter's

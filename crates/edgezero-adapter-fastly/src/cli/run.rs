@@ -183,7 +183,19 @@ fn locate_artifact(
 /// §"Writeback ownership" — we deliberately don't emit
 /// `service_id = ""`).
 pub(crate) fn synthesise_fastly_toml(app_name: &str, service_id: Option<&str>) -> String {
-    use toml_edit::{value, DocumentMut, Item, Table};
+    use toml_edit::{value, Array, DocumentMut, Item, Table};
+
+    // The 2026-07 fix: the `name` field spells the scaffold-convention
+    // adapter crate name (`<app_name>-adapter-fastly`) so it lines up
+    // with the Cargo package fastly compute compiles from. Prior
+    // behaviour used bare `app_name`, which diverged from the
+    // scaffold `.hbs` template output that shipped `<crate_name>` in
+    // its `name = ...` line.
+    let crate_name = if app_name.is_empty() {
+        "app-adapter-fastly".to_owned()
+    } else {
+        format!("{app_name}-adapter-fastly")
+    };
 
     let mut doc = DocumentMut::new();
     doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
@@ -192,9 +204,12 @@ pub(crate) fn synthesise_fastly_toml(app_name: &str, service_id: Option<&str>) -
     // -- but the return is discarded intentionally. Using `insert`
     // instead of `doc["..."] = ...` sidesteps `clippy::indexing_slicing`
     // (the index form panics if the key is missing; `insert` doesn't).
-    doc.insert("manifest_version", value(3));
-    doc.insert("name", value(app_name));
+    let mut authors = Array::new();
+    authors.push("");
+    doc.insert("authors", value(authors));
     doc.insert("language", value("rust"));
+    doc.insert("manifest_version", value(3));
+    doc.insert("name", value(&crate_name));
     if let Some(sid) = service_id {
         doc.insert("service_id", value(sid));
     }
@@ -204,13 +219,13 @@ pub(crate) fn synthesise_fastly_toml(app_name: &str, service_id: Option<&str>) -
     // `[local_server]` header is a placeholder the operator fills in
     // when seeding local viceroy state (config-store contents,
     // per-request backends, etc.).
+    doc.insert("local_server", Item::Table(Table::new()));
     let mut scripts = Table::new();
     scripts.insert(
         "build",
         value("cargo build --profile release --target wasm32-wasip1"),
     );
     doc.insert("scripts", Item::Table(scripts));
-    doc.insert("local_server", Item::Table(Table::new()));
     doc.to_string()
 }
 
@@ -290,8 +305,13 @@ mod tests {
         let out = synthesise_fastly_toml("demo", None);
         assert!(out.starts_with("# edgezero-provision: v1"));
         assert!(out.contains("manifest_version = 3"));
-        assert!(out.contains(r#"name = "demo""#));
+        // Post-2026-07: `name` names the ADAPTER crate, not the app.
+        assert!(out.contains(r#"name = "demo-adapter-fastly""#));
         assert!(out.contains(r#"language = "rust""#));
+        assert!(
+            out.contains(r#"authors = [""]"#),
+            "fastly.toml must ship the empty-authors line (scaffold parity): {out}"
+        );
         assert!(out.contains("[scripts]"));
         assert!(out.contains("[local_server]"));
         assert!(
@@ -328,6 +348,9 @@ mod tests {
 
     #[test]
     fn synthesise_fastly_toml_escapes_pathological_app_names() {
+        // Post-2026-07 synth derives the crate name from
+        // `<app_name>-adapter-fastly`. Assert the suffix survives
+        // escaping for pathological `app_name`s.
         for name in [
             r#"has"quote"#,
             r"has\backslash",
@@ -335,9 +358,13 @@ mod tests {
             "has = equals",
         ] {
             let out = synthesise_fastly_toml(name, None);
-            // Re-parsing must succeed AND round-trip the name.
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
-            assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
+            let expected = format!("{name}-adapter-fastly");
+            assert_eq!(
+                doc["name"].as_str(),
+                Some(expected.as_str()),
+                "input: {name:?}"
+            );
         }
     }
 
