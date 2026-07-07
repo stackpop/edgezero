@@ -550,9 +550,14 @@ pub trait Adapter: Sync + Send {
 
     /// First-run bootstrap synthesiser, called by the CLI ONLY when
     /// `mode == Local` AND the adapter manifest (or related local
-    /// files like `runtime-config.toml`) is absent. Returns
-    /// `Ok(Vec::new())` for adapters that own no synthesised local
-    /// state (e.g. Axum — `axum.toml` stays tracked).
+    /// files like `runtime-config.toml`) is absent. All four
+    /// bundled adapters (axum, cloudflare, fastly, spin) override
+    /// this — the `Ok(Vec::new())` default is retained only for
+    /// downstream / experimental adapters that own no synthesised
+    /// local state. The 2026-07 amendment folded `axum.toml` into
+    /// the same gitignored / provision-generated model as the
+    /// other three, so the earlier "Axum has no synthesised local
+    /// state" carve-out no longer applies.
     ///
     /// Each `(relative_path, contents)` tuple is written by the CLI
     /// under `manifest_root` BEFORE `validate_adapter_manifest`

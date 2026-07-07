@@ -192,38 +192,30 @@ pub(crate) fn synthesise_runtime_config_toml() -> String {
 /// manifests" note in the spec).
 ///
 /// Built via `toml_edit::DocumentMut` (NOT raw `format!`) so any
-/// legal `[app].name` or `[adapters.spin.adapter].component`
+/// legal `<crate_name>` or `[adapters.spin.adapter].component`
 /// selector — including values with TOML-significant characters
 /// like `"`, `\`, or newlines — is escaped correctly.
 ///
 /// Component-id resolution: prefer the explicit
 /// `[adapters.spin.adapter].component` selector when set. When
-/// unset, fall back to the scaffold-convention crate name
-/// `<app_name>-adapter-spin` (matching what
-/// `SPIN_BLUEPRINT.crate_suffix` produces at `edgezero new` time)
-/// so the resolved `[component.<id>].source` path names the
-/// wasm artifact Cargo actually builds. The pre-2026-07 fallback
-/// to bare `app_name` produced e.g. `demo_app.wasm` while Cargo
-/// produced `demo_app_adapter_spin.wasm`, so a clean clone's
-/// regenerated `spin.toml` pointed at a non-existent artifact.
+/// unset, use `crate_name` — which the caller resolves from the
+/// adapter crate's `Cargo.toml` `[package].name` (via
+/// `cli_support::read_adapter_crate_name`) so the resolved
+/// `[component.<id>].source` path names the wasm artifact Cargo
+/// actually builds. The pre-2026-07 fallback to bare `app_name`
+/// produced e.g. `demo_app.wasm` while Cargo produced
+/// `demo_app_adapter_spin.wasm`; the pre-2026-07-v2 fallback to
+/// the scaffold-convention `<app>-adapter-spin` broke on renamed
+/// adapter crates (e.g. `[adapters.spin.adapter].crate =
+/// "crates/spin-server"`).
 ///
 /// The wasm source path uses the UNDERSCORED component id because
 /// Rust's Cargo output filenames convert hyphens to underscores
 /// (`my-crate` → `my_crate.wasm`).
-pub(crate) fn synthesise_spin_toml(app_name: &str, component: Option<&str>) -> String {
+pub(crate) fn synthesise_spin_toml(crate_name: &str, component: Option<&str>) -> String {
     use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
-    let derived_component;
-    let component_id: &str = if let Some(cid) = component {
-        cid
-    } else {
-        derived_component = if app_name.is_empty() {
-            "app-adapter-spin".to_owned()
-        } else {
-            format!("{app_name}-adapter-spin")
-        };
-        &derived_component
-    };
+    let component_id: &str = component.unwrap_or(crate_name);
     let component_under = component_id.replace('-', "_");
 
     let mut doc = DocumentMut::new();
@@ -371,31 +363,48 @@ mod tests {
     // ---------- synthesise_spin_toml / synthesise_runtime_config_toml ----------
 
     #[test]
-    fn synthesises_spin_toml_derives_crate_name_when_component_unset() {
-        // 2026-07 fix: unset component now derives `<app>-adapter-spin`
-        // (scaffold-convention crate name), not bare `<app>`, so the
-        // resolved wasm source path matches the artifact Cargo emits
-        // (`<app>_adapter_spin.wasm`). Prior behaviour named the
-        // component `demo` and pointed at `/release/demo.wasm`, which
-        // Cargo never produced under a `demo-adapter-spin` package.
-        let out = synthesise_spin_toml("demo", None);
+    fn synthesises_spin_toml_uses_crate_name_when_component_unset() {
+        // Caller resolves the crate name from the adapter-crate
+        // Cargo.toml `[package].name` — the synth just takes the
+        // resolved value and threads it into `[application].name`
+        // + the component id + the underscored wasm path. Verifying
+        // with the scaffold-convention name `demo-adapter-spin` so a
+        // renamed-adapter regression is easy to spot.
+        let out = synthesise_spin_toml("demo-adapter-spin", None);
         assert!(out.starts_with("# edgezero-provision: v1"));
         assert!(out.contains("spin_manifest_version = 2"));
         assert!(out.contains(r#"name = "demo-adapter-spin""#));
         assert!(out.contains(r#"component = "demo-adapter-spin""#));
-        // toml_edit emits the section header as a bare key
-        // (`demo-adapter-spin`) — no quoting needed for TOML bare
-        // keys that only contain `A-Z`, `a-z`, `0-9`, `-`, `_`.
         assert!(out.contains("[component.demo-adapter-spin]"));
         assert!(out.contains("/release/demo_adapter_spin.wasm"));
     }
 
     #[test]
+    fn synthesises_spin_toml_uses_renamed_crate_name() {
+        // Regression for the reviewer-flagged renamed-adapter bug:
+        // when the operator sets `[adapters.spin.adapter].crate =
+        // "crates/spin-server"`, the synth must emit the wasm
+        // source path Cargo actually produces (`spin_server.wasm`),
+        // not the scaffold-convention `demo_app_adapter_spin.wasm`.
+        // The synth takes the crate name verbatim; the caller in
+        // `cli/mod.rs` is responsible for resolving it from the
+        // Cargo.toml — this test pins the synth half of the invariant.
+        let out = synthesise_spin_toml("spin-server", None);
+        assert!(out.contains(r#"name = "spin-server""#));
+        assert!(out.contains(r#"component = "spin-server""#));
+        assert!(out.contains("[component.spin-server]"));
+        assert!(
+            out.contains("/release/spin_server.wasm"),
+            "spin.toml source must underscore the renamed crate name: {out}"
+        );
+    }
+
+    #[test]
     fn synthesises_spin_toml_honors_component_selector() {
-        let out = synthesise_spin_toml("demo", Some("worker"));
+        let out = synthesise_spin_toml("demo-adapter-spin", Some("worker"));
         assert!(out.contains(r#"component = "worker""#));
         assert!(out.contains("[component.worker]"));
-        // wasm path matches the component id, not the app name:
+        // wasm path matches the component id, not the crate name:
         assert!(out.contains("/release/worker.wasm"));
     }
 
@@ -407,7 +416,7 @@ mod tests {
         // the scaffold `spin.toml.hbs` template; folding them into the
         // synth keeps `edgezero new` and clean-clone `provision --local`
         // byte-identical.
-        let out = synthesise_spin_toml("demo", None);
+        let out = synthesise_spin_toml("demo-adapter-spin", None);
         assert!(
             out.contains(r#"allowed_outbound_hosts = ["https://*:*"]"#),
             "synth must ship the scaffold's outbound-host allow-list: {out}"
@@ -425,11 +434,13 @@ mod tests {
     }
 
     #[test]
-    fn synthesise_spin_toml_escapes_pathological_app_names() {
-        // Post-2026-07 synth derives the component id (and hence
-        // `[application].name`) from `<app_name>-adapter-spin` when
-        // no explicit component override is set. Assert the derived
-        // suffix survives escaping for pathological `app_name`s.
+    fn synthesise_spin_toml_escapes_pathological_crate_names() {
+        // Cargo restricts `[package].name` to `[A-Za-z0-9_-]`, but
+        // the synth must still be defensive against TOML-hostile
+        // inputs so an exotic value in
+        // `[adapters.spin.adapter].crate` doesn't produce invalid
+        // TOML at either `[application].name` (root) or the
+        // `[component.<id>]` header key.
         for name in [
             r#"has"quote"#,
             r"has\backslash",
@@ -438,10 +449,9 @@ mod tests {
         ] {
             let out = synthesise_spin_toml(name, None);
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
-            let expected = format!("{name}-adapter-spin");
             assert_eq!(
                 doc["application"]["name"].as_str(),
-                Some(expected.as_str()),
+                Some(name),
                 "app name round-trip failed for {name:?}: {out}"
             );
         }

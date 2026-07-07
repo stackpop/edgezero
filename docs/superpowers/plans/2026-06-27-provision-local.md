@@ -5009,7 +5009,7 @@ This is the largest test task — Spin's env-label alignment (spec §"Per-adapte
 - [ ] **Step 1: Write the four common tests, scoped to the no-manifest-mutation contract:**
 
   - `provision_local_creates_dot_edgezero_dir`
-  - `provision_local_does_not_touch_axum_toml` (regression test for the Axum exception)
+  - `provision_local_preserves_existing_axum_toml` (was `provision_local_does_not_touch_axum_toml` under the pre-2026-07 "Axum exception" wording; the file is now provision-generated on missing but the merge path is still a no-op on operator edits)
   - `provision_local_writes_env_name_lines`
   - `re_provision_preserves_operator_env_edits`
 

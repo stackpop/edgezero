@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use ctor::ctor;
+use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
@@ -501,7 +502,7 @@ impl Adapter for SpinCliAdapter {
 
     fn synthesise_baseline_manifest(
         &self,
-        _manifest_root: &Path,
+        manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
         component_selector: Option<&str>,
         app_name: &str,
@@ -521,10 +522,27 @@ impl Adapter for SpinCliAdapter {
                 || PathBuf::from("runtime-config.toml"),
                 |parent| parent.join("runtime-config.toml"),
             );
+        // Prefer the ACTUAL adapter crate name from the `Cargo.toml`
+        // next to the manifest — honours the operator-tracked
+        // `[adapters.spin.adapter].crate` path when it points at a
+        // rename like `crates/spin-server`, so the emitted wasm
+        // source path names the artifact Cargo actually builds
+        // (`spin_server.wasm` rather than the scaffold-convention
+        // `demo_app_adapter_spin.wasm`). Fall back to the scaffold
+        // convention only when no Cargo.toml is discoverable.
+        let derived_crate_name =
+            cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+                .unwrap_or_else(|| {
+                    if app_name.is_empty() {
+                        "app-adapter-spin".to_owned()
+                    } else {
+                        format!("{app_name}-adapter-spin")
+                    }
+                });
         Ok(vec![
             (
                 spin_rel,
-                run::synthesise_spin_toml(app_name, component_selector),
+                run::synthesise_spin_toml(&derived_crate_name, component_selector),
             ),
             (rc_rel, run::synthesise_runtime_config_toml()),
         ])

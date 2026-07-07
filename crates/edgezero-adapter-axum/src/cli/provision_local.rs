@@ -98,6 +98,7 @@ mod tests {
         Adapter as _, ProvisionMode, ProvisionStores, ResolvedStoreId,
     };
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     #[test]
@@ -401,6 +402,51 @@ mod tests {
             after,
             sentinel.to_vec(),
             "existing axum.toml must be byte-for-byte unchanged after re-provision"
+        );
+    }
+
+    #[test]
+    fn synthesised_axum_toml_honors_renamed_adapter_crate() {
+        // Regression: reviewer verified that a project with
+        // `[adapters.axum.adapter].manifest = "crates/server/axum.toml"`
+        // + `[package].name = "server"` in `crates/server/Cargo.toml`
+        // ended up with `crate = "demo-app-adapter-axum"` on
+        // clean-clone provision because the synth ignored the
+        // adjacent Cargo.toml. This test pins the fix: the
+        // synthesiser must read `crates/<x>/Cargo.toml`
+        // `[package].name` and thread THAT into `[adapter].crate`.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let crate_dir = root.join("crates/server");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = AxumCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/server/axum.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds for renamed crate");
+        assert_eq!(outcome.len(), 1);
+        let (rel, body) = outcome.into_iter().next().unwrap();
+        assert_eq!(rel, PathBuf::from("crates/server/axum.toml"));
+        assert!(
+            body.contains(r#"crate = "server""#),
+            "synthesised axum.toml must honour the renamed adapter crate \
+             `[package].name = \"server\"` from crates/server/Cargo.toml \
+             — got: {body}"
+        );
+        assert!(
+            !body.contains(r#"crate = "demo-app-adapter-axum""#),
+            "synthesised axum.toml MUST NOT fall back to the scaffold \
+             convention when a real Cargo.toml is present: {body}"
         );
     }
 

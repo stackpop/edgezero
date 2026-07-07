@@ -180,26 +180,19 @@ fn locate_artifact(
 /// byte-identical output; see the "Generated Adapter manifests"
 /// note in the spec).
 ///
-/// The `name` field spells the scaffold-convention adapter crate
-/// name `<app_name>-adapter-cloudflare` (matching what
-/// `CLOUDFLARE_BLUEPRINT.crate_suffix` produces at `edgezero new`
-/// time) — `worker-build` reads this and expects it to match the
-/// Cargo package name. Prior behaviour used bare `app_name`,
-/// which produced e.g. `name = "demo"` while Cargo produced
-/// `demo-adapter-cloudflare`, so a clean clone's regenerated
-/// `wrangler.toml` mismatched the crate wrangler had to build.
+/// The `name` field spells the adapter crate's Cargo package name.
+/// The caller in `cli/mod.rs` reads this from the `Cargo.toml`
+/// adjacent to the adapter manifest (honouring the operator's
+/// `[adapters.cloudflare.adapter].crate` rename) and falls back
+/// to the scaffold convention `<app_name>-adapter-cloudflare`
+/// only when no Cargo.toml is discoverable. `worker-build` reads
+/// this field and expects it to match the Cargo package it builds.
 ///
 /// Built via `toml_edit::DocumentMut` (NOT raw `format!`) so any
-/// legal `[app].name` — including names with TOML-significant
-/// characters like `"`, `\`, or newlines — is escaped correctly.
-pub(super) fn synthesise_wrangler_toml(app_name: &str) -> String {
+/// legal name — including values with TOML-significant characters
+/// like `"`, `\`, or newlines — is escaped correctly.
+pub(super) fn synthesise_wrangler_toml(crate_name: &str) -> String {
     use toml_edit::{value, DocumentMut, Item, Table};
-
-    let crate_name = if app_name.is_empty() {
-        "app-adapter-cloudflare".to_owned()
-    } else {
-        format!("{app_name}-adapter-cloudflare")
-    };
 
     let mut doc = DocumentMut::new();
     doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
@@ -208,7 +201,7 @@ pub(super) fn synthesise_wrangler_toml(app_name: &str) -> String {
     // -- but the return is discarded intentionally. Using `insert`
     // instead of `doc["..."] = ...` sidesteps `clippy::indexing_slicing`
     // (the index form panics if the key is missing; `insert` doesn't).
-    doc.insert("name", value(&crate_name));
+    doc.insert("name", value(crate_name));
     doc.insert("main", value("build/worker/shim.mjs"));
     doc.insert("compatibility_date", value("2024-01-01"));
 
@@ -232,9 +225,12 @@ mod tests {
 
     #[test]
     fn synthesises_minimal_wrangler_toml_with_header() {
-        let out = synthesise_wrangler_toml("demo");
+        // Caller resolves the crate name from the adapter-crate
+        // Cargo.toml (see `read_adapter_crate_name` in cli_support);
+        // the synth itself is a pure toml_edit shape emitter over the
+        // resolved value.
+        let out = synthesise_wrangler_toml("demo-adapter-cloudflare");
         assert!(out.starts_with("# edgezero-provision: v1"));
-        // Post-2026-07: `name` names the ADAPTER crate, not the app.
         assert!(out.contains(r#"name = "demo-adapter-cloudflare""#));
         assert!(out.contains(r#"main = "build/worker/shim.mjs""#));
         assert!(out.contains("compatibility_date = "));
@@ -247,10 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn synthesise_wrangler_toml_escapes_pathological_app_names() {
-        // Post-2026-07 synth derives the crate name from
-        // `<app_name>-adapter-cloudflare`. Assert the suffix
-        // survives escaping for pathological `app_name`s.
+    fn synthesise_wrangler_toml_escapes_pathological_crate_names() {
+        // Adapter crate names come from Cargo.toml `[package].name`
+        // — Cargo restricts them to `[A-Za-z0-9_-]`, but the synth
+        // must still be defensive against TOML-hostile inputs so
+        // an operator that stashes something exotic into
+        // `[adapters.<name>.adapter].crate` doesn't produce
+        // invalid TOML.
         for name in [
             r#"has"quote"#,
             r"has\backslash",
@@ -259,12 +258,7 @@ mod tests {
         ] {
             let out = synthesise_wrangler_toml(name);
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
-            let expected = format!("{name}-adapter-cloudflare");
-            assert_eq!(
-                doc["name"].as_str(),
-                Some(expected.as_str()),
-                "input: {name:?}"
-            );
+            assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
         }
     }
 }

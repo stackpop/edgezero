@@ -4,6 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ctor::ctor;
+use edgezero_adapter::cli_support;
 use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
@@ -416,7 +417,7 @@ impl Adapter for AxumCliAdapter {
 
     fn synthesise_baseline_manifest(
         &self,
-        _manifest_root: &Path,
+        manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         app_name: &str,
@@ -430,16 +431,21 @@ impl Adapter for AxumCliAdapter {
         // without needing the operator to hand-author one -- same
         // model as Cloudflare / Fastly / Spin.
         let rel = adapter_manifest_path.map_or_else(|| PathBuf::from("axum.toml"), PathBuf::from);
-        // `app_name` is the top-level `[app].name` from
-        // `edgezero.toml`. If the operator hasn't set it yet we fall
-        // back to a placeholder so the file parses; provision will
-        // overwrite the value on the next run (see the shape at
-        // `run::synthesise_axum_toml`).
-        let crate_name = if app_name.is_empty() {
-            "app-adapter-axum".to_owned()
-        } else {
-            format!("{app_name}-adapter-axum")
-        };
+        // Prefer the ACTUAL adapter crate name from the
+        // `Cargo.toml` next to the manifest -- honours the
+        // operator-tracked `[adapters.axum.adapter].crate` path
+        // when it points at a rename like `crates/server`. Fall
+        // back to the scaffold convention only when the Cargo.toml
+        // is absent or unreadable (typically a first-run scaffold
+        // where the file gets written moments later).
+        let crate_name = cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+            .unwrap_or_else(|| {
+                if app_name.is_empty() {
+                    "app-adapter-axum".to_owned()
+                } else {
+                    format!("{app_name}-adapter-axum")
+                }
+            });
         Ok(vec![(rel, run::synthesise_axum_toml(&crate_name))])
     }
 }

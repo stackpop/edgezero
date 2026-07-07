@@ -1781,6 +1781,65 @@ mod tests {
         assert!(dir.path().join(".env").exists());
     }
 
+    #[test]
+    fn synthesised_spin_toml_honors_renamed_adapter_crate() {
+        // Regression: reviewer verified that a project with
+        // `[adapters.spin.adapter].manifest = "crates/spin-server/spin.toml"`
+        // + `[package].name = "spin-server"` in
+        // `crates/spin-server/Cargo.toml` ended up with
+        // `source = ".../demo_app_adapter_spin.wasm"` on clean-clone
+        // provision because the synth ignored the adjacent
+        // Cargo.toml. This test pins the fix: the synthesiser must
+        // read `crates/<x>/Cargo.toml` `[package].name` and thread
+        // it into both the component id and the underscored wasm
+        // source path.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let crate_dir = root.join("crates/spin-server");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"spin-server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = SpinCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/spin-server/spin.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds for renamed crate");
+
+        // Locate the spin.toml entry (order stable but assert by rel path).
+        let (spin_rel, spin_body) = outcome
+            .iter()
+            .find(|(rel, _)| rel.ends_with("spin.toml"))
+            .expect("spin.toml in outcome");
+        assert_eq!(spin_rel, &PathBuf::from("crates/spin-server/spin.toml"));
+
+        assert!(
+            spin_body.contains(r#"name = "spin-server""#),
+            "[application].name must match the renamed adapter crate: {spin_body}"
+        );
+        assert!(
+            spin_body.contains(r#"component = "spin-server""#),
+            "trigger component id must match the renamed adapter crate: {spin_body}"
+        );
+        assert!(
+            spin_body.contains(
+                "source = \"../../target/wasm32-wasip2/release/spin_server.wasm\""
+            ),
+            "wasm source path must underscore the renamed crate name (spin_server.wasm) — got: {spin_body}"
+        );
+        assert!(
+            !spin_body.contains("demo_app_adapter_spin.wasm"),
+            "wasm source MUST NOT fall back to the scaffold convention when a real Cargo.toml is present: {spin_body}"
+        );
+    }
+
     // ---- Spin-specific env-label alignment tests ----
 
     #[test]

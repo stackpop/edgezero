@@ -1449,10 +1449,20 @@ key_value_stores = []
 component ids at
 `crates/edgezero-adapter-spin/src/cli.rs:942`). Precedence:
 (1) `[adapters.spin.adapter].component` when set, verbatim;
-(2) otherwise `<app_name>` (the project's `[app].name`) as
-the default, matching the app-demo fixture and the scaffold
-template's first-time output. Whatever the bootstrap writes
-into the trigger's `component = "..."` value MUST equal the
+(2) otherwise the ADAPTER CRATE package name read from
+`Cargo.toml` next to the manifest (i.e.
+`<manifest_root>/<adapter_manifest_path>/../Cargo.toml`
+`[package].name`), which honours the operator's
+`[adapters.spin.adapter].crate` path when it points at a
+rename like `crates/spin-server`; (3) as a last-resort
+fallback (Cargo.toml absent or unreadable), the
+scaffold-convention `<app_name>-adapter-spin`. A pre-2026-07
+version of this spec had step (2) fall back to bare
+`<app_name>`, which broke on any project that renamed the
+adapter crate — the synthesiser emitted
+`source = ".../<app>.wasm"` while Cargo produced
+`<crate_name>.wasm`. Whatever the bootstrap writes into the
+trigger's `component = "..."` value MUST equal the
 `[component.<id>]` block name it emits in the same pass --
 Spin's loader otherwise rejects the manifest. Operators who
 later add a `component = "..."` value to `edgezero.toml`
@@ -1461,11 +1471,12 @@ re-run `provision --local` to refresh.
 
 `<target_wasm_path>` is computed as the conventional
 workspace-relative wasm artefact path
-`"../../target/wasm32-wasip2/release/<component_id_underscored>.wasm"`
-(matches the existing app-demo fixture; the wasm filename
-matches the component id, not the app name). Operators
-whose workspace layout differs edit the synthesised file
-once.
+`"../../target/wasm32-wasip2/release/<component_id_underscored>.wasm"`.
+The wasm filename underscores the component id (hyphens
+become underscores per Cargo's output convention), so a
+component id of `spin-server` resolves to
+`spin_server.wasm`. Operators whose workspace layout differs
+edit the synthesised file once.
 
 ### Spin (`runtime-config.toml`)
 

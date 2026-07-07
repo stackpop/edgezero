@@ -182,20 +182,17 @@ fn locate_artifact(
 /// operator's first `fastly compute deploy` populates it (per spec
 /// §"Writeback ownership" — we deliberately don't emit
 /// `service_id = ""`).
-pub(crate) fn synthesise_fastly_toml(app_name: &str, service_id: Option<&str>) -> String {
+pub(crate) fn synthesise_fastly_toml(crate_name: &str, service_id: Option<&str>) -> String {
     use toml_edit::{value, Array, DocumentMut, Item, Table};
 
-    // The 2026-07 fix: the `name` field spells the scaffold-convention
-    // adapter crate name (`<app_name>-adapter-fastly`) so it lines up
-    // with the Cargo package fastly compute compiles from. Prior
-    // behaviour used bare `app_name`, which diverged from the
-    // scaffold `.hbs` template output that shipped `<crate_name>` in
-    // its `name = ...` line.
-    let crate_name = if app_name.is_empty() {
-        "app-adapter-fastly".to_owned()
-    } else {
-        format!("{app_name}-adapter-fastly")
-    };
+    // The `name` field spells the adapter crate's Cargo package
+    // name. The caller in `cli/mod.rs` reads this from the
+    // `Cargo.toml` adjacent to the adapter manifest (honouring the
+    // operator's `[adapters.fastly.adapter].crate` rename) and
+    // falls back to the scaffold convention
+    // `<app_name>-adapter-fastly` only when no Cargo.toml is
+    // discoverable. `fastly compute build` reads this and expects
+    // it to match the Cargo package it builds.
 
     let mut doc = DocumentMut::new();
     doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
@@ -209,7 +206,7 @@ pub(crate) fn synthesise_fastly_toml(app_name: &str, service_id: Option<&str>) -
     doc.insert("authors", value(authors));
     doc.insert("language", value("rust"));
     doc.insert("manifest_version", value(3));
-    doc.insert("name", value(&crate_name));
+    doc.insert("name", value(crate_name));
     if let Some(sid) = service_id {
         doc.insert("service_id", value(sid));
     }
@@ -302,10 +299,12 @@ mod tests {
 
     #[test]
     fn synthesises_minimal_fastly_toml_with_header_and_no_service_id() {
-        let out = synthesise_fastly_toml("demo", None);
+        // Caller resolves the crate name from the adapter-crate
+        // Cargo.toml; the synth is a pure toml_edit shape emitter
+        // over the resolved value.
+        let out = synthesise_fastly_toml("demo-adapter-fastly", None);
         assert!(out.starts_with("# edgezero-provision: v1"));
         assert!(out.contains("manifest_version = 3"));
-        // Post-2026-07: `name` names the ADAPTER crate, not the app.
         assert!(out.contains(r#"name = "demo-adapter-fastly""#));
         assert!(out.contains(r#"language = "rust""#));
         assert!(
@@ -347,10 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn synthesise_fastly_toml_escapes_pathological_app_names() {
-        // Post-2026-07 synth derives the crate name from
-        // `<app_name>-adapter-fastly`. Assert the suffix survives
-        // escaping for pathological `app_name`s.
+    fn synthesise_fastly_toml_escapes_pathological_crate_names() {
+        // Cargo restricts `[package].name` to `[A-Za-z0-9_-]`, but
+        // the synth must still be defensive against TOML-hostile
+        // inputs so an exotic value in
+        // `[adapters.fastly.adapter].crate` doesn't produce invalid
+        // TOML.
         for name in [
             r#"has"quote"#,
             r"has\backslash",
@@ -359,12 +360,7 @@ mod tests {
         ] {
             let out = synthesise_fastly_toml(name, None);
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
-            let expected = format!("{name}-adapter-fastly");
-            assert_eq!(
-                doc["name"].as_str(),
-                Some(expected.as_str()),
-                "input: {name:?}"
-            );
+            assert_eq!(doc["name"].as_str(), Some(name), "input: {name:?}");
         }
     }
 

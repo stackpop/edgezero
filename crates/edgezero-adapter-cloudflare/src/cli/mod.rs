@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ctor::ctor;
+use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
 use edgezero_adapter::registry::{
@@ -379,7 +380,7 @@ impl Adapter for CloudflareCliAdapter {
 
     fn synthesise_baseline_manifest(
         &self,
-        _manifest_root: &Path,
+        manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         app_name: &str,
@@ -387,7 +388,21 @@ impl Adapter for CloudflareCliAdapter {
     ) -> Result<Vec<(PathBuf, String)>, String> {
         let rel =
             adapter_manifest_path.map_or_else(|| PathBuf::from("wrangler.toml"), PathBuf::from);
-        Ok(vec![(rel, run::synthesise_wrangler_toml(app_name))])
+        // Prefer the ACTUAL adapter crate name from the `Cargo.toml`
+        // next to the manifest — honours the operator-tracked
+        // `[adapters.cloudflare.adapter].crate` path when it points
+        // at a rename (e.g. `crates/worker`). Fall back to the
+        // scaffold convention `<app>-adapter-cloudflare` only when
+        // no Cargo.toml is available.
+        let crate_name = cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+            .unwrap_or_else(|| {
+                if app_name.is_empty() {
+                    "app-adapter-cloudflare".to_owned()
+                } else {
+                    format!("{app_name}-adapter-cloudflare")
+                }
+            });
+        Ok(vec![(rel, run::synthesise_wrangler_toml(&crate_name))])
     }
 }
 

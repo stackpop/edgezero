@@ -97,6 +97,41 @@ pub fn run_native_cli(program: &str, args: &[&str], install_hint: &str) -> Resul
     }
 }
 
+/// Resolve the ADAPTER CRATE package name for the manifest being
+/// synthesised. Reads `[package].name` from the `Cargo.toml` that
+/// sits next to the adapter manifest — i.e. under the crate
+/// `[adapters.<name>.adapter].crate` names in `edgezero.toml`.
+///
+/// Used by `Adapter::synthesise_baseline_manifest` impls to write
+/// runtime-authoritative fields — Axum's `[adapter].crate`, the
+/// Spin `[application].name` / component id / wasm source path,
+/// Cloudflare's `wrangler.toml` `name`, Fastly's `fastly.toml`
+/// `name`. The synthesised value MUST match the Cargo package the
+/// adapter actually builds; hardcoding a `<app>-adapter-<id>`
+/// convention silently mispoints the wasm source path on any
+/// project that renames the adapter crate.
+///
+/// Returns `None` when:
+/// - `adapter_manifest_path` is `None` (no adapter manifest path
+///   declared in `edgezero.toml`), OR
+/// - the resolved `Cargo.toml` next to the manifest is missing,
+///   unreadable, or has no `[package].name`.
+///
+/// Callers fall back to a scaffold-convention crate name in that
+/// case (e.g. `<app_name>-adapter-<id>`) so the synthesis is
+/// still deterministic on a fresh scaffold.
+#[inline]
+#[must_use]
+pub fn read_adapter_crate_name(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+) -> Option<String> {
+    let rel = adapter_manifest_path?;
+    let manifest_abs = manifest_root.join(rel);
+    let crate_dir = manifest_abs.parent()?;
+    read_package_name(&crate_dir.join("Cargo.toml")).ok()
+}
+
 /// Reads the crate name from a `Cargo.toml`, supporting both the inline and `[package]` forms.
 ///
 /// # Errors
@@ -130,6 +165,54 @@ pub fn read_package_name(manifest: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn read_adapter_crate_name_returns_package_name_from_sibling_cargo_toml() {
+        // The common case: `[adapters.axum.adapter].manifest =
+        // "crates/server/axum.toml"` with a package name of
+        // `server` at `crates/server/Cargo.toml`. The helper must
+        // return `Some("server")` so the synthesiser emits
+        // `crate = "server"` in the resulting axum.toml.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let crate_dir = root.join("crates/server");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let out = read_adapter_crate_name(root, Some("crates/server/axum.toml"));
+        assert_eq!(out.as_deref(), Some("server"));
+    }
+
+    #[test]
+    fn read_adapter_crate_name_returns_none_when_cargo_toml_missing() {
+        // First-run scaffold path: the adapter manifest hasn't been
+        // laid down yet, so the synthesiser must fall back to its
+        // scaffold-convention default. Represented here by
+        // pointing at a nested manifest whose sibling Cargo.toml
+        // doesn't exist yet.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("crates/pending")).unwrap();
+        // No Cargo.toml written under crates/pending/.
+
+        let out = read_adapter_crate_name(root, Some("crates/pending/spin.toml"));
+        assert!(out.is_none(), "missing Cargo.toml must yield None: {out:?}");
+    }
+
+    #[test]
+    fn read_adapter_crate_name_returns_none_when_manifest_path_unset() {
+        // `[adapters.<name>.adapter].manifest` is optional in
+        // `edgezero.toml`. When omitted, the helper has nothing to
+        // read and must return `None` so the caller falls back to
+        // its scaffold convention.
+        let dir = tempdir().unwrap();
+        let out = read_adapter_crate_name(dir.path(), None);
+        assert!(out.is_none());
+    }
 
     #[test]
     fn workspace_root_defaults_to_dir_when_no_cargo_toml() {

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use ctor::ctor;
+use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::registry::{
     register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
@@ -350,7 +351,7 @@ impl Adapter for FastlyCliAdapter {
 
     fn synthesise_baseline_manifest(
         &self,
-        _manifest_root: &Path,
+        manifest_root: &Path,
         adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
         app_name: &str,
@@ -365,9 +366,22 @@ impl Adapter for FastlyCliAdapter {
             .and_then(|state| state.fields.get("service_id"))
             .map(String::as_str);
         let rel = adapter_manifest_path.map_or_else(|| PathBuf::from("fastly.toml"), PathBuf::from);
+        // Prefer the ACTUAL adapter crate name from the `Cargo.toml`
+        // next to the manifest — honours the operator-tracked
+        // `[adapters.fastly.adapter].crate` path when it points at
+        // a rename. Fall back to the scaffold convention only when
+        // no Cargo.toml is discoverable.
+        let crate_name = cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+            .unwrap_or_else(|| {
+                if app_name.is_empty() {
+                    "app-adapter-fastly".to_owned()
+                } else {
+                    format!("{app_name}-adapter-fastly")
+                }
+            });
         Ok(vec![(
             rel,
-            run::synthesise_fastly_toml(app_name, deployed_service_id),
+            run::synthesise_fastly_toml(&crate_name, deployed_service_id),
         )])
     }
 }
