@@ -3,7 +3,7 @@
 Pre-release composite action for deploying a checked-out EdgeZero application to Fastly Compute.
 
 ```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+- uses: stackpop/edgezero/.github/actions/deploy@<ref>
   with:
     adapter: fastly
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}

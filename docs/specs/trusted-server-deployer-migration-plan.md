@@ -41,7 +41,7 @@ Production workflow shape:
 2. checkout Trusted Server source separately at the selected ref into `trusted-server`;
 3. write pre-deploy summary;
 4. capture the currently active Fastly version before deploy;
-5. invoke `stackpop/edgezero/.github/actions/deploy@<full-commit-sha>` with:
+5. invoke `stackpop/edgezero/.github/actions/deploy@<ref>` with:
    - `adapter: fastly`;
    - `working-directory: trusted-server`;
    - `manifest: edgezero.toml` when present on all deployed refs;

@@ -11,7 +11,7 @@
 **Pre-release identity:**
 
 ```yaml
-uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+uses: stackpop/edgezero/.github/actions/deploy@<ref>
 ```
 
 ## 1. Executive summary
@@ -38,8 +38,8 @@ The action owns repeatable deployment setup:
 2. resolve the checked-out application directory and optional `edgezero.toml`;
 3. resolve Rust from the application or this repository's `.tool-versions`;
 4. install `wasm32-wasip1`;
-5. install an action-owned EdgeZero CLI from the same EdgeZero commit selected
-   by the `uses:` ref;
+5. install an action-owned EdgeZero CLI from the EdgeZero repository revision
+   selected by the `uses:` ref;
 6. install the pinned Fastly CLI version defined by this repository's tool
    version policy;
 7. optionally restore/save an exact-key application build cache;
@@ -65,9 +65,10 @@ of scope for this generic deploy action.
 2. **The caller owns source.** The action never calls `actions/checkout`.
 3. **Fastly-only v0, future-compatible API.** The `adapter` input is required
    even though only `fastly` is accepted in v0.
-4. **Full-SHA pre-release only.** Initial consumers pin the action to a full
-   EdgeZero commit SHA. No `v1` alias, Marketplace publication, or release tag
-   is defined by this spec.
+4. **Pre-release action ref.** Consumers may select the action with a branch,
+   tag, or commit SHA. A full commit SHA is recommended when reproducible
+   production deploys matter. No `v1` alias, Marketplace publication, or
+   release tag is defined by this spec.
 5. **Use repository tool versions.** The action's EdgeZero CLI build toolchain
    and default application Rust toolchain come from the EdgeZero monorepo's
    `.tool-versions` file.
@@ -122,10 +123,11 @@ The v0 action will not:
 
 ### 5.1 Invocation path
 
-Production examples must pin a full commit SHA:
+Use a trusted action ref. A full commit SHA is recommended for reproducible
+production deploys, but branches and tags are accepted:
 
 ```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+- uses: stackpop/edgezero/.github/actions/deploy@<ref>
   with:
     adapter: fastly
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -192,7 +194,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+      - uses: stackpop/edgezero/.github/actions/deploy@<ref>
         with:
           adapter: fastly
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -223,7 +225,7 @@ jobs:
           persist-credentials: false
 
       - name: Deploy application
-        uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+        uses: stackpop/edgezero/.github/actions/deploy@<ref>
         with:
           adapter: fastly
           working-directory: app
@@ -234,7 +236,7 @@ jobs:
 ### 6.3 Monorepo application
 
 ```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+- uses: stackpop/edgezero/.github/actions/deploy@<ref>
   with:
     adapter: fastly
     working-directory: apps/api
@@ -428,7 +430,7 @@ from silently overriding the typed credential contract.
 Application configuration may still be passed through normal workflow `env:`:
 
 ```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+- uses: stackpop/edgezero/.github/actions/deploy@<ref>
   with:
     adapter: fastly
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -565,9 +567,10 @@ The action must not construct its own error messages containing credentials.
 
 ## 16. Security requirements
 
-1. Require production examples to pin this action and third-party actions to
-   full commit SHAs.
-2. Do not accept caller-selected EdgeZero CLI source, branch, tag, or commit.
+1. Recommend full commit SHAs for production examples that need reproducible
+   action and third-party action behavior.
+2. Do not accept a separate caller-selected EdgeZero CLI source outside the
+   selected action repository revision.
 3. Install the EdgeZero CLI from the selected action repository revision.
 4. Use the EdgeZero repository `.tool-versions` Rust version for the action CLI
    build and application fallback.
@@ -684,14 +687,14 @@ The live gate must:
 - treat rollback/cleanup as caller-owned provider logic, not generic action
   behavior.
 
-This live gate is not required to publish the initial full-SHA pre-release, but
+This live gate is not required to publish the initial pre-release action, but
 it is required before advertising a stable version alias.
 
 ## 18. Documentation requirements
 
 Before implementation is considered complete, user-facing docs must include:
 
-1. action location and full-SHA pinning guidance;
+1. action location and trusted-ref guidance;
 2. supported adapter table showing Fastly-only v0;
 3. runner support;
 4. same-repository checkout example;
@@ -714,7 +717,7 @@ Before implementation is considered complete, user-facing docs must include:
 The v0 design is implemented when all of the following are true:
 
 1. A caller can check out an EdgeZero Fastly application and invoke
-   `stackpop/edgezero/.github/actions/deploy@<full-commit-sha>`.
+   `stackpop/edgezero/.github/actions/deploy@<ref>`.
 2. The action requires `adapter: fastly`.
 3. Unknown adapters, `cloudflare`, `spin`, and `axum` fail before tool
    installation.

@@ -3,13 +3,13 @@
 EdgeZero includes a pre-release composite GitHub Action for deploying a checked-out application to Fastly Compute.
 
 ::: warning Pre-release
-The deploy action is currently full-SHA only. Do not use a moving branch or tag in production workflows.
+The deploy action is pre-release. Use a trusted ref; a full commit SHA is recommended when you need reproducible production deploys.
 :::
 
 ## Action path
 
 ```yaml
-uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+uses: stackpop/edgezero/.github/actions/deploy@<ref>
 ```
 
 The action lives inside the EdgeZero monorepo at `.github/actions/deploy`.
@@ -49,7 +49,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+      - uses: stackpop/edgezero/.github/actions/deploy@<ref>
         with:
           adapter: fastly
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -75,7 +75,7 @@ steps:
       persist-credentials: false
 
   - name: Deploy application
-    uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+    uses: stackpop/edgezero/.github/actions/deploy@<ref>
     with:
       adapter: fastly
       working-directory: app
@@ -86,7 +86,7 @@ steps:
 ## Monorepo or non-root manifest
 
 ```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<full-commit-sha>
+- uses: stackpop/edgezero/.github/actions/deploy@<ref>
   with:
     adapter: fastly
     working-directory: apps/api
@@ -137,7 +137,7 @@ Application settings may still use workflow `env:` when the app genuinely needs 
 
 ## EdgeZero CLI revision
 
-The action builds and runs the `edgezero` binary from the same EdgeZero commit selected by the `uses:` ref. It does not install the CLI from the application repository or from the application's Cargo dependencies. Pin the action to a full commit SHA to pin the CLI implementation.
+The action builds and runs the `edgezero` binary from the EdgeZero repository revision selected by the `uses:` ref. It does not install the CLI from the application repository or from the application's Cargo dependencies. Use a full commit SHA when you need to pin the CLI implementation exactly.
 
 ## Build behavior
 

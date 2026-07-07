@@ -151,14 +151,14 @@ grep -q '^effective-build-mode=never$' "$TMP/resolve.out" || fail "fastly auto d
 grep -q '^rust-toolchain=1.88.0$' "$TMP/resolve.out" || fail "toolchain discovery failed"
 grep -q '^source-revision=' "$TMP/resolve.out" || fail "source revision missing"
 
-# resolve-project can use the pinned action ref when the action root is not a Git checkout.
+# resolve-project can use the action ref when the action root is not a Git checkout.
 ACTION_NOGIT="$TMP/action-root-no-git"
 mkdir -p "$ACTION_NOGIT"
 cp "$ROOT/.tool-versions" "$ACTION_NOGIT/.tool-versions"
 GITHUB_OUTPUT="$TMP/resolve-ref.out" \
 GITHUB_WORKSPACE="$TMP/workspace" \
 EDGEZERO_ACTION_ROOT="$ACTION_NOGIT" \
-EDGEZERO_ACTION_REF=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+EDGEZERO_ACTION_REF=feature/deploy-action \
 INPUT_WORKING_DIRECTORY=app \
 INPUT_MANIFEST=edgezero.toml \
 INPUT_RUST_TOOLCHAIN=auto \
@@ -167,7 +167,8 @@ INPUT_CACHE=false \
 RUNNER_OS=Linux \
 RUNNER_ARCH=X64 \
 run_expect_ok resolve-ref "$ACTION_DIR/scripts/resolve-project.sh"
-grep -q '^edgezero-revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa$' "$TMP/resolve-ref.out" || fail "action ref revision fallback failed"
+grep -q '^edgezero-revision=feature/deploy-action$' "$TMP/resolve-ref.out" || fail "action ref revision fallback failed"
+grep -q 'feature-deploy-action' "$TMP/resolve-ref.out" || fail "action ref cache key sanitization failed"
 
 # resolve-project rejects malformed .tool-versions instead of silently falling back.
 BAD_WS="$TMP/bad-toolchain"

@@ -130,12 +130,12 @@ fi
 
 if EDGEZERO_REVISION=$(git -C "$ACTION_ROOT" rev-parse HEAD 2>/dev/null); then
   :
-elif [[ "$ACTION_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+elif [[ -n "$ACTION_REF" ]]; then
   EDGEZERO_REVISION=$ACTION_REF
 else
-  fail "could not resolve immutable EdgeZero action revision; pin the action with a full commit SHA"
+  fail "could not resolve EdgeZero action revision"
 fi
-CACHE_KEY="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$RUST_TOOLCHAIN")-wasm32-wasip1-${EDGEZERO_REVISION}-${SOURCE_REVISION}-${LOCK_HASH}"
+CACHE_KEY="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$RUST_TOOLCHAIN")-wasm32-wasip1-$(sanitize_ref "$EDGEZERO_REVISION")-${SOURCE_REVISION}-${LOCK_HASH}"
 TARGET_DIR="$APP_GIT_ROOT/target"
 
 effective_build_mode() {
