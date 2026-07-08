@@ -647,6 +647,47 @@ mod tests {
 
     // ---------- provision (local mode) ----------
 
+    #[test]
+    fn synthesised_fastly_toml_honors_renamed_adapter_crate() {
+        use std::path::PathBuf;
+
+        // Reviewer regression: with
+        // `[adapters.fastly.adapter].manifest = "crates/fast-edge/svc/fastly.toml"`
+        // + `[package].name = "fast-edge"`, clean-clone provision
+        // must emit `name = "fast-edge"` — NOT the fallback
+        // `demo-app-adapter-fastly`. Also covers the nested
+        // manifest shape (`crates/fast-edge/svc/fastly.toml`).
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let crate_dir = root.join("crates/fast-edge");
+        fs::create_dir_all(crate_dir.join("svc")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"fast-edge\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = FastlyCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/fast-edge/svc/fastly.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds for nested renamed crate");
+        let (rel, body) = outcome.into_iter().next().unwrap();
+        assert_eq!(rel, PathBuf::from("crates/fast-edge/svc/fastly.toml"));
+        assert!(
+            body.contains(r#"name = "fast-edge""#),
+            "fastly.toml must name the renamed adapter crate (fast-edge): {body}"
+        );
+        assert!(
+            !body.contains(r#"name = "demo-app-adapter-fastly""#),
+            "MUST NOT fall back to scaffold convention when the Cargo.toml exists further up: {body}"
+        );
+    }
+
     /// Local provision writes `[[local_server.kv_stores.<platform>]]`
     /// and `[local_server.config_stores.<platform>]` blocks. The
     /// config-store block's `contents` MUST be a TOML table (not

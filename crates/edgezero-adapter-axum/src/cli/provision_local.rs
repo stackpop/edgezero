@@ -451,6 +451,45 @@ mod tests {
     }
 
     #[test]
+    fn synthesised_axum_toml_honors_renamed_adapter_crate_with_nested_manifest() {
+        // Reviewer regression: the manifest may live at a nested
+        // path like `crates/server/config/axum.toml`, and the
+        // package `[package].name` sits one level up at
+        // `crates/server/Cargo.toml`. The synthesiser must walk up
+        // from the manifest parent to find the crate root before
+        // reading the package name.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let crate_dir = root.join("crates/server");
+        fs::create_dir_all(crate_dir.join("config")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = AxumCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/server/config/axum.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds for nested manifest");
+        let (rel, body) = outcome.into_iter().next().unwrap();
+        assert_eq!(rel, PathBuf::from("crates/server/config/axum.toml"));
+        assert!(
+            body.contains(r#"crate = "server""#),
+            "nested manifest must walk up to `crates/server/Cargo.toml` and read `[package].name = \"server\"` — got: {body}"
+        );
+        assert!(
+            !body.contains(r#"crate = "demo-app-adapter-axum""#),
+            "MUST NOT fall back to scaffold convention when the crate Cargo.toml exists further up: {body}"
+        );
+    }
+
+    #[test]
     fn provision_local_writes_env_name_lines() {
         // Fixture: one store per kind. Local provision must:
         //   - write `.edgezero/.env` starting with the provenance

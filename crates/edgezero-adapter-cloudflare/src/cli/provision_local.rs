@@ -1160,6 +1160,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn synthesised_wrangler_toml_honors_renamed_adapter_crate() {
+        // Reviewer regression: with
+        // `[adapters.cloudflare.adapter].manifest = "crates/cf-worker/wrangler.toml"`
+        // + `[package].name = "cf-worker"`, clean-clone provision
+        // must emit `name = "cf-worker"` — NOT the fallback
+        // `demo-app-adapter-cloudflare`. Also covers the nested
+        // manifest shape: the Cargo.toml sits at
+        // `crates/cf-worker/Cargo.toml` while the manifest may be
+        // one directory deeper (`crates/cf-worker/config/wrangler.toml`).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let crate_dir = root.join("crates/cf-worker");
+        fs::create_dir_all(crate_dir.join("config")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"cf-worker\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = CloudflareCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/cf-worker/config/wrangler.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds for nested renamed crate");
+        let (rel, body) = outcome.into_iter().next().unwrap();
+        assert_eq!(rel, PathBuf::from("crates/cf-worker/config/wrangler.toml"));
+        assert!(
+            body.contains(r#"name = "cf-worker""#),
+            "wrangler.toml must name the renamed adapter crate (cf-worker) — got: {body}"
+        );
+        assert!(
+            !body.contains(r#"name = "demo-app-adapter-cloudflare""#),
+            "MUST NOT fall back to scaffold convention when the Cargo.toml exists further up: {body}"
+        );
+    }
+
     // ---------- provision_local_ contract suite (spec §"Per-adapter test contract") ----------
 
     #[test]

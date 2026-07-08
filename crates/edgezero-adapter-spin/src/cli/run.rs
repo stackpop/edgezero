@@ -196,27 +196,39 @@ pub(crate) fn synthesise_runtime_config_toml() -> String {
 /// selector — including values with TOML-significant characters
 /// like `"`, `\`, or newlines — is escaped correctly.
 ///
-/// Component-id resolution: prefer the explicit
-/// `[adapters.spin.adapter].component` selector when set. When
-/// unset, use `crate_name` — which the caller resolves from the
-/// adapter crate's `Cargo.toml` `[package].name` (via
-/// `cli_support::read_adapter_crate_name`) so the resolved
-/// `[component.<id>].source` path names the wasm artifact Cargo
-/// actually builds. The pre-2026-07 fallback to bare `app_name`
-/// produced e.g. `demo_app.wasm` while Cargo produced
-/// `demo_app_adapter_spin.wasm`; the pre-2026-07-v2 fallback to
-/// the scaffold-convention `<app>-adapter-spin` broke on renamed
-/// adapter crates (e.g. `[adapters.spin.adapter].crate =
-/// "crates/spin-server"`).
+/// Two distinct identities feed this synth and are kept SEPARATE:
 ///
-/// The wasm source path uses the UNDERSCORED component id because
-/// Rust's Cargo output filenames convert hyphens to underscores
-/// (`my-crate` → `my_crate.wasm`).
+/// - `crate_name`: the Cargo `[package].name` the caller resolved
+///   from the adapter crate's `Cargo.toml` (via
+///   `cli_support::read_adapter_crate_name`). Drives
+///   `[application].name` AND the wasm source basename
+///   (`<crate_name_under>.wasm`) — Cargo names the wasm artifact
+///   after the package name, regardless of what the operator
+///   calls the Spin component.
+///
+/// - `component`: the Spin component id selector from
+///   `[adapters.spin.adapter].component`. The operator's runtime
+///   discriminator for a multi-component `spin.toml`. Drives
+///   `[[trigger.http]].component` AND the `[component.<id>]`
+///   table key. Defaults to `crate_name` when unset (single-
+///   component projects).
+///
+/// A pre-2026-07-v3 shape derived the wasm basename from the
+/// component id, which broke when the operator set
+/// `[adapters.spin.adapter].component = "worker"` on a Cargo
+/// package named `spin-server`: the synthesiser emitted
+/// `source = ".../worker.wasm"` while Cargo produced
+/// `spin_server.wasm`.
 pub(crate) fn synthesise_spin_toml(crate_name: &str, component: Option<&str>) -> String {
     use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
     let component_id: &str = component.unwrap_or(crate_name);
-    let component_under = component_id.replace('-', "_");
+    // Wasm source path underscores the CARGO CRATE name — NOT the
+    // component id. Spin's component id is an operator selector;
+    // the actual artifact Cargo builds is always
+    // `<package.name>.wasm` (with hyphens converted to underscores
+    // per Cargo's output convention).
+    let crate_name_under = crate_name.replace('-', "_");
 
     let mut doc = DocumentMut::new();
     doc.decor_mut().set_prefix("# edgezero-provision: v1\n");
@@ -228,11 +240,12 @@ pub(crate) fn synthesise_spin_toml(crate_name: &str, component: Option<&str>) ->
     // is missing; `insert` doesn't).
     doc.insert("spin_manifest_version", value(2));
 
-    // [application] — name matches the component id (which is the
-    // adapter crate name) so the emitted application name lines up
-    // with the Cargo package that produces the wasm artifact.
+    // [application] — name IS the Cargo package name, so the
+    // emitted application identity lines up with the Cargo
+    // package that produces the wasm artifact regardless of how
+    // the operator names the runtime component below.
     let mut application = Table::new();
-    application.insert("name", value(component_id));
+    application.insert("name", value(crate_name));
     application.insert("version", value("0.1.0"));
     doc.insert("application", Item::Table(application));
 
@@ -258,7 +271,7 @@ pub(crate) fn synthesise_spin_toml(crate_name: &str, component: Option<&str>) ->
     comp.insert(
         "source",
         value(format!(
-            "../../target/wasm32-wasip2/release/{component_under}.wasm"
+            "../../target/wasm32-wasip2/release/{crate_name_under}.wasm"
         )),
     );
     // Spin defaults outbound HTTP to deny-all; the operator-facing
@@ -402,10 +415,52 @@ mod tests {
     #[test]
     fn synthesises_spin_toml_honors_component_selector() {
         let out = synthesise_spin_toml("demo-adapter-spin", Some("worker"));
+        // Component selector drives the trigger/section keys...
         assert!(out.contains(r#"component = "worker""#));
         assert!(out.contains("[component.worker]"));
-        // wasm path matches the component id, not the crate name:
-        assert!(out.contains("/release/worker.wasm"));
+        // ...but the wasm source basename ALWAYS follows the Cargo
+        // crate name — Cargo produces `<package.name>.wasm`
+        // regardless of the operator-chosen component id.
+        assert!(
+            out.contains("/release/demo_adapter_spin.wasm"),
+            "wasm basename must underscore the Cargo crate name, not the component selector: {out}"
+        );
+        assert!(
+            !out.contains("/release/worker.wasm"),
+            "wasm path MUST NOT track the component selector (Cargo doesn't name artifacts after it): {out}"
+        );
+        // [application].name also stays tied to the crate name, not
+        // the component selector — Spin's application identity is
+        // the Cargo package, not the runtime dispatch label.
+        assert!(out.contains(r#"name = "demo-adapter-spin""#));
+    }
+
+    #[test]
+    fn synthesised_spin_toml_component_selector_does_not_leak_into_wasm_basename() {
+        // Reviewer-flagged regression: with
+        // `[package].name = "spin-server"` and
+        // `[adapters.spin.adapter].component = "worker"`, the
+        // previous synth emitted `source = ".../worker.wasm"`
+        // while Cargo produced `spin_server.wasm`. The two knobs
+        // must be independent.
+        let out = synthesise_spin_toml("spin-server", Some("worker"));
+        assert!(
+            out.contains(r#"name = "spin-server""#),
+            "app.name = crate: {out}"
+        );
+        assert!(
+            out.contains(r#"component = "worker""#),
+            "trigger.component: {out}"
+        );
+        assert!(out.contains("[component.worker]"), "component table: {out}");
+        assert!(
+            out.contains("/release/spin_server.wasm"),
+            "wasm basename must match the Cargo package (spin_server), not the component (worker): {out}"
+        );
+        assert!(
+            !out.contains("worker.wasm"),
+            "wasm path must NOT include the component id as a filename: {out}"
+        );
     }
 
     #[test]

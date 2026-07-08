@@ -1840,6 +1840,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn synthesised_spin_toml_honors_renamed_adapter_crate_with_nested_manifest() {
+        // Reviewer regression #1: the adapter manifest may live at
+        // a nested path (`crates/spin-server/config/spin.toml`) with
+        // the Cargo.toml at the crate root one level up. The
+        // synthesiser must walk from the manifest parent up to find
+        // the crate's Cargo.toml before it can name the wasm
+        // artifact correctly.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let crate_dir = root.join("crates/spin-server");
+        fs::create_dir_all(crate_dir.join("config")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"spin-server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = SpinCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/spin-server/config/spin.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds for nested manifest");
+        let (spin_rel, spin_body) = outcome
+            .iter()
+            .find(|(rel, _)| rel.ends_with("spin.toml"))
+            .expect("spin.toml in outcome");
+        assert_eq!(
+            spin_rel,
+            &PathBuf::from("crates/spin-server/config/spin.toml")
+        );
+        assert!(
+            spin_body.contains(r#"name = "spin-server""#),
+            "nested manifest must walk up to `crates/spin-server/Cargo.toml`: {spin_body}"
+        );
+        assert!(
+            spin_body.contains("/release/spin_server.wasm"),
+            "wasm basename must underscore the crate name (spin_server) even with a nested manifest: {spin_body}"
+        );
+    }
+
+    #[test]
+    fn synthesised_spin_toml_component_selector_does_not_leak_into_wasm_basename() {
+        // Reviewer regression #2: `[adapters.spin.adapter].component`
+        // is a Spin runtime selector, NOT the Cargo package name.
+        // With `[package].name = "spin-server"` and
+        // `[adapters.spin.adapter].component = "worker"`, the
+        // synthesiser MUST emit `source = ".../spin_server.wasm"`
+        // (the artifact Cargo actually builds), NOT
+        // `source = ".../worker.wasm"`.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let crate_dir = root.join("crates/spin-server");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"spin-server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = SpinCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/spin-server/spin.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds");
+        let (_, spin_body) = outcome
+            .iter()
+            .find(|(rel, _)| rel.ends_with("spin.toml"))
+            .expect("spin.toml in outcome");
+
+        // Re-synthesise with a component override to verify the
+        // component selector reroutes the trigger + section
+        // headers but NOT the wasm artifact basename.
+        let outcome2 = SpinCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/spin-server/spin.toml"),
+                Some("worker"),
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis with component selector succeeds");
+        let (_, spin_body2) = outcome2
+            .iter()
+            .find(|(rel, _)| rel.ends_with("spin.toml"))
+            .expect("spin.toml in outcome");
+
+        // Baseline: no component selector → both point at crate name.
+        assert!(spin_body.contains(r#"component = "spin-server""#));
+        assert!(spin_body.contains("/release/spin_server.wasm"));
+
+        // With component selector: trigger + [component.<id>] key
+        // switch to "worker"; wasm basename stays "spin_server".
+        assert!(
+            spin_body2.contains(r#"component = "worker""#),
+            "trigger.component tracks the operator selector: {spin_body2}"
+        );
+        assert!(
+            spin_body2.contains("[component.worker]"),
+            "component table key tracks the selector: {spin_body2}"
+        );
+        assert!(
+            spin_body2.contains("/release/spin_server.wasm"),
+            "wasm basename tracks the Cargo package (spin_server), NOT the component selector (worker): {spin_body2}"
+        );
+        assert!(
+            !spin_body2.contains("worker.wasm"),
+            "wasm path MUST NOT use the component selector as its filename: {spin_body2}"
+        );
+        // [application].name also stays crate-anchored regardless
+        // of what the component selector is.
+        assert!(spin_body2.contains(r#"name = "spin-server""#));
+    }
+
     // ---- Spin-specific env-label alignment tests ----
 
     #[test]

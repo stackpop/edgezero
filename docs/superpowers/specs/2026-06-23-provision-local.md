@@ -1443,40 +1443,45 @@ source = "<target_wasm_path>"
 key_value_stores = []
 ```
 
-**`<component_id>` resolution.** The bootstrap reads
-`[adapters.spin.adapter].component` from `edgezero.toml`
-(the same selector Spin's runtime validates against actual
-component ids at
-`crates/edgezero-adapter-spin/src/cli.rs:942`). Precedence:
-(1) `[adapters.spin.adapter].component` when set, verbatim;
-(2) otherwise the ADAPTER CRATE package name read from
-`Cargo.toml` next to the manifest (i.e.
-`<manifest_root>/<adapter_manifest_path>/../Cargo.toml`
-`[package].name`), which honours the operator's
-`[adapters.spin.adapter].crate` path when it points at a
-rename like `crates/spin-server`; (3) as a last-resort
-fallback (Cargo.toml absent or unreadable), the
-scaffold-convention `<app_name>-adapter-spin`. A pre-2026-07
-version of this spec had step (2) fall back to bare
-`<app_name>`, which broke on any project that renamed the
-adapter crate — the synthesiser emitted
-`source = ".../<app>.wasm"` while Cargo produced
-`<crate_name>.wasm`. Whatever the bootstrap writes into the
-trigger's `component = "..."` value MUST equal the
-`[component.<id>]` block name it emits in the same pass --
-Spin's loader otherwise rejects the manifest. Operators who
-later add a `component = "..."` value to `edgezero.toml`
-out of phase with their already-synthesised `spin.toml`
-re-run `provision --local` to refresh.
+**Two distinct identities feed the Spin baseline** and are kept
+separate — a pre-2026-07-v3 version of the synth conflated them,
+which broke any project where the operator's Spin component
+selector differed from the Cargo package name.
+
+- **`<crate_name>`** — the adapter crate's Cargo
+  `[package].name`. Read by walking upward from the manifest's
+  parent directory to the first `Cargo.toml` inside `manifest_root`
+  (so a nested manifest like `crates/server/config/spin.toml`
+  still resolves to `crates/server/Cargo.toml`), then reading
+  `[package].name`. Drives `[application].name` AND the wasm
+  source basename — Cargo always produces
+  `<package_name_underscored>.wasm` regardless of what the
+  operator calls the Spin component. Fallback when no Cargo.toml
+  is reachable (fresh scaffold before the crate files land):
+  scaffold-convention `<app_name>-adapter-spin`.
+
+- **`<component_id>`** — the Spin component id from
+  `[adapters.spin.adapter].component`. The operator's runtime
+  discriminator for a multi-component `spin.toml`, and the same
+  selector Spin's runtime validates against actual component ids
+  at `crates/edgezero-adapter-spin/src/cli.rs:942`. Drives
+  `[[trigger.http]].component` AND the `[component.<id>]` table
+  key. Defaults to `<crate_name>` when unset (single-component
+  projects). Whatever the bootstrap writes into the trigger's
+  `component = "..."` value MUST equal the `[component.<id>]`
+  block name it emits in the same pass — Spin's loader otherwise
+  rejects the manifest. Operators who later add a
+  `component = "..."` value to `edgezero.toml` out of phase with
+  their already-synthesised `spin.toml` re-run `provision --local`
+  to refresh.
 
 `<target_wasm_path>` is computed as the conventional
 workspace-relative wasm artefact path
-`"../../target/wasm32-wasip2/release/<component_id_underscored>.wasm"`.
-The wasm filename underscores the component id (hyphens
-become underscores per Cargo's output convention), so a
-component id of `spin-server` resolves to
-`spin_server.wasm`. Operators whose workspace layout differs
-edit the synthesised file once.
+`"../../target/wasm32-wasip2/release/<crate_name_underscored>.wasm"`.
+The wasm filename ALWAYS underscores the CARGO CRATE name —
+never the component id, because Cargo names artifacts after the
+package, not the Spin runtime selector. Operators whose workspace
+layout differs edit the synthesised file once.
 
 ### Spin (`runtime-config.toml`)
 
