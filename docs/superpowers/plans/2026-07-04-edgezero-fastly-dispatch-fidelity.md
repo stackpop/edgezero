@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 1.95, edition 2021. `edgezero-adapter-fastly` (behind the `fastly` feature), `edgezero-core` (`Hooks` trait, `http::Extensions`), `edgezero-macros` (`app!`). `http` crate `HeaderMap`/`Extensions` via `edgezero_core::http`.
 
-**Source spec:** `docs/superpowers/specs/2026-07-03-edgezero-p0cd-fastly-dispatch-and-appstate-design.md` (P0-C), verified against `65afbd3`.
+**Source spec:** `docs/superpowers/specs/2026-07-03-edgezero-fastly-dispatch-and-appstate-design.md` (P0-C), verified against `65afbd3`.
 
 ## Global Constraints
 
@@ -37,7 +37,7 @@
   4. `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
   5. `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`
 - **No backward-compat constraint** — prefer the cleanest breaking change; update every in-tree call site in the same PR.
-- **Shared with P0-D:** Task 4 reworks the `app!` `AppArgs` grammar into keyword arguments (adding `owns_logging`). The sibling P0-D plan (`2026-07-04-edgezero-p0d-app-macro-state.md`) **extends that same grammar** with a `state` key — execute this P0-C plan first so P0-D builds on the keyword-arg framework.
+- **Shared with P0-D:** Task 4 reworks the `app!` `AppArgs` grammar into keyword arguments (adding `owns_logging`). The sibling P0-D plan (`2026-07-04-edgezero-app-macro-state.md`) **extends that same grammar** with a `state` key — execute this P0-C plan first so P0-D builds on the keyword-arg framework.
 
 ---
 

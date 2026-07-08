@@ -8,12 +8,12 @@
 
 **Tech Stack:** Rust 1.95, edition 2021. `edgezero-macros` (`app!`), `examples/app-demo` (worked example). Reuses `edgezero-core` `RouterBuilder::with_state` / `State<T>` unchanged.
 
-**Source spec:** `docs/superpowers/specs/2026-07-03-edgezero-p0cd-fastly-dispatch-and-appstate-design.md` (P0-D), verified against `65afbd3`.
+**Source spec:** `docs/superpowers/specs/2026-07-03-edgezero-fastly-dispatch-and-appstate-design.md` (P0-D), verified against `65afbd3`.
 
 ## Global Constraints
 
 - **Rust 1.95.0**, edition 2021. Strict clippy gate (`restriction = deny`): watch `arbitrary_source_item_ordering` (order struct fields / test fns), `min_ident_chars`, `absolute_paths`, `impl_trait_in_params`, `assertions_on_result_states`, `needless_raw_strings`, `missing_trait_methods`.
-- **DEPENDS ON P0-C.** This plan **extends the `app!` `AppArgs` keyword-argument grammar** introduced by the P0-C plan (`2026-07-04-edgezero-p0c-fastly-dispatch-fidelity.md`, Task 4). Execute P0-C first. After P0-C, `AppArgs` is `struct AppArgs { app_ident: Option<Ident>, owns_logging: Option<bool>, path: LitStr }` with a keyword-arg parser whose `match key.to_string()` has an `owns_logging` arm and an `_ => unknown key` arm; Task 1 below adds a `state` field + arm. If P0-C has not landed, do it first — do not reintroduce the grammar here.
+- **DEPENDS ON P0-C.** This plan **extends the `app!` `AppArgs` keyword-argument grammar** introduced by the P0-C plan (`2026-07-04-edgezero-fastly-dispatch-fidelity.md`, Task 4). Execute P0-C first. After P0-C, `AppArgs` is `struct AppArgs { app_ident: Option<Ident>, owns_logging: Option<bool>, path: LitStr }` with a keyword-arg parser whose `match key.to_string()` has an `owns_logging` arm and an `_ => unknown key` arm; Task 1 below adds a `state` field + arm. If P0-C has not landed, do it first — do not reintroduce the grammar here.
 - **Reused, unchanged API** (from PR #306, `crates/edgezero-core/src/router.rs`): `RouterBuilder::with_state<T>(self, value: T) -> Self where T: Clone + Send + Sync + 'static`; the router injects `state_extensions` into every request at dispatch. `State<T>` (`crates/edgezero-core/src/extractor.rs`) extracts it; an unregistered `T` → `500`.
 - **CI gates (all must pass):** `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo test --workspace --all-targets`; `cargo check --workspace --all-targets --features "fastly cloudflare spin"`; `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`; and `(cd examples/app-demo && cargo test)`.
 - **No backward-compat constraint.** `state` is optional; omitting it leaves `build_router()` byte-identical to today.
