@@ -119,19 +119,38 @@ fn assert_provision_paths_impl(
         }
     }
 
-    // Step 2 (strict-local only): when both are set, manifest MUST
-    // sit inside the adapter crate dir. Closes the spec's stronger
-    // promise for local-mode writes -- without this, crate =
-    // "crates/cf" + manifest = "tmp/wrangler.toml" would pass step 1
-    // but write to a path outside the adapter crate. Cloud dispatch
-    // does not run this step -- legitimate cloud fixtures use e.g.
-    // `manifest = "wrangler.toml"` at the project root alongside a
-    // crate under `crates/`, which is safe for vendor-CLI dispatch
-    // even though it fails the strict-local containment.
+    // Step 2 (strict-local only): manifest MUST be declared AND
+    // resolve inside the adapter crate dir. Closes the spec's
+    // stronger promise for local-mode writes:
+    //   - Without the "declared" half, a manifest with `crate =
+    //     "crates/server"` and no `.manifest` would fall through to
+    //     the adapter synth's `PathBuf::from("axum.toml")` default,
+    //     landing generated manifests at the project root instead of
+    //     under the crate — and `read_adapter_crate_name` couldn't
+    //     honour the renamed adapter crate (it needs the manifest
+    //     path to walk up to the crate's Cargo.toml).
+    //   - Without the "inside" half, `crate = "crates/cf"` +
+    //     `manifest = "tmp/wrangler.toml"` would pass Step 1 but
+    //     write to a path outside the adapter crate.
+    //
+    // Cloud dispatch does not run this step — legitimate cloud
+    // fixtures use e.g. `manifest = "wrangler.toml"` at the project
+    // root alongside a crate under `crates/`, which is safe for
+    // vendor-CLI dispatch even though it fails the strict-local
+    // containment.
     if !strict_local {
         return Ok(());
     }
-    if let (Some(crate_raw), Some(manifest_raw)) = (adapter_crate_path, adapter_manifest_path) {
+    let Some(manifest_raw) = adapter_manifest_path else {
+        return Err(
+            "[adapters.<name>.adapter].manifest is required for `--local` provision \
+             and config paths; without it the synthesiser falls back to a project-\
+             root filename outside the adapter crate and cannot honour a renamed \
+             adapter crate's Cargo.toml"
+                .to_owned(),
+        );
+    };
+    if let Some(crate_raw) = adapter_crate_path {
         let crate_resolved = lexical_normalize(&root.join(Path::new(crate_raw)));
         let manifest_resolved = lexical_normalize(&root.join(Path::new(manifest_raw)));
         if !manifest_resolved.starts_with(&crate_resolved) {
@@ -251,5 +270,59 @@ mod tests {
             Some("crates/cf"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_manifest_when_crate_declared_in_local_mode() {
+        // Regression: an operator who declares `[adapters.<x>.adapter].crate
+        // = "crates/server"` but forgets `.manifest = "..."` would slip past
+        // the pre-2026-07 containment guard (Step 2 short-circuited on the
+        // missing `.manifest`). Downstream, `Adapter::synthesise_baseline_manifest`
+        // falls back to `PathBuf::from("axum.toml")` at the project root —
+        // OUTSIDE `crates/server` — and `read_adapter_crate_name` cannot walk
+        // up to the crate's Cargo.toml (it has no manifest path to start from),
+        // so the emitted manifest points at the wrong Cargo package too.
+        //
+        // Strict-local now rejects a missing `.manifest` outright so both
+        // failure modes are impossible.
+        let err = assert_provision_paths_contained(Path::new("."), None, Some("crates/server"))
+            .unwrap_err();
+        assert!(
+            err.contains("[adapters.<name>.adapter].manifest is required for `--local`"),
+            "missing .manifest must be rejected in local mode: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_manifest_even_without_declared_crate_in_local_mode() {
+        // The invariant is `--local always writes to a declared manifest
+        // path`, not `--local always names an adapter crate`. An operator
+        // who leaves BOTH knobs unset falls back to root-level defaults —
+        // still a containment leak.
+        let err = assert_provision_paths_contained(Path::new("."), None, None).unwrap_err();
+        assert!(
+            err.contains("[adapters.<name>.adapter].manifest is required for `--local`"),
+            "missing .manifest must be rejected even when .crate is also unset: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_manifest_without_crate_declaration_in_local_mode() {
+        // Symmetric to the above: `.crate` remains optional in local mode
+        // (only `.manifest` is required). This case is unusual but legal —
+        // e.g. a downstream project that scaffolds a manifest at a fixed
+        // path but doesn't need `provision` to also validate crate-dir
+        // ancestry.
+        assert_provision_paths_contained(Path::new("."), Some("crates/cf/wrangler.toml"), None)
+            .unwrap();
+    }
+
+    #[test]
+    fn safe_variant_still_allows_missing_manifest() {
+        // Cloud dispatch (assert_provision_paths_safe) legitimately runs
+        // without a `.manifest` field on adapters that manage manifests via
+        // their vendor CLI. Missing-manifest rejection is strict-local only.
+        assert_provision_paths_safe(Path::new("."), None, Some("crates/cf")).unwrap();
+        assert_provision_paths_safe(Path::new("."), None, None).unwrap();
     }
 }

@@ -509,6 +509,38 @@ where
         strict: false,
     };
     let ctx = load_validation_context(&validate_args)?;
+
+    // Path containment BEFORE any adapter path is joined with the
+    // manifest root and passed into an adapter read. Push runs the
+    // same guard (config.rs:356) before `run_shared_checks`; diff
+    // was previously unguarded on the argument that a read-only
+    // command can't corrupt the tree — but the adapter's
+    // `read_config_entry` / `read_config_entry_local` STILL joins
+    // `manifest_root` with `[adapters.<name>.adapter].manifest` and
+    // reads (and prints) the resulting file. Without this gate a
+    // poisoned `manifest = "../../etc/shadow"` would surface as a
+    // diff line rather than an early error.
+    let manifest_root_for_check = ctx
+        .manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for adapter_cfg in ctx.manifest().adapters.values() {
+        if args.local {
+            assert_provision_paths_contained(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        } else {
+            assert_provision_paths_safe(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        }
+    }
+
     run_shared_checks(&ctx)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
@@ -2960,6 +2992,7 @@ name = "demo-app"
 
 [adapters.axum.adapter]
 crate = "crates/demo-axum"
+manifest = "crates/demo-axum/axum.toml"
 
 [adapters.axum.commands]
 build = "echo"

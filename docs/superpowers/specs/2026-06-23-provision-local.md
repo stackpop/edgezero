@@ -201,10 +201,18 @@ local files through it is wired up in the same PR:
    ultimately resolve manifest-relative paths). Push
    only writes local files when `--local` is set, so
    the helper call sits inside the `args.local` arm.
-3. (Existing remote-only entry points -- cloud
-   provision shell-outs, `run_config_diff` read-only --
-   stay unchecked. They don't write through
-   manifest-declared paths.)
+3. `run_config_diff_typed` runs the same containment
+   loop (`--local` uses `assert_provision_paths_contained`;
+   default cloud uses `assert_provision_paths_safe`) BEFORE
+   `run_shared_checks` and before any adapter
+   `read_config_entry` / `read_config_entry_local` dispatch.
+   Read-only is not enough: those adapter reads still join
+   `manifest_root` with `[adapters.<name>.adapter].manifest`
+   and read (and print) the resulting file body. Without
+   this gate a poisoned `manifest = "../../etc/shadow"`
+   would surface as diff output rather than an early error.
+4. (Cloud provision shell-outs stay unchecked past Step 1.
+   They don't write through manifest-declared paths.)
 
 Push and provision import the shared helper from
 `path_safety.rs` so a future check addition lands in both
@@ -1819,15 +1827,21 @@ git ls-files | rg '(^|/)runtime-config\.toml$' && exit 1 || true
 ### Migration for the in-tree `examples/app-demo/`
 
 - The currently-tracked manifests are removed from version control:
+  - `examples/app-demo/crates/app-demo-adapter-axum/axum.toml`
   - `examples/app-demo/crates/app-demo-adapter-fastly/fastly.toml`
   - `examples/app-demo/crates/app-demo-adapter-cloudflare/wrangler.toml`
   - `examples/app-demo/crates/app-demo-adapter-spin/spin.toml`
   - any in-tree `runtime-config.toml` next to the Spin manifest
 - The implementing commit runs `git rm` on each of these files
-  and adds the four patterns to the root `.gitignore` in the same
-  commit so the worktree is clean immediately after.
+  and adds the five patterns to the root `.gitignore` in the same
+  commit so the worktree is clean immediately after. (The 2026-07
+  amendment folded `axum.toml` into the gitignored set alongside
+  the other four adapter manifests; the CI gate at Task 37
+  enforces all five.)
 - The richer per-adapter scaffold remains in the adapter
-  crates' `templates/` directories for `edgezero new`'s use.
+  crates' `templates/` directories for `edgezero new`'s use —
+  except `axum.toml`, whose scaffold template was removed so
+  scaffold-time provision is the single writer.
   For the steady-state dev loop, `provision --local`
   synthesises the concrete files at the same paths from
   `edgezero.toml` primitives via `toml_edit::DocumentMut`

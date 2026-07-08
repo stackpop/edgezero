@@ -8,6 +8,7 @@
 //! each `edgezero-adapter-*` crate's `Adapter::provision` impl, not
 //! here.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
@@ -343,10 +344,13 @@ where
 
     // 2. Base preflight gates — must fire BEFORE any tempdir work
     //    so dry-run can't bypass expensive-mistake protection.
-    //    Real-write inherits these from run_provision's own call
-    //    below; dry-run inlines base+typed inside staging.
-    enforce_single_store_capability(ctx.manifest(), &args.adapter)?;
-    strict_handler_paths(ctx.manifest())?;
+    //    Real-write inherits these from `run_provision_inner`'s
+    //    own call below; dry-run must include ALL three gates
+    //    (capability + handler paths + deployed-field ownership)
+    //    or a manifest that the actual run would reject can slip
+    //    past dry-run and mislead the operator into thinking
+    //    provision will succeed.
+    run_manifest_shape_gates(ctx.manifest(), &args.adapter)?;
 
     // 3. Canonical adapter lookup (case-insensitive on the key).
     //    Clone the canonical spelling so the borrow from
@@ -1059,17 +1063,42 @@ pub(crate) fn render_dry_run_report(
         if old == new {
             continue;
         }
-        // Unified diff with a small context radius (2 lines around
-        // each hunk). Prior implementation used `iter_all_changes()`
-        // which emits the ENTIRE file body with `Equal` markers on
-        // every unchanged line -- a fine visualisation, but for files
-        // like `.dev.vars` / `.env` that the operator fills in with
-        // real secret values, streaming the full pre-image through
-        // `log::info!` on every `provision --local --dry-run` leaks
-        // those values into CI logs, screen recordings, and terminal
-        // scrollback. `unified_diff` scopes the emission to the
-        // changed hunks plus 2 context lines each side.
-        let diff = TextDiff::from_lines(&old, &new);
+        // Env / secret carriage files (`.env`, `.dev.vars`) hold
+        // operator-authored secret values. `context_radius(2)` scopes
+        // context to two lines around each hunk, but if provision
+        // appends new lines at EOF the LAST two pre-existing lines
+        // still surface as unchanged context — which for a
+        // `.dev.vars` populated with real production secrets means
+        // those secrets show up in CI logs, screen recordings, and
+        // terminal scrollback. Redact both sides through a
+        // `KEY=<redacted>` filter for env-shaped paths BEFORE
+        // computing the diff. Comment lines and blank lines pass
+        // through as-is so structural drift is still visible.
+        let is_env_like = is_env_secret_carriage_path(proj_path);
+        let old_render = if is_env_like {
+            redact_env_body_for_diff(&old)
+        } else {
+            old.clone()
+        };
+        let new_render = if is_env_like {
+            redact_env_body_for_diff(&new)
+        } else {
+            new.clone()
+        };
+        if old_render == new_render {
+            // Diff was purely value churn on secret files. Emit a
+            // single line so the operator knows something changed
+            // without leaking the specific keys or values.
+            let path_display = proj_path.display();
+            out.push('\n');
+            out.push_str("--- ");
+            out.push_str(&path_display.to_string());
+            out.push_str("\n+++ ");
+            out.push_str(&path_display.to_string());
+            out.push_str("\n@@ (redacted: env / secret carriage file -- values differ) @@\n");
+            continue;
+        }
+        let diff = TextDiff::from_lines(&old_render, &new_render);
         let path_display = proj_path.display().to_string();
         out.push('\n');
         out.push_str(
@@ -1079,6 +1108,54 @@ pub(crate) fn render_dry_run_report(
                 .header(&path_display, &path_display)
                 .to_string(),
         );
+    }
+    out
+}
+
+/// True when the path is a secret-carriage env file (`.env`,
+/// `.dev.vars`). Match on file NAME only so nested paths like
+/// `.edgezero/.env` and `<spin_crate>/.env` are both covered.
+fn is_env_secret_carriage_path(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(OsStr::to_str),
+        Some(".env" | ".dev.vars")
+    )
+}
+
+/// Rewrite each `KEY=value` line in an env-shaped body as
+/// `KEY=<redacted>`, preserving comment and blank lines verbatim.
+/// Used by `render_dry_run_report` before diffing so a `.env` or
+/// `.dev.vars` never surfaces operator secrets as context in the
+/// unified-diff output. Structural changes (added/removed KEYS,
+/// added comment lines) still show up as normal +/- hunks.
+fn redact_env_body_for_diff(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        // Split off the trailing newline (if any) via char_indices
+        // so we never slice inside a multi-byte codepoint. Env-file
+        // content is normally 7-bit ASCII, but redaction of a
+        // hand-authored operator note that includes UTF-8 must not
+        // panic.
+        let (content, tail) = match line.rfind('\n') {
+            Some(idx) => line.split_at(idx),
+            None => (line, ""),
+        };
+        if content.is_empty() || content.trim_start().starts_with('#') {
+            out.push_str(line);
+            continue;
+        }
+        if let Some((key, _value)) = content.split_once('=') {
+            out.push_str(key);
+            out.push('=');
+            out.push_str("<redacted>");
+            out.push_str(tail);
+        } else {
+            // Malformed line without `=`; emit as-is so the operator
+            // sees the structural anomaly. Not a secret leak: any
+            // real `.env` file uses `KEY=VALUE`, and a stray line
+            // that isn't `KEY=` shape usually can't hold a secret.
+            out.push_str(line);
+        }
     }
     out
 }
@@ -1682,9 +1759,14 @@ adapters = ["axum"]
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
-        // spin.toml with NO [component.*] table.
+        // spin.toml with NO [component.*] table. PROVISION_MANIFEST
+        // declares Spin's manifest at `crates/demo-spin/spin.toml`
+        // (nested inside the crate dir per the 2026-07 strict-local
+        // containment requirement).
+        let spin_manifest = temp.path().join("crates/demo-spin/spin.toml");
+        fs::create_dir_all(spin_manifest.parent().unwrap()).expect("mkdir demo-spin");
         fs::write(
-            temp.path().join("spin.toml"),
+            &spin_manifest,
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n",
         )
         .expect("write empty spin.toml");
@@ -1927,8 +2009,10 @@ ids = ["default"]
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, PROVISION_MANIFEST).expect("write manifest");
+        let spin_manifest = temp.path().join("crates/demo-spin/spin.toml");
+        fs::create_dir_all(spin_manifest.parent().unwrap()).expect("mkdir demo-spin");
         fs::write(
-            temp.path().join("spin.toml"),
+            &spin_manifest,
             "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n",
         )
         .expect("write spin.toml");
@@ -3532,6 +3616,7 @@ name = "demo-app"
 
 [adapters.Axum.adapter]
 crate = "crates/demo-axum"
+manifest = "crates/demo-axum/axum.toml"
 
 [adapters.Axum.commands]
 build = "echo"
@@ -3628,5 +3713,149 @@ ids = ["default"]
             manifest: manifest_path.clone(),
         })
         .expect("case-insensitive arg lookup must succeed");
+    }
+
+    // ---------- H3 regression: dry-run env / secret redaction ----------
+
+    #[test]
+    fn dry_run_diff_redacts_env_values_and_never_leaks_context() {
+        // The pre-2026-07 dry-run renderer emitted the raw `.env`
+        // pre-image around each hunk with a 2-line context radius.
+        // When provision appends new lines at EOF, the LAST two
+        // real operator secret lines surface as unchanged context —
+        // and a real `.env` populated with API_TOKEN=<secret>
+        // leaks the secret into CI logs, screen recordings, and
+        // terminal scrollback.
+        //
+        // The current renderer redacts `KEY=<value>` lines through a
+        // `KEY=<redacted>` filter for env-shaped paths BEFORE
+        // diffing. This regression pins that behaviour: the diff
+        // output MUST NOT contain the raw secret value.
+        let project = TempDir::new().expect("project dir");
+        let staged = TempDir::new().expect("staged dir");
+        let project_env = project.path().join(".edgezero/.env");
+        let staged_env = staged.path().join(".edgezero/.env");
+        fs::create_dir_all(project_env.parent().unwrap()).expect("mkdir project");
+        fs::create_dir_all(staged_env.parent().unwrap()).expect("mkdir staged");
+
+        let secret_value = "sk-live-super-secret-do-not-leak";
+        fs::write(
+            &project_env,
+            format!("# preexisting operator overrides\nAPI_TOKEN={secret_value}\n"),
+        )
+        .unwrap();
+        fs::write(
+            &staged_env,
+            format!(
+                "# preexisting operator overrides\nAPI_TOKEN={secret_value}\nEDGEZERO__STORES__KV__SESSIONS__NAME=sessions\n"
+            ),
+        )
+        .unwrap();
+
+        let allow_list = DryRunAllowList {
+            pairs: vec![(project_env.clone(), staged_env.clone())],
+        };
+        let outcome = adapter_registry::ProvisionOutcome::default();
+        let report = render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome);
+
+        assert!(
+            !report.contains(secret_value),
+            "SECURITY: real .env value leaked into dry-run diff — got: {report}"
+        );
+        assert!(
+            report.contains("API_TOKEN=<redacted>"),
+            "existing KEY=value line must appear in redacted form so structural diff still reads: {report}"
+        );
+        assert!(
+            report.contains("EDGEZERO__STORES__KV__SESSIONS__NAME=<redacted>"),
+            "newly-appended KEY=value line must also be redacted (values never surface): {report}"
+        );
+    }
+
+    #[test]
+    fn dry_run_diff_emits_redacted_placeholder_when_only_values_changed() {
+        // Provision that ONLY rewrites secret values (no structural
+        // change) must show the operator that something changed
+        // without leaking either the old or new value. The renderer
+        // emits a single redacted-header line for that case.
+        let project = TempDir::new().expect("project dir");
+        let staged = TempDir::new().expect("staged dir");
+        let project_env = project.path().join(".dev.vars");
+        let staged_env = staged.path().join(".dev.vars");
+
+        fs::write(&project_env, "API_TOKEN=old-secret\n").unwrap();
+        fs::write(&staged_env, "API_TOKEN=new-secret\n").unwrap();
+
+        let allow_list = DryRunAllowList {
+            pairs: vec![(project_env.clone(), staged_env.clone())],
+        };
+        let outcome = adapter_registry::ProvisionOutcome::default();
+        let report = render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome);
+
+        assert!(!report.contains("old-secret"), "old value leaked: {report}");
+        assert!(!report.contains("new-secret"), "new value leaked: {report}");
+        assert!(
+            report.contains("(redacted:") && report.contains("values differ"),
+            "value-only churn must surface a single redacted-header line: {report}"
+        );
+    }
+
+    #[test]
+    fn dry_run_diff_leaves_non_env_files_unredacted() {
+        // Only `.env` / `.dev.vars` are treated as secret carriage.
+        // Every other file (adapter manifests, JSON config, etc.)
+        // must diff normally so operators can see the actual changes.
+        let project = TempDir::new().expect("project dir");
+        let staged = TempDir::new().expect("staged dir");
+        let project_toml = project.path().join("spin.toml");
+        let staged_toml = staged.path().join("spin.toml");
+
+        fs::write(&project_toml, "name = \"old-name\"\n").unwrap();
+        fs::write(&staged_toml, "name = \"new-name\"\n").unwrap();
+
+        let allow_list = DryRunAllowList {
+            pairs: vec![(project_toml.clone(), staged_toml.clone())],
+        };
+        let outcome = adapter_registry::ProvisionOutcome::default();
+        let report = render_dry_run_report(project.path(), staged.path(), &allow_list, &outcome);
+
+        assert!(
+            report.contains("old-name") && report.contains("new-name"),
+            "non-env file must diff normally without redaction: {report}"
+        );
+    }
+
+    #[test]
+    fn redact_env_body_preserves_comments_and_blank_lines() {
+        let body = "\
+# A comment\n\
+\n\
+API_TOKEN=very-secret-value\n\
+\n\
+# another comment\n\
+DATABASE_URL=postgres://user:pass@host/db\n\
+";
+        let redacted = redact_env_body_for_diff(body);
+        assert!(redacted.contains("# A comment"), "comment preserved");
+        assert!(
+            redacted.contains("# another comment"),
+            "second comment preserved"
+        );
+        assert!(
+            redacted.contains("API_TOKEN=<redacted>"),
+            "value redacted, key preserved: {redacted}"
+        );
+        assert!(
+            redacted.contains("DATABASE_URL=<redacted>"),
+            "value with = in it fully redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains("very-secret-value"),
+            "secret value must not survive: {redacted}"
+        );
+        assert!(
+            !redacted.contains("postgres://"),
+            "value must be replaced entirely (nothing after the first `=`): {redacted}"
+        );
     }
 }

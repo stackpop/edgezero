@@ -26,6 +26,7 @@ name = "demo-app"
 
 [adapters.axum.adapter]
 crate = "crates/demo-axum"
+manifest = "crates/demo-axum/axum.toml"
 [adapters.axum.commands]
 build = "echo"
 deploy = "echo"
@@ -33,7 +34,7 @@ serve = "echo"
 
 [adapters.cloudflare.adapter]
 crate = "crates/demo-cf"
-manifest = "wrangler.toml"
+manifest = "crates/demo-cf/wrangler.toml"
 
 [adapters.cloudflare.commands]
 build = "echo"
@@ -42,7 +43,7 @@ serve = "echo"
 
 [adapters.fastly.adapter]
 crate = "crates/demo-fastly"
-manifest = "fastly.toml"
+manifest = "crates/demo-fastly/fastly.toml"
 
 [adapters.fastly.commands]
 build = "echo"
@@ -51,7 +52,7 @@ serve = "echo"
 
 [adapters.spin.adapter]
 crate = "crates/demo-spin"
-manifest = "spin.toml"
+manifest = "crates/demo-spin/spin.toml"
 [adapters.spin.commands]
 build = "echo"
 deploy = "echo"

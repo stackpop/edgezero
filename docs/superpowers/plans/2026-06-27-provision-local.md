@@ -4519,6 +4519,7 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
 
 - Modify: root `.gitignore`
 - Delete (via `git rm --cached`):
+  - `examples/app-demo/crates/app-demo-adapter-axum/axum.toml`
   - `examples/app-demo/crates/app-demo-adapter-fastly/fastly.toml`
   - `examples/app-demo/crates/app-demo-adapter-cloudflare/wrangler.toml`
   - `examples/app-demo/crates/app-demo-adapter-spin/spin.toml`
