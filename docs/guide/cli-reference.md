@@ -311,12 +311,29 @@ file is the adapter's `synthesise_baseline_manifest` (no scaffold
 
 **`--local` per-adapter behaviour:**
 
-| `--adapter`  | Behaviour under `--local`                                                                                                                                                                                                                                                                                                   |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `axum`       | Synthesises `axum.toml` if missing (`crate` / `crate_dir` / `host` / `port` defaults) and writes `.edgezero/.env` with a `#[secret]` placeholder line per declared field so `run_serve` can source it. Merge path is a no-op on existing `axum.toml` (operator edits survive).                                              |
-| `cloudflare` | Synthesises `wrangler.toml` if missing and merges `[[kv_namespaces]]` bindings per declared KV / config id. Writes `.dev.vars` with `#[secret]` placeholders (the file `wrangler dev` reads for secret variables).                                                                                                          |
-| `fastly`     | Synthesises `fastly.toml` if missing and merges `[local_server.kv_stores.*]` + `[local_server.config_stores.*]` tables per declared id (Viceroy state — `[setup.*]` belongs to cloud provision). Writes `[[local_server.secret_stores.<store_id>]]` entries with `#[secret]` placeholders so Viceroy resolves them locally. |
-| `spin`       | Synthesises `spin.toml` + `runtime-config.toml` if missing, merges `key_value_stores` labels into the resolved `[component.<id>]`, and appends `[variables]` + `SPIN_VARIABLE_<NAME>` placeholder lines to `<spin_crate>/.env`. Operator edits to `[variables]` stay local until hand-shared.                               |
+`provision --local` has TWO layers, and this table splits them so
+operators know which entry point emits which side effects:
+
+- **Base (bundled `edgezero provision --local`)** synthesises
+  adapter manifests when missing, merges per-store bindings, and
+  writes the runtime env-label lines (`EDGEZERO__STORES__<KIND>__<ID>__NAME`
+  values) that the runtime needs to resolve stores. It does NOT
+  emit `#[secret]` / `[variables]` / `SPIN_VARIABLE_*` placeholders
+  — the bundled binary has no downstream typed app-config to walk.
+- **Typed (downstream `<app>-cli provision --local`, which routes
+  through `run_provision_typed::<AppConfig>`)** runs base first,
+  then additionally emits per-secret placeholder lines derived
+  from your typed `AppConfig`'s `#[secret]` / `#[secret(store_ref)]`
+  fields. The generated CLI dispatches this because it owns the
+  concrete `AppConfig` type; the bundled `edgezero` binary
+  intentionally does not.
+
+| `--adapter`  | Base `provision --local`                                                                                                                                                                                                                                                          | Typed additions (via `<app>-cli`)                                                                                                                                                      |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `axum`       | Synthesises `axum.toml` if missing (`crate` / `crate_dir` / `host` / `port` defaults) and writes `.edgezero/.env` with the `__NAME` env-label lines per declared store id so `run_serve` can source them. Merge path is a no-op on existing `axum.toml` (operator edits survive). | Appends `<key_value>=` placeholder lines to `.edgezero/.env` — one per `#[secret]` field on `AppConfig`.                                                                               |
+| `cloudflare` | Synthesises `wrangler.toml` if missing and merges `[[kv_namespaces]]` bindings per declared KV / config id.                                                                                                                                                                       | Writes `.dev.vars` with `<key_value>=""` placeholders — one per `#[secret]` field (the file `wrangler dev` reads for secret variables).                                                |
+| `fastly`     | Synthesises `fastly.toml` if missing and merges `[local_server.kv_stores.*]` + `[local_server.config_stores.*]` tables per declared id (Viceroy state — `[setup.*]` belongs to cloud provision).                                                                                  | Appends `[[local_server.secret_stores.<store_id>]]` entries — one per `#[secret]` field — so Viceroy resolves them locally.                                                            |
+| `spin`       | Synthesises `spin.toml` + `runtime-config.toml` if missing and merges `key_value_stores` labels into the resolved `[component.<id>]`.                                                                                                                                             | Appends lowercased `[variables]` + `[component.<id>.variables]` entries in `spin.toml` and `SPIN_VARIABLE_<NAME>` placeholder lines in `<spin_crate>/.env`. Operator edits stay local. |
 
 **`--dry-run`** works with either form: without `--local` it does
 not invoke any native CLI and does not edit the adapter manifest;

@@ -3492,23 +3492,38 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 - [ ] **Step 1: Write the failing tests**
 
   ```rust
+  // 2026-07 amendment: the synth's FIRST positional argument is the
+  // CARGO PACKAGE NAME (read from the adapter crate's `Cargo.toml`
+  // `[package].name` by the caller in `cli/mod.rs` via
+  // `cli_support::read_adapter_crate_name`), NOT `[app].name`.
+  // The wasm source path is derived from THIS value, never from
+  // the operator's Spin component selector — Cargo names the
+  // artifact after the package regardless of runtime dispatch.
   #[test]
-  fn synthesises_spin_toml_uses_app_name_when_component_unset() {
-      let out = synthesise_spin_toml("demo", None);
+  fn synthesises_spin_toml_uses_crate_name_when_component_unset() {
+      let out = synthesise_spin_toml("demo-adapter-spin", None);
       assert!(out.starts_with("# edgezero-provision: v1"));
       assert!(out.contains("spin_manifest_version = 2"));
-      assert!(out.contains(r#"name = "demo""#));
-      assert!(out.contains(r#"component = "demo""#));
-      assert!(out.contains("[component.demo]"));
+      assert!(out.contains(r#"name = "demo-adapter-spin""#));
+      assert!(out.contains(r#"component = "demo-adapter-spin""#));
+      assert!(out.contains("[component.demo-adapter-spin]"));
+      assert!(out.contains("/release/demo_adapter_spin.wasm"));
   }
 
   #[test]
   fn synthesises_spin_toml_honors_component_selector() {
-      let out = synthesise_spin_toml("demo", Some("worker"));
+      // Component selector reroutes the trigger and section keys...
+      let out = synthesise_spin_toml("demo-adapter-spin", Some("worker"));
       assert!(out.contains(r#"component = "worker""#));
       assert!(out.contains("[component.worker]"));
-      // wasm path matches the component id, not the app name:
-      assert!(out.contains("/release/worker.wasm"));
+      // ...but wasm basename ALWAYS follows the Cargo package,
+      // never the component id (Cargo produces
+      // `<package_name_underscored>.wasm` regardless of the Spin
+      // runtime selector). And `[application].name` also stays
+      // pinned to the crate name.
+      assert!(out.contains("/release/demo_adapter_spin.wasm"));
+      assert!(out.contains(r#"name = "demo-adapter-spin""#));
+      assert!(!out.contains("/release/worker.wasm"));
   }
 
   #[test]
@@ -3526,10 +3541,20 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
 - [ ] **Step 3: Implement**
 
   ```rust
-  pub(crate) fn synthesise_spin_toml(app_name: &str, component: Option<&str>) -> String {
+  // First arg is `crate_name`, NOT `app_name` — the caller in
+  // `cli/mod.rs` resolves it from
+  // `<manifest_root>/<adapter_manifest_path>/../.../Cargo.toml`
+  // (walking upward for nested manifests) via
+  // `cli_support::read_adapter_crate_name`.
+  pub(crate) fn synthesise_spin_toml(crate_name: &str, component: Option<&str>) -> String {
       use toml_edit::{array, table, value, Array, ArrayOfTables, DocumentMut, Table};
-      let component_id = component.unwrap_or(app_name);
-      let component_under = component_id.replace('-', "_");
+      let component_id = component.unwrap_or(crate_name);
+      // Wasm basename tracks the CARGO PACKAGE, not the component
+      // selector. Cargo produces `<package_name_underscored>.wasm`;
+      // deriving the source path from `component_id` would silently
+      // mispoint on any project where the operator's Spin selector
+      // differs from the Cargo package name.
+      let crate_name_under = crate_name.replace('-', "_");
 
       let mut doc = DocumentMut::new();
       doc.decor_mut()
@@ -3537,7 +3562,9 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
       doc["spin_manifest_version"] = value(2);
 
       let application = doc["application"].or_insert(table());
-      application["name"] = value(app_name);
+      // [application].name IS the Cargo package name — the app's
+      // identity lines up with the artifact Cargo emits.
+      application["name"] = value(crate_name);
       application["version"] = value("0.1.0");
 
       // [[trigger.http]] is an array-of-tables; build via
@@ -3562,7 +3589,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
           .expect("component must be a table");
       let mut comp = Table::new();
       comp["source"] = value(format!(
-          "../../target/wasm32-wasip2/release/{component_under}.wasm"
+          "../../target/wasm32-wasip2/release/{crate_name_under}.wasm"
       ));
       comp["key_value_stores"] = value(Array::new());
       component_table.insert(component_id, toml_edit::Item::Table(comp));
@@ -3578,7 +3605,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   }
   ```
 
-  Add Spin pathological-name tests: `synthesise_spin_toml_escapes_pathological_app_names` AND `synthesise_spin_toml_escapes_pathological_component_id` (the component id flows into BOTH the `component = "..."` value AND the `[component.<id>]` key — both must round-trip cleanly).
+  Add Spin pathological-name tests: `synthesise_spin_toml_escapes_pathological_crate_names` (verifies `[application].name` round-trips through toml_edit for exotic Cargo package names) AND `synthesise_spin_toml_escapes_pathological_component_id` (the component id flows into BOTH the `component = "..."` value AND the `[component.<id>]` key — both must round-trip cleanly).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -4885,14 +4912,14 @@ The spec gitignores FIVE manifest filenames: `axum.toml`, `fastly.toml`, `spin.t
       fi
   ```
 
-  The regex matches the four generated manifests AND `.dev.vars` -- aligning with the gitignore entries from Task 33 and the spec's downstream migration runbook. Without `.dev.vars` in the CI gate, an operator who accidentally `git add`'d their `.dev.vars` after editing real secret values would push the secrets to the remote unflagged.
+  The regex matches all five generated manifests AND `.dev.vars` -- aligning with the gitignore entries from Task 33 and the spec's downstream migration runbook. Without `.dev.vars` in the CI gate, an operator who accidentally `git add`'d their `.dev.vars` after editing real secret values would push the secrets to the remote unflagged.
 
 - [ ] **Step 2: Verify the step is present**
 
-  Run: `yq '.jobs.test.steps[] | select(.name == "Enforce Cloudflare/Fastly/Spin manifests and .dev.vars are not tracked")' .github/workflows/test.yml`
+  Run: `yq '.jobs.test.steps[] | select(.name == "Enforce adapter manifests and .dev.vars are not tracked")' .github/workflows/test.yml`
   Expected: the step is present.
 
-- [ ] **Step 3: Sanity-check the regex matches the five targets but NOT `axum.toml`**
+- [ ] **Step 3: Sanity-check the regex matches ALL five manifests (including `axum.toml`) + `.dev.vars`**
 
   Run locally:
 
@@ -4913,7 +4940,7 @@ The spec gitignores FIVE manifest filenames: `axum.toml`, `fastly.toml`, `spin.t
 
   ```bash
   git add .github/workflows/test.yml
-  git commit -m "CI: gate fastly/spin/wrangler/runtime-config.toml + .dev.vars (axum.toml exempt)"
+  git commit -m "CI: gate axum/fastly/spin/wrangler/runtime-config.toml + .dev.vars against tracking"
   ```
 
 ---
