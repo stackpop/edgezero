@@ -448,9 +448,11 @@ in the `cli.rs` test module.
 - **Sibling coexistence preserved**: a push of `app_config` must not
   remove `app_config_staging` chunk keys (Spec 12.7 coexistence).
 - **Suspicious prior pointer (real push)**: seed the root with a
-  pointer-kind-but-invalid value (e.g. `version: 2`); a real local push
-  of a new config returns a suspicious-pointer warning, deletes no chunk
-  keys as a side effect, and still writes the new value.
+  pointer-kind-but-invalid value (e.g. `version: 2`) **and** pre-seed
+  real chunk-like keys under the root namespace (so "no deletes" is
+  non-vacuous); a real local push of a new config returns a
+  suspicious-pointer warning, leaves the pre-seeded chunk keys present,
+  and still writes the new value.
 - **Reserved key rejected**: `push_config_entries_local` with a logical
   key containing `.__edgezero_chunks.` returns `Err` before touching
   `fastly.toml` (file unchanged / not created).

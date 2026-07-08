@@ -248,7 +248,11 @@ fn expand_root(root_key: &str, body: &str) -> Result<(Vec<(String, String)>, Has
     let expanded = prepare_fastly_config_entries(root_key, body)?;
     let new_keys: HashSet<String> = expanded.iter().map(|(k, _)| k.clone()).collect();
     // prepare_* always emits the root entry LAST (root pointer or direct value).
-    let new_root_value = expanded.last().map(|(_, v)| v.clone()).unwrap_or_default();
+    // Make the invariant explicit rather than silently defaulting to "".
+    let new_root_value = expanded
+        .last()
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| format!("internal: no physical entries produced for root `{root_key}`"))?;
     Ok((expanded, new_keys, new_root_value))
 }
 
@@ -269,7 +273,7 @@ fn reject_reserved_root_keys(entries: &[(String, String)]) -> Result<(), String>
     for (key, _) in entries {
         if key.contains(CHUNK_KEY_INFIX) {
             return Err(format!(
-                "config key `{key}` contains the reserved infix `{CHUNK_KEY_INFIX}`, which collides with Fastly chunk storage; choose a different --key"
+                "config key `{key}` contains the reserved infix `{CHUNK_KEY_INFIX}`, which collides with Fastly chunk storage; choose a different config key (or --key override)"
             ));
         }
     }
@@ -411,11 +415,14 @@ assert!(combined.contains("unknown: suspicious prior pointer"));
 - [ ] **Step 3c: Add local suspicious-pointer real-push test (spec §"local")**
 
 Seed `fastly.toml` so the root holds a pointer-kind-but-invalid value
-(e.g. `{"edgezero_kind":"fastly_config_chunks","version":2}`), then run a
-REAL (non-dry-run) local push of a new config. Assert:
+(e.g. `{"edgezero_kind":"fastly_config_chunks","version":2}`) **and**
+seed one or more real chunk-like entries under the root's namespace
+(keys containing `.__edgezero_chunks.`) so the "no deletes" assertion is
+non-vacuous. Then run a REAL (non-dry-run) local push of a new config.
+Assert:
 - the returned status `Vec<String>` contains a suspicious-pointer warning,
-- no chunk keys were removed as a side effect (the writer must not delete
-  when `prior_chunk_keys` returns `Err`),
+- **the pre-seeded chunk-like keys are still present** (the writer must
+  not prune when `prior_chunk_keys` returns `Err`),
 - the new value is written to the root key.
 
 - [ ] **Step 3d: Add reserved-key rejection test (local)**
