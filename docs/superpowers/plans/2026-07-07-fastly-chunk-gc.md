@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, `serde_json`, `toml_edit`, existing Fastly CLI shell-out helpers, existing fake-`fastly` test shims, `cargo test -p edgezero-adapter-fastly --features cli`.
 
-**Precondition (gate):** Cloud GC is **single-writer, best-effort** — it is safe only when pushes to a given config store are serialized. The post-commit read-back guard narrows but does not close the concurrent-push window (Fastly has no compare-and-delete). Do NOT start this plan unless the team accepts that concurrent cloud pushes are unsupported for GC purposes. If strict concurrent-push safety is required, stop and redesign around an offline, lease-guarded `config gc` (the deferred non-goal) instead. See the spec's "Concurrency model".
+**Concurrency model — last-writer-wins:** Concurrent cloud pushes are **supported**. The root pointer is `update --upsert`, so the last write wins on the config value. GC obeys LWW via the post-commit read-back guard: a push reclaims prior chunks only while it is still the last writer of the root (read-back == what it wrote), otherwise it **yields** and deletes nothing — so a superseded push never deletes the winner's live chunks. The guard narrows but does not fully close the window (Fastly has no compare-and-delete), making GC best-effort under LWW, not transactional. No blocking precondition. See the spec's "Concurrency model: last-writer-wins".
 
 ---
 
@@ -921,6 +921,6 @@ git commit -m "test(fastly): verify chunk gc behavior"
 - Use exact `toml_edit::Table` key operations for local dotted chunk keys.
 - If a push commit fails, do not sweep anything. The old root pointer may still be live.
 - If GC fails, return `Ok` with warning status lines. The push success criterion remains new entries committed.
-- Cloud GC assumes a **single writer** per config store (serialized pushes). The post-commit read-back guard removes the common revert-before-read-back race but NOT the read-back-then-revert interleaving — Fastly has no compare-and-delete. This is best-effort by design (spec "Concurrency model"); do not represent cloud GC as strictly concurrent-safe.
+- Cloud GC follows **last-writer-wins** (spec "Concurrency model: last-writer-wins"): concurrent pushes are supported; the last root-pointer write wins on the value. A push sweeps prior chunks only while the post-commit read-back shows it is still the last writer, else it yields. The guard removes the common race but not the read-back-then-supersede interleaving (no compare-and-delete) — best-effort, not transactional; don't represent it as strictly concurrent-safe.
 - Cloud GC costs: one pre-push `describe` per root, plus one post-commit read-back `describe` per root that has orphans, plus one `fastly` `delete` process per orphan (sequential). A 50-chunk prior generation ≈ 50 sequential deletes. Fastly has no bulk delete-by-key (`--all` is store-wide and unusable); do not add parallel spawns in v1 without measuring.
 - Line numbers in this plan are approximate anchors against `main`; `grep` the named function/test before editing, since prior edits shift offsets.

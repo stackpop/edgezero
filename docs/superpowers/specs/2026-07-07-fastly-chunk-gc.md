@@ -91,7 +91,8 @@ pointer no longer does.
   therefore every chunk key; but the set-difference is the correct,
   idempotent formulation (a re-push of *identical* bytes re-derives the
   same keys and deletes nothing). "Idempotent" here is about re-pushing
-  the same bytes, NOT concurrency safety — see the Concurrency model.
+  the same bytes, NOT concurrency safety — see "Concurrency model:
+  last-writer-wins".
 
 ## Invariants (MUST)
 
@@ -133,46 +134,49 @@ pointer no longer does.
    warning folded into the returned status lines; the push still
    reports success. A leaked chunk is harmless; a failed push is not.
 
-5. **Cloud deletes are guarded by a post-commit root read-back
-   (mitigation, not a guarantee).** A concurrent push could overwrite
-   the root between our commit and our sweep — e.g. revert it to the
-   prior pointer, making the "orphans" live again. So before deleting a
-   root's orphans, cloud GC re-reads the raw root and proceeds only if
-   it still equals *exactly* the value this push wrote (`new_root_value`).
-   If it differs (or the re-read fails), GC is skipped for that root with
-   a warning. This shrinks the window but does NOT close it: Fastly has
-   no compare-and-delete, so an interleaving push can still restore the
-   prior pointer *after* our read-back passes but *before* our deletes
-   run, causing a live delete (see Concurrency model). The local path
-   holds the whole file in one in-memory rewrite and has no equivalent
-   remote-concurrency window.
+5. **Cloud deletes obey last-writer-wins via a post-commit read-back.**
+   A push reclaims a root's prior chunks only while it is still the last
+   writer of that root. After committing, cloud GC re-reads the raw root
+   and deletes only if it still equals *exactly* what this push wrote
+   (`new_root_value`); if a newer push has superseded it (root differs)
+   or the re-read fails, GC **yields** — deletes nothing, warns, moves
+   on. This keeps a superseded push from deleting the winner's live
+   chunks. The guard narrows but does not fully close the window (Fastly
+   has no compare-and-delete); see "Concurrency model: last-writer-wins"
+   for the residual and its bounded impact. The local path holds the
+   whole file in one in-memory rewrite and has no remote-concurrency
+   window.
 
-## Concurrency model
+## Concurrency model: last-writer-wins
 
-**Cloud GC assumes a single writer per config store** — i.e. pushes to a
-given store are serialized (one operator, or a CI pipeline that does not
-run overlapping `config push` jobs against the same store). Under that
-assumption the read-back guard (invariant 5) makes cloud GC safe: after
-we write our root and confirm it on read-back, nothing else changes it,
-so its orphans are genuinely dead.
+The config value follows **last-writer-wins (LWW)**. The root key is a
+single Config Store entry and `update --upsert` means the push whose
+root pointer lands *last* defines the live config. Concurrent pushes to
+the same store are **supported** under this semantic — no single-writer
+assumption, no lock, no blocking precondition.
 
-Under **concurrent** writers, cloud GC is **best-effort and not
-strictly safe**. Fastly Config Store exposes no compare-and-delete or
-lock, so there is a residual interleaving — push A commits B and its
-read-back passes, then push C reverts the root to the prior pointer A,
-then A's deletes run and remove chunks that are live again for C. The
-read-back guard removes the *common* revert-before-read-back case but
-cannot remove this one. The impact is bounded to a specific config
-store's chunk data; it never affects other stores or the root pointer
-itself, and the immediately-following read will surface the integrity
-error (missing/again-orphaned chunk) rather than serving wrong data.
+GC layers onto LWW with one rule: **a push reclaims prior-generation
+chunks only while it is still the last writer of the root.** That is
+exactly what the invariant-5 read-back checks — after committing, the
+push re-reads the root and sweeps only if it still equals what the push
+wrote (`new_root_value`). If a newer push has superseded it (the root
+now differs), the push **yields**: it deletes nothing and lets the new
+last writer own reclamation. This is what keeps LWW honest — a
+superseded (losing) push never deletes the *winner's* live chunks, so
+the winner's config stays readable.
 
-If strict concurrent-push safety is ever required, the design must
-change: stop deleting inline and move all reclamation to an offline,
-lease-guarded `config gc` command (the deferred non-goal), or introduce
-an external lock around push. That is out of scope for v1, which ships
-GC as a single-writer, best-effort convenience. **Do not begin
-implementation unless the team accepts this single-writer assumption.**
+Best-effort boundary (stated honestly): the read-back narrows but does
+not fully close the window, because Fastly exposes no compare-and-delete.
+A newer push can still supersede us *between* our read-back and an
+individual delete, so in a rare interleaving a losing push can delete a
+chunk the new winner references. The blast radius is one store's chunk
+data — never another store, never the root pointer. The next read of
+that config then surfaces an integrity error (missing chunk) rather than
+serving wrong data, and re-pushing the winning config restores it
+(chunks are written before the pointer). GC is therefore a best-effort
+reclaimer under LWW, not a transactional one. If that residual ever
+matters, the deferred `config gc` non-goal is the path to fully
+lease-guarded reclamation.
 
 ## `prior_chunk_keys` helper (`chunked_config.rs`)
 
