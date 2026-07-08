@@ -374,21 +374,24 @@ impl Adapter for FastlyCliAdapter {
                 "no config entries to push to fastly config-store `{name}` (logical id `{logical}`)"
             )]);
         }
-        // Expand each logical (key, envelope_json) into physical entries
-        // via the chunk-pointer helper. Entries ≤ 8 000 chars go through
-        // as a single direct entry; larger envelopes are split into
-        // content-addressed chunks with a root pointer written LAST.
-        // Collect all physical entries before any writes so pointer-too-
-        // large errors surface before touching the remote store.
+        // Reject reserved keys before any expansion or I/O.
+        reject_reserved_root_keys(entries)?;
+        // Expand each logical root once: flatten for the commit, and keep
+        // the exact per-root keep-set + the value written at the root key
+        // for GC (no prefix scan of the flattened set). Collecting all
+        // physical entries first also surfaces pointer-too-large errors
+        // before touching the remote store.
         let mut physical_entries: Vec<(String, String)> = Vec::new();
+        let mut roots: Vec<(String, HashSet<String>, String)> = Vec::with_capacity(entries.len());
         for (key, body) in entries {
-            let expanded = prepare_fastly_config_entries(key, body)?;
+            let (expanded, new_keys, new_root_value) = expand_root(key, body)?;
             physical_entries.extend(expanded);
+            roots.push((key.clone(), new_keys, new_root_value));
         }
         if dry_run {
-            // Report intent without shelling out. One line per logical key
-            // noting whether it would be direct or chunked, plus chunk count.
-            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            // Report intent without shelling out. Stays fully offline: no
+            // store-id resolution, no remote read (so no GC count).
+            let mut out = Vec::with_capacity(entries.len().saturating_mul(2).saturating_add(1));
             out.push(format!(
                 "would resolve fastly config-store `{name}` (logical id `{logical}`) via `fastly config-store list --json` and push entries:"
             ));
@@ -407,18 +410,77 @@ impl Adapter for FastlyCliAdapter {
                         body.len()
                     ));
                 }
+                out.push(format!(
+                    "  would delete orphaned prior-generation chunks of `{key}` (count determined at push time)"
+                ));
             }
             return Ok(out);
         }
         let resolved_id = resolve_remote_config_store_id(name)?;
+        // Build GC plans BEFORE the commit: read each root's prior value so
+        // we know which chunks the old pointer referenced.
+        let mut gc_plans: Vec<FastlyConfigGcPlan> = Vec::with_capacity(roots.len());
+        for (root_key, new_keys, new_root_value) in roots {
+            let prior_keys = match fetch_remote_config_store_entry(&resolved_id, &root_key) {
+                Ok(Some(raw)) => prior_chunk_keys(&root_key, &raw),
+                Ok(None) => Ok(Vec::new()),
+                Err(err) => Err(format!(
+                    "failed to read prior root `{root_key}` for chunk GC: {err}; skipping GC for this root"
+                )),
+            };
+            gc_plans.push(FastlyConfigGcPlan {
+                root_key,
+                prior_keys,
+                new_keys,
+                new_root_value,
+            });
+        }
+        // Commit all physical entries (each root's chunks first, its root
+        // pointer last).
         push_entries_with_committer(&physical_entries, |key, value| {
             create_config_store_entry(&resolved_id, key, value)
         })?;
-        Ok(vec![format!(
+        // Post-commit sweep, last-writer-wins: delete a root's orphans only
+        // while a read-back confirms the root still holds exactly what we
+        // wrote. If a newer push has superseded it, yield (delete nothing).
+        let mut warnings = Vec::new();
+        for plan in &gc_plans {
+            let orphans = match orphan_chunk_keys(plan) {
+                Ok(keys) if !keys.is_empty() => keys,
+                Ok(_) => continue,
+                Err(err) => {
+                    warnings.push(format!("warning: {err}"));
+                    continue;
+                }
+            };
+            match fetch_remote_config_store_entry(&resolved_id, &plan.root_key) {
+                Ok(Some(current)) if current == plan.new_root_value => {
+                    for key in orphans {
+                        if let Err(err) = delete_config_store_entry(&resolved_id, &key) {
+                            warnings.push(format!(
+                                "note: could not reclaim orphan chunk `{key}` for `{}` ({err}); it is inert and will be removed by a future `config gc`",
+                                plan.root_key
+                            ));
+                        }
+                    }
+                }
+                Ok(_) => warnings.push(format!(
+                    "note: skipped chunk GC for `{}`: root changed since this push wrote it (concurrent push?); orphans left for a future `config gc`",
+                    plan.root_key
+                )),
+                Err(err) => warnings.push(format!(
+                    "note: skipped chunk GC for `{}`: could not re-read root before sweep ({err}); orphans left for a future `config gc`",
+                    plan.root_key
+                )),
+            }
+        }
+        let mut out = vec![format!(
             "pushed {} physical entries ({} logical) to fastly config-store `{name}` (logical id `{logical}`, id={resolved_id})",
             physical_entries.len(),
             entries.len()
-        )])
+        )];
+        out.extend(warnings);
+        Ok(out)
     }
 
     fn push_config_entries_local(
@@ -1291,6 +1353,46 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
         "`fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+/// Shell `fastly config-store-entry delete --store-id=<id> --key=<key>
+/// --auto-yes` for a single orphan chunk. Only ever passes `--key`: the
+/// subcommand also accepts `-a/--all`, which wipes EVERY entry in the
+/// store — never construct that flag here. `--auto-yes` suppresses the
+/// interactive confirmation. A "not found" / "does not exist" / "404"
+/// stderr is treated as success (the entry is already gone).
+fn delete_config_store_entry(store_id: &str, key: &str) -> Result<(), String> {
+    let store_arg = format!("--store-id={store_id}");
+    let key_arg = format!("--key={key}");
+    let output = Command::new("fastly")
+        .args([
+            "config-store-entry",
+            "delete",
+            store_arg.as_str(),
+            key_arg.as_str(),
+            "--auto-yes",
+        ])
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to spawn `fastly`: {err}")
+            }
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lower = stderr.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("does not exist") || lower.contains("404") {
+        return Ok(());
+    }
+    Err(format!(
+        "`fastly config-store-entry delete --store-id={store_id} --key={key} --auto-yes` exited with status {}\nstderr: {}",
+        output.status,
+        stderr.trim()
     ))
 }
 
@@ -2483,10 +2585,14 @@ build = \"cargo build --release\"
                 true,
             )
             .expect("dry-run succeeds");
-        // First line names the resolve+publish flow; subsequent lines preview
-        // each key the push would create (so callers can eyeball the keyset
-        // before running for real).
-        assert_eq!(out.len(), 1 + entries.len(), "header + per-entry preview");
+        // First line names the resolve+publish flow; then per key a preview
+        // line plus an offline GC-intent line (so callers can eyeball the
+        // keyset before running for real).
+        assert_eq!(
+            out.len(),
+            1 + entries.len() * 2,
+            "header + per-entry preview + per-entry GC-intent"
+        );
         assert!(
             out[0].contains("would resolve fastly config-store `app_config`")
                 && out[0].contains("push entries"),
@@ -3008,6 +3114,360 @@ build = \"cargo build --release\"
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod");
         fake_dir
+    }
+
+    /// Fake `fastly` for cloud chunk-GC tests. Logs each
+    /// `config-store-entry` op ("describe <key>" / "update <key>" /
+    /// "delete <key>") to `oplog`, one per line. `root_describe_seq`
+    /// gives the successive raw `item_value`s returned when the ROOT key
+    /// is described (call 1 = prior read, call 2 = read-back guard);
+    /// exhausting the sequence yields "not found". `fail_delete_key`
+    /// makes that one delete exit non-zero.
+    #[cfg(unix)]
+    fn fake_fastly_gc(
+        root_key: &str,
+        root_describe_seq: &[String],
+        fail_delete_key: Option<&str>,
+        oplog: &Path,
+    ) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().expect("tempdir");
+        let list_file = dir.path().join("list.json");
+        fs::write(
+            &list_file,
+            format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#),
+        )
+        .expect("list");
+        for (i, value) in root_describe_seq.iter().enumerate() {
+            let wrapped = format!(
+                r#"{{"item_value":{}}}"#,
+                serde_json::to_string(value).expect("escape")
+            );
+            fs::write(
+                dir.path().join(format!("resp_{root_key}_{}.json", i + 1)),
+                wrapped,
+            )
+            .expect("resp");
+        }
+        let template = r#"#!/bin/sh
+if [ "$1" = "config-store" ]; then cat '@LIST@'; exit 0; fi
+sub="$2"
+key=""
+for arg in "$@"; do case "$arg" in --key=*) key="${arg#--key=}";; esac; done
+if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '@OPLOG@'; exit 0; fi
+if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '@OPLOG@'; if [ "$key" = "@FAIL@" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
+if [ "$sub" = "describe" ]; then
+  printf 'describe %s\n' "$key" >> '@OPLOG@'
+  cfile='@DIR@/count_'"$key"
+  n=0; [ -f "$cfile" ] && n=$(cat "$cfile"); n=$((n+1)); printf '%s' "$n" > "$cfile"
+  rf='@DIR@/resp_'"$key"'_'"$n"'.json'
+  if [ -f "$rf" ]; then cat "$rf"; exit 0; fi
+  echo 'Error: item not found' >&2; exit 1
+fi
+echo 'unexpected' >&2; exit 1
+"#;
+        let script = template
+            .replace("@LIST@", &list_file.display().to_string())
+            .replace("@OPLOG@", &oplog.display().to_string())
+            .replace("@DIR@", &dir.path().display().to_string())
+            .replace("@FAIL@", fail_delete_key.unwrap_or(""));
+        let sp = dir.path().join("fastly");
+        fs::write(&sp, script).expect("script");
+        let mut perms = fs::metadata(&sp).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&sp, perms).expect("chmod");
+        dir
+    }
+
+    /// Split a chunked envelope into (chunk keys, root pointer value).
+    #[cfg(unix)]
+    fn chunked_parts(root_key: &str, envelope: &str) -> (Vec<String>, String) {
+        let entries = prepare_fastly_config_entries(root_key, envelope).expect("expand");
+        let (_, pointer) = entries.last().expect("pointer").clone();
+        let chunk_keys = entries[..entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
+        (chunk_keys, pointer)
+    }
+
+    #[cfg(unix)]
+    fn oplog_has(oplog: &Path, line: &str) -> bool {
+        fs::read_to_string(oplog)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l == line)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_deletes_prior_chunks_and_keeps_new() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "z".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:03Z".to_owned()))
+                .expect("B")
+        };
+        let (a_chunks, a_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_a);
+        let (b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
+
+        // describe#1 = prior A pointer; describe#2 (read-back) = new B pointer.
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[a_pointer, b_pointer], None, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must succeed");
+
+        // Every prior A-chunk is deleted; the root and new B-chunks are not.
+        for key in &a_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "prior chunk `{key}` must be deleted; log:\n{}",
+                fs::read_to_string(&oplog).unwrap_or_default()
+            );
+        }
+        assert!(
+            !oplog_has(&oplog, &format!("delete {TEST_CONFIG_ID}")),
+            "root pointer must never be deleted"
+        );
+        for key in &b_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "new chunk `{key}` must not be deleted"
+            );
+        }
+        // Deletes happen strictly after the root-pointer update (commit).
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        let root_update = log
+            .lines()
+            .position(|l| l == format!("update {TEST_CONFIG_ID}"))
+            .expect("root update logged");
+        let first_delete = log
+            .lines()
+            .position(|l| l.starts_with("delete "))
+            .expect("a delete logged");
+        assert!(
+            first_delete > root_update,
+            "deletes must follow the root update; log:\n{log}"
+        );
+        assert!(out[0].contains("pushed"), "summary present: {out:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_skips_gc_when_root_changed() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "q".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:04Z".to_owned()))
+                .expect("B")
+        };
+        let (_a_chunks, a_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_a);
+
+        // Read-back returns the OLD A pointer (a concurrent push reverted the
+        // root), which differs from what this push wrote -> GC yields.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[a_pointer.clone(), a_pointer],
+            None,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must succeed");
+
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|l| l.starts_with("delete ")),
+            "no deletes when the root changed under us; log:\n{log}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("root changed")),
+            "must warn that GC was skipped: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_rejects_reserved_key() {
+        let dir = tempdir().expect("tempdir");
+        let bad_key = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        let err = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(bad_key.clone(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("reserved key must be rejected");
+        assert!(err.contains(&bad_key), "names the key: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_dry_run_reports_gc_intent_offline() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        // No fake on PATH: a dry-run must not shell out to fastly at all.
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                true,
+            )
+            .expect("dry-run must not error");
+        assert!(
+            out.iter()
+                .any(|l| l.contains("would delete orphaned prior-generation chunks")),
+            "dry-run reports GC intent: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_no_prior_issues_no_deletes() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        // Empty describe sequence => root not found => no prior chunks.
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], None, &oplog);
+        let _path = PathPrepend::new(fake.path());
+        FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|l| l.starts_with("delete ")),
+            "no prior => no deletes; log:\n{log}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_delete_failure_warns_but_succeeds() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "w".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:05Z".to_owned()))
+                .expect("B")
+        };
+        let (a_chunks, a_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_a);
+        let (_b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
+        let fail_key = a_chunks[0].clone();
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[a_pointer, b_pointer],
+            Some(&fail_key),
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push still succeeds despite a failed delete");
+        assert!(
+            out.iter()
+                .any(|l| l.contains("could not reclaim orphan chunk") && l.contains(&fail_key)),
+            "failed delete surfaces an informational warning: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_suspicious_prior_warns_no_deletes() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let envelope_b = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        // Prior is pointer-kind but invalid (version 2) => warn, no deletes.
+        let bad = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#.to_owned();
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[bad], None, &oplog);
+        let _path = PathPrepend::new(fake.path());
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|l| l.starts_with("delete ")),
+            "suspicious prior => no deletes; log:\n{log}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("skipping chunk GC")),
+            "warns about the suspicious pointer: {out:?}"
+        );
     }
 
     #[cfg(unix)]
