@@ -184,7 +184,6 @@ the blob never contains resolved secret bytes. It pushes per-adapter:
 - **spin** — reads `runtime-config.toml` (next to `spin.toml` by
   default; override with `--runtime-config <path>`) to dispatch
   per-backend. Decision order:
-
   1. `--local` forces SQLite-direct against
      `<spin.toml dir>/.spin/sqlite_key_value.db`. Non-`default` labels
      still require a `[key_value_store.<label>]` stanza in
