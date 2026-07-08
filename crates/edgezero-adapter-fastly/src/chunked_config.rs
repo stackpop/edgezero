@@ -302,6 +302,66 @@ where
     Ok(reconstructed)
 }
 
+/// Validate a prior root value and return the chunk keys it referenced,
+/// scoped to `root_key`'s own chunk namespace. Used only for chunk GC on
+/// re-push (Stage 7 writeback).
+///
+/// Parse as `serde_json::Value` FIRST so a pointer-kind value with
+/// missing/invalid fields still reaches the warning path instead of being
+/// silently dropped by a failed struct deserialize.
+///
+/// Returns:
+/// - `Ok(keys)`  -- value is a valid v1 chunk pointer; `keys` are its
+///   `chunks[].key` entries (all confirmed to match
+///   `"{root_key}{CHUNK_KEY_INFIX}"`).
+/// - `Ok(vec![])` -- value is a direct `BlobEnvelope`, absent, or not
+///   pointer-shaped at all (normal: first push, or was-direct). Silent.
+/// - `Err(msg)`  -- value IS pointer-kind (`edgezero_kind == POINTER_KIND`)
+///   but fails validation: malformed, unsupported `version`, or a
+///   referenced key falls outside this root's chunk prefix. Callers log
+///   `msg` as a warning and skip GC for this root (delete nothing).
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>, String> {
+    // 1. Parse loosely. Not-JSON, or not our pointer kind => silent.
+    let value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if value
+        .get("edgezero_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some(POINTER_KIND)
+    {
+        // Direct BlobEnvelope, unrelated JSON, or first push.
+        return Ok(Vec::new());
+    }
+
+    // 2. It IS pointer-kind: from here every failure WARNS (Err), never silent.
+    let pointer: FastlyChunkPointer = serde_json::from_value(value).map_err(|err| {
+        format!("prior chunk pointer at `{root_key}` is malformed: {err}; skipping chunk GC")
+    })?;
+    if pointer.version != 1 {
+        return Err(format!(
+            "prior chunk pointer at `{root_key}` has unsupported version {}; skipping chunk GC",
+            pointer.version
+        ));
+    }
+
+    // 3. Prefix-scope every referenced key to this root's own namespace.
+    let prefix = format!("{root_key}{CHUNK_KEY_INFIX}");
+    let mut keys = Vec::with_capacity(pointer.chunks.len());
+    for chunk_ref in pointer.chunks {
+        if !chunk_ref.key.starts_with(&prefix) {
+            return Err(format!(
+                "prior chunk pointer at `{root_key}` references chunk key `{}` outside expected prefix `{prefix}`; skipping chunk GC",
+                chunk_ref.key
+            ));
+        }
+        keys.push(chunk_ref.key);
+    }
+    Ok(keys)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -656,5 +716,88 @@ mod tests {
             "error must mention version: {err}"
         );
         assert!(err.contains("my_key"), "error must name root key: {err}");
+    }
+
+    // ---- prior_chunk_keys tests ----
+
+    #[test]
+    fn prior_chunk_keys_returns_valid_v1_pointer_keys() {
+        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = prepare_fastly_config_entries("app_config", &envelope).unwrap();
+        let (_, pointer_json) = entries.last().unwrap();
+
+        let keys = prior_chunk_keys("app_config", pointer_json).expect("valid pointer");
+
+        let expected: Vec<String> = entries[..entries.len().saturating_sub(1)]
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn prior_chunk_keys_returns_empty_for_direct_envelope() {
+        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT);
+        assert_eq!(
+            prior_chunk_keys("app_config", &envelope).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn prior_chunk_keys_returns_empty_for_unrelated_json() {
+        assert_eq!(
+            prior_chunk_keys("app_config", r#"{"hello":"world"}"#).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn prior_chunk_keys_returns_empty_for_wrong_kind() {
+        let raw = r#"{"edgezero_kind":"other","version":1,"chunks":[],"data_sha256":"","envelope_len":0,"envelope_sha256":""}"#;
+        assert_eq!(
+            prior_chunk_keys("app_config", raw).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn prior_chunk_keys_rejects_unsupported_pointer_version() {
+        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = prepare_fastly_config_entries("app_config", &envelope).unwrap();
+        let (_, pointer_json) = entries.last().unwrap();
+        let mut pointer: FastlyChunkPointer = serde_json::from_str(pointer_json).unwrap();
+        pointer.version = 2;
+        let raw = serde_json::to_string(&pointer).unwrap();
+
+        let err = prior_chunk_keys("app_config", &raw).expect_err("version 2 should warn");
+        assert!(err.contains("unsupported version"), "{err}");
+    }
+
+    #[test]
+    fn prior_chunk_keys_rejects_foreign_chunk_prefix() {
+        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = prepare_fastly_config_entries("app_config", &envelope).unwrap();
+        let (_, pointer_json) = entries.last().unwrap();
+        let mut pointer: FastlyChunkPointer = serde_json::from_str(pointer_json).unwrap();
+        pointer.chunks[0].key =
+            pointer.chunks[0]
+                .key
+                .replacen("app_config", "app_config_staging", 1);
+        let raw = serde_json::to_string(&pointer).unwrap();
+
+        let err = prior_chunk_keys("app_config", &raw).expect_err("foreign chunk should warn");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    // Regression for the Value-first rule: a value that IS pointer-kind but
+    // is missing required fields (`chunks`, `data_sha256`, …) must WARN, not
+    // be silently dropped by a failed struct deserialize.
+    #[test]
+    fn prior_chunk_keys_warns_on_pointer_kind_with_missing_fields() {
+        let raw = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#;
+        let err = prior_chunk_keys("app_config", raw)
+            .expect_err("pointer-kind but malformed must warn, not Ok([])");
+        assert!(!err.is_empty(), "{err}");
     }
 }
