@@ -1216,7 +1216,7 @@ This task lands the trait method + CLI call site. The per-adapter synthesiser ov
   }
   ```
 
-  The default impl is `Ok(Vec::new())` so every existing adapter compiles untouched. Cloudflare / Fastly / Spin override this in Tasks 17 / 21 / 24. Axum keeps the default.
+  The default impl is `Ok(Vec::new())` so every existing adapter compiles untouched. All four bundled adapters (Cloudflare / Fastly / Spin / Axum) override this in Tasks 17 / 21 / 24 / (Axum override lands in the 2026-07 amendment; see `AxumCliAdapter::synthesise_baseline_manifest` in `crates/edgezero-adapter-axum/src/cli/mod.rs`). The trait-level `Ok(Vec::new())` default is retained only for downstream / experimental adapters that own no synthesised local state.
 
 - [ ] **Step 4: Restructure `run_provision` so synthesis + validation + dispatch all see the same root (real worktree OR tempdir)**
 
@@ -3619,7 +3619,7 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
   ```rust
   fn synthesise_baseline_manifest(
       &self,
-      _manifest_root: &Path,
+      manifest_root: &Path,
       adapter_manifest_path: Option<&str>,
       component_selector: Option<&str>,
       app_name: &str,
@@ -3633,8 +3633,22 @@ This task lives BEFORE Section 5 because Cloudflare's `.dev.vars` writer (Task 1
           .parent()
           .map(|p| p.join("runtime-config.toml"))
           .unwrap_or_else(|| std::path::PathBuf::from("runtime-config.toml"));
+      // Resolve the ADAPTER CRATE package name from the Cargo.toml
+      // adjacent to the manifest (or the nearest ancestor's, per
+      // `read_adapter_crate_name`'s upward walk). Fall back to the
+      // scaffold convention only when no reachable Cargo.toml exists
+      // -- passing bare `app_name` here silently mispoints the wasm
+      // source path on any project that renames the adapter crate.
+      let crate_name = cli_support::read_adapter_crate_name(manifest_root, adapter_manifest_path)
+          .unwrap_or_else(|| {
+              if app_name.is_empty() {
+                  "app-adapter-spin".to_owned()
+              } else {
+                  format!("{app_name}-adapter-spin")
+              }
+          });
       Ok(vec![
-          (spin_rel, synthesise_spin_toml(app_name, component_selector)),
+          (spin_rel, synthesise_spin_toml(&crate_name, component_selector)),
           (rc_rel,   synthesise_runtime_config_toml()),
       ])
   }
@@ -4534,15 +4548,18 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
   Run from repo root (do NOT use `xargs -r` — it is GNU-only):
 
   ```bash
-  # Regex matches the four generated manifest files AND any tracked
+  # Regex matches all five generated adapter manifests
+  # (axum/fastly/spin/wrangler/runtime-config) AND any tracked
   # `.dev.vars` (Cloudflare's per-secret placeholder file).
   # The plan's in-tree app-demo fixture happens to NOT track
   # `.dev.vars` today, but aligning the regex with the spec's
   # downstream-migration regex (spec §"Migration for downstream
   # projects") keeps the two runbooks symmetrical and protects
   # against future drift where a contributor commits a smoke
-  # artifact by mistake.
-  tracked=$(git ls-files | rg '(^|/)(fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' || true)
+  # artifact by mistake. The regex must stay byte-identical to
+  # Task 37's CI gate — if you change one, change the other in
+  # the same commit.
+  tracked=$(git ls-files | rg '(^|/)(axum|fastly|spin|wrangler|runtime-config)\.toml$|(^|/)\.dev\.vars$' || true)
   if [ -n "$tracked" ]; then
       printf '%s\n' "$tracked" | xargs git rm --cached
   fi
@@ -4550,7 +4567,7 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
 
 - [ ] **Step 3: Verify the worktree still has the files locally** (so the smoke + dev loop keeps working until step 4's `provision --local` warm-up).
 
-  Run: `ls examples/app-demo/crates/app-demo-adapter-{fastly,cloudflare,spin}/`
+  Run: `ls examples/app-demo/crates/app-demo-adapter-{axum,fastly,cloudflare,spin}/`
   Expected: each adapter's manifest is still present in the worktree.
 
 - [ ] **Step 4: Sanity-check the gitignore covered ALL six gated paths**
@@ -4567,7 +4584,7 @@ The template AND the emit-list wiring (`root_gitignore` → `.gitignore`) alread
 
   ```bash
   git add .gitignore
-  git commit -m "Gitignore Cloudflare/Fastly/Spin manifests; regenerate via provision --local"
+  git commit -m "Gitignore all adapter manifests + .dev.vars; regenerate via provision --local"
   ```
 
 ### Task 34: Extend `run_serve` with adapter-scoped env-file load

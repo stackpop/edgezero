@@ -1382,11 +1382,27 @@ binary, so forking them is not a realistic sharing mechanism.
 When a manifest is absent at the start of `provision --local`,
 the CLI bootstrap writes the following minimal-valid baseline
 via `toml_edit::DocumentMut` before the adapter's
-`provision` step layers store bindings on top. `<app_name>`
-comes from `edgezero.toml`'s `[app].name`. Per-adapter
-overrides past this baseline are operator scope (hand-edit
-the synthesised file; the merge mechanics preserve those
-edits on re-run). See "Shareable vs. local-only
+`provision` step layers store bindings on top.
+
+**`<crate_name>` is the ADAPTER CRATE package name**, resolved
+by walking upward from the manifest's parent directory to the
+first `Cargo.toml` inside `manifest_root` and reading its
+`[package].name`. This honours the operator's
+`[adapters.<name>.adapter].crate` path when it points at a
+rename or a nested manifest (e.g.
+`crates/server/config/wrangler.toml` still resolves to
+`crates/server/Cargo.toml`). When no reachable Cargo.toml
+carries `[package].name`, the synthesiser falls back to the
+scaffold-convention `<app_name>-adapter-<id>`. A pre-2026-07
+version of this spec derived `<crate_name>` from `[app].name`,
+which broke on any project that renamed its adapter crate —
+Cargo builds `<package_name_underscored>.wasm`, and any wrangler
+/ fastly / spin manifest that names something else fails at
+build or run time.
+
+Per-adapter overrides past this baseline are operator scope
+(hand-edit the synthesised file; the merge mechanics preserve
+those edits on re-run). See "Shareable vs. local-only
 customizations (v1)" above for the cross-team sharing
 contract.
 
@@ -1394,7 +1410,7 @@ contract.
 
 ```toml
 # edgezero-provision: v1
-name = "<app_name>"
+name = "<crate_name>"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-01-01"
 ```
@@ -1409,7 +1425,7 @@ the change.
 ```toml
 # edgezero-provision: v1
 manifest_version = 3
-name = "<app_name>"
+name = "<crate_name>"
 language = "rust"
 
 [scripts]
@@ -1431,7 +1447,7 @@ populates it on first run.
 spin_manifest_version = 2
 
 [application]
-name = "<app_name>"
+name = "<crate_name>"
 version = "0.1.0"
 
 [[trigger.http]]
