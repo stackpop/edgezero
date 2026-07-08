@@ -89,8 +89,9 @@ pointer no longer does.
 - **Orphans**: `prior_chunk_keys − new_keep_set`. In practice this is
   all prior chunk keys, because a changed config changes the SHA and
   therefore every chunk key; but the set-difference is the correct,
-  race-safe formulation (a re-push of *identical* bytes re-derives the
-  same keys and deletes nothing).
+  idempotent formulation (a re-push of *identical* bytes re-derives the
+  same keys and deletes nothing). "Idempotent" here is about re-pushing
+  the same bytes, NOT concurrency safety — see the Concurrency model.
 
 ## Invariants (MUST)
 
@@ -132,20 +133,46 @@ pointer no longer does.
    warning folded into the returned status lines; the push still
    reports success. A leaked chunk is harmless; a failed push is not.
 
-5. **Cloud deletes are guarded by a post-commit root read-back.** A
-   concurrent push could overwrite the root between our commit and our
-   sweep — e.g. revert it to the prior pointer, making the "orphans"
-   live again. So before deleting a root's orphans, cloud GC re-reads
-   the raw root and proceeds only if it still equals *exactly* the value
-   this push wrote (`new_root_value`). If it differs (or the re-read
-   fails), GC is skipped for that root with a warning. This narrows but
-   does not fully close the window (no compare-and-delete exists in
-   Fastly; a writer could still intervene between the read-back and an
-   individual delete) — acceptable under invariant 4, since the guard
-   eliminates the realistic revert-to-prior corruption and the residual
-   only risks a leak, never a live delete in the common case. The local
-   path holds the whole file in one rewrite and has no equivalent
+5. **Cloud deletes are guarded by a post-commit root read-back
+   (mitigation, not a guarantee).** A concurrent push could overwrite
+   the root between our commit and our sweep — e.g. revert it to the
+   prior pointer, making the "orphans" live again. So before deleting a
+   root's orphans, cloud GC re-reads the raw root and proceeds only if
+   it still equals *exactly* the value this push wrote (`new_root_value`).
+   If it differs (or the re-read fails), GC is skipped for that root with
+   a warning. This shrinks the window but does NOT close it: Fastly has
+   no compare-and-delete, so an interleaving push can still restore the
+   prior pointer *after* our read-back passes but *before* our deletes
+   run, causing a live delete (see Concurrency model). The local path
+   holds the whole file in one in-memory rewrite and has no equivalent
    remote-concurrency window.
+
+## Concurrency model
+
+**Cloud GC assumes a single writer per config store** — i.e. pushes to a
+given store are serialized (one operator, or a CI pipeline that does not
+run overlapping `config push` jobs against the same store). Under that
+assumption the read-back guard (invariant 5) makes cloud GC safe: after
+we write our root and confirm it on read-back, nothing else changes it,
+so its orphans are genuinely dead.
+
+Under **concurrent** writers, cloud GC is **best-effort and not
+strictly safe**. Fastly Config Store exposes no compare-and-delete or
+lock, so there is a residual interleaving — push A commits B and its
+read-back passes, then push C reverts the root to the prior pointer A,
+then A's deletes run and remove chunks that are live again for C. The
+read-back guard removes the *common* revert-before-read-back case but
+cannot remove this one. The impact is bounded to a specific config
+store's chunk data; it never affects other stores or the root pointer
+itself, and the immediately-following read will surface the integrity
+error (missing/again-orphaned chunk) rather than serving wrong data.
+
+If strict concurrent-push safety is ever required, the design must
+change: stop deleting inline and move all reclamation to an offline,
+lease-guarded `config gc` command (the deferred non-goal), or introduce
+an external lock around push. That is out of scope for v1, which ships
+GC as a single-writer, best-effort convenience. **Do not begin
+implementation unless the team accepts this single-writer assumption.**
 
 ## `prior_chunk_keys` helper (`chunked_config.rs`)
 
@@ -282,12 +309,15 @@ handled for free: the new value is a direct envelope,
   (at worst) a mix of old and new chunks, each still referenced by
   whichever pointer actually committed. Reclamation waits for the next
   successful push. Leak-safe over corrupt-safe, per invariant 4.
-- **Cost**: one extra `describe` per logical root before the push, plus
-  one `delete` per orphan after. No store-wide `list` call. Deletes are
-  sequential `fastly` subprocess spawns — a large prior generation
-  (e.g. 50 chunks) adds ~50 sequential shell-outs of post-push latency.
-  Fastly exposes no bulk delete-by-key (`--all` is store-wide), so v1
-  accepts this cost rather than parallelising spawns.
+- **Cost**: per logical root, one `describe` before the push; then, for
+  each root that actually has orphans, a second `describe` after commit
+  (the read-back guard); then one `delete` per orphan. A root with no
+  prior chunks costs only the first `describe` and no read-back. No
+  store-wide `list` call. Deletes are sequential `fastly` subprocess
+  spawns — a large prior generation (e.g. 50 chunks) adds ~50 sequential
+  shell-outs of post-push latency. Fastly exposes no bulk delete-by-key
+  (`--all` is store-wide), so v1 accepts this cost rather than
+  parallelising spawns.
 
 ## Local path (`push_config_entries_local` / `write_fastly_local_config_store`)
 
@@ -428,6 +458,10 @@ in the `cli.rs` test module.
 - **Dry-run degrades, never fails**: a malformed `fastly.toml` makes the
   dry-run report `unknown` for the GC count while still printing the
   direct-vs-chunked intent lines and returning `Ok`.
+- **Dry-run suspicious prior pointer**: seed the root with a
+  pointer-kind-but-invalid value; the dry-run reports
+  `(unknown: suspicious prior pointer)` for that root and still returns
+  `Ok` without writing.
 
 ## Non-goals
 

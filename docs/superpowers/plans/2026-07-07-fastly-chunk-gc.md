@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust 2021, `serde_json`, `toml_edit`, existing Fastly CLI shell-out helpers, existing fake-`fastly` test shims, `cargo test -p edgezero-adapter-fastly --features cli`.
 
+**Precondition (gate):** Cloud GC is **single-writer, best-effort** — it is safe only when pushes to a given config store are serialized. The post-commit read-back guard narrows but does not close the concurrent-push window (Fastly has no compare-and-delete). Do NOT start this plan unless the team accepts that concurrent cloud pushes are unsupported for GC purposes. If strict concurrent-push safety is required, stop and redesign around an offline, lease-guarded `config gc` (the deferred non-goal) instead. See the spec's "Concurrency model".
+
 ---
 
 ## File Structure
@@ -395,6 +397,15 @@ dry-run the SAME bytes and assert the count is `0`:
 
 ```rust
 assert!(combined.contains("would delete 0 orphan chunks"));
+```
+
+Add a third dry-run test for a suspicious prior pointer: seed the root
+with a pointer-kind-but-invalid value (e.g. `version: 2`), dry-run a new
+config, and assert the degraded line plus no write:
+
+```rust
+assert!(combined.contains("unknown: suspicious prior pointer"));
+// and the file is unchanged
 ```
 
 - [ ] **Step 3c: Add local suspicious-pointer real-push test (spec §"local")**
@@ -910,5 +921,6 @@ git commit -m "test(fastly): verify chunk gc behavior"
 - Use exact `toml_edit::Table` key operations for local dotted chunk keys.
 - If a push commit fails, do not sweep anything. The old root pointer may still be live.
 - If GC fails, return `Ok` with warning status lines. The push success criterion remains new entries committed.
-- Cloud GC spawns one `fastly` process per orphan, sequentially. A large prior generation (e.g. 50 chunks) means ~50 sequential shell-outs after the push — a known wall-clock cost. Fastly has no bulk delete-by-key (`--all` is store-wide and unusable), so batching is not available; do not add parallel spawns in v1 without measuring.
+- Cloud GC assumes a **single writer** per config store (serialized pushes). The post-commit read-back guard removes the common revert-before-read-back race but NOT the read-back-then-revert interleaving — Fastly has no compare-and-delete. This is best-effort by design (spec "Concurrency model"); do not represent cloud GC as strictly concurrent-safe.
+- Cloud GC costs: one pre-push `describe` per root, plus one post-commit read-back `describe` per root that has orphans, plus one `fastly` `delete` process per orphan (sequential). A 50-chunk prior generation ≈ 50 sequential deletes. Fastly has no bulk delete-by-key (`--all` is store-wide and unusable); do not add parallel spawns in v1 without measuring.
 - Line numbers in this plan are approximate anchors against `main`; `grep` the named function/test before editing, since prior edits shift offsets.
