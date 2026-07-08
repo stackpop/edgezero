@@ -453,19 +453,25 @@ impl Adapter for FastlyCliAdapter {
                 fastly_path.display()
             )]);
         }
-        // Expand logical entries into physical entries (chunks + pointer).
+        // Reject reserved keys before any expansion or I/O.
+        reject_reserved_root_keys(entries)?;
+        // Expand each logical root once: flatten for the write, keep the
+        // exact per-root keep-set for GC (no prefix scan of the flattened set).
         let mut physical_entries: Vec<(String, String)> = Vec::new();
+        let mut gc_roots: Vec<(String, HashSet<String>)> = Vec::with_capacity(entries.len());
         for (key, body) in entries {
-            let expanded = prepare_fastly_config_entries(key, body)?;
+            let (expanded, new_keys, _new_root) = expand_root(key, body)?;
             physical_entries.extend(expanded);
+            gc_roots.push((key.clone(), new_keys));
         }
         if dry_run {
-            let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+            let counts = local_orphan_counts_for_dry_run(&fastly_path, name, entries);
+            let mut out = Vec::with_capacity(entries.len().saturating_mul(2).saturating_add(1));
             out.push(format!(
                 "would edit `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`) with entries:",
                 fastly_path.display(),
             ));
-            for (key, body) in entries {
+            for (idx, (key, body)) in entries.iter().enumerate() {
                 let expanded = prepare_fastly_config_entries(key, body)
                     .unwrap_or_else(|_| vec![(key.clone(), body.clone())]);
                 if expanded.len() == 1 {
@@ -480,16 +486,28 @@ impl Adapter for FastlyCliAdapter {
                         body.len()
                     ));
                 }
+                match counts.get(idx).map(|(_, count)| count) {
+                    Some(Ok(n)) => out.push(format!(
+                        "  would delete {n} orphan chunks from the previous generation of `{key}`"
+                    )),
+                    Some(Err(reason)) => out.push(format!(
+                        "  would delete an unknown number of orphan chunks from the previous generation of `{key}` (unknown: {reason})"
+                    )),
+                    None => {}
+                }
             }
             return Ok(out);
         }
-        write_fastly_local_config_store(&fastly_path, name, &physical_entries)?;
-        Ok(vec![format!(
+        let warnings =
+            write_fastly_local_config_store(&fastly_path, name, &physical_entries, &gc_roots)?;
+        let mut out = vec![format!(
             "wrote {} physical entries ({} logical) to `[local_server.config_stores.{name}.contents]` in {} (logical id `{logical}`); restart `fastly compute serve` to pick up changes",
             physical_entries.len(),
             entries.len(),
             fastly_path.display()
-        )])
+        )];
+        out.extend(warnings);
+        Ok(out)
     }
 
     fn read_config_entry(
@@ -930,7 +948,8 @@ fn write_fastly_local_config_store(
     path: &Path,
     platform_name: &str,
     entries: &[(String, String)],
-) -> Result<(), String> {
+    gc_roots: &[(String, HashSet<String>)],
+) -> Result<Vec<String>, String> {
     use toml_edit::{table, DocumentMut, Item, Table, Value};
 
     let raw = match fs::read_to_string(path) {
@@ -995,13 +1014,44 @@ fn write_fastly_local_config_store(
             path.display()
         )
     })?;
+    // Snapshot prior chunk keys per GC root BEFORE the upsert, using the
+    // exact keep-set the caller computed for each root (no prefix scan).
+    let mut plans: Vec<FastlyConfigGcPlan> = Vec::with_capacity(gc_roots.len());
+    for (root_key, new_keys) in gc_roots {
+        let prior_keys = contents_tbl
+            .get(root_key)
+            .and_then(toml_edit::Item::as_str)
+            .map_or_else(|| Ok(Vec::new()), |raw| prior_chunk_keys(root_key, raw));
+        plans.push(FastlyConfigGcPlan {
+            root_key: root_key.clone(),
+            prior_keys,
+            new_keys: new_keys.clone(),
+            new_root_value: String::new(), // unused locally (no remote concurrency)
+        });
+    }
+
+    // Upsert the new physical entries.
     for (key, value) in entries {
         contents_tbl.insert(key, Item::Value(Value::from(value.clone())));
     }
 
+    // Prune orphans in the same in-memory rewrite; a suspicious prior
+    // pointer (Err) warns and deletes nothing.
+    let mut warnings = Vec::new();
+    for plan in &plans {
+        match orphan_chunk_keys(plan) {
+            Ok(orphans) => {
+                for key in orphans {
+                    contents_tbl.remove(&key);
+                }
+            }
+            Err(err) => warnings.push(format!("warning: {err}")),
+        }
+    }
+
     fs::write(path, doc.to_string())
         .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
-    Ok(())
+    Ok(warnings)
 }
 
 // -------------------------------------------------------------------
@@ -1066,6 +1116,66 @@ fn reject_reserved_root_keys(entries: &[(String, String)]) -> Result<(), String>
         }
     }
     Ok(())
+}
+
+/// Best-effort per-root orphan count for `config push --local --dry-run`.
+/// Reads the current `fastly.toml` (offline) and, for each logical
+/// `(root_key, body)`, counts `prior_chunk_keys(root, old) - new_keys`
+/// where `new_keys` is the root's OWN expansion. Never fails the dry-run:
+/// on a missing file / no prior pointer / direct prior value it reports
+/// `Ok(0)`; on unreadable or malformed prior state it reports `Err(reason)`
+/// which the caller renders as an "unknown" line.
+fn local_orphan_counts_for_dry_run(
+    path: &Path,
+    platform_name: &str,
+    entries: &[(String, String)],
+) -> Vec<(String, Result<usize, String>)> {
+    use toml_edit::{DocumentMut, Item};
+
+    // Parse the current file once (best-effort). Absent file => no prior.
+    let parsed: Result<Option<DocumentMut>, String> = match fs::read_to_string(path) {
+        Ok(text) => text
+            .parse::<DocumentMut>()
+            .map(Some)
+            .map_err(|_| "could not read prior state".to_owned()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("could not read prior state".to_owned()),
+    };
+
+    entries
+        .iter()
+        .map(|(root_key, body)| {
+            let new_keys = match expand_root(root_key, body) {
+                Ok((_, keys, _)) => keys,
+                Err(err) => return (root_key.clone(), Err(err)),
+            };
+            let count = match &parsed {
+                Err(reason) => Err(reason.clone()),
+                Ok(None) => Ok(0),
+                Ok(Some(doc)) => {
+                    let contents = doc
+                        .get("local_server")
+                        .and_then(|ls| ls.get("config_stores"))
+                        .and_then(|cs| cs.get(platform_name))
+                        .and_then(|st| st.get("contents"))
+                        .and_then(Item::as_table);
+                    match contents.and_then(|tbl| tbl.get(root_key)) {
+                        None => Ok(0), // no contents table, or no prior value for this root
+                        Some(item) => match item.as_str() {
+                            None => Err("could not read prior state".to_owned()),
+                            Some(raw) => match prior_chunk_keys(root_key, raw) {
+                                Ok(prior) => {
+                                    Ok(prior.iter().filter(|k| !new_keys.contains(*k)).count())
+                                }
+                                Err(_) => Err("suspicious prior pointer".to_owned()),
+                            },
+                        },
+                    }
+                }
+            };
+            (root_key.clone(), count)
+        })
+        .collect()
 }
 
 // -------------------------------------------------------------------
@@ -1975,7 +2085,7 @@ mod tests {
             ("greeting".to_owned(), "hello".to_owned()),
             ("service.timeout_ms".to_owned(), "1500".to_owned()),
         ];
-        write_fastly_local_config_store(&path, TEST_CONFIG_ID, &entries).expect("write");
+        write_fastly_local_config_store(&path, TEST_CONFIG_ID, &entries, &[]).expect("write");
         let after = fs::read_to_string(&path).expect("read back");
         assert!(
             after.contains(&format!("[local_server.config_stores.{TEST_CONFIG_ID}]")),
@@ -2008,12 +2118,14 @@ mod tests {
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "stale".to_owned())],
+            &[],
         )
         .expect("first write");
         write_fastly_local_config_store(
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "fresh".to_owned())],
+            &[],
         )
         .expect("second write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -2043,6 +2155,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
         )
         .expect("write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -2072,6 +2185,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), "hi".to_owned())],
+            &[],
         )
         .expect("write");
         let after = fs::read_to_string(&path).expect("read back");
@@ -2507,6 +2621,7 @@ build = \"cargo build --release\"
             &path,
             TEST_CONFIG_ID,
             &[("greeting".to_owned(), envelope_json.clone())],
+            &[],
         )
         .expect("setup write");
 
@@ -3384,6 +3499,7 @@ build = \"cargo build --release\"
             &fastly_toml,
             TEST_CONFIG_ID,
             &[("cfg".to_owned(), json_str.clone())],
+            &[],
         )
         .expect("write");
 
@@ -3412,7 +3528,8 @@ build = \"cargo build --release\"
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let physical = prepare_fastly_config_entries(TEST_CONFIG_ID, &envelope).unwrap();
         // Write all physical entries (chunks + pointer) to the local store.
-        write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &physical).expect("write");
+        write_fastly_local_config_store(&fastly_toml, TEST_CONFIG_ID, &physical, &[])
+            .expect("write");
 
         let result = FastlyCliAdapter
             .read_config_entry_local(
@@ -3440,14 +3557,11 @@ build = \"cargo build --release\"
     ///
     /// The local fastly.toml writer upserts per-key (so a sibling
     /// `--key app_config_staging` push leaves `app_config` intact per
-    /// spec 12.7). Within the SAME root key, old chunks for envelope
-    /// A remain in the contents table after envelope B's push — they're
-    /// unreferenced (the root pointer at `app_config` now names B's
-    /// chunks), matching the remote Fastly behaviour where the
-    /// per-entry `update --upsert` shell-out has no atomic-delete
-    /// pairing. The runtime-correctness property holds either way: a
-    /// read after push B follows the active pointer and reconstructs
-    /// envelope B, not A.
+    /// spec 12.7). Within the SAME root key, GC on re-push prunes the
+    /// prior generation: after envelope B's push, envelope A's chunks —
+    /// now unreferenced by the `app_config` pointer — are removed from
+    /// the contents table. A read after push B follows the active
+    /// pointer and reconstructs envelope B, not A.
     #[cfg(unix)]
     #[test]
     #[expect(
@@ -3461,8 +3575,7 @@ build = \"cargo build --release\"
         fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
 
         // First push: envelope A. Records the chunk-key set so we can
-        // confirm they survive the second push (no garbage collection
-        // in v1 — spec 9.3 + Q6).
+        // confirm they are pruned by the second push's GC.
         let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         FastlyCliAdapter
             .push_config_entries_local(
@@ -3496,10 +3609,10 @@ build = \"cargo build --release\"
         );
 
         // Second push: a DIFFERENT oversized envelope B. The
-        // content-addressed chunk keys must shift to B's sha; old
-        // A-chunks may remain in the table (v1 doesn't GC). Build
-        // envelope B with a distinct payload key so its SHA differs
-        // from A's even at the same total length.
+        // content-addressed chunk keys must shift to B's sha; GC then
+        // prunes the old A-chunks. Build envelope B with a distinct
+        // payload key so its SHA differs from A's even at the same
+        // total length.
         let envelope_b = {
             use edgezero_core::blob_envelope::BlobEnvelope;
             use serde_json::json;
@@ -3541,8 +3654,7 @@ build = \"cargo build --release\"
 
         // Chunk keys are content-addressed by envelope SHA, so the B
         // push installs a fresh chunk-set whose keys are all distinct
-        // from A's. Under the upsert semantic the A-chunks remain in
-        // the contents table (no GC in v1); B's chunks are simply added.
+        // from A's. GC on re-push prunes the now-unreferenced A-chunks.
         let new_b_chunks: Vec<&String> = chunks_b
             .iter()
             .filter(|key| !chunks_a.contains(*key))
@@ -3551,12 +3663,12 @@ build = \"cargo build --release\"
             !new_b_chunks.is_empty(),
             "push B must have added at least one new content-addressed chunk: A-set={chunks_a:?} B-set={chunks_b:?}"
         );
-        // Old A-chunks remain in the table (orphan-but-present —
-        // matches the remote Fastly write-only-upsert semantic).
+        // Old A-chunks are pruned: GC deletes the prior generation the
+        // old pointer referenced once B's pointer supersedes it.
         for chunk_key in &chunks_a {
             assert!(
-                chunks_b.contains(chunk_key),
-                "old A-chunk `{chunk_key}` must remain in the local table after push B (v1 has no GC); B-set={chunks_b:?}"
+                !chunks_b.contains(chunk_key),
+                "old A-chunk `{chunk_key}` must be pruned from the local table after push B; B-set={chunks_b:?}"
             );
         }
 
@@ -3582,6 +3694,290 @@ build = \"cargo build --release\"
         assert_ne!(
             value, envelope_a,
             "old envelope A's chunks must be inert -- read must NOT return A"
+        );
+    }
+
+    // ---------- local chunk GC ----------
+
+    /// Config shrinks from chunked back under the 8 000-char limit: the
+    /// new value is a direct envelope, so GC prunes every prior chunk.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_prunes_prior_chunks_when_value_shrinks_to_direct() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), chunked)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("first push");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("second push");
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+
+        assert_eq!(
+            contents
+                .get(TEST_CONFIG_ID)
+                .and_then(toml_edit::Item::as_str),
+            Some(direct.as_str()),
+            "root holds the direct envelope"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|(key, _)| key.contains(CHUNK_KEY_INFIX)),
+            "prior chunks must be pruned: {after}"
+        );
+    }
+
+    /// A logical key containing the reserved chunk infix is rejected
+    /// before any file I/O (it would collide with the chunk namespace).
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_rejects_reserved_key() {
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let bad_key = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(bad_key.clone(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("reserved key must be rejected");
+        assert!(err.contains(&bad_key), "error names the key: {err}");
+        assert!(
+            !fastly_toml.exists(),
+            "rejection must happen before any write"
+        );
+    }
+
+    /// A suspicious prior pointer (pointer-kind but invalid) makes GC
+    /// warn and delete nothing — pre-seeded chunk keys must survive.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_warns_on_suspicious_prior_pointer_and_keeps_chunks() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        // Seed the root with a pointer-kind-but-invalid value AND a real
+        // chunk-like key so "no deletes" is non-vacuous.
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n\n",
+            "[local_server.config_stores.app_config.contents]\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+            "\"app_config.__edgezero_chunks.deadbeef.0\" = \"seeded-chunk-payload\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push must still succeed");
+
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("skipping chunk GC"),
+            "must warn about the suspicious prior pointer: {combined}"
+        );
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+        assert!(
+            contents
+                .get("app_config.__edgezero_chunks.deadbeef.0")
+                .is_some(),
+            "pre-seeded chunk key must survive a suspicious-pointer skip: {after}"
+        );
+        assert_eq!(
+            contents
+                .get(TEST_CONFIG_ID)
+                .and_then(toml_edit::Item::as_str),
+            Some(direct.as_str()),
+            "new value still written"
+        );
+    }
+
+    /// Dry-run reports the orphan count and writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_reports_orphan_count() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_a)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+        let before = fs::read_to_string(&fastly_toml).expect("read");
+
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "y".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:02Z".to_owned()))
+                .expect("envelope B")
+        };
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run");
+
+        let combined = out.join("\n");
+        assert!(
+            combined.contains("would delete") && combined.contains("orphan chunks"),
+            "dry-run must report orphan count: {combined}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            before,
+            "dry-run must not edit fastly.toml"
+        );
+    }
+
+    /// Dry-run of an identical re-push reports zero orphans (new keys
+    /// equal prior keys — regression for expanding new_keys).
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_identical_repush_counts_zero() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                true, // dry_run, same bytes
+            )
+            .expect("dry-run");
+
+        assert!(
+            out.join("\n").contains("would delete 0 orphan chunks"),
+            "identical re-push must count 0 orphans: {out:?}"
+        );
+    }
+
+    /// Dry-run over a suspicious prior pointer reports an unknown count
+    /// and does not fail.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_suspicious_prior_pointer_unknown() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n\n",
+            "[local_server.config_stores.app_config.contents]\n",
+            "app_config = \"{\\\"edgezero_kind\\\":\\\"fastly_config_chunks\\\",\\\"version\\\":2}\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run must not fail on suspicious pointer");
+
+        assert!(
+            out.join("\n").contains("unknown: suspicious prior pointer"),
+            "dry-run must degrade to unknown: {out:?}"
         );
     }
 }
