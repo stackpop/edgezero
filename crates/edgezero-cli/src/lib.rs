@@ -757,10 +757,21 @@ serve = "echo"
     #[cfg(not(windows))]
     #[test]
     fn run_serve_loads_env_file_into_process_env_before_spawning_child() {
-        // Contract test (spec §"Adapter-scoped env-file load"): a
+        // Contract test (spec §"Adapter-scoped env-file load"): the
         // `.env` next to the resolved `spin.toml` must have its
         // `KEY=VALUE` lines set into the process env BEFORE
-        // `adapter::execute` runs the manifest's serve command.
+        // `adapter::execute` runs the manifest's serve command, so
+        // the SPAWNED CHILD sees the values.
+        //
+        // Test fidelity note: proving the parent process loaded the
+        // .env (via `env::var(marker_key)` after `run_serve`) is
+        // necessary but not sufficient — the spec asks for
+        // intercepting the spawned child's env. We achieve that
+        // here by making the serve command a small shell script
+        // that writes its OWN observed value of the marker to a
+        // file. The test then reads that file and asserts the
+        // child saw the same value the parent set.
+        //
         // Prior to c38cb54 the resolver looked at `<crate>/.env`;
         // the manifest below deliberately places `.env` under a
         // nested manifest parent to prove the fix loads THAT file
@@ -771,8 +782,23 @@ serve = "echo"
         let _pre = EnvOverride::remove(marker_key);
 
         let temp = TempDir::new().expect("temp dir");
+
+        // The child writes its observed marker value here. We pick
+        // a path INSIDE the tempdir so parallel test runs never
+        // collide, and thread it into the manifest's serve command
+        // string via `format!`.
+        let observed_path = temp.path().join("child_observed.txt");
+        let observed_path_display = observed_path.to_string_lossy();
+
         let manifest_path = temp.path().join("edgezero.toml");
-        let manifest_body = r#"
+        // Serve command: a `sh -c` script that writes the child's
+        // OWN view of $MARKER_KEY to `observed_path`. If the
+        // spawned child inherits nothing (i.e. `run_serve` did NOT
+        // load the .env before dispatch), the file will contain an
+        // empty value and the assertion below will fail with a
+        // useful diff.
+        let manifest_body = format!(
+            r#"
 [app]
 name = "demo-app"
 
@@ -783,9 +809,10 @@ manifest = "crates/spin/config/spin.toml"
 [adapters.spin.commands]
 build = "echo"
 deploy = "echo"
-serve = "echo"
-"#;
-        fs::write(&manifest_path, manifest_body).expect("write manifest");
+serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_display}"'
+"#,
+        );
+        fs::write(&manifest_path, &manifest_body).expect("write manifest");
 
         // Provision writes `.env` next to the RESOLVED spin.toml
         // (`crates/spin/config/.env` here). Seed one directly.
@@ -797,7 +824,8 @@ serve = "echo"
         // Also seed a decoy `.env` at the pre-fix location
         // (`crates/spin/.env`) with a DIFFERENT value so a
         // regression to the crate-based lookup surfaces as a
-        // wrong-value assertion, not a silent pass.
+        // wrong-value assertion in the CHILD-observed file, not a
+        // silent pass.
         let decoy_dir = temp.path().join("crates/spin");
         fs::create_dir_all(&decoy_dir).expect("mkdir spin crate");
         let decoy_env = decoy_dir.join(".env");
@@ -812,21 +840,34 @@ serve = "echo"
         let args = ServeArgs {
             adapter: "spin".to_owned(),
         };
-        run_serve(&args).expect("run_serve must succeed with an echo serve command");
+        run_serve(&args).expect("run_serve must succeed with the sh-echo serve command");
 
-        let actual = env::var(marker_key).ok();
+        // 1. Parent-side check: the process env has the value from
+        //    the nested-manifest-parent .env. Necessary for the
+        //    child to inherit it.
+        let parent_observed = env::var(marker_key).ok();
         assert_eq!(
-            actual.as_deref(),
+            parent_observed.as_deref(),
             Some(marker_value),
-            "run_serve MUST load the nested-manifest-parent .env into process env \
-             BEFORE spawning the serve command — got {actual:?}"
+            "run_serve MUST load the nested-manifest-parent .env into process env — got {parent_observed:?}"
         );
 
-        // Cleanup: the outer `EnvOverride::remove(marker_key)`
-        // guard's Drop restores the pre-test state (which was
-        // "unset"), so we don't need a manual `env::remove_var`
-        // here. Sanity: this test intentionally poisons the
-        // decoy path; the assertion above proves the resolver
+        // 2. Child-side check (the spec's real ask): the spawned
+        //    shell wrote its OWN view of $MARKER_KEY to disk. That
+        //    value MUST match the .env's value — proving the child
+        //    inherited the load before executing.
+        let child_observed =
+            fs::read_to_string(&observed_path).expect("child wrote observed marker");
+        assert_eq!(
+            child_observed,
+            marker_value,
+            "spawned serve child MUST see the marker from the nested-manifest-parent .env — \
+             got {child_observed:?} at {}",
+            observed_path.display()
+        );
+
+        // Sanity: this test intentionally poisons the decoy path;
+        // the child-observed assertion above proves the resolver
         // preferred the manifest-derived nested path over it.
         assert!(env_path.exists() && decoy_env.exists());
     }
