@@ -1361,9 +1361,12 @@ fn collect_secret_leaves<'raw>(
                 } else {
                     format!("{rendered}.{name}")
                 };
+                // Intermediates are always required — `field.optional` reflects
+                // only the leaf, and the derive never nests through `Option`. This
+                // matches the runtime walk (`resolve_secret_field`) so `config
+                // validate` catches exactly what the runtime would reject.
                 match table.get(name.as_ref()) {
                     Some(child) => walk(child, field, rest, &next_rendered, out),
-                    None if field.optional => Ok(()),
                     None => Err(format!("missing `{next_rendered}`")),
                 }
             }
@@ -2156,6 +2159,48 @@ other = "x"
         assert!(
             err.contains("integrations.datadome.server_side_key"),
             "collector error names the dotted path: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_secret_leaves_skips_absent_optional_leaf() {
+        // An optional (`Option<String>`) secret leaf that's absent from the TOML
+        // yields nothing — no error. The parent table exists; only the leaf key
+        // is missing.
+        let raw: Value = toml::from_str("[integrations.datadome]\nother = \"x\"\n").expect("toml");
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                SecretPathSegment::Field(Cow::Borrowed("datadome")),
+                SecretPathSegment::Field(Cow::Borrowed("webhook_key")),
+            ],
+            optional: true,
+        };
+        let leaves = collect_secret_leaves(&raw, &field).expect("absent optional leaf is ok");
+        assert!(leaves.is_empty(), "absent optional leaf yields nothing");
+    }
+
+    #[test]
+    fn collect_secret_leaves_errors_on_missing_required_intermediate() {
+        // A missing INTERMEDIATE (the `integrations` table) is an error even
+        // when the leaf is optional — `optional` reflects only the leaf, and
+        // intermediates are structurally required. Locks alignment with the
+        // runtime walk (`resolve_secret_field`).
+        let raw: Value = toml::from_str("other = \"x\"\n").expect("toml");
+        let field = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                SecretPathSegment::Field(Cow::Borrowed("datadome")),
+                SecretPathSegment::Field(Cow::Borrowed("webhook_key")),
+            ],
+            optional: true,
+        };
+        let err = collect_secret_leaves(&raw, &field).expect_err("missing required intermediate");
+        assert!(
+            err.contains("integrations"),
+            "collector error names the missing intermediate: {err}"
         );
     }
 

@@ -371,8 +371,10 @@ fn main() {
         eprintln!(
             "\n{violations} nested-AppConfig violation(s). \
              A field whose type resolves to another #[derive(AppConfig)] struct \
-             (even through Option/Vec/Box wrappers) must opt in with \
-             #[app_config(nested)]; otherwise nesting is rejected (spec \u{00a7}3.3)."
+             (detected even through Option/Vec/Box wrappers) must opt in with \
+             #[app_config(nested)]. Opt-in supports a direct `T` or `Vec<T>` field \
+             only — restructure Option/Box-wrapped nesting to one of those. \
+             Otherwise nesting is rejected (spec \u{00a7}3.3)."
         );
         process::exit(1);
     }

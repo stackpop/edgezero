@@ -245,6 +245,7 @@ mod tests {
         // `secret_on_option_non_string.rs` and `secret_store_ref_optional.rs`.
         cases.compile_fail("tests/ui/app_config_empty.rs");
         cases.compile_fail("tests/ui/app_config_nested_on_non_appconfig.rs");
+        cases.compile_fail("tests/ui/app_config_nested_self_cycle.rs");
         cases.compile_fail("tests/ui/app_config_unknown_option.rs");
         cases.compile_fail("tests/ui/nested_field_serde_rename.rs");
         cases.compile_fail("tests/ui/nested_parent_rename_all.rs");

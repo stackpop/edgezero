@@ -389,6 +389,22 @@ resolution failures name the offending leaf by its dotted path, with
 concrete array indices — e.g. `integrations.datadome.server_side_key` or
 `partners[3].api_key` — so a bad key name points straight at the field.
 
+**Limitations of `#[app_config(nested)]`:**
+
+- **Shape:** opt-in supports a direct field (`T`) or `Vec<T>` only.
+  Wrapper-nested forms like `Option<Inner>` or `Box<Inner>` are not
+  supported — restructure to a direct or `Vec<T>` field. (Only the
+  **leaf** may be optional, via `#[secret] field: Option<String>`.)
+- **Required intermediates:** only the leaf's own `Option<String>` is
+  skippable. A missing or `null` intermediate object/array in the stored
+  blob (e.g. the whole `partners` array) is a `ConfigOutOfDate` error, not
+  a silent skip — both `config validate` and the runtime reject it.
+- **No cyclic nesting:** a type that nests itself
+  (`#[app_config(nested)] x: Vec<Self>`) is a compile error. A _mutual_
+  cycle (`A` nests `B`, `B` nests `A`) can't be caught by the derive (it
+  sees one type at a time) and would overflow the stack on first use —
+  cyclic config is pathological; don't do it.
+
 ### Environment-variable overlay
 
 Every key in `<name>.toml` can be overridden at runtime by an env

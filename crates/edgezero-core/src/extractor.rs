@@ -892,6 +892,12 @@ where
     C: AppConfigMeta,
 {
     for field in C::secret_fields() {
+        // `StoreRef` holds a store id, not a secret key — skip it here (no
+        // descent, no resolution). Its value is consumed by a sibling
+        // `KeyInNamedStore` leaf, and it's validated at push time.
+        if matches!(field.kind, SecretKind::StoreRef) {
+            continue;
+        }
         resolve_secret_field(ctx, data, &field, &field.path, String::new()).await?;
     }
     Ok(())
@@ -913,27 +919,27 @@ fn resolve_secret_field<'walk>(
             Some((SecretPathSegment::Field(name), [])) => {
                 resolve_leaf(ctx, node, field, name.as_ref(), &rendered).await
             }
-            // Descend into an object key.
+            // Descend into an object key. Intermediates are ALWAYS required —
+            // `field.optional` reflects only the LEAF (`Option<String>`), and the
+            // derive never nests through `Option`/`Box`, so a missing/null parent
+            // is a stale blob. (Skipping it here would let the whole subtree pass
+            // silently and only fail later with a vaguer serde error.)
             Some((SecretPathSegment::Field(name), rest)) => {
                 let next_rendered = join_field(&rendered, name.as_ref());
                 match node.get_mut(name.as_ref()) {
-                    // Absent optional subtree: key missing OR serialized as null.
-                    None | Some(serde_json::Value::Null) if field.optional => Ok(()),
+                    None | Some(serde_json::Value::Null) => Err(EdgeError::config_out_of_date(
+                        format!("missing or null value at `{next_rendered}`"),
+                        next_rendered,
+                    )),
                     Some(child) => {
                         resolve_secret_field(ctx, child, field, rest, next_rendered).await
                     }
-                    None => Err(EdgeError::config_out_of_date(
-                        format!("missing or non-object value at `{next_rendered}`"),
-                        next_rendered,
-                    )),
                 }
             }
-            // Iterate every array element.
+            // Iterate every array element. The array itself is a required
+            // intermediate (see above), so a non-array is always an error.
             Some((SecretPathSegment::ArrayEach, rest)) => {
                 let Some(items) = node.as_array_mut() else {
-                    if field.optional {
-                        return Ok(());
-                    }
                     return Err(EdgeError::config_out_of_date(
                         format!("expected an array at `{rendered}`"),
                         rendered,
@@ -968,15 +974,13 @@ async fn resolve_leaf(
     key: &str,
     rendered_parent: &str,
 ) -> Result<(), EdgeError> {
-    if matches!(field.kind, SecretKind::StoreRef) {
-        return Ok(()); // store id, not a secret key
-    }
+    // `StoreRef` is filtered out in `secret_walk` before any descent, so it
+    // never reaches here. The leaf's parent is a required intermediate, so a
+    // non-object parent is always an error — only the leaf key below honors
+    // `field.optional`.
     let leaf_path = join_field(rendered_parent, key);
 
     let Some(parent_obj) = parent.as_object_mut() else {
-        if field.optional {
-            return Ok(());
-        }
         return Err(EdgeError::config_out_of_date(
             format!("expected an object containing `{key}` at `{rendered_parent}`"),
             leaf_path,
@@ -1288,6 +1292,22 @@ mod tests {
             vec![SecretField {
                 kind: SecretKind::KeyInDefault,
                 path: vec![SecretPathSegment::Field(Cow::Borrowed("maybe_key"))],
+                optional: true,
+            }]
+        }
+    }
+
+    // Optional leaf behind required intermediates: integrations.datadome.webhook_key
+    struct OptionalNestedCfg;
+    impl AppConfigMeta for OptionalNestedCfg {
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInDefault,
+                path: vec![
+                    SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                    SecretPathSegment::Field(Cow::Borrowed("datadome")),
+                    SecretPathSegment::Field(Cow::Borrowed("webhook_key")),
+                ],
                 optional: true,
             }]
         }
@@ -2569,6 +2589,32 @@ mod tests {
         assert!(err
             .to_string()
             .contains("integrations.datadome.server_side_key"));
+    }
+
+    #[test]
+    fn secret_walk_missing_required_intermediate_errors_even_when_leaf_optional() {
+        // `optional` reflects only the LEAF (`Option<String>`). A missing
+        // INTERMEDIATE (the whole `integrations` subtree) is a stale blob and
+        // must error with the dotted path — NOT pass silently and degrade to a
+        // vaguer serde error downstream.
+        let ctx = ctx_with_default_secret_store("unused", "unused");
+        let mut data = serde_json::json!({ "greeting": "hi" }); // no `integrations`
+        let err = block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+            .expect_err("missing required intermediate");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.to_string().contains("integrations"),
+            "error names the missing intermediate: {err}"
+        );
+    }
+
+    #[test]
+    fn secret_walk_present_intermediate_absent_optional_leaf_is_ok() {
+        // The mirror case: intermediates present, optional leaf absent -> skip.
+        let ctx = ctx_with_default_secret_store("unused", "unused");
+        let mut data = serde_json::json!({ "integrations": { "datadome": {} } });
+        block_on(secret_walk::<OptionalNestedCfg>(&ctx, &mut data))
+            .expect("absent optional leaf under present intermediates is fine");
     }
 
     #[test]

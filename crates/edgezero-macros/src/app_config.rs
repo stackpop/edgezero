@@ -71,6 +71,21 @@ fn expand(input: &DeriveInput) -> Result<TokenStream2, syn::Error> {
 
     let (annotations, nested_descriptors) = classify_fields(fields)?;
 
+    // Direct self-cycle guard: `struct A { #[app_config(nested)] x: A }` (or
+    // `Vec<A>`) makes the emitted `A::secret_fields()` call itself forever. The
+    // DIRECT case is catchable here because the child ident is the struct's own.
+    // (Mutual cycles A<->B are invisible to a proc-macro — it only ever sees one
+    // type at a time — so those remain a documented limitation.)
+    for descriptor in &nested_descriptors {
+        if type_is_bare_ident(descriptor.child_ty, &input.ident) {
+            return Err(syn::Error::new_spanned(
+                descriptor.child_ty,
+                "`#[app_config(nested)]` cannot reference the enclosing type \
+                 (cyclic nesting): `secret_fields()` would recurse forever",
+            ));
+        }
+    }
+
     // secret_fields() emits the Rust field name verbatim. A container-
     // level `#[serde(rename_all = ...)]` would desync that metadata
     // from what `config validate` (and the Spin collision check) sees
@@ -240,6 +255,12 @@ fn emit_impl(
                 ]
             }
         };
+        // Direct self-cycles are rejected at compile time above. A MUTUAL cycle
+        // (`A` nests `Vec<B>` and `B` nests `Vec<A>`) can't be caught here — a
+        // proc-macro sees one type at a time — and would produce mutually
+        // recursive `secret_fields()` bodies that overflow the stack on first
+        // call. Cyclic config is pathological (infinite data), so the mutual case
+        // is documented rather than guarded; a runtime depth cap could be added.
         quote! {
             for mut __f in <#child_ty as ::edgezero_core::app_config::AppConfigMeta>::secret_fields() {
                 let mut __p = #prefix;
@@ -407,6 +428,23 @@ fn nested_optin(field: &Field) -> syn::Result<bool> {
 }
 
 /// The child element type to recurse into and whether it is an array element.
+/// `true` when `ty` is a bare single-segment path equal to `ident` (e.g. the
+/// `A` in `Vec<A>` or a direct `A` field, matched against the enclosing struct's
+/// name). Path-qualified names (`crate::A`) are intentionally not matched — they
+/// avoid the false positive of a distinct same-named type in another module.
+fn type_is_bare_ident(ty: &Type, ident: &syn::Ident) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path.qself.is_none()
+        && type_path.path.segments.len() == 1
+        && type_path
+            .path
+            .segments
+            .first()
+            .is_some_and(|segment| segment.ident == *ident)
+}
+
 /// `Vec<T>` / `[T]` -> (T, true); otherwise (`field_ty`, false).
 fn nested_child_type(ty: &Type) -> (&Type, bool) {
     if let Type::Path(type_path) = ty {
