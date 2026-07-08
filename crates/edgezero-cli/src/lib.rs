@@ -77,6 +77,8 @@ use args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
 #[cfg(feature = "cli")]
 use edgezero_core::manifest::{Manifest, ManifestLoader};
 #[cfg(feature = "cli")]
+use path_safety::assert_provision_paths_safe;
+#[cfg(feature = "cli")]
 use std::env;
 #[cfg(feature = "cli")]
 use std::io::ErrorKind;
@@ -191,12 +193,32 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
 
     // Adapter-scoped env-file load: `axum` reads `.edgezero/.env`,
-    // `spin` reads `<crate>/.env`. `cloudflare` and `fastly` read
-    // their own files (`.dev.vars`, `[local_server.*]`) via their
-    // emulators and need no CLI-side help.
+    // `spin` reads the `.env` next to the resolved `spin.toml`.
+    // `cloudflare` and `fastly` read their own files (`.dev.vars`,
+    // `[local_server.*]`) via their emulators and need no CLI-side
+    // help.
+    //
+    // Spin's env path is derived from
+    // `[adapters.spin.adapter].manifest` (see
+    // `resolve_serve_env_file`), so an operator-authored poisoned
+    // manifest string like `manifest = "/etc/spin.toml"` or
+    // `manifest = "../../../secrets/env"` would resolve to an
+    // out-of-tree `.env` that `env_file::load_into_process_env`
+    // would happily read and inject into the process env
+    // (subsequently inherited by the spawned adapter). Run the
+    // same absolute-path + `..` traversal guard provision and
+    // config already use before touching the resolved path.
     if let Some(loader) = manifest.as_ref() {
         if let Some(root) = loader.manifest().root() {
-            if let Some(env_path) = resolve_serve_env_file(loader.manifest(), &args.adapter, root) {
+            let manifest_data = loader.manifest();
+            if let Some((_key, adapter_cfg)) = manifest_data.adapter_entry(&args.adapter) {
+                assert_provision_paths_safe(
+                    root,
+                    adapter_cfg.adapter.manifest.as_deref(),
+                    adapter_cfg.adapter.crate_path.as_deref(),
+                )?;
+            }
+            if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root) {
                 if env_path.exists() {
                     env_file::load_into_process_env(&env_path)?;
                 }
@@ -652,6 +674,161 @@ ids = ["MY_SECRETS"]
         let loader = ManifestLoader::load_from_str(BASIC_MANIFEST);
         let root = PathBuf::from("/tmp/proj");
         assert!(resolve_serve_env_file(loader.manifest(), "fastly", &root).is_none());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_serve_rejects_absolute_spin_adapter_manifest_path() {
+        // Regression: `resolve_serve_env_file` derives Spin's `.env`
+        // path from `[adapters.spin.adapter].manifest.parent()` and
+        // `run_serve` then reads that file. A poisoned absolute
+        // manifest string like `/etc/spin.toml` would resolve to
+        // `/etc/.env` — `env_file::load_into_process_env` would
+        // read it and inject its lines into the process env,
+        // subsequently inherited by the spawned adapter. The path
+        // safety guard must fire BEFORE the read.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let poisoned = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "/etc/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        fs::write(&manifest_path, poisoned).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = ServeArgs {
+            adapter: "spin".to_owned(),
+        };
+        let err = run_serve(&args).expect_err(
+            "run_serve MUST refuse to resolve an absolute [adapters.spin.adapter].manifest",
+        );
+        assert!(
+            err.contains("must be a project-relative path"),
+            "path-safety guard must fire before the .env read: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_serve_rejects_parent_traversal_in_spin_adapter_manifest() {
+        // Symmetric to the absolute-path guard: `..` in the
+        // manifest string would resolve `.env` above the project
+        // root. Must fire BEFORE the read.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let poisoned = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "../../../outside/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        fs::write(&manifest_path, poisoned).expect("write manifest");
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = ServeArgs {
+            adapter: "spin".to_owned(),
+        };
+        let err = run_serve(&args)
+            .expect_err("run_serve MUST refuse a `..` traversal in the manifest string");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "traversal guard must fire before the .env read: {err}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn run_serve_loads_env_file_into_process_env_before_spawning_child() {
+        // Contract test (spec §"Adapter-scoped env-file load"): a
+        // `.env` next to the resolved `spin.toml` must have its
+        // `KEY=VALUE` lines set into the process env BEFORE
+        // `adapter::execute` runs the manifest's serve command.
+        // Prior to c38cb54 the resolver looked at `<crate>/.env`;
+        // the manifest below deliberately places `.env` under a
+        // nested manifest parent to prove the fix loads THAT file
+        // (not a same-named file under `.crate`).
+        let marker_key = "EDGEZERO_TEST_SERVE_ENV_LOADED_MARKER";
+        let marker_value = "spin-nested-manifest-parent";
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let _pre = EnvOverride::remove(marker_key);
+
+        let temp = TempDir::new().expect("temp dir");
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/config/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        fs::write(&manifest_path, manifest_body).expect("write manifest");
+
+        // Provision writes `.env` next to the RESOLVED spin.toml
+        // (`crates/spin/config/.env` here). Seed one directly.
+        let env_dir = temp.path().join("crates/spin/config");
+        fs::create_dir_all(&env_dir).expect("mkdir nested spin dir");
+        let env_path = env_dir.join(".env");
+        fs::write(&env_path, format!("{marker_key}={marker_value}\n")).expect("seed nested .env");
+
+        // Also seed a decoy `.env` at the pre-fix location
+        // (`crates/spin/.env`) with a DIFFERENT value so a
+        // regression to the crate-based lookup surfaces as a
+        // wrong-value assertion, not a silent pass.
+        let decoy_dir = temp.path().join("crates/spin");
+        fs::create_dir_all(&decoy_dir).expect("mkdir spin crate");
+        let decoy_env = decoy_dir.join(".env");
+        fs::write(
+            &decoy_env,
+            format!("{marker_key}=THIS_MUST_NOT_BE_LOADED_from_crate_root\n"),
+        )
+        .expect("seed decoy .env");
+
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = ServeArgs {
+            adapter: "spin".to_owned(),
+        };
+        run_serve(&args).expect("run_serve must succeed with an echo serve command");
+
+        let actual = env::var(marker_key).ok();
+        assert_eq!(
+            actual.as_deref(),
+            Some(marker_value),
+            "run_serve MUST load the nested-manifest-parent .env into process env \
+             BEFORE spawning the serve command — got {actual:?}"
+        );
+
+        // Cleanup: the outer `EnvOverride::remove(marker_key)`
+        // guard's Drop restores the pre-test state (which was
+        // "unset"), so we don't need a manual `env::remove_var`
+        // here. Sanity: this test intentionally poisons the
+        // decoy path; the assertion above proves the resolver
+        // preferred the manifest-derived nested path over it.
+        assert!(env_path.exists() && decoy_env.exists());
     }
 
     #[test]
