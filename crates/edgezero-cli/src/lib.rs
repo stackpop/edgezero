@@ -235,13 +235,40 @@ fn resolve_serve_env_file(
     match adapter_lower.as_str() {
         "axum" => Some(manifest_root.join(".edgezero").join(".env")),
         "spin" => {
+            // Spin provision writes `.env` next to the resolved
+            // `spin.toml` (see
+            // `edgezero-adapter-spin/src/cli/provision_local.rs`:
+            // `env_path = spin_dir.join(".env")`). Derive the same
+            // path here from `[adapters.spin.adapter].manifest`.
+            // A nested manifest like
+            // `[adapters.spin.adapter].manifest = "crates/spin/config/spin.toml"`
+            // places `.env` at `crates/spin/config/.env`, NOT at
+            // `crates/spin/.env` — deriving from `.crate` would miss
+            // the runtime env-label and typed `SPIN_VARIABLE_*` lines
+            // provision just wrote.
             let (_key, adapter_cfg) = manifest.adapter_entry(adapter_name)?;
-            let crate_dir = adapter_cfg
-                .adapter
-                .crate_path
-                .as_deref()
-                .map_or_else(|| manifest_root.to_path_buf(), |cp| manifest_root.join(cp));
-            Some(crate_dir.join(".env"))
+            let env_dir = adapter_cfg.adapter.manifest.as_deref().map_or_else(
+                || {
+                    // No `.manifest` declared (e.g. an out-of-tree
+                    // fixture that predates the 2026-07 both-required
+                    // rule). Fall back to `.crate`; if that's also
+                    // unset, `manifest_root`. Match the historical
+                    // resolution shape so this branch is a strict
+                    // superset of the pre-fix behaviour.
+                    adapter_cfg
+                        .adapter
+                        .crate_path
+                        .as_deref()
+                        .map_or_else(|| manifest_root.to_path_buf(), |cp| manifest_root.join(cp))
+                },
+                |mp| {
+                    let manifest_abs = manifest_root.join(mp);
+                    manifest_abs
+                        .parent()
+                        .map_or_else(|| manifest_root.to_path_buf(), Path::to_path_buf)
+                },
+            );
+            Some(env_dir.join(".env"))
         }
         _ => None,
     }
@@ -374,6 +401,25 @@ name = "demo-app"
 crate = "crates/spin"
 
 [adapters.Spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+
+    /// Nested-manifest fixture: `[adapters.spin.adapter].manifest`
+    /// points at a sub-directory inside `.crate`. Provision writes
+    /// `.env` next to the resolved `spin.toml`
+    /// (`crates/spin/config/.env`) — `run_serve` must load from
+    /// the same path.
+    const SPIN_MANIFEST_NESTED: &str = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/config/spin.toml"
+
+[adapters.spin.commands]
 build = "echo"
 deploy = "echo"
 serve = "echo"
@@ -567,6 +613,28 @@ ids = ["MY_SECRETS"]
         let resolved = resolve_serve_env_file(loader.manifest(), "spin", &root)
             .expect("spin arm returns Some");
         assert_eq!(resolved, root.join("crates/spin").join(".env"));
+    }
+
+    #[test]
+    fn resolve_serve_env_file_spin_honors_nested_manifest_parent() {
+        // Regression: provision writes `.env` next to the resolved
+        // `spin.toml` (`spin_dir.join(".env")` in
+        // `edgezero-adapter-spin/src/cli/provision_local.rs`).
+        // With `[adapters.spin.adapter].manifest = "crates/spin/config/spin.toml"`,
+        // provision writes `crates/spin/config/.env`. run_serve
+        // MUST load from the same path — deriving from
+        // `.crate = "crates/spin"` alone would look at
+        // `crates/spin/.env` and miss every EDGEZERO__STORES__…__NAME
+        // + typed SPIN_VARIABLE_* line provision just wrote.
+        let loader = ManifestLoader::load_from_str(SPIN_MANIFEST_NESTED);
+        let root = PathBuf::from("/tmp/proj");
+        let resolved = resolve_serve_env_file(loader.manifest(), "spin", &root)
+            .expect("spin arm returns Some");
+        assert_eq!(
+            resolved,
+            root.join("crates/spin/config").join(".env"),
+            "spin serve MUST load .env from the manifest's parent dir (matches provision's writeback path), NOT from the adapter crate root"
+        );
     }
 
     #[test]
