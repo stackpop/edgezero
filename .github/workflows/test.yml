@@ -71,6 +71,13 @@ jobs:
             exit 1
           fi
 
+      # The checker's own unit tests live behind `required-features =
+      # ["nested-app-config-check"]`, so the unfeatured
+      # `cargo test --workspace` step below does not compile or run them.
+      # Exercise them explicitly to keep the coverage closure enforced by CI.
+      - name: Nested AppConfig checker tests
+        run: cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config
+
       - name: Run workspace tests
         run: cargo test --workspace --all-targets
 
