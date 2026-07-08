@@ -3056,12 +3056,16 @@ build = \"cargo build --release\"
     /// gives the successive raw `item_value`s returned when the ROOT key
     /// is described (call 1 = prior read, call 2 = read-back guard);
     /// exhausting the sequence yields "not found". `fail_delete_key`
-    /// makes that one delete exit non-zero.
+    /// makes that one delete exit non-zero. `describe_hard_error` makes
+    /// every describe fail with a non-not-found error (so
+    /// `fetch_remote_config_store_entry` returns `Err`, exercising the
+    /// prior-read-failure GC path).
     #[cfg(unix)]
     fn fake_fastly_gc(
         root_key: &str,
         root_describe_seq: &[String],
         fail_delete_key: Option<&str>,
+        describe_hard_error: bool,
         oplog: &Path,
     ) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3077,6 +3081,7 @@ if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '{
 if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
 if [ "$sub" = "describe" ]; then
   printf 'describe %s\n' "$key" >> '{{{oplog}}}'
+  {{#if hard_error}}echo 'Error: internal server error' >&2; exit 1{{/if}}
   cfile='{{{dir}}}/count_'"$key"
   n=0; [ -f "$cfile" ] && n=$(cat "$cfile"); n=$((n+1)); printf '%s' "$n" > "$cfile"
   rf='{{{dir}}}/resp_'"$key"'_'"$n"'.json'
@@ -3109,6 +3114,7 @@ echo 'unexpected' >&2; exit 1
             "oplog": oplog.display().to_string(),
             "dir": dir.path().display().to_string(),
             "fail": fail_delete_key.unwrap_or(""),
+            "hard_error": describe_hard_error,
         });
         let script = handlebars::Handlebars::new()
             .render_template(TEMPLATE, &data)
@@ -3161,7 +3167,7 @@ echo 'unexpected' >&2; exit 1
         let (b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
 
         // describe#1 = prior A pointer; describe#2 (read-back) = new B pointer.
-        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[a_pointer, b_pointer], None, &oplog);
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[a_pointer, b_pointer], None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
 
         let out = FastlyCliAdapter
@@ -3235,6 +3241,7 @@ echo 'unexpected' >&2; exit 1
             TEST_CONFIG_ID,
             &[a_pointer.clone(), a_pointer],
             None,
+            false,
             &oplog,
         );
         let _path = PathPrepend::new(fake.path());
@@ -3315,7 +3322,7 @@ echo 'unexpected' >&2; exit 1
         let oplog = dir.path().join("ops.log");
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         // Empty describe sequence => root not found => no prior chunks.
-        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], None, &oplog);
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
         FastlyCliAdapter
             .push_config_entries(
@@ -3357,6 +3364,7 @@ echo 'unexpected' >&2; exit 1
             TEST_CONFIG_ID,
             &[a_pointer, b_pointer],
             Some(&fail_key),
+            false,
             &oplog,
         );
         let _path = PathPrepend::new(fake.path());
@@ -3389,7 +3397,7 @@ echo 'unexpected' >&2; exit 1
         let envelope_b = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         // Prior is pointer-kind but invalid (version 2) => warn, no deletes.
         let bad = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#.to_owned();
-        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[bad], None, &oplog);
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[bad], None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
         let out = FastlyCliAdapter
             .push_config_entries(
@@ -3410,6 +3418,41 @@ echo 'unexpected' >&2; exit 1
         assert!(
             out.iter().any(|line| line.contains("skipping chunk GC")),
             "warns about the suspicious pointer: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_prior_read_failure_warns_no_deletes() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        // Describe fails hard (not a not-found) => prior read errors => GC
+        // is skipped for this root with a warning; the push still succeeds.
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], None, true, &oplog);
+        let _path = PathPrepend::new(fake.path());
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds despite prior-read failure");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "prior-read failure => no deletes; log:\n{log}"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("failed to read prior root")),
+            "must warn about the failed prior read: {out:?}"
         );
     }
 
@@ -4381,6 +4424,103 @@ echo 'unexpected' >&2; exit 1
         assert!(
             out.join("\n").contains("unknown: suspicious prior pointer"),
             "dry-run must degrade to unknown: {out:?}"
+        );
+    }
+
+    /// GC of a chunked root must not touch a chunked SIBLING's chunks —
+    /// the prefix `app_config.__edgezero_chunks.` must not match
+    /// `app_config_staging.__edgezero_chunks.` (shared string prefix).
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_gc_preserves_sibling_chunks() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let make = |tag: &str| {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".to_owned()))
+                .expect("envelope")
+        };
+        let push = |key: &str, body: String| {
+            FastlyCliAdapter
+                .push_config_entries_local(
+                    dir.path(),
+                    Some("fastly.toml"),
+                    None,
+                    &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                    &[(key.to_owned(), body)],
+                    &AdapterPushContext::new(),
+                    false,
+                )
+                .expect("push");
+        };
+
+        // app_config gen X, then a chunked sibling, then app_config gen Z.
+        push("app_config", make("x1"));
+        push("app_config_staging", make("staging"));
+        let staging_chunks = {
+            let (chunks, _) = chunked_parts("app_config_staging", &make("staging"));
+            chunks
+        };
+        push("app_config", make("z2")); // GCs app_config's gen-X chunks
+
+        let after = fs::read_to_string(&fastly_toml).expect("read");
+        let doc: toml_edit::DocumentMut = after.parse().expect("parse");
+        let contents = doc
+            .get("local_server")
+            .and_then(|ls| ls.get("config_stores"))
+            .and_then(|cs| cs.get(TEST_CONFIG_ID))
+            .and_then(|st| st.get("contents"))
+            .and_then(toml_edit::Item::as_table)
+            .expect("contents");
+        for key in &staging_chunks {
+            assert!(
+                contents.get(key).is_some(),
+                "sibling chunk `{key}` must survive app_config GC: {after}"
+            );
+        }
+    }
+
+    /// Cloud identical-bytes re-push reclaims nothing (new keys equal prior
+    /// keys). Read-back returns our own value so the guard would PASS if
+    /// orphans were miscomputed — making "no deletes" non-vacuous.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_identical_repush_issues_no_deletes() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let (_chunks, pointer) = chunked_parts(TEST_CONFIG_ID, &envelope);
+        // Prior == what this push writes; read-back also returns it.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[pointer.clone(), pointer],
+            None,
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+        FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "identical re-push must delete nothing; log:\n{log}"
         );
     }
 
