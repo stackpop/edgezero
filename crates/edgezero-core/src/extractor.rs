@@ -875,10 +875,18 @@ where
     // is a key NAME; RUNTIME runs cfg.validate() because the value is
     // now the resolved secret.
     cfg.validate().map_err(|err| {
-        EdgeError::config_out_of_date(
-            err.to_string(),
-            first_violating_field(&err).unwrap_or_default(),
-        )
+        // SECURITY: `secret_walk` has replaced `#[secret]` fields with their
+        // RESOLVED values, and `validator`'s error params echo the rejected
+        // value — so `err.to_string()` here can leak a secret into the HTTP
+        // response body and logs. Keep the field path (structural, not secret)
+        // but drop the formatted validator details on this runtime path.
+        let field = first_violating_field(&err).unwrap_or_default();
+        let message = if field.is_empty() {
+            "app config failed validation".to_owned()
+        } else {
+            format!("app config failed validation for field `{field}`")
+        };
+        EdgeError::config_out_of_date(message, field)
     })?;
     Ok(cfg)
 }
@@ -2798,6 +2806,64 @@ mod tests {
                 "field_path names the violating secret field: {err:?}"
             );
         }
+    }
+
+    /// SECURITY (P1): a resolved secret that FAILS a validator must NOT appear in
+    /// the error message or the rendered HTTP response — `validator` echoes the
+    /// rejected value in its params, and by this point the field holds the
+    /// resolved secret. The field PATH must still be reported.
+    #[test]
+    fn runtime_validation_error_does_not_leak_resolved_secret() {
+        use crate::config_store::{ConfigStore, ConfigStoreError};
+        use crate::response::IntoResponse as _;
+
+        #[derive(Debug, Deserialize, Validate)]
+        struct SecretLen {
+            #[validate(length(min = 100_u64))]
+            api_token: String,
+        }
+        impl AppConfigMeta for SecretLen {
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
+        }
+        struct BlobStore(String);
+        #[async_trait(?Send)]
+        impl ConfigStore for BlobStore {
+            async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+
+        // A distinctive resolved secret that fails the `length(min = 100)` rule.
+        const SECRET: &str = "s3cr3t-DEADBEEF-do-not-leak";
+        let blob = make_envelope(serde_json::json!({ "api_token": "mykey" }));
+        let secret_store = InMemorySecretStore::new([("vault/mykey", bytes::Bytes::from(SECRET))]);
+        let ctx = ctx_with_config_and_secrets(BlobStore(blob), "key", secret_store, "vault");
+        let err = block_on(AppConfig::<SecretLen>::from_request(&ctx))
+            .expect_err("short resolved secret must fail validator");
+
+        // The error message names the field but NOT the secret.
+        assert!(
+            err.message().contains("api_token"),
+            "names the field: {err:?}"
+        );
+        assert!(
+            !err.message().contains(SECRET),
+            "error message must not leak the resolved secret: {}",
+            err.message()
+        );
+        // And neither does the rendered response body.
+        let response = err.into_response().expect("response");
+        let body = String::from_utf8_lossy(response.body().as_bytes().unwrap_or_default());
+        assert!(
+            !body.contains(SECRET),
+            "rendered response must not leak the resolved secret: {body}"
+        );
     }
 
     #[test]
