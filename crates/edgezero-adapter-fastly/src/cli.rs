@@ -147,6 +147,22 @@ enum ConfigStoreLookup {
     SchemaDrift(String),
 }
 
+/// Per-root plan for reclaiming a prior generation's chunk entries on
+/// re-push (Stage 7). Built by the config-push paths; consumed by the
+/// GC helpers `expand_root` / `orphan_chunk_keys`.
+struct FastlyConfigGcPlan {
+    /// Exact keep-set this push writes for the root (chunk keys + root key).
+    new_keys: HashSet<String>,
+    /// Exactly the value written at `root_key` (its new pointer, or the
+    /// direct envelope). Cloud uses it as a read-back concurrency guard
+    /// (last-writer-wins); local ignores it.
+    new_root_value: String,
+    /// Prior chunk keys to consider deleting, or a warning to surface
+    /// (suspicious prior pointer) that skips GC for this root.
+    prior_keys: Result<Vec<String>, String>,
+    root_key: String,
+}
+
 // The three `validate_*` trait methods exist on `Adapter` because
 // spin requires them (variable-name regex, `[component.*]`
 // discovery, flat-namespace collision). The trait surface is typed
@@ -429,10 +445,10 @@ impl Adapter for FastlyCliAdapter {
                 )),
             };
             gc_plans.push(FastlyConfigGcPlan {
-                root_key,
-                prior_keys,
                 new_keys,
                 new_root_value,
+                prior_keys,
+                root_key,
             });
         }
         // Commit all physical entries (each root's chunks first, its root
@@ -1083,12 +1099,12 @@ fn write_fastly_local_config_store(
         let prior_keys = contents_tbl
             .get(root_key)
             .and_then(toml_edit::Item::as_str)
-            .map_or_else(|| Ok(Vec::new()), |raw| prior_chunk_keys(root_key, raw));
+            .map_or_else(|| Ok(Vec::new()), |value| prior_chunk_keys(root_key, value));
         plans.push(FastlyConfigGcPlan {
-            root_key: root_key.clone(),
-            prior_keys,
             new_keys: new_keys.clone(),
             new_root_value: String::new(), // unused locally (no remote concurrency)
+            prior_keys,
+            root_key: root_key.clone(),
         });
     }
 
@@ -1120,34 +1136,24 @@ fn write_fastly_local_config_store(
 // chunk GC helpers (Stage 7 re-push reclamation)
 // -------------------------------------------------------------------
 
-/// Per-root plan for reclaiming a prior generation's chunk entries.
-struct FastlyConfigGcPlan {
-    root_key: String,
-    /// Prior chunk keys to consider deleting, or a warning to surface
-    /// (suspicious prior pointer) that skips GC for this root.
-    prior_keys: Result<Vec<String>, String>,
-    /// Exact keep-set this push writes for the root (chunk keys + root key).
-    new_keys: HashSet<String>,
-    /// Exactly the value written at `root_key` (its new pointer, or the
-    /// direct envelope). Cloud uses it as a read-back concurrency guard
-    /// (last-writer-wins); local ignores it.
-    new_root_value: String,
-}
-
 /// Expand ONE logical `(root_key, body)` into its physical entries, the
 /// exact keep-set for that root, and the value written at the root key.
 /// No cross-root prefix scanning (a free-form `--key` can't mislead it).
+#[expect(
+    clippy::type_complexity,
+    reason = "one-off internal return; a named type would not aid readability"
+)]
 fn expand_root(
     root_key: &str,
     body: &str,
 ) -> Result<(Vec<(String, String)>, HashSet<String>, String), String> {
     let expanded = prepare_fastly_config_entries(root_key, body)?;
-    let new_keys: HashSet<String> = expanded.iter().map(|(k, _)| k.clone()).collect();
+    let new_keys: HashSet<String> = expanded.iter().map(|(key, _)| key.clone()).collect();
     // prepare_* always emits the root entry LAST (root pointer or direct
     // value). Make the invariant explicit rather than silently defaulting.
     let new_root_value = expanded
         .last()
-        .map(|(_, v)| v.clone())
+        .map(|(_, value)| value.clone())
         .ok_or_else(|| format!("internal: no physical entries produced for root `{root_key}`"))?;
     Ok((expanded, new_keys, new_root_value))
 }
@@ -1199,7 +1205,7 @@ fn local_orphan_counts_for_dry_run(
         Ok(text) => text
             .parse::<DocumentMut>()
             .map(Some)
-            .map_err(|_| "could not read prior state".to_owned()),
+            .map_err(|_err| "could not read prior state".to_owned()),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
         Err(_) => Err("could not read prior state".to_owned()),
     };
@@ -1227,7 +1233,7 @@ fn local_orphan_counts_for_dry_run(
                             None => Err("could not read prior state".to_owned()),
                             Some(raw) => match prior_chunk_keys(root_key, raw) {
                                 Ok(prior) => {
-                                    Ok(prior.iter().filter(|k| !new_keys.contains(*k)).count())
+                                    Ok(prior.iter().filter(|key| !new_keys.contains(*key)).count())
                                 }
                                 Err(_) => Err("suspicious prior pointer".to_owned()),
                             },
@@ -1669,6 +1675,7 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     use edgezero_adapter::cli_support::read_package_name;
+    use std::collections::HashSet;
     #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
@@ -1684,79 +1691,6 @@ mod tests {
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
-
-    // ---- chunk GC helpers ----
-
-    #[test]
-    fn reject_reserved_root_keys_accepts_clean_keys() {
-        let entries = vec![
-            ("app_config".to_owned(), "{}".to_owned()),
-            ("app_config_staging".to_owned(), "{}".to_owned()),
-        ];
-        assert!(reject_reserved_root_keys(&entries).is_ok());
-    }
-
-    #[test]
-    fn reject_reserved_root_keys_rejects_infix_key() {
-        let bad = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
-        let entries = vec![(bad.clone(), "{}".to_owned())];
-        let err = reject_reserved_root_keys(&entries).expect_err("reserved infix must reject");
-        assert!(err.contains(&bad), "error names the key: {err}");
-        assert!(err.contains("reserved"), "error explains why: {err}");
-    }
-
-    #[test]
-    fn orphan_chunk_keys_subtracts_new_keys() {
-        let mut new_keys = std::collections::HashSet::new();
-        new_keys.insert("keep".to_owned());
-        let plan = FastlyConfigGcPlan {
-            root_key: "app_config".to_owned(),
-            prior_keys: Ok(vec![
-                "gone1".to_owned(),
-                "keep".to_owned(),
-                "gone2".to_owned(),
-            ]),
-            new_keys,
-            new_root_value: String::new(),
-        };
-        let orphans = orphan_chunk_keys(&plan).expect("ok");
-        assert_eq!(orphans, vec!["gone1".to_owned(), "gone2".to_owned()]);
-    }
-
-    #[test]
-    fn orphan_chunk_keys_propagates_prior_err() {
-        let plan = FastlyConfigGcPlan {
-            root_key: "app_config".to_owned(),
-            prior_keys: Err("suspicious".to_owned()),
-            new_keys: std::collections::HashSet::new(),
-            new_root_value: String::new(),
-        };
-        assert!(orphan_chunk_keys(&plan).is_err());
-    }
-
-    #[test]
-    fn expand_root_direct_value_has_single_entry() {
-        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
-        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
-        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
-        assert_eq!(expanded.len(), 1);
-        assert_eq!(new_root_value, envelope);
-        assert!(new_keys.contains(TEST_CONFIG_ID));
-        assert_eq!(new_keys.len(), 1);
-    }
-
-    #[test]
-    fn expand_root_chunked_value_carries_pointer_as_root_value() {
-        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
-        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
-        assert!(expanded.len() >= 2, "chunks + pointer");
-        let (last_key, last_val) = expanded.last().unwrap();
-        assert_eq!(last_key, TEST_CONFIG_ID);
-        assert_eq!(&new_root_value, last_val);
-        assert!(new_keys.contains(TEST_CONFIG_ID));
-        assert_eq!(new_keys.len(), expanded.len());
-    }
 
     /// RAII guard: prepends a directory to `$PATH` and restores the original
     /// value on drop.
@@ -3138,44 +3072,52 @@ build = \"cargo build --release\"
             format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#),
         )
         .expect("list");
-        for (i, value) in root_describe_seq.iter().enumerate() {
+        for (index, value) in root_describe_seq.iter().enumerate() {
             let wrapped = format!(
                 r#"{{"item_value":{}}}"#,
                 serde_json::to_string(value).expect("escape")
             );
+            let nth = index.saturating_add(1);
             fs::write(
-                dir.path().join(format!("resp_{root_key}_{}.json", i + 1)),
+                dir.path().join(format!("resp_{root_key}_{nth}.json")),
                 wrapped,
             )
             .expect("resp");
         }
-        let template = r#"#!/bin/sh
-if [ "$1" = "config-store" ]; then cat '@LIST@'; exit 0; fi
+        // Rendered with handlebars. Triple-stache `{{{ }}}` disables HTML
+        // escaping (paths are not markup); the shell's own `${var}` /
+        // `$(( ))` use single braces so they are literal text to handlebars.
+        const TEMPLATE: &str = r#"#!/bin/sh
+if [ "$1" = "config-store" ]; then cat '{{{list}}}'; exit 0; fi
 sub="$2"
 key=""
 for arg in "$@"; do case "$arg" in --key=*) key="${arg#--key=}";; esac; done
-if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '@OPLOG@'; exit 0; fi
-if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '@OPLOG@'; if [ "$key" = "@FAIL@" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
+if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '{{{oplog}}}'; exit 0; fi
+if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
 if [ "$sub" = "describe" ]; then
-  printf 'describe %s\n' "$key" >> '@OPLOG@'
-  cfile='@DIR@/count_'"$key"
+  printf 'describe %s\n' "$key" >> '{{{oplog}}}'
+  cfile='{{{dir}}}/count_'"$key"
   n=0; [ -f "$cfile" ] && n=$(cat "$cfile"); n=$((n+1)); printf '%s' "$n" > "$cfile"
-  rf='@DIR@/resp_'"$key"'_'"$n"'.json'
+  rf='{{{dir}}}/resp_'"$key"'_'"$n"'.json'
   if [ -f "$rf" ]; then cat "$rf"; exit 0; fi
   echo 'Error: item not found' >&2; exit 1
 fi
 echo 'unexpected' >&2; exit 1
 "#;
-        let script = template
-            .replace("@LIST@", &list_file.display().to_string())
-            .replace("@OPLOG@", &oplog.display().to_string())
-            .replace("@DIR@", &dir.path().display().to_string())
-            .replace("@FAIL@", fail_delete_key.unwrap_or(""));
-        let sp = dir.path().join("fastly");
-        fs::write(&sp, script).expect("script");
-        let mut perms = fs::metadata(&sp).expect("meta").permissions();
+        let data = serde_json::json!({
+            "list": list_file.display().to_string(),
+            "oplog": oplog.display().to_string(),
+            "dir": dir.path().display().to_string(),
+            "fail": fail_delete_key.unwrap_or(""),
+        });
+        let script = handlebars::Handlebars::new()
+            .render_template(TEMPLATE, &data)
+            .expect("render fake fastly script");
+        let script_path = dir.path().join("fastly");
+        fs::write(&script_path, script).expect("script");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
         perms.set_mode(0o755);
-        fs::set_permissions(&sp, perms).expect("chmod");
+        fs::set_permissions(&script_path, perms).expect("chmod");
         dir
     }
 
@@ -3186,7 +3128,7 @@ echo 'unexpected' >&2; exit 1
         let (_, pointer) = entries.last().expect("pointer").clone();
         let chunk_keys = entries[..entries.len().saturating_sub(1)]
             .iter()
-            .map(|(k, _)| k.clone())
+            .map(|(key, _)| key.clone())
             .collect();
         (chunk_keys, pointer)
     }
@@ -3196,7 +3138,7 @@ echo 'unexpected' >&2; exit 1
         fs::read_to_string(oplog)
             .unwrap_or_default()
             .lines()
-            .any(|l| l == line)
+            .any(|entry| entry == line)
     }
 
     #[cfg(unix)]
@@ -3256,11 +3198,11 @@ echo 'unexpected' >&2; exit 1
         let log = fs::read_to_string(&oplog).unwrap_or_default();
         let root_update = log
             .lines()
-            .position(|l| l == format!("update {TEST_CONFIG_ID}"))
+            .position(|line| line == format!("update {TEST_CONFIG_ID}"))
             .expect("root update logged");
         let first_delete = log
             .lines()
-            .position(|l| l.starts_with("delete "))
+            .position(|line| line.starts_with("delete "))
             .expect("a delete logged");
         assert!(
             first_delete > root_update,
@@ -3311,11 +3253,11 @@ echo 'unexpected' >&2; exit 1
 
         let log = fs::read_to_string(&oplog).unwrap_or_default();
         assert!(
-            !log.lines().any(|l| l.starts_with("delete ")),
+            !log.lines().any(|line| line.starts_with("delete ")),
             "no deletes when the root changed under us; log:\n{log}"
         );
         assert!(
-            out.iter().any(|l| l.contains("root changed")),
+            out.iter().any(|line| line.contains("root changed")),
             "must warn that GC was skipped: {out:?}"
         );
     }
@@ -3359,7 +3301,7 @@ echo 'unexpected' >&2; exit 1
             .expect("dry-run must not error");
         assert!(
             out.iter()
-                .any(|l| l.contains("would delete orphaned prior-generation chunks")),
+                .any(|line| line.contains("would delete orphaned prior-generation chunks")),
             "dry-run reports GC intent: {out:?}"
         );
     }
@@ -3388,7 +3330,7 @@ echo 'unexpected' >&2; exit 1
             .expect("push succeeds");
         let log = fs::read_to_string(&oplog).unwrap_or_default();
         assert!(
-            !log.lines().any(|l| l.starts_with("delete ")),
+            !log.lines().any(|line| line.starts_with("delete ")),
             "no prior => no deletes; log:\n{log}"
         );
     }
@@ -3431,7 +3373,8 @@ echo 'unexpected' >&2; exit 1
             .expect("push still succeeds despite a failed delete");
         assert!(
             out.iter()
-                .any(|l| l.contains("could not reclaim orphan chunk") && l.contains(&fail_key)),
+                .any(|line| line.contains("could not reclaim orphan chunk")
+                    && line.contains(&fail_key)),
             "failed delete surfaces an informational warning: {out:?}"
         );
     }
@@ -3461,11 +3404,11 @@ echo 'unexpected' >&2; exit 1
             .expect("push succeeds");
         let log = fs::read_to_string(&oplog).unwrap_or_default();
         assert!(
-            !log.lines().any(|l| l.starts_with("delete ")),
+            !log.lines().any(|line| line.starts_with("delete ")),
             "suspicious prior => no deletes; log:\n{log}"
         );
         assert!(
-            out.iter().any(|l| l.contains("skipping chunk GC")),
+            out.iter().any(|line| line.contains("skipping chunk GC")),
             "warns about the suspicious pointer: {out:?}"
         );
     }
@@ -4365,7 +4308,7 @@ echo 'unexpected' >&2; exit 1
     }
 
     /// Dry-run of an identical re-push reports zero orphans (new keys
-    /// equal prior keys — regression for expanding new_keys).
+    /// equal prior keys — regression for expanding `new_keys`).
     #[cfg(unix)]
     #[test]
     fn push_config_entries_local_dry_run_identical_repush_counts_zero() {
@@ -4439,5 +4382,78 @@ echo 'unexpected' >&2; exit 1
             out.join("\n").contains("unknown: suspicious prior pointer"),
             "dry-run must degrade to unknown: {out:?}"
         );
+    }
+
+    // ---- chunk GC helpers ----
+
+    #[test]
+    fn reject_reserved_root_keys_accepts_clean_keys() {
+        let entries = vec![
+            ("app_config".to_owned(), "{}".to_owned()),
+            ("app_config_staging".to_owned(), "{}".to_owned()),
+        ];
+        reject_reserved_root_keys(&entries).expect("clean keys accepted");
+    }
+
+    #[test]
+    fn reject_reserved_root_keys_rejects_infix_key() {
+        let bad = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        let entries = vec![(bad.clone(), "{}".to_owned())];
+        let err = reject_reserved_root_keys(&entries).expect_err("reserved infix must reject");
+        assert!(err.contains(&bad), "error names the key: {err}");
+        assert!(err.contains("reserved"), "error explains why: {err}");
+    }
+
+    #[test]
+    fn orphan_chunk_keys_subtracts_new_keys() {
+        let mut new_keys = HashSet::new();
+        new_keys.insert("keep".to_owned());
+        let plan = FastlyConfigGcPlan {
+            new_keys,
+            new_root_value: String::new(),
+            prior_keys: Ok(vec![
+                "gone1".to_owned(),
+                "keep".to_owned(),
+                "gone2".to_owned(),
+            ]),
+            root_key: "app_config".to_owned(),
+        };
+        let orphans = orphan_chunk_keys(&plan).expect("ok");
+        assert_eq!(orphans, vec!["gone1".to_owned(), "gone2".to_owned()]);
+    }
+
+    #[test]
+    fn orphan_chunk_keys_propagates_prior_err() {
+        let plan = FastlyConfigGcPlan {
+            new_keys: HashSet::new(),
+            new_root_value: String::new(),
+            prior_keys: Err("suspicious".to_owned()),
+            root_key: "app_config".to_owned(),
+        };
+        orphan_chunk_keys(&plan).unwrap_err();
+    }
+
+    #[test]
+    fn expand_root_direct_value_has_single_entry() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(new_root_value, envelope);
+        assert!(new_keys.contains(TEST_CONFIG_ID));
+        assert_eq!(new_keys.len(), 1);
+    }
+
+    #[test]
+    fn expand_root_chunked_value_carries_pointer_as_root_value() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
+        assert!(expanded.len() >= 2, "chunks + pointer");
+        let (last_key, last_value) = expanded.last().unwrap();
+        assert_eq!(last_key, TEST_CONFIG_ID);
+        assert_eq!(&new_root_value, last_value);
+        assert!(new_keys.contains(TEST_CONFIG_ID));
+        assert_eq!(new_keys.len(), expanded.len());
     }
 }
