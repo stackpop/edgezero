@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -5,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
 
-use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value};
+use crate::chunked_config::{
+    prepare_fastly_config_entries, prior_chunk_keys, resolve_fastly_config_value, CHUNK_KEY_INFIX,
+};
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
@@ -1002,6 +1005,70 @@ fn write_fastly_local_config_store(
 }
 
 // -------------------------------------------------------------------
+// chunk GC helpers (Stage 7 re-push reclamation)
+// -------------------------------------------------------------------
+
+/// Per-root plan for reclaiming a prior generation's chunk entries.
+struct FastlyConfigGcPlan {
+    root_key: String,
+    /// Prior chunk keys to consider deleting, or a warning to surface
+    /// (suspicious prior pointer) that skips GC for this root.
+    prior_keys: Result<Vec<String>, String>,
+    /// Exact keep-set this push writes for the root (chunk keys + root key).
+    new_keys: HashSet<String>,
+    /// Exactly the value written at `root_key` (its new pointer, or the
+    /// direct envelope). Cloud uses it as a read-back concurrency guard
+    /// (last-writer-wins); local ignores it.
+    new_root_value: String,
+}
+
+/// Expand ONE logical `(root_key, body)` into its physical entries, the
+/// exact keep-set for that root, and the value written at the root key.
+/// No cross-root prefix scanning (a free-form `--key` can't mislead it).
+fn expand_root(
+    root_key: &str,
+    body: &str,
+) -> Result<(Vec<(String, String)>, HashSet<String>, String), String> {
+    let expanded = prepare_fastly_config_entries(root_key, body)?;
+    let new_keys: HashSet<String> = expanded.iter().map(|(k, _)| k.clone()).collect();
+    // prepare_* always emits the root entry LAST (root pointer or direct
+    // value). Make the invariant explicit rather than silently defaulting.
+    let new_root_value = expanded
+        .last()
+        .map(|(_, v)| v.clone())
+        .ok_or_else(|| format!("internal: no physical entries produced for root `{root_key}`"))?;
+    Ok((expanded, new_keys, new_root_value))
+}
+
+/// Orphans = prior chunk keys not in the new keep-set. Propagates a
+/// suspicious-pointer `Err` so the caller can warn and skip GC.
+fn orphan_chunk_keys(plan: &FastlyConfigGcPlan) -> Result<Vec<String>, String> {
+    match &plan.prior_keys {
+        Ok(prior) => Ok(prior
+            .iter()
+            .filter(|key| !plan.new_keys.contains(*key))
+            .cloned()
+            .collect()),
+        Err(err) => Err(err.clone()),
+    }
+}
+
+/// Reject logical keys that collide with the reserved chunk namespace.
+/// `--key` is free-form, so this is enforced at the Fastly adapter
+/// boundary: such a key would let a push write into another key's chunk
+/// space, and could not be reclaimed correctly.
+fn reject_reserved_root_keys(entries: &[(String, String)]) -> Result<(), String> {
+    for (key, _) in entries {
+        if key.contains(CHUNK_KEY_INFIX) {
+            return Err(format!(
+                "config key `{key}` contains the reserved infix `{CHUNK_KEY_INFIX}`, which collides with Fastly chunk storage; choose a different config key (or --key override)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// -------------------------------------------------------------------
 // `config push` helpers
 // -------------------------------------------------------------------
 
@@ -1405,6 +1472,79 @@ mod tests {
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
+
+    // ---- chunk GC helpers ----
+
+    #[test]
+    fn reject_reserved_root_keys_accepts_clean_keys() {
+        let entries = vec![
+            ("app_config".to_owned(), "{}".to_owned()),
+            ("app_config_staging".to_owned(), "{}".to_owned()),
+        ];
+        assert!(reject_reserved_root_keys(&entries).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_root_keys_rejects_infix_key() {
+        let bad = format!("app_config{CHUNK_KEY_INFIX}deadbeef.0");
+        let entries = vec![(bad.clone(), "{}".to_owned())];
+        let err = reject_reserved_root_keys(&entries).expect_err("reserved infix must reject");
+        assert!(err.contains(&bad), "error names the key: {err}");
+        assert!(err.contains("reserved"), "error explains why: {err}");
+    }
+
+    #[test]
+    fn orphan_chunk_keys_subtracts_new_keys() {
+        let mut new_keys = std::collections::HashSet::new();
+        new_keys.insert("keep".to_owned());
+        let plan = FastlyConfigGcPlan {
+            root_key: "app_config".to_owned(),
+            prior_keys: Ok(vec![
+                "gone1".to_owned(),
+                "keep".to_owned(),
+                "gone2".to_owned(),
+            ]),
+            new_keys,
+            new_root_value: String::new(),
+        };
+        let orphans = orphan_chunk_keys(&plan).expect("ok");
+        assert_eq!(orphans, vec!["gone1".to_owned(), "gone2".to_owned()]);
+    }
+
+    #[test]
+    fn orphan_chunk_keys_propagates_prior_err() {
+        let plan = FastlyConfigGcPlan {
+            root_key: "app_config".to_owned(),
+            prior_keys: Err("suspicious".to_owned()),
+            new_keys: std::collections::HashSet::new(),
+            new_root_value: String::new(),
+        };
+        assert!(orphan_chunk_keys(&plan).is_err());
+    }
+
+    #[test]
+    fn expand_root_direct_value_has_single_entry() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(new_root_value, envelope);
+        assert!(new_keys.contains(TEST_CONFIG_ID));
+        assert_eq!(new_keys.len(), 1);
+    }
+
+    #[test]
+    fn expand_root_chunked_value_carries_pointer_as_root_value() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let (expanded, new_keys, new_root_value) = expand_root(TEST_CONFIG_ID, &envelope).unwrap();
+        assert!(expanded.len() >= 2, "chunks + pointer");
+        let (last_key, last_val) = expanded.last().unwrap();
+        assert_eq!(last_key, TEST_CONFIG_ID);
+        assert_eq!(&new_root_value, last_val);
+        assert!(new_keys.contains(TEST_CONFIG_ID));
+        assert_eq!(new_keys.len(), expanded.len());
+    }
 
     /// RAII guard: prepends a directory to `$PATH` and restores the original
     /// value on drop.
