@@ -198,7 +198,7 @@ profile = "release"
 features = ["cloudflare"]
 
 [adapters.cloudflare.commands]
-build = "wrangler build --cwd crates/app-demo-adapter-cloudflare"
+build = "wrangler deploy --dry-run --cwd crates/app-demo-adapter-cloudflare"
 deploy = "wrangler deploy --cwd crates/app-demo-adapter-cloudflare"
 serve = "wrangler dev --cwd crates/app-demo-adapter-cloudflare"
 

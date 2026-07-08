@@ -103,11 +103,17 @@ edgezero build --adapter axum
 
 The command executes the `build` command from `[adapters.<name>.commands]` in `edgezero.toml`, or falls back to the built-in adapter helper.
 
-Any arguments after `--` are forwarded to the adapter command:
+Any arguments after `--` are forwarded unchanged to the manifest-defined or
+built-in adapter build command:
 
 ```bash
-edgezero build --adapter fastly -- --flag value
+edgezero build --adapter <name> -- <provider-build-args...>
 ```
+
+Use passthrough arguments only for non-secret options. EdgeZero omits them from
+its own command log, but the provider CLI, shell, process list, or CI runner may
+still expose them. Pass credentials through the provider's supported
+environment variables or credential store instead.
 
 ### edgezero serve
 
@@ -169,6 +175,16 @@ edgezero deploy --adapter cloudflare
 edgezero deploy --adapter spin
 ```
 
+Any arguments after `--` are forwarded unchanged to the manifest-defined or
+built-in adapter deploy command:
+
+```bash
+edgezero deploy --adapter <name> -- <provider-deploy-args...>
+```
+
+As with build arguments, passthrough deploy arguments must not contain secrets.
+Use environment variables or the provider's credential store for credentials.
+
 **Provider behavior:**
 
 - **Fastly**: Runs `fastly compute deploy`
@@ -178,6 +194,29 @@ edgezero deploy --adapter spin
 ::: warning
 The `axum` adapter doesn't support `deploy` - use standard container/binary deployment instead.
 :::
+
+#### Command dispatch and provider-manifest resolution
+
+For `build` and `deploy`, a command explicitly configured in
+`[adapters.<name>.commands]` takes precedence over the built-in adapter helper.
+EdgeZero runs that command from the directory containing `edgezero.toml` and
+appends any passthrough arguments after shell-escaping them.
+
+When no explicit command is configured, EdgeZero delegates to the registered
+built-in adapter. The Fastly, Cloudflare, and Spin helpers resolve their
+provider manifest (`fastly.toml`, `wrangler.toml`, or `spin.toml`) as follows:
+
+1. Search the current working directory and then its ancestors. The first
+   matching provider manifest wins.
+2. If the upward search finds nothing, scan the Cargo workspace and select the
+   unique manifest whose parent directory is nearest to the current working
+   directory.
+3. If multiple manifests are equally near, fail with an error listing the
+   candidates. Run the command from the intended adapter crate or define the
+   explicit `[adapters.<name>.commands]` entry to remove the ambiguity.
+
+This avoids silently deploying a different application from a multi-adapter or
+multi-application workspace.
 
 ### edgezero config validate
 

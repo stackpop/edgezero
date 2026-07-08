@@ -462,7 +462,7 @@ target = "wasm32-unknown-unknown"
 profile = "release"
 
 [adapters.cloudflare.commands]
-build = "wrangler build --cwd crates/my-app-adapter-cloudflare"
+build = "wrangler deploy --dry-run --cwd crates/my-app-adapter-cloudflare"
 deploy = "wrangler deploy --cwd crates/my-app-adapter-cloudflare"
 serve = "wrangler dev --cwd crates/my-app-adapter-cloudflare"
 
