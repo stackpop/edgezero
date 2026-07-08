@@ -3065,25 +3065,6 @@ build = \"cargo build --release\"
         oplog: &Path,
     ) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempdir().expect("tempdir");
-        let list_file = dir.path().join("list.json");
-        fs::write(
-            &list_file,
-            format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#),
-        )
-        .expect("list");
-        for (index, value) in root_describe_seq.iter().enumerate() {
-            let wrapped = format!(
-                r#"{{"item_value":{}}}"#,
-                serde_json::to_string(value).expect("escape")
-            );
-            let nth = index.saturating_add(1);
-            fs::write(
-                dir.path().join(format!("resp_{root_key}_{nth}.json")),
-                wrapped,
-            )
-            .expect("resp");
-        }
         // Rendered with handlebars. Triple-stache `{{{ }}}` disables HTML
         // escaping (paths are not markup); the shell's own `${var}` /
         // `$(( ))` use single braces so they are literal text to handlebars.
@@ -3104,6 +3085,25 @@ if [ "$sub" = "describe" ]; then
 fi
 echo 'unexpected' >&2; exit 1
 "#;
+        let dir = tempdir().expect("tempdir");
+        let list_file = dir.path().join("list.json");
+        fs::write(
+            &list_file,
+            format!(r#"[{{"name":"{TEST_CONFIG_ID}","id":"store-abc123"}}]"#),
+        )
+        .expect("list");
+        for (index, value) in root_describe_seq.iter().enumerate() {
+            let wrapped = format!(
+                r#"{{"item_value":{}}}"#,
+                serde_json::to_string(value).expect("escape")
+            );
+            let nth = index.saturating_add(1);
+            fs::write(
+                dir.path().join(format!("resp_{root_key}_{nth}.json")),
+                wrapped,
+            )
+            .expect("resp");
+        }
         let data = serde_json::json!({
             "list": list_file.display().to_string(),
             "oplog": oplog.display().to_string(),
