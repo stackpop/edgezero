@@ -367,6 +367,14 @@ assert!(combined.contains("orphan chunks"));
 
 Also keep `assert_eq!(after, original)`.
 
+Add a second dry-run test for the identical-bytes re-push (regression
+for MEDIUM-A / the expand-`new_keys` rule): seed a chunked config, then
+dry-run the SAME bytes and assert the count is `0`:
+
+```rust
+assert!(combined.contains("would delete 0 orphan chunks"));
+```
+
 - [ ] **Step 4: Run local tests to verify failures**
 
 Run:
@@ -393,13 +401,27 @@ fn write_fastly_local_config_store(
 ) -> Result<Vec<String>, String>
 ```
 
-Update ALL existing call sites to pass `roots`. The adapter caller
-(`push_config_entries_local`) passes the logical entry keys
-(`&entries.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()`).
-Setup-only writes in the unit-test module pass the store id they seed
-(e.g. `&[TEST_CONFIG_ID]`), or `&[]` where the test does not exercise
-GC. Existing direct callers that only `.expect("write")` can ignore the
-returned `Vec<String>`.
+Update ALL existing call sites to pass `roots`. There are **10** (line
+numbers approximate — grep `write_fastly_local_config_store` to confirm):
+
+| Site | Kind | `roots` to pass |
+| --- | --- | --- |
+| `cli.rs:483` | prod (`push_config_entries_local`) | logical entry keys (see caller snippet below) |
+| `cli.rs:1838` | test — minimal-file block | `&[TEST_CONFIG_ID]` |
+| `cli.rs:1867`, `:1873` | test — replaces-block-on-re-push | `&[TEST_CONFIG_ID]` (both writes) |
+| `cli.rs:1902` | test — preserves-unrelated-blocks | `&[TEST_CONFIG_ID]` |
+| `cli.rs:1931` | test — creates-file-when-missing | `&[TEST_CONFIG_ID]` |
+| `cli.rs:2366` | test | the store id it seeds, or `&[]` if GC is irrelevant |
+| `cli.rs:3243` | test | the store id it seeds, or `&[]` |
+| `cli.rs:3275` | test — local chunked roundtrip | `&[TEST_CONFIG_ID]` |
+
+Pass `&[]` only where the test does not exercise GC and the extra prune
+would perturb its assertions; otherwise pass the seeded root(s). The
+adapter caller (`push_config_entries_local`) passes the logical entry
+keys (see snippet below). Existing direct callers that only
+`.expect("write")` can ignore the returned `Vec<String>` (the return
+type changes from `Result<(), _>` to `Result<Vec<String>, _>`, which is
+source-compatible with `.expect(...)`).
 
 Inside the function:
 
@@ -467,23 +489,32 @@ fn local_orphan_counts_for_dry_run(
     entries: &[(String, String)], // logical entries; roots are their keys
 ) -> Vec<(String, Result<usize, String>)> {
     // Roots are the logical entry keys (NOT inferred from physical keys).
+    // For each logical (root_key, body):
+    //   new_keys = keys of prepare_fastly_config_entries(root_key, body) ∪ {root_key}
+    //     — MUST expand here; using the logical key alone would over-count an
+    //       identical-bytes re-push (new chunk keys would be missing from
+    //       new_keys, so every prior chunk would look like an orphan).
+    //   old_raw  = contents table value at root_key (if present)
+    //   count    = orphan_chunk_keys({prior_chunk_keys(root, old_raw), new_keys}).len()
     // Missing file, missing/absent contents table, or a root with no prior
     //   pointer / a direct prior value => Ok(0) per root.
     // Unreadable file, malformed TOML, contents-not-a-table, or a root
     //   value that is not a string => Err("could not read prior state").
     // prior_chunk_keys(root, old_raw) returning Err (suspicious pointer)
-    //   => Err(<that message>).
-    // Use prior_chunk_keys(root, old_raw), new_key_set_for_root, and orphan_chunk_keys.
+    //   => Err("suspicious prior pointer").
 }
 ```
 
 This helper MUST NOT fail the dry-run: it returns a per-root `Result`
 that the caller renders as a count or an `unknown (...)` line. The
 current dry-run reads no file at all, so introducing this read must not
-turn a previously-succeeding dry-run into an error. Use exact
-`toml_edit` table access, not string scanning. Keep this helper small;
-if it gets large, split only into `local_contents_table` and count
-computation.
+turn a previously-succeeding dry-run into an error. Note it expands each
+logical entry via `prepare_fastly_config_entries` to derive the true
+`new_keys` — the same expansion the real push performs — so the count
+matches what the push would actually delete (0 for an identical
+re-push). Use exact `toml_edit` table access, not string scanning. Keep
+this helper small; if it gets large, split only into
+`local_contents_table` and count computation.
 
 - [ ] **Step 7: Wire local dry-run count output**
 
@@ -495,11 +526,12 @@ out.push(format!(
 ));
 ```
 
-For an `Err`, emit:
+For an `Err`, emit (wording matches the spec's local dry-run bullet —
+`{reason}` is `could not read prior state` or `suspicious prior pointer`):
 
 ```rust
 out.push(format!(
-    "  would delete unknown orphan chunks from the previous generation of `{key}` ({err})"
+    "  would delete an unknown number of orphan chunks from the previous generation of `{key}` (unknown: {reason})"
 ));
 ```
 
@@ -581,7 +613,9 @@ Expected: new GC tests fail because no deletes or warning lines exist yet.
 
 - [ ] **Step 4: Add `delete_config_store_entry`**
 
-Add near `create_config_store_entry`:
+Add near `create_config_store_entry`. NOTE: only ever pass `--key`.
+The delete subcommand also accepts `-a/--all`, which wipes **every**
+entry in the store — never construct that flag here.
 
 ```rust
 fn delete_config_store_entry(store_id: &str, key: &str) -> Result<(), String> {
@@ -656,8 +690,12 @@ for plan in &gc_plans {
         Ok(keys) => {
             for key in keys {
                 if let Err(err) = delete_config_store_entry(&resolved_id, &key) {
+                    // Informational: the push already succeeded and the new
+                    // pointer is live, so this orphan is inert, just not
+                    // reclaimed. It will be cleaned by a future `config gc`
+                    // command; do NOT tell the operator to retry the push.
                     warnings.push(format!(
-                        "warning: failed to delete orphan chunk `{key}` for `{}`: {err}",
+                        "note: could not reclaim orphan chunk `{key}` for `{}` ({err}); it is inert and will be removed by a future `config gc`",
                         plan.root_key
                     ));
                 }
@@ -789,3 +827,5 @@ git commit -m "test(fastly): verify chunk gc behavior"
 - Use exact `toml_edit::Table` key operations for local dotted chunk keys.
 - If a push commit fails, do not sweep anything. The old root pointer may still be live.
 - If GC fails, return `Ok` with warning status lines. The push success criterion remains new entries committed.
+- Cloud GC spawns one `fastly` process per orphan, sequentially. A large prior generation (e.g. 50 chunks) means ~50 sequential shell-outs after the push — a known wall-clock cost. Fastly has no bulk delete-by-key (`--all` is store-wide and unusable), so batching is not available; do not add parallel spawns in v1 without measuring.
+- Line numbers in this plan are approximate anchors against `main`; `grep` the named function/test before editing, since prior edits shift offsets.

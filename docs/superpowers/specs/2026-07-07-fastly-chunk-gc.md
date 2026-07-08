@@ -216,9 +216,18 @@ handled for free: the new value is a direct envelope,
   shelling `fastly config-store-entry delete --store-id=<id>
   --key=<key> --auto-yes`, mirroring the spawn/stderr handling of
   `create_config_store_entry` (`cli.rs:1073`). `--auto-yes` suppresses
-  any interactive confirmation (non-interactive shell-out). Treat a
+  any interactive confirmation (non-interactive shell-out). Only ever
+  pass `--key`: the subcommand also accepts `-a/--all`, which deletes
+  **every** entry in the store — never construct that flag. Treat a
   "not found" / "does not exist" / "404" stderr as success (already
   gone).
+- **A failed delete is informational, not actionable.** The push has
+  already succeeded and the new pointer is live, so an un-deleted orphan
+  is inert. Word the warning accordingly (e.g. "could not reclaim orphan
+  chunk … ; it is inert and will be removed by a future `config gc`") —
+  do NOT imply the operator should retry the push. There is no reclaim
+  command in v1, so such an orphan persists as a pre-existing leak (see
+  Non-goals) until that future tool ships.
 - **Sweep after the whole commit.** The cloud writer flattens every
   logical root's physical entries into one `physical_entries` vec
   (`cli.rs:380`) and commits them in a single `push_entries_with_committer`
@@ -234,7 +243,11 @@ handled for free: the new value is a direct envelope,
   whichever pointer actually committed. Reclamation waits for the next
   successful push. Leak-safe over corrupt-safe, per invariant 4.
 - **Cost**: one extra `describe` per logical root before the push, plus
-  one `delete` per orphan after. No store-wide `list` call.
+  one `delete` per orphan after. No store-wide `list` call. Deletes are
+  sequential `fastly` subprocess spawns — a large prior generation
+  (e.g. 50 chunks) adds ~50 sequential shell-outs of post-push latency.
+  Fastly exposes no bulk delete-by-key (`--all` is store-wide), so v1
+  accepts this cost rather than parallelising spawns.
 
 ## Local path (`push_config_entries_local` / `write_fastly_local_config_store`)
 
@@ -263,8 +276,14 @@ threaded explicitly rather than inferred from the flattened entries:
   warnings are suspicious-pointer ones.
 - **Dry-run (offline, best-effort count).** `push_config_entries_local`'s
   dry-run (`cli.rs:459`) reads no remote state. Extend it to read the
-  current `fastly.toml`, compute `prior_chunk_keys` per root, and report
-  the orphan count, e.g.
+  current `fastly.toml` and, per root, compute the orphan count as
+  `prior_chunk_keys(root, old_value) − new_keys`, where `new_keys` is
+  the **expanded** key set (`prepare_fastly_config_entries(root, body)`
+  keys ∪ `{root}`) — the same expansion the real push does. Expanding
+  is required: using the logical key alone would over-count an
+  identical-bytes re-push (the new chunk keys would be missing from
+  `new_keys`, making every prior chunk look like an orphan; the correct
+  answer is `0`). Report e.g.
   `"  would delete 9 orphan chunks from the previous generation of `app_config`"`.
   Error semantics — the dry-run MUST NOT newly fail where it succeeds
   today (the current dry-run does not read the file at all), so GC
@@ -273,11 +292,12 @@ threaded explicitly rather than inferred from the flattened entries:
     → report `0`.
   - File present but unreadable, malformed TOML, `contents` not a table,
     or a root's value not a string → report
-    `"unknown (could not read prior state)"` for that root and continue.
-    (The real push still fails fatally on malformed TOML via the writer
-    at `cli.rs:938`; only the dry-run *count* degrades.)
+    `"would delete an unknown number of orphan chunks from the previous generation of `app_config` (unknown: could not read prior state)"`
+    for that root and continue. (The real push still fails fatally on
+    malformed TOML via the writer at `cli.rs:938`; only the dry-run
+    *count* degrades.)
   - Prior value is pointer-kind-but-invalid (`prior_chunk_keys` → `Err`)
-    → report `"unknown (suspicious prior pointer)"`.
+    → report the same line with `(unknown: suspicious prior pointer)`.
 
 ## Existing tests that MUST change
 
@@ -346,6 +366,9 @@ in the `cli.rs` test module.
   correctly — its own prior chunks are swept, siblings untouched.
 - **Dry-run count**: reports the correct orphan count and writes
   nothing.
+- **Dry-run identical re-push counts 0**: seed a chunked config, then
+  dry-run the SAME bytes → reports `0` orphans (regression for computing
+  `new_keys` from the expanded, not logical, entries).
 - **Dry-run degrades, never fails**: a malformed `fastly.toml` makes the
   dry-run report `unknown` for the GC count while still printing the
   direct-vs-chunked intent lines and returning `Ok`.
