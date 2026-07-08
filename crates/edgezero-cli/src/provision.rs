@@ -1131,16 +1131,61 @@ fn is_env_secret_carriage_path(path: &Path) -> bool {
 fn redact_env_body_for_diff(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     for line in body.split_inclusive('\n') {
-        // Split off the trailing newline (if any) via char_indices
-        // so we never slice inside a multi-byte codepoint. Env-file
-        // content is normally 7-bit ASCII, but redaction of a
-        // hand-authored operator note that includes UTF-8 must not
-        // panic.
+        // Split off the trailing newline (if any) — env-file content
+        // is normally 7-bit ASCII, but redaction of a hand-authored
+        // operator note that includes UTF-8 must not panic.
         let (content, tail) = match line.rfind('\n') {
             Some(idx) => line.split_at(idx),
             None => (line, ""),
         };
-        if content.is_empty() || content.trim_start().starts_with('#') {
+        let trimmed = content.trim_start();
+        if trimmed.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        // Comment-shaped lines still get redacted when they carry a
+        // `KEY=value` shape. Reason: adapter provisioners emit
+        // commented placeholder entries like
+        // `# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=` (see
+        // `edgezero-adapter-axum/src/cli/provision_local.rs`), and
+        // operators frequently leave stashed real values behind a
+        // leading `#` for later use. `env_file.rs`'s dedup helper
+        // treats single-hash `# KEY=value` as a real commented env
+        // entry, so it's part of the secret-carriage surface.
+        //
+        // Pure comments — either shebang-style banners
+        // (`# edgezero-provision: v1`), or comments that don't
+        // contain an `=` — pass through unchanged so structural
+        // context stays readable.
+        if let Some(after_hash) = trimmed.strip_prefix('#') {
+            let body_after_hash = after_hash.trim_start();
+            if let Some((key, _value)) = body_after_hash.split_once('=') {
+                // Preserve the operator's original indent + leading
+                // `#` shape (e.g. `#`, `# `, `  # `). Iterate chars
+                // rather than byte-slice so a multi-byte UTF-8
+                // codepoint in the key or value never triggers an
+                // in-codepoint slice.
+                let mut past_hash = false;
+                for ch in content.chars() {
+                    if past_hash {
+                        if ch.is_whitespace() {
+                            out.push(ch);
+                        } else {
+                            break;
+                        }
+                    } else {
+                        out.push(ch);
+                        if ch == '#' {
+                            past_hash = true;
+                        }
+                    }
+                }
+                out.push_str(key);
+                out.push_str("=<redacted>");
+                out.push_str(tail);
+                continue;
+            }
+            // Pure comment — no `=` in the body.
             out.push_str(line);
             continue;
         }
@@ -3822,6 +3867,64 @@ ids = ["default"]
         assert!(
             report.contains("old-name") && report.contains("new-name"),
             "non-env file must diff normally without redaction: {report}"
+        );
+    }
+
+    #[test]
+    fn redact_env_body_redacts_commented_key_value_lines() {
+        // Regression: the pre-fix filter treated ANY `#`-starting
+        // line as a pure comment and passed it through verbatim.
+        // But the adapter provisioners emit commented placeholder
+        // env entries (e.g. `# EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY=`)
+        // and operators frequently stash real values behind a
+        // leading `#` for later use. Both shapes must be redacted.
+        // Pure comments (no `=`) still pass through so structural
+        // context stays readable in the diff.
+        //
+        // Concatenate line-by-line via `format!` (not string
+        // continuation `\`) so leading whitespace on indented lines
+        // survives verbatim — Rust's `\n\` continuation would strip
+        // the two leading spaces on the `  # DATABASE_URL=...` line.
+        let body = format!(
+            "{}{}{}{}{}",
+            "# edgezero-provision: v1\n",
+            "# API_TOKEN=sk-live-stashed-secret-do-not-leak\n",
+            "#EDGEZERO__STORES__SECRETS__DEFAULT__NAME=some_value\n",
+            "  # DATABASE_URL=postgres://user:pass@host/db\n",
+            "API_TOKEN=live-secret\n",
+        );
+        let redacted = redact_env_body_for_diff(&body);
+        assert!(
+            redacted.contains("# edgezero-provision: v1"),
+            "banner-shaped pure comment preserved: {redacted}"
+        );
+        assert!(
+            !redacted.contains("sk-live-stashed-secret-do-not-leak"),
+            "SECURITY: commented `# KEY=value` MUST be redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("# API_TOKEN=<redacted>"),
+            "commented KEY=value line still surfaces as a commented redacted line: {redacted}"
+        );
+        assert!(
+            !redacted.contains("some_value"),
+            "SECURITY: no-space `#KEY=value` MUST also be redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("#EDGEZERO__STORES__SECRETS__DEFAULT__NAME=<redacted>"),
+            "no-space form redacts: {redacted}"
+        );
+        assert!(
+            !redacted.contains("postgres://"),
+            "SECURITY: indented commented `KEY=value` MUST be redacted: {redacted}"
+        );
+        assert!(
+            redacted.contains("  # DATABASE_URL=<redacted>"),
+            "indented commented line preserves its indent + `#` shape: {redacted}"
+        );
+        assert!(
+            !redacted.contains("live-secret"),
+            "SECURITY: non-comment value redacted (sanity check): {redacted}"
         );
     }
 

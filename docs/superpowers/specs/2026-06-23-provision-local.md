@@ -44,7 +44,16 @@ the config blob, leaving everything provision wrote intact.
 - Never creates files outside the adapter crate's directory or
   the gitignored local-state directories (`.wrangler/`, `.spin/`,
   `.edgezero/`, `.dev.vars`, `.env`). This is enforced by the
-  path-containment rule below, not just by convention.
+  path-containment rule below, not just by convention. `--local`
+  provision and config paths REQUIRE both
+  `[adapters.<name>.adapter].crate` and
+  `[adapters.<name>.adapter].manifest` to be declared — the
+  strict-local containment rule proves the manifest resolves
+  inside the adapter crate dir, which is impossible when either
+  field is absent. All four bundled adapters (axum, cloudflare,
+  fastly, spin) declare both fields in generated projects; there
+  is no legacy adapter that legitimately omits either in local
+  mode.
 
 ### Path containment (MUST)
 
@@ -135,33 +144,58 @@ pub(crate) fn assert_provision_paths_contained(
             }
         }
     }
-    // Step 2: when both `.crate` and `.manifest` are set, the
-    // manifest path MUST resolve inside the adapter crate dir.
-    // Without this, `crate = "crates/cf"` plus
-    // `manifest = "tmp/wrangler.toml"` would pass step 1 but
-    // write to a path OUTSIDE the adapter crate -- breaking
-    // the "never creates files outside the adapter crate"
-    // promise this section opens with.
+    // Step 2 (strict-local only): BOTH `.crate` AND `.manifest`
+    // are REQUIRED and the manifest MUST resolve inside the
+    // adapter crate dir. Any one of the three failure modes
+    // below breaks the "never creates files outside the
+    // adapter crate" promise this section opens with:
     //
-    // `crate = None` means the operator omitted the crate
-    // declaration (legal for adapters whose layout doesn't
-    // need it, e.g. Axum); we skip this stronger check
-    // entirely and fall back to step 1's project-root
-    // containment.
-    if let (Some(crate_raw), Some(manifest_raw)) =
-        (adapter_crate_path, adapter_manifest_path)
-    {
-        let crate_resolved = lexical_normalize(&root.join(Path::new(crate_raw)));
-        let manifest_resolved = lexical_normalize(&root.join(Path::new(manifest_raw)));
-        if !manifest_resolved.starts_with(&crate_resolved) {
-            return Err(format!(
-                "[adapters.<name>.adapter].manifest `{manifest_raw}` must \
-                 resolve inside [adapters.<name>.adapter].crate `{crate_raw}`; \
-                 resolved manifest path `{}` is not under crate path `{}`",
-                manifest_resolved.display(),
-                crate_resolved.display(),
-            ));
-        }
+    //   - Missing `.manifest`: the adapter synth's
+    //     `PathBuf::from("<default>.toml")` fallback lands
+    //     generated files at the project root, and
+    //     `read_adapter_crate_name` has no path to walk up
+    //     from.
+    //   - Missing `.crate`: the CLI can't PROVE the manifest
+    //     lives inside any adapter crate. A permissive
+    //     `manifest = "wrangler.toml"` at project root would
+    //     silently land wrangler.toml outside any crate.
+    //   - Both set but manifest outside crate: e.g.
+    //     `crate = "crates/cf"` +
+    //     `manifest = "tmp/wrangler.toml"` passes step 1 but
+    //     writes outside the adapter crate.
+    //
+    // Cloud dispatch does not run this step -- legitimate
+    // cloud fixtures use `manifest = "wrangler.toml"` at the
+    // project root alongside a crate under `crates/`, which
+    // is safe for vendor-CLI dispatch. All four bundled
+    // adapters declare BOTH fields in generated projects
+    // (the scaffolder writes them; there is no legacy
+    // adapter that legitimately omits either).
+    if !strict_local {
+        return Ok(());
+    }
+    let Some(manifest_raw) = adapter_manifest_path else {
+        return Err(format!(
+            "[adapters.<name>.adapter].manifest is required for `--local` \
+             provision and config paths"
+        ));
+    };
+    let Some(crate_raw) = adapter_crate_path else {
+        return Err(format!(
+            "[adapters.<name>.adapter].crate is required for `--local` \
+             provision and config paths"
+        ));
+    };
+    let crate_resolved = lexical_normalize(&root.join(Path::new(crate_raw)));
+    let manifest_resolved = lexical_normalize(&root.join(Path::new(manifest_raw)));
+    if !manifest_resolved.starts_with(&crate_resolved) {
+        return Err(format!(
+            "[adapters.<name>.adapter].manifest `{manifest_raw}` must \
+             resolve inside [adapters.<name>.adapter].crate `{crate_raw}`; \
+             resolved manifest path `{}` is not under crate path `{}`",
+            manifest_resolved.display(),
+            crate_resolved.display(),
+        ));
     }
     Ok(())
 }
