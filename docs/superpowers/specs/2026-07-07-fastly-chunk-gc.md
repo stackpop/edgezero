@@ -63,12 +63,16 @@ pointer no longer does.
   either a direct `BlobEnvelope` or a chunk pointer. Never GC'd. The
   root key is the logical store-config id, or the operator's
   `--key <override>` — a free-form `Option<String>` (`args.rs:311`,
-  used directly in `config.rs:297`). Because `--key` is **not**
-  validated today, GC does NOT infer roots by string-matching the chunk
-  infix; it threads the logical root keys explicitly (see Local path).
-  As defence-in-depth, the implementation SHOULD also reject a `--key`
-  containing the reserved infix `.__edgezero_chunks.` at push time,
-  since such a key would collide with the generated chunk namespace.
+  used directly in `config.rs:297`). GC never infers roots by
+  string-matching the chunk infix; roots come from the caller's logical
+  entries. In addition, the Fastly adapter **MUST reject** (hard error,
+  not warning) any logical key containing the reserved infix
+  `.__edgezero_chunks.`, at the top of both `push_config_entries` and
+  `push_config_entries_local`, before any expansion or I/O. Such a key
+  collides with the generated chunk namespace and has no valid use; a
+  push must not be able to write into another key's chunk space. The
+  check lives at the Fastly adapter boundary (the infix is a
+  Fastly-specific concept), not in generic `edgezero-cli`.
 - **Previous pointer**: the value stored at the root key *before* this
   push overwrites it.
 - **Prior chunk keys**: the keys named by `previous_pointer.chunks[]`,
@@ -76,7 +80,12 @@ pointer no longer does.
   Empty if the previous value was a direct envelope, missing, or not a
   valid v1 pointer.
 - **New keep-set**: the physical keys this push writes for that root —
-  the new chunk keys plus the root key itself.
+  the new chunk keys plus the root key itself. It is built by expanding
+  **that root's own** `(root_key, body)` via
+  `prepare_fastly_config_entries` and taking those keys — NOT by
+  prefix-scanning the flattened multi-root physical set (which would
+  reintroduce infix inference and mis-handle shared prefixes or a
+  free-form key).
 - **Orphans**: `prior_chunk_keys − new_keep_set`. In practice this is
   all prior chunk keys, because a changed config changes the SHA and
   therefore every chunk key; but the set-difference is the correct,
@@ -122,6 +131,21 @@ pointer no longer does.
    sweep is optimistic — any read/parse/delete failure degrades to a
    warning folded into the returned status lines; the push still
    reports success. A leaked chunk is harmless; a failed push is not.
+
+5. **Cloud deletes are guarded by a post-commit root read-back.** A
+   concurrent push could overwrite the root between our commit and our
+   sweep — e.g. revert it to the prior pointer, making the "orphans"
+   live again. So before deleting a root's orphans, cloud GC re-reads
+   the raw root and proceeds only if it still equals *exactly* the value
+   this push wrote (`new_root_value`). If it differs (or the re-read
+   fails), GC is skipped for that root with a warning. This narrows but
+   does not fully close the window (no compare-and-delete exists in
+   Fastly; a writer could still intervene between the read-back and an
+   individual delete) — acceptable under invariant 4, since the guard
+   eliminates the realistic revert-to-prior corruption and the residual
+   only risks a leak, never a live delete in the common case. The local
+   path holds the whole file in one rewrite and has no equivalent
+   remote-concurrency window.
 
 ## `prior_chunk_keys` helper (`chunked_config.rs`)
 
@@ -173,24 +197,33 @@ with missing `chunks` and `version:2` → `Err` (NOT silently `Ok([])`);
 
 ## Algorithm
 
-For each logical `(root_key, envelope_json)` entry in the push:
+# --- validate first (both paths), before any expansion or I/O ---
+reject the whole push if ANY logical key contains CHUNK_KEY_INFIX   # hard error
+
+For each logical `(root_key, body)` entry in the push:
 
 ```
 # --- before writing ---
-prev        = read_root_value(root_key)          # may be absent
-prior       = prior_chunk_keys(root_key, prev)   # Ok([]) unless prev is a valid v1 pointer
-expanded    = prepare_fastly_config_entries(root_key, envelope_json)
-new_keys    = { k for (k, _) in expanded } ∪ { root_key }
+prev            = read_root_value(root_key)          # may be absent
+prior           = prior_chunk_keys(root_key, prev)   # Ok([]) unless prev is a valid v1 pointer
+expanded        = prepare_fastly_config_entries(root_key, body)   # THIS root only
+new_keys        = { k for (k, _) in expanded }       # includes root_key (its last entry)
+new_root_value  = value of expanded.last()           # exactly what we write at root_key
 
 # --- write (existing behaviour, unchanged) ---
 push expanded            # chunks first, root pointer last  (commit point)
 
-# --- sweep (new, best-effort, only after push succeeds) ---
+# --- sweep (best-effort, only after the WHOLE push succeeds) ---
 match prior:
     Err(msg): warn(msg)                                  # suspicious pointer; skip GC
     Ok(keys):
-        for k in keys − new_keys:
-            try delete_entry(k) except e: warn("failed to delete orphan chunk `{k}`: {e}")
+        orphans = keys − new_keys
+        if orphans not empty:
+            # cloud only — read-back concurrency guard (invariant 5):
+            if read_root_value(root_key) != new_root_value:
+                warn("root `{root_key}` changed since this push wrote it; skipping GC"); continue
+            for k in orphans:
+                try delete_entry(k) except e: warn("could not reclaim orphan `{k}`: {e}")
 ```
 
 The **shrink-to-direct** case (config drops back under 8 000 chars) is
@@ -236,6 +269,13 @@ handled for free: the new value is a direct envelope,
   `Ok` — i.e. after ALL roots' chunks + pointers are committed. Fold
   delete failures and prior-read/parse warnings into the returned status
   `Vec<String>` (the push still returns `Ok`).
+- **Read-back concurrency guard (invariant 5).** Each root's GC record
+  carries `new_root_value` — the exact value written at the root key
+  (its new pointer, or the direct envelope; i.e. the last expanded
+  entry's value). In the post-commit sweep, before deleting a root's
+  orphans, re-read the raw root via `fetch_remote_config_store_entry`
+  and delete only if it equals `new_root_value`; otherwise warn ("root
+  changed since this push wrote it") and skip that root.
 - **Partial-commit failure ⇒ no GC.** If the committer fails partway,
   `push_config_entries` returns `Err` and no sweep runs for any root.
   Safe by construction: nothing is deleted, so the store is left with
@@ -253,19 +293,22 @@ handled for free: the new value is a direct envelope,
 
 The local `contents` table is held entirely in memory in a single
 `DocumentMut`, so GC here is fully reliable and needs no round-trips.
-To stay sound against a free-form `--key`, the logical root keys are
-threaded explicitly rather than inferred from the flattened entries:
+Per-root keep-sets are computed from each root's own expansion and
+passed to the writer explicitly — never inferred from the flattened set:
 
-- **Thread logical roots (no inference).** `push_config_entries_local`
-  already holds the logical `entries: &[(String, String)]`. Pass the
-  logical root keys into `write_fastly_local_config_store` via a new
-  parameter (e.g. `roots: &[&str]`) alongside `physical_entries`. No
-  string-matching on the chunk infix — a `--key` that happens to
-  contain `.__edgezero_chunks.` cannot mislead root detection.
+- **Pass exact per-root keep-sets (no inference).**
+  `push_config_entries_local` expands each logical `(root_key, body)` via
+  `prepare_fastly_config_entries` (once, reused for `physical_entries`)
+  and passes `gc_roots: &[(String, HashSet<String>)]` — each root with
+  its own exact new-key set — into `write_fastly_local_config_store`
+  alongside `physical_entries`. No string-matching on the chunk infix; a
+  `--key` containing `.__edgezero_chunks.` is separately rejected up
+  front (Terminology). An empty `gc_roots` means "no GC" (setup-only
+  writers pass `&[]`).
 - **Sweep inside the single rewrite.** In `write_fastly_local_config_store`
-  (`cli.rs:926`), before the upsert loop, snapshot each threaded root's
-  *old* value from the existing `contents_tbl`. After inserting the new
-  physical entries, for each root compute
+  (`cli.rs:926`), before the upsert loop, snapshot each root's *old*
+  value from the existing `contents_tbl`. After inserting the new
+  physical entries, for each `(root, new_keys)` compute
   `prior_chunk_keys(root, old_value)` and `contents_tbl.remove(k)` for
   each orphan `k` in `prior − new_keys`. All within the one
   `DocumentMut` that the trailing `fs::write` (`cli.rs:999`) persists —
@@ -346,6 +389,15 @@ in the `cli.rs` test module.
   errors (non-not-found) → push `Ok`, GC skipped, warning present.
 - **Suspicious pointer degrades to warning**: prior value is
   pointer-kind with `version` 2 → push `Ok`, no deletes, warning.
+- **Concurrency guard skips on changed root**: the fake serves the root
+  `describe` twice — prior pointer pre-commit, then a *different* value
+  on the post-commit read-back → GC skipped for that root with a "root
+  changed" warning and **no** `delete` calls. (The happy-path
+  delete test conversely serves the newly-written value on read-back so
+  the guard passes.)
+- **Reserved key rejected**: `push_config_entries` with a logical key
+  containing `.__edgezero_chunks.` returns `Err` before any `fastly`
+  invocation (no `list`/`describe`/`update`/`delete`).
 - **Ordering**: extend the argv-log fake to assert every `delete` argv
   appears strictly after the root-pointer `update` argv.
 - **Dry-run stays offline**: dry-run makes no `list`/`describe`/`delete`
@@ -361,9 +413,13 @@ in the `cli.rs` test module.
   chunk keys removed, root holds the direct envelope.
 - **Sibling coexistence preserved**: a push of `app_config` must not
   remove `app_config_staging` chunk keys (Spec 12.7 coexistence).
-- **Free-form `--key` with the infix**: threading roots (not inference)
-  means a root key containing `.__edgezero_chunks.` is still handled
-  correctly — its own prior chunks are swept, siblings untouched.
+- **Suspicious prior pointer (real push)**: seed the root with a
+  pointer-kind-but-invalid value (e.g. `version: 2`); a real local push
+  of a new config returns a suspicious-pointer warning, deletes no chunk
+  keys as a side effect, and still writes the new value.
+- **Reserved key rejected**: `push_config_entries_local` with a logical
+  key containing `.__edgezero_chunks.` returns `Err` before touching
+  `fastly.toml` (file unchanged / not created).
 - **Dry-run count**: reports the correct orphan count and writes
   nothing.
 - **Dry-run identical re-push counts 0**: seed a chunked config, then
@@ -393,8 +449,8 @@ in the `cli.rs` test module.
 | File | Change |
 | --- | --- |
 | `crates/edgezero-adapter-fastly/src/chunked_config.rs` | Add `pub(crate) fn prior_chunk_keys(root_key, raw) -> Result<Vec<String>, String>` (validates v1 + prefix-scopes) + unit tests |
-| `crates/edgezero-adapter-fastly/src/cli.rs` (`push_config_entries`, `:349`) | Per-root prior read via `fetch_remote_config_store_entry`; `delete_config_store_entry` helper (`--auto-yes`); post-commit sweep; offline dry-run GC-intent line; tests |
-| `crates/edgezero-adapter-fastly/src/cli.rs` (`push_config_entries_local`, `:421`) | Thread logical roots to the writer; best-effort dry-run orphan counts (degrade to "unknown", never newly fail); tests |
-| `crates/edgezero-adapter-fastly/src/cli.rs` (`write_fastly_local_config_store`, `:926`) | New `roots: &[&str]` param; snapshot old values, prune orphans in the same in-memory rewrite before the existing `fs::write` (`:999`) |
+| `crates/edgezero-adapter-fastly/src/cli.rs` (helpers) | `reject_reserved_root_keys`, `expand_root` (exact per-root keep-set + `new_root_value`), `orphan_chunk_keys`, `delete_config_store_entry` (`--key --auto-yes`, never `--all`) |
+| `crates/edgezero-adapter-fastly/src/cli.rs` (`push_config_entries`, `:349`) | Reject reserved keys; per-root prior read via `fetch_remote_config_store_entry`; post-commit sweep with read-back concurrency guard; offline dry-run GC-intent line; tests |
+| `crates/edgezero-adapter-fastly/src/cli.rs` (`push_config_entries_local`, `:421`) | Reject reserved keys; pass exact per-root keep-sets to the writer; best-effort dry-run orphan counts (degrade to "unknown", never newly fail); tests |
+| `crates/edgezero-adapter-fastly/src/cli.rs` (`write_fastly_local_config_store`, `:926`) | New `gc_roots: &[(String, HashSet<String>)]` param (empty ⇒ no GC); snapshot old values, prune orphans in the same in-memory rewrite before the existing `fs::write` (`:999`); update all 10 call sites |
 | `crates/edgezero-adapter-fastly/src/cli.rs` (test `:3317`) | Invert: assert old chunks are deleted after re-push; drop "no GC in v1" commentary |
-| `crates/edgezero-cli/src/config.rs` (`:297`) / `args.rs` (`:311`) — optional, defence-in-depth | Reject a `--key` containing `.__edgezero_chunks.` at push time (collides with the chunk namespace) |
