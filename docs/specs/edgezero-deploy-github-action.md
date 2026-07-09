@@ -38,7 +38,7 @@ Three layers:
 
 | Layer           | Action              | Responsibility                                                                        |
 | --------------- | ------------------- | ------------------------------------------------------------------------------------- |
-| Build           | `build-cli`         | Compile the caller-selected EdgeZero CLI **once** and publish it.                     |
+| Build           | `build-cli`         | Compile the app-provided CLI package **once** and publish it.                         |
 | Engine (shared) | `deploy-core`       | Adapter-independent engine **scripts** sourced by wrappers; consume the prebuilt CLI. |
 | Adapter wrapper | `deploy-fastly` (…) | Minimal per-adapter shim: type provider credentials, call the engine.                 |
 
@@ -221,23 +221,23 @@ ref and keeps one engine for every adapter.
 The engine is parameterized by the values the wrapper passes to those scripts
 (as environment variables), conceptually:
 
-| Parameter            | Meaning                                                                                                                                                                                            |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `adapter`            | Passed to `<cli> deploy --adapter <adapter>`. The engine does **not** enumerate compiled adapters; the CLI rejects an unknown adapter with its own error.                                          |
-| `cli-artifact`       | Name of the `build-cli` artifact to download. The engine reads `cli-bin` and `cli-version` from the artifact's `cli-meta.json`.                                                                    |
-| `cli-bin`            | Optional override for the binary name; if empty, taken from `cli-meta.json`.                                                                                                                       |
-| `working-directory`  | Application directory relative to `github.workspace`. Must resolve inside `github.workspace`.                                                                                                      |
-| `manifest`           | Optional `edgezero.toml` path relative to `working-directory`. If set, must exist; exported as `EDGEZERO_MANIFEST`.                                                                                |
-| `rust-toolchain`     | Application Rust toolchain for the deploy build. `auto` follows §7.                                                                                                                                |
-| `target`             | Application build target. `auto` derives it from `adapter` (for example `fastly` → `wasm32-wasip1`).                                                                                               |
-| `build-mode`         | One of `auto`, `always`, `never` (§8).                                                                                                                                                             |
-| `build-args`         | JSON array of strings passed after `<cli> build --adapter <adapter> --`. Must not contain secrets.                                                                                                 |
-| `deploy-args`        | JSON array of caller-supplied deploy args appended after action-owned deploy flags. Must not contain secrets.                                                                                      |
-| `deploy-arg-allow`   | Adapter allowlist pattern for caller `deploy-args` (wrapper-provided; §9).                                                                                                                         |
-| `provider-env`       | JSON object of provider credential names → values, injected **only** into the deploy step (§10).                                                                                                   |
-| `provider-env-clear` | JSON array of env var names (wrapper-provided) the engine unsets in non-deploy steps and clears + re-exports from `provider-env` in the deploy step (§10). Keeps alias-clearing provider-agnostic. |
-| `deploy-flags`       | JSON array of action-owned deploy flags the wrapper injects before caller `deploy-args` (`--service-id …`, `--non-interactive`).                                                                   |
-| `cache`              | Enable exact-key application `target/` caching (`true`/`false`).                                                                                                                                   |
+| Parameter            | Meaning                                                                                                                                                                                                                                            |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `adapter`            | Passed to `<cli> deploy --adapter <adapter>`. The engine does **not** enumerate compiled adapters; the CLI rejects an unknown adapter with its own error.                                                                                          |
+| `cli-artifact`       | Name of the `build-cli` artifact to download. The engine reads `cli-bin` and `cli-version` from the artifact's `cli-meta.json`.                                                                                                                    |
+| `cli-bin`            | Optional override for the binary name; if empty, taken from `cli-meta.json`.                                                                                                                                                                       |
+| `working-directory`  | Application directory relative to `github.workspace`. Must resolve inside `github.workspace`.                                                                                                                                                      |
+| `manifest`           | Optional `edgezero.toml` path relative to `working-directory`. If set, must exist; exported as `EDGEZERO_MANIFEST`.                                                                                                                                |
+| `rust-toolchain`     | Application Rust toolchain for the deploy build. `auto` follows §7.                                                                                                                                                                                |
+| `target`             | Application build target. `auto` derives it from `adapter` (for example `fastly` → `wasm32-wasip1`).                                                                                                                                               |
+| `build-mode`         | One of `auto`, `always`, `never` (§8).                                                                                                                                                                                                             |
+| `build-args`         | JSON array of strings passed after `<cli> build --adapter <adapter> --`. Must not contain secrets.                                                                                                                                                 |
+| `deploy-args`        | JSON array of caller-supplied deploy args appended after action-owned deploy flags. Must not contain secrets.                                                                                                                                      |
+| `deploy-arg-allow`   | Adapter allowlist pattern for caller `deploy-args` (wrapper-provided; §9).                                                                                                                                                                         |
+| `provider-env`       | JSON object of provider credential names → values. Present **only in the deploy step's own environment** (step-scoped `env:`); the variable never reaches setup/build steps, and the engine parses it only inside the deploy step (§10).           |
+| `provider-env-clear` | JSON array of env var names (wrapper-provided) the engine unsets in non-deploy steps and clears + re-exports from `provider-env` inside the deploy step (§10). Defense-in-depth against inherited caller `env:`; keeps clearing provider-agnostic. |
+| `deploy-flags`       | JSON array of action-owned deploy flags the wrapper injects before caller `deploy-args` (`--service-id …`, `--non-interactive`).                                                                                                                   |
+| `cache`              | Enable exact-key application `target/` caching (`true`/`false`).                                                                                                                                                                                   |
 
 The wrapper surfaces engine results as its own outputs: `adapter`,
 `source-revision`, `cli-version`, `effective-build-mode`.
@@ -295,9 +295,11 @@ without the engine itself knowing Fastly's names.
    read `cli-meta.json` for `cli-bin`/`cli-version` (a wrapper `cli-bin` input
    overrides), and prepend the directory to `PATH` for action steps only.
 5. Parse `build-args`, `deploy-args`, `deploy-flags`, `provider-env-clear` as
-   JSON string arrays and `provider-env` as a JSON string→string object.
+   JSON string arrays. **`provider-env` is not present in these steps** — it is
+   scoped to the deploy step's own `env:` and parsed only there (step 17), so
+   setup/build never hold the secret-bearing blob.
 6. In every non-deploy step (setup, build), unset each name in
-   `provider-env-clear` so no provider credential leaks outside the deploy step.
+   `provider-env-clear` (defense-in-depth against inherited caller `env:`).
 7. Reject NUL-containing argument or value entries.
 8. Apply the adapter's deploy-arg allowlist (wrapper-provided) to `deploy-args`.
 9. Resolve `working-directory` beneath `github.workspace` using canonical paths
@@ -318,8 +320,9 @@ without the engine itself knowing Fastly's names.
 16. Resolve `build-mode` (§8). If `always`, run
     `<cli-bin> build --adapter <adapter> -- <build-args…>` with **no** provider
     credentials in scope (the `provider-env-clear` names stay unset here).
-17. In a separate deploy step, clear the `provider-env-clear` aliases, then
-    export only the `provider-env` values, and run:
+17. In a separate deploy step whose step-scoped `env:` is the **only** place
+    `provider-env` is exposed: clear the `provider-env-clear` aliases, parse
+    `provider-env` and export only its values, and run:
 
     ```text
     <cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>
@@ -398,12 +401,17 @@ wrapper inputs (typed) → provider-env {NAME: value} → deploy step env → CL
 
 Rules:
 
-- Setup, `build-cli`, and separate build steps never receive `provider-env`.
-- Alias clearing is **wrapper-driven and provider-agnostic**: the engine unsets
-  the names in the wrapper-supplied `provider-env-clear` list in non-deploy
-  steps, and in the deploy step clears those same names before exporting only
-  the typed `provider-env` values. The engine hard-codes no provider names, so
-  caller `env:` cannot override the typed contract.
+- **`provider-env` is bound only to the deploy step's own `env:`** — a
+  step-scoped environment, not a job/engine-global variable. Setup, `build-cli`,
+  and separate build steps never receive the `provider-env` variable at all, so
+  the secret-bearing blob is absent from their environments (not merely unset
+  after the fact). The engine parses `provider-env` only inside the deploy step.
+- Alias clearing is **wrapper-driven and provider-agnostic**, and is
+  defense-in-depth for a _different_ threat — a caller who sets provider aliases
+  through their own workflow `env:`. The engine unsets the wrapper-supplied
+  `provider-env-clear` names in non-deploy steps, and clears them in the deploy
+  step before exporting only the `provider-env` values. The engine hard-codes no
+  provider names, so caller `env:` cannot override the typed contract.
 - `provider-env` values never reach `GITHUB_ENV`, `GITHUB_OUTPUT`, caches, or
   summaries.
 
@@ -626,8 +634,8 @@ The design is implemented when:
 6. Typed provider credentials reach only the deploy step and never appear in
    outputs, caches, action-owned logs, or summaries.
 7. Passthrough argument boundaries are preserved; no `eval`.
-8. `cache: true` uses exact keys and caches only the application Git root
-   `target/`.
+8. `cache: true` uses exact keys and caches only the **Cargo workspace root**
+   `target/` (§11.1), so nested-workspace monorepos cache the right artifacts.
 9. All CI, tooling, and tests run without Python; `actionlint` and `zizmor` run
    from pinned release binaries.
 10. Third-party actions are pinned to readable released tags.

@@ -139,8 +139,11 @@ steps:
   `build-cli` compiles that package from your checkout, so the CLI and your app
   never disagree on schema. `build-cli` does not use the EdgeZero monorepo CLI.
 - Provide typed provider credentials through wrapper inputs, not caller `env:`.
-- Ensure the deployed ref has committed source (no dirty working tree) and, for
-  caching, a root `Cargo.lock`.
+- Ensure the deployed ref has committed source (no dirty working tree) and a
+  `Cargo.lock` at your app's **Cargo workspace root** (the workspace that owns
+  `cli-package` — in a nested-workspace monorepo this may be your app
+  subdirectory, not the repo root). `build-cli` requires it, and caching keys on
+  it.
 - Pin action references to readable released tags, or full SHAs for production
   reproducibility.
 - Use least-privilege permissions (`contents: read`), protected environments,

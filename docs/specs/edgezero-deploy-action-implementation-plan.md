@@ -14,7 +14,7 @@ Implement the layered deploy actions in the EdgeZero monorepo:
 .github/actions/deploy-fastly
 ```
 
-`build-cli` compiles the caller-selected EdgeZero CLI once and publishes it as an
+`build-cli` compiles the app-provided CLI package once and publishes it as an
 artifact. `deploy-core` is the adapter-independent deploy engine that consumes
 the prebuilt CLI. `deploy-fastly` is a minimal wrapper that types Fastly
 credentials and calls the engine. Provider orchestration (build, deploy,
