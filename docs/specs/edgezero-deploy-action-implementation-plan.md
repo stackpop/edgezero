@@ -83,10 +83,15 @@ reference to port from. Most transfer with light changes:
    - A directory of scripts under `.github/actions/deploy-core/`, **not** a
      standalone composite action. Wrappers source them via
      `$GITHUB_ACTION_PATH/../deploy-core/…`.
-   - Parameters (via env from the wrapper): `adapter`, `cli-artifact`, `cli-bin`,
-     `working-directory`, `manifest`, `rust-toolchain`, `target`, `build-mode`,
-     `build-args`, `deploy-args`, `deploy-arg-allow`, `provider-env`,
+   - Non-secret parameters (available to all steps): `adapter`, `cli-artifact`,
+     `cli-bin`, `working-directory`, `manifest`, `rust-toolchain`, `target`,
+     `build-mode`, `build-args`, `deploy-args`, `deploy-arg-allow`,
      `provider-env-clear`, `deploy-flags`, `cache`.
+   - **`provider-env` is NOT one of these.** It is bound only to the deploy
+     step's own `env:` (step-scoped) and parsed only there — never present in the
+     setup/build step environments, so the secret-bearing blob cannot leak (spec
+     §5.2, §10). Setup/build see only the non-secret parameters plus
+     `provider-env-clear`.
    - Download the CLI artifact (tar) under `RUNNER_TEMP`, extract preserving the
      executable bit (or `chmod +x <cli-bin>`), read `cli-meta.json` for
      `cli-bin`/`cli-version` (wrapper `cli-bin` overrides), and PATH-scope it.
@@ -105,9 +110,11 @@ reference to port from. Most transfer with light changes:
    - Optional exact-key cache of the **Cargo workspace root** `target/`
      restore/save.
    - Resolve `build-mode`; optional credential-free build.
-   - Non-deploy steps: unset the `provider-env-clear` names.
-   - Deploy step: clear the `provider-env-clear` aliases, export only
-     `provider-env`, then run
+   - Non-deploy steps: unset the `provider-env-clear` names (defense-in-depth;
+     `provider-env` itself is absent here).
+   - Deploy step only (its `env:` carries `provider-env`): clear the
+     `provider-env-clear` aliases, parse `provider-env` and export only its
+     values, then run
      `<cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>` via
      Bash arrays. Note the build-in-deploy caveat: Fastly's default `never`
      compiles the app during deploy with the token in scope, so require trusted
