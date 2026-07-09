@@ -250,5 +250,7 @@ mod tests {
         cases.compile_fail("tests/ui/nested_field_serde_rename.rs");
         cases.compile_fail("tests/ui/nested_parent_rename_all.rs");
         cases.pass("tests/ui/secret_with_store_ref_named.rs");
+        // A generic `#[app_config(nested)]` child compiles (method-scope bound check).
+        cases.pass("tests/ui/app_config_generic_nested_child.rs");
     }
 }

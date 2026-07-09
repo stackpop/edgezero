@@ -399,11 +399,13 @@ concrete array indices — e.g. `integrations.datadome.server_side_key` or
   skippable. A missing or `null` intermediate object/array in the stored
   blob (e.g. the whole `partners` array) is a `ConfigOutOfDate` error, not
   a silent skip — both `config validate` and the runtime reject it.
-- **No cyclic nesting:** a type that nests itself
-  (`#[app_config(nested)] x: Vec<Self>`) is a compile error. A _mutual_
-  cycle (`A` nests `B`, `B` nests `A`) can't be caught by the derive (it
-  sees one type at a time) and would overflow the stack on first use —
-  cyclic config is pathological; don't do it.
+- **No cyclic nesting:** a type that directly nests itself by name
+  (`#[app_config(nested)] x: Vec<Config>`) is a compile error. A cycle the
+  derive can't see one-type-at-a-time — a _mutual_ cycle (`A` nests `B`,
+  `B` nests `A`) or a path-qualified self-reference (`Vec<crate::Config>`)
+  — is caught at runtime instead: `secret_fields()` panics with a clear
+  message rather than overflowing the stack. Cyclic config is pathological
+  (infinite data); don't do it.
 
 ### Environment-variable overlay
 

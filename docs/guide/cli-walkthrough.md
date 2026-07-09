@@ -23,8 +23,9 @@ The default `edgezero` binary exposes the same commands but has no typed app-con
 struct in scope, so it runs the **raw** `config validate` path and **cannot** run
 `config push` at all (the bundled `config push` errors, pointing you at the downstream
 CLI — the blob model needs the typed `AppConfig<C>`). Downstream CLIs upgrade to the
-typed paths so `validator` rules, `#[secret]` / `#[secret(store_ref)]` checks, and
-Spin's flat-namespace collision check all run.
+typed paths so non-secret `validator` rules, `#[secret]` / `#[secret(store_ref)]`
+checks, and Spin's flat-namespace collision check all run. Validators on secret
+leaves run at runtime after `AppConfig<C>` resolves the actual secret values.
 
 ## 1. Scaffold
 

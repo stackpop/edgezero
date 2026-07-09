@@ -55,16 +55,16 @@ fn build_fastly_request(method: Method, uri: &Uri, headers: &HeaderMap) -> Fastl
         fastly_request.append_header(name.as_str(), value.clone());
     }
 
-    // Use the authority (`host:port`) so an explicit non-default target port is
-    // preserved in the `Host` header — origin-form fidelity. Falls back to the
-    // bare host when there's no authority. (Backend connection + TLS SNI still
+    // Build `Host` from host + explicit port so a non-default target port is
+    // preserved (origin-form fidelity) WITHOUT leaking any `user:pass@` userinfo
+    // that `uri.authority()` would include. (Backend connection + TLS SNI still
     // key off `uri.host()` in `ensure_backend`.)
-    let host_header = match uri.authority() {
-        Some(authority) => Some(authority.as_str()),
-        None => uri.host(),
-    };
-    if let Some(value) = host_header {
-        fastly_request.set_header("Host", value);
+    if let Some(host) = uri.host() {
+        let value = match uri.port() {
+            Some(port) => format!("{host}:{}", port.as_str()),
+            None => host.to_owned(),
+        };
+        fastly_request.set_header("Host", value.as_str());
     }
 
     fastly_request

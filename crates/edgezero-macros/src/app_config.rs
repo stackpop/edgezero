@@ -255,12 +255,11 @@ fn emit_impl(
                 ]
             }
         };
-        // Direct self-cycles are rejected at compile time above. A MUTUAL cycle
-        // (`A` nests `Vec<B>` and `B` nests `Vec<A>`) can't be caught here — a
-        // proc-macro sees one type at a time — and would produce mutually
-        // recursive `secret_fields()` bodies that overflow the stack on first
-        // call. Cyclic config is pathological (infinite data), so the mutual case
-        // is documented rather than guarded; a runtime depth cap could be added.
+        // Bare direct self-cycles are rejected at compile time (in `expand`).
+        // Cycles the derive can't see one-type-at-a-time — mutual `A`<->`B`, or a
+        // path-qualified self-reference `Vec<crate::A>` — recurse here, so the
+        // `SecretFieldsRecursionGuard` entered at the top of the nested body
+        // turns them into a clear panic instead of a stack overflow.
         quote! {
             for mut __f in <#child_ty as ::edgezero_core::app_config::AppConfigMeta>::secret_fields() {
                 let mut __p = #prefix;
@@ -275,6 +274,12 @@ fn emit_impl(
         quote! { ::std::vec![#(#direct_entries),*] }
     } else {
         quote! {
+            // Backstop for cyclic nesting the compile-time bare self-cycle check
+            // can't see (mutual `A`<->`B`, or a path-qualified `Vec<crate::A>`):
+            // panic with a clear message instead of overflowing the stack. Held
+            // across the child recursion below; dropped on return.
+            let __recursion_guard =
+                ::edgezero_core::app_config::SecretFieldsRecursionGuard::enter();
             let mut __out: ::std::vec::Vec<::edgezero_core::app_config::SecretField> =
                 ::std::vec![#(#direct_entries),*];
             #(#nested_pushes)*
@@ -284,31 +289,30 @@ fn emit_impl(
 
     // A nested child must go through `#[derive(AppConfig)]` — the
     // `AppConfigRoot` marker — not merely impl `AppConfigMeta` by hand.
-    // The closure is never called, but coercing it to `fn()` type-checks
-    // its body, enforcing the bound with a clear error span per child.
+    // Emitted inside `secret_fields()` (METHOD scope, not module scope) so a
+    // generic child type (`T` in `struct Wrapper<T>`) resolves; at module scope
+    // the check failed with "cannot find type `T`". The no-op calls are compiled
+    // out, but naming `__assert::<Child>()` enforces the bound at compile time.
     let nested_child_tys: Vec<&Type> = nested_descriptors
         .iter()
         .map(|descriptor| descriptor.child_ty)
         .collect();
-    let root_assertion = if nested_child_tys.is_empty() {
+    let root_bound_checks = if nested_child_tys.is_empty() {
         quote! {}
     } else {
         quote! {
-            const _: fn() = || {
-                fn __assert_app_config_root<__T: ::edgezero_core::app_config::AppConfigRoot>() {}
-                #( __assert_app_config_root::<#nested_child_tys>(); )*
-            };
+            fn __assert_app_config_root<__T: ::edgezero_core::app_config::AppConfigRoot>() {}
+            #( __assert_app_config_root::<#nested_child_tys>(); )*
         }
     };
 
     quote! {
-        #root_assertion
-
         #[automatically_derived]
         impl #impl_generics ::edgezero_core::app_config::AppConfigMeta
             for #struct_ident #type_generics #where_clause
         {
             fn secret_fields() -> ::std::vec::Vec<::edgezero_core::app_config::SecretField> {
+                #root_bound_checks
                 #secret_fields_body
             }
         }

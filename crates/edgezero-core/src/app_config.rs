@@ -15,11 +15,13 @@
 
 use std::any;
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread_local;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -83,6 +85,59 @@ pub trait AppConfigMeta {
     /// including those reached through `#[app_config(nested)]` children,
     /// each carrying its full path from this struct's root.
     fn secret_fields() -> Vec<SecretField>;
+}
+
+thread_local! {
+    static SECRET_FIELDS_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII depth guard entered at the top of every derived
+/// [`AppConfigMeta::secret_fields`] body that recurses into
+/// `#[app_config(nested)]` children.
+///
+/// A cyclic nesting graph — a mutual `A`↔`B` cycle, or a path-qualified
+/// self-reference (`Vec<crate::A>`) that the derive's compile-time check can't
+/// resolve — would otherwise recurse until the stack overflows (an
+/// undiagnosable trap on WASM). This turns that into a clear panic on first
+/// call. Constructed only by generated code; not part of the public contract.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct SecretFieldsRecursionGuard {
+    // Private field: only `enter()` may construct this guard.
+    _seal: (),
+}
+
+impl SecretFieldsRecursionGuard {
+    /// Maximum `#[app_config(nested)]` depth. Legitimate configs nest a handful
+    /// of levels; anything beyond this is a cycle.
+    pub const MAX_DEPTH: u32 = 64;
+
+    /// Enter one recursion level.
+    ///
+    /// # Panics
+    /// Panics once nesting exceeds [`Self::MAX_DEPTH`] — indicating a cyclic
+    /// `#[app_config(nested)]` graph (mutual or path-qualified self-reference).
+    #[inline]
+    #[must_use]
+    pub fn enter() -> Self {
+        SECRET_FIELDS_DEPTH.with(|depth| {
+            let next = depth.get().saturating_add(1);
+            assert!(
+                next <= Self::MAX_DEPTH,
+                "#[app_config(nested)] recursion exceeded {} levels — cyclic nesting?",
+                Self::MAX_DEPTH
+            );
+            depth.set(next);
+        });
+        Self { _seal: () }
+    }
+}
+
+impl Drop for SecretFieldsRecursionGuard {
+    #[inline]
+    fn drop(&mut self) {
+        SECRET_FIELDS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 
 /// Discriminator on a [`SecretField`] capturing which secret-store
