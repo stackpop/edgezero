@@ -2,6 +2,8 @@
 //! manifest-declared paths and let adapters write files through
 //! them. See spec §"Path containment (MUST)".
 
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 /// Reject absolute paths and `..` traversal for the
@@ -117,6 +119,36 @@ fn assert_provision_paths_impl(
                 ));
             }
         }
+        // Symlink rejection: walk each component of the resolved
+        // path (relative to `project_root`) and reject if any
+        // existing intermediate is a symlink. `Component`s that
+        // haven't been created yet on disk are fine — the adapter
+        // will materialise them itself from EdgeZero-owned code.
+        // The Step-1 lexical check only forbids literal `..` and
+        // absolute paths, so an operator who plants
+        // `crates/worker` as a symlink pointing at
+        // `/tmp/outside/crate` still passes: `starts_with(root)` is
+        // true because the string starts with the root, but
+        // adapter `fs::write` calls follow the symlink and touch
+        // `/tmp/outside/crate/...`. Reject the symlink component
+        // BEFORE dispatch so the adapter never gets a chance to
+        // escape.
+        //
+        // Note: this closes the ambient-file surface but is not a
+        // full TOCTOU guard. A concurrent attacker who plants the
+        // symlink between this check and the adapter's write can
+        // still race. Fully closing that would require
+        // directory-relative opens (`openat` + `O_NOFOLLOW`)
+        // threaded through every adapter — tracked as follow-up
+        // scope.
+        if do_step1_starts_with {
+            let joined = root.join(candidate);
+            reject_symlink_components(&root, &joined, label)?;
+        } else {
+            // `root == "."` — walk from cwd via the candidate
+            // directly.
+            reject_symlink_components(Path::new("."), candidate, label)?;
+        }
     }
 
     // Step 2 (strict-local only): BOTH `.manifest` AND `.crate` must
@@ -175,6 +207,58 @@ fn assert_provision_paths_impl(
             manifest_resolved.display(),
             crate_resolved.display()
         ));
+    }
+    Ok(())
+}
+
+/// Walk from `start` inward one component at a time along
+/// `candidate` and reject if any existing intermediate reports
+/// `is_symlink()`. Components that don't exist yet (first-run
+/// bootstrap where the adapter crate isn't materialised on disk)
+/// are fine — the adapter will create them from EdgeZero-owned
+/// code, and the strict-local invariant already forces the
+/// resulting write path to sit inside the crate dir.
+///
+/// `symlink_metadata` does not follow symlinks; a broken symlink
+/// still reports `is_symlink() == true`, so we catch dangling
+/// links too.
+///
+/// `label` identifies the offending manifest field for the error
+/// message ("`[adapters.<name>.adapter].manifest`" or ".crate").
+fn reject_symlink_components(start: &Path, candidate: &Path, label: &str) -> Result<(), String> {
+    let mut walk = start.to_path_buf();
+    for comp in candidate
+        .strip_prefix(start)
+        .unwrap_or(candidate)
+        .components()
+    {
+        walk.push(comp.as_os_str());
+        match fs::symlink_metadata(&walk) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(format!(
+                    "{label} resolves through a symlink at `{}`; \
+                     symlinks in manifest-declared paths would let an adapter's \
+                     `fs::write` follow the link off the project tree. Replace the \
+                     symlink with a regular directory (or a symlink to a path INSIDE \
+                     the project root — the guard walks each component individually)",
+                    walk.display()
+                ));
+            }
+            // Missing intermediate is fine — the adapter creates
+            // it from EdgeZero-owned code.
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            // Ok(md) where md is not a symlink: continue walking.
+            // Any other Err (permission denied, invalid input,
+            // etc.) is surfaced as a hard error rather than
+            // silently letting the path through.
+            Ok(_) => {}
+            Err(err) => {
+                return Err(format!(
+                    "{label}: failed to inspect `{}` for symlink safety: {err}",
+                    walk.display()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -351,5 +435,120 @@ mod tests {
         assert_provision_paths_safe(Path::new("."), None, Some("crates/cf")).unwrap();
         assert_provision_paths_safe(Path::new("."), None, None).unwrap();
         assert_provision_paths_safe(Path::new("."), Some("crates/cf/wrangler.toml"), None).unwrap();
+    }
+
+    // ---------- Symlink rejection (PR #287 review blocking #2) ----------
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_adapter_crate_directory() {
+        // Reviewer regression: `crate = "crates/worker"` passes the
+        // lexical check when `crates/worker` is a symlink to a
+        // directory outside the project — subsequent adapter
+        // `fs::write` calls follow the symlink and mutate the
+        // external target. The guard now rejects any symlink
+        // component in the path.
+        use std::os::unix::fs::symlink;
+        let project = tempfile::TempDir::new().expect("project");
+        let escape = tempfile::TempDir::new().expect("escape target");
+        let crates_dir = project.path().join("crates");
+        fs::create_dir_all(&crates_dir).unwrap();
+        symlink(escape.path(), crates_dir.join("worker")).unwrap();
+
+        // Plant a valid manifest inside the (symlinked) crate dir
+        // so the strict-local containment check would otherwise
+        // pass; the symlink rejection has to fire first.
+        fs::write(escape.path().join("wrangler.toml"), "").unwrap();
+
+        let err = assert_provision_paths_contained(
+            project.path(),
+            Some("crates/worker/wrangler.toml"),
+            Some("crates/worker"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("through a symlink"),
+            "symlinked crate must be rejected: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_in_manifest_intermediate_component() {
+        // The bypass also works when the CRATE dir is a real
+        // directory but a sub-directory INSIDE it is a symlink
+        // (e.g. `crates/worker` is real, but
+        // `crates/worker/config` is a symlink into /tmp). The
+        // reject walks every component.
+        use std::os::unix::fs::symlink;
+        let project = tempfile::TempDir::new().expect("project");
+        let escape = tempfile::TempDir::new().expect("escape target");
+        let worker = project.path().join("crates/worker");
+        fs::create_dir_all(&worker).unwrap();
+        symlink(escape.path(), worker.join("config")).unwrap();
+        fs::write(escape.path().join("wrangler.toml"), "").unwrap();
+
+        let err = assert_provision_paths_contained(
+            project.path(),
+            Some("crates/worker/config/wrangler.toml"),
+            Some("crates/worker"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("through a symlink"),
+            "symlinked intermediate must be rejected: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_variant_also_rejects_symlinked_paths() {
+        // The safe variant guards cloud dispatch (which reads the
+        // manifest for service-id lookup but doesn't write local
+        // files). Symlink following would still let an adapter
+        // read from outside the project — reject there too.
+        use std::os::unix::fs::symlink;
+        let project = tempfile::TempDir::new().expect("project");
+        let escape = tempfile::TempDir::new().expect("escape target");
+        let crates_dir = project.path().join("crates");
+        fs::create_dir_all(&crates_dir).unwrap();
+        symlink(escape.path(), crates_dir.join("worker")).unwrap();
+        fs::write(escape.path().join("wrangler.toml"), "").unwrap();
+
+        let err = assert_provision_paths_safe(
+            project.path(),
+            Some("crates/worker/wrangler.toml"),
+            Some("crates/worker"),
+        )
+        .unwrap_err();
+        assert!(err.contains("through a symlink"), "safe variant: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_regular_directory_and_first_run_missing_paths() {
+        // Sanity: a plain directory tree (no symlinks) passes.
+        // Also: the first-run scaffold path — the adapter crate
+        // doesn't exist on disk yet — must not fail the walk.
+        // `symlink_metadata` returns NotFound; the guard stops
+        // walking and returns Ok.
+        let project = tempfile::TempDir::new().expect("project");
+        let crates_dir = project.path().join("crates");
+        fs::create_dir_all(&crates_dir).unwrap();
+        fs::create_dir_all(crates_dir.join("worker")).unwrap();
+        // First run: no wrangler.toml file yet.
+        assert_provision_paths_contained(
+            project.path(),
+            Some("crates/worker/wrangler.toml"),
+            Some("crates/worker"),
+        )
+        .unwrap();
+        // Really-first run: crate dir doesn't exist yet either.
+        assert_provision_paths_contained(
+            project.path(),
+            Some("crates/newcrate/wrangler.toml"),
+            Some("crates/newcrate"),
+        )
+        .unwrap();
     }
 }

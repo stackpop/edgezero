@@ -1417,6 +1417,23 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
         let Some(adapter) = adapter_registry::get_adapter(name) else {
             continue;
         };
+        // Absolute-path + `..`-traversal + under-project-root gate
+        // BEFORE the adapter joins `manifest_root` with the declared
+        // manifest path and reads whatever's there.
+        //
+        // Push and diff already run this loop upfront with the
+        // stricter contained variant (see `run_config_push_typed` /
+        // `run_config_diff_typed`), so this call is redundant on
+        // those paths — but it's the ONLY guard on `run_config_validate*`.
+        // Without it, Spin's `validate_adapter_manifest` reads
+        // `manifest_root.join(adapter_manifest_path)` unchecked and
+        // an absolute or traversing manifest string surfaces its
+        // file contents as the validation error message.
+        assert_provision_paths_safe(
+            manifest_root,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.crate_path.as_deref(),
+        )?;
         adapter.validate_app_config_keys(&key_refs)?;
         adapter.validate_adapter_manifest(
             manifest_root,
@@ -1934,6 +1951,69 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         assert!(
             err.contains(&app_config.display().to_string()),
             "error names the bad file: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_rejects_absolute_adapter_manifest_path_before_adapter_validators_run() {
+        // Regression (PR #287 review, blocking #1): pre-2026-07-09,
+        // `run_config_validate` -> `run_shared_checks` ->
+        // `run_adapter_shared_checks` called
+        // `adapter.validate_adapter_manifest(manifest_root, path, ...)`
+        // without first running `assert_provision_paths_safe`.
+        // Spin's validator then reads
+        // `manifest_root.join(adapter_manifest_path)` — an operator
+        // who poisoned the manifest string with an absolute path
+        // like `/etc/spin.toml` would surface that file's contents
+        // as a validation error message. The path-safety guard now
+        // fires per-adapter INSIDE `run_adapter_shared_checks`,
+        // covering validate as well as push/diff.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "/etc/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, VALID_APP_CONFIG);
+        let err = run_config_validate(&args_for(&manifest_path)).expect_err(
+            "absolute [adapters.spin.adapter].manifest must be rejected before dispatch",
+        );
+        assert!(
+            err.contains("must be a project-relative path"),
+            "path-safety guard must fire before adapter.validate_adapter_manifest: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_rejects_parent_traversal_adapter_manifest_before_adapter_validators_run() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "../../../outside/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, VALID_APP_CONFIG);
+        let err = run_config_validate(&args_for(&manifest_path))
+            .expect_err("`..` traversal in manifest must be rejected before dispatch");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "path-safety guard must fire before adapter.validate_adapter_manifest: {err}"
         );
     }
 

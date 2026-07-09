@@ -203,11 +203,20 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
     // `resolve_serve_env_file`), so an operator-authored poisoned
     // manifest string like `manifest = "/etc/spin.toml"` or
     // `manifest = "../../../secrets/env"` would resolve to an
-    // out-of-tree `.env` that `env_file::load_into_process_env`
-    // would happily read and inject into the process env
-    // (subsequently inherited by the spawned adapter). Run the
-    // same absolute-path + `..` traversal guard provision and
+    // out-of-tree `.env` that the parser would happily read and
+    // hand to the spawned adapter. Run the same absolute-path +
+    // `..` traversal + symlink-component guard provision and
     // config already use before touching the resolved path.
+    //
+    // The overlay is threaded into the spawned child via
+    // `Command::env` (see `adapter::execute_with_env_overlay`)
+    // rather than `std::env::set_var`. On Unix `setenv` /
+    // `getenv` are not thread-safe: a downstream multithreaded
+    // process calling `run_serve` from one thread while another
+    // thread reads `std::env::var` observes a torn read. Passing
+    // the overlay through `Command::env` keeps every mutation on
+    // the `Command`'s private map — no shared state, no race.
+    let mut env_overlay: Vec<(String, String)> = Vec::new();
     if let Some(loader) = manifest.as_ref() {
         if let Some(root) = loader.manifest().root() {
             let manifest_data = loader.manifest();
@@ -220,17 +229,18 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
             }
             if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root) {
                 if env_path.exists() {
-                    env_file::load_into_process_env(&env_path)?;
+                    env_overlay = env_file::parse_env_overlay(&env_path)?;
                 }
             }
         }
     }
 
-    adapter::execute(
+    adapter::execute_with_env_overlay(
         &args.adapter,
         adapter::Action::Serve,
         manifest.as_ref(),
         &[],
+        &env_overlay,
     )
 }
 
@@ -842,20 +852,18 @@ serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_displa
         };
         run_serve(&args).expect("run_serve must succeed with the sh-echo serve command");
 
-        // 1. Parent-side check: the process env has the value from
-        //    the nested-manifest-parent .env. Necessary for the
-        //    child to inherit it.
-        let parent_observed = env::var(marker_key).ok();
-        assert_eq!(
-            parent_observed.as_deref(),
-            Some(marker_value),
-            "run_serve MUST load the nested-manifest-parent .env into process env — got {parent_observed:?}"
-        );
-
-        // 2. Child-side check (the spec's real ask): the spawned
-        //    shell wrote its OWN view of $MARKER_KEY to disk. That
-        //    value MUST match the .env's value — proving the child
-        //    inherited the load before executing.
+        // Child-side check (the spec's real ask): the spawned
+        // shell wrote its OWN view of $MARKER_KEY to disk. That
+        // value MUST match the .env's value — proving the child
+        // inherited the Command::env overlay before executing.
+        //
+        // Note (post-PR#287 review, blocking #3): the load path
+        // now threads the overlay through Command::env instead of
+        // std::env::set_var, so the PARENT's env stays unchanged.
+        // A dedicated no-parent-mutation assertion lives in
+        // `run_serve_does_not_mutate_parent_process_env_yet_child_sees_env_file_value`
+        // below; this test intentionally stays focused on the
+        // manifest-parent .env resolution regression.
         let child_observed =
             fs::read_to_string(&observed_path).expect("child wrote observed marker");
         assert_eq!(
@@ -891,51 +899,139 @@ serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_displa
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn load_into_process_env_reads_key_equals_value_lines() {
-        // Process-env is global; serialise with the manifest guard
-        // (which every other env-mutating test in this module already
-        // uses) and rely on EnvOverride::remove's Drop to restore any
-        // prior value the parent shell may have set.
+    fn run_serve_does_not_mutate_parent_process_env_yet_child_sees_env_file_value() {
+        // Regression (PR #287 review, blocking #3): the pre-fix
+        // `env_file::load_into_process_env` wrote every KEY=VALUE
+        // pair via `std::env::set_var`. That's not thread-safe on
+        // Unix and can race with any concurrent reader in a
+        // multithreaded downstream process embedding
+        // `edgezero_cli::run_serve`.
+        //
+        // The current design threads the `.env` overlay through
+        // `Command::env` (see `env_file::parse_env_overlay` +
+        // `adapter::execute_with_env_overlay`), so the CHILD sees
+        // the file's values at exec time while the PARENT's shared
+        // `environ` stays untouched.
+        //
+        // This test seeds a nested Spin `.env` with a marker, runs
+        // `run_serve`, and asserts BOTH:
+        //   (a) the child's observed marker equals the .env value
+        //       (proving the overlay reached the spawned process),
+        //   (b) the parent's `env::var(marker_key)` is still None
+        //       (proving `run_serve` did NOT call `set_var`).
+        let marker_key = "EDGEZERO_TEST_SERVE_ENV_NO_PARENT_MUTATION_MARKER";
+        let marker_value = "child-only-do-not-leak-to-parent";
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _foo = EnvOverride::remove("EDGEZERO_TEST_ENV_LOAD_FOO");
-        let _baz = EnvOverride::remove("EDGEZERO_TEST_ENV_LOAD_BAZ");
+        // Pre-condition: the marker MUST be unset in the parent, or
+        // `existing env wins` would drop the overlay and the test
+        // could pass vacuously.
+        let _pre = EnvOverride::remove(marker_key);
+
         let temp = TempDir::new().expect("temp dir");
-        let env_path = temp.path().join(".env");
-        fs::write(
-            &env_path,
-            "EDGEZERO_TEST_ENV_LOAD_FOO=bar\n\
-             # comment line -- ignored\n\
-             \n\
-             EDGEZERO_TEST_ENV_LOAD_BAZ=\"quoted value\"\n\
-             malformed line without equals sign\n",
-        )
-        .expect("write env file");
-        env_file::load_into_process_env(&env_path).expect("load ok");
-        assert_eq!(
-            env::var("EDGEZERO_TEST_ENV_LOAD_FOO").ok().as_deref(),
-            Some("bar")
+        let observed_path = temp.path().join("child_observed.txt");
+        let observed_path_display = observed_path.to_string_lossy();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = format!(
+            r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_display}"'
+"#,
         );
+        fs::write(&manifest_path, &manifest_body).expect("write manifest");
+        let env_dir = temp.path().join("crates/spin");
+        fs::create_dir_all(&env_dir).expect("mkdir spin");
+        fs::write(
+            env_dir.join(".env"),
+            format!("{marker_key}={marker_value}\n"),
+        )
+        .expect("seed .env");
+
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        let args = ServeArgs {
+            adapter: "spin".to_owned(),
+        };
+        run_serve(&args).expect("run_serve must succeed");
+
+        // (a) CHILD side — must see the marker.
+        let child_observed =
+            fs::read_to_string(&observed_path).expect("child wrote observed marker");
         assert_eq!(
-            env::var("EDGEZERO_TEST_ENV_LOAD_BAZ").ok().as_deref(),
-            Some("quoted value")
+            child_observed, marker_value,
+            "spawned child MUST inherit the .env overlay: got {child_observed:?}"
+        );
+
+        // (b) PARENT side — must NOT see the marker. This is the
+        // load-bearing thread-safety assertion.
+        let parent_observed = env::var(marker_key).ok();
+        assert!(
+            parent_observed.is_none(),
+            "run_serve MUST NOT mutate the parent process env; found `{marker_key}={parent_observed:?}`. \
+             Regression: `env_file::parse_env_overlay` bypassed and someone re-introduced \
+             `std::env::set_var` on the load path."
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
-    fn load_into_process_env_existing_env_wins() {
-        // Pre-set the key to a caller value; a `.env` line with the
-        // same key must NOT overwrite it. The `.env` file supplies
-        // defaults; the caller's env is the source of truth.
+    fn run_serve_existing_parent_env_wins_over_env_file() {
+        // Same contract, opposite direction: when the parent env
+        // already has the key, the .env's value must NOT overlay.
+        // Serialised access to `EDGEZERO_TEST_SERVE_ENV_KEEP` via
+        // the manifest guard so a concurrent test can't observe
+        // torn state.
+        let marker_key = "EDGEZERO_TEST_SERVE_ENV_KEEP";
+        let parent_value = "from-parent";
+        let file_value = "from-dot-env-do-not-leak";
         let _lock = manifest_guard().lock().expect("manifest guard");
-        let _keep = EnvOverride::set("EDGEZERO_TEST_ENV_LOAD_KEEP", "caller_value");
+        let _pre = EnvOverride::set(marker_key, parent_value);
+
         let temp = TempDir::new().expect("temp dir");
-        let env_path = temp.path().join(".env");
-        fs::write(&env_path, "EDGEZERO_TEST_ENV_LOAD_KEEP=file_value\n").expect("write env file");
-        env_file::load_into_process_env(&env_path).expect("load ok");
+        let observed_path = temp.path().join("child_observed.txt");
+        let observed_path_display = observed_path.to_string_lossy();
+        let manifest_path = temp.path().join("edgezero.toml");
+        let manifest_body = format!(
+            r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/spin"
+manifest = "crates/spin/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = 'sh -c "printf %s \"${{{marker_key}:-<unset>}}\" > {observed_path_display}"'
+"#,
+        );
+        fs::write(&manifest_path, &manifest_body).expect("write manifest");
+        let env_dir = temp.path().join("crates/spin");
+        fs::create_dir_all(&env_dir).expect("mkdir spin");
+        fs::write(env_dir.join(".env"), format!("{marker_key}={file_value}\n")).expect("seed .env");
+
+        let manifest_str = manifest_path.to_string_lossy().into_owned();
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &manifest_str);
+        run_serve(&ServeArgs {
+            adapter: "spin".to_owned(),
+        })
+        .expect("run_serve must succeed");
+
+        let child_observed = fs::read_to_string(&observed_path).expect("child wrote observed");
         assert_eq!(
-            env::var("EDGEZERO_TEST_ENV_LOAD_KEEP").ok().as_deref(),
-            Some("caller_value")
+            child_observed, parent_value,
+            "parent env MUST win over .env overlay: got {child_observed:?}"
         );
     }
 }

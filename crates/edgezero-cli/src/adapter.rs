@@ -94,6 +94,26 @@ pub fn execute(
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
 ) -> Result<(), String> {
+    execute_with_env_overlay(adapter_name, action, manifest_loader, adapter_args, &[])
+}
+
+/// Same as [`execute`] but additionally applies an owned
+/// `(key, value)` overlay to the spawned child's environment via
+/// `Command::env`. Used by `run_serve` to expose the
+/// provision-written `.env` file WITHOUT mutating the parent
+/// process's shared `environ` (see `env_file.rs` for the
+/// thread-safety rationale).
+///
+/// Existing-env-wins: entries whose key is already set in the
+/// parent process are dropped here so a caller-supplied
+/// `KEY=value` on the command line still overrides the `.env`.
+pub(crate) fn execute_with_env_overlay(
+    adapter_name: &str,
+    action: Action,
+    manifest_loader: Option<&ManifestLoader>,
+    adapter_args: &[String],
+    env_overlay: &[(String, String)],
+) -> Result<(), String> {
     if let Some(loader) = manifest_loader {
         if let Some(command) = manifest_command(loader.manifest(), adapter_name, action) {
             let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
@@ -107,6 +127,7 @@ pub fn execute(
                 Some(env),
                 adapter_bind,
                 adapter_args,
+                env_overlay,
             );
         }
     }
@@ -165,6 +186,14 @@ fn adapter_bind_from_manifest(
     (cfg.adapter.host.clone(), cfg.adapter.port)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper; each argument is a distinct axis of \
+              the shell dispatch (command, cwd, adapter identity, \
+              action, manifest env, bind hint, passthrough args, \
+              env-file overlay) and bundling them for the lint's \
+              sake would add ceremony without clarity"
+)]
 fn run_shell(
     command: &str,
     cwd: &Path,
@@ -173,6 +202,7 @@ fn run_shell(
     environment: Option<ResolvedEnvironment>,
     adapter_bind: (Option<String>, Option<u16>),
     adapter_args: &[String],
+    env_overlay: &[(String, String)],
 ) -> Result<(), String> {
     let full_command = if adapter_args.is_empty() {
         command.to_owned()
@@ -219,6 +249,20 @@ fn run_shell(
 
     if let Some(env) = environment {
         apply_environment(adapter_name, &env, &mut cmd)?;
+    }
+
+    // `.env` file overlay (Spin's `<spin_dir>/.env`, Axum's
+    // `.edgezero/.env`). Threaded through `Command::env` — the
+    // child inherits these values at exec time; the parent's
+    // shared `environ` is untouched. Existing-env-wins: the
+    // parent process already exported KEY, keep the parent
+    // value (same rule as the manifest `[environment.variables]`
+    // block above and the adapter bind hint above).
+    for (key, value) in env_overlay {
+        if env::var_os(key.as_str()).is_some() {
+            continue;
+        }
+        cmd.env(key, value);
     }
 
     let status = cmd
