@@ -106,7 +106,8 @@ reference to port from. Most transfer with light changes:
      for lockfile hashing and `target/` caching — in a monorepo this may be under
      `working-directory`, not the Git root (spec §11.1).
    - Resolve Rust toolchain (explicit → Rustup files → `.tool-versions` → repo
-     fallback) and application `target` (from `adapter` when `auto`).
+     fallback) and install the **wrapper-provided** concrete `target` (the engine
+     never maps `adapter` → target).
    - Optional exact-key cache of the **Cargo workspace root** `target/`
      restore/save.
    - Resolve `build-mode`; optional credential-free build.
@@ -136,6 +137,10 @@ reference to port from. Most transfer with light changes:
      `--comment` only, `provider-env-clear` = Fastly auth/endpoint aliases
      (`FASTLY_API_TOKEN`, `FASTLY_SERVICE_ID`, `FASTLY_ENDPOINT`, …), Fastly
      `auto` build-mode → `never`.
+   - **Install the pinned Fastly CLI** (official release + checksum, action-owned
+     dir on `PATH`) before sourcing the engine, so `<cli> deploy --adapter fastly`
+     finds `fastly`. This is the wrapper's provider-tool responsibility; the
+     engine assumes `fastly` is already on `PATH`.
    - Output `fastly-version` (parsed from the app CLI). Source the shared
      `deploy-core` scripts; no build, toolchain, or path logic of its own.
 
@@ -143,13 +148,18 @@ reference to port from. Most transfer with light changes:
    - `healthcheck-fastly`: thin wrapper — inputs `cli-artifact`, `cli-bin`,
      `fastly-api-token`, `fastly-service-id`, `fastly-version`, `domain`,
      `deploy-to` (`production`/`staging`), retry/timeout; runs
-     `<cli> healthcheck --adapter fastly …`; outputs `healthy`, `status-code`.
+     `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
+     `FASTLY_API_TOKEN` in the step env; outputs `healthy`, `status-code`.
    - `rollback-fastly`: thin wrapper — inputs `cli-artifact`, `cli-bin`,
      `fastly-api-token`, `fastly-service-id`, `fastly-version`, `deploy-to`;
-     runs `<cli> rollback --adapter fastly …`; outputs `rolled-back-to`.
-   - Both reuse only the CLI-artifact download + credential-scoping helpers from
-     `deploy-core`; no source resolution, toolchain, build, or cache. Carry no
-     orchestration policy — the caller wires stage → healthcheck → rollback.
+     runs `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
+     `FASTLY_API_TOKEN` in the step env; outputs `rolled-back-to`.
+   - Both map `fastly-service-id` → `--service-id` and `fastly-api-token` →
+     step-scoped `FASTLY_API_TOKEN`. They reuse only the CLI-artifact download +
+     credential-scoping helpers from `deploy-core`; no source resolution,
+     toolchain, build, cache, or Fastly CLI install (they call the Fastly API).
+     Carry no orchestration policy — the caller wires stage → healthcheck →
+     rollback.
 
 5. **Scripts layout**
    - Provider-neutral scripts under `deploy-core/`; the Fastly install + checksum
@@ -203,6 +213,7 @@ reference to port from. Most transfer with light changes:
 ## Known follow-up candidates
 
 - Add `deploy-cloudflare` / `deploy-spin` wrappers via the same engine.
-- Add provider-specific staging/health-check/rollback as separate actions.
+- Add staging/health-check/rollback lifecycle actions for adapters **beyond
+  Fastly** (Fastly's trio is in current scope, phases 3–4 / 8).
 - Optionally consume a prebuilt/attested CLI binary matching the app's pinned
   version instead of compiling from source.

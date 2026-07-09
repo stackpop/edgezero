@@ -238,7 +238,7 @@ The engine is parameterized by the values the wrapper passes to those scripts
 | `working-directory`  | Application directory relative to `github.workspace`. Must resolve inside `github.workspace`.                                                                                                                                                      |
 | `manifest`           | Optional `edgezero.toml` path relative to `working-directory`. If set, must exist; exported as `EDGEZERO_MANIFEST`.                                                                                                                                |
 | `rust-toolchain`     | Application Rust toolchain for the deploy build. `auto` follows §7.                                                                                                                                                                                |
-| `target`             | Application build target. `auto` derives it from `adapter` (for example `fastly` → `wasm32-wasip1`).                                                                                                                                               |
+| `target`             | Concrete application build target the **wrapper** supplies (Fastly → `wasm32-wasip1`). The engine installs exactly this target and never maps `adapter` → target, so adding an adapter does not touch the engine.                                  |
 | `build-mode`         | One of `auto`, `always`, `never` (§8).                                                                                                                                                                                                             |
 | `build-args`         | JSON array of strings passed after `<cli> build --adapter <adapter> --`. Must not contain secrets.                                                                                                                                                 |
 | `deploy-args`        | JSON array of caller-supplied deploy args appended after action-owned deploy flags. Must not contain secrets.                                                                                                                                      |
@@ -262,12 +262,19 @@ Minimal composite actions. A wrapper only:
 
 1. declares the provider's typed credential inputs;
 2. maps them into `provider-env` and action-owned `deploy-flags`;
-3. sets `adapter`, `target`, the adapter `deploy-arg` allowlist, and the
-   `provider-env-clear` alias list; and
-4. sources the shared `deploy-core` scripts via `$GITHUB_ACTION_PATH/../deploy-core`.
+3. sets `adapter`, a **concrete `target`** (for Fastly, `wasm32-wasip1`), the
+   adapter `deploy-arg` allowlist, and the `provider-env-clear` alias list;
+4. **installs the pinned provider CLI it needs** — for Fastly, the Fastly CLI
+   (official release, checksum-verified, into an action-owned dir on `PATH`), so
+   the app CLI's `<cli> deploy --adapter fastly` (which shells out to `fastly`)
+   finds it. This is the one provider-specific install, and it lives in the
+   wrapper precisely so the provider-neutral engine never learns provider tools;
+   and
+5. sources the shared `deploy-core` scripts via `$GITHUB_ACTION_PATH/../deploy-core`.
 
 A wrapper contains no build logic, no toolchain resolution, no path
-confinement — those are engine concerns.
+confinement — those are engine concerns. Provider **tooling** (the Fastly CLI)
+is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 **`deploy-fastly` inputs**
 
@@ -313,17 +320,18 @@ subcommands.
 
 The capability is scaffolded into the CLI, not reproduced in action shell:
 
-| App-CLI invocation                                                          | Fastly operations the adapter performs                                                                                                                              |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<cli> deploy --adapter fastly` (production, existing)                      | `fastly compute deploy` → builds, uploads, **activates**; emits the activated version.                                                                              |
-| `<cli> deploy --adapter fastly --stage`                                     | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version. |
-| `<cli> healthcheck --adapter fastly --version <v> --domain <d> [--staging]` | Production: `curl` the domain. Staging: resolve `staging_ips` for `<v>` via the Fastly API, then `curl --connect-to` that IP; emits healthy/status.                 |
-| `<cli> rollback --adapter fastly --version <v> [--staging]`                 | Production: activate `<v> - 1`. Staging: deactivate the staged `<v>`.                                                                                               |
+| App-CLI invocation                                                                            | Fastly operations the adapter performs                                                                                                                              |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<cli> deploy --adapter fastly --service-id <id>` (production, existing)                      | `fastly compute deploy` → builds, uploads, **activates**; emits the activated version.                                                                              |
+| `<cli> deploy --adapter fastly --service-id <id> --stage`                                     | `fastly compute update --autoclone --version=active` (upload to a new **draft** version, no activation) → `fastly service-version stage`; emits the staged version. |
+| `<cli> healthcheck --adapter fastly --service-id <id> --version <v> --domain <d> [--staging]` | Production: `curl` the domain. Staging: resolve `staging_ips` for `<v>` on `<id>` via the Fastly API, then `curl --connect-to` that IP; emits healthy/status.       |
+| `<cli> rollback --adapter fastly --service-id <id> --version <v> [--staging]`                 | Production: activate `<v> - 1` on `<id>`. Staging: deactivate the staged `<v>` on `<id>`.                                                                           |
 
-The app CLI (built by `build-cli`) exposes these subcommands the same way it
-exposes `deploy`/`config`. The downstream CLI template gains `Healthcheck` and
-`Rollback` arms and a deployment-version surface, tracked with the other
-companion CLI changes.
+Every Fastly subcommand takes `--service-id <id>` (the service the operation
+targets) and reads `FASTLY_API_TOKEN` from the environment. The app CLI (built by
+`build-cli`) exposes these subcommands the same way it exposes `deploy`/`config`.
+The downstream CLI template gains `Healthcheck` and `Rollback` arms and a
+deployment-version surface, tracked with the other companion CLI changes.
 
 #### 5.4.2 Version output
 
@@ -341,17 +349,22 @@ generic engine still exposes no deployment version.
 - **`healthcheck-fastly`** — thin wrapper: downloads the CLI artifact, takes
   `fastly-api-token`, `fastly-service-id`, `fastly-version`, `domain`,
   `deploy-to` (`production`/`staging`), retry/timeout inputs; runs
-  `<cli> healthcheck --adapter fastly …`; outputs `healthy` and `status-code`.
-  Needs no application source or build.
+  `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
+  `FASTLY_API_TOKEN` in the step env; outputs `healthy` and `status-code`. Needs
+  no application source or build.
 - **`rollback-fastly`** — thin wrapper: takes `fastly-api-token`,
   `fastly-service-id`, `fastly-version`, `deploy-to`; runs
-  `<cli> rollback --adapter fastly …`; on production emits `rolled-back-to`.
-  Needs no application source or build.
+  `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
+  `FASTLY_API_TOKEN` in the step env; on production emits `rolled-back-to`. Needs
+  no application source or build.
 
-`healthcheck-fastly` and `rollback-fastly` reuse only the CLI-artifact download
+`healthcheck-fastly` and `rollback-fastly` map `fastly-service-id` → the
+`--service-id` flag and `fastly-api-token` → step-scoped `FASTLY_API_TOKEN`
+(same credential discipline as deploy). They reuse only the CLI-artifact download
 and credential-scoping helpers from `deploy-core`; they skip source resolution,
 toolchain install, build, and cache, since they operate on Fastly service
-versions via the API, not on application source.
+versions via the API, not on application source. They need no Fastly CLI install
+(they call the Fastly API, not `fastly compute …`).
 
 #### 5.4.4 Composing the lifecycle
 
@@ -423,8 +436,9 @@ adapter adds its own lifecycle actions if its provider supports staging.
     CLI build did not dirty this tree).
 12. Resolve the **Cargo workspace root** for `working-directory` (§11.1) for all
     Cargo-scoped operations that follow.
-13. Resolve the application Rust toolchain (§7) and install it plus the resolved
-    application `target` (for example `wasm32-wasip1` for Fastly).
+13. Resolve the application Rust toolchain (§7) and install it plus the
+    **wrapper-provided** application `target` (Fastly → `wasm32-wasip1`). The
+    engine does not map `adapter` → target.
 14. If `cache: true`, restore the exact-key **Cargo workspace root** `target/`
     cache.
 15. Print non-sensitive diagnostics.
