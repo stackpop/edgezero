@@ -1187,6 +1187,41 @@ fn reject_reserved_root_keys(entries: &[(String, String)]) -> Result<(), String>
 }
 
 /// Best-effort per-root orphan count for `config push --local --dry-run`.
+/// Navigate to `[local_server.config_stores.<name>.contents]` for the
+/// dry-run counter. `Ok(None)` when any level is absent (no prior state);
+/// `Err` when a level is present but the wrong type — prior state the real
+/// writer would reject, so the count must degrade to "unknown", not 0.
+fn local_contents_table<'doc>(
+    doc: &'doc toml_edit::DocumentMut,
+    platform_name: &str,
+) -> Result<Option<&'doc toml_edit::Table>, String> {
+    let malformed = || "could not read prior state".to_owned();
+    let Some(server_item) = doc.get("local_server") else {
+        return Ok(None);
+    };
+    let Some(server) = server_item.as_table() else {
+        return Err(malformed());
+    };
+    let Some(stores_item) = server.get("config_stores") else {
+        return Ok(None);
+    };
+    let Some(stores) = stores_item.as_table() else {
+        return Err(malformed());
+    };
+    let Some(store_item) = stores.get(platform_name) else {
+        return Ok(None);
+    };
+    let Some(store) = store_item.as_table() else {
+        return Err(malformed());
+    };
+    let Some(contents_item) = store.get("contents") else {
+        return Ok(None);
+    };
+    contents_item
+        .as_table()
+        .map_or_else(|| Err(malformed()), |table| Ok(Some(table)))
+}
+
 /// Reads the current `fastly.toml` (offline) and, for each logical
 /// `(root_key, body)`, counts `prior_chunk_keys(root, old) - new_keys`
 /// where `new_keys` is the root's OWN expansion. Never fails the dry-run:
@@ -1198,7 +1233,7 @@ fn local_orphan_counts_for_dry_run(
     platform_name: &str,
     entries: &[(String, String)],
 ) -> Vec<(String, Result<usize, String>)> {
-    use toml_edit::{DocumentMut, Item};
+    use toml_edit::DocumentMut;
 
     // Parse the current file once (best-effort). Absent file => no prior.
     let parsed: Result<Option<DocumentMut>, String> = match fs::read_to_string(path) {
@@ -1220,15 +1255,11 @@ fn local_orphan_counts_for_dry_run(
             let count = match &parsed {
                 Err(reason) => Err(reason.clone()),
                 Ok(None) => Ok(0),
-                Ok(Some(doc)) => {
-                    let contents = doc
-                        .get("local_server")
-                        .and_then(|ls| ls.get("config_stores"))
-                        .and_then(|cs| cs.get(platform_name))
-                        .and_then(|st| st.get("contents"))
-                        .and_then(Item::as_table);
-                    match contents.and_then(|tbl| tbl.get(root_key)) {
-                        None => Ok(0), // no contents table, or no prior value for this root
+                Ok(Some(doc)) => match local_contents_table(doc, platform_name) {
+                    Err(reason) => Err(reason),
+                    Ok(None) => Ok(0),
+                    Ok(Some(contents)) => match contents.get(root_key) {
+                        None => Ok(0), // no prior value for this root
                         Some(item) => match item.as_str() {
                             None => Err("could not read prior state".to_owned()),
                             Some(raw) => match prior_chunk_keys(root_key, raw) {
@@ -1238,8 +1269,8 @@ fn local_orphan_counts_for_dry_run(
                                 Err(_) => Err("suspicious prior pointer".to_owned()),
                             },
                         },
-                    }
-                }
+                    },
+                },
             };
             (root_key.clone(), count)
         })
@@ -3052,7 +3083,8 @@ build = \"cargo build --release\"
 
     /// Fake `fastly` for cloud chunk-GC tests. Logs each
     /// `config-store-entry` op ("describe <key>" / "update <key>" /
-    /// "delete <key>") to `oplog`, one per line. `root_describe_seq`
+    /// "delete <key>", plus "delete-argv <full argv>") to `oplog`, one per
+    /// line. `root_describe_seq`
     /// gives the successive raw `item_value`s returned when the ROOT key
     /// is described (call 1 = prior read, call 2 = read-back guard);
     /// exhausting the sequence yields "not found". `fail_delete_key`
@@ -3078,7 +3110,7 @@ sub="$2"
 key=""
 for arg in "$@"; do case "$arg" in --key=*) key="${arg#--key=}";; esac; done
 if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '{{{oplog}}}'; exit 0; fi
-if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
+if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; printf 'delete-argv %s\n' "$*" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
 if [ "$sub" = "describe" ]; then
   printf 'describe %s\n' "$key" >> '{{{oplog}}}'
   {{#if hard_error}}echo 'Error: internal server error' >&2; exit 1{{/if}}
@@ -3453,6 +3485,113 @@ echo 'unexpected' >&2; exit 1
             out.iter()
                 .any(|line| line.contains("failed to read prior root")),
             "must warn about the failed prior read: {out:?}"
+        );
+    }
+
+    /// Every delete must pass `--key` + `--auto-yes` and NEVER `--all`
+    /// (which would wipe the whole store). Asserts the actual argv.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_delete_uses_key_and_auto_yes_never_all() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let envelope_b = {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ "alt": "k".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:06Z".to_owned()))
+                .expect("B")
+        };
+        let (_a_chunks, a_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_a);
+        let (_b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[a_pointer, b_pointer], None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+        FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        let argv_lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.starts_with("delete-argv "))
+            .collect();
+        assert!(
+            !argv_lines.is_empty(),
+            "at least one delete happened: {log}"
+        );
+        for line in argv_lines {
+            assert!(
+                line.contains("--auto-yes"),
+                "delete must pass --auto-yes: {line}"
+            );
+            assert!(
+                line.contains("--key="),
+                "delete must target a --key: {line}"
+            );
+            assert!(
+                !line.contains("--all"),
+                "delete must NEVER pass --all (store-wide wipe): {line}"
+            );
+        }
+    }
+
+    /// Cloud config shrinking back under the limit: the new value is a
+    /// direct envelope, so every prior chunk is reclaimed and the root is
+    /// upserted (never deleted).
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_shrink_to_direct_deletes_all_prior_chunks() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+        let chunked = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let direct = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT);
+        let (prior_chunks, prior_pointer) = chunked_parts(TEST_CONFIG_ID, &chunked);
+        // New value is direct, so new_root_value == the direct envelope;
+        // read-back returns it so the guard passes.
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[prior_pointer, direct.clone()],
+            None,
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+        FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), direct)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+        for key in &prior_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "prior chunk `{key}` must be deleted on shrink-to-direct"
+            );
+        }
+        assert!(
+            !oplog_has(&oplog, &format!("delete {TEST_CONFIG_ID}")),
+            "root pointer must never be deleted"
+        );
+        assert!(
+            oplog_has(&oplog, &format!("update {TEST_CONFIG_ID}")),
+            "root must be upserted with the direct value"
         );
     }
 
@@ -4424,6 +4563,43 @@ echo 'unexpected' >&2; exit 1
         assert!(
             out.join("\n").contains("unknown: suspicious prior pointer"),
             "dry-run must degrade to unknown: {out:?}"
+        );
+    }
+
+    /// A present-but-malformed `contents` (non-table) is prior state the
+    /// real writer would reject — the dry-run count must degrade to
+    /// `unknown: could not read prior state`, not silently report 0.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_dry_run_non_table_contents_unknown() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        let seed = concat!(
+            "name = \"demo\"\n\n",
+            "[local_server.config_stores.app_config]\n",
+            "format = \"inline-toml\"\n",
+            "contents = \"bad\"\n",
+        );
+        fs::write(&fastly_toml, seed).expect("seed");
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let out = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                true, // dry_run
+            )
+            .expect("dry-run must not fail on malformed contents");
+
+        assert!(
+            out.join("\n")
+                .contains("unknown: could not read prior state"),
+            "non-table contents must degrade to unknown: {out:?}"
         );
     }
 
