@@ -343,15 +343,19 @@ generic engine still exposes no deployment version.
 
 #### 5.4.3 The three actions
 
-- **`deploy-fastly` (`stage: true`)** — runs `<cli> deploy --adapter fastly
---stage`; outputs `fastly-version` (the staged draft). Reuses the engine for
-  build/source/credential scoping; only the `--stage` flag differs.
+- **`deploy-fastly` (`stage: true`)** — runs
+  `<cli> deploy --adapter fastly --service-id <id> --stage` (the wrapper injects
+  `--service-id` via `deploy-flags`); outputs `fastly-version` (the staged
+  draft). Reuses the engine for build/source/credential scoping; only the
+  `--stage` flag differs.
 - **`healthcheck-fastly`** — thin wrapper: downloads the CLI artifact, takes
   `fastly-api-token`, `fastly-service-id`, `fastly-version`, `domain`,
   `deploy-to` (`production`/`staging`), retry/timeout inputs; runs
   `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
-  `FASTLY_API_TOKEN` in the step env; outputs `healthy` and `status-code`. Needs
-  no application source or build.
+  `FASTLY_API_TOKEN` in the step env; outputs `healthy` and `status-code`. It
+  **exits non-zero after retries when the probe is unhealthy** (so a caller can
+  gate rollback on `if: failure()`), while still emitting the outputs. Needs no
+  application source or build.
 - **`rollback-fastly`** — thin wrapper: takes `fastly-api-token`,
   `fastly-service-id`, `fastly-version`, `deploy-to`; runs
   `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
@@ -611,25 +615,29 @@ values, or provider auth state.
 
 All validation and setup failures stop before invoking provider deployment.
 
-| Failure                                 | Required diagnostic                                                           |
-| --------------------------------------- | ----------------------------------------------------------------------------- |
-| Missing/unknown `cli-package`           | State that the app must name a CLI package present in its own workspace.      |
-| Missing `cli-artifact`                  | State that a compiled CLI artifact from `build-cli` is required.              |
-| Malformed `adapter` token               | Name the input and its allowed shape (the CLI validates support at run time). |
-| Invalid boolean                         | Name the input and allowed values.                                            |
-| Missing working directory               | Print the workspace-relative requested path.                                  |
-| Path escapes workspace                  | Name the input; require paths under `github.workspace`.                       |
-| Missing explicit manifest               | Print the workspace-relative requested path.                                  |
-| Invalid JSON arguments/env              | Name the invalid input without printing its value.                            |
-| Non-string entry                        | State that every array/object value must be a string.                         |
-| Disallowed deploy arg                   | State the allowlist and rejected position without printing the array.         |
-| Rust toolchain cannot be resolved       | List files checked and suggest explicit `rust-toolchain`.                     |
-| Dirty working tree                      | State that deployments require committed source.                              |
-| Missing `Cargo.lock` when cache enabled | Explain the exact-key cache requirement.                                      |
-| Missing provider credential input       | Name the missing input, never its value.                                      |
-| Build command fails                     | Preserve exit status; state that deploy was not attempted.                    |
-| Deploy command fails                    | Preserve exit status; state that rollback is caller-owned.                    |
-| Cleanup fails                           | Mark the action failed; identify the area without printing secrets.           |
+| Failure                                         | Required diagnostic                                                             |
+| ----------------------------------------------- | ------------------------------------------------------------------------------- |
+| Missing/unknown `cli-package`                   | State that the app must name a CLI package present in its own workspace.        |
+| Missing `cli-artifact`                          | State that a compiled CLI artifact from `build-cli` is required.                |
+| Malformed `adapter` token                       | Name the input and its allowed shape (the CLI validates support at run time).   |
+| Invalid boolean                                 | Name the input and allowed values.                                              |
+| Missing working directory                       | Print the workspace-relative requested path.                                    |
+| Path escapes workspace                          | Name the input; require paths under `github.workspace`.                         |
+| Missing explicit manifest                       | Print the workspace-relative requested path.                                    |
+| Invalid JSON arguments/env                      | Name the invalid input without printing its value.                              |
+| Non-string entry                                | State that every array/object value must be a string.                           |
+| Disallowed deploy arg                           | State the allowlist and rejected position without printing the array.           |
+| Rust toolchain cannot be resolved               | List files checked and suggest explicit `rust-toolchain`.                       |
+| Dirty working tree                              | State that deployments require committed source.                                |
+| Missing `Cargo.lock` when cache enabled         | Explain the exact-key cache requirement.                                        |
+| Missing provider credential input               | Name the missing input, never its value.                                        |
+| Build command fails                             | Preserve exit status; state that deploy was not attempted.                      |
+| Deploy command fails                            | Preserve exit status; state that rollback is caller-owned.                      |
+| Staged deploy fails                             | Preserve exit status; emit no `fastly-version` so the caller skips rollback.    |
+| Missing `fastly-version` (healthcheck/rollback) | State it is required, sourced from the deploy/stage output.                     |
+| Health check unhealthy after retries            | Exit non-zero and set `healthy=false`/`status-code` so the caller can rollback. |
+| Rollback command fails                          | Preserve exit status; state the version was not rolled back.                    |
+| Cleanup fails                                   | Mark the action failed; identify the area without printing secrets.             |
 
 Provider CLI stderr passes through so provider API errors stay actionable. The
 actions never construct error messages containing credentials.
@@ -708,6 +716,10 @@ Fastly wrapper:
 - credential presence validation and scoping (absent from build-cli/setup/build,
   present only in deploy);
 - cache key construction and missing-lockfile failure;
+- staging lifecycle: `stage` flag adds `--stage`; `fastly-version` parsed from CLI
+  output; `healthcheck-fastly` / `rollback-fastly` pass `--service-id` + version
+  and scope `FASTLY_API_TOKEN`; healthcheck exits non-zero on unhealthy; staging
+  vs production argv;
 - cleanup on success and failure; and
 - redaction of credentials from action-owned logs.
 
@@ -716,10 +728,19 @@ Tests must not need live provider credentials.
 ### 15.3 Composite smoke test
 
 A workflow exercises the layered actions end to end with a minimal fixture
-EdgeZero app: run `build-cli`, then `deploy-fastly`, using fake provider binaries
-that write marker files instead of contacting Fastly; assert CLI-artifact reuse,
-invocation order, working directory, argument boundaries, cache behavior,
-credential scope, and public outputs.
+EdgeZero app: run `build-cli`, then `deploy-fastly` (both production and
+`stage: true`), then `healthcheck-fastly` and `rollback-fastly`. Fake the
+dependencies each action actually uses:
+
+- for `deploy-fastly`, a fake `fastly` binary that writes marker files and prints
+  a version instead of contacting Fastly;
+- for `healthcheck-fastly` / `rollback-fastly`, a fake **app CLI** (or stubbed
+  Fastly API / `curl` responses) — these actions call the Fastly API, not the
+  `fastly` CLI, so no fake `fastly` binary is involved.
+
+Assert CLI-artifact reuse, invocation order, working directory, argument
+boundaries (`--service-id`, `--stage`), `fastly-version` threading stage →
+healthcheck → rollback, cache behavior, credential scope, and public outputs.
 
 ### 15.4 Installer / live gates
 
@@ -764,9 +785,15 @@ The design is implemented when:
 9. All CI, tooling, and tests run without Python; `actionlint` and `zizmor` run
    from pinned release binaries.
 10. Third-party actions are pinned to readable released tags.
-11. Static checks, Bash contract tests, and the composite smoke test pass.
-12. Docs include same-repo, separate-repo, and monorepo examples across the
-    three-layer model.
+11. Fastly staging lifecycle works end to end: `deploy-fastly` `stage: true`
+    stages a draft and outputs `fastly-version`; `healthcheck-fastly` probes the
+    staged version (via its staging IP) and exits non-zero when unhealthy;
+    `rollback-fastly` deactivates the staged version (or activates the previous
+    production version). All three thread `--service-id` and `fastly-version` and
+    scope `FASTLY_API_TOKEN`; the generic engine is unchanged.
+12. Static checks, Bash contract tests, and the composite smoke test pass.
+13. Docs include same-repo, separate-repo, and monorepo examples across the
+    three-layer model, plus a Fastly staging-lifecycle example.
 
 ## 18. Risks and mitigations
 

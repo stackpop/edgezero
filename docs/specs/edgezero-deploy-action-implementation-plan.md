@@ -174,9 +174,12 @@ reference to port from. Most transfer with light changes:
      (no `pip`).
    - Port the metadata-validation heredocs into `tests/run.sh`.
    - Composite smoke test: `build-cli` → `deploy-fastly` (both production and
-     `stage: true`) → `healthcheck-fastly` → `rollback-fastly` with fake `fastly`
-     binaries writing marker files; assert CLI-artifact reuse, credential
-     scoping, and version threading.
+     `stage: true`) → `healthcheck-fastly` → `rollback-fastly`. Fake each action's
+     real dependency: a fake `fastly` binary (marker files + printed version) for
+     `deploy-fastly`; a fake app CLI or stubbed Fastly API/`curl` responses for
+     `healthcheck-fastly`/`rollback-fastly` (they call the API, not `fastly`).
+     Assert CLI-artifact reuse, credential scoping, and `fastly-version`
+     threading.
 
 7. **Bash contract tests (`tests/run.sh`)**
    - Cover engine + wrappers: adapter/boolean/JSON validation, path confinement,

@@ -218,10 +218,12 @@ Workflow shape:
 4. run `deploy-fastly` (set `stage: true` for staging) with the CLI artifact,
    `working-directory: trusted-server`, typed Fastly credentials, and optional
    `deploy-args: ["--comment", …]`; capture `fastly-version`;
-5. run `healthcheck-fastly` with `deploy-to`, `domain`, and the captured
-   `fastly-version`;
-6. on failure, run `rollback-fastly` with the same `deploy-to`/`fastly-version`;
-   and
+5. run `healthcheck-fastly` with the CLI artifact, typed Fastly credentials
+   (`fastly-api-token`, `fastly-service-id`), `deploy-to`, `domain`, and the
+   captured `fastly-version`;
+6. on failure, run `rollback-fastly` with the CLI artifact, typed Fastly
+   credentials (`fastly-api-token`, `fastly-service-id`), and the same
+   `deploy-to` / `fastly-version`; and
 7. write a summary from the action outputs.
 
 ### 6.4 Required deployer changes
