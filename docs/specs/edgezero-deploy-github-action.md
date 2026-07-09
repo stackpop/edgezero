@@ -1,319 +1,344 @@
-# EdgeZero Deploy GitHub Action — Fastly v0 Spec
+# EdgeZero Deploy GitHub Actions — Layered, Adapter-Independent Spec
 
-**Status:** Implemented Fastly v0 contract
+**Status:** Revised design (supersedes the Fastly-only v0 spec)
 
-**Date:** 2026-07-02
+**Date:** 2026-07-08
 
 **Delivery target:** implementation in the `stackpop/edgezero` monorepo
 
-**Action path:** `.github/actions/deploy`
+**Action paths:**
 
-**Pre-release identity:**
-
-```yaml
-uses: stackpop/edgezero/.github/actions/deploy@<ref>
+```text
+.github/actions/build-cli
+.github/actions/deploy-core
+.github/actions/deploy-fastly
 ```
 
 ## 1. Executive summary
 
-Add a reusable GitHub composite action to the EdgeZero monorepo that deploys a
-checked-out EdgeZero application to Fastly Compute.
+Ship reusable GitHub composite actions that deploy a checked-out EdgeZero
+application to a supported provider by driving the EdgeZero CLI.
 
-The first version intentionally supports only one deployable adapter:
+The design is **layered** so a new adapter is added without rewriting the deploy
+engine, and the **CLI is the boundary** — the actions never reproduce provider
+build, deploy, config-push, or provision logic in YAML or shell. Everything an
+adapter needs (`edgezero build`, `edgezero deploy`, `edgezero config push`,
+`edgezero provision`) already lives in the CLI; the actions only compile the
+CLI, scope credentials, and invoke the right subcommand.
 
-| Adapter      | v0 status                | Target                                 |
-| ------------ | ------------------------ | -------------------------------------- |
-| `fastly`     | Supported                | `wasm32-wasip1`                        |
-| `cloudflare` | Future                   | Not implemented in v0                  |
-| `spin`       | Future preview candidate | Not implemented in v0                  |
-| `axum`       | Excluded                 | No EdgeZero remote deployment contract |
+The CLI is **the app's own CLI package.** The application tells `build-cli` which
+CLI package to compile (a crate in the application's own workspace), and
+`build-cli` builds it from the application checkout. It is **not** the EdgeZero
+monorepo CLI and **not** the action's own repository revision. Because the CLI is
+the app's own package, built from the app's source and lockfile, the CLI and the
+application always agree on the manifest, adapter, and config schema — and an app
+may ship a CLI extended with its own commands.
 
-The action does not check out application source. The caller owns checkout,
+Three layers:
+
+| Layer           | Action              | Responsibility                                                                        |
+| --------------- | ------------------- | ------------------------------------------------------------------------------------- |
+| Build           | `build-cli`         | Compile the caller-selected EdgeZero CLI **once** and publish it.                     |
+| Engine (shared) | `deploy-core`       | Adapter-independent engine **scripts** sourced by wrappers; consume the prebuilt CLI. |
+| Adapter wrapper | `deploy-fastly` (…) | Minimal per-adapter shim: type provider credentials, call the engine.                 |
+
+The actions do not check out application source. The caller owns checkout,
 repository permissions, ref selection, GitHub Environment policy, concurrency,
 timeouts, and any health check or rollback process.
-
-The action owns repeatable deployment setup:
-
-1. validate public inputs;
-2. resolve the checked-out application directory and optional `edgezero.toml`;
-3. resolve Rust from the application or this repository's `.tool-versions`;
-4. install `wasm32-wasip1`;
-5. install an action-owned EdgeZero CLI from the EdgeZero repository revision
-   selected by the `uses:` ref;
-6. install the pinned Fastly CLI version defined by this repository's tool
-   version policy;
-7. optionally restore/save an exact-key application build cache;
-8. apply the Fastly build-mode policy;
-9. run EdgeZero build when required; and
-10. run EdgeZero deploy with typed Fastly credentials scoped to provider
-    mutation steps.
 
 The core boundary is EdgeZero itself:
 
 ```text
-edgezero build --adapter fastly
-edgezero deploy --adapter fastly
+<cli> build  --adapter <adapter>
+<cli> deploy --adapter <adapter>
 ```
 
+where `<cli>` is the application's own CLI binary built by `build-cli`.
+
 Provider-specific staging, deployment IDs, health checks, and rollback are out
-of scope for this generic deploy action.
+of scope for these deploy actions.
 
 ## 2. Design principles
 
-1. **EdgeZero is the deployment boundary.** The action invokes the EdgeZero CLI
-   instead of reproducing provider build/deploy logic in YAML or shell.
-2. **The caller owns source.** The action never calls `actions/checkout`.
-3. **Fastly-only v0, future-compatible API.** The `adapter` input is required
-   even though only `fastly` is accepted in v0.
-4. **Pre-release action ref.** Consumers may select the action with a branch,
-   tag, or commit SHA. A full commit SHA is recommended when reproducible
-   production deploys matter. No `v1` alias, Marketplace publication, or
-   release tag is defined by this spec.
-5. **Use repository tool versions.** The action's EdgeZero CLI build toolchain
-   and default application Rust toolchain come from the EdgeZero monorepo's
-   `.tool-versions` file.
-6. **Typed provider credentials.** Fastly credentials are passed through action
-   inputs, not caller `env:`, so setup and separate build steps do not inherit
-   the API token. Deploy is the only provider mutation step that receives the token.
-7. **No shell string APIs.** Passthrough arguments are JSON arrays and are
-   invoked without `eval`.
-8. **Safe by default.** Caching is opt-in, deploys require committed source,
-   and provider credentials are not written to outputs, summaries, caches, or
-   action-global environment files.
+1. **EdgeZero CLI is the deployment boundary.** The actions invoke CLI
+   subcommands instead of reproducing provider logic. Provider orchestration
+   belongs in the CLI, not in action shell scripts.
+2. **Layered and adapter-independent.** A generic `deploy-core` engine holds all
+   provider-neutral behavior. Adapter wrappers are minimal and only supply typed
+   credentials and the adapter name. Adding an adapter adds a wrapper; it does
+   not fork the engine.
+3. **The caller owns source.** The actions never call `actions/checkout`.
+4. **The application provides the CLI package.** The app tells `build-cli` which
+   CLI package to compile via a required `cli-package` input, and `build-cli`
+   builds that package from the application's own checkout. It never builds the
+   EdgeZero monorepo CLI or the action's own repository revision. The
+   application owns which CLI deploys it.
+5. **Compile once, reuse everywhere.** `build-cli` compiles the CLI a single
+   time per workflow and publishes it as an artifact. Deploy actions consume the
+   prebuilt binary and never recompile it.
+6. **Typed provider credentials.** Credentials are passed through wrapper action
+   inputs, not caller `env:`, so setup and build steps never inherit provider
+   tokens. Only the provider mutation step receives them.
+7. **No shell string APIs.** Passthrough arguments are JSON arrays invoked
+   through Bash arrays without `eval`.
+8. **No Python in tooling or CI.** Validation, metadata checks, and security
+   scans run through Bash, `jq`, and pinned release binaries (`actionlint`,
+   `zizmor`). No `python3` heredocs and no `pip install`.
+9. **Pin third-party actions to readable released tags.** Reusable third-party
+   actions are referenced by their published major/minor tag (for example
+   `actions/checkout@v4`), not opaque commit SHAs chosen ad hoc.
+10. **Safe by default.** Caching is opt-in, deploys require committed source, and
+    provider credentials never reach outputs, summaries, caches, or
+    action-global environment files.
 
 ## 3. Goals
 
-1. Deploy any checked-out EdgeZero Fastly application from GitHub Actions.
-2. Support same-repository, separate-repository, private-repository, and
+1. Deploy any checked-out EdgeZero application from GitHub Actions through the
+   EdgeZero CLI.
+2. Keep the deploy engine adapter-independent so Cloudflare, Spin, and future
+   adapters reuse it.
+3. Compile the CLI package the application provides, from the application's own
+   source, so the CLI and the deployed application never disagree on schema.
+4. Compile the CLI once and share the artifact across deploy steps and jobs.
+5. Support same-repository, separate-repository, private-repository, and
    monorepo checkout layouts.
-3. Require explicit `adapter: fastly` for v0.
-4. Respect the application's `edgezero.toml` when present.
-5. Support explicit `working-directory` and explicit `manifest` selection.
-6. Build and install the EdgeZero CLI from the action commit selected by
-   `uses:`.
-7. Install the Fastly CLI reproducibly from a pinned version.
-8. Accept typed Fastly credentials and expose them only to provider mutation steps.
-9. Support JSON-array build and deploy passthrough arguments.
-10. Support opt-in exact-key application `target/` caching.
-11. Produce actionable validation failures before deployment begins.
-12. Avoid logging provider credentials or action-managed secret values.
+6. Respect the application's `edgezero.toml` when present and support explicit
+   `working-directory` and `manifest` selection.
+7. Accept typed provider credentials and expose them only to the provider
+   mutation step.
+8. Support JSON-array build and deploy passthrough arguments.
+9. Support opt-in, exact-key application `target/` caching.
+10. Produce actionable validation failures before deployment begins.
+11. Keep all tooling and CI free of Python; use pinned release binaries.
 
 ## 4. Non-goals
 
-The v0 action will not:
+The deploy actions will not:
 
 1. check out application source;
 2. choose an application ref;
-3. deploy Cloudflare Workers, Fermyon Spin, or Axum applications;
-4. deploy more than one adapter per invocation;
-5. provision Fastly services, domains, dictionaries, config stores, secrets, or
-   other provider resources;
-6. push runtime config or secrets to Fastly;
-7. implement Fastly staging;
-8. parse or expose a Fastly service version;
-9. perform health checks;
-10. perform automatic rollback;
-11. configure GitHub job permissions, environments, approvals, concurrency, or
-    timeouts;
-12. support Windows or macOS runners;
-13. publish a stable version alias; or
-14. provide a general `setup` action for running arbitrary EdgeZero commands.
+3. deploy more than one adapter per `deploy-*` invocation;
+4. provision provider resources or push runtime config as a side effect of
+   deploy (these remain explicit CLI subcommands the caller may run separately);
+5. implement provider staging;
+6. parse or expose a provider deployment/service version;
+7. perform health checks;
+8. perform automatic rollback;
+9. configure GitHub job permissions, environments, approvals, concurrency, or
+   timeouts;
+10. support Windows or macOS runners;
+11. publish a stable version alias; or
+12. provide a general `setup` action for running arbitrary EdgeZero commands
+    (the CLI is available via the `build-cli` artifact for callers who need it).
 
-## 5. Public action contract
+## 5. Architecture
 
-### 5.1 Invocation path
+### 5.1 Layer 1 — `build-cli`
 
-Use a trusted action ref. A full commit SHA is recommended for reproducible
-production deploys, but branches and tags are accepted:
+Compiles the **CLI package the application provides** — a crate in the
+application's own workspace, named by the required `cli-package` input — once,
+and publishes it as a workflow artifact so every downstream deploy step consumes
+the same binary. The CLI is built from the application checkout and its lockfile,
+so it matches the application and may include app-specific commands. `build-cli`
+never builds the EdgeZero monorepo CLI.
 
-```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<ref>
-  with:
-    adapter: fastly
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-```
+**Inputs**
 
-The action lives at:
+| Input               | Required | Default         | Contract                                                                                                                                                     |
+| ------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cli-package`       | Yes      | none            | Cargo package name of the CLI to build, defined in the application's own workspace. `build-cli` builds this package from the application checkout.           |
+| `cli-bin`           | No       | `<cli-package>` | Binary name produced by `cli-package`. Defaults to the package name (the generated downstream CLI names its bin after the package).                          |
+| `working-directory` | No       | `.`             | Application directory (relative to `github.workspace`) containing the workspace/lockfile that defines `cli-package`. Must resolve inside `github.workspace`. |
+| `rust-toolchain`    | No       | `auto`          | Explicit toolchain, or `auto` to follow the application toolchain resolution precedence (§7).                                                                |
+| `artifact-name`     | No       | `edgezero-cli`  | Name of the uploaded artifact.                                                                                                                               |
 
-```text
-.github/actions/deploy/action.yml
-```
+There is intentionally no `adapters` / features input. The application's own
+`Cargo.toml` already pins which adapters compile into its CLI (through the
+`edgezero-cli` dependency it declares); `build-cli` builds the package exactly as
+the application declares it, so the app owns adapter selection.
 
-The root of the EdgeZero repository remains the Rust workspace root and does
-not become a GitHub Action entry point.
+**Outputs**
 
-### 5.2 Inputs
+| Output          | Meaning                                                        |
+| --------------- | -------------------------------------------------------------- |
+| `cli-version`   | CLI package version, read from `cargo metadata` at build time. |
+| `cli-package`   | The application CLI package that was built.                    |
+| `cli-bin`       | The binary name inside the artifact.                           |
+| `artifact-name` | Name of the uploaded CLI artifact for downstream `download`.   |
 
-| Input               | Required | Default | Contract                                                                                                                                                                    |
-| ------------------- | -------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `adapter`           | Yes      | none    | Must be exactly `fastly` in v0. Unknown adapters, `cloudflare`, `spin`, and `axum` fail before setup.                                                                       |
-| `working-directory` | No       | `.`     | Application directory relative to `github.workspace`. Must resolve inside `github.workspace`.                                                                               |
-| `manifest`          | No       | empty   | Optional `edgezero.toml` path relative to `working-directory`. If set, the file must exist and is exported as `EDGEZERO_MANIFEST`.                                          |
-| `rust-toolchain`    | No       | `auto`  | Explicit application Rust toolchain or automatic discovery.                                                                                                                 |
-| `build-mode`        | No       | `auto`  | One of `auto`, `always`, or `never`. For Fastly, `auto` resolves to `never`.                                                                                                |
-| `build-args`        | No       | `[]`    | JSON array of strings passed after `edgezero build --adapter fastly --`. Must not contain secrets.                                                                          |
-| `deploy-args`       | No       | `[]`    | JSON array of caller-supplied Fastly comment arguments appended after the action-owned deploy flags. Must not contain secrets. Other Fastly deploy args are rejected in v0. |
-| `cache`             | No       | `false` | Enable exact-key application `target/` caching. Accepts only `true` or `false`.                                                                                             |
-| `fastly-api-token`  | Yes      | none    | Fastly API token. Injected only into the EdgeZero deploy step as `FASTLY_API_TOKEN`.                                                                                        |
-| `fastly-service-id` | Yes      | none    | Fastly service ID used by the action-owned deploy flag to prevent accidental service creation.                                                                              |
+**Behavior**
 
-Boolean inputs accept only the literal strings `true` and `false`.
+1. Require a `Cargo.lock` at the app's Cargo workspace root (see §11.1); fail
+   with a remediation message if it is missing. All Cargo commands run with
+   `--locked` so the build never creates or updates the lockfile.
+2. Confirm via `cargo metadata --locked` that `cli-package` exists in the
+   application workspace under `working-directory` and that it declares a binary
+   target named `<cli-bin>` (default `<cli-package>`). Fail if either is absent.
+3. Install the resolved host Rust toolchain (§7). The CLI is a native host tool;
+   the WASM target needed to build the _application_ is installed later by the
+   deploy engine, not here.
+4. Build **into an action-owned `CARGO_TARGET_DIR` below `RUNNER_TEMP`**, never
+   the app checkout, so the CLI build does not write `target/` into the
+   application working tree (which the deploy engine later dirty-checks):
 
-`build-args` and `deploy-args` must parse as JSON arrays containing only string
-values. Strings containing NUL bytes are rejected because operating-system
-arguments cannot represent them.
+   ```text
+   CARGO_TARGET_DIR=<RUNNER_TEMP>/edgezero-cli-build \
+     cargo build --locked --release -p <cli-package> --bin <cli-bin>
+   ```
 
-### 5.3 Outputs
+5. Read `cli-version` from `cargo metadata` for `cli-package`, and smoke-check
+   the binary with `<cli-bin> --help` (today's CLI has no `--version`; see the
+   note below).
+6. Write a small metadata file (`cli-meta.json`) next to the binary containing
+   `cli-bin`, `cli-version`, and `cli-package`.
+7. Upload the binary **and `cli-meta.json`** as a single **tar archive** so the
+   executable bit survives the round trip (`actions/upload-artifact` zips and
+   drops POSIX permissions).
 
-| Output                 | Meaning                                                   |
-| ---------------------- | --------------------------------------------------------- |
-| `adapter`              | Normalized adapter, always `fastly` in v0.                |
-| `source-revision`      | Git commit deployed from `working-directory`.             |
-| `edgezero-revision`    | EdgeZero action/CLI revision selected by the `uses:` ref. |
-| `provider-cli-version` | Installed Fastly CLI version.                             |
-| `effective-build-mode` | Resolved build behavior, `always` or `never`.             |
+The artifact is self-describing: the engine reads `cli-meta.json` to learn the
+binary name and version, so callers do not have to re-pass `cli-bin`/`cli-version`
+(a wrapper `cli-bin` input, if given, overrides the metadata).
 
-The action intentionally does not expose a Fastly service version or deployment
-ID. Provider-specific deployment metadata requires a separate design.
+`build-cli` never receives provider credentials and leaves the app checkout
+clean (no `target/`, no lockfile mutation), so a later dirty-source guard passes.
 
-## 6. Checkout and source contract
+> **Companion CLI improvement (tracked separately):** the generated downstream
+> CLI template currently sets no clap `version`, so `<cli> --version` fails. Add
+> `#[command(version)]` to the downstream CLI template so future apps expose a
+> version surface. Until then, `cli-version` comes from `cargo metadata` and the
+> runnability check uses `--help`.
 
-The caller must check out application source before invoking the action.
+### 5.2 Layer 2 — `deploy-core` (shared engine scripts)
 
-### 6.1 Same-repository application
+Adapter-independent. Holds every provider-neutral concern so wrappers stay
+minimal. `deploy-core` is **not a standalone composite action**; it is a
+directory of shared scripts under `.github/actions/deploy-core/`. Each adapter
+wrapper is the real composite action and sources these scripts through
+`$GITHUB_ACTION_PATH/../deploy-core/…`, which resolves inside the same fetched
+EdgeZero action repository. This avoids referencing a "private" sibling action by
+ref and keeps one engine for every adapter.
 
-```yaml
-jobs:
-  deploy:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@<full-commit-sha>
-        with:
-          persist-credentials: false
+The engine is parameterized by the values the wrapper passes to those scripts
+(as environment variables), conceptually:
 
-      - uses: stackpop/edgezero/.github/actions/deploy@<ref>
-        with:
-          adapter: fastly
-          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-```
+| Parameter            | Meaning                                                                                                                                                                                            |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `adapter`            | Passed to `<cli> deploy --adapter <adapter>`. The engine does **not** enumerate compiled adapters; the CLI rejects an unknown adapter with its own error.                                          |
+| `cli-artifact`       | Name of the `build-cli` artifact to download. The engine reads `cli-bin` and `cli-version` from the artifact's `cli-meta.json`.                                                                    |
+| `cli-bin`            | Optional override for the binary name; if empty, taken from `cli-meta.json`.                                                                                                                       |
+| `working-directory`  | Application directory relative to `github.workspace`. Must resolve inside `github.workspace`.                                                                                                      |
+| `manifest`           | Optional `edgezero.toml` path relative to `working-directory`. If set, must exist; exported as `EDGEZERO_MANIFEST`.                                                                                |
+| `rust-toolchain`     | Application Rust toolchain for the deploy build. `auto` follows §7.                                                                                                                                |
+| `target`             | Application build target. `auto` derives it from `adapter` (for example `fastly` → `wasm32-wasip1`).                                                                                               |
+| `build-mode`         | One of `auto`, `always`, `never` (§8).                                                                                                                                                             |
+| `build-args`         | JSON array of strings passed after `<cli> build --adapter <adapter> --`. Must not contain secrets.                                                                                                 |
+| `deploy-args`        | JSON array of caller-supplied deploy args appended after action-owned deploy flags. Must not contain secrets.                                                                                      |
+| `deploy-arg-allow`   | Adapter allowlist pattern for caller `deploy-args` (wrapper-provided; §9).                                                                                                                         |
+| `provider-env`       | JSON object of provider credential names → values, injected **only** into the deploy step (§10).                                                                                                   |
+| `provider-env-clear` | JSON array of env var names (wrapper-provided) the engine unsets in non-deploy steps and clears + re-exports from `provider-env` in the deploy step (§10). Keeps alias-clearing provider-agnostic. |
+| `deploy-flags`       | JSON array of action-owned deploy flags the wrapper injects before caller `deploy-args` (`--service-id …`, `--non-interactive`).                                                                   |
+| `cache`              | Enable exact-key application `target/` caching (`true`/`false`).                                                                                                                                   |
 
-### 6.2 Separate orchestration and application repositories
+The wrapper surfaces engine results as its own outputs: `adapter`,
+`source-revision`, `cli-version`, `effective-build-mode`.
 
-```yaml
-jobs:
-  deploy:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout deployment repository
-        uses: actions/checkout@<full-commit-sha>
-        with:
-          path: deployer
-          persist-credentials: false
+The engine contains no provider-specific credential names, service concepts,
+endpoints, or CLI flags — those, and the list of aliases to clear
+(`provider-env-clear`), all arrive from the wrapper. It invokes the application's
+CLI binary (`<cli-bin>`), not a hard-coded `edgezero`.
 
-      - name: Checkout application
-        uses: actions/checkout@<full-commit-sha>
-        with:
-          repository: stackpop/my-edgezero-app
-          ref: ${{ inputs.ref }}
-          path: app
-          persist-credentials: false
+### 5.3 Layer 3 — adapter wrappers (`deploy-fastly`, …)
 
-      - name: Deploy application
-        uses: stackpop/edgezero/.github/actions/deploy@<ref>
-        with:
-          adapter: fastly
-          working-directory: app
-          fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-          fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-```
+Minimal composite actions. A wrapper only:
 
-### 6.3 Monorepo application
+1. declares the provider's typed credential inputs;
+2. maps them into `provider-env` and action-owned `deploy-flags`;
+3. sets `adapter`, `target`, the adapter `deploy-arg` allowlist, and the
+   `provider-env-clear` alias list; and
+4. sources the shared `deploy-core` scripts via `$GITHUB_ACTION_PATH/../deploy-core`.
 
-```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<ref>
-  with:
-    adapter: fastly
-    working-directory: apps/api
-    manifest: edgezero.toml
-    cache: true
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-```
+A wrapper contains no build logic, no toolchain resolution, no path
+confinement — those are engine concerns.
 
-## 7. Execution flow
+**`deploy-fastly` inputs**
 
-The action executes these steps in order:
+| Input               | Required | Default       | Contract                                                                                       |
+| ------------------- | -------- | ------------- | ---------------------------------------------------------------------------------------------- |
+| `cli-artifact`      | Yes      | none          | `build-cli` artifact name. Forwarded to the engine.                                            |
+| `cli-bin`           | No       | from artifact | Binary name inside the artifact. Forwarded to the engine.                                      |
+| `fastly-api-token`  | Yes      | none          | Mapped into `provider-env` as `FASTLY_API_TOKEN`, deploy step only.                            |
+| `fastly-service-id` | Yes      | none          | Mapped into action-owned `deploy-flags` as `--service-id <id>` to prevent accidental creation. |
+| `working-directory` | No       | `.`           | Forwarded to the engine.                                                                       |
+| `manifest`          | No       | empty         | Forwarded to the engine.                                                                       |
+| `build-mode`        | No       | `auto`        | Forwarded. Fastly `auto` resolves to `never`.                                                  |
+| `build-args`        | No       | `[]`          | Forwarded to the engine.                                                                       |
+| `deploy-args`       | No       | `[]`          | Forwarded. Allowlisted to `--comment` for Fastly (§9).                                         |
+| `cache`             | No       | `false`       | Forwarded to the engine.                                                                       |
 
-1. Verify the runner is Linux x86-64. GitHub-hosted `ubuntu-24.04` is the
-   tested environment.
-2. Validate `adapter`; only `fastly` is accepted.
+The wrapper sets `adapter: fastly`, `target: wasm32-wasip1`, the action-owned
+`deploy-flags` (`--service-id …`, `--non-interactive`) so deployments cannot
+prompt in CI or select an unintended service, and
+`provider-env-clear: ["FASTLY_API_TOKEN", "FASTLY_SERVICE_ID", "FASTLY_ENDPOINT",
+"FASTLY_CARGO_PROFILE", …]` so the engine clears Fastly auth/endpoint aliases
+without the engine itself knowing Fastly's names.
+
+## 6. Execution flow (engine)
+
+1. Verify the runner is Linux x86-64 (`ubuntu-24.04` is the tested environment).
+2. Validate that `adapter` is a well-formed, non-empty token. The engine does
+   **not** enumerate the CLI's compiled adapters (there is no introspection
+   command); an unsupported adapter surfaces as the CLI's own error at build or
+   deploy time.
 3. Validate exact boolean inputs.
-4. Parse `build-args` and `deploy-args` as JSON string arrays.
-5. Reject NUL-containing argument values.
-6. Reject Fastly deploy passthrough flags that override typed authentication,
-   service selection, endpoint selection, or debug/authentication behavior.
-7. Resolve `working-directory` beneath `github.workspace` using canonical paths
-   and symlink resolution.
-8. Fail if the working directory does not exist or is not a directory.
-9. If `manifest` is non-empty:
-
-- resolve it relative to `working-directory`;
-- fail if it resolves outside `github.workspace`;
-- fail if it does not exist or is not a regular file; and
-- export it as `EDGEZERO_MANIFEST` for EdgeZero CLI invocations.
-
-10. Resolve the application Git root from `working-directory`.
-11. Record `source-revision` and fail if the application working tree has
-    uncommitted or staged changes.
-12. Resolve the application Rust toolchain.
-13. Install the Rust toolchain and `wasm32-wasip1` target.
-14. Build/install the action-owned EdgeZero CLI from the action repository root
-    at the selected action commit.
-15. Install the pinned Fastly CLI.
-16. If `cache: true`, restore the exact-key application `target/` cache.
-17. Print non-sensitive diagnostics.
-18. Resolve `build-mode`:
-    - `always` runs a separate EdgeZero build;
-    - `never` skips the separate build; and
-    - `auto` resolves to `never` for Fastly.
-19. If effective build mode is `always`, run:
-
-    ```text
-    edgezero build --adapter fastly -- <build-args...>
-    ```
-
-    The build step receives no Fastly credential values from typed inputs.
-
-20. In a separate deploy step, set only the typed Fastly API token and run
-    EdgeZero deploy with action-owned Fastly CI flags followed by caller
-    `deploy-args`:
+4. Download the `cli-artifact` (a tar) into an action-owned directory below
+   `RUNNER_TEMP`, extract it preserving permissions (or `chmod +x <cli-bin>`),
+   read `cli-meta.json` for `cli-bin`/`cli-version` (a wrapper `cli-bin` input
+   overrides), and prepend the directory to `PATH` for action steps only.
+5. Parse `build-args`, `deploy-args`, `deploy-flags`, `provider-env-clear` as
+   JSON string arrays and `provider-env` as a JSON string→string object.
+6. In every non-deploy step (setup, build), unset each name in
+   `provider-env-clear` so no provider credential leaks outside the deploy step.
+7. Reject NUL-containing argument or value entries.
+8. Apply the adapter's deploy-arg allowlist (wrapper-provided) to `deploy-args`.
+9. Resolve `working-directory` beneath `github.workspace` using canonical paths
+   and symlink resolution; fail if missing or not a directory.
+10. If `manifest` is non-empty: resolve it under `working-directory`, fail if it
+    escapes `github.workspace` or is not a regular file, and export
+    `EDGEZERO_MANIFEST`.
+11. Resolve the application **Git root**; record `source-revision`; fail on a
+    dirty working tree (`build-cli` used an isolated `CARGO_TARGET_DIR`, so its
+    CLI build did not dirty this tree).
+12. Resolve the **Cargo workspace root** for `working-directory` (§11.1) for all
+    Cargo-scoped operations that follow.
+13. Resolve the application Rust toolchain (§7) and install it plus the resolved
+    application `target` (for example `wasm32-wasip1` for Fastly).
+14. If `cache: true`, restore the exact-key **Cargo workspace root** `target/`
+    cache.
+15. Print non-sensitive diagnostics.
+16. Resolve `build-mode` (§8). If `always`, run
+    `<cli-bin> build --adapter <adapter> -- <build-args…>` with **no** provider
+    credentials in scope (the `provider-env-clear` names stay unset here).
+17. In a separate deploy step, clear the `provider-env-clear` aliases, then
+    export only the `provider-env` values, and run:
 
     ```text
-    edgezero deploy --adapter fastly -- --service-id <fastly-service-id> --non-interactive <deploy-args...>
+    <cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>
     ```
 
-    The action owns `--service-id` and `--non-interactive` so deployments cannot
-    prompt in CI or silently create/select an unintended service.
+    For adapters whose deploy also compiles the application (Fastly's default),
+    this step builds application code with credentials in scope — see §10.1.
 
-21. Clean action-owned temporary tool, auth, log, and cache state with
-    `if: always()` where GitHub permits cleanup to run.
-22. Save the application cache when enabled and safe to save.
-23. Set outputs and write a non-sensitive GitHub step summary with
+18. Clean action-owned temporary tool, auth, log, and cache state with
+    `if: always()`.
+19. Save the application cache when enabled and safe.
+20. Set outputs and write a non-sensitive GitHub step summary with
     `if: always()`.
 
 When an argument array is empty, the trailing `--` may be omitted.
 
-## 8. Toolchain and tool installation
+## 7. Toolchain resolution
 
-### 8.1 Rust toolchain resolution
-
-Application Rust toolchain resolution uses this precedence:
+Application Rust toolchain resolution precedence:
 
 1. explicit `rust-toolchain` input when not `auto`;
 2. nearest `rust-toolchain.toml` or `rust-toolchain`, walking from
@@ -323,455 +348,318 @@ Application Rust toolchain resolution uses this precedence:
 
 At each directory, Rustup-native files take precedence over `.tool-versions`.
 Malformed toolchain files fail instead of silently selecting a different
-compiler.
+compiler. `build-cli` uses the same precedence for the CLI build.
 
-The action-owned EdgeZero CLI build also uses the EdgeZero repository root
-`.tool-versions` `rust` entry.
+## 8. Build behavior
 
-### 8.2 EdgeZero CLI installation
+| Value    | Behavior                                                         |
+| -------- | ---------------------------------------------------------------- |
+| `auto`   | Apply the adapter's default policy.                              |
+| `always` | Run `<cli> build --adapter <adapter>` before deploy.             |
+| `never`  | Skip the separate build; deploy builds or consumes the artifact. |
 
-The action installs the EdgeZero CLI from the same repository revision selected
-by the `uses:` ref. It does not install the CLI from the caller application's
-Cargo dependencies, branch, tag, or path.
+Fastly `auto` resolves to `never` because `<cli> deploy --adapter fastly`
+builds unless a prebuilt package is provided. Other adapters define their own
+default policy in their wrapper.
 
-For v0, the installed executable is the current repository binary name,
-`edgezero`. The crate/package remains `edgezero-cli`, but the action invokes the
-installed binary. If the project later renames the installed binary, the action
-implementation and documentation must change together. The public action
-contract should not require callers to know the internal executable path.
+## 9. Passthrough arguments
 
-The CLI is installed into an action-owned directory below `RUNNER_TEMP` and
-prepended to `PATH` for action steps only.
-
-### 8.3 Fastly CLI installation
-
-The Fastly CLI version is pinned by the EdgeZero repository tool-version policy.
-The initial implementation should follow the repository `.tool-versions` Fastly
-CLI version and record the exact installer artifact and SHA-256 checksum in the
-action implementation metadata.
-
-The installer must:
-
-- use an official Fastly distribution;
-- verify the downloaded artifact checksum;
-- place the binary in an action-owned directory below `RUNNER_TEMP`;
-- print `fastly --version`; and
-- avoid printing authentication state.
-
-## 9. Build behavior
-
-The public `build-mode` input controls whether the action runs a separate
-EdgeZero build before deploy.
-
-| Value    | Behavior                                                                              |
-| -------- | ------------------------------------------------------------------------------------- |
-| `auto`   | Apply the v0 Fastly policy.                                                           |
-| `always` | Run `edgezero build --adapter fastly` before deploy.                                  |
-| `never`  | Skip the separate build and rely on deploy to build or consume the required artifact. |
-
-The v0 Fastly `auto` policy is:
-
-| Adapter  | Effective mode | Reason                                                                |
-| -------- | -------------- | --------------------------------------------------------------------- |
-| `fastly` | `never`        | Fastly `compute deploy` builds unless a prebuilt package is provided. |
-
-`always` is useful for a separate validation build, but Fastly deploy may still
-compile again. `never` is the default Fastly behavior and assumes the deploy
-command is self-contained.
-
-## 10. Manifest behavior
-
-When `manifest` is empty, the action leaves `EDGEZERO_MANIFEST` unset and runs
-from `working-directory`. EdgeZero then applies its normal behavior:
-
-- load `edgezero.toml` from the current working directory when present; or
-- use the built-in Fastly adapter fallback when no default manifest exists.
-
-When `manifest` is provided, the action sets `EDGEZERO_MANIFEST` to the
-canonical absolute path of that file. Missing explicit manifests are hard
-errors.
-
-Provider manifest discovery remains EdgeZero's responsibility. The action must
-not guess between multiple `fastly.toml` files. Monorepos with multiple Fastly
-manifests should select a deterministic `working-directory` or define explicit
-Fastly commands in `edgezero.toml`.
-
-Because v0 injects action-owned Fastly deploy flags after `--`, a manifest-defined
-Fastly deploy command used with this action must forward or accept Fastly
-Compute deploy/publish flags such as `--service-id`, `--non-interactive`, and
-caller-supplied safe flags like `--comment`. Wrapper scripts are allowed, but
-they must preserve this contract.
-
-## 11. Fastly credential contract
-
-Fastly authentication uses typed action inputs only:
+`build-args`, `deploy-args`, and `deploy-flags` are JSON arrays so argument
+boundaries are explicit:
 
 ```yaml
 with:
-  fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-  fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-```
-
-The deploy step maps these inputs as follows:
-
-| Input               | Deploy-step use                                                                                                                              |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `fastly-api-token`  | Exported only for deploy as `FASTLY_API_TOKEN`.                                                                                              |
-| `fastly-service-id` | Passed as the action-owned `--service-id` deploy flag and may also be exported as `FASTLY_SERVICE_ID` for Fastly CLI fallback compatibility. |
-
-Setup and separate build steps must clear Fastly authentication aliases from
-their environments, including values accidentally provided through caller
-`env:`.
-
-The deploy step must clear known Fastly authentication and endpoint aliases
-before exporting only the typed values needed for v0. This prevents caller `env:`
-from silently overriding the typed credential contract.
-
-Application configuration may still be passed through normal workflow `env:`:
-
-```yaml
-- uses: stackpop/edgezero/.github/actions/deploy@<ref>
-  with:
-    adapter: fastly
-    fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
-    fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
-  env:
-    MY_APP_SETTING: ${{ vars.MY_APP_SETTING }}
-```
-
-Callers should not duplicate provider authentication credentials in `env:`.
-Runtime secrets should prefer provider-managed runtime secret stores rather
-than deploy-time environment variables.
-
-## 12. Passthrough arguments
-
-`build-args` and `deploy-args` are JSON arrays so argument boundaries are
-explicit:
-
-```yaml
-with:
-  build-args: '["--features", "fastly"]'
+  build-args: '["--verbose"]'
   deploy-args: '["--comment", "deployed by GitHub Actions"]'
 ```
 
-The action must:
+`deploy-core` must:
 
-- parse arrays with `jq` or equivalent safe JSON parsing;
-- reject non-arrays;
-- reject non-string entries;
-- reject strings containing NUL bytes;
+- parse arrays with `jq` (no Python);
+- reject non-arrays, non-string entries, and NUL bytes;
 - construct commands as Bash arrays;
 - never use `eval`; and
-- avoid printing the raw JSON input arrays during validation.
+- avoid printing raw JSON inputs during validation.
 
-Arguments must not contain secrets. EdgeZero, provider CLIs, or manifest-defined
-wrapper commands may print command arguments as part of normal diagnostics;
-GitHub secret masking is a final defense, not the primary security boundary.
+Each adapter wrapper supplies an allowlist for caller `deploy-args`. For Fastly,
+`deploy-args` are allowlisted to `--comment VALUE` / `--comment=VALUE`; all other
+deploy args are rejected so caller input cannot override typed service selection,
+authentication, non-interactive mode, endpoint, profile, or debug behavior. The
+allowlist ships with accept/reject tests.
 
-For v0, `deploy-args` are intentionally allowlisted to Fastly deploy comments:
-`--comment VALUE` or `--comment=VALUE`. All other caller-supplied deploy args
-are rejected so future Fastly flags cannot bypass the typed credential/service
-contract, non-interactive mode, or endpoint/debug behavior. The
-implementation must maintain accept/reject tests for allowed comments and
-blocked service ID, service name, API token, endpoint, profile, interactive,
-short-flag, and debug-mode overrides.
+## 10. Provider credential contract
 
-## 13. Caching
+Credentials flow through the `provider-env` JSON object, which `deploy-core`
+injects **only** into the deploy step:
 
-The `cache` input enables opt-in application build caching.
+```text
+wrapper inputs (typed) → provider-env {NAME: value} → deploy step env → CLI
+```
 
-Caching defaults to `false` because deployment builds run trusted application
-code and build output may contain sensitive generated data.
+Rules:
 
-When enabled, the action caches only the canonical application Git root
-`target/` directory. It must not cache:
+- Setup, `build-cli`, and separate build steps never receive `provider-env`.
+- Alias clearing is **wrapper-driven and provider-agnostic**: the engine unsets
+  the names in the wrapper-supplied `provider-env-clear` list in non-deploy
+  steps, and in the deploy step clears those same names before exporting only
+  the typed `provider-env` values. The engine hard-codes no provider names, so
+  caller `env:` cannot override the typed contract.
+- `provider-env` values never reach `GITHUB_ENV`, `GITHUB_OUTPUT`, caches, or
+  summaries.
 
-- provider authentication files;
-- action-owned tool installations;
-- Fastly logs;
-- temporary deploy state;
-- arbitrary workspace paths; or
-- files outside the application Git root.
+Application (non-credential) configuration may still pass through normal
+workflow `env:`.
 
-The cache key must be exact and include at least:
+### 10.1 Build-in-deploy caveat (trusted source requirement)
 
-- runner OS;
-- runner architecture;
-- resolved Rust toolchain;
-- Rust target, `wasm32-wasip1`;
-- EdgeZero action/CLI revision;
-- application source revision; and
-- application `Cargo.lock` hash.
+Some adapters compile the application **inside** the deploy step. Fastly's
+default `build-mode: never` relies on `<cli> deploy`, which runs
+`fastly compute deploy` — and that command builds the application unless a
+prebuilt package already exists. Consequently, with the Fastly default, the
+application is compiled while `FASTLY_API_TOKEN` is in scope.
 
-The action must not use broad restore prefixes in v0. If `cache: true` and the
-application lockfile cannot be found, the action fails before deployment with a
-remediation message.
+This is an explicit, accepted boundary, not an oversight:
 
-Callers may enable caching only for trusted immutable refs and applications
-whose builds do not write secret-derived data into `target/`.
+- The action still guarantees credentials are absent from setup, `build-cli`,
+  and any separate `build-mode: always` build step.
+- Because deploy may still recompile, a credential-free `always` prebuild does
+  not remove the exposure; it only front-loads a validation build.
+- Therefore callers **must** deploy only trusted, immutable source refs (full
+  SHAs or protected tags) and use GitHub Environment approvals, so untrusted
+  code never runs with the token in scope.
 
-## 14. Logging and summary
+Adapters that support a genuinely credential-free prebuild followed by a
+credential-only publish may set a different default in their wrapper; Fastly does
+not today.
 
-The action should log and summarize non-sensitive facts:
+## 11. Caching
 
-- selected adapter;
-- resolved application directory relative to `github.workspace`;
-- source revision;
-- explicit manifest path or default discovery;
-- Rust toolchain and target;
-- EdgeZero action/CLI revision;
-- Fastly CLI version;
-- requested and effective build mode;
-- cache enabled/disabled and cache key fingerprint, not full secrets or args;
-- final result.
+`cache` enables opt-in application build caching, `false` by default.
 
-The action must not log:
+### 11.1 Git root vs Cargo workspace root
 
-- `fastly-api-token`;
-- full process environments;
-- application secret values;
-- provider authentication state; or
-- values written to provider auth files.
+Two distinct roots are resolved from `working-directory`, and they are **not**
+interchangeable:
 
-## 15. Error handling
+- **Git root** — the enclosing repository. Used only for `source-revision` and
+  the dirty-source guard.
+- **Cargo workspace root** — resolved with `cargo locate-project --workspace`
+  (or `cargo metadata`) from `working-directory`. Owns the real `Cargo.lock` and
+  the real `target/` directory. In a monorepo or nested workspace this is often
+  under `working-directory` (for example `apps/api/`), not the Git root.
 
-All validation and setup failures must stop before invoking Fastly deployment.
+Cargo-scoped operations — lockfile hashing, lockfile presence checks, and
+`target/` caching — use the **Cargo workspace root**. Git-scoped operations use
+the **Git root**.
 
-Expected failures and diagnostics:
+### 11.2 Cache contents and key
 
-| Failure                                 | Required diagnostic                                                            |
-| --------------------------------------- | ------------------------------------------------------------------------------ |
-| Missing `adapter`                       | State that `adapter` is required and v0 supports `fastly`.                     |
-| Unsupported adapter                     | State that v0 supports only `fastly`.                                          |
-| `axum` selected                         | State that Axum has no EdgeZero remote deployment contract.                    |
-| `cloudflare` or `spin` selected         | State that the adapter is planned for future work but not implemented in v0.   |
-| Invalid boolean                         | Name the input and allowed values.                                             |
-| Missing working directory               | Print the workspace-relative requested path.                                   |
-| Path escapes workspace                  | Name the input and state that paths must stay under `github.workspace`.        |
-| Missing explicit manifest               | Print the workspace-relative requested path.                                   |
-| Invalid JSON arguments                  | Name the invalid input without printing its value.                             |
-| Non-string argument entry               | State that every array element must be a string.                               |
-| Unsupported Fastly deploy arg           | State the allowlist and rejected argument position without printing the array. |
-| Rust toolchain cannot be resolved       | List files checked and suggest explicit `rust-toolchain`.                      |
-| Dirty working tree                      | State that deployments require committed source.                               |
-| Missing `Cargo.lock` when cache enabled | Explain the exact-key cache requirement.                                       |
-| EdgeZero CLI installation fails         | Print the action revision and Rust toolchain, not secrets.                     |
-| Fastly CLI installation fails           | Print the pinned Fastly version and installer source.                          |
-| Missing Fastly credential input         | Name the missing input, never its value.                                       |
-| Build command fails                     | Preserve exit status and state that deploy was not attempted.                  |
-| Deploy command fails                    | Preserve exit status and state that rollback is caller-owned.                  |
-| Cleanup fails                           | Mark the action failed and identify the cleanup area without printing secrets. |
+When enabled, cache only the resolved **Cargo workspace root** `target/`. Never
+cache provider auth files, action-owned tool installs, logs, temporary deploy
+state, or paths outside that `target/`.
 
-Provider CLI stderr may pass through so Fastly API errors remain actionable.
-The action must not construct its own error messages containing credentials.
+The cache key is exact and includes at least: runner OS, runner architecture,
+resolved Rust toolchain, resolved `target`, CLI version, application source
+revision, and the **Cargo workspace root** `Cargo.lock` hash. No broad restore
+prefixes. If `cache: true` and that lockfile is missing, fail before deployment
+with a remediation message.
 
-## 16. Security requirements
+## 12. Logging and summary
 
-1. Recommend full commit SHAs for production examples that need reproducible
-   action and third-party action behavior.
-2. Do not accept a separate caller-selected EdgeZero CLI source outside the
-   selected action repository revision.
-3. Install the EdgeZero CLI from the selected action repository revision.
-4. Use the EdgeZero repository `.tool-versions` Rust version for the action CLI
-   build and application fallback.
-5. Download provider tools only from official release locations and verify
-   SHA-256 checksums.
-6. Install action-owned binaries below `RUNNER_TEMP`.
-7. Use Bash arrays; never use `eval`.
-8. Allow-list `adapter` before using it in file selection or command arguments.
-9. Treat the checked-out application and `edgezero.toml` as executable code.
-10. Require trusted immutable source refs for deployment workflows.
-11. Inject Fastly credentials only into the EdgeZero deploy step.
-12. Do not write Fastly credentials to `GITHUB_ENV`, `GITHUB_OUTPUT`, caches, or summaries.
-13. Clear provider auth aliases from non-provider steps.
-14. Reject caller paths outside `github.workspace`, including symlink escapes.
-15. Escape percent, carriage return, and newline characters before emitting
-    user-influenced GitHub annotations or masking commands.
-16. Reject carriage returns and newlines in single-line output values.
-17. Disable caching by default and use exact keys only when enabled.
-18. Do not automatically retry Fastly deployment. Retries are limited to
-    idempotent downloads.
-19. Do not use `github.token` for provider authentication.
-20. Document least-privilege workflow permissions: `contents: read` unless the
-    caller has additional needs.
-21. Document caller-owned environment protection, concurrency, and timeouts.
-22. Allowlist Fastly passthrough deploy args to comments so caller input cannot
-    override typed service selection, authentication, non-interactive mode,
-    endpoint, profile, debug controls, or future Fastly flags.
+Log and summarize non-sensitive facts only: adapter, workspace-relative
+application directory, source revision, manifest path or default discovery, Rust
+toolchain and target, CLI version, requested/effective build mode, cache
+enabled/disabled and key fingerprint, and final result.
 
-## 17. Testing strategy
+Never log provider credentials, full process environments, application secret
+values, or provider auth state.
 
-### 17.1 Static validation
+## 13. Error handling
 
-CI for the action must run:
+All validation and setup failures stop before invoking provider deployment.
 
-- `actionlint` over workflow files;
+| Failure                                 | Required diagnostic                                                           |
+| --------------------------------------- | ----------------------------------------------------------------------------- |
+| Missing/unknown `cli-package`           | State that the app must name a CLI package present in its own workspace.      |
+| Missing `cli-artifact`                  | State that a compiled CLI artifact from `build-cli` is required.              |
+| Malformed `adapter` token               | Name the input and its allowed shape (the CLI validates support at run time). |
+| Invalid boolean                         | Name the input and allowed values.                                            |
+| Missing working directory               | Print the workspace-relative requested path.                                  |
+| Path escapes workspace                  | Name the input; require paths under `github.workspace`.                       |
+| Missing explicit manifest               | Print the workspace-relative requested path.                                  |
+| Invalid JSON arguments/env              | Name the invalid input without printing its value.                            |
+| Non-string entry                        | State that every array/object value must be a string.                         |
+| Disallowed deploy arg                   | State the allowlist and rejected position without printing the array.         |
+| Rust toolchain cannot be resolved       | List files checked and suggest explicit `rust-toolchain`.                     |
+| Dirty working tree                      | State that deployments require committed source.                              |
+| Missing `Cargo.lock` when cache enabled | Explain the exact-key cache requirement.                                      |
+| Missing provider credential input       | Name the missing input, never its value.                                      |
+| Build command fails                     | Preserve exit status; state that deploy was not attempted.                    |
+| Deploy command fails                    | Preserve exit status; state that rollback is caller-owned.                    |
+| Cleanup fails                           | Mark the action failed; identify the area without printing secrets.           |
+
+Provider CLI stderr passes through so provider API errors stay actionable. The
+actions never construct error messages containing credentials.
+
+## 14. Security requirements
+
+1. Recommend readable released tags for third-party actions and, for production,
+   full commit SHAs of the EdgeZero action ref where reproducibility matters.
+2. Compile the CLI package the application provides, from the application
+   checkout and its lockfile; do not build the EdgeZero monorepo CLI or the
+   action's own revision.
+3. Compile the CLI once in `build-cli`; deploy steps consume the artifact and
+   never recompile.
+4. Download provider tools and validation binaries only from official release
+   locations and verify SHA-256 checksums.
+5. Install action-owned binaries below `RUNNER_TEMP`.
+6. Use Bash arrays; never use `eval`; never use Python.
+7. Allow-list `adapter` before using it in file selection or command arguments.
+8. Treat the checked-out application and `edgezero.toml` as executable code.
+9. Inject provider credentials only into the deploy step via `provider-env`.
+10. Never write provider credentials to `GITHUB_ENV`, `GITHUB_OUTPUT`, caches, or
+    summaries.
+11. Clear the wrapper-supplied `provider-env-clear` aliases from non-provider
+    steps; the engine hard-codes no provider names.
+12. Reject caller paths outside `github.workspace`, including symlink escapes.
+13. Escape percent, carriage return, and newline characters before emitting
+    user-influenced GitHub annotations or masking commands; reject CR/LF in
+    single-line output values.
+14. Disable caching by default; use exact keys only when enabled.
+15. Do not auto-retry provider deployment; retries are limited to idempotent
+    downloads.
+16. Do not use `github.token` for provider authentication.
+17. Document least-privilege workflow permissions (`contents: read` unless the
+    caller needs more) and caller-owned environment protection, concurrency, and
+    timeouts.
+
+## 15. Testing strategy
+
+### 15.1 Static validation (no Python)
+
+CI for the actions runs:
+
+- `actionlint` from a **pinned release binary** over workflow and action files;
 - `shellcheck` over shell scripts;
-- YAML parsing for `.github/actions/deploy/action.yml`;
-- metadata contract tests for public inputs and outputs;
-- a check that no unsupported provider credential inputs exist in v0;
-- a workflow security scanner such as `zizmor`;
-- checksum verification for provider installer metadata;
-- a check that action tool versions agree with `.tool-versions`; and
+- YAML parsing for each `action.yml`;
+- metadata contract tests for public inputs/outputs, ported into the Bash
+  `tests/run.sh` harness (replacing the previous `python3` heredocs);
+- a check that action tool versions agree with `.tool-versions`;
+- `zizmor` from a **pinned release binary** (Rust; installed as a release
+  artifact or via `cargo install zizmor --locked`, never `pip`); and
 - Markdown/example validation.
 
-### 17.2 Script contract tests
+Third-party actions used by CI (`actions/checkout`, `actions/cache`, artifact
+upload/download) are pinned to readable released tags.
 
-Use temporary directories and fake binaries to test:
+### 15.2 Script contract tests (Bash)
 
-- required `adapter` validation;
-- `fastly` acceptance;
-- `cloudflare`, `spin`, `axum`, and unknown adapter rejection;
+Use temporary directories and fake binaries to test, across the engine and the
+Fastly wrapper:
+
+- `adapter` well-formedness validation (unknown adapters surface as the CLI's
+  own error, not an engine allowlist);
+- app-provided `cli-package` build (fail on missing/unknown package), tar
+  round-trip preserving the executable bit, and artifact consumption;
 - exact boolean parsing;
-- toolchain precedence;
-- malformed toolchain files;
-- working-directory confinement;
-- symlink escape rejection;
-- dirty source rejection;
-- source revision output;
+- toolchain precedence and malformed-file failure;
+- working-directory confinement and symlink-escape rejection;
+- dirty-source rejection and source-revision output;
 - explicit and default manifest behavior;
-- JSON argument parsing;
-- argument boundary preservation;
-- rejected non-string and NUL-containing arguments;
-- unsupported Fastly deploy-arg rejection, including short override flags;
-- build-mode resolution;
-- build failure preventing deploy;
+- JSON argument/env parsing and boundary preservation;
+- rejected non-string and NUL-containing entries;
+- adapter deploy-arg allowlist (accept `--comment`, reject service/auth/endpoint/
+  profile/interactive/short-flag/debug overrides);
+- build-mode resolution and build-failure-prevents-deploy;
 - deploy exit-code propagation;
-- credential presence validation;
-- credentials absent from setup and separate build processes;
-- credentials present only in deploy;
-- cache key construction;
-- missing lockfile failure when cache is enabled;
+- credential presence validation and scoping (absent from build-cli/setup/build,
+  present only in deploy);
+- cache key construction and missing-lockfile failure;
 - cleanup on success and failure; and
 - redaction of credentials from action-owned logs.
 
-These tests must not need live Fastly credentials.
+Tests must not need live provider credentials.
 
-### 17.3 Composite-action smoke tests
+### 15.3 Composite smoke test
 
-A GitHub Actions workflow should exercise the local composite action with a
-minimal fixture EdgeZero Fastly app.
+A workflow exercises the layered actions end to end with a minimal fixture
+EdgeZero app: run `build-cli`, then `deploy-fastly`, using fake provider binaries
+that write marker files instead of contacting Fastly; assert CLI-artifact reuse,
+invocation order, working directory, argument boundaries, cache behavior,
+credential scope, and public outputs.
 
-The smoke test should:
+### 15.4 Installer / live gates
 
-1. check out this repository;
-2. create or use a fixture application;
-3. install the real pinned Rust and Fastly tools where practical;
-4. invoke `./.github/actions/deploy` locally;
-5. use manifest build/deploy commands or fake Fastly binaries that write marker
-   files instead of contacting Fastly;
-6. assert invocation order, working directory, argument boundaries, cache behavior,
-   and credential scope; and
-7. verify public outputs.
+- Scheduled CI verifies the pinned Fastly CLI installer still produces a runnable
+  binary matching the expected version, without deploying.
+- A protected manual workflow may eventually deploy a disposable Fastly fixture
+  before any stable version alias is created; it runs only from protected
+  branches or approved dispatch, never from fork PRs, uses isolated resources,
+  and treats rollback/cleanup as caller-owned.
 
-### 17.4 Installer tests
+## 16. Documentation requirements
 
-Scheduled or manually triggered CI should verify that the pinned Fastly CLI
-installer still produces a runnable binary matching the expected version.
+User-facing docs must cover: the three-layer model and when to use each action;
+how `build-cli` compiles the app-provided CLI package; supported adapters and how new adapters
+layer on; runner support; same-repo, separate-repo, and monorepo checkout
+examples; complete input/output tables per action; typed provider credential
+guidance and why credentials must not pass through caller `env:`; build-mode and
+cache behavior with security caveats; least-privilege permissions and
+environment/concurrency/timeout recommendations; explicit non-goals; and future
+adapter notes.
 
-This test verifies installation only and must not deploy.
+## 17. Acceptance criteria
 
-### 17.5 Live deployment gate
+The design is implemented when:
 
-A protected manual workflow should eventually deploy a disposable Fastly fixture
-before any stable version alias is created.
+1. A caller can compile the CLI once with `build-cli` and deploy a checked-out
+   EdgeZero application with `deploy-fastly`, reusing the same CLI artifact.
+2. `build-cli` compiles the app-provided `cli-package` from the application
+   checkout and never builds the EdgeZero monorepo CLI or the action's own
+   revision.
+3. `deploy-core` contains no provider-specific credential names, service
+   concepts, endpoints, or CLI flags — only `provider-env`, `provider-env-clear`,
+   `deploy-flags`, and `deploy-args` carry them.
+4. Adding a second adapter is a new minimal wrapper plus target/allowlist data,
+   with no engine fork.
+5. Deploy steps consume the prebuilt CLI artifact and never recompile it.
+6. Typed provider credentials reach only the deploy step and never appear in
+   outputs, caches, action-owned logs, or summaries.
+7. Passthrough argument boundaries are preserved; no `eval`.
+8. `cache: true` uses exact keys and caches only the application Git root
+   `target/`.
+9. All CI, tooling, and tests run without Python; `actionlint` and `zizmor` run
+   from pinned release binaries.
+10. Third-party actions are pinned to readable released tags.
+11. Static checks, Bash contract tests, and the composite smoke test pass.
+12. Docs include same-repo, separate-repo, and monorepo examples across the
+    three-layer model.
 
-The live gate must:
+## 18. Risks and mitigations
 
-- run only from protected release branches or explicitly approved manual
-  dispatch;
-- use isolated Fastly resources;
-- never run for pull requests from forks;
-- verify the deployed endpoint or provider deployment record;
-- clean up through provider-specific steps; and
-- treat rollback/cleanup as caller-owned provider logic, not generic action
-  behavior.
+| Risk                                                  | Mitigation                                                                                         |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| CLI and application manifest schema incompatible      | CLI is the app's own package, built from the app checkout, so they cannot diverge.                 |
+| Provider deploy builds while credentials are in scope | Keep the separate build credential-free; document caching caveats; require trusted immutable refs. |
+| Mutable refs execute unexpected manifest commands     | Caller owns checkout; document tag/SHA protection and GitHub Environment approvals.                |
+| Caching stores sensitive generated output             | Disable by default; exact keys only; cache only `target/`.                                         |
+| Provider CLI installer changes or disappears          | Pin versions and checksums; run scheduled installer tests.                                         |
+| Monorepo has multiple provider manifests              | Require deterministic `working-directory` or explicit `edgezero.toml`; the actions do not guess.   |
+| Engine grows provider-specific behavior               | Keep provider concepts in wrappers and the CLI; keep `deploy-core` provider-neutral.               |
 
-This live gate is not required to publish the initial pre-release action, but
-it is required before advertising a stable version alias.
+## 19. Future work
 
-## 18. Documentation requirements
+1. Cloudflare Workers deployment (`deploy-cloudflare` wrapper).
+2. Spin/Fermyon Cloud preview deployment (`deploy-spin` wrapper).
+3. Provider-specific deployment metadata outputs.
+4. Provider-specific staging, health-check, and rollback actions.
+5. Optionally consume a prebuilt/attested CLI binary matching the application's
+   pinned version instead of compiling from source.
+6. Release artifact reuse between build and deploy jobs beyond the CLI.
+7. Stable version aliases such as `v1`.
+8. Linux arm64, macOS, or other runner support.
 
-Before implementation is considered complete, user-facing docs must include:
-
-1. action location and trusted-ref guidance;
-2. supported adapter table showing Fastly-only v0;
-3. runner support;
-4. same-repository checkout example;
-5. separate-repository checkout example;
-6. monorepo `working-directory` and `manifest` example;
-7. complete input and output tables;
-8. typed Fastly credential guidance;
-9. explanation of why provider credentials should not be passed through
-   caller `env:`;
-10. build-mode behavior;
-11. cache behavior and security caveats;
-12. trusted-ref requirement;
-13. least-privilege permissions example;
-14. protected environment, timeout, and concurrency recommendations;
-15. explicit non-goals; and
-16. future adapter notes for Cloudflare and Spin.
-
-## 19. Acceptance criteria
-
-The v0 design is implemented when all of the following are true:
-
-1. A caller can check out an EdgeZero Fastly application and invoke
-   `stackpop/edgezero/.github/actions/deploy@<ref>`.
-2. The action requires `adapter: fastly`.
-3. Unknown adapters, `cloudflare`, `spin`, and `axum` fail before tool
-   installation.
-4. The action contains no hard-coded application repository, application path,
-   Fastly domain, deployment environment, or service ID.
-5. The action invokes EdgeZero CLI for build and deploy operations.
-6. The EdgeZero CLI is built from the selected action commit.
-7. Rust versions come from application discovery or the EdgeZero repo
-   `.tool-versions` fallback.
-8. Fastly selects `wasm32-wasip1` and installs the pinned Fastly CLI.
-9. The caller can select a non-root working directory and explicit manifest.
-10. Typed Fastly credentials reach only deploy.
-11. Fastly credentials never appear in outputs, caches, action-owned logs, or summaries.
-12. Passthrough argument boundaries are preserved.
-13. `build-mode: auto` resolves to `never` for Fastly.
-14. A failed required build prevents deployment.
-15. A failed deployment returns a failing action status and does not trigger
-    rollback.
-16. `cache: true` uses exact keys and caches only the application Git root
-    `target/` directory.
-17. Static checks, script contract tests, composite smoke tests, and installer
-    tests pass.
-18. README or docs examples include same-repository, separate-repository,
-    and monorepo checkout models.
-
-## 20. Risks and mitigations
-
-| Risk                                                          | Mitigation                                                                                          |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
-| EdgeZero CLI and application manifest schema are incompatible | Pin the action to a full EdgeZero commit SHA and publish compatibility notes before stable aliases. |
-| Fastly deploy builds while credentials are in scope           | Require trusted immutable refs; keep separate build credential-free; document caching caveats.      |
-| Mutable refs execute unexpected manifest commands             | Caller owns checkout; document full SHA/tag protection and GitHub Environment approvals.            |
-| Caching stores sensitive generated output                     | Disable by default; exact keys only; cache only `target/`; document when not to enable.             |
-| Provider CLI installer changes or disappears                  | Pin versions and checksums; run scheduled installer tests.                                          |
-| Monorepo has multiple `fastly.toml` files                     | Require deterministic `working-directory` or explicit `edgezero.toml`; action does not guess.       |
-| Generic action grows provider-specific behavior               | Keep staging, rollback, health checks, and deployment metadata out of v0.                           |
-
-## 21. Future work
-
-Future designs may add:
-
-1. Cloudflare Workers deployment;
-2. Spin/Fermyon Cloud preview deployment;
-3. provider-specific deployment metadata outputs;
-4. Fastly staging as a separate provider-specific action;
-5. generic or provider-specific health checks;
-6. provider-specific rollback actions;
-7. reusable setup action for multiple EdgeZero commands;
-8. release artifact reuse between build and deploy jobs;
-9. prebuilt and attested EdgeZero CLI binaries;
-10. stable version aliases such as `v1`; and
-11. Linux arm64, macOS, or other runner support.
-
-## 22. References
+## 20. References
 
 - EdgeZero CLI reference: `docs/guide/cli-reference.md`
 - EdgeZero Fastly adapter: `crates/edgezero-adapter-fastly/src/cli.rs`
