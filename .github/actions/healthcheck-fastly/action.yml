@@ -1,0 +1,91 @@
+name: EdgeZero healthcheck-fastly
+description: Probe a deployed Fastly version's health via the app CLI. Exits non-zero when unhealthy after retries.
+
+inputs:
+  cli-artifact:
+    description: Name of the build-cli artifact to download and run.
+    required: true
+  cli-bin:
+    description: Binary name inside the artifact. Defaults to the artifact metadata.
+    required: false
+    default: ""
+  fastly-api-token:
+    description: Fastly API token (required for staging IP resolution).
+    required: true
+  fastly-service-id:
+    description: Fastly service ID.
+    required: true
+  fastly-version:
+    description: Fastly service version to check.
+    required: true
+  domain:
+    description: Domain to probe (e.g. www.example.com).
+    required: true
+  deploy-to:
+    description: Deployment target, 'production' or 'staging'.
+    required: false
+    default: production
+  retry:
+    description: Number of retries.
+    required: false
+    default: "3"
+  retry-delay:
+    description: Seconds between retries.
+    required: false
+    default: "5"
+  timeout:
+    description: Request timeout in seconds.
+    required: false
+    default: "10"
+
+outputs:
+  healthy:
+    description: Whether the deployment is healthy (true/false).
+    value: ${{ steps.check.outputs.healthy }}
+  status-code:
+    description: HTTP status code returned.
+    value: ${{ steps.check.outputs['status-code'] }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download CLI artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs['cli-artifact'] }}
+        path: ${{ runner.temp }}/edgezero-cli-download
+
+    - name: Extract CLI
+      id: cli
+      shell: bash
+      env:
+        EDGEZERO_CLI_ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO_TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        INPUT_CLI_BIN: ${{ inputs['cli-bin'] }}
+        FASTLY_API_TOKEN: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-cli.sh
+
+    - name: Health check
+      id: check
+      shell: bash
+      env:
+        CLI_BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        VERSION: ${{ inputs['fastly-version'] }}
+        DOMAIN: ${{ inputs.domain }}
+        DEPLOY_TO: ${{ inputs['deploy-to'] }}
+        RETRY: ${{ inputs.retry }}
+        RETRY_DELAY: ${{ inputs['retry-delay'] }}
+        TIMEOUT: ${{ inputs.timeout }}
+        FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+      run: |
+        log="${RUNNER_TEMP:-/tmp}/edgezero-healthcheck.log"
+        args=("$CLI_BIN" healthcheck --adapter fastly --service-id "$SERVICE_ID" --version "$VERSION" --domain "$DOMAIN" --retry "$RETRY" --retry-delay "$RETRY_DELAY" --timeout "$TIMEOUT")
+        [[ "$DEPLOY_TO" == "staging" ]] && args+=(--staging)
+        rc=0
+        "${args[@]}" 2>&1 | tee "$log" || rc=$?
+        healthy=$(grep -oE '^healthy=(true|false)' "$log" | tail -n 1 | cut -d= -f2 || true)
+        status=$(grep -oE '^status-code=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)
+        echo "healthy=${healthy:-false}" >> "$GITHUB_OUTPUT"
+        echo "status-code=${status}" >> "$GITHUB_OUTPUT"
+        exit "$rc"

@@ -1,0 +1,217 @@
+name: EdgeZero deploy-fastly
+description: Deploy a checked-out EdgeZero application to Fastly Compute using a prebuilt app CLI artifact.
+
+inputs:
+  cli-artifact:
+    description: Name of the build-cli artifact to download and run.
+    required: true
+  cli-bin:
+    description: Binary name inside the artifact. Defaults to the artifact metadata.
+    required: false
+    default: ""
+  fastly-api-token:
+    description: Fastly API token. Injected only into the deploy step.
+    required: true
+  fastly-service-id:
+    description: Fastly service ID. Passed as the typed --service-id CLI flag.
+    required: true
+  working-directory:
+    description: Application directory relative to github.workspace.
+    required: false
+    default: .
+  manifest:
+    description: Optional edgezero.toml path relative to working-directory.
+    required: false
+    default: ""
+  build-mode:
+    description: One of auto, always, or never. Fastly auto resolves to never.
+    required: false
+    default: auto
+  build-args:
+    description: JSON array of strings passed to the CLI build after --.
+    required: false
+    default: "[]"
+  deploy-args:
+    description: JSON array of Fastly --comment passthrough args (allowlisted).
+    required: false
+    default: "[]"
+  stage:
+    description: When true, deploy to a staged draft version instead of activating production.
+    required: false
+    default: "false"
+  cache:
+    description: Enable exact-key Cargo workspace target/ caching.
+    required: false
+    default: "false"
+
+outputs:
+  fastly-version:
+    description: Fastly service version deployed (production) or staged.
+    value: ${{ steps.deploy.outputs['fastly-version'] }}
+  source-revision:
+    description: Git revision deployed from working-directory.
+    value: ${{ steps.resolve.outputs['source-revision'] }}
+  cli-version:
+    description: Version of the app CLI consumed from the artifact.
+    value: ${{ steps.cli.outputs['cli-version'] }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      id: validate
+      shell: bash
+      env:
+        INPUT_ADAPTER: fastly
+        INPUT_BUILD_MODE: ${{ inputs['build-mode'] }}
+        INPUT_CACHE: ${{ inputs.cache }}
+        INPUT_BUILD_ARGS: ${{ inputs['build-args'] }}
+        INPUT_DEPLOY_ARGS: ${{ inputs['deploy-args'] }}
+        INPUT_DEPLOY_ARG_ALLOW: "--comment"
+        INPUT_DEPLOY_FLAGS: ${{ inputs.stage == 'true' && format('["--service-id","{0}","--stage"]', inputs['fastly-service-id']) || format('["--service-id","{0}"]', inputs['fastly-service-id']) }}
+        INPUT_PROVIDER_ENV_CLEAR: '["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT"]'
+        INPUT_FASTLY_API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
+        INPUT_FASTLY_SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        EDGEZERO_RUNNER_OS: ${{ runner.os }}
+        EDGEZERO_RUNNER_ARCH: ${{ runner.arch }}
+        EDGEZERO_ACTION_STATE_DIR: ${{ runner.temp }}/edgezero-deploy-state
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+      run: |
+        [[ "${INPUT_FASTLY_API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
+        [[ -n "${INPUT_FASTLY_SERVICE_ID}" ]] || { echo "::error::missing required input 'fastly-service-id'"; exit 1; }
+        "$GITHUB_ACTION_PATH/../deploy-core/scripts/validate-inputs.sh"
+
+    - name: Download CLI artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs['cli-artifact'] }}
+        path: ${{ runner.temp }}/edgezero-cli-download
+
+    - name: Extract CLI
+      id: cli
+      shell: bash
+      env:
+        EDGEZERO_CLI_ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO_TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        INPUT_CLI_BIN: ${{ inputs['cli-bin'] }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-cli.sh
+
+    - name: Resolve project
+      id: resolve
+      shell: bash
+      env:
+        EDGEZERO_ACTION_ROOT: ${{ github.action_path }}/../../..
+        EDGEZERO_CLI_VERSION: ${{ steps.cli.outputs['cli-version'] }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        INPUT_MANIFEST: ${{ inputs.manifest }}
+        INPUT_RUST_TOOLCHAIN: auto
+        INPUT_TARGET: wasm32-wasip1
+        INPUT_BUILD_MODE: ${{ inputs['build-mode'] }}
+        INPUT_CACHE: ${{ inputs.cache }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/resolve-project.sh
+
+    - name: Restore application target cache
+      if: ${{ inputs.cache == 'true' }}
+      id: cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        key: ${{ steps.resolve.outputs['cache-key'] }}
+        path: ${{ steps.resolve.outputs['cache-path'] }}
+
+    - name: Install Rust
+      shell: bash
+      env:
+        RUST_TOOLCHAIN: ${{ steps.resolve.outputs['rust-toolchain'] }}
+        RUST_TARGET: wasm32-wasip1
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/install-rust.sh
+
+    - name: Install Fastly CLI
+      id: install-fastly
+      shell: bash
+      env:
+        EDGEZERO_ACTION_ROOT: ${{ github.action_path }}/../../..
+        VERSIONS_JSON: ${{ github.action_path }}/versions.json
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+      run: $GITHUB_ACTION_PATH/scripts/install-fastly.sh
+
+    - name: Build (validation)
+      if: ${{ steps.resolve.outputs['effective-build-mode'] == 'always' }}
+      shell: bash
+      env:
+        EDGEZERO_CLI_BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        EDGEZERO_ADAPTER: fastly
+        EDGEZERO_WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory'] }}
+        EDGEZERO_MANIFEST_PATH: ${{ steps.resolve.outputs['manifest'] }}
+        DEPLOY_BUILD_ARGS_FILE: ${{ steps.validate.outputs['build-args-file'] }}
+        DEPLOY_PROVIDER_ENV_CLEAR_FILE: ${{ steps.validate.outputs['provider-env-clear-file'] }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/run-cli.sh build
+
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        EDGEZERO_CLI_BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        EDGEZERO_ADAPTER: fastly
+        EDGEZERO_WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory'] }}
+        EDGEZERO_MANIFEST_PATH: ${{ steps.resolve.outputs['manifest'] }}
+        DEPLOY_FLAGS_FILE: ${{ steps.validate.outputs['deploy-flags-file'] }}
+        DEPLOY_ARGS_FILE: ${{ steps.validate.outputs['deploy-args-file'] }}
+        FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        FASTLY_SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+      run: |
+        set -o pipefail
+        log="${RUNNER_TEMP:-/tmp}/edgezero-deploy.log"
+        "$GITHUB_ACTION_PATH/../deploy-core/scripts/run-cli.sh" deploy 2>&1 | tee "$log"
+        version=$(grep -oE '^version=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)
+        echo "fastly-version=${version}" >> "$GITHUB_OUTPUT"
+
+    - name: Save application target cache
+      if: ${{ inputs.cache == 'true' && steps.cache-restore.outputs['cache-hit'] != 'true' }}
+      uses: actions/cache/save@v4
+      with:
+        key: ${{ steps.resolve.outputs['cache-key'] }}
+        path: ${{ steps.resolve.outputs['cache-path'] }}
+
+    - name: Write summary
+      if: ${{ always() }}
+      shell: bash
+      env:
+        SUMMARY_ADAPTER: fastly
+        SUMMARY_WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory-relative'] }}
+        SUMMARY_SOURCE_REVISION: ${{ steps.resolve.outputs['source-revision'] }}
+        SUMMARY_MANIFEST: ${{ steps.resolve.outputs['manifest-summary'] }}
+        SUMMARY_RUST_TOOLCHAIN: ${{ steps.resolve.outputs['rust-toolchain'] }}
+        SUMMARY_TARGET: wasm32-wasip1
+        SUMMARY_CLI_VERSION: ${{ steps.cli.outputs['cli-version'] }}
+        SUMMARY_EFFECTIVE_BUILD_MODE: ${{ steps.resolve.outputs['effective-build-mode'] }}
+        SUMMARY_CACHE: ${{ inputs.cache }}
+        SUMMARY_RESULT: ${{ steps.deploy.outcome }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/write-summary.sh
+
+    - name: Cleanup
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO_ACTION_STATE_DIR: ${{ runner.temp }}/edgezero-deploy-state
+        EDGEZERO_TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh
