@@ -1,0 +1,155 @@
+name: Deploy actions
+
+on:
+  pull_request:
+    paths:
+      - .github/actions/build-cli/**
+      - .github/actions/deploy-core/**
+      - .github/actions/deploy-fastly/**
+      - .github/actions/healthcheck-fastly/**
+      - .github/actions/rollback-fastly/**
+      - .github/workflows/deploy-action.yml
+      - crates/edgezero-adapter/**
+      - crates/edgezero-adapter-fastly/**
+      - crates/edgezero-cli/**
+      - docs/guide/deploy-github-actions.md
+      - docs/specs/**
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/build-cli/**
+      - .github/actions/deploy-core/**
+      - .github/actions/deploy-fastly/**
+      - .github/actions/healthcheck-fastly/**
+      - .github/actions/rollback-fastly/**
+      - .github/workflows/deploy-action.yml
+      - crates/edgezero-adapter/**
+      - crates/edgezero-adapter-fastly/**
+      - crates/edgezero-cli/**
+      - docs/guide/deploy-github-actions.md
+      - docs/specs/**
+
+permissions:
+  contents: read
+
+env:
+  ACTIONLINT_VERSION: 1.7.7
+  ZIZMOR_VERSION: 1.16.3
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (pinned release binary)
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --fail --location --silent --show-error "$url" --output /tmp/actionlint.tar.gz
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
+
+      - name: Actionlint (workflows)
+        run: actionlint
+
+      - name: Third-party actions pinned to a ref
+        run: .github/actions/deploy-core/tests/check-action-pins.sh
+
+      - name: Install zizmor (cargo, no pip)
+        run: cargo install zizmor --version "${ZIZMOR_VERSION}" --locked
+
+      - name: Zizmor security scan
+        run: |
+          zizmor --offline \
+            .github/workflows/deploy-action.yml \
+            .github/actions/build-cli/action.yml \
+            .github/actions/deploy-fastly/action.yml \
+            .github/actions/healthcheck-fastly/action.yml \
+            .github/actions/rollback-fastly/action.yml
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: ShellCheck action scripts
+        run: |
+          shellcheck -x \
+            .github/actions/build-cli/scripts/*.sh \
+            .github/actions/deploy-core/scripts/*.sh \
+            .github/actions/deploy-core/tests/*.sh \
+            .github/actions/deploy-fastly/scripts/*.sh
+
+      - name: Bash contract tests
+        run: .github/actions/deploy-core/tests/run.sh
+
+      - name: Validate docs
+        run: |
+          cd docs
+          npm ci
+          npm run format
+          npm run lint
+          npm run build
+
+  composite-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build CLI from the monorepo package
+        id: cli
+        uses: ./.github/actions/build-cli
+        with:
+          cli-package: edgezero-cli
+          cli-bin: edgezero
+          working-directory: .
+
+      - name: Create fixture app
+        run: |
+          set -euo pipefail
+          mkdir -p fixture-app
+          cd fixture-app
+          git init -q
+          git config user.email test@example.com
+          git config user.name Test
+          cat >Cargo.toml <<'TOML'
+          [package]
+          name = "fixture-app"
+          version = "0.0.0"
+          edition = "2021"
+          TOML
+          mkdir -p src
+          echo 'fn main() {}' >src/main.rs
+          cargo generate-lockfile
+          # Fake fastly binary on PATH so `fastly compute deploy` writes a marker.
+          mkdir -p bin
+          cat >bin/fastly <<'FASTLY'
+          #!/usr/bin/env bash
+          printf '%s\n' "$@" >>"$GITHUB_WORKSPACE/fixture-app/fastly-argv.txt"
+          echo "SUCCESS: Deployed package (version 7)"
+          FASTLY
+          chmod +x bin/fastly
+          echo "$GITHUB_WORKSPACE/fixture-app/bin" >>"$GITHUB_PATH"
+          git add -A
+          git commit -q -m fixture
+
+      - name: Deploy fixture (production) with local action
+        uses: ./.github/actions/deploy-fastly
+        with:
+          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+          deploy-args: '["--comment","smoke"]'
+
+      - name: Assert Fastly was invoked with the service id
+        run: |
+          set -euo pipefail
+          test -f fixture-app/fastly-argv.txt
+          grep -q -- 'dummy-service' fixture-app/fastly-argv.txt
+          grep -q -- 'compute' fixture-app/fastly-argv.txt

@@ -129,14 +129,14 @@ runs:
         key: ${{ steps.resolve.outputs['cache-key'] }}
         path: ${{ steps.resolve.outputs['cache-path'] }}
 
-    - name: Install Rust
-      shell: bash
-      env:
-        RUST_TOOLCHAIN: ${{ steps.resolve.outputs['rust-toolchain'] }}
-        RUST_TARGET: wasm32-wasip1
-        FASTLY_API_TOKEN: ""
-        FASTLY_SERVICE_ID: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/install-rust.sh
+    - name: Install Rust toolchain
+      uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: ${{ steps.resolve.outputs['rust-toolchain'] }}
+        target: wasm32-wasip1
+        # Our resolve-project step owns exact-key target/ caching; disable the
+        # action's own cache to avoid double-caching and key drift.
+        cache: false
 
     - name: Install Fastly CLI
       id: install-fastly

@@ -5,134 +5,157 @@ set -euo pipefail
 # root (source revision + dirty-source guard) from the Cargo workspace root
 # (Cargo.lock hash + target/ cache), so nested-workspace monorepos cache the
 # right artifacts. Provider-neutral: no provider names appear here.
+#
+# Inputs (environment): INPUT_WORKING_DIRECTORY, INPUT_MANIFEST,
+# INPUT_RUST_TOOLCHAIN, INPUT_TARGET (required), INPUT_BUILD_MODE, INPUT_CACHE,
+# EDGEZERO_ACTION_ROOT (required), EDGEZERO_CLI_VERSION.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-WORKSPACE=${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}
-ACTION_ROOT=${EDGEZERO_ACTION_ROOT:?EDGEZERO_ACTION_ROOT is required}
-WORKING_DIRECTORY=${INPUT_WORKING_DIRECTORY:-.}
-MANIFEST=${INPUT_MANIFEST:-}
-RUST_TOOLCHAIN_INPUT=${INPUT_RUST_TOOLCHAIN:-auto}
-RUST_TARGET=${INPUT_TARGET:?INPUT_TARGET is required (wrapper-provided concrete target)}
-CACHE=${INPUT_CACHE:-false}
-CLI_VERSION=${EDGEZERO_CLI_VERSION:-unknown}
-
-require_cmd git
-require_cmd cargo
-
-WORKSPACE_REAL=$(canonical_path "$WORKSPACE")
-APP_INPUT="$WORKSPACE/$WORKING_DIRECTORY"
-[[ -d "$APP_INPUT" ]] || fail "working-directory '$WORKING_DIRECTORY' does not exist or is not a directory"
-APP_DIR=$(canonical_path "$APP_INPUT")
-is_under "$WORKSPACE_REAL" "$APP_DIR" || fail "input 'working-directory' must resolve inside github.workspace"
-APP_REL=$(relative_to "$WORKSPACE_REAL" "$APP_DIR")
-
-if [[ -n "$MANIFEST" ]]; then
-  MANIFEST_INPUT="$APP_DIR/$MANIFEST"
-  [[ -f "$MANIFEST_INPUT" ]] || fail "manifest '$APP_REL/$MANIFEST' does not exist or is not a regular file"
-  MANIFEST_PATH=$(canonical_path "$MANIFEST_INPUT")
-  is_under "$WORKSPACE_REAL" "$MANIFEST_PATH" || fail "input 'manifest' must resolve inside github.workspace"
-  MANIFEST_REL=$(relative_to "$WORKSPACE_REAL" "$MANIFEST_PATH")
-else
-  MANIFEST_PATH=""
-  MANIFEST_REL="EdgeZero default discovery"
-fi
-
-# --- Git root: source revision + dirty-source guard ---------------------------
-APP_GIT_ROOT=$(git -C "$APP_DIR" rev-parse --show-toplevel 2>/dev/null || true)
-[[ -n "$APP_GIT_ROOT" ]] || fail "working-directory '$APP_REL' is not inside a Git repository"
-APP_GIT_ROOT=$(canonical_path "$APP_GIT_ROOT")
-is_under "$WORKSPACE_REAL" "$APP_GIT_ROOT" || fail "application Git root must resolve inside github.workspace"
-SOURCE_REVISION=$(git -C "$APP_GIT_ROOT" rev-parse HEAD)
-if ! git -C "$APP_GIT_ROOT" diff --quiet --ignore-submodules -- ||
-  ! git -C "$APP_GIT_ROOT" diff --cached --quiet --ignore-submodules -- ||
-  [[ -n "$(git -C "$APP_GIT_ROOT" ls-files --others --exclude-standard)" ]]; then
-  fail "deployments require committed source; working tree for '$APP_REL' is dirty"
-fi
-
-# --- Cargo workspace root: lockfile + target/ + cache -------------------------
-if ! WORKSPACE_MANIFEST=$(cd "$APP_DIR" && cargo locate-project --workspace --message-format plain 2>/dev/null); then
-  WORKSPACE_MANIFEST=""
-fi
-[[ -n "$WORKSPACE_MANIFEST" ]] || fail "could not locate the Cargo workspace root from '$APP_REL'"
-CARGO_WS_ROOT=$(canonical_path "$(dirname "$WORKSPACE_MANIFEST")")
-LOCKFILE="$CARGO_WS_ROOT/Cargo.lock"
-if [[ "$CACHE" == "true" && ! -f "$LOCKFILE" ]]; then
-  fail "cache is enabled but Cargo.lock was not found at the Cargo workspace root ($CARGO_WS_ROOT); exact-key caching requires Cargo.lock"
-fi
-LOCK_HASH="none"
-[[ -f "$LOCKFILE" ]] && LOCK_HASH=$(sha256_file "$LOCKFILE")
-TARGET_DIR="$CARGO_WS_ROOT/target"
-
-# --- Rust toolchain resolution (input > rustup files > .tool-versions) --------
-parse_rust_toolchain_file() {
+# --- Rust toolchain resolution helpers ---------------------------------------
+parse_toolchain_from_channel_file() {
   local value
   value=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | awk 'NF { print; exit }')
   [[ -n "$value" ]] || fail "malformed Rust toolchain file: $1"
   printf '%s\n' "$value"
 }
-parse_rust_toolchain_toml() {
+
+parse_toolchain_from_toml() {
   local value
   value=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*["'\''`]([^"'\''`]+)["'\''`][[:space:]]*$/\1/p' "$1" | head -n 1)
   [[ -n "$value" ]] || fail "malformed Rust toolchain TOML file: $1"
   printf '%s\n' "$value"
 }
+
+# Resolve the toolchain: explicit input > rustup files (walking to the Git root)
+# > .tool-versions > the EdgeZero action repo fallback.
 resolve_rust_toolchain() {
-  if [[ "$RUST_TOOLCHAIN_INPUT" != "auto" ]]; then
-    [[ -n "$RUST_TOOLCHAIN_INPUT" ]] || fail "input 'rust-toolchain' cannot be empty"
-    printf '%s\n' "$RUST_TOOLCHAIN_INPUT"
+  local input="$1" app_dir="$2" git_root="$3" action_root="$4"
+  if [[ "$input" != "auto" ]]; then
+    [[ -n "$input" ]] || fail "input 'rust-toolchain' cannot be empty"
+    printf '%s\n' "$input"
     return
   fi
-  local directory="$APP_DIR" value
+  local directory="$app_dir" value
   while true; do
     if [[ -f "$directory/rust-toolchain.toml" ]]; then
-      parse_rust_toolchain_toml "$directory/rust-toolchain.toml"
+      parse_toolchain_from_toml "$directory/rust-toolchain.toml"
       return
     fi
     if [[ -f "$directory/rust-toolchain" ]]; then
-      parse_rust_toolchain_file "$directory/rust-toolchain"
+      parse_toolchain_from_channel_file "$directory/rust-toolchain"
       return
     fi
     if [[ -f "$directory/.tool-versions" ]] && value=$(read_tool_version "$directory/.tool-versions" rust) && [[ -n "$value" ]]; then
       printf '%s\n' "$value"
       return
     fi
-    [[ "$directory" == "$APP_GIT_ROOT" ]] && break
-    local next
-    next=$(dirname "$directory")
-    [[ "$next" == "$directory" ]] && break
-    directory="$next"
+    [[ "$directory" == "$git_root" ]] && break
+    local parent
+    parent=$(dirname "$directory")
+    [[ "$parent" == "$directory" ]] && break
+    directory="$parent"
   done
-  if [[ -f "$ACTION_ROOT/.tool-versions" ]] && value=$(read_tool_version "$ACTION_ROOT/.tool-versions" rust) && [[ -n "$value" ]]; then
+  if [[ -f "$action_root/.tool-versions" ]] && value=$(read_tool_version "$action_root/.tool-versions" rust) && [[ -n "$value" ]]; then
     printf '%s\n' "$value"
     return
   fi
   fail "could not resolve Rust toolchain; checked rust-toolchain.toml, rust-toolchain, .tool-versions; set input 'rust-toolchain' explicitly"
 }
-RUST_TOOLCHAIN=$(resolve_rust_toolchain)
 
-CACHE_KEY="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$RUST_TOOLCHAIN")-$(sanitize_ref "$RUST_TARGET")-$(sanitize_ref "$CLI_VERSION")-${SOURCE_REVISION}-${LOCK_HASH}"
-
-effective_build_mode() {
-  case "${INPUT_BUILD_MODE:-auto}" in
-    auto) printf 'never\n' ;;
+resolve_effective_build_mode() {
+  case "${1:-auto}" in
+    auto | never) printf 'never\n' ;;
     always) printf 'always\n' ;;
-    never) printf 'never\n' ;;
     *) fail "input 'build-mode' must be one of: auto, always, never" ;;
   esac
 }
-EFFECTIVE_BUILD_MODE=$(effective_build_mode)
 
-append_output working-directory "$APP_DIR"
-append_output working-directory-relative "$APP_REL"
-append_output manifest "$MANIFEST_PATH"
-append_output manifest-summary "$MANIFEST_REL"
-append_output app-git-root "$APP_GIT_ROOT"
-append_output cargo-workspace-root "$CARGO_WS_ROOT"
-append_output source-revision "$SOURCE_REVISION"
-append_output rust-toolchain "$RUST_TOOLCHAIN"
-append_output effective-build-mode "$EFFECTIVE_BUILD_MODE"
-append_output cache-key "$CACHE_KEY"
-append_output cache-path "$TARGET_DIR"
+# Record the source revision and fail on a dirty working tree.
+assert_committed_source() {
+  local git_root="$1" app_rel="$2"
+  if ! git -C "$git_root" diff --quiet --ignore-submodules -- ||
+    ! git -C "$git_root" diff --cached --quiet --ignore-submodules -- ||
+    [[ -n "$(git -C "$git_root" ls-files --others --exclude-standard)" ]]; then
+    fail "deployments require committed source; working tree for '$app_rel' is dirty"
+  fi
+}
+
+main() {
+  local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
+  local action_root="${EDGEZERO_ACTION_ROOT:?EDGEZERO_ACTION_ROOT is required}"
+  local working_directory="${INPUT_WORKING_DIRECTORY:-.}"
+  local manifest="${INPUT_MANIFEST:-}"
+  local rust_toolchain_input="${INPUT_RUST_TOOLCHAIN:-auto}"
+  local target="${INPUT_TARGET:?INPUT_TARGET is required (wrapper-provided concrete target)}"
+  local cache="${INPUT_CACHE:-false}"
+  local cli_version="${EDGEZERO_CLI_VERSION:-unknown}"
+
+  require_cmd git
+  require_cmd cargo
+
+  # Application directory, confined to github.workspace.
+  local workspace_real app_dir app_rel
+  workspace_real=$(canonical_path "$workspace")
+  [[ -d "$workspace/$working_directory" ]] || fail "working-directory '$working_directory' does not exist or is not a directory"
+  app_dir=$(canonical_path "$workspace/$working_directory")
+  is_under "$workspace_real" "$app_dir" || fail "input 'working-directory' must resolve inside github.workspace"
+  app_rel=$(relative_to "$workspace_real" "$app_dir")
+
+  # Optional explicit manifest.
+  local manifest_path manifest_summary
+  if [[ -n "$manifest" ]]; then
+    [[ -f "$app_dir/$manifest" ]] || fail "manifest '$app_rel/$manifest' does not exist or is not a regular file"
+    manifest_path=$(canonical_path "$app_dir/$manifest")
+    is_under "$workspace_real" "$manifest_path" || fail "input 'manifest' must resolve inside github.workspace"
+    manifest_summary=$(relative_to "$workspace_real" "$manifest_path")
+  else
+    manifest_path=""
+    manifest_summary="EdgeZero default discovery"
+  fi
+
+  # Git root: source revision + dirty-source guard.
+  local git_root source_revision
+  git_root=$(git -C "$app_dir" rev-parse --show-toplevel 2>/dev/null || true)
+  [[ -n "$git_root" ]] || fail "working-directory '$app_rel' is not inside a Git repository"
+  git_root=$(canonical_path "$git_root")
+  is_under "$workspace_real" "$git_root" || fail "application Git root must resolve inside github.workspace"
+  source_revision=$(git -C "$git_root" rev-parse HEAD)
+  assert_committed_source "$git_root" "$app_rel"
+
+  # Cargo workspace root: lockfile + target/ + cache.
+  local cargo_ws_manifest cargo_ws_root lockfile lock_hash target_dir
+  if ! cargo_ws_manifest=$(cd "$app_dir" && cargo locate-project --workspace --message-format plain 2>/dev/null); then
+    cargo_ws_manifest=""
+  fi
+  [[ -n "$cargo_ws_manifest" ]] || fail "could not locate the Cargo workspace root from '$app_rel'"
+  cargo_ws_root=$(canonical_path "$(dirname "$cargo_ws_manifest")")
+  lockfile="$cargo_ws_root/Cargo.lock"
+  if [[ "$cache" == "true" && ! -f "$lockfile" ]]; then
+    fail "cache is enabled but Cargo.lock was not found at the Cargo workspace root ($cargo_ws_root); exact-key caching requires Cargo.lock"
+  fi
+  lock_hash="none"
+  [[ -f "$lockfile" ]] && lock_hash=$(sha256_file "$lockfile")
+  target_dir="$cargo_ws_root/target"
+
+  local rust_toolchain effective_build_mode cache_key
+  rust_toolchain=$(resolve_rust_toolchain "$rust_toolchain_input" "$app_dir" "$git_root" "$action_root")
+  effective_build_mode=$(resolve_effective_build_mode "${INPUT_BUILD_MODE:-auto}")
+  cache_key="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$rust_toolchain")-$(sanitize_ref "$target")-$(sanitize_ref "$cli_version")-${source_revision}-${lock_hash}"
+
+  append_output working-directory "$app_dir"
+  append_output working-directory-relative "$app_rel"
+  append_output manifest "$manifest_path"
+  append_output manifest-summary "$manifest_summary"
+  append_output app-git-root "$git_root"
+  append_output cargo-workspace-root "$cargo_ws_root"
+  append_output source-revision "$source_revision"
+  append_output rust-toolchain "$rust_toolchain"
+  append_output effective-build-mode "$effective_build_mode"
+  append_output cache-key "$cache_key"
+  append_output cache-path "$target_dir"
+}
+
+main "$@"

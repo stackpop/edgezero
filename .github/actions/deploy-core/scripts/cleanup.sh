@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=${EDGEZERO_ACTION_STATE_DIR:-}
-if [[ -n "$ROOT" && -d "$ROOT" ]]; then
-  rm -rf "$ROOT"
-fi
+# Removes action-owned temporary state, tool installs, and any provider auth
+# state. Runs with `if: always()`, so it must tolerate partially-created dirs.
 
-TOOL_ROOT=${EDGEZERO_TOOL_ROOT:-}
-if [[ -n "$TOOL_ROOT" && -d "$TOOL_ROOT" ]]; then
-  rm -rf "$TOOL_ROOT"
-fi
+remove_if_present() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] && rm -rf "$dir"
+}
 
-# Remove action-owned Fastly auth state if future installers create it.
-if [[ -n "${EDGEZERO_FASTLY_HOME:-}" && -d "$EDGEZERO_FASTLY_HOME" ]]; then
-  rm -rf "$EDGEZERO_FASTLY_HOME"
-fi
+main() {
+  remove_if_present "${EDGEZERO_ACTION_STATE_DIR:-}"
+  remove_if_present "${EDGEZERO_TOOL_ROOT:-}"
+  remove_if_present "${EDGEZERO_FASTLY_HOME:-}"
+}
+
+main "$@"
