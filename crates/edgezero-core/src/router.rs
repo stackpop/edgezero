@@ -3,36 +3,33 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use matchit::Router as PathRouter;
-use serde::Serialize;
 use tower_service::Service;
 
-use crate::body::Body;
 use crate::context::RequestContext;
 use crate::error::EdgeError;
-use crate::handler::{BoxHandler, IntoHandler};
-use crate::http::{
-    header::CONTENT_TYPE, response_builder, HandlerFuture, HeaderValue, Method, Request, Response,
-    ResponseBuilder, StatusCode,
-};
+use crate::handler::{BoxHandler, IntoHandler, IntrospectionNeeds};
+use crate::http::{HandlerFuture, Method, Request, Response};
+use crate::introspection::{ManifestJson, RouteTable};
 use crate::middleware::{BoxMiddleware, Middleware, Next};
 use crate::params::PathParams;
 use crate::response::IntoResponse as _;
 
-pub const DEFAULT_ROUTE_LISTING_PATH: &str = "/__edgezero/routes";
-
 struct RouteEntry {
     handler: BoxHandler,
+    introspection_needs: IntrospectionNeeds,
 }
 
 impl Clone for RouteEntry {
     fn clone(&self) -> Self {
         Self {
             handler: Arc::clone(&self.handler),
+            introspection_needs: self.introspection_needs,
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
         self.handler = Arc::clone(&source.handler);
+        self.introspection_needs = source.introspection_needs;
     }
 }
 
@@ -64,12 +61,6 @@ impl RouteInfo {
     }
 }
 
-#[derive(Serialize)]
-struct RouteListingEntry {
-    method: String,
-    path: String,
-}
-
 enum RouteMatch<'route> {
     Found(&'route RouteEntry, PathParams),
     MethodNotAllowed(Vec<Method>),
@@ -78,9 +69,9 @@ enum RouteMatch<'route> {
 
 #[derive(Default)]
 pub struct RouterBuilder {
+    manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
     route_info: Vec<RouteInfo>,
-    route_listing_path: Option<String>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
 }
 
@@ -95,11 +86,17 @@ impl RouterBuilder {
     {
         let router = self.routes.entry(method.clone()).or_default();
 
+        // The handler reports which introspection payloads its route needs; the
+        // flag is read once here and consulted per request in `dispatch`.
+        let boxed = handler.into_handler();
+        let introspection_needs = boxed.introspection_needs();
+
         router
             .insert(
                 path,
                 RouteEntry {
-                    handler: handler.into_handler(),
+                    handler: boxed,
+                    introspection_needs,
                 },
             )
             .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
@@ -108,56 +105,17 @@ impl RouterBuilder {
             .push(RouteInfo::new(method, path.to_owned()));
     }
 
-    /// # Panics
-    /// Panics if a route is registered for both an explicit path and the route-listing path.
-    /// Both paths are programmer-supplied at build time; a duplicate is a routing-config bug
-    /// that should fail loudly before the binary ever serves traffic.
-    #[expect(
-        clippy::panic,
-        reason = "duplicate route is a build-time programmer error, not a runtime condition"
-    )]
     #[must_use]
     #[inline]
-    pub fn build(mut self) -> RouterService {
-        let listing_path = self.route_listing_path.clone();
+    pub fn build(self) -> RouterService {
+        let route_index: Arc<[RouteInfo]> = Arc::from(self.route_info);
 
-        let mut route_info = self.route_info.clone();
-        if let Some(path) = &listing_path {
-            route_info.push(RouteInfo::new(Method::GET, path.clone()));
-        }
-
-        let route_index: Arc<[RouteInfo]> = Arc::from(route_info);
-
-        if let Some(path) = listing_path {
-            let outer_index = Arc::clone(&route_index);
-            let listing_handler = move |_ctx: RequestContext| {
-                let inner_index = Arc::clone(&outer_index);
-                async move {
-                    let payload: Vec<RouteListingEntry> = inner_index
-                        .iter()
-                        .map(|route| RouteListingEntry {
-                            method: route.method().as_str().to_owned(),
-                            path: route.path().to_owned(),
-                        })
-                        .collect();
-
-                    build_listing_response(&payload, response_builder())
-                }
-            };
-
-            self.routes
-                .entry(Method::GET)
-                .or_default()
-                .insert(
-                    path.as_str(),
-                    RouteEntry {
-                        handler: listing_handler.into_handler(),
-                    },
-                )
-                .unwrap_or_else(|err| panic!("duplicate route definition for {path}: {err}"));
-        }
-
-        RouterService::new(self.routes, self.middlewares, route_index)
+        RouterService::new(
+            self.routes,
+            self.middlewares,
+            route_index,
+            self.manifest_json,
+        )
     }
 
     #[must_use]
@@ -167,33 +125,6 @@ impl RouterBuilder {
         H: IntoHandler,
     {
         self.route(path, Method::DELETE, handler)
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn enable_route_listing(self) -> Self {
-        self.enable_route_listing_at(DEFAULT_ROUTE_LISTING_PATH)
-    }
-
-    /// # Panics
-    /// Panics if `path` is empty or does not begin with `/`.
-    #[must_use]
-    #[inline]
-    pub fn enable_route_listing_at<S>(mut self, path: S) -> Self
-    where
-        S: Into<String>,
-    {
-        let route_listing_path = path.into();
-        assert!(
-            !route_listing_path.is_empty(),
-            "route listing path cannot be empty"
-        );
-        assert!(
-            route_listing_path.starts_with('/'),
-            "route listing path must begin with '/'"
-        );
-        self.route_listing_path = Some(route_listing_path);
-        self
     }
 
     #[must_use]
@@ -255,21 +186,44 @@ impl RouterBuilder {
         self.add_route(path, method, handler);
         self
     }
+
+    #[must_use]
+    #[inline]
+    pub fn with_manifest_json<S: Into<Arc<str>>>(mut self, json: S) -> Self {
+        self.manifest_json = Some(json.into());
+        self
+    }
 }
 
 struct RouterInner {
+    manifest_json: Option<Arc<str>>,
     middlewares: Vec<BoxMiddleware>,
     route_index: Arc<[RouteInfo]>,
     routes: HashMap<Method, PathRouter<RouteEntry>>,
 }
 
 impl RouterInner {
-    async fn dispatch(&self, request: Request) -> Result<Response, EdgeError> {
+    async fn dispatch(&self, mut request: Request) -> Result<Response, EdgeError> {
         let method = request.method().clone();
         let path = request.uri().path().to_owned();
 
         match self.find_route(&method, &path) {
             RouteMatch::Found(entry, params) => {
+                // Inject only the introspection payloads this route asked for —
+                // nothing for the vast majority of routes that need none.
+                let needs = entry.introspection_needs;
+                if needs.manifest {
+                    if let Some(json) = &self.manifest_json {
+                        request
+                            .extensions_mut()
+                            .insert(ManifestJson(Arc::clone(json)));
+                    }
+                }
+                if needs.routes {
+                    request
+                        .extensions_mut()
+                        .insert(RouteTable(Arc::clone(&self.route_index)));
+                }
                 let ctx = RequestContext::new(request, params);
                 let next = Next::new(&self.middlewares, entry.handler.as_ref());
                 next.run(ctx).await
@@ -344,9 +298,11 @@ impl RouterService {
         routes: HashMap<Method, PathRouter<RouteEntry>>,
         middlewares: Vec<BoxMiddleware>,
         route_index: Arc<[RouteInfo]>,
+        manifest_json: Option<Arc<str>>,
     ) -> Self {
         Self {
             inner: Arc::new(RouterInner {
+                manifest_json,
                 middlewares,
                 route_index,
                 routes,
@@ -373,21 +329,150 @@ impl RouterService {
     }
 }
 
-fn build_listing_response<T: Serialize>(
-    payload: &T,
-    builder: ResponseBuilder,
-) -> Result<Response, EdgeError> {
-    let body = Body::json(payload).map_err(EdgeError::internal)?;
-    let response = builder
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .body(body)
-        .map_err(EdgeError::internal)?;
-    Ok(response)
-}
-
 #[cfg(test)]
 mod tests {
+    /// Per-capability introspection injection: a route receives exactly the
+    /// payloads its handler opted into via `#[action(manifest|routes)]`.
+    mod introspection_gating {
+        use super::*;
+        use crate::handler::DynHandler;
+
+        /// A handler that records which introspection payloads its request
+        /// carried, as `(manifest_present, routes_present)`, and reports `needs`.
+        struct CapProbe {
+            needs: IntrospectionNeeds,
+            seen: Arc<Mutex<Option<(bool, bool)>>>,
+        }
+
+        impl DynHandler for CapProbe {
+            fn call(&self, ctx: RequestContext) -> HandlerFuture {
+                let seen = Arc::clone(&self.seen);
+                Box::pin(async move {
+                    *seen.lock().unwrap() = Some((
+                        ctx.extension::<ManifestJson>().is_some(),
+                        ctx.extension::<RouteTable>().is_some(),
+                    ));
+                    response_with_body(StatusCode::OK, Body::empty())
+                })
+            }
+            fn introspection_needs(&self) -> IntrospectionNeeds {
+                self.needs
+            }
+        }
+
+        #[test]
+        fn manifest_and_routes_route_injects_both() {
+            // Combined `#[action(manifest, routes)]` → both payloads injected.
+            let seen = run_probe(
+                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                IntrospectionNeeds {
+                    manifest: true,
+                    routes: true,
+                },
+            );
+            assert_eq!(seen, (true, true));
+        }
+
+        #[test]
+        fn manifest_route_injects_only_manifest() {
+            // Manifest available AND requested → ManifestJson present, RouteTable absent.
+            let seen = run_probe(
+                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                IntrospectionNeeds {
+                    manifest: true,
+                    routes: false,
+                },
+            );
+            assert_eq!(seen, (true, false));
+        }
+
+        #[test]
+        fn middleware_sees_injected_manifest() {
+            // Injection happens before the middleware chain, so a middleware on a
+            // manifest-flagged route sees the payload.
+            struct Probe(Arc<Mutex<Option<bool>>>);
+            #[async_trait::async_trait(?Send)]
+            impl Middleware for Probe {
+                async fn handle(
+                    &self,
+                    ctx: RequestContext,
+                    next: Next<'_>,
+                ) -> Result<Response, EdgeError> {
+                    *self.0.lock().unwrap() = Some(ctx.extension::<ManifestJson>().is_some());
+                    next.run(ctx).await
+                }
+            }
+
+            let saw: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+            let router = RouterService::builder()
+                .with_manifest_json("{\"app\":{\"name\":\"t\"}}")
+                .middleware(Probe(Arc::clone(&saw)))
+                .get(
+                    "/",
+                    CapProbe {
+                        needs: IntrospectionNeeds {
+                            manifest: true,
+                            routes: false,
+                        },
+                        seen: Arc::new(Mutex::new(None)),
+                    },
+                )
+                .build();
+            let request = request_builder()
+                .method(Method::GET)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            block_on(router.oneshot(request)).unwrap();
+            assert_eq!(*saw.lock().unwrap(), Some(true));
+        }
+
+        #[test]
+        fn plain_route_injects_neither() {
+            // Manifest IS baked but the route requested nothing → neither injected.
+            let seen = run_probe(
+                RouterService::builder().with_manifest_json("{\"app\":{\"name\":\"t\"}}"),
+                IntrospectionNeeds::default(),
+            );
+            assert_eq!(seen, (false, false));
+        }
+
+        #[test]
+        fn routes_route_injects_only_routes() {
+            // Only `routes` requested → RouteTable present (from the always-available
+            // route index), ManifestJson absent (not requested; none baked either).
+            let seen = run_probe(
+                RouterService::builder(),
+                IntrospectionNeeds {
+                    manifest: false,
+                    routes: true,
+                },
+            );
+            assert_eq!(seen, (false, true));
+        }
+
+        fn run_probe(builder: RouterBuilder, needs: IntrospectionNeeds) -> (bool, bool) {
+            let seen = Arc::new(Mutex::new(None));
+            let router = builder
+                .get(
+                    "/",
+                    CapProbe {
+                        needs,
+                        seen: Arc::clone(&seen),
+                    },
+                )
+                .build();
+            let request = request_builder()
+                .method(Method::GET)
+                .uri("/")
+                .body(Body::empty())
+                .unwrap();
+            block_on(router.oneshot(request)).unwrap();
+            let observed = *seen.lock().unwrap();
+            observed.expect("handler ran")
+        }
+    }
+
     use super::*;
     use crate::body::Body;
     use crate::context::RequestContext;
@@ -397,9 +482,7 @@ mod tests {
     use crate::response::response_with_body;
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
-    use serde::ser::Error as _;
-    use serde::{Deserialize, Serialize};
-    use serde_json::json;
+    use serde::Deserialize;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
 
@@ -603,6 +686,7 @@ mod tests {
     fn route_entry_clone_copies_handler() {
         let entry = RouteEntry {
             handler: ok_handler.into_handler(),
+            introspection_needs: IntrospectionNeeds::default(),
         };
         let cloned = entry.clone();
 
@@ -614,117 +698,6 @@ mod tests {
         let ctx = RequestContext::new(request, PathParams::default());
         let response = block_on(cloned.handler.call(ctx)).expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[test]
-    #[should_panic(expected = "duplicate route definition")]
-    fn route_listing_duplicate_path_panics() {
-        let _service = RouterService::builder()
-            .enable_route_listing()
-            .get(DEFAULT_ROUTE_LISTING_PATH, ok_handler)
-            .build();
-    }
-
-    #[test]
-    fn route_listing_outputs_all_routes() {
-        async fn noop(_ctx: RequestContext) -> Result<(), EdgeError> {
-            Ok(())
-        }
-
-        let service = RouterService::builder()
-            .enable_route_listing()
-            .get("/health", noop)
-            .post("/items", noop)
-            .build();
-
-        let request = request_builder()
-            .method(Method::GET)
-            .uri(DEFAULT_ROUTE_LISTING_PATH)
-            .body(Body::empty())
-            .expect("request");
-
-        let response = block_on(service.clone().call(request)).expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.body().as_bytes().expect("buffered");
-        let payload: Vec<serde_json::Value> = serde_json::from_slice(body).expect("json payload");
-
-        assert!(payload.contains(&json!({
-            "method": "GET",
-            "path": DEFAULT_ROUTE_LISTING_PATH
-        })));
-        assert!(payload.contains(&json!({
-            "method": "GET",
-            "path": "/health"
-        })));
-        assert!(payload.contains(&json!({
-            "method": "POST",
-            "path": "/items"
-        })));
-
-        let routes = service.routes();
-        assert!(routes
-            .iter()
-            .any(|route| route.path() == "/health" && *route.method() == Method::GET));
-
-        let health_request = request_builder()
-            .method(Method::GET)
-            .uri("/health")
-            .body(Body::empty())
-            .expect("request");
-        let health_response = block_on(service.clone().call(health_request)).expect("response");
-        assert_eq!(health_response.status(), StatusCode::NO_CONTENT);
-
-        let items_request = request_builder()
-            .method(Method::POST)
-            .uri("/items")
-            .body(Body::empty())
-            .expect("request");
-        let items_response = block_on(service.clone().call(items_request)).expect("response");
-        assert_eq!(items_response.status(), StatusCode::NO_CONTENT);
-    }
-
-    #[test]
-    #[should_panic(expected = "route listing path cannot be empty")]
-    fn route_listing_rejects_empty_path() {
-        let _builder = RouterService::builder().enable_route_listing_at("");
-    }
-
-    #[test]
-    #[should_panic(expected = "route listing path must begin with '/'")]
-    fn route_listing_rejects_missing_slash() {
-        let _builder = RouterService::builder().enable_route_listing_at("routes");
-    }
-
-    #[test]
-    fn route_listing_response_handles_builder_failure() {
-        #[derive(Serialize)]
-        struct Payload {
-            ok: bool,
-        }
-
-        let builder = response_builder().header("bad\nname", "value");
-        let err =
-            build_listing_response(&Payload { ok: true }, builder).expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn route_listing_response_handles_json_failure() {
-        struct FailingSerialize;
-
-        impl Serialize for FailingSerialize {
-            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: serde::Serializer,
-            {
-                Err(S::Error::custom("boom"))
-            }
-        }
-
-        let err = build_listing_response(&FailingSerialize, response_builder())
-            .expect_err("expected error");
-        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

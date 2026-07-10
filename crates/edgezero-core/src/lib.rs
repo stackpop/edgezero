@@ -9,6 +9,10 @@
     reason = "proc-macros must be re-exported through the parent crate"
 )]
 
+// Required so `#[action]` handlers defined inside this crate resolve the
+// absolute `::edgezero_core::…` paths the proc-macro emits.
+extern crate self as edgezero_core;
+
 pub mod addr;
 pub mod app;
 pub mod app_config;
@@ -23,6 +27,7 @@ pub mod error;
 pub mod extractor;
 pub mod handler;
 pub mod http;
+pub mod introspection;
 pub mod key_value_store;
 pub mod manifest;
 pub mod middleware;

@@ -308,6 +308,7 @@ pub async fn secrets_echo(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use edgezero_core::blob_envelope::BlobEnvelope;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -318,7 +319,9 @@ mod tests {
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
-    use edgezero_core::store_registry::{ConfigStoreBinding, KvRegistry};
+    use edgezero_core::store_registry::{
+        ConfigRegistry, ConfigStoreBinding, KvRegistry, StoreRegistry,
+    };
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -417,6 +420,84 @@ mod tests {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
+    }
+
+    struct FixedStore(String);
+
+    #[async_trait(?Send)]
+    impl ConfigStore for FixedStore {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn introspection_routes_are_wired() {
+        let router = crate::build_router();
+
+        // manifest: 200 + JSON body whose [app].name is "app-demo".
+        let manifest_req = request_builder()
+            .method(Method::GET)
+            .uri("/_app-demo/manifest")
+            .body(Body::empty())
+            .unwrap();
+        let manifest_resp = block_on(router.oneshot(manifest_req)).unwrap();
+        assert_eq!(manifest_resp.status(), StatusCode::OK);
+        assert_eq!(
+            manifest_resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let manifest_body: serde_json::Value = manifest_resp.into_body().to_json().unwrap();
+        assert_eq!(manifest_body["app"]["name"], "app-demo");
+
+        // routes: 200 + [{method,path}] including the root route.
+        let routes_req = request_builder()
+            .method(Method::GET)
+            .uri("/_app-demo/routes")
+            .body(Body::empty())
+            .unwrap();
+        let routes_resp = block_on(router.oneshot(routes_req)).unwrap();
+        assert_eq!(routes_resp.status(), StatusCode::OK);
+        let routes_body: serde_json::Value = routes_resp.into_body().to_json().unwrap();
+        let arr = routes_body.as_array().expect("routes array");
+        assert!(arr
+            .iter()
+            .any(|entry| entry["method"] == "GET" && entry["path"] == "/"));
+
+        // /config: seed a default config store with a valid envelope so a wired
+        // route returns 200 (a routing miss would be 404, proving nothing).
+        let data = serde_json::json!({ "greeting": "hi", "api_token": "demo_api_token" });
+        let blob =
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned()))
+                .unwrap();
+        let registry: ConfigRegistry = StoreRegistry::new(
+            [(
+                "app_config".to_owned(),
+                ConfigStoreBinding {
+                    handle: ConfigStoreHandle::new(Arc::new(FixedStore(blob))),
+                    default_key: "app_config".to_owned(),
+                },
+            )]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "app_config".to_owned(),
+        );
+        let mut config_req = request_builder()
+            .method(Method::GET)
+            .uri("/_app-demo/config")
+            .body(Body::empty())
+            .unwrap();
+        config_req.extensions_mut().insert(registry);
+        let config_resp = block_on(router.oneshot(config_req)).unwrap();
+        assert_eq!(
+            config_resp.status(),
+            StatusCode::OK,
+            "/config should be wired and 200 with a store"
+        );
+        // Raw envelope `data`: secret field holds the KEY NAME, not a resolved value.
+        let config_body: serde_json::Value = config_resp.into_body().to_json().unwrap();
+        assert_eq!(config_body["api_token"], "demo_api_token");
+        assert_eq!(config_body["greeting"], "hi");
     }
 
     #[test]

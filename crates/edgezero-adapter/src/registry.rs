@@ -626,4 +626,67 @@ mod tests {
             "expected Unsupported variant from default local impl"
         );
     }
+
+    #[test]
+    fn push_context_new_is_prod_with_no_paths() {
+        let ctx = AdapterPushContext::new();
+        assert!(!ctx.local);
+        assert_eq!(ctx.manifest_adapter_deploy_cmd, None);
+        assert_eq!(ctx.runtime_config_path, None);
+    }
+
+    #[test]
+    fn push_context_builders_set_each_field() {
+        let path = Path::new("runtime-config.toml");
+        let ctx = AdapterPushContext::new()
+            .with_local(true)
+            .with_manifest_adapter_deploy_cmd("spin cloud deploy")
+            .with_runtime_config_path(path);
+        assert!(ctx.local);
+        assert_eq!(ctx.manifest_adapter_deploy_cmd, Some("spin cloud deploy"));
+        assert_eq!(ctx.runtime_config_path, Some(path));
+    }
+
+    #[test]
+    fn default_validation_and_kind_methods_are_noops() {
+        // `FIRST` overrides only `execute` + `name`, so every other
+        // method here exercises the trait's default impl.
+        assert!(FIRST.merged_id_kinds().is_empty());
+        assert!(FIRST.single_store_kinds().is_empty());
+        assert_eq!(
+            FIRST.validate_adapter_manifest(Path::new("/tmp"), None, None),
+            Ok(())
+        );
+        assert_eq!(
+            FIRST.validate_app_config_keys(&["greeting", "service.timeout_ms"]),
+            Ok(())
+        );
+        let entry = TypedSecretEntry::new("vault", "api_token", "demo_api_token");
+        assert_eq!(FIRST.validate_typed_secrets(&[entry]), Ok(()));
+    }
+
+    #[test]
+    fn default_push_config_entries_error_names_the_adapter() {
+        // Unlike the no-op defaults above, the push defaults RETURN AN
+        // ERROR that interpolates the adapter name — load-bearing for CLI
+        // UX, so assert the message content, not just `is_err`.
+        let root = Path::new("/tmp");
+        let store = ResolvedStoreId::from_logical("app_config");
+        let ctx = AdapterPushContext::new();
+
+        let err = FIRST
+            .push_config_entries(root, None, None, &store, &[], &ctx, false)
+            .expect_err("default push must be unsupported");
+        assert!(err.contains("dummy"), "should name the adapter: {err}");
+        assert!(err.contains("does not implement"), "msg: {err}");
+
+        let local_err = FIRST
+            .push_config_entries_local(root, None, None, &store, &[], &ctx, false)
+            .expect_err("default local push must be unsupported");
+        assert!(
+            local_err.contains("dummy"),
+            "should name the adapter: {local_err}"
+        );
+        assert!(local_err.contains("--local"), "msg: {local_err}");
+    }
 }
