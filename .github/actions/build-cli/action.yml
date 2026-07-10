@@ -1,0 +1,60 @@
+name: EdgeZero build-cli
+description: Compile the CLI package the application provides and publish it as a self-describing artifact.
+
+inputs:
+  cli-package:
+    description: Cargo package name of the CLI to build, defined in the application's own workspace.
+    required: true
+  cli-bin:
+    description: Binary name produced by cli-package. Defaults to the package name.
+    required: false
+    default: ""
+  working-directory:
+    description: Application directory (relative to github.workspace) whose workspace defines cli-package.
+    required: false
+    default: .
+  rust-toolchain:
+    description: Explicit host Rust toolchain, or 'auto' to follow application discovery.
+    required: false
+    default: auto
+  artifact-name:
+    description: Name of the uploaded CLI artifact.
+    required: false
+    default: edgezero-cli
+
+outputs:
+  cli-version:
+    description: CLI package version read from cargo metadata.
+    value: ${{ steps.build.outputs['cli-version'] }}
+  cli-package:
+    description: The application CLI package that was built.
+    value: ${{ steps.build.outputs['cli-package'] }}
+  cli-bin:
+    description: The binary name inside the artifact.
+    value: ${{ steps.build.outputs['cli-bin'] }}
+  artifact-name:
+    description: Name of the uploaded CLI artifact for downstream download.
+    value: ${{ steps.build.outputs['artifact-name'] }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build application CLI package
+      id: build
+      shell: bash
+      env:
+        EDGEZERO_ACTION_ROOT: ${{ github.action_path }}/../../..
+        INPUT_CLI_PACKAGE: ${{ inputs['cli-package'] }}
+        INPUT_CLI_BIN: ${{ inputs['cli-bin'] }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        INPUT_RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
+        INPUT_ARTIFACT_NAME: ${{ inputs['artifact-name'] }}
+      run: $GITHUB_ACTION_PATH/scripts/build-cli.sh
+
+    - name: Upload CLI artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.build.outputs['artifact-name'] }}
+        path: ${{ steps.build.outputs['tarball-path'] }}
+        if-no-files-found: error
+        retention-days: 1
