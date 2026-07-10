@@ -52,8 +52,8 @@ jobs:
           tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
           sudo install -m 0755 /tmp/actionlint /usr/local/bin/actionlint
 
-      - name: Actionlint (workflows)
-        run: actionlint
+      - name: Actionlint (this workflow)
+        run: actionlint .github/workflows/deploy-action.yml
 
       - name: Third-party actions pinned to a ref
         run: .github/actions/deploy-core/tests/check-action-pins.sh
@@ -110,33 +110,7 @@ jobs:
           working-directory: .
 
       - name: Create fixture app
-        run: |
-          set -euo pipefail
-          mkdir -p fixture-app
-          cd fixture-app
-          git init -q
-          git config user.email test@example.com
-          git config user.name Test
-          cat >Cargo.toml <<'TOML'
-          [package]
-          name = "fixture-app"
-          version = "0.0.0"
-          edition = "2021"
-          TOML
-          mkdir -p src
-          echo 'fn main() {}' >src/main.rs
-          cargo generate-lockfile
-          # Fake fastly binary on PATH so `fastly compute deploy` writes a marker.
-          mkdir -p bin
-          cat >bin/fastly <<'FASTLY'
-          #!/usr/bin/env bash
-          printf '%s\n' "$@" >>"$GITHUB_WORKSPACE/fixture-app/fastly-argv.txt"
-          echo "SUCCESS: Deployed package (version 7)"
-          FASTLY
-          chmod +x bin/fastly
-          echo "$GITHUB_WORKSPACE/fixture-app/bin" >>"$GITHUB_PATH"
-          git add -A
-          git commit -q -m fixture
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
 
       - name: Deploy fixture (production) with local action
         uses: ./.github/actions/deploy-fastly

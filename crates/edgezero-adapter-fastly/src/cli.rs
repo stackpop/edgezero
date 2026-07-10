@@ -2113,7 +2113,7 @@ mod tests {
     #[test]
     fn build_curl_probe_args_production_has_no_connect_to() {
         let args = build_curl_probe_args("example.com", None, 10);
-        assert!(!args.iter().any(|a| a == "--connect-to"));
+        assert!(!args.iter().any(|arg| arg == "--connect-to"));
         assert!(args.contains(&"https://example.com/".to_owned()));
         assert!(args.contains(&"--max-time".to_owned()));
         assert!(args.contains(&"10".to_owned()));
@@ -2124,7 +2124,7 @@ mod tests {
         let args = build_curl_probe_args("staging.example.com", Some("151.101.2.10"), 15);
         let idx = args
             .iter()
-            .position(|a| a == "--connect-to")
+            .position(|arg| arg == "--connect-to")
             .expect("--connect-to present for staging");
         assert_eq!(args[idx + 1], "::151.101.2.10:443");
         assert!(args.contains(&"https://staging.example.com/".to_owned()));
@@ -2132,55 +2132,55 @@ mod tests {
 
     #[test]
     fn probe_with_retries_returns_first_healthy() {
-        let mut calls = 0;
-        let mut between = 0;
+        let mut calls: i32 = 0;
+        let mut between: i32 = 0;
         let result = probe_with_retries(
             5,
             || {
-                calls += 1;
+                calls += 1_i32;
                 Ok(200)
             },
-            || between += 1,
+            || between += 1_i32,
         );
         assert_eq!(result, Ok(200));
-        assert_eq!(calls, 1, "should stop after first healthy probe");
-        assert_eq!(between, 0, "no delay before the first attempt");
+        assert_eq!(calls, 1_i32, "should stop after first healthy probe");
+        assert_eq!(between, 0_i32, "no delay before the first attempt");
     }
 
     #[test]
     fn probe_with_retries_succeeds_after_unhealthy_attempts() {
-        let mut calls = 0;
-        let mut between = 0;
+        let mut calls: i32 = 0;
+        let mut between: i32 = 0;
         let result = probe_with_retries(
             5,
             || {
-                calls += 1;
-                if calls < 3 {
+                calls += 1_i32;
+                if calls < 3_i32 {
                     Ok(503)
                 } else {
                     Ok(200)
                 }
             },
-            || between += 1,
+            || between += 1_i32,
         );
         assert_eq!(result, Ok(200));
-        assert_eq!(calls, 3);
+        assert_eq!(calls, 3_i32);
         assert_eq!(
-            between, 2,
+            between, 2_i32,
             "delay runs between each of the first 3 attempts"
         );
     }
 
     #[test]
     fn probe_with_retries_exhausts_and_reports_last_code() {
-        let mut between = 0;
-        let result = probe_with_retries(3, || Ok(500), || between += 1);
+        let mut between: i32 = 0;
+        let result = probe_with_retries(3, || Ok(500), || between += 1_i32);
         assert_eq!(
             result,
             Err((Some(500), "unhealthy HTTP status 500".to_owned()))
         );
         assert_eq!(
-            between, 2,
+            between, 2_i32,
             "delay runs between attempts, not after the last"
         );
     }
@@ -2194,16 +2194,20 @@ mod tests {
 
     #[test]
     fn probe_with_retries_treats_zero_retry_as_one_attempt() {
-        let mut calls = 0;
-        let _ = probe_with_retries(
+        let mut calls: i32 = 0;
+        let result = probe_with_retries(
             0,
             || {
-                calls += 1;
+                calls += 1_i32;
                 Ok(500)
             },
             || {},
         );
-        assert_eq!(calls, 1);
+        assert_eq!(
+            result,
+            Err((Some(500), "unhealthy HTTP status 500".to_owned()))
+        );
+        assert_eq!(calls, 1_i32);
     }
 
     #[test]
