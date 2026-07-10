@@ -101,6 +101,32 @@ handler = "app_demo_core::handlers::kv_note_delete"
 adapters = ["axum", "cloudflare", "fastly", "spin"]
 description = "Delete a note by id"
 
+# -- Introspection routes ------------------------------------------------------
+
+[[triggers.http]]
+id = "manifest"
+path = "/_app-demo/manifest"
+methods = ["GET"]
+handler = "edgezero_core::introspection::manifest"
+adapters = ["axum", "cloudflare", "fastly", "spin"]
+description = "App manifest as JSON"
+
+[[triggers.http]]
+id = "config"
+path = "/_app-demo/config"
+methods = ["GET"]
+handler = "edgezero_core::introspection::config"
+adapters = ["axum", "cloudflare", "fastly", "spin"]
+description = "Effective app config (secret-safe)"
+
+[[triggers.http]]
+id = "routes"
+path = "/_app-demo/routes"
+methods = ["GET"]
+handler = "edgezero_core::introspection::routes"
+adapters = ["axum", "cloudflare", "fastly", "spin"]
+description = "Registered route table"
+
 # -- Secrets demo route --------------------------------------------------------
 
 [[triggers.http]]

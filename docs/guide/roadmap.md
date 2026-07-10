@@ -14,7 +14,7 @@ shift as the roadmap evolves.
 - Adapter behavior matrix: document which adapters buffer bodies, which preserve streaming, and
   where proxy headers/automatic decompression apply so expectations match runtime behavior.
 - Example coverage: add focused guides for `axum.toml`, manifest `description` fields, logging
-  precedence, and route listing + body-mode behavior to reduce ambiguity.
+  precedence, and introspection routes + body-mode behavior to reduce ambiguity.
 - Spin support: add first-class Spin adapter support and document how EdgeZero manifests mirror
   Spin-compatible deployments.
 - Provider additions: prototype a third adapter (e.g. AWS Lambda@Edge or Vercel Edge Functions)
