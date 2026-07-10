@@ -15,6 +15,15 @@ pub enum Action {
     AuthStatus,
     Build,
     Deploy,
+    /// Fastly staging lifecycle (spec §5.4): stage a draft version.
+    DeployStaged,
+    /// Fastly staging lifecycle (spec §5.4): emit the active version.
+    EmitVersion,
+    /// Fastly staging lifecycle (spec §5.4): probe health.
+    Healthcheck,
+    /// Fastly staging lifecycle (spec §5.4): activate previous /
+    /// deactivate staged.
+    Rollback,
     Serve,
 }
 
@@ -27,6 +36,10 @@ impl fmt::Display for Action {
             Action::Build => "build",
             Action::Deploy => "deploy",
             Action::Serve => "serve",
+            Action::DeployStaged => "deploy --stage",
+            Action::EmitVersion => "deploy (version)",
+            Action::Healthcheck => "healthcheck",
+            Action::Rollback => "rollback",
         };
         f.write_str(label)
     }
@@ -42,6 +55,10 @@ impl From<Action> for AdapterAction {
             Action::Build => AdapterAction::Build,
             Action::Deploy => AdapterAction::Deploy,
             Action::Serve => AdapterAction::Serve,
+            Action::DeployStaged => AdapterAction::DeployStaged,
+            Action::EmitVersion => AdapterAction::EmitVersion,
+            Action::Healthcheck => AdapterAction::Healthcheck,
+            Action::Rollback => AdapterAction::Rollback,
         }
     }
 }
@@ -148,6 +165,12 @@ fn manifest_command<'manifest>(
         Action::Build => cfg.commands.build.as_deref(),
         Action::Deploy => cfg.commands.deploy.as_deref(),
         Action::Serve => cfg.commands.serve.as_deref(),
+        // The Fastly staging lifecycle actions (spec §5.4) are not
+        // manifest-configurable shell commands — they run the
+        // adapter's built-in Fastly logic directly. Returning None
+        // routes `adapter::execute` past the manifest-command path to
+        // the registered adapter's `execute`.
+        Action::DeployStaged | Action::EmitVersion | Action::Healthcheck | Action::Rollback => None,
     }
 }
 

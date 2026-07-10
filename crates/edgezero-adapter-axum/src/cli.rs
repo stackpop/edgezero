@@ -148,6 +148,13 @@ impl Adapter for AxumCliAdapter {
             AdapterAction::Build => build(args),
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
+            // The Fastly staging lifecycle (spec §5.4) is Fastly-only.
+            AdapterAction::DeployStaged
+            | AdapterAction::EmitVersion
+            | AdapterAction::Healthcheck
+            | AdapterAction::Rollback => Err(format!(
+                "axum adapter does not support the Fastly staging lifecycle action {action:?} (spec §5.4)"
+            )),
             other => Err(format!("axum adapter does not support {other:?}")),
         }
     }

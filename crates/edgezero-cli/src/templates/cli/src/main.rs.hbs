@@ -12,14 +12,14 @@
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
-    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs,
-    ProvisionArgs, ServeArgs,
+    AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs,
+    HealthcheckArgs, NewArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
 use edgezero_cli::DiffExit;
 use {{proj_core_mod}}::config::{{NameUpperCamel}}Config;
 
 #[derive(Parser, Debug)]
-#[command(name = "{{proj_cli}}", about = "{{name}} edge CLI")]
+#[command(name = "{{proj_cli}}", version, about = "{{name}} edge CLI")]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -37,11 +37,17 @@ enum Cmd {
     Config({{NameUpperCamel}}ConfigCmd),
     /// Deploy to a target edge.
     Deploy(DeployArgs),
+    /// Probe a deployed version's health (Fastly staging lifecycle).
+    /// Exits non-zero when unhealthy after retries.
+    Healthcheck(HealthcheckArgs),
     /// Create a new `EdgeZero` app skeleton.
     New(NewArgs),
     /// Create the platform resources backing the declared
     /// `[stores.<kind>].ids`.
     Provision(ProvisionArgs),
+    /// Roll a service back to a previous version, or deactivate a
+    /// staged version (Fastly staging lifecycle).
+    Rollback(RollbackArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
 }
@@ -94,8 +100,10 @@ fn main() {
             edgezero_cli::run_config_validate_typed::<{{NameUpperCamel}}Config>(&args)
         }
         Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Cmd::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
         Cmd::New(args) => edgezero_cli::run_new(&args),
         Cmd::Provision(args) => edgezero_cli::run_provision(&args),
+        Cmd::Rollback(args) => edgezero_cli::run_rollback(&args),
         Cmd::Serve(args) => edgezero_cli::run_serve(&args),
     };
     if let Err(err) = result {

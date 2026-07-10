@@ -19,6 +19,27 @@ pub enum AdapterAction {
     AuthStatus,
     Build,
     Deploy,
+    /// Stage a draft platform version without activating it. Fastly
+    /// clones the active service version, uploads the built package
+    /// to it, then marks it staged; other adapters return an
+    /// "unsupported" error. Part of the Fastly staging lifecycle
+    /// (deploy-github-action spec §5.4).
+    DeployStaged,
+    /// Emit the deployed/active platform version in a parseable form
+    /// (`version=<N>`) so a CI action can capture it. Fastly resolves
+    /// the active service version; other adapters return
+    /// "unsupported". Companion to `Deploy` for the staging lifecycle
+    /// (spec §5.4.2).
+    EmitVersion,
+    /// Probe a deployed version's health and exit non-zero when
+    /// unhealthy after retries. Fastly curls the domain (or its
+    /// staging IP resolved from the Fastly API); other adapters
+    /// return "unsupported" (spec §5.4).
+    Healthcheck,
+    /// Roll a service back: production activates the previous version,
+    /// staging deactivates the staged version. Fastly-only; other
+    /// adapters return "unsupported" (spec §5.4).
+    Rollback,
     Serve,
 }
 

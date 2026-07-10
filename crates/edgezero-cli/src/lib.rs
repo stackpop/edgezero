@@ -55,7 +55,7 @@ pub use config::{
 pub use provision::run_provision;
 
 #[cfg(feature = "cli")]
-use args::{BuildArgs, DeployArgs, NewArgs, ServeArgs};
+use args::{BuildArgs, DeployArgs, HealthcheckArgs, NewArgs, RollbackArgs, ServeArgs};
 #[cfg(feature = "cli")]
 use edgezero_core::manifest::ManifestLoader;
 #[cfg(feature = "cli")]
@@ -160,11 +160,134 @@ pub fn run_build(args: &BuildArgs) -> Result<(), String> {
 pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+
+    // Thread `--service-id` (spec §5.4) into the adapter invocation
+    // when provided, ahead of any operator passthrough args. Fastly
+    // consumes it; adapters that don't need a service id ignore it.
+    let mut passthrough: Vec<String> = Vec::new();
+    if let Some(service_id) = &args.service_id {
+        passthrough.push("--service-id".to_owned());
+        passthrough.push(service_id.clone());
+    }
+    passthrough.extend_from_slice(&args.adapter_args);
+
+    if args.stage {
+        // Staged deploy: clone the active version, upload the built
+        // package to a new draft, mark it staged, and emit the staged
+        // version (spec §5.4). Never runs the manifest `deploy`
+        // command, which would activate production.
+        return adapter::execute(
+            &args.adapter,
+            adapter::Action::DeployStaged,
+            manifest.as_ref(),
+            &passthrough,
+        );
+    }
+
     adapter::execute(
         &args.adapter,
         adapter::Action::Deploy,
         manifest.as_ref(),
-        &args.adapter_args,
+        &passthrough,
+    )?;
+
+    // Production deploy also emits the activated version (spec §5.4.2)
+    // so the deploy-fastly action can surface `fastly-version`. This
+    // is Fastly-specific and best-effort: it only runs with a known
+    // service id, and a failure to resolve the version must NOT fail
+    // an already-activated deploy — the version is a convenience
+    // output, not the deploy's success criterion.
+    if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
+        if let Err(err) = adapter::execute(
+            &args.adapter,
+            adapter::Action::EmitVersion,
+            manifest.as_ref(),
+            &passthrough,
+        ) {
+            log::warn!(
+                "[edgezero] deploy succeeded but resolving the activated version failed: {err}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Probe a deployed version's health (Fastly staging lifecycle, spec
+/// §5.4) and return `Err` when the probe is unhealthy after retries so
+/// the process exits non-zero (letting a CI caller gate rollback on
+/// failure).
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be loaded, the adapter is
+/// not configured / registered, the adapter does not support
+/// healthchecks, or the probe is unhealthy after all retries.
+#[cfg(feature = "cli")]
+#[inline]
+pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
+    let manifest = load_manifest_optional()?;
+    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    let mut passthrough: Vec<String> = Vec::new();
+    if let Some(service_id) = &args.service_id {
+        passthrough.push("--service-id".to_owned());
+        passthrough.push(service_id.clone());
+    }
+    if let Some(version) = &args.version {
+        passthrough.push("--version".to_owned());
+        passthrough.push(version.clone());
+    }
+    if let Some(domain) = &args.domain {
+        passthrough.push("--domain".to_owned());
+        passthrough.push(domain.clone());
+    }
+    if args.staging {
+        passthrough.push("--staging".to_owned());
+    }
+    passthrough.push("--retry".to_owned());
+    passthrough.push(args.retry.to_string());
+    passthrough.push("--retry-delay".to_owned());
+    passthrough.push(args.retry_delay.to_string());
+    passthrough.push("--timeout".to_owned());
+    passthrough.push(args.timeout.to_string());
+    adapter::execute(
+        &args.adapter,
+        adapter::Action::Healthcheck,
+        manifest.as_ref(),
+        &passthrough,
+    )
+}
+
+/// Roll a service back (Fastly staging lifecycle, spec §5.4):
+/// production activates the previous version; staging deactivates the
+/// staged version.
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be loaded, the adapter is
+/// not configured / registered, the adapter does not support
+/// rollback, or the rollback API call fails.
+#[cfg(feature = "cli")]
+#[inline]
+pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
+    let manifest = load_manifest_optional()?;
+    ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
+    let mut passthrough: Vec<String> = Vec::new();
+    if let Some(service_id) = &args.service_id {
+        passthrough.push("--service-id".to_owned());
+        passthrough.push(service_id.clone());
+    }
+    if let Some(version) = &args.version {
+        passthrough.push("--version".to_owned());
+        passthrough.push(version.clone());
+    }
+    if args.staging {
+        passthrough.push("--staging".to_owned());
+    }
+    adapter::execute(
+        &args.adapter,
+        adapter::Action::Rollback,
+        manifest.as_ref(),
+        &passthrough,
     )
 }
 
@@ -391,6 +514,11 @@ mod tests {
         let args = DeployArgs {
             adapter: "fastly".to_owned(),
             adapter_args: Vec::new(),
+            // No service id → the production version-emit step (spec
+            // §5.4.2) is skipped, so this test exercises only the
+            // manifest `deploy` command path.
+            service_id: None,
+            stage: false,
         };
         run_deploy(&args).expect("deploy command runs");
     }

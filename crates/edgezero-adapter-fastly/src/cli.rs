@@ -4,6 +4,8 @@ use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+use std::thread;
+use std::time::Duration;
 
 use crate::chunked_config::{prepare_fastly_config_entries, resolve_fastly_config_value};
 use ctor::ctor;
@@ -120,6 +122,14 @@ static FASTLY_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
 const FASTLY_INSTALL_HINT: &str =
     "install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again";
 
+/// Env var carrying the Fastly API token (read by the Fastly CLI and
+/// forwarded to the Fastly API via the `Fastly-Key` header). Part of
+/// the Fastly staging lifecycle (deploy-github-action spec §5.4).
+const FASTLY_API_TOKEN_ENV: &str = "FASTLY_API_TOKEN";
+/// Env var carrying the default Fastly service id, used when
+/// `--service-id` is not passed explicitly (spec §5.4).
+const FASTLY_SERVICE_ID_ENV: &str = "FASTLY_SERVICE_ID";
+
 struct FastlyCliAdapter;
 
 /// Outcome of scanning `fastly config-store list --json` for a
@@ -190,6 +200,11 @@ impl Adapter for FastlyCliAdapter {
             }
             AdapterAction::Deploy => deploy(args),
             AdapterAction::Serve => serve(args),
+            // Fastly staging lifecycle (deploy-github-action spec §5.4).
+            AdapterAction::DeployStaged => deploy_staged(args),
+            AdapterAction::EmitVersion => emit_active_version(args),
+            AdapterAction::Healthcheck => healthcheck(args),
+            AdapterAction::Rollback => rollback(args),
             other => Err(format!("fastly adapter does not support {other:?}")),
         }
     }
@@ -1386,6 +1401,541 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// ===================================================================
+// Fastly staging lifecycle (deploy-github-action spec §5.4)
+// ===================================================================
+//
+// These entry points back the `deploy --stage`, `healthcheck`, and
+// `rollback` app-CLI subcommands. They mirror the Fastly semantics of
+// `stackpop/trusted-server-actions`:
+//
+//   * staged deploy  → build + `compute update --autoclone` (no
+//     activation) + `service-version stage`; emits the staged version.
+//   * production      → `fastly compute deploy` runs via the manifest
+//     command; `emit_active_version` resolves the activated version.
+//   * healthcheck     → curl the domain (production) or the version's
+//     resolved staging IP (`--staging`); non-zero exit when unhealthy.
+//   * rollback        → activate `<v>-1` (production) or deactivate
+//     `<v>` (staging) via the Fastly API.
+//
+// **Version-output contract (spec §5.4.2):** deploy/stage print a
+// single `version=<N>` line to stdout (via `log::info!`, which the CLI
+// logger emits verbatim). The `deploy-fastly` action greps that line
+// to surface `fastly-version`. Rollback prints `rolled-back-to=<N>`.
+//
+// Provider HTTP calls shell out to `curl` (matching
+// trusted-server-actions and avoiding a WASM-incompatible HTTP client
+// in the adapter). The `FASTLY_API_TOKEN` is passed to `curl` via a
+// `--config -` stdin file rather than on argv, so it never appears in
+// `ps` / `/proc/<pid>/cmdline` (same discipline as
+// `create_config_store_entry`'s `--stdin`).
+
+/// Value that follows `flag` in a `--flag value` arg slice, if present.
+fn arg_value<'args>(args: &'args [String], flag: &str) -> Option<&'args str> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|idx| idx.checked_add(1))
+        .and_then(|idx| args.get(idx))
+        .map(String::as_str)
+}
+
+/// Whether a boolean `flag` (e.g. `--staging`) is present in `args`.
+fn arg_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+/// Copy of `args` with `--flag value` removed (both tokens). Used to
+/// forward operator passthrough (e.g. `--comment`) to `fastly compute
+/// update` without re-passing `--service-id`, which is threaded
+/// explicitly.
+fn args_without_flag_value(args: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if arg == flag {
+            skip = true;
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
+}
+
+/// Resolve the target service id from `--service-id` or, failing that,
+/// `FASTLY_SERVICE_ID`.
+fn resolve_service_id(args: &[String]) -> Result<String, String> {
+    if let Some(value) = arg_value(args, "--service-id") {
+        return Ok(value.to_owned());
+    }
+    env::var(FASTLY_SERVICE_ID_ENV).map_err(|_err| {
+        format!("no service id: pass `--service-id <id>` or set {FASTLY_SERVICE_ID_ENV}")
+    })
+}
+
+/// Read the required Fastly API token from the environment.
+fn require_token() -> Result<String, String> {
+    env::var(FASTLY_API_TOKEN_ENV)
+        .map_err(|_err| format!("{FASTLY_API_TOKEN_ENV} must be set in the environment"))
+}
+
+/// Whether an HTTP status counts as healthy (2xx/3xx).
+fn is_healthy_status(code: u16) -> bool {
+    (200..400).contains(&code)
+}
+
+/// The version to activate when rolling a production service back from
+/// `version`. `None` when there is no earlier version (`version <= 1`).
+fn previous_version(version: u64) -> Option<u64> {
+    (version > 1).then(|| version.saturating_sub(1))
+}
+
+/// Best-effort scan of Fastly CLI output for a trailing version number
+/// (`... version 42`, `version=42`, etc.). Returns the LAST match,
+/// which is the freshly-created draft in `compute update` output.
+fn parse_fastly_version(text: &str) -> Option<u64> {
+    let lower = text.to_ascii_lowercase();
+    let mut result = None;
+    for (idx, _) in lower.match_indices("version") {
+        let after = idx.saturating_add("version".len());
+        let Some(rest) = lower.get(after..) else {
+            continue;
+        };
+        let digits: String = rest
+            .chars()
+            .skip_while(|ch| !ch.is_ascii_digit())
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(parsed) = digits.parse::<u64>() {
+            result = Some(parsed);
+        }
+    }
+    result
+}
+
+/// Parse `fastly service-version list --json` (or the Fastly API
+/// `/service/<id>/version` array) for the `number` of the `active`
+/// version.
+fn parse_active_version(json: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.as_array()?.iter().find_map(|entry| {
+        (entry.get("active").and_then(serde_json::Value::as_bool) == Some(true))
+            .then(|| entry.get("number").and_then(serde_json::Value::as_u64))
+            .flatten()
+    })
+}
+
+/// Highest `number` in a version-list JSON array — the fallback for
+/// resolving the just-created draft when output parsing fails.
+fn parse_latest_version(json: &str) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value
+        .as_array()?
+        .iter()
+        .filter_map(|entry| entry.get("number").and_then(serde_json::Value::as_u64))
+        .max()
+}
+
+/// First staging IP found anywhere under a `staging_ips` array in the
+/// Fastly API `domain?include=staging_ips` response.
+fn parse_staging_ip(json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    find_staging_ip(&value)
+}
+
+fn find_staging_ip(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(ip) = map
+                .get("staging_ips")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.iter().find_map(serde_json::Value::as_str))
+            {
+                return Some(ip.to_owned());
+            }
+            map.values().find_map(find_staging_ip)
+        }
+        serde_json::Value::Array(arr) => arr.iter().find_map(find_staging_ip),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => None,
+    }
+}
+
+/// Build the `curl` argv for a health probe. Production probes the
+/// domain directly; staging reroutes the TLS connection to the
+/// resolved staging IP via `--connect-to ::<ip>:443`.
+fn build_curl_probe_args(domain: &str, staging_ip: Option<&str>, timeout_secs: u64) -> Vec<String> {
+    let mut args = vec![
+        "-sS".to_owned(),
+        "-o".to_owned(),
+        "/dev/null".to_owned(),
+        "-w".to_owned(),
+        "%{http_code}".to_owned(),
+        "--max-time".to_owned(),
+        timeout_secs.to_string(),
+    ];
+    if let Some(ip) = staging_ip {
+        args.push("--connect-to".to_owned());
+        args.push(format!("::{ip}:443"));
+    }
+    args.push(format!("https://{domain}/"));
+    args
+}
+
+/// Retry a health probe. Returns `Ok(code)` on the first healthy
+/// status, or `Err((last_code, message))` after exhausting attempts.
+/// `between` runs between attempts (not after the last) so it can be a
+/// no-op in tests.
+fn probe_with_retries<P, S>(
+    retry: u32,
+    mut prober: P,
+    mut between: S,
+) -> Result<u16, (Option<u16>, String)>
+where
+    P: FnMut() -> Result<u16, String>,
+    S: FnMut(),
+{
+    let attempts = retry.max(1);
+    let mut last_code = None;
+    let mut last_msg = "no probe attempts were made".to_owned();
+    for attempt in 0..attempts {
+        match prober() {
+            Ok(code) if is_healthy_status(code) => return Ok(code),
+            Ok(code) => {
+                last_code = Some(code);
+                last_msg = format!("unhealthy HTTP status {code}");
+            }
+            Err(err) => last_msg = err,
+        }
+        if attempt.saturating_add(1) < attempts {
+            between();
+        }
+    }
+    Err((last_code, last_msg))
+}
+
+/// Run `fastly <args>` in `cwd`, inheriting stdio, and map a non-zero
+/// exit to an error.
+fn run_fastly_status(fastly_args: &[String], cwd: &Path) -> Result<(), String> {
+    let status = Command::new("fastly")
+        .args(fastly_args)
+        .current_dir(cwd)
+        .status()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to run fastly CLI: {err}")
+            }
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`fastly {}` exited with status {status}",
+            fastly_args.join(" ")
+        ))
+    }
+}
+
+/// Run `fastly <args>` in `cwd` capturing stdout+stderr (combined) for
+/// version parsing. Errors on a non-zero exit.
+fn run_fastly_capture(fastly_args: &[String], cwd: &Path) -> Result<String, String> {
+    let output = Command::new("fastly")
+        .args(fastly_args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                format!("`fastly` not found on PATH; {FASTLY_INSTALL_HINT}")
+            } else {
+                format!("failed to run fastly CLI: {err}")
+            }
+        })?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    if output.status.success() {
+        Ok(combined)
+    } else {
+        Err(format!(
+            "`fastly {}` exited with status {}\n{}",
+            fastly_args.join(" "),
+            output.status,
+            combined.trim()
+        ))
+    }
+}
+
+/// Run `curl -sS --config -`, piping `config` (which carries the
+/// `Fastly-Key` header + url) through stdin so the token never touches
+/// argv. Returns stdout on a zero exit.
+fn curl_config_capture(config: &str) -> Result<String, String> {
+    let mut child = Command::new("curl")
+        .args(["-sS", "--config", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            if err.kind() == ErrorKind::NotFound {
+                "`curl` not found on PATH; install curl and retry".to_owned()
+            } else {
+                format!("failed to spawn `curl`: {err}")
+            }
+        })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open stdin pipe to `curl`".to_owned())?;
+    stdin
+        .write_all(config.as_bytes())
+        .map_err(|err| format!("failed to write curl config to stdin: {err}"))?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait on `curl`: {err}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!(
+            "`curl` exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+/// `GET https://api.fastly.com<path>` with the `Fastly-Key` header;
+/// returns the response body.
+fn fastly_api_get(path: &str, token: &str) -> Result<String, String> {
+    let config =
+        format!("header = \"Fastly-Key: {token}\"\nurl = \"https://api.fastly.com{path}\"\n");
+    curl_config_capture(&config)
+}
+
+/// `POST https://api.fastly.com<path>` with the `Fastly-Key` header;
+/// returns the HTTP status, erroring on non-2xx.
+fn fastly_api_post(path: &str, token: &str) -> Result<u16, String> {
+    let config = format!(
+        "request = \"POST\"\nheader = \"Fastly-Key: {token}\"\nurl = \"https://api.fastly.com{path}\"\noutput = \"/dev/null\"\nwrite-out = \"%{{http_code}}\"\n"
+    );
+    let out = curl_config_capture(&config)?;
+    let code: u16 = out.trim().parse().map_err(|err| {
+        format!(
+            "could not parse HTTP status from curl output {:?}: {err}",
+            out.trim()
+        )
+    })?;
+    if (200..300).contains(&code) {
+        Ok(code)
+    } else {
+        Err(format!("Fastly API POST {path} returned HTTP {code}"))
+    }
+}
+
+/// `deploy --adapter fastly --service-id <id> --stage` (spec §5.4):
+/// build, upload to a new draft version (no activation), stage it, and
+/// emit `version=<N>`.
+fn deploy_staged(args: &[String]) -> Result<(), String> {
+    let service_id = resolve_service_id(args)?;
+    // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
+    // with a clear message when it's missing rather than deep in a
+    // `fastly compute update` error.
+    require_token()?;
+
+    let manifest =
+        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    let manifest_dir = manifest
+        .parent()
+        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
+    let extra = args_without_flag_value(args, "--service-id");
+
+    // 1. Build the wasm package (no deploy / activation).
+    run_fastly_status(
+        &[
+            "compute".to_owned(),
+            "build".to_owned(),
+            "--non-interactive".to_owned(),
+        ],
+        manifest_dir,
+    )?;
+
+    // 2. Clone the active version into a new draft and upload the
+    //    package to it — `--autoclone` + `--version=active` keeps
+    //    production traffic on the currently-active version.
+    let mut update = vec![
+        "compute".to_owned(),
+        "update".to_owned(),
+        "--autoclone".to_owned(),
+        format!("--service-id={service_id}"),
+        "--version=active".to_owned(),
+        "--non-interactive".to_owned(),
+    ];
+    update.extend(extra);
+    let update_out = run_fastly_capture(&update, manifest_dir)?;
+
+    // Resolve the new draft version: parse the update output, falling
+    // back to the highest version reported by the Fastly API.
+    let version = if let Some(version) = parse_fastly_version(&update_out) {
+        version
+    } else {
+        let token = require_token()?;
+        let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
+        parse_latest_version(&json).ok_or_else(|| {
+            format!(
+                "could not determine the staged version from `fastly compute update` output or the Fastly API; raw output:\n{update_out}"
+            )
+        })?
+    };
+
+    // 3. Mark the draft version staged (no activation).
+    run_fastly_status(
+        &[
+            "service-version".to_owned(),
+            "stage".to_owned(),
+            format!("--service-id={service_id}"),
+            format!("--version={version}"),
+        ],
+        manifest_dir,
+    )?;
+
+    // 4. Emit the staged version (spec §5.4.2 parseable contract).
+    log::info!("version={version}");
+    Ok(())
+}
+
+/// Production companion to `deploy` (spec §5.4.2): resolve the active
+/// service version via the Fastly API and emit `version=<N>`.
+fn emit_active_version(args: &[String]) -> Result<(), String> {
+    let service_id = resolve_service_id(args)?;
+    let token = require_token()?;
+    let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
+    let version = parse_active_version(&json).ok_or_else(|| {
+        format!("could not resolve the active version for service {service_id} from the Fastly API")
+    })?;
+    log::info!("version={version}");
+    Ok(())
+}
+
+/// `healthcheck --adapter fastly ...` (spec §5.4): probe the domain
+/// (production) or the version's staging IP (`--staging`), retrying up
+/// to `--retry` times. Emits `status-code` / `healthy` and returns
+/// `Err` (non-zero exit) when unhealthy after retries.
+fn healthcheck(args: &[String]) -> Result<(), String> {
+    let domain =
+        arg_value(args, "--domain").ok_or_else(|| "healthcheck requires --domain".to_owned())?;
+    let retry = arg_value(args, "--retry")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3_u32);
+    let retry_delay = arg_value(args, "--retry-delay")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_u64);
+    let timeout = arg_value(args, "--timeout")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_u64);
+
+    let staging_ip = if arg_flag(args, "--staging") {
+        let service_id = resolve_service_id(args)?;
+        let version = arg_value(args, "--version")
+            .ok_or_else(|| "staging healthcheck requires --version".to_owned())?;
+        let token = require_token()?;
+        let json = fastly_api_get(
+            &format!("/service/{service_id}/version/{version}/domain?include=staging_ips"),
+            &token,
+        )?;
+        Some(parse_staging_ip(&json).ok_or_else(|| {
+            format!("no staging IP found for service {service_id} version {version}")
+        })?)
+    } else {
+        None
+    };
+
+    let curl_args = build_curl_probe_args(domain, staging_ip.as_deref(), timeout);
+    let delay = Duration::from_secs(retry_delay);
+    let outcome = probe_with_retries(retry, || curl_status(&curl_args), || thread::sleep(delay));
+    match outcome {
+        Ok(code) => {
+            log::info!("status-code={code}");
+            log::info!("healthy=true");
+            Ok(())
+        }
+        Err((last_code, msg)) => {
+            if let Some(code) = last_code {
+                log::info!("status-code={code}");
+            }
+            log::info!("healthy=false");
+            Err(format!(
+                "healthcheck for {domain} failed after {} attempt(s): {msg}",
+                retry.max(1)
+            ))
+        }
+    }
+}
+
+/// Run a single `curl` health probe, returning the HTTP status. A
+/// transport failure (timeout, DNS, refused) surfaces as `Err` so the
+/// retry loop treats it as an unhealthy attempt.
+fn curl_status(args: &[String]) -> Result<u16, String> {
+    let output = Command::new("curl").args(args).output().map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            "`curl` not found on PATH; install curl and retry".to_owned()
+        } else {
+            format!("failed to spawn `curl`: {err}")
+        }
+    })?;
+    if !output.status.success() {
+        return Err(format!(
+            "curl transport failure (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim().parse::<u16>().map_err(|err| {
+        format!(
+            "could not parse HTTP status from curl output {:?}: {err}",
+            stdout.trim()
+        )
+    })
+}
+
+/// `rollback --adapter fastly ...` (spec §5.4): production activates
+/// `<version> - 1`; staging deactivates `<version>`.
+fn rollback(args: &[String]) -> Result<(), String> {
+    let service_id = resolve_service_id(args)?;
+    let version_str =
+        arg_value(args, "--version").ok_or_else(|| "rollback requires --version".to_owned())?;
+    let version: u64 = version_str.parse().map_err(|err| {
+        format!("--version must be a positive integer, got {version_str:?}: {err}")
+    })?;
+    let token = require_token()?;
+
+    if arg_flag(args, "--staging") {
+        fastly_api_post(
+            &format!("/service/{service_id}/version/{version}/deactivate"),
+            &token,
+        )?;
+        log::info!(
+            "[edgezero] deactivated staged version {version} on Fastly service {service_id}"
+        );
+    } else {
+        let previous = previous_version(version).ok_or_else(|| {
+            format!("cannot roll back version {version}: no previous version exists")
+        })?;
+        fastly_api_post(
+            &format!("/service/{service_id}/version/{previous}/activate"),
+            &token,
+        )?;
+        log::info!("rolled-back-to={previous}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1439,6 +1989,221 @@ mod tests {
                 None => env::remove_var("PATH"),
             }
         }
+    }
+
+    // ── Fastly staging lifecycle helpers (spec §5.4) ──────────────────
+
+    #[test]
+    fn arg_value_reads_flag_value() {
+        let args = vec![
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+            "--version".to_owned(),
+            "42".to_owned(),
+        ];
+        assert_eq!(arg_value(&args, "--service-id"), Some("SVC1"));
+        assert_eq!(arg_value(&args, "--version"), Some("42"));
+        assert_eq!(arg_value(&args, "--missing"), None);
+    }
+
+    #[test]
+    fn arg_value_none_when_flag_is_last() {
+        let args = vec!["--version".to_owned()];
+        assert_eq!(arg_value(&args, "--version"), None);
+    }
+
+    #[test]
+    fn arg_flag_detects_presence() {
+        let args = vec!["--staging".to_owned()];
+        assert!(arg_flag(&args, "--staging"));
+        assert!(!arg_flag(&args, "--nope"));
+    }
+
+    #[test]
+    fn args_without_flag_value_strips_pair() {
+        let args = vec![
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+            "--comment".to_owned(),
+            "ci".to_owned(),
+        ];
+        assert_eq!(
+            args_without_flag_value(&args, "--service-id"),
+            vec!["--comment".to_owned(), "ci".to_owned()]
+        );
+    }
+
+    #[test]
+    fn resolve_service_id_prefers_flag() {
+        let args = vec!["--service-id".to_owned(), "SVC_FROM_ARG".to_owned()];
+        assert_eq!(resolve_service_id(&args).unwrap(), "SVC_FROM_ARG");
+    }
+
+    #[test]
+    fn is_healthy_status_covers_2xx_3xx() {
+        assert!(is_healthy_status(200));
+        assert!(is_healthy_status(204));
+        assert!(is_healthy_status(301));
+        assert!(is_healthy_status(399));
+        assert!(!is_healthy_status(400));
+        assert!(!is_healthy_status(500));
+        assert!(!is_healthy_status(199));
+    }
+
+    #[test]
+    fn previous_version_computes_predecessor() {
+        assert_eq!(previous_version(42), Some(41));
+        assert_eq!(previous_version(2), Some(1));
+        assert_eq!(previous_version(1), None);
+        assert_eq!(previous_version(0), None);
+    }
+
+    #[test]
+    fn parse_fastly_version_handles_common_shapes() {
+        assert_eq!(
+            parse_fastly_version("SUCCESS: Deployed package (service abc, version 7)"),
+            Some(7)
+        );
+        assert_eq!(parse_fastly_version("Cloned to version=12"), Some(12));
+        // The LAST version mention wins (the freshly-created draft).
+        assert_eq!(
+            parse_fastly_version("Cloning version 3... created version 4"),
+            Some(4)
+        );
+        assert_eq!(parse_fastly_version("no numbers here"), None);
+    }
+
+    #[test]
+    fn parse_active_version_finds_active_entry() {
+        let json = r#"[
+            {"number": 1, "active": false},
+            {"number": 2, "active": true},
+            {"number": 3, "active": false}
+        ]"#;
+        assert_eq!(parse_active_version(json), Some(2));
+    }
+
+    #[test]
+    fn parse_active_version_none_when_no_active() {
+        let json = r#"[{"number": 1, "active": false}]"#;
+        assert_eq!(parse_active_version(json), None);
+    }
+
+    #[test]
+    fn parse_latest_version_returns_max_number() {
+        let json = r#"[{"number": 1},{"number": 5},{"number": 3}]"#;
+        assert_eq!(parse_latest_version(json), Some(5));
+    }
+
+    #[test]
+    fn parse_staging_ip_finds_nested_ip() {
+        // Array of domain objects, each carrying a staging_ips array.
+        let json = r#"[
+            {"name": "example.com", "staging_ips": ["151.101.2.10", "151.101.66.10"]}
+        ]"#;
+        assert_eq!(parse_staging_ip(json).as_deref(), Some("151.101.2.10"));
+    }
+
+    #[test]
+    fn parse_staging_ip_none_when_absent() {
+        let json = r#"[{"name": "example.com"}]"#;
+        assert_eq!(parse_staging_ip(json), None);
+    }
+
+    #[test]
+    fn build_curl_probe_args_production_has_no_connect_to() {
+        let args = build_curl_probe_args("example.com", None, 10);
+        assert!(!args.iter().any(|a| a == "--connect-to"));
+        assert!(args.contains(&"https://example.com/".to_owned()));
+        assert!(args.contains(&"--max-time".to_owned()));
+        assert!(args.contains(&"10".to_owned()));
+    }
+
+    #[test]
+    fn build_curl_probe_args_staging_reroutes_to_ip() {
+        let args = build_curl_probe_args("staging.example.com", Some("151.101.2.10"), 15);
+        let idx = args
+            .iter()
+            .position(|a| a == "--connect-to")
+            .expect("--connect-to present for staging");
+        assert_eq!(args[idx + 1], "::151.101.2.10:443");
+        assert!(args.contains(&"https://staging.example.com/".to_owned()));
+    }
+
+    #[test]
+    fn probe_with_retries_returns_first_healthy() {
+        let mut calls = 0;
+        let mut between = 0;
+        let result = probe_with_retries(
+            5,
+            || {
+                calls += 1;
+                Ok(200)
+            },
+            || between += 1,
+        );
+        assert_eq!(result, Ok(200));
+        assert_eq!(calls, 1, "should stop after first healthy probe");
+        assert_eq!(between, 0, "no delay before the first attempt");
+    }
+
+    #[test]
+    fn probe_with_retries_succeeds_after_unhealthy_attempts() {
+        let mut calls = 0;
+        let mut between = 0;
+        let result = probe_with_retries(
+            5,
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Ok(503)
+                } else {
+                    Ok(200)
+                }
+            },
+            || between += 1,
+        );
+        assert_eq!(result, Ok(200));
+        assert_eq!(calls, 3);
+        assert_eq!(
+            between, 2,
+            "delay runs between each of the first 3 attempts"
+        );
+    }
+
+    #[test]
+    fn probe_with_retries_exhausts_and_reports_last_code() {
+        let mut between = 0;
+        let result = probe_with_retries(3, || Ok(500), || between += 1);
+        assert_eq!(
+            result,
+            Err((Some(500), "unhealthy HTTP status 500".to_owned()))
+        );
+        assert_eq!(
+            between, 2,
+            "delay runs between attempts, not after the last"
+        );
+    }
+
+    #[test]
+    fn probe_with_retries_reports_transport_error() {
+        let result: Result<u16, (Option<u16>, String)> =
+            probe_with_retries(1, || Err("connection refused".to_owned()), || {});
+        assert_eq!(result, Err((None, "connection refused".to_owned())));
+    }
+
+    #[test]
+    fn probe_with_retries_treats_zero_retry_as_one_attempt() {
+        let mut calls = 0;
+        let _ = probe_with_retries(
+            0,
+            || {
+                calls += 1;
+                Ok(500)
+            },
+            || {},
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

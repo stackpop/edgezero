@@ -33,6 +33,9 @@ pub enum Command {
     Demo,
     /// Deploy to a target edge.
     Deploy(DeployArgs),
+    /// Probe a deployed version's health (Fastly staging lifecycle,
+    /// spec §5.4). Exits non-zero when unhealthy after retries.
+    Healthcheck(HealthcheckArgs),
     /// Create a new `EdgeZero` app skeleton (multi-crate workspace).
     New(NewArgs),
     /// Create the platform resources backing the declared
@@ -40,6 +43,9 @@ pub enum Command {
     /// own dispatch: cloudflare shells out to `wrangler`, fastly to
     /// `fastly`, spin edits `spin.toml` in-place, axum is a no-op.
     Provision(ProvisionArgs),
+    /// Roll a service back to a previous version, or deactivate a
+    /// staged version (Fastly staging lifecycle, spec §5.4).
+    Rollback(RollbackArgs),
     /// Run a local simulation (adapter-specific).
     Serve(ServeArgs),
 }
@@ -148,6 +154,19 @@ pub struct DeployArgs {
     /// Arguments passed through to the adapter deploy command.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub adapter_args: Vec<String>,
+    /// Platform service id the deploy targets. Consumed by the Fastly
+    /// staging lifecycle (spec §5.4): production deploy passes it
+    /// through to `fastly compute deploy` and resolves the activated
+    /// version; `--stage` uses it to clone + stage a draft version.
+    /// Adapters that don't need a service id ignore it.
+    #[arg(long)]
+    pub service_id: Option<String>,
+    /// Stage a draft version instead of activating (Fastly only, spec
+    /// §5.4): builds and uploads to a new draft service version cloned
+    /// from the active one, marks it staged, and emits the staged
+    /// version. Non-Fastly adapters reject `--stage`.
+    #[arg(long)]
+    pub stage: bool,
 }
 
 /// Arguments for the `new` command.
@@ -203,6 +222,65 @@ pub struct ServeArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
+}
+
+/// Arguments for the `healthcheck` command (Fastly staging lifecycle,
+/// spec §5.4).
+///
+/// No `Default` impl (like `AuthArgs`): `--adapter` is required and
+/// the numeric flags carry clap defaults that a derived `Default`
+/// would zero out. Tests exercise it through clap parsing instead.
+#[derive(clap::Args, Debug)]
+#[non_exhaustive]
+pub struct HealthcheckArgs {
+    /// Target adapter name.
+    #[arg(long = "adapter", required = true)]
+    pub adapter: String,
+    /// Public domain to probe.
+    #[arg(long)]
+    pub domain: Option<String>,
+    /// Total number of attempts before declaring the probe unhealthy.
+    #[arg(long, default_value_t = 3)]
+    pub retry: u32,
+    /// Seconds to wait between attempts.
+    #[arg(long = "retry-delay", default_value_t = 5)]
+    pub retry_delay: u64,
+    /// Platform service id to probe.
+    #[arg(long)]
+    pub service_id: Option<String>,
+    /// Probe the staged version via its resolved staging IP rather
+    /// than the live production endpoint.
+    #[arg(long)]
+    pub staging: bool,
+    /// Per-attempt connect/read timeout in seconds.
+    #[arg(long, default_value_t = 10)]
+    pub timeout: u64,
+    /// Service version to probe (threaded from a prior deploy/stage).
+    #[arg(long)]
+    pub version: Option<String>,
+}
+
+/// Arguments for the `rollback` command (Fastly staging lifecycle,
+/// spec §5.4).
+///
+/// No `Default` impl (like `AuthArgs`): `--adapter` is required.
+#[derive(clap::Args, Debug)]
+#[non_exhaustive]
+pub struct RollbackArgs {
+    /// Target adapter name.
+    #[arg(long = "adapter", required = true)]
+    pub adapter: String,
+    /// Platform service id to roll back.
+    #[arg(long)]
+    pub service_id: Option<String>,
+    /// Roll back the staged version (deactivate) instead of the
+    /// production version (activate previous).
+    #[arg(long)]
+    pub staging: bool,
+    /// Reference version: production activates `<version> - 1`;
+    /// staging deactivates `<version>`.
+    #[arg(long)]
+    pub version: Option<String>,
 }
 
 /// Output format for `config diff`.
@@ -663,6 +741,170 @@ mod tests {
     fn provision_requires_adapter() {
         Args::try_parse_from(["edgezero", "provision"])
             .expect_err("`provision` without --adapter must error");
+    }
+
+    // ── Fastly staging lifecycle arg tests (spec §5.4) ─────────────────
+
+    #[test]
+    fn deploy_stage_flag_defaults_false() {
+        let args = Args::try_parse_from(["edgezero", "deploy", "--adapter", "fastly"])
+            .expect("parse deploy");
+        let Command::Deploy(deploy) = args.cmd else {
+            panic!("expected Command::Deploy");
+        };
+        assert!(!deploy.stage);
+        assert!(deploy.service_id.is_none());
+    }
+
+    #[test]
+    fn deploy_parses_service_id_and_stage() {
+        // Mirrors the spec §5.4 invocation:
+        // `<cli> deploy --adapter fastly --service-id <id> --stage`.
+        let args = Args::try_parse_from([
+            "edgezero",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC123",
+            "--stage",
+        ])
+        .expect("parse deploy --service-id --stage");
+        let Command::Deploy(deploy) = args.cmd else {
+            panic!("expected Command::Deploy");
+        };
+        assert!(deploy.stage);
+        assert_eq!(deploy.service_id.as_deref(), Some("SVC123"));
+        assert!(deploy.adapter_args.is_empty());
+    }
+
+    #[test]
+    fn deploy_service_id_and_stage_coexist_with_passthrough() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "deploy",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC123",
+            "--",
+            "--comment",
+            "ci build",
+        ])
+        .expect("parse deploy with passthrough");
+        let Command::Deploy(deploy) = args.cmd else {
+            panic!("expected Command::Deploy");
+        };
+        assert_eq!(deploy.service_id.as_deref(), Some("SVC123"));
+        assert!(!deploy.stage);
+        assert_eq!(deploy.adapter_args, vec!["--comment", "ci build"]);
+    }
+
+    #[test]
+    fn healthcheck_parses_full_flags() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC123",
+            "--version",
+            "42",
+            "--domain",
+            "staging.example.com",
+            "--staging",
+            "--retry",
+            "7",
+            "--retry-delay",
+            "2",
+            "--timeout",
+            "15",
+        ])
+        .expect("parse healthcheck");
+        let Command::Healthcheck(hc) = args.cmd else {
+            panic!("expected Command::Healthcheck");
+        };
+        assert_eq!(hc.adapter, "fastly");
+        assert_eq!(hc.service_id.as_deref(), Some("SVC123"));
+        assert_eq!(hc.version.as_deref(), Some("42"));
+        assert_eq!(hc.domain.as_deref(), Some("staging.example.com"));
+        assert!(hc.staging);
+        assert_eq!(hc.retry, 7);
+        assert_eq!(hc.retry_delay, 2);
+        assert_eq!(hc.timeout, 15);
+    }
+
+    #[test]
+    fn healthcheck_defaults_retry_delay_timeout() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--domain",
+            "example.com",
+        ])
+        .expect("parse healthcheck with defaults");
+        let Command::Healthcheck(hc) = args.cmd else {
+            panic!("expected Command::Healthcheck");
+        };
+        assert!(!hc.staging);
+        assert_eq!(hc.retry, 3);
+        assert_eq!(hc.retry_delay, 5);
+        assert_eq!(hc.timeout, 10);
+    }
+
+    #[test]
+    fn healthcheck_requires_adapter() {
+        Args::try_parse_from(["edgezero", "healthcheck", "--domain", "example.com"])
+            .expect_err("`healthcheck` without --adapter must error");
+    }
+
+    #[test]
+    fn rollback_parses_flags() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC123",
+            "--version",
+            "42",
+            "--staging",
+        ])
+        .expect("parse rollback");
+        let Command::Rollback(rb) = args.cmd else {
+            panic!("expected Command::Rollback");
+        };
+        assert_eq!(rb.adapter, "fastly");
+        assert_eq!(rb.service_id.as_deref(), Some("SVC123"));
+        assert_eq!(rb.version.as_deref(), Some("42"));
+        assert!(rb.staging);
+    }
+
+    #[test]
+    fn rollback_staging_defaults_false() {
+        let args = Args::try_parse_from([
+            "edgezero",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--version",
+            "9",
+        ])
+        .expect("parse rollback without --staging");
+        let Command::Rollback(rb) = args.cmd else {
+            panic!("expected Command::Rollback");
+        };
+        assert!(!rb.staging);
+    }
+
+    #[test]
+    fn rollback_requires_adapter() {
+        Args::try_parse_from(["edgezero", "rollback", "--version", "9"])
+            .expect_err("`rollback` without --adapter must error");
     }
 
     // ── config push / diff stub tests (12.8 + 12.11) ──────────────────
