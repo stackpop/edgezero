@@ -137,7 +137,9 @@ main() {
     fail "cache is enabled but Cargo.lock was not found at the Cargo workspace root ($cargo_ws_root); exact-key caching requires Cargo.lock"
   fi
   lock_hash="none"
-  [[ -f "$lockfile" ]] && lock_hash=$(sha256_file "$lockfile")
+  if [[ -f "$lockfile" ]]; then
+    lock_hash=$(sha256_file "$lockfile")
+  fi
   target_dir="$cargo_ws_root/target"
 
   local rust_toolchain effective_build_mode cache_key

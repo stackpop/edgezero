@@ -6,7 +6,11 @@ set -euo pipefail
 
 remove_if_present() {
   local dir="$1"
-  [[ -n "$dir" && -d "$dir" ]] && rm -rf "$dir"
+  # Always return success: an absent dir is not an error, and this runs under
+  # `set -e` where a bare `[[…]] && rm` would exit non-zero when the dir is gone.
+  if [[ -n "$dir" && -d "$dir" ]]; then
+    rm -rf "$dir"
+  fi
 }
 
 main() {

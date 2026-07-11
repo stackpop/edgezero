@@ -39,5 +39,7 @@ while IFS= read -r line; do
   esac
 done < <(grep -rEn '^[[:space:]]*(-[[:space:]]+)?uses:' "${files[@]}" 2>/dev/null || true)
 
-[[ "$status" -eq 0 ]] && echo "all third-party action references are pinned to a concrete ref"
+if [[ "$status" -eq 0 ]]; then
+  echo "all third-party action references are pinned to a concrete ref"
+fi
 exit "$status"
