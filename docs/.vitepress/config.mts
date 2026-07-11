@@ -60,6 +60,10 @@ export default defineConfig({
           { text: 'CLI Reference', link: '/guide/cli-reference' },
           { text: 'CLI Walkthrough', link: '/guide/cli-walkthrough' },
           {
+            text: 'Deploying from GitHub Actions',
+            link: '/guide/deploy-github-actions',
+          },
+          {
             text: 'Manifest Store Migration',
             link: '/guide/manifest-store-migration',
           },

@@ -203,7 +203,7 @@ reference to port from. Most transfer with light changes:
      the downstream CLI template so app CLIs expose them.
 
 9. **Docs**
-   - Rewrite `docs/guide/deploy-github-actions.md` around the three-layer model,
+   - Write `docs/guide/deploy-github-actions.md` around the three-layer model,
      general EdgeZero-app-repo adoption, and the Fastly staging lifecycle.
    - Document the app-provided CLI package build, artifact reuse, credential
      scoping, adapter layering, staging trio, and non-goals.
