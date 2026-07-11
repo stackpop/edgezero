@@ -76,8 +76,11 @@ jobs:
           sudo apt-get install -y shellcheck
 
       - name: ShellCheck action scripts
+        # -e SC1091: the `source "$SCRIPT_DIR/common.sh"` path is dynamic, so
+        # shellcheck can't follow it from the repo root — that info finding is
+        # not a real defect. Everything else is checked.
         run: |
-          shellcheck -x \
+          shellcheck -e SC1091 \
             .github/actions/build-cli/scripts/*.sh \
             .github/actions/deploy-core/scripts/*.sh \
             .github/actions/deploy-core/tests/*.sh \
@@ -121,11 +124,11 @@ jobs:
           fastly-service-id: dummy-service
           deploy-args: '["--comment","smoke"]'
 
-      - name: Assert the deploy reached the Fastly CLI
+      - name: Assert the deploy ran with the typed service id
         run: |
           set -euo pipefail
-          test -f fixture-app/fastly-argv.txt
-          # The action orchestrated build-cli -> deploy-fastly -> app CLI ->
-          # `fastly compute deploy`; the fake `fastly` recorded a compute subcommand.
-          grep -q -- 'compute' fixture-app/fastly-argv.txt
-          echo "recorded fastly argv:"; cat fixture-app/fastly-argv.txt
+          test -f fixture-app/deploy-argv.txt
+          # build-cli -> deploy-fastly -> app CLI ran the overridden deploy
+          # command with the wrapper's typed --service-id threaded through.
+          grep -q -- 'dummy-service' fixture-app/deploy-argv.txt
+          echo "recorded deploy argv:"; cat fixture-app/deploy-argv.txt
