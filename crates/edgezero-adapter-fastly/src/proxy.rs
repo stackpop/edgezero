@@ -46,15 +46,25 @@ fn build_fastly_request(method: Method, uri: &Uri, headers: &HeaderMap) -> Fastl
     let mut fastly_request = FastlyRequest::new(method.clone(), uri.to_string());
     fastly_request.set_method(method);
 
+    // Append (not set) so a multi-value client header survives; `Host` below is
+    // set explicitly as a single value.
     for (name, value) in headers {
         if name.as_str().eq_ignore_ascii_case("host") {
             continue;
         }
-        fastly_request.set_header(name.as_str(), value.clone());
+        fastly_request.append_header(name.as_str(), value.clone());
     }
 
+    // Build `Host` from host + explicit port so a non-default target port is
+    // preserved (origin-form fidelity) WITHOUT leaking any `user:pass@` userinfo
+    // that `uri.authority()` would include. (Backend connection + TLS SNI still
+    // key off `uri.host()` in `ensure_backend`.)
     if let Some(host) = uri.host() {
-        fastly_request.set_header("Host", host);
+        let value = match uri.port() {
+            Some(port) => format!("{host}:{}", port.as_str()),
+            None => host.to_owned(),
+        };
+        fastly_request.set_header("Host", value.as_str());
     }
 
     fastly_request
@@ -64,9 +74,13 @@ fn convert_response(fastly_response: &mut FastlyResponse) -> ProxyResponse {
     let status = fastly_response.get_status();
     let mut proxy_response = ProxyResponse::new(status, Body::empty());
 
-    for header in fastly_response.get_header_names() {
-        if let Some(value) = fastly_response.get_header(header) {
-            proxy_response.headers_mut().insert(header, value.clone());
+    // Preserve multi-value ORIGIN response headers (e.g. Set-Cookie): read ALL
+    // values per name and append, instead of first-value + insert (which
+    // replaced). `get_header_names()` yields `&HeaderName`, usable for both
+    // `get_header_all` and `append`.
+    for name in fastly_response.get_header_names() {
+        for value in fastly_response.get_header_all(name) {
+            proxy_response.headers_mut().append(name, value.clone());
         }
     }
 
@@ -210,6 +224,23 @@ mod tests {
                 out
             }),
         }
+    }
+
+    #[test]
+    fn convert_response_preserves_multi_value_set_cookie() {
+        let mut fastly_response = FastlyResponse::from_status(200);
+        fastly_response.append_header("set-cookie", "a=1");
+        fastly_response.append_header("set-cookie", "b=2");
+
+        let proxy_response = convert_response(&mut fastly_response);
+
+        let cookies: Vec<String> = proxy_response
+            .headers()
+            .get_all("set-cookie")
+            .into_iter()
+            .map(|value| value.to_str().expect("utf8").to_owned())
+            .collect();
+        assert_eq!(cookies, vec!["a=1".to_owned(), "b=2".to_owned()]);
     }
 
     #[test]

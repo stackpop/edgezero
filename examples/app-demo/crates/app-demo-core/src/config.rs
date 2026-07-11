@@ -123,16 +123,16 @@ mod tests {
 
     #[test]
     fn secret_fields_metadata_matches_declarations() {
-        let mut by_name: Vec<(&str, SecretKind)> = AppDemoConfig::SECRET_FIELDS
-            .iter()
-            .map(|f| (f.name, f.kind))
+        let mut by_path: Vec<(String, SecretKind)> = AppDemoConfig::secret_fields()
+            .into_iter()
+            .map(|f| (f.dotted_path(), f.kind))
             .collect();
-        by_name.sort_by_key(|(name, _)| *name);
+        by_path.sort_by_key(|(path, _)| path.clone());
         assert_eq!(
-            by_name,
+            by_path,
             vec![
-                ("api_token", SecretKind::KeyInDefault),
-                ("vault", SecretKind::StoreRef),
+                ("api_token".to_owned(), SecretKind::KeyInDefault),
+                ("vault".to_owned(), SecretKind::StoreRef),
             ],
         );
     }

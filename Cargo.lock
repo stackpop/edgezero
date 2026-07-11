@@ -824,7 +824,9 @@ dependencies = [
 name = "edgezero-macros"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "edgezero-core",
+ "futures",
  "log",
  "proc-macro2",
  "quote",
