@@ -130,7 +130,10 @@ runs:
         path: ${{ steps.resolve.outputs['cache-path'] }}
 
     - name: Install Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      # Trusted, widely-used action; a readable major-version tag pin is our
+      # policy (design principle #9). zizmor's blanket policy wants a hash pin —
+      # allow the tag here explicitly with justification.
+      uses: actions-rust-lang/setup-rust-toolchain@v1 # zizmor: ignore[unpinned-uses]
       with:
         toolchain: ${{ steps.resolve.outputs['rust-toolchain'] }}
         target: wasm32-wasip1

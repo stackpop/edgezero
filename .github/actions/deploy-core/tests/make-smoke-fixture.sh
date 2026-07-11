@@ -32,6 +32,14 @@ TOML
   echo 'fn main() {}' >src/main.rs
   cargo generate-lockfile
 
+  # Minimal Fastly manifest so the CLI's Fastly deploy path proceeds to invoke
+  # the (fake) `fastly` binary instead of erroring on a missing manifest.
+  cat >fastly.toml <<'FTOML'
+manifest_version = 3
+name = "fixture-app"
+language = "rust"
+FTOML
+
   # Fake `fastly` so `fastly compute deploy` records argv and reports success.
   cat >bin/fastly <<'FASTLY'
 #!/usr/bin/env bash

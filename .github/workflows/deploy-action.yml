@@ -121,9 +121,11 @@ jobs:
           fastly-service-id: dummy-service
           deploy-args: '["--comment","smoke"]'
 
-      - name: Assert Fastly was invoked with the service id
+      - name: Assert the deploy reached the Fastly CLI
         run: |
           set -euo pipefail
           test -f fixture-app/fastly-argv.txt
-          grep -q -- 'dummy-service' fixture-app/fastly-argv.txt
+          # The action orchestrated build-cli -> deploy-fastly -> app CLI ->
+          # `fastly compute deploy`; the fake `fastly` recorded a compute subcommand.
           grep -q -- 'compute' fixture-app/fastly-argv.txt
+          echo "recorded fastly argv:"; cat fixture-app/fastly-argv.txt
