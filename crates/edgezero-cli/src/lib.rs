@@ -176,12 +176,69 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         // package to a new draft, mark it staged, and emit the staged
         // version (spec §5.4). Never runs the manifest `deploy`
         // command, which would activate production.
+        //
+        // Thread the manifest-configured Fastly manifest path (resolved
+        // from `[adapters.<adapter>.adapter].manifest` relative to the
+        // `EDGEZERO_MANIFEST`-honoring manifest root) so the staged
+        // deploy targets the app the operator selected — not whichever
+        // `fastly.toml` a bare working-directory search finds first in a
+        // monorepo. The adapter falls back to a cwd search only when the
+        // manifest declares no adapter `manifest` key.
+        let mut staged: Vec<String> = Vec::new();
+        if let Some(manifest_path) = resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)
+        {
+            staged.push("--manifest-path".to_owned());
+            staged.push(manifest_path);
+        }
+        staged.extend(passthrough);
         return adapter::execute(
             &args.adapter,
             adapter::Action::DeployStaged,
             manifest.as_ref(),
-            &passthrough,
+            &staged,
         );
+    }
+
+    // Production deploy also emits the activated version (spec §5.4.2)
+    // so the deploy-fastly action can surface `fastly-version` and the
+    // deploy→healthcheck→rollback chain has a real version to thread.
+    //
+    // Resolution precedence (cheapest + most reliable first):
+    //   1. The deploy command's OWN output. We tee it (echoed live to
+    //      the operator, captured for us) and look for a canonical
+    //      `version=<N>` line, then for Fastly's native phrasing
+    //      ("... version 12"). The deploy command already knows the
+    //      version it activated, so this needs no API round-trip and
+    //      works under a manifest `[adapters.fastly.commands].deploy`
+    //      override (including test fixtures with dummy credentials).
+    //   2. Only when the output yields nothing: the Fastly API lookup
+    //      (`EmitVersion`), which needs a live API + a real token.
+    //   3. If BOTH fail: a clear `Err`. We never silently emit an empty
+    //      version — that was the original finding.
+    if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
+        let captured = adapter::execute_capture(
+            &args.adapter,
+            adapter::Action::Deploy,
+            manifest.as_ref(),
+            &passthrough,
+        )?;
+        if let Some(version) = captured.as_deref().and_then(parse_deploy_version) {
+            log::info!("version={version}");
+            return Ok(());
+        }
+        return adapter::execute(
+            &args.adapter,
+            adapter::Action::EmitVersion,
+            manifest.as_ref(),
+            &passthrough,
+        )
+        .map_err(|err| {
+            format!(
+                "deploy succeeded but the activated version could not be resolved: no `version=<N>` \
+                 (or Fastly `version <N>`) line in the deploy output, and the Fastly API fallback \
+                 failed: {err}"
+            )
+        });
     }
 
     adapter::execute(
@@ -189,27 +246,76 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
         adapter::Action::Deploy,
         manifest.as_ref(),
         &passthrough,
-    )?;
+    )
+}
 
-    // Production deploy also emits the activated version (spec §5.4.2)
-    // so the deploy-fastly action can surface `fastly-version`. This
-    // is Fastly-specific and best-effort: it only runs with a known
-    // service id, and a failure to resolve the version must NOT fail
-    // an already-activated deploy — the version is a convenience
-    // output, not the deploy's success criterion.
-    if args.service_id.is_some() && args.adapter.eq_ignore_ascii_case("fastly") {
-        if let Err(err) = adapter::execute(
-            &args.adapter,
-            adapter::Action::EmitVersion,
-            manifest.as_ref(),
-            &passthrough,
-        ) {
-            log::warn!(
-                "[edgezero] deploy succeeded but resolving the activated version failed: {err}"
-            );
+/// Parse an activated service version out of a deploy command's output.
+///
+/// Precedence:
+///   1. A canonical `version=<N>` line (what a manifest
+///      `[adapters.fastly.commands].deploy` override — or a CI fixture —
+///      emits, and what `EdgeZero` itself prints).
+///   2. Fastly's native phrasing, e.g.
+///      `SUCCESS: Deployed package (service abc, version 12)`. The LAST
+///      mention wins, which is the version the deploy ended on.
+///
+/// Returns `None` when neither shape is present, which sends the caller
+/// to the Fastly API fallback.
+#[cfg(feature = "cli")]
+fn parse_deploy_version(output: &str) -> Option<u64> {
+    parse_canonical_version_line(output).or_else(|| parse_native_version_mention(output))
+}
+
+/// Last `version=<N>` line in `output` (leading/trailing whitespace on
+/// the line is ignored).
+#[cfg(feature = "cli")]
+fn parse_canonical_version_line(output: &str) -> Option<u64> {
+    output.lines().rev().find_map(|line| {
+        let digits: String = line
+            .trim()
+            .strip_prefix("version=")?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse::<u64>().ok()
+    })
+}
+
+/// Last `version <N>` mention anywhere in `output` (case-insensitive),
+/// covering Fastly's `Deployed package (service abc, version 12)`.
+#[cfg(feature = "cli")]
+fn parse_native_version_mention(output: &str) -> Option<u64> {
+    let lower = output.to_ascii_lowercase();
+    let mut result = None;
+    for (idx, _) in lower.match_indices("version") {
+        let after = idx.saturating_add("version".len());
+        let Some(rest) = lower.get(after..) else {
+            continue;
+        };
+        let digits: String = rest
+            .chars()
+            .skip_while(|ch| !ch.is_ascii_digit())
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(parsed) = digits.parse::<u64>() {
+            result = Some(parsed);
         }
     }
-    Ok(())
+    result
+}
+
+/// Resolve the absolute path of the adapter's platform manifest
+/// (`[adapters.<adapter>.adapter].manifest`) relative to the manifest
+/// root. Returns `None` when there is no loaded manifest, no root, no
+/// entry for the adapter, or no `manifest` key. Used by the Fastly
+/// staged deploy to target the operator-selected app in a monorepo.
+#[cfg(feature = "cli")]
+fn resolve_adapter_manifest_path(loader: Option<&ManifestLoader>, adapter: &str) -> Option<String> {
+    let manifest = loader?.manifest();
+    let root = manifest.root()?;
+    let (_canonical, cfg) = manifest.adapter_entry(adapter)?;
+    let rel = cfg.adapter.manifest.as_deref()?;
+    Some(root.join(rel).to_string_lossy().into_owned())
 }
 
 /// Probe a deployed version's health (Fastly staging lifecycle, spec
@@ -227,28 +333,25 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
 pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
-    let mut passthrough: Vec<String> = Vec::new();
-    if let Some(service_id) = &args.service_id {
-        passthrough.push("--service-id".to_owned());
-        passthrough.push(service_id.clone());
-    }
-    if let Some(version) = &args.version {
-        passthrough.push("--version".to_owned());
-        passthrough.push(version.clone());
-    }
-    if let Some(domain) = &args.domain {
-        passthrough.push("--domain".to_owned());
-        passthrough.push(domain.clone());
-    }
+    let mut passthrough: Vec<String> = vec![
+        "--service-id".to_owned(),
+        args.service_id.clone(),
+        "--version".to_owned(),
+        args.version.clone(),
+        "--domain".to_owned(),
+        args.domain.clone(),
+    ];
     if args.staging {
         passthrough.push("--staging".to_owned());
     }
-    passthrough.push("--retry".to_owned());
-    passthrough.push(args.retry.to_string());
-    passthrough.push("--retry-delay".to_owned());
-    passthrough.push(args.retry_delay.to_string());
-    passthrough.push("--timeout".to_owned());
-    passthrough.push(args.timeout.to_string());
+    passthrough.extend([
+        "--retry".to_owned(),
+        args.retry.to_string(),
+        "--retry-delay".to_owned(),
+        args.retry_delay.to_string(),
+        "--timeout".to_owned(),
+        args.timeout.to_string(),
+    ]);
     adapter::execute(
         &args.adapter,
         adapter::Action::Healthcheck,
@@ -271,15 +374,12 @@ pub fn run_healthcheck(args: &HealthcheckArgs) -> Result<(), String> {
 pub fn run_rollback(args: &RollbackArgs) -> Result<(), String> {
     let manifest = load_manifest_optional()?;
     ensure_adapter_defined(&args.adapter, manifest.as_ref())?;
-    let mut passthrough: Vec<String> = Vec::new();
-    if let Some(service_id) = &args.service_id {
-        passthrough.push("--service-id".to_owned());
-        passthrough.push(service_id.clone());
-    }
-    if let Some(version) = &args.version {
-        passthrough.push("--version".to_owned());
-        passthrough.push(version.clone());
-    }
+    let mut passthrough: Vec<String> = vec![
+        "--service-id".to_owned(),
+        args.service_id.clone(),
+        "--version".to_owned(),
+        args.version.clone(),
+    ];
     if args.staging {
         passthrough.push("--staging".to_owned());
     }
@@ -465,6 +565,46 @@ mod tests {
             .expect("load result")
             .expect("manifest present");
         assert!(manifest.manifest().adapters.contains_key("fastly"));
+    }
+
+    // ── deploy-output version parsing (spec §5.4.2) ───────────────────
+
+    #[test]
+    fn parse_deploy_version_reads_canonical_line() {
+        // What a manifest `[adapters.fastly.commands].deploy` override
+        // (or a CI fixture running with dummy creds) emits. Must be
+        // parsed WITHOUT any Fastly API round-trip.
+        let output = "building...\nversion=7\ndone\n";
+        assert_eq!(parse_deploy_version(output), Some(7));
+    }
+
+    #[test]
+    fn parse_deploy_version_reads_fastly_native_phrasing() {
+        let output = "SUCCESS: Deployed package (service abc123, version 12)\n";
+        assert_eq!(parse_deploy_version(output), Some(12));
+    }
+
+    #[test]
+    fn parse_deploy_version_none_when_absent_triggers_fallback() {
+        // No version anywhere -> `None`, which routes run_deploy to the
+        // Fastly API fallback (and to a clear Err if that also fails).
+        let output = "Building package...\nUploading...\nAll good.\n";
+        assert_eq!(parse_deploy_version(output), None);
+        assert_eq!(parse_deploy_version(""), None);
+    }
+
+    #[test]
+    fn parse_deploy_version_prefers_canonical_over_native_mention() {
+        // A fixture that both narrates a clone AND emits the canonical
+        // line: the canonical line is authoritative.
+        let output = "Cloning version 3...\nversion=9\n";
+        assert_eq!(parse_deploy_version(output), Some(9));
+    }
+
+    #[test]
+    fn parse_deploy_version_native_takes_last_mention() {
+        let output = "Cloning version 3... created version 4\n";
+        assert_eq!(parse_deploy_version(output), Some(4));
     }
 
     #[test]

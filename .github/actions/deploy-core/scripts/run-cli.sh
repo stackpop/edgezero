@@ -5,9 +5,15 @@ set -euo pipefail
 #
 # Provider-neutral: it invokes `<cli-bin> <mode> --adapter <adapter>` with the
 # wrapper's typed deploy-flags (before `--`) and the caller's passthrough
-# deploy-args (after `--`). Credential scoping is the wrapper's job, done with
-# step-level `env:`; this script only clears the wrapper-named aliases during a
-# credential-free build.
+# deploy-args (after `--`).
+#
+# Credential boundary (deploy mode): the wrapper never exports provider tokens
+# onto the step directly. It passes DEPLOY_PROVIDER_ENV (a JSON object of typed
+# credential name -> value) plus a provider-env-clear name list. This script
+# first UNSETS every clear-listed alias (removing any inherited FASTLY_* value),
+# then exports only the typed values from DEPLOY_PROVIDER_ENV — and only names
+# that are declared in the clear list. So inherited endpoint/token aliases can
+# never survive into the deploy. Build mode is credential-free and only clears.
 #
 # Inputs (environment):
 #   EDGEZERO_CLI_BIN            required  binary name to invoke (on PATH)
@@ -17,7 +23,8 @@ set -euo pipefail
 #   DEPLOY_BUILD_ARGS_FILE     optional  NUL-delimited build passthrough (build)
 #   DEPLOY_FLAGS_FILE          optional  NUL-delimited typed flags     (deploy)
 #   DEPLOY_ARGS_FILE           optional  NUL-delimited passthrough     (deploy)
-#   DEPLOY_PROVIDER_ENV_CLEAR_FILE optional NUL-delimited env names to clear (build)
+#   DEPLOY_PROVIDER_ENV_CLEAR_FILE optional NUL-delimited env names to clear
+#   DEPLOY_PROVIDER_ENV        optional  JSON object of typed creds     (deploy)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -46,6 +53,45 @@ clear_named_aliases() {
       unset "$name" || true
     fi
   done <"$file"
+}
+
+# Return 0 if <name> appears in the NUL-delimited clear-list file.
+name_in_clear_list() {
+  local wanted="$1" file="$2" name
+  [[ -s "$file" ]] || return 1
+  while IFS= read -r -d '' name; do
+    [[ "$name" == "$wanted" ]] && return 0
+  done <"$file"
+  return 1
+}
+
+# Clear the provider aliases, then export ONLY the typed values from
+# DEPLOY_PROVIDER_ENV whose names are declared in the clear list. jq parses the
+# JSON, so values are opaque data (never interpreted by the shell).
+import_provider_env() {
+  local clear_file="$1"
+  local json="${DEPLOY_PROVIDER_ENV:-}"
+  [[ -n "$json" ]] || json='{}'
+  clear_named_aliases "$clear_file"
+
+  require_cmd jq
+  require_cmd base64
+  printf '%s' "$json" | jq -e 'type == "object"' >/dev/null 2>&1 ||
+    fail "DEPLOY_PROVIDER_ENV must be a JSON object of string values"
+  printf '%s' "$json" | jq -e 'all(.[]; type == "string")' >/dev/null 2>&1 ||
+    fail "every DEPLOY_PROVIDER_ENV value must be a string"
+
+  # One "NAME BASE64VALUE" line per entry. Base64 keeps values line-safe
+  # (newlines, spaces, quotes cannot break the read loop) and opaque.
+  local name b64 value
+  while read -r name b64; do
+    [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+      fail "DEPLOY_PROVIDER_ENV name '$name' is not a valid environment variable name"
+    name_in_clear_list "$name" "$clear_file" ||
+      fail "DEPLOY_PROVIDER_ENV name '$name' must be declared in provider-env-clear"
+    value=$(printf '%s' "$b64" | base64 --decode)
+    export "$name=$value"
+  done < <(printf '%s' "$json" | jq -r 'to_entries[] | "\(.key) \(.value | @base64)"')
 }
 
 # Build the CLI argv for `build` mode into the global ARGV array.
@@ -92,7 +138,11 @@ main() {
 
   case "$mode" in
     build) build_build_argv "$cli_bin" "$adapter" ;;
-    deploy) build_deploy_argv "$cli_bin" "$adapter" ;;
+    deploy)
+      # Clear inherited provider aliases and export only the typed credentials.
+      import_provider_env "${DEPLOY_PROVIDER_ENV_CLEAR_FILE:-/dev/null}"
+      build_deploy_argv "$cli_bin" "$adapter"
+      ;;
   esac
 
   if [[ -n "$manifest" ]]; then

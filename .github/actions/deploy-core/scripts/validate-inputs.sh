@@ -68,6 +68,7 @@ main() {
   local adapter="${INPUT_ADAPTER:-}"
   local build_mode="${INPUT_BUILD_MODE:-auto}"
   local cache="${INPUT_CACHE:-false}"
+  local stage="${INPUT_STAGE:-false}"
   local deploy_arg_allow="${INPUT_DEPLOY_ARG_ALLOW:-}"
 
   require_supported_runner "${EDGEZERO_RUNNER_OS:-}" "${EDGEZERO_RUNNER_ARCH:-}"
@@ -83,6 +84,11 @@ main() {
   case "$cache" in
     true | false) ;;
     *) fail "input 'cache' must be exactly 'true' or 'false'" ;;
+  esac
+  # A typo here must never silently fall back to a production deploy.
+  case "$stage" in
+    true | false) ;;
+    *) fail "input 'stage' must be exactly 'true' or 'false'" ;;
   esac
 
   require_cmd jq

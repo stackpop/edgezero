@@ -55,11 +55,22 @@ runs:
         SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         VERSION: ${{ inputs['fastly-version'] }}
         DEPLOY_TO: ${{ inputs['deploy-to'] }}
+        # Only the typed token reaches the CLI; blank any inherited alias.
         FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
       run: |
+        # A typo in deploy-to must never silently roll back production.
+        case "$DEPLOY_TO" in production | staging) ;; *) echo "::error::input 'deploy-to' must be 'production' or 'staging' (got '$DEPLOY_TO')"; exit 1 ;; esac
         log="${RUNNER_TEMP:-/tmp}/edgezero-rollback.log"
         args=("$CLI_BIN" rollback --adapter fastly --service-id "$SERVICE_ID" --version "$VERSION")
-        [[ "$DEPLOY_TO" == "staging" ]] && args+=(--staging)
+        if [[ "$DEPLOY_TO" == "staging" ]]; then args+=(--staging); fi
         rc=0
         "${args[@]}" 2>&1 | tee "$log" || rc=$?
         rolled=$(grep -oE '^rolled-back-to=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)

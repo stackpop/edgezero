@@ -157,13 +157,29 @@ Outputs: `cli-version`, `cli-package`, `cli-bin`, `artifact-name`.
 
 Outputs: `fastly-version`, `source-revision`, `cli-version`.
 
+## Strict lifecycle values (fail closed)
+
+`stage` and `deploy-to` are validated exactly, and a bad value **fails the run**
+rather than falling back to production:
+
+- `stage` must be exactly `true` or `false`.
+- `deploy-to` must be exactly `production` or `staging`.
+
+A typo like `stage: True` or `deploy-to: Staging` is rejected up front — it will
+never silently deploy to, probe, or roll back production.
+
 ## Credentials
 
-Fastly credentials are typed inputs, not workflow `env:`. The engine binds the
-token to the deploy step's own environment only — setup and build steps never see
-it, and it never reaches outputs, caches, logs, or step summaries. Do not
-duplicate provider credentials in `env:`; prefer provider-managed runtime secret
-stores for application secrets.
+Fastly credentials are typed inputs, not workflow `env:`. Setup and build steps
+never see the token, and it never reaches outputs, caches, logs, or step
+summaries. Do not duplicate provider credentials in `env:`; prefer
+provider-managed runtime secret stores for application secrets.
+
+The deploy step enforces a hard credential boundary: before the CLI runs, every
+known provider alias (`FASTLY_TOKEN`, `FASTLY_ENDPOINT`, `FASTLY_API_URL`, …) is
+**cleared**, and only the typed values you passed are exported. An inherited
+`FASTLY_ENDPOINT` or `FASTLY_TOKEN` from the surrounding workflow cannot reach
+the deploy.
 
 Deploy runs trusted application code: because Fastly's default `build-mode:
 never` lets `fastly compute deploy` build during deploy, the application is

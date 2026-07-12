@@ -96,6 +96,7 @@ main() {
   require_cmd rustup
   require_cmd jq
   require_cmd tar
+  validate_artifact_name "$artifact_name"
 
   # Resolve the application directory beneath github.workspace.
   local workspace_real app_dir
@@ -143,7 +144,8 @@ main() {
     '{"cli-bin": $bin, "cli-version": $version, "cli-package": $package}' \
     >"$stage_root/cli-meta.json"
 
-  local tarball="$stage_root/../${artifact_name}.tar"
+  # Fixed tarball name — never derive a path component from caller input.
+  local tarball="$stage_root/../edgezero-cli.tar"
   tar -C "$stage_root" -cf "$tarball" "$cli_bin" cli-meta.json
   tarball=$(canonical_path "$tarball")
 

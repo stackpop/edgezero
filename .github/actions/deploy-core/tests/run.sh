@@ -73,6 +73,7 @@ run_validate_inputs() {
     INPUT_DEPLOY_FLAGS="${VALIDATE_DEPLOY_FLAGS:-[]}" \
     INPUT_PROVIDER_ENV_CLEAR="${VALIDATE_PROVIDER_ENV_CLEAR:-[]}" \
     INPUT_DEPLOY_ARG_ALLOW="${VALIDATE_ALLOW:-}" \
+    INPUT_STAGE="${VALIDATE_STAGE:-false}" \
     EDGEZERO_ACTION_STATE_DIR="$state_dir" \
     GITHUB_OUTPUT="$state_dir/output.txt" \
     bash "$CORE_SCRIPTS/validate-inputs.sh"
@@ -83,12 +84,75 @@ test_validate_inputs() {
   VALIDATE_ADAPTER=fastly assert_succeeds "accepts a well-formed adapter" run_validate_inputs
   VALIDATE_ADAPTER=FASTLY assert_fails "rejects a malformed adapter" run_validate_inputs
   VALIDATE_CACHE=maybe assert_fails "rejects a non-boolean cache" run_validate_inputs
+  VALIDATE_STAGE=true assert_succeeds "accepts stage=true" run_validate_inputs
+  VALIDATE_STAGE=True assert_fails "rejects a non-boolean stage (typo -> no silent prod)" run_validate_inputs
   VALIDATE_DEPLOY_ARGS='["--comment","hi"]' VALIDATE_ALLOW='--comment' \
     assert_succeeds "allows an allowlisted deploy-arg (--comment)" run_validate_inputs
   VALIDATE_DEPLOY_ARGS='["--service-id","x"]' VALIDATE_ALLOW='--comment' \
     assert_fails "rejects a non-allowlisted deploy-arg (--service-id)" run_validate_inputs
   VALIDATE_DEPLOY_ARGS='"not-an-array"' assert_fails "rejects non-array deploy-args" run_validate_inputs
   VALIDATE_BUILD_ARGS='[1,2]' assert_fails "rejects non-string build-args" run_validate_inputs
+}
+
+# ---------------------------------------------------------------------------
+# build-cli artifact-name — never usable as a path traversal
+# ---------------------------------------------------------------------------
+check_artifact_name() {
+  # Run validate_artifact_name from build-cli's common.sh in a subshell.
+  bash -c 'source "$1"; validate_artifact_name "$2"' _ \
+    "$ACTIONS_DIR/build-cli/scripts/common.sh" "$1"
+}
+
+test_artifact_name() {
+  section "build-cli artifact-name"
+  assert_succeeds "accepts a conservative artifact name" check_artifact_name "edgezero-cli.v1"
+  assert_fails "rejects path traversal ('../x')" check_artifact_name "../x"
+  assert_fails "rejects path separators ('a/b')" check_artifact_name "a/b"
+  assert_fails "rejects a leading dot" check_artifact_name ".hidden"
+  assert_fails "rejects an empty name" check_artifact_name ""
+}
+
+# ---------------------------------------------------------------------------
+# run-cli.sh — provider-env credential boundary
+# ---------------------------------------------------------------------------
+# A fake CLI records the FASTLY_* it actually saw; run-cli must clear inherited
+# aliases and export only the declared, typed values.
+test_provider_env_boundary() {
+  section "run-cli provider-env boundary"
+
+  local bin_dir="$WORK_DIR/pe-bin" app_dir="$WORK_DIR/pe-app"
+  local seen="$WORK_DIR/pe-seen.txt" clear="$WORK_DIR/pe-clear.nul"
+  mkdir -p "$bin_dir" "$app_dir"
+  cat >"$bin_dir/fakecli" <<EOF
+#!/usr/bin/env bash
+{
+  printf 'TOKEN=%s\n' "\${FASTLY_API_TOKEN-unset}"
+  printf 'ENDPOINT=%s\n' "\${FASTLY_ENDPOINT-unset}"
+} >"$seen"
+EOF
+  chmod +x "$bin_dir/fakecli"
+  printf 'FASTLY_API_TOKEN\0FASTLY_ENDPOINT\0' >"$clear"
+
+  run_deploy_pe() {
+    env -i PATH="$bin_dir:$PATH" \
+      EDGEZERO_CLI_BIN=fakecli EDGEZERO_ADAPTER=fastly \
+      EDGEZERO_WORKING_DIRECTORY="$app_dir" \
+      DEPLOY_PROVIDER_ENV_CLEAR_FILE="$clear" \
+      DEPLOY_PROVIDER_ENV="$1" \
+      FASTLY_API_TOKEN=inherited-BAD FASTLY_ENDPOINT=https://inherited.invalid \
+      bash "$CORE_SCRIPTS/run-cli.sh" deploy
+  }
+
+  if run_deploy_pe '{"FASTLY_API_TOKEN":"typed-tok"}' >/dev/null 2>&1; then
+    assert_equals "typed token wins; inherited endpoint cleared" \
+      $'TOKEN=typed-tok\nENDPOINT=unset' "$(cat "$seen")"
+  else
+    fail "run-cli deploy (provider-env) failed to execute"
+  fi
+
+  # A provider-env name not declared in provider-env-clear is rejected.
+  assert_fails "rejects an undeclared provider-env name" \
+    run_deploy_pe '{"FASTLY_TOKEN":"x"}'
 }
 
 # ---------------------------------------------------------------------------
@@ -191,7 +255,9 @@ test_fastly_versions() {
 # ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
+  test_artifact_name
   test_run_cli_argv
+  test_provider_env_boundary
   test_download_cli_metadata
   test_fastly_versions
 

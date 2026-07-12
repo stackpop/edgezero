@@ -103,3 +103,17 @@ read_tool_version() {
 sanitize_ref() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.=-' '-'
 }
+
+# Reject an artifact name that could escape the action-owned staging directory
+# when used as a path component: no separators, no traversal, no leading dot,
+# only a conservative character set.
+validate_artifact_name() {
+  local name="$1"
+  [[ -n "$name" ]] || fail "input 'artifact-name' must not be empty"
+  case "$name" in
+    */* | *\\* | *..*) fail "input 'artifact-name' must not contain path separators or '..': '$name'" ;;
+    .*) fail "input 'artifact-name' must not start with '.': '$name'" ;;
+  esac
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    fail "input 'artifact-name' may contain only letters, digits, '.', '_', '-': '$name'"
+}

@@ -99,6 +99,9 @@ jobs:
 
   composite-smoke:
     runs-on: ubuntu-24.04
+    # An inherited provider alias the deploy MUST clear (provider-env boundary).
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
     steps:
       - uses: actions/checkout@v4
         with:
@@ -116,6 +119,7 @@ jobs:
         run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
 
       - name: Deploy fixture (production) with local action
+        id: deploy
         uses: ./.github/actions/deploy-fastly
         with:
           cli-artifact: ${{ steps.cli.outputs.artifact-name }}
@@ -124,11 +128,20 @@ jobs:
           fastly-service-id: dummy-service
           deploy-args: '["--comment","smoke"]'
 
-      - name: Assert the deploy command ran
+      - name: Assert end-to-end deploy, version threading, and credential boundary
+        env:
+          FASTLY_VERSION_OUT: ${{ steps.deploy.outputs['fastly-version'] }}
         run: |
           set -euo pipefail
-          # The marker file exists only if build-cli -> deploy-fastly -> the app
-          # CLI ran the overridden Fastly deploy command end to end.
+          # 1) The whole chain ran: build-cli -> deploy-fastly -> app CLI -> the
+          #    overridden Fastly deploy command.
           test -f fixture-app/deploy-argv.txt
-          echo "deploy marker present; recorded argv:"
-          cat fixture-app/deploy-argv.txt
+          test -f fixture-app/env-seen.txt
+          echo "recorded argv:"; cat fixture-app/deploy-argv.txt
+          echo "credentials the deploy saw:"; cat fixture-app/env-seen.txt
+          # 2) fastly-version threaded out of the action.
+          [[ "$FASTLY_VERSION_OUT" == "7" ]] || { echo "::error::expected fastly-version=7, got '$FASTLY_VERSION_OUT'"; exit 1; }
+          # 3) provider-env boundary: typed creds present, inherited alias cleared.
+          grep -qx 'token=dummy-token' fixture-app/env-seen.txt || { echo "::error::typed FASTLY_API_TOKEN not delivered"; exit 1; }
+          grep -qx 'service-id=dummy-service' fixture-app/env-seen.txt || { echo "::error::typed FASTLY_SERVICE_ID not delivered"; exit 1; }
+          grep -qx 'endpoint=CLEARED' fixture-app/env-seen.txt || { echo "::error::inherited FASTLY_ENDPOINT was NOT cleared before deploy"; exit 1; }

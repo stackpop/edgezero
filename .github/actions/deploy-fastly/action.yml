@@ -68,8 +68,9 @@ runs:
         INPUT_BUILD_ARGS: ${{ inputs['build-args'] }}
         INPUT_DEPLOY_ARGS: ${{ inputs['deploy-args'] }}
         INPUT_DEPLOY_ARG_ALLOW: "--comment"
+        INPUT_STAGE: ${{ inputs.stage }}
         INPUT_DEPLOY_FLAGS: ${{ inputs.stage == 'true' && format('["--service-id","{0}","--stage"]', inputs['fastly-service-id']) || format('["--service-id","{0}"]', inputs['fastly-service-id']) }}
-        INPUT_PROVIDER_ENV_CLEAR: '["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT"]'
+        INPUT_PROVIDER_ENV_CLEAR: '["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_HOME"]'
         INPUT_FASTLY_API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
         INPUT_FASTLY_SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         EDGEZERO_RUNNER_OS: ${{ runner.os }}
@@ -83,6 +84,8 @@ runs:
       run: |
         [[ "${INPUT_FASTLY_API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
         [[ -n "${INPUT_FASTLY_SERVICE_ID}" ]] || { echo "::error::missing required input 'fastly-service-id'"; exit 1; }
+        [[ "${INPUT_FASTLY_SERVICE_ID}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::input 'fastly-service-id' must match ^[A-Za-z0-9_-]+$"; exit 1; }
+        # validate-inputs.sh also rejects a non-boolean 'stage' before any deploy.
         "$GITHUB_ACTION_PATH/../deploy-core/scripts/validate-inputs.sh"
 
     - name: Download CLI artifact
@@ -175,13 +178,24 @@ runs:
         EDGEZERO_MANIFEST_PATH: ${{ steps.resolve.outputs['manifest'] }}
         DEPLOY_FLAGS_FILE: ${{ steps.validate.outputs['deploy-flags-file'] }}
         DEPLOY_ARGS_FILE: ${{ steps.validate.outputs['deploy-args-file'] }}
-        FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
-        FASTLY_SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        # Credential boundary: pass the typed values as data (not as FASTLY_*
+        # aliases). run-cli.sh clears every provider-env-clear alias — including
+        # any inherited FASTLY_ENDPOINT/FASTLY_TOKEN — and then exports only these.
+        DEPLOY_PROVIDER_ENV_CLEAR_FILE: ${{ steps.validate.outputs['provider-env-clear-file'] }}
+        EDGEZERO_FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        EDGEZERO_FASTLY_SERVICE_ID: ${{ inputs['fastly-service-id'] }}
       run: |
         set -o pipefail
+        command -v jq >/dev/null || { echo "::error::jq is required"; exit 1; }
+        DEPLOY_PROVIDER_ENV=$(jq -n \
+          --arg t "$EDGEZERO_FASTLY_API_TOKEN" \
+          --arg s "$EDGEZERO_FASTLY_SERVICE_ID" \
+          '{FASTLY_API_TOKEN: $t, FASTLY_SERVICE_ID: $s}')
+        export DEPLOY_PROVIDER_ENV
         log="${RUNNER_TEMP:-/tmp}/edgezero-deploy.log"
         "$GITHUB_ACTION_PATH/../deploy-core/scripts/run-cli.sh" deploy 2>&1 | tee "$log"
         version=$(grep -oE '^version=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)
+        [[ -n "$version" ]] || { echo "::error::deploy reported success but emitted no fastly-version"; exit 1; }
         echo "fastly-version=${version}" >> "$GITHUB_OUTPUT"
 
     - name: Save application target cache

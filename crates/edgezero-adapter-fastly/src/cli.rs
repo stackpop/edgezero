@@ -1710,19 +1710,108 @@ fn curl_config_capture(config: &str) -> Result<String, String> {
     }
 }
 
+/// Wrap `value` in a curl-config double-quoted string, escaping the
+/// characters that would otherwise let a value terminate its quote and
+/// inject additional curl options. Within a curl `--config` file a
+/// double-quoted value only honours the escapes `\\`, `\"`, `\n`, `\r`,
+/// `\t` (and the config is parsed line-by-line, so a raw newline ends
+/// the directive regardless of quoting). We escape backslash and quote
+/// so the value cannot break out of the quotes, and map raw control
+/// characters to their escape form so NO raw newline (or CR/tab) is
+/// ever written into the config file. This is the second half of the
+/// injection defence: untrusted identifiers are also validated (see
+/// `validate_service_id` / `validate_version_str` / `validate_domain`),
+/// but the token is a secret we cannot constrain to a charset, so it
+/// relies on this escaping alone.
+fn curl_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().saturating_add(2));
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Validate an operator-supplied Fastly service id before it is
+/// interpolated into an API URL. Fastly service ids are opaque
+/// alphanumeric handles; constrain to `^[A-Za-z0-9_-]+$` so a value
+/// carrying a quote / newline / space (which could inject curl options
+/// via the `--config` file) is rejected with a clear error.
+fn validate_service_id(id: &str) -> Result<(), String> {
+    if !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid service id {id:?}: expected only ASCII letters, digits, `_`, or `-`"
+        ))
+    }
+}
+
+/// Validate a service-version string is a plain non-negative integer
+/// before it is interpolated into an API URL. Returns the parsed value
+/// so callers can reuse it.
+fn validate_version_str(version: &str) -> Result<u64, String> {
+    version.parse::<u64>().map_err(|err| {
+        format!("invalid version {version:?}: expected a non-negative integer: {err}")
+    })
+}
+
+/// Validate a domain is a plausible hostname before it is placed into a
+/// `curl` URL. Rejects anything outside the DNS label charset
+/// (`[A-Za-z0-9-.]`), empty / over-long values, leading/trailing dots,
+/// and empty labels so an injected quote / slash / space / newline
+/// cannot smuggle curl options or a second URL.
+fn validate_domain(domain: &str) -> Result<(), String> {
+    let charset_ok = domain
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.');
+    let shape_ok = !domain.is_empty()
+        && domain.len() <= 253
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..");
+    if charset_ok && shape_ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid domain {domain:?}: expected a hostname like `example.com`"
+        ))
+    }
+}
+
 /// `GET https://api.fastly.com<path>` with the `Fastly-Key` header;
-/// returns the response body.
+/// returns the response body. Both the header (carrying the secret
+/// token) and the URL are written through `curl_quote` so neither can
+/// inject curl options into the `--config` document.
 fn fastly_api_get(path: &str, token: &str) -> Result<String, String> {
-    let config =
-        format!("header = \"Fastly-Key: {token}\"\nurl = \"https://api.fastly.com{path}\"\n");
+    let header = curl_quote(&format!("Fastly-Key: {token}"));
+    let url = curl_quote(&format!("https://api.fastly.com{path}"));
+    let config = format!("header = {header}\nurl = {url}\n");
     curl_config_capture(&config)
 }
 
-/// `POST https://api.fastly.com<path>` with the `Fastly-Key` header;
-/// returns the HTTP status, erroring on non-2xx.
-fn fastly_api_post(path: &str, token: &str) -> Result<u16, String> {
+/// `PUT https://api.fastly.com<path>` with the `Fastly-Key` header;
+/// returns the HTTP status, erroring on non-2xx. Fastly's version
+/// activate/deactivate endpoints require `PUT` (not `POST`). Header and
+/// URL are escaped via `curl_quote`; the literal `request`, `output`,
+/// and `write-out` directives are fixed constants.
+fn fastly_api_put(path: &str, token: &str) -> Result<u16, String> {
+    let header = curl_quote(&format!("Fastly-Key: {token}"));
+    let url = curl_quote(&format!("https://api.fastly.com{path}"));
     let config = format!(
-        "request = \"POST\"\nheader = \"Fastly-Key: {token}\"\nurl = \"https://api.fastly.com{path}\"\noutput = \"/dev/null\"\nwrite-out = \"%{{http_code}}\"\n"
+        "request = \"PUT\"\nheader = {header}\nurl = {url}\noutput = \"/dev/null\"\nwrite-out = \"%{{http_code}}\"\n"
     );
     let out = curl_config_capture(&config)?;
     let code: u16 = out.trim().parse().map_err(|err| {
@@ -1734,8 +1823,38 @@ fn fastly_api_post(path: &str, token: &str) -> Result<u16, String> {
     if (200..300).contains(&code) {
         Ok(code)
     } else {
-        Err(format!("Fastly API POST {path} returned HTTP {code}"))
+        Err(format!("Fastly API PUT {path} returned HTTP {code}"))
     }
+}
+
+/// Resolve the directory containing the Fastly manifest for a staged
+/// deploy.
+///
+/// The CLI (`edgezero_cli::run_deploy`) resolves the `edgezero.toml`
+/// manifest — honouring `EDGEZERO_MANIFEST` — and threads the
+/// manifest-configured `[adapters.fastly.adapter].manifest` path in as
+/// `--manifest-path <abs fastly.toml>`. Prefer that so a monorepo with
+/// multiple Fastly apps stages the app the operator actually selected,
+/// rather than whichever `fastly.toml` a bare working-directory search
+/// happens to find first. Only when no `--manifest-path` is threaded
+/// (e.g. a manifest that declares Fastly commands but no adapter
+/// `manifest` key) do we fall back to the working-directory search the
+/// legacy `deploy` path used.
+fn resolve_staged_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
+    if let Some(raw) = arg_value(args, "--manifest-path") {
+        let path = PathBuf::from(raw);
+        return path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .ok_or_else(|| format!("fastly manifest path {raw:?} has no parent directory"));
+    }
+    let manifest =
+        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+    manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())
 }
 
 /// `deploy --adapter fastly --service-id <id> --stage` (spec §5.4):
@@ -1743,17 +1862,22 @@ fn fastly_api_post(path: &str, token: &str) -> Result<u16, String> {
 /// emit `version=<N>`.
 fn deploy_staged(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
+    validate_service_id(&service_id)?;
     // The Fastly CLI reads FASTLY_API_TOKEN from the env; fail fast
     // with a clear message when it's missing rather than deep in a
     // `fastly compute update` error.
     require_token()?;
 
-    let manifest =
-        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
-    let extra = args_without_flag_value(args, "--service-id");
+    let manifest_dir_buf = resolve_staged_manifest_dir(args)?;
+    let manifest_dir = manifest_dir_buf.as_path();
+    // Strip both the explicitly-threaded `--service-id` and the
+    // CLI-injected `--manifest-path` so neither is forwarded to
+    // `fastly compute update` (which doesn't understand
+    // `--manifest-path`).
+    let extra = args_without_flag_value(
+        &args_without_flag_value(args, "--service-id"),
+        "--manifest-path",
+    );
 
     // 1. Build the wasm package (no deploy / activation).
     run_fastly_status(
@@ -1813,6 +1937,7 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
 /// service version via the Fastly API and emit `version=<N>`.
 fn emit_active_version(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
+    validate_service_id(&service_id)?;
     let token = require_token()?;
     let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
     let version = parse_active_version(&json).ok_or_else(|| {
@@ -1829,6 +1954,7 @@ fn emit_active_version(args: &[String]) -> Result<(), String> {
 fn healthcheck(args: &[String]) -> Result<(), String> {
     let domain =
         arg_value(args, "--domain").ok_or_else(|| "healthcheck requires --domain".to_owned())?;
+    validate_domain(domain)?;
     let retry = arg_value(args, "--retry")
         .and_then(|value| value.parse().ok())
         .unwrap_or(3_u32);
@@ -1841,8 +1967,10 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
 
     let staging_ip = if arg_flag(args, "--staging") {
         let service_id = resolve_service_id(args)?;
-        let version = arg_value(args, "--version")
+        validate_service_id(&service_id)?;
+        let version_str = arg_value(args, "--version")
             .ok_or_else(|| "staging healthcheck requires --version".to_owned())?;
+        let version = validate_version_str(version_str)?;
         let token = require_token()?;
         let json = fastly_api_get(
             &format!("/service/{service_id}/version/{version}/domain?include=staging_ips"),
@@ -1908,26 +2036,31 @@ fn curl_status(args: &[String]) -> Result<u16, String> {
 /// `<version> - 1`; staging deactivates `<version>`.
 fn rollback(args: &[String]) -> Result<(), String> {
     let service_id = resolve_service_id(args)?;
+    validate_service_id(&service_id)?;
     let version_str =
         arg_value(args, "--version").ok_or_else(|| "rollback requires --version".to_owned())?;
-    let version: u64 = version_str.parse().map_err(|err| {
-        format!("--version must be a positive integer, got {version_str:?}: {err}")
-    })?;
+    let version = validate_version_str(version_str)?;
     let token = require_token()?;
 
     if arg_flag(args, "--staging") {
-        fastly_api_post(
-            &format!("/service/{service_id}/version/{version}/deactivate"),
+        // Staging rollback deactivates the STAGED version on the
+        // `staging` environment. Fastly's environment-scoped
+        // deactivate is `PUT .../deactivate/staging` (a plain
+        // `.../deactivate` would target the production activation).
+        fastly_api_put(
+            &format!("/service/{service_id}/version/{version}/deactivate/staging"),
             &token,
         )?;
         log::info!(
             "[edgezero] deactivated staged version {version} on Fastly service {service_id}"
         );
     } else {
+        // Production rollback re-activates the previous version.
+        // Fastly's activate endpoint requires `PUT` (not `POST`).
         let previous = previous_version(version).ok_or_else(|| {
             format!("cannot roll back version {version}: no previous version exists")
         })?;
-        fastly_api_post(
+        fastly_api_put(
             &format!("/service/{service_id}/version/{previous}/activate"),
             &token,
         )?;
@@ -2034,9 +2167,93 @@ mod tests {
     }
 
     #[test]
+    fn resolve_staged_manifest_dir_prefers_manifest_path_flag() {
+        // When the CLI threads `--manifest-path <abs fastly.toml>`, the
+        // staged deploy must use its parent directory rather than a bare
+        // working-directory search (which in a monorepo could pick a
+        // different app's fastly.toml).
+        let args = vec![
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+            "--manifest-path".to_owned(),
+            "/repo/apps/edge/fastly.toml".to_owned(),
+        ];
+        let dir = resolve_staged_manifest_dir(&args).expect("resolves from --manifest-path");
+        assert_eq!(dir, PathBuf::from("/repo/apps/edge"));
+    }
+
+    #[test]
     fn resolve_service_id_prefers_flag() {
         let args = vec!["--service-id".to_owned(), "SVC_FROM_ARG".to_owned()];
         assert_eq!(resolve_service_id(&args).unwrap(), "SVC_FROM_ARG");
+    }
+
+    // ── curl-config escaping + input validation (injection defence) ───
+
+    #[test]
+    fn curl_quote_escapes_quotes_and_backslashes() {
+        assert_eq!(curl_quote("plain"), "\"plain\"");
+        assert_eq!(curl_quote("a\"b"), "\"a\\\"b\"");
+        assert_eq!(curl_quote("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn curl_quote_never_emits_raw_control_characters() {
+        // A token carrying a `"` and a newline must not be able to
+        // terminate its quoted value and inject a second `url = "..."`
+        // directive. The `"` is escaped and the newline is folded to a
+        // `\n` escape so NO raw newline reaches the curl config file.
+        let token = "tok\"en\nurl = \"https://evil.example\"";
+        let quoted = curl_quote(token);
+        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+        assert!(!quoted.contains('\n'), "no raw newline: {quoted}");
+        assert!(!quoted.contains('\r'));
+        // The only unescaped `"` are the wrapping pair; every interior
+        // quote is preceded by a backslash.
+        assert_eq!(quoted, "\"tok\\\"en\\nurl = \\\"https://evil.example\\\"\"");
+        // A tab folds too.
+        assert_eq!(curl_quote("a\tb"), "\"a\\tb\"");
+    }
+
+    #[test]
+    fn validate_service_id_accepts_opaque_handles() {
+        validate_service_id("SU1Z0isxPaozGVKXdv0eY").expect("alphanumeric handle");
+        validate_service_id("abc_DEF-123").expect("underscore + dash handle");
+    }
+
+    #[test]
+    fn validate_service_id_rejects_injection_and_empty() {
+        // The canonical attack: a service id that closes the url value
+        // and appends a second url directive.
+        validate_service_id("abc\nurl = \"http://evil\"").expect_err("newline injection");
+        validate_service_id("abc\"def").expect_err("quote");
+        validate_service_id("has space").expect_err("space");
+        validate_service_id("has/slash").expect_err("slash");
+        validate_service_id("").expect_err("empty");
+    }
+
+    #[test]
+    fn validate_version_str_accepts_integer_rejects_junk() {
+        assert_eq!(validate_version_str("42"), Ok(42));
+        assert_eq!(validate_version_str("0"), Ok(0));
+        validate_version_str("-1").expect_err("negative");
+        validate_version_str("4.2").expect_err("float");
+        validate_version_str("42\nurl = \"x\"").expect_err("newline injection");
+        validate_version_str("").expect_err("empty");
+    }
+
+    #[test]
+    fn validate_domain_accepts_hostnames_rejects_injection() {
+        validate_domain("example.com").expect("bare hostname");
+        validate_domain("staging.example.co.uk").expect("multi-label hostname");
+        validate_domain("host-1.example.com").expect("hostname with dash");
+        validate_domain("").expect_err("empty");
+        validate_domain(".example.com").expect_err("leading dot");
+        validate_domain("example.com.").expect_err("trailing dot");
+        validate_domain("exa..mple.com").expect_err("empty label");
+        validate_domain("example.com/evil").expect_err("slash");
+        validate_domain("example.com\nurl = \"x\"").expect_err("newline injection");
+        validate_domain("has space.com").expect_err("space");
     }
 
     #[test]

@@ -236,18 +236,20 @@ pub struct HealthcheckArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
-    /// Public domain to probe.
-    #[arg(long)]
-    pub domain: Option<String>,
+    /// Public domain to probe. Required: the deploy→healthcheck→rollback
+    /// contract always threads it.
+    #[arg(long, required = true)]
+    pub domain: String,
     /// Total number of attempts before declaring the probe unhealthy.
     #[arg(long, default_value_t = 3)]
     pub retry: u32,
     /// Seconds to wait between attempts.
     #[arg(long = "retry-delay", default_value_t = 5)]
     pub retry_delay: u64,
-    /// Platform service id to probe.
-    #[arg(long)]
-    pub service_id: Option<String>,
+    /// Platform service id to probe. Required (staging resolves the
+    /// staging IP from it; production threads it for parity).
+    #[arg(long, required = true)]
+    pub service_id: String,
     /// Probe the staged version via its resolved staging IP rather
     /// than the live production endpoint.
     #[arg(long)]
@@ -256,8 +258,9 @@ pub struct HealthcheckArgs {
     #[arg(long, default_value_t = 10)]
     pub timeout: u64,
     /// Service version to probe (threaded from a prior deploy/stage).
-    #[arg(long)]
-    pub version: Option<String>,
+    /// Required so the version is never silently dropped.
+    #[arg(long, required = true)]
+    pub version: String,
 }
 
 /// Arguments for the `rollback` command (Fastly staging lifecycle,
@@ -270,17 +273,17 @@ pub struct RollbackArgs {
     /// Target adapter name.
     #[arg(long = "adapter", required = true)]
     pub adapter: String,
-    /// Platform service id to roll back.
-    #[arg(long)]
-    pub service_id: Option<String>,
+    /// Platform service id to roll back. Required.
+    #[arg(long, required = true)]
+    pub service_id: String,
     /// Roll back the staged version (deactivate) instead of the
     /// production version (activate previous).
     #[arg(long)]
     pub staging: bool,
     /// Reference version: production activates `<version> - 1`;
-    /// staging deactivates `<version>`.
-    #[arg(long)]
-    pub version: Option<String>,
+    /// staging deactivates `<version>`. Required.
+    #[arg(long, required = true)]
+    pub version: String,
 }
 
 /// Output format for `config diff`.
@@ -826,9 +829,9 @@ mod tests {
             panic!("expected Command::Healthcheck");
         };
         assert_eq!(hc.adapter, "fastly");
-        assert_eq!(hc.service_id.as_deref(), Some("SVC123"));
-        assert_eq!(hc.version.as_deref(), Some("42"));
-        assert_eq!(hc.domain.as_deref(), Some("staging.example.com"));
+        assert_eq!(hc.service_id, "SVC123");
+        assert_eq!(hc.version, "42");
+        assert_eq!(hc.domain, "staging.example.com");
         assert!(hc.staging);
         assert_eq!(hc.retry, 7);
         assert_eq!(hc.retry_delay, 2);
@@ -842,6 +845,10 @@ mod tests {
             "healthcheck",
             "--adapter",
             "fastly",
+            "--service-id",
+            "SVC123",
+            "--version",
+            "42",
             "--domain",
             "example.com",
         ])
@@ -857,8 +864,57 @@ mod tests {
 
     #[test]
     fn healthcheck_requires_adapter() {
-        Args::try_parse_from(["edgezero", "healthcheck", "--domain", "example.com"])
-            .expect_err("`healthcheck` without --adapter must error");
+        Args::try_parse_from([
+            "edgezero",
+            "healthcheck",
+            "--service-id",
+            "SVC123",
+            "--version",
+            "42",
+            "--domain",
+            "example.com",
+        ])
+        .expect_err("`healthcheck` without --adapter must error");
+    }
+
+    #[test]
+    fn healthcheck_requires_service_id_version_and_domain() {
+        // Each required lifecycle input must be present; omitting any
+        // one is a parse error (spec §5.4 deploy→healthcheck→rollback
+        // threading depends on them).
+        Args::try_parse_from([
+            "edgezero",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--version",
+            "42",
+            "--domain",
+            "example.com",
+        ])
+        .expect_err("missing --service-id must error");
+        Args::try_parse_from([
+            "edgezero",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC123",
+            "--domain",
+            "example.com",
+        ])
+        .expect_err("missing --version must error");
+        Args::try_parse_from([
+            "edgezero",
+            "healthcheck",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC123",
+            "--version",
+            "42",
+        ])
+        .expect_err("missing --domain must error");
     }
 
     #[test]
@@ -879,8 +935,8 @@ mod tests {
             panic!("expected Command::Rollback");
         };
         assert_eq!(rb.adapter, "fastly");
-        assert_eq!(rb.service_id.as_deref(), Some("SVC123"));
-        assert_eq!(rb.version.as_deref(), Some("42"));
+        assert_eq!(rb.service_id, "SVC123");
+        assert_eq!(rb.version, "42");
         assert!(rb.staging);
     }
 
@@ -891,6 +947,8 @@ mod tests {
             "rollback",
             "--adapter",
             "fastly",
+            "--service-id",
+            "SVC123",
             "--version",
             "9",
         ])
@@ -903,8 +961,37 @@ mod tests {
 
     #[test]
     fn rollback_requires_adapter() {
-        Args::try_parse_from(["edgezero", "rollback", "--version", "9"])
-            .expect_err("`rollback` without --adapter must error");
+        Args::try_parse_from([
+            "edgezero",
+            "rollback",
+            "--service-id",
+            "SVC123",
+            "--version",
+            "9",
+        ])
+        .expect_err("`rollback` without --adapter must error");
+    }
+
+    #[test]
+    fn rollback_requires_service_id_and_version() {
+        Args::try_parse_from([
+            "edgezero",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--version",
+            "9",
+        ])
+        .expect_err("missing --service-id must error");
+        Args::try_parse_from([
+            "edgezero",
+            "rollback",
+            "--adapter",
+            "fastly",
+            "--service-id",
+            "SVC123",
+        ])
+        .expect_err("missing --version must error");
     }
 
     // ── config push / diff stub tests (12.8 + 12.11) ──────────────────
