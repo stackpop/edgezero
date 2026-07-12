@@ -8,7 +8,7 @@ use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{request_builder, Request};
+use edgezero_core::http::{request_builder, Extensions, Request};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
@@ -151,6 +151,7 @@ impl<'app> FastlyService<'app> {
                 secrets,
                 ..Default::default()
             },
+            |_req, _extensions| {},
         )
     }
 
@@ -276,12 +277,31 @@ fn dispatch_core_request(
     from_core_response(response).map_err(|err| map_edge_error(&err))
 }
 
-fn dispatch_with_handles(
+/// Run an app-provided closure against a scratch `Extensions` populated from the
+/// RAW `fastly::Request` (JA4 / H2 / etc.), BEFORE `into_core_request` consumes
+/// the request. Returns the scratch bag to be `extend`ed into the core request.
+fn apply_request_extend<F>(req: &FastlyRequest, extend: F) -> Extensions
+where
+    F: FnOnce(&FastlyRequest, &mut Extensions),
+{
+    let mut scratch = Extensions::default();
+    extend(req, &mut scratch);
+    scratch
+}
+
+fn dispatch_with_handles<F>(
     app: &App,
     req: FastlyRequest,
     stores: Stores,
-) -> Result<FastlyResponse, FastlyError> {
-    let core_request = into_core_request(req).map_err(|err| map_edge_error(&err))?;
+    extend: F,
+) -> Result<FastlyResponse, FastlyError>
+where
+    F: FnOnce(&FastlyRequest, &mut Extensions),
+{
+    // Read raw-request signals into a scratch bag BEFORE conversion consumes `req`.
+    let scratch = apply_request_extend(&req, extend);
+    let mut core_request = into_core_request(req).map_err(|err| map_edge_error(&err))?;
+    core_request.extensions_mut().extend(scratch);
     dispatch_core_request(app, core_request, stores)
 }
 
@@ -292,14 +312,18 @@ fn dispatch_with_handles(
 /// id default). KV failures escalate via [`resolve_kv_handle`]'s
 /// `kv_required=true` path; missing config / secret stores degrade silently
 /// with a one-time warning.
-pub(crate) fn dispatch_with_registries(
+pub(crate) fn dispatch_with_registries<F>(
     app: &App,
     req: FastlyRequest,
     config_meta: Option<StoreMetadata>,
     kv_meta: Option<StoreMetadata>,
     secret_meta: Option<StoreMetadata>,
     env: &EnvConfig,
-) -> Result<FastlyResponse, FastlyError> {
+    extend: F,
+) -> Result<FastlyResponse, FastlyError>
+where
+    F: FnOnce(&FastlyRequest, &mut Extensions),
+{
     let kv_registry = build_kv_registry(kv_meta, env)?;
     let config_registry = build_config_registry(config_meta, env);
     let secret_registry = build_secret_registry(secret_meta, env);
@@ -312,6 +336,7 @@ pub(crate) fn dispatch_with_registries(
             secret_registry,
             ..Default::default()
         },
+        extend,
     )
 }
 
@@ -571,6 +596,65 @@ mod synthesis_tests {
 
     fn secret_handle() -> SecretHandle {
         SecretHandle::new(Arc::new(NoopSecretStore))
+    }
+
+    #[test]
+    fn apply_request_extend_populates_scratch_from_raw_request() {
+        use edgezero_core::http::Method;
+
+        #[derive(Clone, Debug, PartialEq)]
+        struct Ja4(String);
+
+        let raw = FastlyRequest::new(Method::GET, "http://example.test/");
+        let scratch = apply_request_extend(&raw, |req, extensions| {
+            // A real closure would call req.get_tls_ja4(); deriving from the URL
+            // keeps the assertion deterministic under Viceroy.
+            let marker = req.get_url_str().to_owned();
+            extensions.insert(Ja4(marker));
+        });
+
+        assert_eq!(
+            scratch.get::<Ja4>(),
+            Some(&Ja4("http://example.test/".to_owned()))
+        );
+    }
+
+    #[test]
+    fn extended_request_extensions_are_visible_to_handler() {
+        use edgezero_core::body::Body;
+        use edgezero_core::context::RequestContext;
+        use edgezero_core::http::{request_builder, Method, StatusCode};
+        use edgezero_core::router::RouterService;
+        use futures::executor::block_on;
+
+        #[derive(Clone)]
+        struct Ja4(String);
+
+        async fn handler(ctx: RequestContext) -> Result<String, EdgeError> {
+            let ja4 = ctx
+                .request()
+                .extensions()
+                .get::<Ja4>()
+                .map_or_else(|| "missing".to_owned(), |value| value.0.clone());
+            Ok(ja4)
+        }
+
+        // Mirror what `dispatch_with_handles` does: a scratch bag built from the
+        // raw request is `extend`ed into the core request before dispatch.
+        let mut scratch = Extensions::default();
+        scratch.insert(Ja4("t13d1516h2".to_owned()));
+
+        let mut core_request = request_builder()
+            .method(Method::GET)
+            .uri("/ja4")
+            .body(Body::empty())
+            .expect("request");
+        core_request.extensions_mut().extend(scratch);
+
+        let service = RouterService::builder().get("/ja4", handler).build();
+        let response = block_on(service.oneshot(core_request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body().as_bytes().expect("buffered"), b"t13d1516h2");
     }
 
     #[test]

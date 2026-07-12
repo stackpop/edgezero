@@ -1,11 +1,14 @@
 use std::env;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::extractor::{AppConfig, Headers, Json, Kv, Path, Query, Secrets, ValidatedPath};
+use edgezero_core::extractor::{
+    AppConfig, Headers, Json, Kv, Path, Query, Secrets, State, ValidatedPath,
+};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
@@ -302,6 +305,16 @@ pub async fn secrets_echo(
         .await
         .map_err(EdgeError::from)?;
     Ok(Text::new(value))
+}
+
+/// Demonstrates app-owned shared state injected via `app!(..., state = ...)`:
+/// the `State<Arc<DemoState>>` extractor resolves the value the macro-generated
+/// router registered with `RouterBuilder::with_state`.
+#[action]
+pub async fn state_demo(
+    State(state): State<Arc<crate::DemoState>>,
+) -> Result<Text<String>, EdgeError> {
+    Ok(Text::new(state.greeting.clone()))
 }
 
 #[cfg(test)]
@@ -1007,6 +1020,25 @@ mod tests {
         assert_eq!(
             String::from_utf8(collected).expect("utf8"),
             "chunk 0\nchunk 1\nchunk 2\n"
+        );
+    }
+
+    #[test]
+    fn state_demo_handler_reads_app_state_through_macro_router() {
+        // build_router() is macro-generated and now calls `.with_state(crate::app_state())`.
+        let service = crate::build_router();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/state-demo")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.body().as_bytes().expect("buffered"),
+            b"hello from app state"
         );
     }
 }
