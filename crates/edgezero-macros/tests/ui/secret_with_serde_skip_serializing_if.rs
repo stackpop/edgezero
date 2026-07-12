@@ -1,8 +1,8 @@
 //! `#[serde(skip_serializing_if = "...")]` conditionally omits the
 //! field from serialisation. Combined with `#[secret]`, that would
-//! make `config push` (which reads `SECRET_FIELDS`, then serialises
+//! make `config push` (which reads `secret_fields()`, then serialises
 //! the typed struct) drop the secret key under the condition —
-//! desyncing the on-the-wire shape from the SECRET_FIELDS invariant
+//! desyncing the on-the-wire shape from the secret_fields() invariant
 //! relies on. Reject at compile time.
 
 #[derive(serde::Deserialize, serde::Serialize, validator::Validate, edgezero_core::AppConfig)]

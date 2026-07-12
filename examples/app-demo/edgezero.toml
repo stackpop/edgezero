@@ -23,6 +23,14 @@ handler = "app_demo_core::handlers::echo"
 adapters = ["axum", "cloudflare", "fastly", "spin"]
 
 [[triggers.http]]
+id = "state-demo"
+path = "/state-demo"
+methods = ["GET"]
+handler = "app_demo_core::handlers::state_demo"
+adapters = ["axum", "cloudflare", "fastly", "spin"]
+description = "Reads app-owned state via State<Arc<DemoState>> (app!(state = ...))"
+
+[[triggers.http]]
 id = "stream"
 path = "/stream"
 methods = ["GET"]

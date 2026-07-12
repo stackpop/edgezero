@@ -25,6 +25,8 @@ use edgezero_core::app::{Hooks, StoresMetadata};
 #[cfg(feature = "fastly")]
 use edgezero_core::env_config::EnvConfig;
 #[cfg(feature = "fastly")]
+use edgezero_core::http::Extensions;
+#[cfg(feature = "fastly")]
 use edgezero_core::manifest::ResolvedLoggingConfig;
 #[cfg(feature = "fastly")]
 #[derive(Debug, Clone)]
@@ -111,15 +113,44 @@ fn logging_from_env(env: &EnvConfig) -> FastlyLogging {
 #[cfg(feature = "fastly")]
 #[inline]
 pub fn run_app<A: Hooks>(req: fastly::Request) -> Result<fastly::Response, fastly::Error> {
+    run_app_with_request_extensions::<A, _>(req, |_req, _extensions| {})
+}
+
+/// Like [`run_app`], but runs `extend` against a scratch
+/// [`Extensions`](edgezero_core::http::Extensions) populated from the raw
+/// `fastly::Request` (TLS JA4, H2 fingerprint, client IP, …) before the request
+/// is converted; the scratch values are merged into the core request's
+/// extensions and are visible to middleware and the `State`/extractor layer.
+///
+/// # Errors
+/// Returns an error if logger setup fails or any required store cannot be opened.
+#[cfg(feature = "fastly")]
+#[inline]
+pub fn run_app_with_request_extensions<A, F>(
+    req: fastly::Request,
+    extend: F,
+) -> Result<fastly::Response, fastly::Error>
+where
+    A: Hooks,
+    F: FnOnce(&fastly::Request, &mut Extensions),
+{
     let stores = A::stores();
     let env = env_config_from_runtime_dictionary(stores);
     let logging = logging_from_env(&env);
-    if logging.use_fastly_logger {
+    if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }
     let app = A::build_app();
-    request::dispatch_with_registries(&app, req, stores.config, stores.kv, stores.secrets, &env)
+    request::dispatch_with_registries(
+        &app,
+        req,
+        stores.config,
+        stores.kv,
+        stores.secrets,
+        &env,
+        extend,
+    )
 }
 
 /// Build an [`EnvConfig`] from the optional `edgezero_runtime_env`
@@ -202,7 +233,7 @@ pub fn run_app_with_config<A: Hooks>(
     req: fastly::Request,
     config_store_name: Option<&str>,
 ) -> Result<fastly::Response, fastly::Error> {
-    if logging.use_fastly_logger {
+    if logging.use_fastly_logger && !A::owns_logging() {
         let endpoint = logging.endpoint.as_deref().unwrap_or("stdout");
         init_logger(endpoint, logging.level, logging.echo_stdout)?;
     }

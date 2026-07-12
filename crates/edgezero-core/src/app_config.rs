@@ -14,11 +14,14 @@
 //!   [`load_app_config_raw_with_options`].
 
 use std::any;
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread_local;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -27,24 +30,114 @@ use toml::value::Datetime;
 use toml::Value;
 use validator::{Validate, ValidationErrors};
 
-/// Per-field metadata emitted by `#[derive(AppConfig)]`. The
-/// derive enumerates every field annotated with `#[secret]` /
-/// `#[secret(store_ref)]`; `config validate` and `config push`
-/// reflect over this array to gate secret-aware behaviour.
-pub trait AppConfigMeta {
-    /// Every `#[secret]` / `#[secret(store_ref)]` field on the struct.
-    const SECRET_FIELDS: &'static [SecretField];
+/// One segment of a [`SecretField`] path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecretPathSegment {
+    /// Every element of an array/`Vec` at this position.
+    ArrayEach,
+    /// An object key — a Rust field name, verbatim (no `serde(rename)`).
+    Field(Cow<'static, str>),
 }
 
 /// One field's worth of secret-annotation metadata.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The `path` locates the secret leaf from the config root. A top-level
+/// scalar has a length-1 path `[Field("api_token")]`.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretField {
-    /// Whether the field's value is a key in the default secret store
-    /// or the logical id of a `[stores.secrets]` entry.
+    /// Which secret-store resolution this field participates in.
     pub kind: SecretKind,
-    /// Rust field name verbatim (no `serde(rename)` translation —
-    /// `#[secret]` rejects renames at compile time).
-    pub name: &'static str,
+    /// `true` for `#[secret]` on `Option<String>`: an absent leaf is
+    /// skipped by the runtime walk instead of erroring.
+    pub optional: bool,
+    /// Path from the config root to the secret leaf.
+    pub path: Vec<SecretPathSegment>,
+}
+
+impl SecretField {
+    /// Human-readable dotted path for error messages and CLI output.
+    /// `ArrayEach` renders as `[*]` (the static form); the runtime walk
+    /// renders per-index `[n]` as it descends.
+    #[inline]
+    #[must_use]
+    pub fn dotted_path(&self) -> String {
+        let mut out = String::new();
+        for segment in &self.path {
+            match segment {
+                SecretPathSegment::Field(name) => {
+                    if !out.is_empty() {
+                        out.push('.');
+                    }
+                    out.push_str(name);
+                }
+                SecretPathSegment::ArrayEach => out.push_str("[*]"),
+            }
+        }
+        out
+    }
+}
+
+/// Per-field metadata emitted by `#[derive(AppConfig)]`. `config validate`
+/// / `config push` and the runtime secret walk reflect over this to gate
+/// secret-aware behaviour.
+pub trait AppConfigMeta {
+    /// Every `#[secret]` / `#[secret(store_ref)]` leaf on the struct,
+    /// including those reached through `#[app_config(nested)]` children,
+    /// each carrying its full path from this struct's root.
+    fn secret_fields() -> Vec<SecretField>;
+}
+
+thread_local! {
+    static SECRET_FIELDS_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII depth guard entered at the top of every derived
+/// [`AppConfigMeta::secret_fields`] body that recurses into
+/// `#[app_config(nested)]` children.
+///
+/// A cyclic nesting graph — a mutual `A`↔`B` cycle, or a path-qualified
+/// self-reference (`Vec<crate::A>`) that the derive's compile-time check can't
+/// resolve — would otherwise recurse until the stack overflows (an
+/// undiagnosable trap on WASM). This turns that into a clear panic on first
+/// call. Constructed only by generated code; not part of the public contract.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct SecretFieldsRecursionGuard {
+    // Private field: only `enter()` may construct this guard.
+    _seal: (),
+}
+
+impl SecretFieldsRecursionGuard {
+    /// Maximum `#[app_config(nested)]` depth. Legitimate configs nest a handful
+    /// of levels; anything beyond this is a cycle.
+    pub const MAX_DEPTH: u32 = 64;
+
+    /// Enter one recursion level.
+    ///
+    /// # Panics
+    /// Panics once nesting exceeds [`Self::MAX_DEPTH`] — indicating a cyclic
+    /// `#[app_config(nested)]` graph (mutual or path-qualified self-reference).
+    #[inline]
+    #[must_use]
+    pub fn enter() -> Self {
+        SECRET_FIELDS_DEPTH.with(|depth| {
+            let next = depth.get().saturating_add(1);
+            assert!(
+                next <= Self::MAX_DEPTH,
+                "#[app_config(nested)] recursion exceeded {} levels — cyclic nesting?",
+                Self::MAX_DEPTH
+            );
+            depth.set(next);
+        });
+        Self { _seal: () }
+    }
+}
+
+impl Drop for SecretFieldsRecursionGuard {
+    #[inline]
+    fn drop(&mut self) {
+        SECRET_FIELDS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
 }
 
 /// Discriminator on a [`SecretField`] capturing which secret-store
@@ -208,21 +301,73 @@ pub fn validate_excluding_secrets<C: validator::Validate + AppConfigMeta>(
     let Err(mut errors) = result else {
         return Ok(());
     };
-    // validator 0.20 exposes errors_mut() -> &mut HashMap<Cow<'static, str>, ValidationErrorsKind>.
-    // `bag.remove(field.name)` works because `field.name` is `&'static str`
-    // and `Cow<'static, str>: Borrow<str>` (the earlier comment cited the
-    // wrong key type — this is the corrected form).
-    let bag = errors.errors_mut();
-    for field in C::SECRET_FIELDS {
+    for field in C::secret_fields() {
         if matches!(field.kind, SecretKind::StoreRef) {
             continue; // store_id field; validator stays
         }
-        bag.remove(field.name);
+        prune_secret_leaf(&mut errors, &field.path);
     }
-    if bag.is_empty() {
+    if errors.errors().is_empty() {
         return Ok(());
     }
     Err(errors)
+}
+
+/// Remove the per-field validator error for the secret leaf at `path`,
+/// descending `ValidationErrorsKind::Struct`/`List` containers, and prune any
+/// container that becomes empty so a fully-cleared branch disappears. Without
+/// the prune, an empty `Struct`/`List` marker would keep `errors` non-empty and
+/// make `validate_excluding_secrets` wrongly return `Err`.
+fn prune_secret_leaf(errors: &mut ValidationErrors, path: &[SecretPathSegment]) {
+    use validator::ValidationErrorsKind;
+
+    let Some((head, rest)) = path.split_first() else {
+        return;
+    };
+    let SecretPathSegment::Field(name) = head else {
+        // `ArrayEach` only appears immediately after a `Field` (the root is
+        // always a struct), so it is consumed by the peek below, never a head.
+        return;
+    };
+
+    // Leaf reached: drop the validator error keyed by this field name.
+    if rest.is_empty() {
+        errors.errors_mut().remove(name.as_ref());
+        return;
+    }
+
+    // A `Field` immediately followed by `ArrayEach` targets a `List` nested
+    // under the field's key; consume the `ArrayEach` here so the recursive
+    // descent sees each element's own remaining path.
+    let (kind_is_array, tail) =
+        if let Some((SecretPathSegment::ArrayEach, array_tail)) = rest.split_first() {
+            (true, array_tail)
+        } else {
+            (false, rest)
+        };
+
+    let mut clear = false;
+    if kind_is_array {
+        if let Some(ValidationErrorsKind::List(items)) = errors.errors_mut().get_mut(name.as_ref())
+        {
+            for inner in items.values_mut() {
+                prune_secret_leaf(inner, tail);
+            }
+            items.retain(|_, inner| !inner.errors().is_empty());
+            clear = items.is_empty();
+        }
+    }
+    if !kind_is_array {
+        if let Some(ValidationErrorsKind::Struct(inner)) =
+            errors.errors_mut().get_mut(name.as_ref())
+        {
+            prune_secret_leaf(inner, tail);
+            clear = inner.errors().is_empty();
+        }
+    }
+    if clear {
+        errors.errors_mut().remove(name.as_ref());
+    }
 }
 
 /// Load and validate a typed app-config from `<name>.toml`.
@@ -618,7 +763,9 @@ mod tests {
     }
 
     impl AppConfigMeta for FixtureConfig {
-        const SECRET_FIELDS: &'static [SecretField] = &[];
+        fn secret_fields() -> Vec<SecretField> {
+            vec![]
+        }
     }
 
     fn write_fixture(contents: &str) -> NamedTempFile {
@@ -1104,7 +1251,9 @@ greeting = "hello"
         }
         // Hand-rolled AppConfigMeta — matches the same shape as the rest of this test.
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![]
+            }
         }
         impl validator::Validate for Fixture {
             fn validate(&self) -> Result<(), validator::ValidationErrors> {
@@ -1136,7 +1285,9 @@ greeting = "hello"
             greeting: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![]
+            }
         }
         let cfg = Fixture {
             greeting: "hello".into(),
@@ -1154,10 +1305,13 @@ greeting = "hello"
             greeting: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "api_token",
-                kind: SecretKind::KeyInDefault,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
         let cfg = Fixture {
             api_token: "short".into(),
@@ -1179,10 +1333,13 @@ greeting = "hello"
             greeting: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "api_token",
-                kind: SecretKind::KeyInDefault,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+                    optional: false,
+                }]
+            }
         }
         let cfg = Fixture {
             api_token: "x".into(),
@@ -1199,15 +1356,224 @@ greeting = "hello"
             store_id: String,
         }
         impl AppConfigMeta for Fixture {
-            const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-                name: "store_id",
-                kind: SecretKind::StoreRef,
-            }];
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::StoreRef,
+                    path: vec![SecretPathSegment::Field(Cow::Borrowed("store_id"))],
+                    optional: false,
+                }]
+            }
         }
         let cfg = Fixture {
             store_id: "short".into(),
         };
         // StoreRef keeps its validator — short store_id still fails.
         validate_excluding_secrets(&cfg).unwrap_err();
+    }
+
+    #[test]
+    fn validate_excluding_secrets_prunes_nested_secret_leaf_validator() {
+        #[derive(Validate)]
+        struct Inner {
+            #[validate(length(min = 100))]
+            server_side_key: String, // holds a short KEY NAME at push time
+        }
+        #[derive(Validate)]
+        struct Outer {
+            #[validate(nested)]
+            integrations: Inner,
+        }
+        impl AppConfigMeta for Outer {
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![
+                        SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                        SecretPathSegment::Field(Cow::Borrowed("server_side_key")),
+                    ],
+                    optional: false,
+                }]
+            }
+        }
+
+        let cfg = Outer {
+            integrations: Inner {
+                server_side_key: "dd_key".to_owned(), // 6 chars < 100
+            },
+        };
+        // The only failure is the nested secret leaf's validator -> pruned -> Ok.
+        validate_excluding_secrets(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validate_excluding_secrets_keeps_nested_non_secret_failures() {
+        #[derive(Validate)]
+        struct Inner {
+            #[validate(length(min = 100))]
+            note: String, // NON-secret, must still fail
+            #[validate(length(min = 100))]
+            server_side_key: String,
+        }
+        #[derive(Validate)]
+        struct Outer {
+            #[validate(nested)]
+            integrations: Inner,
+        }
+        impl AppConfigMeta for Outer {
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![
+                        SecretPathSegment::Field(Cow::Borrowed("integrations")),
+                        SecretPathSegment::Field(Cow::Borrowed("server_side_key")),
+                    ],
+                    optional: false,
+                }]
+            }
+        }
+
+        let cfg = Outer {
+            integrations: Inner {
+                server_side_key: "dd_key".to_owned(),
+                note: "short".to_owned(),
+            },
+        };
+        validate_excluding_secrets(&cfg).unwrap_err(); // `note` still fails
+    }
+
+    #[test]
+    fn validate_excluding_secrets_prunes_array_secret_leaf_keeps_siblings() {
+        #[derive(Validate)]
+        struct Outer {
+            #[validate(nested)]
+            partners: Vec<Partner>,
+        }
+        #[derive(Validate)]
+        struct Partner {
+            #[validate(length(min = 100))]
+            api_key: String, // secret leaf (a key NAME at push time)
+            #[validate(length(min = 100))]
+            label: String, // NON-secret sibling
+        }
+        impl AppConfigMeta for Outer {
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![
+                        SecretPathSegment::Field(Cow::Borrowed("partners")),
+                        SecretPathSegment::ArrayEach,
+                        SecretPathSegment::Field(Cow::Borrowed("api_key")),
+                    ],
+                    optional: false,
+                }]
+            }
+        }
+
+        // Every element fails BOTH validators at push time.
+        let cfg = Outer {
+            partners: vec![
+                Partner {
+                    api_key: "k0".to_owned(),
+                    label: "s".to_owned(),
+                },
+                Partner {
+                    api_key: "k1".to_owned(),
+                    label: "s".to_owned(),
+                },
+            ],
+        };
+        // `api_key` (secret) pruned from every List element; `label`
+        // (non-secret) survives in every element -> overall Err.
+        let err = validate_excluding_secrets(&cfg).expect_err("non-secret siblings still fail");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains("label"),
+            "non-secret sibling must survive"
+        );
+        assert!(
+            !rendered.contains("api_key"),
+            "secret leaf must be pruned from every array element"
+        );
+    }
+
+    #[test]
+    fn validate_excluding_secrets_prunes_array_all_secret_failures_to_ok() {
+        #[derive(Validate)]
+        struct Outer {
+            #[validate(nested)]
+            partners: Vec<Partner>,
+        }
+        #[derive(Validate)]
+        struct Partner {
+            #[validate(length(min = 100))]
+            api_key: String, // the ONLY validated field, and it's the secret leaf
+        }
+        impl AppConfigMeta for Outer {
+            fn secret_fields() -> Vec<SecretField> {
+                vec![SecretField {
+                    kind: SecretKind::KeyInDefault,
+                    path: vec![
+                        SecretPathSegment::Field(Cow::Borrowed("partners")),
+                        SecretPathSegment::ArrayEach,
+                        SecretPathSegment::Field(Cow::Borrowed("api_key")),
+                    ],
+                    optional: false,
+                }]
+            }
+        }
+
+        // Every element's only failure is the secret leaf -> each List element
+        // clears -> the empty List is pruned -> `partners` removed -> Ok.
+        let cfg = Outer {
+            partners: vec![
+                Partner {
+                    api_key: "k0".to_owned(),
+                },
+                Partner {
+                    api_key: "k1".to_owned(),
+                },
+            ],
+        };
+        validate_excluding_secrets(&cfg).expect(
+            "an array branch whose only failures are secret leaves must fully prune to Ok(())",
+        );
+    }
+
+    #[test]
+    fn dotted_path_renders_nested_and_array_segments() {
+        use super::{SecretField, SecretKind, SecretPathSegment::*};
+        use std::borrow::Cow;
+
+        let top = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![Field(Cow::Borrowed("api_token"))],
+            optional: false,
+        };
+        assert_eq!(top.dotted_path(), "api_token");
+
+        let nested = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                Field(Cow::Borrowed("integrations")),
+                Field(Cow::Borrowed("datadome")),
+                Field(Cow::Borrowed("server_side_key")),
+            ],
+            optional: false,
+        };
+        assert_eq!(
+            nested.dotted_path(),
+            "integrations.datadome.server_side_key"
+        );
+
+        let array = SecretField {
+            kind: SecretKind::KeyInDefault,
+            path: vec![
+                Field(Cow::Borrowed("partners")),
+                ArrayEach,
+                Field(Cow::Borrowed("api_key")),
+            ],
+            optional: false,
+        };
+        assert_eq!(array.dotted_path(), "partners[*].api_key");
     }
 }
