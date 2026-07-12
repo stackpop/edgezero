@@ -340,7 +340,9 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
         .and_then(|raw| LevelFilter::from_str(raw).ok())
         .unwrap_or(LevelFilter::Info);
 
-    let _logger_init = SimpleLogger::new().with_level(level).init();
+    if !A::owns_logging() {
+        let _logger_init = SimpleLogger::new().with_level(level).init();
+    }
 
     let resolution = resolve_addr(&env);
     for warning in &resolution.warnings {

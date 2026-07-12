@@ -101,8 +101,11 @@ pub async fn run_app<A: Hooks>(
     ctx: Context,
 ) -> Result<Response, WorkerError> {
     // Best-effort: if a logger is already installed, ignore the error rather
-    // than panicking — every Worker request re-enters this function.
-    drop(init_logger());
+    // than panicking — every Worker request re-enters this function. Skipped
+    // entirely when the app owns logging.
+    if !A::owns_logging() {
+        drop(init_logger());
+    }
     let stores = A::stores();
     let env_config = env_config_from_worker(&env, stores);
     let app = A::build_app();

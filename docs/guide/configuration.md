@@ -186,7 +186,10 @@ ids     = ["app_config"]         # one id per logical config store
 
 The portable schema is symmetric across `[stores.kv]`, `[stores.config]`,
 and `[stores.secrets]`: declare logical `ids` only; resolve platform
-names at runtime via `EDGEZERO__STORES__<KIND>__<ID>__NAME`. The
+names at runtime via `EDGEZERO__STORES__<KIND>__<ID>__NAME`. Config
+stores additionally honour `EDGEZERO__STORES__CONFIG__<ID>__KEY` to
+select which pushed blob the runtime reads (the staging/canary selector
+that pairs with `config push --key`; defaults to the logical id). The
 pre-rewrite `name`, `enabled`, `[stores.config.defaults]`, and
 `[stores.config.adapters.*]` fields are a hard load error — see
 [the migration guide](./manifest-store-migration.md).
@@ -285,8 +288,10 @@ The function deserialises, runs the `validator` rules (e.g.
 | `#[secret]`            | The field's value is a **key inside the default secret store** declared by `[stores.secrets]`. |
 | `#[secret(store_ref)]` | The field's value is a **logical store id** that must appear in `[stores.secrets].ids`.        |
 
-Only bare `String` fields can carry a `#[secret]` annotation;
-combining it with `#[serde(flatten)]`, `#[serde(rename)]`, or
+`#[secret]` fields must be `String` or `Option<String>` (an absent
+optional secret is skipped at runtime — see
+[Nested and array secrets](#nested-and-array-secrets)); combining the
+annotation with `#[serde(flatten)]`, `#[serde(rename)]`, or
 `#[serde(skip)]` is a compile error. The `config validate` command
 (see [CLI reference](/guide/cli-reference)) checks that every
 `#[secret(store_ref)]` value matches a declared id.
@@ -306,6 +311,101 @@ let value = ctx
     .require_str("active")
     .await?;
 ```
+
+### Nested and array secrets
+
+`#[secret]` fields don't have to live at the config root. They can sit
+inside nested structs and inside `Vec<_>` elements, resolved at runtime
+by their **field path** instead of a single top-level name.
+
+To recurse into a nested type, mark the field with `#[app_config(nested)]`
+(it mirrors `#[validate(nested)]`, which you'll usually want alongside it),
+and make the nested type itself derive `AppConfig`:
+
+```rust
+#[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    #[app_config(nested)]
+    #[validate(nested)]
+    pub integrations: Integrations,
+
+    #[app_config(nested)]
+    #[validate(nested)]
+    pub partners: Vec<Partner>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+#[serde(deny_unknown_fields)]
+pub struct Integrations {
+    #[app_config(nested)]
+    #[validate(nested)]
+    pub datadome: DataDome,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+#[serde(deny_unknown_fields)]
+pub struct DataDome {
+    #[secret]
+    pub server_side_key: String,
+
+    // A named-store secret: `token` is a key in the store named by its
+    // `vault` sibling. The `store_ref` sibling is resolved within the
+    // innermost object that contains the secret leaf.
+    #[secret(store_ref = "vault")]
+    pub token: String,
+    #[secret(store_ref)]
+    pub vault: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate, edgezero_core::AppConfig)]
+#[serde(deny_unknown_fields)]
+pub struct Partner {
+    #[secret]
+    pub api_key: String,
+
+    // An optional secret: absent (or `null`) at runtime -> skipped, not an error.
+    #[secret]
+    pub webhook_key: Option<String>,
+}
+```
+
+At request time the extractor walks each secret path and swaps the stored
+**key name** for the resolved value:
+
+- Object nesting resolves the leaf at its full path
+  (`integrations.datadome.server_side_key`).
+- `Vec<_>` arrays resolve the annotated field on **every** element
+  (`partners[*].api_key`).
+- A `#[secret]` on `Option<String>` is skipped when the value is absent
+  or `null`; a present value is resolved like any other secret.
+- `#[secret(store_ref = "…")]` resolves against the store named by its
+  **sibling** field — the one in the same innermost object as the secret
+  leaf, not a root-level field.
+
+The nested type must derive `AppConfig`; marking a field
+`#[app_config(nested)]` whose type does not is a compile error. Runtime
+resolution failures name the offending leaf by its dotted path, with
+concrete array indices — e.g. `integrations.datadome.server_side_key` or
+`partners[3].api_key` — so a bad key name points straight at the field.
+
+**Limitations of `#[app_config(nested)]`:**
+
+- **Shape:** opt-in supports a direct field (`T`) or `Vec<T>` only.
+  Wrapper-nested forms like `Option<Inner>` or `Box<Inner>` are not
+  supported — restructure to a direct or `Vec<T>` field. (Only the
+  **leaf** may be optional, via `#[secret] field: Option<String>`.)
+- **Required intermediates:** only the leaf's own `Option<String>` is
+  skippable. A missing or `null` intermediate object/array in the stored
+  blob (e.g. the whole `partners` array) is a `ConfigOutOfDate` error, not
+  a silent skip — both `config validate` and the runtime reject it.
+- **No cyclic nesting:** a type that directly nests itself by name
+  (`#[app_config(nested)] x: Vec<Config>`) is a compile error. A cycle the
+  derive can't see one-type-at-a-time — a _mutual_ cycle (`A` nests `B`,
+  `B` nests `A`) or a path-qualified self-reference (`Vec<crate::Config>`)
+  — is caught at runtime instead: `secret_fields()` panics with a clear
+  message rather than overflowing the stack. Cyclic config is pathological
+  (infinite data); don't do it.
 
 ### Environment-variable overlay
 

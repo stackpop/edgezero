@@ -9,24 +9,82 @@ use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Ident, LitStr, Token};
 use validator::Validate as _;
 
+#[derive(Debug)]
 struct AppArgs {
     app_ident: Option<Ident>,
+    owns_logging: Option<bool>,
     path: LitStr,
+    state: Option<syn::Expr>,
 }
 
 impl Parse for AppArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let path: LitStr = input.parse()?;
-        let app_ident = if input.peek(Token![,]) {
+        let mut app_ident: Option<Ident> = None;
+        let mut owns_logging: Option<bool> = None;
+        let mut state: Option<syn::Expr> = None;
+        let mut seen_keyword = false;
+
+        while input.peek(Token![,]) {
             input.parse::<Token![,]>()?;
-            Some(input.parse::<Ident>()?)
-        } else {
-            None
-        };
+
+            // Keyword argument: `Ident = Value`.
+            if input.peek(Ident) && input.peek2(Token![=]) {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                seen_keyword = true;
+                match key.to_string().as_str() {
+                    "owns_logging" => {
+                        if owns_logging.is_some() {
+                            return Err(syn::Error::new(
+                                key.span(),
+                                "duplicate `owns_logging` argument",
+                            ));
+                        }
+                        let value: syn::LitBool = input.parse()?;
+                        owns_logging = Some(value.value);
+                    }
+                    "state" => {
+                        if state.is_some() {
+                            return Err(syn::Error::new(key.span(), "duplicate `state` argument"));
+                        }
+                        state = Some(input.parse::<syn::Expr>()?);
+                    }
+                    other => {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            format!(
+                                "unknown `app!` argument `{other}`; expected `state` or `owns_logging`"
+                            ),
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            // Bare identifier: the optional custom App type name, only before keywords.
+            if input.peek(Ident) {
+                if seen_keyword || app_ident.is_some() {
+                    return Err(input.error(
+                        "the custom App identifier must come immediately after the manifest path, before keyword arguments",
+                    ));
+                }
+                app_ident = Some(input.parse::<Ident>()?);
+                continue;
+            }
+
+            return Err(input.error("expected a custom App identifier or `key = value` argument"));
+        }
+
         if !input.is_empty() {
             return Err(input.error("unexpected tokens after app! macro arguments"));
         }
-        Ok(Self { app_ident, path })
+        Ok(Self {
+            app_ident,
+            owns_logging,
+            path,
+            state,
+        })
     }
 }
 
@@ -120,6 +178,15 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     }
     manifest.finalize();
 
+    let manifest_json = match serde_json::to_string(&manifest) {
+        Ok(json) => json,
+        Err(err) => {
+            let msg = format!("failed to serialize manifest to JSON: {err}");
+            return quote!(compile_error!(#msg);).into();
+        }
+    };
+    let manifest_json_lit = LitStr::new(&manifest_json, Span::call_site());
+
     let app_ident = args
         .app_ident
         .unwrap_or_else(|| Ident::new("App", Span::call_site()));
@@ -140,12 +207,23 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
     };
     let stores_tokens = build_stores_tokens(&manifest);
 
-    // The emitted `Hooks` impl below explicitly defines `configure` and
-    // `build_app` even though their bodies mirror the trait defaults. This is
-    // required because `missing_trait_methods` (restriction = deny) forbids
-    // relying on trait defaults in the impl. If `Hooks::configure` or
-    // `Hooks::build_app` defaults change, update these emitted bodies to match.
+    let manifest_path_lit = LitStr::new(&manifest_path.to_string_lossy(), Span::call_site());
+    let owns_logging_lit = args.owns_logging.unwrap_or(false);
+    // Emitted only when `state = <expr>` is given; `Option<TokenStream2>: ToTokens`
+    // renders `None` as nothing, so an app without `state` is unchanged.
+    let state_call = args.state.as_ref().map(|state_expr| {
+        quote! { builder = builder.with_state(#state_expr); }
+    });
+
+    // The emitted `Hooks` impl below explicitly defines `configure`,
+    // `owns_logging`, and `build_app` even though their bodies mirror the trait
+    // defaults. This is required because `missing_trait_methods` (restriction =
+    // deny) forbids relying on trait defaults in the impl. If those `Hooks`
+    // defaults change, update these emitted bodies to match.
     let output = quote! {
+        // Force a rebuild when the manifest file changes (include_bytes tracks it as a build input).
+        const _: &[u8] = include_bytes!(#manifest_path_lit);
+
         pub struct #app_ident;
 
         impl edgezero_core::app::Hooks for #app_ident {
@@ -154,6 +232,10 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
             }
 
             fn configure(_app: &mut edgezero_core::app::App) {}
+
+            fn owns_logging() -> bool {
+                #owns_logging_lit
+            }
 
             fn name() -> &'static str {
                 #app_name_lit
@@ -170,6 +252,8 @@ pub fn expand_app(input: TokenStream) -> TokenStream {
 
         pub fn build_router() -> edgezero_core::router::RouterService {
             let mut builder = edgezero_core::router::RouterService::builder();
+            builder = builder.with_manifest_json(#manifest_json_lit);
+            #state_call
             #(#middleware_tokens)*
             #(#route_tokens)*
             builder.build()
@@ -251,7 +335,107 @@ fn route_for_method(method: &str, path: &LitStr, handler: &syn::ExprPath) -> Tok
 
 #[cfg(test)]
 mod tests {
-    use super::parse_handler_path;
+    use super::{build_route_tokens, parse_handler_path, AppArgs, Manifest};
+    use syn::parse_str;
+
+    #[test]
+    fn app_args_parses_app_ident_then_keyword() {
+        let args: AppArgs =
+            parse_str(r#""edgezero.toml", MyApp, owns_logging = false"#).expect("parse");
+        assert_eq!(
+            args.app_ident.map(|ident| ident.to_string()),
+            Some("MyApp".to_owned())
+        );
+        assert_eq!(args.owns_logging, Some(false));
+    }
+
+    #[test]
+    fn app_args_parses_owns_logging_true() {
+        let args: AppArgs = parse_str(r#""edgezero.toml", owns_logging = true"#).expect("parse");
+        assert_eq!(args.owns_logging, Some(true));
+        assert!(args.app_ident.is_none());
+    }
+
+    #[test]
+    fn app_args_parses_path_and_app_ident() {
+        let args: AppArgs = parse_str(r#""edgezero.toml", MyApp"#).expect("parse");
+        assert_eq!(
+            args.app_ident.map(|ident| ident.to_string()),
+            Some("MyApp".to_owned())
+        );
+        assert_eq!(args.owns_logging, None);
+    }
+
+    #[test]
+    fn app_args_parses_path_only() {
+        let args: AppArgs = parse_str(r#""edgezero.toml""#).expect("parse");
+        assert_eq!(args.path.value(), "edgezero.toml");
+        assert!(args.app_ident.is_none());
+        assert_eq!(args.owns_logging, None);
+        assert!(args.state.is_none());
+    }
+
+    #[test]
+    fn app_args_parses_state_expr() {
+        let args: AppArgs =
+            parse_str(r#""edgezero.toml", state = crate::app_state()"#).expect("parse");
+        let rendered = args.state.map(|expr| quote::quote!(#expr).to_string());
+        assert_eq!(rendered, Some("crate :: app_state ()".to_owned()));
+        assert!(args.app_ident.is_none());
+        assert_eq!(args.owns_logging, None);
+    }
+
+    #[test]
+    fn app_args_parses_state_with_app_ident_and_owns_logging() {
+        let args: AppArgs =
+            parse_str(r#""edgezero.toml", MyApp, state = crate::app_state(), owns_logging = true"#)
+                .expect("parse");
+        assert_eq!(
+            args.app_ident.map(|ident| ident.to_string()),
+            Some("MyApp".to_owned())
+        );
+        assert_eq!(args.owns_logging, Some(true));
+        assert!(args.state.is_some());
+    }
+
+    #[test]
+    fn app_args_rejects_duplicate_state() {
+        let err = parse_str::<AppArgs>(r#""edgezero.toml", state = a(), state = b()"#)
+            .expect_err("duplicate state");
+        assert!(err.to_string().contains("duplicate `state`"), "got: {err}");
+    }
+
+    #[test]
+    fn app_args_rejects_duplicate_key() {
+        let err =
+            parse_str::<AppArgs>(r#""edgezero.toml", owns_logging = true, owns_logging = false"#)
+                .expect_err("duplicate");
+        assert!(
+            err.to_string().contains("duplicate `owns_logging`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn app_args_rejects_ident_after_keyword() {
+        let err = parse_str::<AppArgs>(r#""edgezero.toml", owns_logging = true, MyApp"#)
+            .expect_err("ident after keyword");
+        assert!(
+            err.to_string()
+                .contains("must come immediately after the manifest path"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn app_args_rejects_unknown_key() {
+        let err =
+            parse_str::<AppArgs>(r#""edgezero.toml", bogus = true"#).expect_err("unknown key");
+        assert!(
+            err.to_string().contains("unknown `app!` argument `bogus`"),
+            "got: {err}"
+        );
+    }
 
     #[test]
     fn parse_handler_path_accepts_absolute_crate_path() {
@@ -272,5 +456,94 @@ mod tests {
             err.contains("not a valid path!"),
             "error message should echo the offending input, got: {err}"
         );
+    }
+
+    #[test]
+    fn build_route_tokens_propagates_invalid_handler_path() {
+        // A manifest that parses cleanly but declares a handler whose
+        // Rust path is invalid: `build_route_tokens` must surface the
+        // `parse_handler_path` error rather than panic or silently skip.
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/"
+methods = ["GET"]
+handler = "1bad::handler"
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let err = build_route_tokens(&manifest).expect_err("invalid handler must error");
+        assert!(
+            err.contains("invalid handler path"),
+            "error should propagate from parse_handler_path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_route_tokens_emits_one_token_per_method() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/"
+methods = ["GET", "POST", "PUT"]
+handler = "crate::handlers::root"
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let tokens = build_route_tokens(&manifest).expect("valid manifest builds routes");
+        // One route token per (trigger × method): 1 trigger × 3 methods.
+        assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn build_route_tokens_skips_trigger_without_handler() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/has"
+methods = ["GET"]
+handler = "crate::handlers::root"
+
+[[triggers.http]]
+path = "/none"
+methods = ["GET"]
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let tokens = build_route_tokens(&manifest).expect("builds");
+        // The handler-less trigger hits the `else { continue }` and
+        // contributes no routes.
+        assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn build_route_tokens_defaults_to_get_when_methods_absent() {
+        let manifest: Manifest = toml::from_str(
+            r#"
+[app]
+name = "demo"
+entry = "crates/demo-core"
+
+[[triggers.http]]
+path = "/"
+handler = "crate::handlers::root"
+"#,
+        )
+        .expect("manifest TOML should parse");
+        let tokens = build_route_tokens(&manifest).expect("builds");
+        // No `methods` key → `Trigger::methods()` defaults to `["GET"]`.
+        assert_eq!(tokens.len(), 1);
     }
 }

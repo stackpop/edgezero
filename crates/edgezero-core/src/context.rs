@@ -69,6 +69,18 @@ impl RequestContext {
             .and_then(|registry| registry.default_ref())
     }
 
+    /// Clone a request extension of type `T`, if present. Used by the
+    /// introspection extractors (`ManifestJson` / `RouteTable`) to read the
+    /// payload the router injected for their route.
+    #[must_use]
+    #[inline]
+    pub(crate) fn extension<T>(&self) -> Option<T>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.request.extensions().get::<T>().cloned()
+    }
+
     /// # Errors
     /// Returns [`EdgeError::bad_request`] if the body cannot be deserialized as form-urlencoded data into `T`, or the body is streaming.
     #[inline]
