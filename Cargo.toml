@@ -69,6 +69,7 @@ sha2 = "0.10"
 similar = "2"
 simple_logger = "5"
 proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
 syn = { version = "2", features = ["full", "extra-traits", "visit"] }
 subtle = "2"
 # Pinned to the `~6.0` range (allows 6.0.x, blocks 6.1+) so a minor
@@ -77,7 +78,7 @@ subtle = "2"
 # up` (where a runtime mismatch surfaces as opaque WIT linker errors).
 spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
 tempfile = "3"
-toml_edit = "0.23"
+toml_edit = "0.25"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 trybuild = "1"

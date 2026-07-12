@@ -1,0 +1,5 @@
+error: `#[app_config]` requires an option; the only supported one is `nested` (e.g. `#[app_config(nested)]`)
+ --> tests/ui/app_config_empty.rs:7:5
+  |
+7 |     #[app_config()]
+  |     ^^^^^^^^^^^^^^^

@@ -1,11 +1,14 @@
 use std::env;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use edgezero_core::action;
 use edgezero_core::body::Body;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::extractor::{AppConfig, Headers, Json, Kv, Path, Query, Secrets, ValidatedPath};
+use edgezero_core::extractor::{
+    AppConfig, Headers, Json, Kv, Path, Query, Secrets, State, ValidatedPath,
+};
 use edgezero_core::http::{self, Response, StatusCode, Uri};
 use edgezero_core::proxy::ProxyRequest;
 use edgezero_core::response::Text;
@@ -304,10 +307,21 @@ pub async fn secrets_echo(
     Ok(Text::new(value))
 }
 
+/// Demonstrates app-owned shared state injected via `app!(..., state = ...)`:
+/// the `State<Arc<DemoState>>` extractor resolves the value the macro-generated
+/// router registered with `RouterBuilder::with_state`.
+#[action]
+pub async fn state_demo(
+    State(state): State<Arc<crate::DemoState>>,
+) -> Result<Text<String>, EdgeError> {
+    Ok(Text::new(state.greeting.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use edgezero_core::blob_envelope::BlobEnvelope;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
@@ -318,7 +332,9 @@ mod tests {
     use edgezero_core::proxy::{ProxyClient, ProxyHandle, ProxyResponse};
     use edgezero_core::response::IntoResponse as _;
     use edgezero_core::secret_store::{InMemorySecretStore, SecretHandle};
-    use edgezero_core::store_registry::{ConfigStoreBinding, KvRegistry};
+    use edgezero_core::store_registry::{
+        ConfigRegistry, ConfigStoreBinding, KvRegistry, StoreRegistry,
+    };
     use futures::executor::block_on;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -417,6 +433,84 @@ mod tests {
         async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
             Err(ConfigStoreError::unavailable("backend offline"))
         }
+    }
+
+    struct FixedStore(String);
+
+    #[async_trait(?Send)]
+    impl ConfigStore for FixedStore {
+        async fn get(&self, _key: &str) -> Result<Option<String>, ConfigStoreError> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[test]
+    fn introspection_routes_are_wired() {
+        let router = crate::build_router();
+
+        // manifest: 200 + JSON body whose [app].name is "app-demo".
+        let manifest_req = request_builder()
+            .method(Method::GET)
+            .uri("/_app-demo/manifest")
+            .body(Body::empty())
+            .unwrap();
+        let manifest_resp = block_on(router.oneshot(manifest_req)).unwrap();
+        assert_eq!(manifest_resp.status(), StatusCode::OK);
+        assert_eq!(
+            manifest_resp.headers().get("content-type").unwrap(),
+            "application/json"
+        );
+        let manifest_body: serde_json::Value = manifest_resp.into_body().to_json().unwrap();
+        assert_eq!(manifest_body["app"]["name"], "app-demo");
+
+        // routes: 200 + [{method,path}] including the root route.
+        let routes_req = request_builder()
+            .method(Method::GET)
+            .uri("/_app-demo/routes")
+            .body(Body::empty())
+            .unwrap();
+        let routes_resp = block_on(router.oneshot(routes_req)).unwrap();
+        assert_eq!(routes_resp.status(), StatusCode::OK);
+        let routes_body: serde_json::Value = routes_resp.into_body().to_json().unwrap();
+        let arr = routes_body.as_array().expect("routes array");
+        assert!(arr
+            .iter()
+            .any(|entry| entry["method"] == "GET" && entry["path"] == "/"));
+
+        // /config: seed a default config store with a valid envelope so a wired
+        // route returns 200 (a routing miss would be 404, proving nothing).
+        let data = serde_json::json!({ "greeting": "hi", "api_token": "demo_api_token" });
+        let blob =
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned()))
+                .unwrap();
+        let registry: ConfigRegistry = StoreRegistry::new(
+            [(
+                "app_config".to_owned(),
+                ConfigStoreBinding {
+                    handle: ConfigStoreHandle::new(Arc::new(FixedStore(blob))),
+                    default_key: "app_config".to_owned(),
+                },
+            )]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "app_config".to_owned(),
+        );
+        let mut config_req = request_builder()
+            .method(Method::GET)
+            .uri("/_app-demo/config")
+            .body(Body::empty())
+            .unwrap();
+        config_req.extensions_mut().insert(registry);
+        let config_resp = block_on(router.oneshot(config_req)).unwrap();
+        assert_eq!(
+            config_resp.status(),
+            StatusCode::OK,
+            "/config should be wired and 200 with a store"
+        );
+        // Raw envelope `data`: secret field holds the KEY NAME, not a resolved value.
+        let config_body: serde_json::Value = config_resp.into_body().to_json().unwrap();
+        assert_eq!(config_body["api_token"], "demo_api_token");
+        assert_eq!(config_body["greeting"], "hi");
     }
 
     #[test]
@@ -926,6 +1020,25 @@ mod tests {
         assert_eq!(
             String::from_utf8(collected).expect("utf8"),
             "chunk 0\nchunk 1\nchunk 2\n"
+        );
+    }
+
+    #[test]
+    fn state_demo_handler_reads_app_state_through_macro_router() {
+        // build_router() is macro-generated and now calls `.with_state(crate::app_state())`.
+        let service = crate::build_router();
+
+        let request = request_builder()
+            .method(Method::GET)
+            .uri("/state-demo")
+            .body(Body::empty())
+            .expect("request");
+
+        let response = block_on(service.oneshot(request)).expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.body().as_bytes().expect("buffered"),
+            b"hello from app state"
         );
     }
 }

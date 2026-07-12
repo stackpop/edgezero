@@ -17,7 +17,7 @@ pub fn app(input: TokenStream) -> TokenStream {
     app::expand_app(input)
 }
 
-#[proc_macro_derive(AppConfig, attributes(secret))]
+#[proc_macro_derive(AppConfig, attributes(secret, app_config))]
 #[inline]
 pub fn app_config_derive(input: TokenStream) -> TokenStream {
     app_config::derive(input)

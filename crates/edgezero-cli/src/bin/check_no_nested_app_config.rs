@@ -63,6 +63,7 @@ use walkdir::WalkDir;
 // Pass 1: collect struct identifiers that derive AppConfig
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct AppConfigStructCollector {
     app_config_structs: HashSet<String>,
 }
@@ -166,6 +167,9 @@ impl<'ast> Visit<'ast> for NestedAppConfigVisitor<'_, '_> {
             if let Some(inner_name) =
                 type_contains_app_config_struct(&field.ty, self.app_config_structs)
             {
+                if field_has_nested_optin(field) {
+                    continue; // opted in via #[app_config(nested)] — allowed
+                }
                 let span = field
                     .ident
                     .as_ref()
@@ -175,6 +179,33 @@ impl<'ast> Visit<'ast> for NestedAppConfigVisitor<'_, '_> {
         }
         visit::visit_item_struct(self, i);
     }
+}
+
+/// Returns `true` only for a well-formed `#[app_config(nested)]`. A malformed
+/// `#[app_config(...)]` returns `false` -> the field is treated as NOT opted
+/// in, so the guard still FLAGS the nesting (loud CI failure) rather than
+/// silently waving it through. This is safe here (unlike the derive's
+/// `nested_optin`, which must hard-error): the guard runs only over
+/// already-compiling code, and the derive's strict `nested_optin` has already
+/// rejected any malformed `#[app_config(...)]` before this binary ever runs.
+fn field_has_nested_optin(field: &syn::Field) -> bool {
+    field.attrs.iter().any(|attr| {
+        if !attr.path().is_ident("app_config") {
+            return false;
+        }
+        // Must actually see `nested`. A bare `#[app_config()]` parses Ok but
+        // never sets `found`, so `.is_ok()` alone would wrongly report opt-in.
+        let mut found = false;
+        let parsed = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("nested") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown app_config option"))
+            }
+        });
+        parsed.is_ok() && found
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -339,9 +370,11 @@ fn main() {
     if violations > 0 {
         eprintln!(
             "\n{violations} nested-AppConfig violation(s). \
-             A struct with #[derive(AppConfig)] must not contain fields whose \
-             type resolves to another #[derive(AppConfig)] struct, even through \
-             Option/Vec/Box wrappers (spec \u{00a7}3.3)."
+             A field whose type resolves to another #[derive(AppConfig)] struct \
+             (detected even through Option/Vec/Box wrappers) must opt in with \
+             #[app_config(nested)]. Opt-in supports a direct `T` or `Vec<T>` field \
+             only — restructure Option/Box-wrapped nesting to one of those. \
+             Otherwise nesting is rejected (spec \u{00a7}3.3)."
         );
         process::exit(1);
     }
@@ -350,4 +383,258 @@ fn main() {
     }
 
     println!("check_no_nested_app_config: OK");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NESTED_VEC_WITH_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { #[app_config(nested)] inner: Vec<Inner> }
+    ";
+
+    const NESTED_WITHOUT_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { inner: Inner }
+    ";
+
+    const NESTED_WITH_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { #[app_config(nested)] inner: Inner }
+    ";
+
+    fn known(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| String::from(*name)).collect()
+    }
+
+    fn ty(src: &str) -> Type {
+        syn::parse_str(src).expect("type parse")
+    }
+
+    #[test]
+    fn struct_derives_app_config_detects_path_suffixed_derive() {
+        let item: syn::ItemStruct =
+            syn::parse_str("#[derive(Debug, edgezero_core::AppConfig)] struct C { x: u8 }")
+                .expect("struct parse");
+        assert!(struct_derives_app_config(&item));
+    }
+
+    #[test]
+    fn struct_derives_app_config_false_without_it() {
+        let item: syn::ItemStruct =
+            syn::parse_str("#[derive(Debug)] struct C { x: u8 }").expect("struct parse");
+        assert!(!struct_derives_app_config(&item));
+    }
+
+    #[test]
+    fn type_contains_app_config_unwraps_nested_wrappers() {
+        let set = known(&["ChildConfig"]);
+        assert_eq!(
+            type_contains_app_config_struct(&ty("ChildConfig"), &set).as_deref(),
+            Some("ChildConfig")
+        );
+        assert_eq!(
+            type_contains_app_config_struct(&ty("Option<Vec<Box<ChildConfig>>>"), &set).as_deref(),
+            Some("ChildConfig")
+        );
+    }
+
+    #[test]
+    fn type_contains_app_config_none_for_unrelated_types() {
+        let set = known(&["ChildConfig"]);
+        assert_eq!(type_contains_app_config_struct(&ty("String"), &set), None);
+        assert_eq!(
+            type_contains_app_config_struct(&ty("Vec<String>"), &set),
+            None
+        );
+    }
+
+    #[test]
+    fn type_contains_app_config_unwraps_every_container_arm() {
+        // Each of these exercises a distinct arm of the recursive match
+        // (Rc/Arc path-wrappers, array, slice, reference, paren, tuple in
+        // either position, and cross-arm combinations). A regression that
+        // deleted any arm — e.g. stops detecting `(ChildConfig, u8)` —
+        // would defeat the CI gate and ship green without these.
+        let set = known(&["ChildConfig"]);
+        for src in [
+            "Rc<ChildConfig>",
+            "Arc<ChildConfig>",
+            "[ChildConfig; 4]",                // Type::Array
+            "[ChildConfig]",                   // Type::Slice
+            "&ChildConfig",                    // Type::Reference
+            "(ChildConfig)",                   // Type::Paren
+            "(ChildConfig, u8)",               // tuple, first position
+            "(u8, ChildConfig)",               // tuple, second position
+            "Vec<(String, Arc<ChildConfig>)>", // path -> tuple -> path
+            "Option<[Box<ChildConfig>; 2]>",   // path -> array -> path
+        ] {
+            assert_eq!(
+                type_contains_app_config_struct(&ty(src), &set).as_deref(),
+                Some("ChildConfig"),
+                "should detect ChildConfig in `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn type_contains_app_config_negatives_including_unwrapped_generic() {
+        let set = known(&["ChildConfig"]);
+        for src in ["String", "Vec<String>", "(u8, String)", "[u8; 4]"] {
+            assert_eq!(
+                type_contains_app_config_struct(&ty(src), &set),
+                None,
+                "should NOT detect ChildConfig in `{src}`"
+            );
+        }
+        // Documented limitation: arbitrary generics (not the whitelisted
+        // transparent wrappers) are NOT unwrapped, so an AppConfig buried
+        // in a `HashMap` value is intentionally not flagged.
+        assert_eq!(
+            type_contains_app_config_struct(&ty("HashMap<String, ChildConfig>"), &set),
+            None
+        );
+    }
+
+    #[test]
+    fn struct_derives_app_config_handles_bare_ident_and_multi_derive() {
+        let bare: syn::ItemStruct =
+            syn::parse_str("#[derive(AppConfig)] struct C { x: u8 }").expect("parse");
+        assert!(struct_derives_app_config(&bare), "bare `AppConfig` ident");
+
+        let multi: syn::ItemStruct =
+            syn::parse_str("#[derive(Debug)] #[derive(Clone, AppConfig)] struct C { x: u8 }")
+                .expect("parse");
+        assert!(
+            struct_derives_app_config(&multi),
+            "AppConfig in a second derive attribute"
+        );
+    }
+
+    #[test]
+    fn struct_derives_app_config_rejects_suffix_collision_and_non_derive() {
+        let suffix: syn::ItemStruct =
+            syn::parse_str("#[derive(AppConfigExt)] struct C { x: u8 }").expect("parse");
+        assert!(
+            !struct_derives_app_config(&suffix),
+            "must be an exact ident match, not a substring"
+        );
+
+        let non_derive: syn::ItemStruct =
+            syn::parse_str("#[repr(C)] struct C { x: u8 }").expect("parse");
+        assert!(!struct_derives_app_config(&non_derive));
+    }
+
+    // --- end-to-end detection: the two-pass visitor pipeline ---
+    // Drives the collectors directly (no file IO) so the binary's actual
+    // job — scan source, flag a real nested-AppConfig, count it — is
+    // proven, not just the leaf helpers.
+
+    fn violations_in(src: &str) -> usize {
+        let file: syn::File = syn::parse_str(src).expect("source parses");
+        let mut collector = AppConfigStructCollector::new();
+        collector.visit_file(&file);
+        let mut visitor =
+            NestedAppConfigVisitor::new(Path::new("test.rs"), &collector.app_config_structs);
+        visitor.visit_file(&file);
+        visitor.violations
+    }
+
+    #[test]
+    fn allows_nesting_with_opt_in() {
+        assert_eq!(violations_in(NESTED_WITH_OPT_IN), 0);
+    }
+
+    #[test]
+    fn allows_vec_nesting_with_opt_in() {
+        assert_eq!(violations_in(NESTED_VEC_WITH_OPT_IN), 0);
+    }
+
+    #[test]
+    fn flags_nesting_without_opt_in() {
+        assert_eq!(violations_in(NESTED_WITHOUT_OPT_IN), 1);
+    }
+
+    #[test]
+    fn detects_nested_app_config_through_wrapper() {
+        let src = "
+            #[derive(edgezero_core::AppConfig)]
+            struct Inner { secret: String }
+            #[derive(edgezero_core::AppConfig)]
+            struct Outer { inner: Option<Inner> }
+        ";
+        assert_eq!(violations_in(src), 1);
+    }
+
+    #[test]
+    fn no_violation_when_field_type_is_not_app_config() {
+        let src = "
+            struct Plain { x: u8 }
+            #[derive(edgezero_core::AppConfig)]
+            struct Outer { plain: Plain }
+        ";
+        assert_eq!(violations_in(src), 0);
+    }
+
+    #[test]
+    fn no_violation_when_outer_struct_is_not_app_config() {
+        let src = "
+            #[derive(edgezero_core::AppConfig)]
+            struct Inner { secret: String }
+            struct Outer { inner: Inner }
+        ";
+        assert_eq!(violations_in(src), 0);
+    }
+
+    #[test]
+    fn counts_multiple_nested_violations() {
+        let src = "
+            #[derive(edgezero_core::AppConfig)]
+            struct Inner { secret: String }
+            #[derive(edgezero_core::AppConfig)]
+            struct Outer { a: Inner, b: Vec<Inner> }
+        ";
+        assert_eq!(violations_in(src), 2);
+    }
+
+    #[test]
+    fn detects_violation_regardless_of_definition_order() {
+        // Inner defined AFTER Outer: the two-pass (collect-all-then-check)
+        // design must still catch it; a naive single pass would miss it.
+        let src = "
+            #[derive(edgezero_core::AppConfig)]
+            struct Outer { inner: Inner }
+            #[derive(edgezero_core::AppConfig)]
+            struct Inner { secret: String }
+        ";
+        assert_eq!(violations_in(src), 1);
+    }
+
+    #[test]
+    fn no_false_positive_from_appconfig_in_doc_comment() {
+        // The walk inspects field TYPES only — `AppConfig` appearing in a
+        // doc comment is not a violation (the module's headline property).
+        let src = "
+            #[derive(edgezero_core::AppConfig)]
+            struct Outer {
+                /// mentions AppConfig in prose, but the field type is String
+                note: String,
+            }
+        ";
+        assert_eq!(violations_in(src), 0);
+    }
+
+    #[test]
+    fn detects_nested_in_tuple_struct_unnamed_field() {
+        // Exercises the `<unnamed>` field-name branch + Span::call_site
+        // fallback in the visitor.
+        let src = "
+            #[derive(edgezero_core::AppConfig)]
+            struct Inner { secret: String }
+            #[derive(edgezero_core::AppConfig)]
+            struct Outer(Inner);
+        ";
+        assert_eq!(violations_in(src), 1);
+    }
 }

@@ -6,7 +6,7 @@
 > checkbox (`- [ ]`) syntax for tracking.
 
 **Date:** 2026-06-16
-**Status:** v1 — Draft, revised through reviewer round 6
+**Status:** v1 — Draft, revised through round 9 (self-review hardening)
 **Author:** (TBD)
 **Branch under assessment:** `feature/extensible-cli`
 
@@ -38,7 +38,7 @@ over-reported gaps. Three claims were checked and **rejected**:
 
 | Rejected claim                                      | Reality (verified)                                                                                                                                                                                                                                              |
 | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `edgezero-cli` `config push` is untested            | `config.rs` has a full push suite — `raw_push_axum_writes_local_config_json`, `raw_push_dry_run_does_not_write`, `raw_push_flattens_nested_tables_into_dotted_keys`, `raw_push_json_encodes_arrays`, store-id resolution + error cases (`config.rs:1600-1790`). |
+| `edgezero-cli` `config push` is untested            | `config.rs` has a full push suite — `typed_push_writes_blob_envelope_to_local_config_file`, `typed_push_dry_run_does_not_write`, `typed_push_envelope_sha_matches_hand_computed_hash`, `typed_push_runs_validator_and_errors_on_bad_config`, `run_config_push_is_stub_pointer_in_bundled_binary`, plus adapter/strict checks (`config.rs:2366` onward). |
 | `core/compression.rs` has "only 2 tests, major gap" | Two tests is the full happy-path matrix (gzip + brotli). The real, narrow gap is the **error path**, not presence.                                                                                                                                              |
 | `axum/service.rs` (680 LOC) has zero tests          | It has `#[tokio::test]` cases (`service.rs:451,528,558`) the marker scan undercounted because of the attribute form. Well covered.                                                                                                                              |
 
@@ -55,8 +55,11 @@ count); the CLI, macros, and adapter CLI
 surfaces are all substantially tested. The genuine gaps fall into three
 buckets:
 
-1. **One** host-testable source file with real logic and _zero_
-   coverage: `edgezero-core/src/handler.rs`.
+1. **Two** host-testable source files with real logic and _zero_
+   coverage: `edgezero-core/src/handler.rs` and the pure `syn` helpers in
+   `edgezero-cli/src/bin/check_no_nested_app_config.rs` (the
+   nested-`AppConfig` CI checker; host-compilable behind the
+   `nested-app-config-check` feature).
 2. A small set of **error/edge-path depth gaps** in modules that already
    have happy-path tests.
 3. The **runtime-bound portions of adapter platform code** (Spin /
@@ -64,8 +67,13 @@ buckets:
    Fastly logger init) that **cannot be host unit-tested**. Note the
    pure helper/conversion paths in these crates _are_ already host- and
    contract-tested (see the Tier-3 split in §4); only the SDK/runtime
-   paths remain. That runtime-bound code only compiles for `wasm32-*`
-   and/or behind platform SDKs. This is by
+   paths remain. The gating differs by adapter: **Spin and Cloudflare**
+   modules are `#[cfg(all(feature=…, target_arch="wasm32"))]` so they
+   never build on the host at all; **Fastly** modules are
+   `#[cfg(feature="fastly")]` only (no `target_arch` gate) — they DO
+   compile on the host, but their live paths call the Fastly compute SDK
+   that isn't meaningfully exercisable off-platform. Either way the live
+   paths are out of host-unit-test scope. This is by
    design per CLAUDE.md ("Don't write tests that require a network
    connection or platform credentials") and is the scope of each
    adapter's contract and/or integration tests, not host unit tests.
@@ -104,6 +112,7 @@ module at all**.
 | Gap                                              | File                                       | Why it matters                                                                                                                                                                                                                      |
 | ------------------------------------------------ | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DynHandler::call` + `IntoHandler::into_handler` | `crates/edgezero-core/src/handler.rs:9-40` | The closure→handler bridge and the `fut.await?.into_response()` error-propagation line (`handler.rs:22`) are the spine of every route. No test exercises them directly today. Pure host logic — trivially testable with `block_on`. |
+| `struct_derives_app_config` + `type_contains_app_config_struct` | `crates/edgezero-cli/src/bin/check_no_nested_app_config.rs:103,196` | The recursive `syn` AST walk that the nested-`AppConfig` CI gate depends on (unwraps `Option`/`Vec`/`Box`/`Rc`/`Arc` to any depth). 353 LOC, zero tests. Host-compilable behind the `nested-app-config-check` feature; testable with `syn::parse_str`. Because it's a `bin`, tests must be an inline `#[cfg(test)]` module (free fns aren't importable from `tests/`). |
 
 ### Tier 2 — host-testable depth gaps (should close)
 
@@ -113,23 +122,28 @@ module at all**.
 | `run_native_cli` error paths | `crates/edgezero-adapter/src/cli_support.rs:82-99` | Happy path is covered; the `ErrorKind::NotFound` → install-hint branch (`:84-92`) and the non-zero-exit branch (`:93-98`) are not. |
 | Decompression error path     | `crates/edgezero-core/src/compression.rs:15-60`    | `decode_gzip_stream` / `decode_brotli_stream` test only valid input; malformed input → `Err` is unexercised.                       |
 
-### Tier 2 backlog — verify-then-test (lower confidence)
+### Tier 2 backlog — verify-then-test (RESOLVED in this PR)
 
-These are plausible depth gaps surfaced during assessment but **not yet
-verified** to the point of writing assertions. Each task is: confirm the
-code path exists as described, then add a test mirroring the module's
-existing idiom. Do **not** write a test against an assumed API.
+These were plausible depth gaps surfaced during assessment but not yet
+verified to the point of writing assertions. Both have now been verified
+against the code and closed:
 
-| Candidate gap                   | File                                                  | Verify first                                                                                                                                                                                                                                                                                                |
-| ------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Adapter` trait default methods | `crates/edgezero-adapter/src/registry.rs:211,375,401` | `merged_id_kinds` (default `&[]`), `validate_app_config_keys`/`validate_typed_secrets` (default `Ok`) — needs a minimal `Adapter` test-double overriding the required `execute` **and** `name` (both are required; reuse the existing `TestAdapter` at `registry.rs:459` rather than writing a new double). |
-| `app!` macro error handling     | `crates/edgezero-macros/src/app.rs`                   | Only 2 codegen tests; missing-file / invalid-TOML diagnostics may be untested — confirm and add a trybuild compile-fail fixture if so.                                                                                                                                                                      |
+| Candidate gap                   | File                                                  | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------- | ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Adapter` trait default methods | `crates/edgezero-adapter/src/registry.rs`             | **Closed.** Verified the no-op defaults (`merged_id_kinds`/`single_store_kinds` → `&[]`; `validate_adapter_manifest`/`validate_app_config_keys`/`validate_typed_secrets` → `Ok`) and covered them via the existing `FIRST` `TestAdapter` (inherits all defaults) — test `default_validation_and_kind_methods_are_noops`.                                                                                                                       |
+| `app!` macro error handling     | `crates/edgezero-macros/src/app.rs`                   | **Closed (partial, by design).** The three `expand_app` file-level diagnostics (read/parse/validate) embed the **absolute** manifest path in their messages, so a trybuild `.stderr` fixture would be machine-dependent and flaky — deliberately NOT added. The cleanly-testable seam is `build_route_tokens`, which had no direct test; covered its error propagation via `build_route_tokens_propagates_invalid_handler_path` (toml-built `Manifest` with a bad handler). |
 
-### Tier 3 — wasm-gated platform code (out of host-unit-test scope)
+### Tier 3 — runtime-bound platform code (out of host-unit-test scope)
 
-Cannot be closed with host unit tests; see §8 for strategy. **Note the
-split**: the pure/helper conversion paths in these crates are _already_
-host- or wasm-contract-tested (see the per-row citations) — only the
+Cannot be closed with host unit tests; see §8 for strategy. **Gating is
+not uniform:** Spin and Cloudflare modules are
+`#[cfg(all(feature=…, target_arch="wasm32"))]` (never built on host);
+Fastly modules are `#[cfg(feature="fastly")]` only and DO compile on the
+host, but their live paths call the Fastly compute SDK — so "out of
+host-unit-test scope" is the shared conclusion, via different routes.
+**Note the split**: the pure/helper conversion paths in these crates are
+_already_ host- or wasm-contract-tested (see the per-row citations) —
+only the
 SDK/runtime-bound paths remain.
 
 | Area                | Already host/contract-tested                                                                                                                                                                                                                                                          | Genuinely runtime-bound (Tier 3)                                                                                                                                                                                                                                                                                              |
@@ -220,12 +234,11 @@ mod tests {
             Err(EdgeError::internal(anyhow::anyhow!("boom")))
         }
         let handler = boom.into_handler();
-        // `block_on(...).expect_err(...)` would also compile (`Body` does
-        // impl `Debug`), but `match` reads clearer for panic-on-`Ok` and
-        // avoids depending on that impl.
-        let error = match block_on(handler.call(ctx())) {
-            Ok(_) => panic!("expected error"),
-            Err(error) => error,
+        // `let...else` (clippy `manual_let_else` requires it over `match`
+        // here). `expect_err` would also compile — `Body` does impl
+        // `Debug` — but this avoids depending on that.
+        let Err(error) = block_on(handler.call(ctx())) else {
+            panic!("expected error");
         };
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -244,6 +257,81 @@ your tree, mirror the idiom in `context.rs:379`).
 ```bash
 git add crates/edgezero-core/src/handler.rs
 git commit -m "test(core): cover DynHandler::call and IntoHandler bridge"
+```
+
+### Task 1b: Cover the nested-`AppConfig` checker helpers (Tier 1)
+
+**Files:**
+
+- Modify/Test: `crates/edgezero-cli/src/bin/check_no_nested_app_config.rs` (append an inline test module — it's a `bin`, so a `tests/` file can't reach its free fns)
+
+- [ ] **Step 1: Add characterization tests** for the two pure `syn`
+  helpers (the recursive-unwrap logic is the whole reason this CI gate
+  exists, per the blob-app-config spec §3.3.1.2):
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn known(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|name| String::from(*name)).collect()
+    }
+
+    fn ty(src: &str) -> syn::Type {
+        syn::parse_str(src).expect("type parse")
+    }
+
+    #[test]
+    fn struct_derives_app_config_detects_path_suffixed_derive() {
+        let item: syn::ItemStruct =
+            syn::parse_str("#[derive(Debug, edgezero_core::AppConfig)] struct C { x: u8 }")
+                .expect("struct parse");
+        assert!(struct_derives_app_config(&item));
+    }
+
+    #[test]
+    fn struct_derives_app_config_false_without_it() {
+        let item: syn::ItemStruct =
+            syn::parse_str("#[derive(Debug)] struct C { x: u8 }").expect("struct parse");
+        assert!(!struct_derives_app_config(&item));
+    }
+
+    #[test]
+    fn type_contains_app_config_unwraps_nested_wrappers() {
+        let set = known(&["ChildConfig"]);
+        assert_eq!(
+            type_contains_app_config_struct(&ty("ChildConfig"), &set).as_deref(),
+            Some("ChildConfig")
+        );
+        assert_eq!(
+            type_contains_app_config_struct(&ty("Option<Vec<Box<ChildConfig>>>"), &set).as_deref(),
+            Some("ChildConfig")
+        );
+    }
+
+    #[test]
+    fn type_contains_app_config_none_for_unrelated_types() {
+        let set = known(&["ChildConfig"]);
+        assert_eq!(type_contains_app_config_struct(&ty("String"), &set), None);
+        assert_eq!(type_contains_app_config_struct(&ty("Vec<String>"), &set), None);
+    }
+}
+```
+
+- [ ] **Step 2: Run** (the bin only builds with its feature)
+
+Run: `cargo test -p edgezero-cli --features nested-app-config-check --bin check_no_nested_app_config`
+Expected: all four tests PASS. (`use super::*` brings the helpers plus
+the `syn` / `Type` / `HashSet` imports already at the top of the bin into
+scope.)
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/edgezero-cli/src/bin/check_no_nested_app_config.rs
+git commit -m "test(cli): cover nested-AppConfig checker syn helpers"
 ```
 
 ### Task 2: Cover `AdapterPushContext` builder (Tier 2)
@@ -319,7 +407,10 @@ git commit -m "test(adapter): cover AdapterPushContext builder"
 
 - [ ] **Step 2: Run**
 
-Run: `cargo test -p edgezero-adapter run_native_cli`
+Run: `cargo test -p edgezero-adapter --features cli run_native_cli` — the
+`cli_support` module is `#[cfg(feature = "cli")]`, so a scoped `-p` run
+needs the feature explicitly (the workspace test enables it via feature
+unification).
 Expected: PASS.
 
 - [ ] **Step 3: Commit**
@@ -352,7 +443,7 @@ git commit -m "test(adapter): cover run_native_cli not-found and non-zero-exit p
     #[test]
     fn decode_brotli_stream_surfaces_error_on_invalid_input() {
         // A high-bit-set lead byte is not a valid brotli stream prefix.
-        let garbage = vec![0xFFu8; 64];
+        let garbage = vec![0xFF_u8; 64];
         let stream = stream::iter(vec![Ok::<Vec<u8>, io::Error>(garbage)]);
         let result = block_on(async {
             decode_brotli_stream(stream).try_collect::<Vec<Bytes>>().await
@@ -375,12 +466,17 @@ git add crates/edgezero-core/src/compression.rs
 git commit -m "test(core): cover gzip and brotli decode error paths"
 ```
 
-### Task 5: Tier-2 backlog (verify-then-test)
+### Task 5: Tier-2 backlog (verify-then-test) — DONE
 
-For each row in §4 "Tier 2 backlog": first read the cited code to
-confirm the path exists as described; if it does, add one test mirroring
-the module's existing idiom and commit; if it does not, note it in the
-v2 changelog and drop it. **Do not** write a test against an assumed API.
+Both backlog rows were verified against the code and closed in this PR
+(see §4 "Tier 2 backlog" for the resolutions):
+
+- **`Adapter` trait defaults** → `default_validation_and_kind_methods_are_noops`
+  in `crates/edgezero-adapter/src/registry.rs`.
+- **`app!` macro error handling** → `build_route_tokens_propagates_invalid_handler_path`
+  in `crates/edgezero-macros/src/app.rs`. The `expand_app` file-level
+  diagnostics were verified untested but deliberately left uncovered (their
+  messages embed absolute paths, making a trybuild fixture flaky).
 
 ---
 
@@ -429,15 +525,16 @@ above (not the already-covered conversions).
 
 ## 9. Acceptance gate
 
-- [ ] Tasks 1–4 land; all five project CI gates (CLAUDE.md) are green:
+- [x] Tasks 1, 1b, 2–4 land; all five project CI gates (CLAUDE.md) are green:
   1. `cargo fmt --all -- --check`
   2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
   3. `cargo test --workspace --all-targets`
   4. `cargo check --workspace --all-targets --features "fastly cloudflare spin"`
   5. `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`
-- [ ] `handler.rs` no longer appears in the `cfg(test)=0` host-testable
+- [x] Neither `handler.rs` nor `check_no_nested_app_config.rs` appears in
+      the `cfg(test)=0` host-testable
       file list.
-- [ ] Tier-2 backlog (Task 5) rows are each either closed with a test or
+- [x] Tier-2 backlog (Task 5) rows are each either closed with a test or
       recorded as "not a gap" in the v2 changelog.
 - [ ] Tier 3 disposition (Q1) is decided and recorded.
 
@@ -533,3 +630,41 @@ scope. (3) Added Cloudflare's response-conversion wasm contract coverage
 (`cloudflare/tests/contract.rs:201`) to the Tier-3 table for
 completeness, and annotated each conversion cite as host vs. wasm
 contract. Also softened the §4 intro to "host- or wasm-contract-tested".
+
+**Deep review (round 7):** multi-agent review vs. committed branch code.
+Five verified fixes: (1) Task 1 compile blocker —
+`EdgeError::internal("boom")` → `EdgeError::internal(anyhow::anyhow!("boom"))`
+(`internal` needs `E: Into<anyhow::Error>`). (2) Missed Tier-1 gap —
+`check_no_nested_app_config.rs` (`syn` helpers, 0 tests, host-testable)
+added to §2/§4 + Task 1b. (3) Fastly is `#[cfg(feature="fastly")]` only,
+not `wasm32`-gated; §2/§4 reworded. (4) §1 config-push cited nonexistent
+`raw_push_*` tests → corrected to real `typed_push_*` at `config.rs:2366+`.
+(5) `Body` does impl `Debug` (`body.rs:160`); Task 1's `match` kept as
+style, false rationale removed. Prettier passes; §9 matches the five
+CLAUDE.md gates.
+
+**Tier-2 backlog closed (round 8):** Task 5's two verify-then-test rows
+were resolved in-PR. (1) `Adapter` trait defaults —
+`default_validation_and_kind_methods_are_noops` exercises the no-op
+defaults via the existing `FIRST` `TestAdapter`. (2) `app!` macro —
+verified the `expand_app` file-level diagnostics are untested but flaky
+to trybuild (absolute paths in messages), so covered the cleanly-testable
+seam instead: `build_route_tokens_propagates_invalid_handler_path`. Both
+pass; full gate suite green.
+
+**Self-review hardening (round 9):** an adversarial review (mutation-lens
++ branch-coverage) of the added tests found weak/missing cases; all
+addressed. (1) `nested-AppConfig` checker — added the previously untested
+recursion arms of `type_contains_app_config_struct` (Rc/Arc/tuple/array/
+slice/reference/paren + cross-wrapper combos + an unwrapped-generic
+negative), `struct_derives_app_config` bare-ident / multi-derive /
+suffix-collision cases, and — the biggest gap — an **end-to-end** suite
+driving the two-pass `NestedAppConfigVisitor` over parsed source (positive
+through a wrapper, negatives, multi-count, definition-order, doc-comment
+non-false-positive, tuple-struct unnamed field): 4 → 15 tests. (2)
+`build_route_tokens` happy path — per-method token count, handler-less
+skip, GET-default. (3) `registry` — the error-returning `push_config_entries`
+/ `push_config_entries_local` defaults (assert the adapter-name message,
+not just `is_err`). (4) Strengthened weak assertions: `handler` now checks
+the response **body** flows through (not just status 200); `run_native_cli`
+non-zero test pins the `exited with status` branch. Full gate suite green.

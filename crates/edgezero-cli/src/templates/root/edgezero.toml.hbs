@@ -52,6 +52,32 @@ methods = ["GET", "POST"]
 handler = "{{proj_core_mod}}::handlers::proxy_demo"
 adapters = [{{{adapter_list}}}]
 
+# -- Introspection routes ------------------------------------------------------
+
+[[triggers.http]]
+id = "manifest"
+path = "/_{{name}}/manifest"
+methods = ["GET"]
+handler = "edgezero_core::introspection::manifest"
+adapters = [{{{adapter_list}}}]
+description = "App manifest as JSON"
+
+[[triggers.http]]
+id = "config"
+path = "/_{{name}}/config"
+methods = ["GET"]
+handler = "edgezero_core::introspection::config"
+adapters = [{{{adapter_list}}}]
+description = "Effective app config (secret-safe)"
+
+[[triggers.http]]
+id = "routes"
+path = "/_{{name}}/routes"
+methods = ["GET"]
+handler = "edgezero_core::introspection::routes"
+adapters = [{{{adapter_list}}}]
+description = "Registered route table"
+
 # -- Stores ----------------------------------------------------------------
 #
 # `[stores.<kind>]` declares logical store ids only. `default` is required
