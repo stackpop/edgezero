@@ -392,6 +392,7 @@ impl Adapter for FastlyCliAdapter {
         }
         // Reject reserved keys before any expansion or I/O.
         reject_reserved_root_keys(entries)?;
+        reject_duplicate_root_keys(entries)?;
         // Expand each logical root once: flatten for the commit, and keep
         // the exact per-root keep-set + the value written at the root key
         // for GC (no prefix scan of the flattened set). Collecting all
@@ -533,6 +534,7 @@ impl Adapter for FastlyCliAdapter {
         }
         // Reject reserved keys before any expansion or I/O.
         reject_reserved_root_keys(entries)?;
+        reject_duplicate_root_keys(entries)?;
         // Expand each logical root once: flatten for the write, keep the
         // exact per-root keep-set for GC (no prefix scan of the flattened set).
         let mut physical_entries: Vec<(String, String)> = Vec::new();
@@ -637,19 +639,20 @@ impl Adapter for FastlyCliAdapter {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Parse the JSON and extract the `item_value` field.
-            let parsed: serde_json::Value =
-                serde_json::from_str(&stdout).map_err(|err| {
-                    format!(
-                        "failed to parse `fastly config-store-entry describe` JSON: {err}\nraw stdout: {stdout}"
-                    )
-                })?;
+            let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
+                format!(
+                    "failed to parse `fastly config-store-entry describe` JSON: {err} (response: {})",
+                    redact_describe_response(&stdout)
+                )
+            })?;
             let value = parsed
                 .get("item_value")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     format!(
                         "`fastly config-store-entry describe` JSON has no string `item_value` field; \
-                         fastly CLI may have changed its output schema. Raw stdout: {stdout}"
+                         fastly CLI may have changed its output schema. (response: {})",
+                        redact_describe_response(&stdout)
                     )
                 })?;
             // Resolve chunk pointers: if `value` is a direct BlobEnvelope it
@@ -790,8 +793,9 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parsed: serde_json::Value = serde_json::from_str(&stdout).map_err(|err| {
             format!(
-                "failed to parse `fastly config-store-entry describe` JSON for chunk \
-                     key `{key}`: {err}\nraw stdout: {stdout}"
+                "failed to parse `fastly config-store-entry describe` JSON for key \
+                 `{key}`: {err} (response: {})",
+                redact_describe_response(&stdout)
             )
         })?;
         let value = parsed
@@ -800,8 +804,9 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
             .ok_or_else(|| {
                 format!(
                     "`fastly config-store-entry describe` JSON has no string `item_value` \
-                     field for chunk key `{key}`; fastly CLI may have changed its output schema. \
-                     Raw stdout: {stdout}"
+                     field for key `{key}`; fastly CLI may have changed its output schema. \
+                     (response: {})",
+                    redact_describe_response(&stdout)
                 )
             })?;
         return Ok(Some(value.to_owned()));
@@ -1186,6 +1191,27 @@ fn reject_reserved_root_keys(entries: &[(String, String)]) -> Result<(), String>
     Ok(())
 }
 
+/// Reject a batch that names the same logical root key more than once.
+///
+/// The adapter trait takes an entry slice and does not enforce uniqueness,
+/// but GC builds one plan per entry and snapshots every plan against the
+/// SAME prior generation. With `[(root, A), (root, B)]` the last tuple wins
+/// the upsert (root = B), yet A's plan would still reclaim `prior - A_keys`
+/// — which includes B's freshly-written chunks — leaving the final pointer
+/// referencing missing chunks. Rejecting is safer than silently coalescing:
+/// a duplicated key is a caller bug, and picking a winner would hide it.
+fn reject_duplicate_root_keys(entries: &[(String, String)]) -> Result<(), String> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    for (key, _) in entries {
+        if !seen.insert(key.as_str()) {
+            return Err(format!(
+                "config key `{key}` appears more than once in a single push; each logical key must be pushed exactly once"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Best-effort per-root orphan count for `config push --local --dry-run`.
 /// Navigate to `[local_server.config_stores.<name>.contents]` for the
 /// dry-run counter. `Ok(None)` when any level is absent (no prior state);
@@ -1480,6 +1506,40 @@ fn find_config_store_id(stdout: &str, name: &str) -> ConfigStoreLookup {
                 .to_owned(),
         )
     }
+}
+
+/// Summarise a `fastly ... describe` response for diagnostics WITHOUT
+/// leaking its contents.
+///
+/// The response body is the stored config value. App config may hold
+/// credentials, internal endpoints, or security policy, and this adapter
+/// performs no secret stripping — while CLI status lines are logged
+/// verbatim and CI logs are commonly retained and shared. So a schema-drift
+/// diagnostic must never echo the payload: report only its size and its
+/// top-level *shape* (field names for an object, type otherwise), never a
+/// value.
+fn redact_describe_response(stdout: &str) -> String {
+    let len = stdout.len();
+    serde_json::from_str::<serde_json::Value>(stdout).map_or_else(
+        |_err| format!("{len} bytes, not valid JSON"),
+        |value| match value {
+            serde_json::Value::Object(map) => {
+                let mut names: Vec<&str> = map.keys().map(String::as_str).collect();
+                names.sort_unstable();
+                format!(
+                    "{len} bytes, JSON object with fields [{}]",
+                    names.join(", ")
+                )
+            }
+            other @ (serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+            | serde_json::Value::Array(_)) => {
+                format!("{len} bytes, JSON {}", shape_summary(&other))
+            }
+        },
+    )
 }
 
 /// One-line type label for a `serde_json::Value` (for diagnostic
@@ -3488,6 +3548,74 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// Schema drift must never echo the config payload. App config can hold
+    /// credentials; CLI status lines are logged verbatim and CI logs are
+    /// retained/shared. Only a size + field-name shape may be reported.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_schema_drift_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_abc123";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Valid JSON, but the value moved out of `item_value` (schema drift).
+        let drift = format!(r#"{{"value_moved_here":"{SENTINEL}"}}"#);
+        let fake = fake_fastly_returning(&drift, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("schema drift must error")
+        };
+        assert!(
+            !err.contains(SENTINEL),
+            "error must not leak the config payload: {err}"
+        );
+        assert!(
+            err.contains("bytes"),
+            "error should carry a redacted size/shape summary: {err}"
+        );
+    }
+
+    /// The GC prior-read runs on EVERY cloud push, so a drifted response must
+    /// not leak the previous config envelope into the push's status lines.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_prior_read_drift_does_not_leak_payload() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_xyz789";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let drift = format!(r#"{{"value_moved_here":"{SENTINEL}"}}"#);
+        let fake = fake_fastly_returning(&drift, "", 0);
+        let _path = PathPrepend::new(fake.path());
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let out = FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push still succeeds; the prior read only warns");
+        for line in &out {
+            assert!(
+                !line.contains(SENTINEL),
+                "push status must not leak the prior config payload: {line}"
+            );
+        }
+    }
+
     /// Every delete must pass `--key` + `--auto-yes` and NEVER `--all`
     /// (which would wipe the whole store). Asserts the actual argv.
     #[cfg(unix)]
@@ -4601,6 +4729,85 @@ echo 'unexpected' >&2; exit 1
                 .contains("unknown: could not read prior state"),
             "non-table contents must degrade to unknown: {out:?}"
         );
+    }
+
+    /// A duplicate root key in one batch is rejected before any I/O.
+    /// Otherwise the earlier tuple's GC plan would reclaim the chunks the
+    /// LAST tuple just installed, leaving the final pointer dangling.
+    /// Regression: prior B, batch `[(root, A), (root, B)]` — the root must
+    /// still resolve afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_local_rejects_duplicate_root_keys() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+        fs::write(&fastly_toml, "name = \"demo\"\n").expect("seed");
+
+        let make = |tag: &str| {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:00Z".to_owned()))
+                .expect("envelope")
+        };
+        let envelope_a = make("aaa");
+        let envelope_b = make("bbb");
+
+        // Prior generation B is live.
+        FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_b.clone())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("seed push");
+        let before = fs::read_to_string(&fastly_toml).expect("read");
+
+        // Duplicate-root batch must be rejected outright.
+        let err = FastlyCliAdapter
+            .push_config_entries_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[
+                    (TEST_CONFIG_ID.to_owned(), envelope_a),
+                    (TEST_CONFIG_ID.to_owned(), envelope_b.clone()),
+                ],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("duplicate root keys must be rejected");
+        assert!(
+            err.contains("more than once"),
+            "error explains the duplicate: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&fastly_toml).expect("read"),
+            before,
+            "rejection must happen before any write"
+        );
+
+        // The live root still resolves to B (nothing was reclaimed).
+        let read = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                TEST_CONFIG_ID,
+                &AdapterPushContext::new(),
+            )
+            .expect("root must still resolve");
+        let ReadConfigEntry::Present(value) = read else {
+            panic!("expected Present");
+        };
+        assert_eq!(value, envelope_b, "root still reconstructs envelope B");
     }
 
     /// GC of a chunked root must not touch a chunked SIBLING's chunks —
