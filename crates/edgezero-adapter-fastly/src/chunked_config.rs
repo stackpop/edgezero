@@ -39,14 +39,6 @@ pub(crate) const CHUNK_KEY_INFIX: &str = ".__edgezero_chunks.";
 /// BOTH the writer (when serialising the pointer) AND the resolver
 /// (when validating the parsed pointer) -- stays unconditional.
 pub(crate) const POINTER_KIND: &str = "fastly_config_chunks";
-/// Infix of the per-root deferred-reclamation record:
-/// `<root>.__edgezero_gc.pending`. Reserved like `CHUNK_KEY_INFIX` --
-/// a logical config key must never contain it. CLI writer only.
-#[cfg(any(feature = "cli", test))]
-pub(crate) const GC_PENDING_INFIX: &str = ".__edgezero_gc.";
-/// `edgezero_kind` discriminant stored in the pending-reclamation record.
-#[cfg(any(feature = "cli", test))]
-pub(crate) const GC_PENDING_KIND: &str = "fastly_config_gc_pending";
 
 // ---------------------------------------------------------------------------
 // Private pointer schema
@@ -67,43 +59,6 @@ struct FastlyChunkRef {
     key: String,
     len: usize,
     sha256: String,
-}
-
-/// One chunk generation, identified by the envelope SHA its chunk keys are
-/// addressed by. The keys themselves are DERIVABLE
-/// (`<root>.__edgezero_chunks.<sha>.<idx>` for `idx` in `0..count`), so the
-/// deferred-reclamation record stores this compact form rather than the raw
-/// key list -- which would blow the 8 000-char entry limit after a couple of
-/// generations.
-#[cfg(any(feature = "cli", test))]
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) struct ChunkGeneration {
-    pub count: usize,
-    pub sha: String,
-}
-
-/// A generation awaiting reclamation, plus when it was superseded.
-#[cfg(any(feature = "cli", test))]
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub(crate) struct GcPendingGeneration {
-    pub count: usize,
-    pub sha: String,
-    /// Unix epoch seconds at which this generation stopped being the live
-    /// pointer. Reclamation waits until it has aged past the grace window,
-    /// so lagging POPs still serving the old pointer keep their chunks.
-    pub superseded_at: u64,
-}
-
-/// The per-root deferred-reclamation record stored at
-/// `<root>.__edgezero_gc.pending`. A LIST, not a single slot: pushing faster
-/// than the grace window must not drop an un-reclaimed generation on the
-/// floor (that would leak it untracked, forever).
-#[cfg(any(feature = "cli", test))]
-#[derive(serde::Deserialize, serde::Serialize)]
-pub(crate) struct GcPendingRecord {
-    edgezero_kind: String,
-    generations: Vec<GcPendingGeneration>,
-    version: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -407,98 +362,25 @@ pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>,
     Ok(keys)
 }
 
-/// The prior pointer's generation (envelope SHA + chunk count), from which
-/// its chunk keys are derivable. Same validation and prefix-scoping as
-/// [`prior_chunk_keys`]: `Ok(None)` for a direct/absent/non-pointer value,
-/// `Err` for a pointer-kind value that fails validation.
+/// Extract the content-address (envelope SHA) of the generation a chunk key
+/// belongs to, for `root_key`. Returns `None` when `key` is not a well-formed
+/// chunk key of that root.
+///
+/// This is how reclamation groups the store's ACTUAL keys into generations. It
+/// validates the shape (`<root>.__edgezero_chunks.<hex-sha>.<index>`) rather
+/// than trusting it: a hand-edited or foreign key never becomes a delete target.
 #[cfg(any(feature = "cli", test))]
-pub(crate) fn prior_chunk_generation(
-    root_key: &str,
-    raw: &str,
-) -> Result<Option<ChunkGeneration>, String> {
-    let keys = prior_chunk_keys(root_key, raw)?;
-    if keys.is_empty() {
-        return Ok(None);
+pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> {
+    let prefix = format!("{root_key}{CHUNK_KEY_INFIX}");
+    let rest = key.strip_prefix(&prefix)?;
+    let (sha, index) = rest.rsplit_once('.')?;
+    if sha.is_empty() || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
     }
-    // The pointer validated above; re-read its sha for the compact form.
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|err| format!("prior chunk pointer at `{root_key}` is malformed: {err}"))?;
-    let sha = value
-        .get("envelope_sha256")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            format!(
-                "prior chunk pointer at `{root_key}` has no `envelope_sha256`; skipping chunk GC"
-            )
-        })?;
-    Ok(Some(ChunkGeneration {
-        count: keys.len(),
-        sha: sha.to_owned(),
-    }))
-}
-
-/// Rebuild a generation's chunk keys from its content address. Mirrors the
-/// key construction in [`prepare_fastly_config_entries`].
-#[cfg(any(feature = "cli", test))]
-pub(crate) fn derive_chunk_keys(root_key: &str, generation: &ChunkGeneration) -> Vec<String> {
-    (0..generation.count)
-        .map(|idx| {
-            format!(
-                "{root_key}{CHUNK_KEY_INFIX}{sha}.{idx}",
-                sha = generation.sha
-            )
-        })
-        .collect()
-}
-
-/// Key of the per-root deferred-reclamation record.
-#[cfg(any(feature = "cli", test))]
-pub(crate) fn gc_pending_key(root_key: &str) -> String {
-    format!("{root_key}{GC_PENDING_INFIX}pending")
-}
-
-/// Parse a pending-reclamation record. `Ok(vec![])` when absent or not our
-/// record; `Err` when it IS our kind but fails validation (caller warns and
-/// skips reclamation rather than clobbering state it cannot understand).
-#[cfg(any(feature = "cli", test))]
-pub(crate) fn parse_gc_pending(
-    root_key: &str,
-    raw: &str,
-) -> Result<Vec<GcPendingGeneration>, String> {
-    let value: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(value) => value,
-        Err(_) => return Ok(Vec::new()),
-    };
-    if value
-        .get("edgezero_kind")
-        .and_then(serde_json::Value::as_str)
-        != Some(GC_PENDING_KIND)
-    {
-        return Ok(Vec::new());
+    if index.is_empty() || !index.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
     }
-    let record: GcPendingRecord = serde_json::from_value(value).map_err(|err| {
-        format!("GC pending record at `{root_key}` is malformed: {err}; skipping chunk reclamation")
-    })?;
-    if record.version != 1 {
-        return Err(format!(
-            "GC pending record at `{root_key}` has unsupported version {}; skipping chunk reclamation",
-            record.version
-        ));
-    }
-    Ok(record.generations)
-}
-
-/// Serialise a pending-reclamation record.
-#[cfg(any(feature = "cli", test))]
-pub(crate) fn serialize_gc_pending(
-    generations: Vec<GcPendingGeneration>,
-) -> Result<String, String> {
-    serde_json::to_string(&GcPendingRecord {
-        edgezero_kind: GC_PENDING_KIND.to_owned(),
-        generations,
-        version: 1,
-    })
-    .map_err(|err| format!("failed to serialise GC pending record: {err}"))
+    Some(sha.to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -929,80 +811,36 @@ mod tests {
         assert!(err.contains("outside"), "{err}");
     }
 
-    // ---- deferred-reclamation tests ----
+    // ---- chunk_key_generation ----
 
-    /// The compact generation form must regenerate EXACTLY the pointer's keys
-    /// — the pending record stores `(sha, count)` instead of the raw key list
-    /// (which would blow the 8 000-char entry limit), so reclamation depends
-    /// on this round-trip being lossless.
     #[test]
-    fn derive_chunk_keys_round_trips_the_pointers_keys() {
+    fn chunk_key_generation_extracts_the_sha() {
         let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         let entries = prepare_fastly_config_entries("app_config", &envelope).unwrap();
-        let (_, pointer_json) = entries.last().unwrap();
-        let expected: Vec<String> = entries[..entries.len().saturating_sub(1)]
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect();
-
-        let generation = prior_chunk_generation("app_config", pointer_json)
-            .expect("valid pointer")
-            .expect("chunked");
-        assert_eq!(generation.count, expected.len());
-        assert_eq!(derive_chunk_keys("app_config", &generation), expected);
+        let (chunk_key, _) = &entries[0];
+        let sha = chunk_key_generation("app_config", chunk_key).expect("a chunk key");
+        assert_eq!(sha.len(), 64, "sha256 hex");
+        assert!(chunk_key.contains(&sha));
     }
 
     #[test]
-    fn prior_chunk_generation_is_none_for_direct_envelope() {
-        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT);
-        assert!(prior_chunk_generation("app_config", &envelope)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn gc_pending_round_trips() {
-        let generations = vec![
-            GcPendingGeneration {
-                count: 3,
-                sha: "aa".repeat(32),
-                superseded_at: 1_720_000_000,
-            },
-            GcPendingGeneration {
-                count: 1,
-                sha: "bb".repeat(32),
-                superseded_at: 1_720_000_500,
-            },
-        ];
-        let raw = serialize_gc_pending(generations).expect("serialise");
-        let parsed = parse_gc_pending("app_config", &raw).expect("parse");
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].count, 3);
-        assert_eq!(parsed[1].superseded_at, 1_720_000_500);
-    }
-
-    #[test]
-    fn parse_gc_pending_is_silent_for_unrelated_values() {
-        assert!(parse_gc_pending("app_config", r#"{"hello":"world"}"#)
-            .unwrap()
-            .is_empty());
-        assert!(parse_gc_pending("app_config", "not json")
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn parse_gc_pending_warns_on_unsupported_version() {
-        let raw = r#"{"edgezero_kind":"fastly_config_gc_pending","version":2,"generations":[]}"#;
-        let err = parse_gc_pending("app_config", raw).expect_err("version 2 must warn");
-        assert!(err.contains("unsupported version"), "{err}");
-    }
-
-    #[test]
-    fn gc_pending_key_is_in_the_reserved_namespace() {
-        let key = gc_pending_key("app_config");
-        assert!(key.contains(GC_PENDING_INFIX), "{key}");
-        assert!(key.starts_with("app_config"), "{key}");
+    fn chunk_key_generation_rejects_foreign_and_malformed_keys() {
+        // Different root.
+        assert!(chunk_key_generation("app_config", "other.__edgezero_chunks.abc123.0").is_none());
+        // The root key itself.
+        assert!(chunk_key_generation("app_config", "app_config").is_none());
+        // Non-hex content address.
+        assert!(
+            chunk_key_generation("app_config", "app_config.__edgezero_chunks.zzzz.0").is_none()
+        );
+        // Non-numeric index.
+        assert!(
+            chunk_key_generation("app_config", "app_config.__edgezero_chunks.abc123.x").is_none()
+        );
+        // Missing index.
+        assert!(
+            chunk_key_generation("app_config", "app_config.__edgezero_chunks.abc123").is_none()
+        );
     }
 
     // Regression for the Value-first rule: a value that IS pointer-kind but
