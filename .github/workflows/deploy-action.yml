@@ -102,6 +102,10 @@ jobs:
           npm run lint
           npm run build
 
+  # Production path: build the app's OWN CLI, deploy through the wrapper, and
+  # prove the whole chain ran with the credential boundary intact. Every
+  # assertion lives in a script under deploy-core/tests/ so it is shellcheck'd
+  # and readable outside the YAML.
   composite-smoke:
     runs-on: ubuntu-24.04
     # An inherited provider alias the deploy MUST clear (provider-env boundary).
@@ -138,27 +142,12 @@ jobs:
       - name: Assert production deploy, version threading, and credential boundary
         env:
           FASTLY_VERSION_OUT: ${{ steps.deploy.outputs['fastly-version'] }}
-        run: |
-          set -euo pipefail
-          # 1) The whole chain ran: build-cli -> deploy-fastly -> app CLI -> the
-          #    overridden Fastly deploy command.
-          test -f fixture-app/deploy-argv.txt
-          test -f fixture-app/env-seen.txt
-          echo "recorded argv:"; cat fixture-app/deploy-argv.txt
-          echo "credentials the deploy saw:"; cat fixture-app/env-seen.txt
-          # 2) fastly-version threaded out of the action.
-          [[ "$FASTLY_VERSION_OUT" == "7" ]] || { echo "::error::expected fastly-version=7, got '$FASTLY_VERSION_OUT'"; exit 1; }
-          # 3) provider-env boundary: typed creds present, inherited alias cleared.
-          grep -qx 'token=dummy-token' fixture-app/env-seen.txt || { echo "::error::typed FASTLY_API_TOKEN not delivered"; exit 1; }
-          grep -qx 'service-id=dummy-service' fixture-app/env-seen.txt || { echo "::error::typed FASTLY_SERVICE_ID not delivered"; exit 1; }
-          grep -qx 'endpoint=CLEARED' fixture-app/env-seen.txt || { echo "::error::inherited FASTLY_ENDPOINT was NOT cleared before deploy"; exit 1; }
+        run: .github/actions/deploy-core/tests/assert-production-deploy.sh
 
-  # Exercises the FULL Fastly staging lifecycle (stage -> healthcheck ->
-  # rollback) against faithful fake `fastly`/`curl` binaries, asserting the exact
-  # verbs and paths. This is the regression test for the review findings:
-  # --comment must not reach `compute update`; the domain API returns a singular
-  # `staging_ip`; activate/deactivate are PUT; staging deactivate is
-  # /deactivate/staging; and an unhealthy probe must FAIL the healthcheck action.
+  # Staging path: the full lifecycle (stage -> healthcheck -> rollback) against
+  # fake `fastly`/`curl` binaries that mirror the real contracts. Because the
+  # bugs a review found were argv/verb bugs, the assertions check argv and verbs
+  # — see the assert-*.sh scripts for what each one regression-tests.
   lifecycle-smoke:
     runs-on: ubuntu-24.04
     steps:
@@ -188,49 +177,19 @@ jobs:
       - name: Extract the app CLI
         env:
           CLI_BIN: ${{ steps.cli.outputs.cli-bin }}
-        run: |
-          set -euo pipefail
-          mkdir -p cli-bin
-          tar -xf cli-dl/*.tar -C cli-bin
-          chmod +x "cli-bin/$CLI_BIN"
+        run: .github/actions/deploy-core/tests/extract-cli.sh
 
-      - name: Staged deploy (asserts --comment never reaches `compute update`)
+      - name: Staged deploy
         env:
           CLI_BIN: ${{ steps.cli.outputs.cli-bin }}
           FASTLY_API_TOKEN: dummy-token
           FASTLY_SERVICE_ID: dummy-service
-        run: |
-          set -euo pipefail
-          cd fixture-app
-          out=$("$GITHUB_WORKSPACE/cli-bin/$CLI_BIN" \
-            deploy --adapter fastly --service-id dummy-service --stage -- --comment "staged smoke" 2>&1 | tee /dev/stderr)
-          echo "$out" | grep -qE '^version=42$' || { echo "::error::staged deploy did not emit version=42"; exit 1; }
+        run: .github/actions/deploy-core/tests/staged-deploy.sh
 
       - name: Assert the staged Fastly call sequence
-        run: |
-          set -euo pipefail
-          log="$FAKE_CALL_LOG"
-          echo "--- recorded fastly/curl calls:"; cat "$log"
+        run: .github/actions/deploy-core/tests/assert-staged-calls.sh
 
-          update=$(grep -E '^fastly compute update ' "$log" | head -n 1)
-          [[ -n "$update" ]] || { echo "::error::no 'compute update' call"; exit 1; }
-          # `compute update` does NOT support --comment; it must never be forwarded.
-          if grep -qE '^fastly compute update .*--comment' "$log"; then
-            echo "::error::--comment was forwarded to 'compute update' (unsupported flag)"; exit 1
-          fi
-          for flag in -- --autoclone --version=active --non-interactive; do
-            [[ "$update" == *"$flag"* ]] || { echo "::error::'compute update' missing $flag"; exit 1; }
-          done
-
-          # The comment must be applied to the version, BEFORE staging it.
-          grep -qE '^fastly service-version update .*--comment' "$log" \
-            || { echo "::error::comment was not applied via 'service-version update'"; exit 1; }
-          cu=$(grep -n '^fastly service-version update ' "$log" | head -n 1 | cut -d: -f1)
-          st=$(grep -n '^fastly service-version stage ' "$log" | head -n 1 | cut -d: -f1)
-          [[ -n "$st" ]] || { echo "::error::version was never staged"; exit 1; }
-          [[ "$cu" -lt "$st" ]] || { echo "::error::comment applied after staging (must precede it)"; exit 1; }
-
-      - name: Health check the staged version (singular staging_ip)
+      - name: Health check the staged version
         uses: ./.github/actions/healthcheck-fastly
         with:
           cli-artifact: ${{ steps.cli.outputs.artifact-name }}
@@ -242,17 +201,10 @@ jobs:
           retry: "1"
           retry-delay: "1"
 
-      - name: Assert staging IP was resolved and probed
-        run: |
-          set -euo pipefail
-          log="$FAKE_CALL_LOG"
-          grep -qE '^GET https://api\.fastly\.com/service/dummy-service/version/42/domain\?include=staging_ips$' "$log" \
-            || { echo "::error::staging-IP lookup not performed"; exit 1; }
-          # The probe must be rerouted to the staging IP from the singular field.
-          grep -qE '^PROBE .*--connect-to ::151\.101\.2\.10:443 .*https://staging\.example\.com/' "$log" \
-            || { echo "::error::probe was not rerouted to the staging IP"; exit 1; }
+      - name: Assert the staging IP was resolved and probed
+        run: .github/actions/deploy-core/tests/assert-staging-probe.sh
 
-      - name: Health check FAILS closed when unhealthy
+      - name: Health check must FAIL when the probe is unhealthy
         id: unhealthy
         continue-on-error: true
         uses: ./.github/actions/healthcheck-fastly
@@ -266,24 +218,16 @@ jobs:
           retry: "1"
           retry-delay: "1"
         env:
-          # Flip the fake probe to 503 for this step only.
+          # Flips the fake probe to 503 for this step only.
           FORCE_UNHEALTHY: "1"
 
-      - name: Assert the unhealthy check actually failed the wrapper
+      - name: Assert the unhealthy check failed the wrapper
         env:
           OUTCOME: ${{ steps.unhealthy.outcome }}
           HEALTHY: ${{ steps.unhealthy.outputs.healthy }}
-        run: |
-          set -euo pipefail
-          # The rollback gate is "healthcheck step failed". If an unhealthy probe
-          # lets the action succeed, no caller would ever roll back.
-          [[ "$OUTCOME" == "failure" ]] \
-            || { echo "::error::unhealthy probe did not fail healthcheck-fastly (outcome=$OUTCOME)"; exit 1; }
-          [[ "$HEALTHY" != "true" ]] \
-            || { echo "::error::unhealthy probe still reported healthy=true"; exit 1; }
-          echo "healthcheck-fastly failed closed on an unhealthy probe"
+        run: .github/actions/deploy-core/tests/assert-unhealthy-failed.sh
 
-      - name: Rollback the staged version (PUT /deactivate/staging)
+      - name: Roll back the staged version
         uses: ./.github/actions/rollback-fastly
         with:
           cli-artifact: ${{ steps.cli.outputs.artifact-name }}
@@ -292,7 +236,7 @@ jobs:
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
 
-      - name: Rollback production (PUT /activate on v-1)
+      - name: Roll back production
         id: prod-rollback
         uses: ./.github/actions/rollback-fastly
         with:
@@ -305,15 +249,4 @@ jobs:
       - name: Assert rollback verbs, paths, and version threading
         env:
           ROLLED_BACK_TO: ${{ steps.prod-rollback.outputs['rolled-back-to'] }}
-        run: |
-          set -euo pipefail
-          log="$FAKE_CALL_LOG"
-          echo "--- recorded calls:"; cat "$log"
-          # Staging rollback: PUT .../deactivate/staging (NOT a plain /deactivate).
-          grep -qE '^PUT https://api\.fastly\.com/service/dummy-service/version/42/deactivate/staging$' "$log" \
-            || { echo "::error::staging rollback did not PUT /deactivate/staging"; exit 1; }
-          # Production rollback activates the PREVIOUS version (42 -> 41), via PUT.
-          grep -qE '^PUT https://api\.fastly\.com/service/dummy-service/version/41/activate$' "$log" \
-            || { echo "::error::production rollback did not PUT /version/41/activate"; exit 1; }
-          # Version threading out of the action.
-          [[ "$ROLLED_BACK_TO" == "41" ]] || { echo "::error::expected rolled-back-to=41, got '$ROLLED_BACK_TO'"; exit 1; }
+        run: .github/actions/deploy-core/tests/assert-rollback-calls.sh
