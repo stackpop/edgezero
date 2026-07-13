@@ -5,9 +5,12 @@ use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    prepare_fastly_config_entries, prior_chunk_keys, resolve_fastly_config_value, CHUNK_KEY_INFIX,
+    derive_chunk_keys, gc_pending_key, parse_gc_pending, prepare_fastly_config_entries,
+    prior_chunk_generation, prior_chunk_keys, resolve_fastly_config_value, serialize_gc_pending,
+    ChunkGeneration, GcPendingGeneration, CHUNK_KEY_INFIX, GC_PENDING_INFIX,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -147,20 +150,39 @@ enum ConfigStoreLookup {
     SchemaDrift(String),
 }
 
-/// Per-root plan for reclaiming a prior generation's chunk entries on
-/// re-push (Stage 7). Built by the config-push paths; consumed by the
-/// GC helpers `expand_root` / `orphan_chunk_keys`.
+/// Per-root plan for the CLOUD path's deferred reclamation.
+///
+/// Fastly's config store is eventually consistent: after we write pointer N,
+/// some POPs still serve pointer N-1 and need N-1's chunks. So a cloud push
+/// never deletes what it just superseded — it *records* that generation and
+/// reclaims it on a later push, once it has aged past the grace window.
+struct FastlyCloudGcPlan {
+    /// Exact keep-set this push writes for the root (chunk keys + root key).
+    new_keys: HashSet<String>,
+    /// Exactly the value written at `root_key`; the read-back guard compares
+    /// against it to confirm we are still the last writer (LWW).
+    new_root_value: String,
+    /// Generations already awaiting reclamation, read before the commit.
+    /// `Err` => record we cannot understand; warn and touch nothing.
+    pending: Result<Vec<GcPendingGeneration>, String>,
+    /// The generation this push supersedes (N-1) — recorded as pending, never
+    /// deleted now. `Err` => suspicious prior pointer; warn and skip.
+    prior: Result<Option<ChunkGeneration>, String>,
+    root_key: String,
+}
+
+/// Per-root plan for the LOCAL path's eager prune.
+///
+/// Local reclamation is safe to do immediately: `fastly.toml` is a single
+/// file that Viceroy reads at startup — there is no propagation window and no
+/// POP that could still be serving the previous pointer. (The cloud path
+/// cannot do this; see [`FastlyCloudGcPlan`].)
 struct FastlyConfigGcPlan {
     /// Exact keep-set this push writes for the root (chunk keys + root key).
     new_keys: HashSet<String>,
-    /// Exactly the value written at `root_key` (its new pointer, or the
-    /// direct envelope). Cloud uses it as a read-back concurrency guard
-    /// (last-writer-wins); local ignores it.
-    new_root_value: String,
     /// Prior chunk keys to consider deleting, or a warning to surface
     /// (suspicious prior pointer) that skips GC for this root.
     prior_keys: Result<Vec<String>, String>,
-    root_key: String,
 }
 
 // The three `validate_*` trait methods exist on `Adapter` because
@@ -428,27 +450,39 @@ impl Adapter for FastlyCliAdapter {
                     ));
                 }
                 out.push(format!(
-                    "  would delete orphaned prior-generation chunks of `{key}` (count determined at push time)"
+                    "  would defer reclamation of `{key}`'s prior generation (reclaimed on a later push, once aged past the grace window)"
                 ));
             }
             return Ok(out);
         }
         let resolved_id = resolve_remote_config_store_id(name)?;
-        // Build GC plans BEFORE the commit: read each root's prior value so
-        // we know which chunks the old pointer referenced.
-        let mut gc_plans: Vec<FastlyConfigGcPlan> = Vec::with_capacity(roots.len());
+        let now = unix_now_secs();
+        let grace = gc_grace_secs();
+        // Build GC plans BEFORE the commit: read each root's prior pointer (the
+        // generation we are about to supersede) and its pending-reclamation
+        // record (generations superseded by EARLIER pushes).
+        let mut gc_plans: Vec<FastlyCloudGcPlan> = Vec::with_capacity(roots.len());
         for (root_key, new_keys, new_root_value) in roots {
-            let prior_keys = match fetch_remote_config_store_entry(&resolved_id, &root_key) {
-                Ok(Some(raw)) => prior_chunk_keys(&root_key, &raw),
-                Ok(None) => Ok(Vec::new()),
+            let prior = match fetch_remote_config_store_entry(&resolved_id, &root_key) {
+                Ok(Some(raw)) => prior_chunk_generation(&root_key, &raw),
+                Ok(None) => Ok(None),
                 Err(err) => Err(format!(
                     "failed to read prior root `{root_key}` for chunk GC: {err}; skipping GC for this root"
                 )),
             };
-            gc_plans.push(FastlyConfigGcPlan {
+            let pending =
+                match fetch_remote_config_store_entry(&resolved_id, &gc_pending_key(&root_key)) {
+                    Ok(Some(raw)) => parse_gc_pending(&root_key, &raw),
+                    Ok(None) => Ok(Vec::new()),
+                    Err(err) => Err(format!(
+                        "failed to read the GC pending record for `{root_key}`: {err}; skipping chunk reclamation"
+                    )),
+                };
+            gc_plans.push(FastlyCloudGcPlan {
                 new_keys,
                 new_root_value,
-                prior_keys,
+                pending,
+                prior,
                 root_key,
             });
         }
@@ -457,39 +491,13 @@ impl Adapter for FastlyCliAdapter {
         push_entries_with_committer(&physical_entries, |key, value| {
             create_config_store_entry(&resolved_id, key, value)
         })?;
-        // Post-commit sweep, last-writer-wins: delete a root's orphans only
-        // while a read-back confirms the root still holds exactly what we
-        // wrote. If a newer push has superseded it, yield (delete nothing).
+        // Post-commit: DEFERRED reclamation. We never delete the generation we
+        // just superseded — the config store is eventually consistent, so POPs
+        // may still be serving it. Instead we record it, and reclaim only older
+        // generations that have aged past the grace window.
         let mut warnings = Vec::new();
-        for plan in &gc_plans {
-            let orphans = match orphan_chunk_keys(plan) {
-                Ok(keys) if !keys.is_empty() => keys,
-                Ok(_) => continue,
-                Err(err) => {
-                    warnings.push(format!("warning: {err}"));
-                    continue;
-                }
-            };
-            match fetch_remote_config_store_entry(&resolved_id, &plan.root_key) {
-                Ok(Some(current)) if current == plan.new_root_value => {
-                    for key in orphans {
-                        if let Err(err) = delete_config_store_entry(&resolved_id, &key) {
-                            warnings.push(format!(
-                                "note: could not reclaim orphan chunk `{key}` for `{}` ({err}); it is inert and will be removed by a future `config gc`",
-                                plan.root_key
-                            ));
-                        }
-                    }
-                }
-                Ok(_) => warnings.push(format!(
-                    "note: skipped chunk GC for `{}`: root changed since this push wrote it (concurrent push?); orphans left for a future `config gc`",
-                    plan.root_key
-                )),
-                Err(err) => warnings.push(format!(
-                    "note: skipped chunk GC for `{}`: could not re-read root before sweep ({err}); orphans left for a future `config gc`",
-                    plan.root_key
-                )),
-            }
+        for plan in gc_plans {
+            warnings.extend(reclaim_and_record(&resolved_id, plan, now, grace));
         }
         let mut out = vec![format!(
             "pushed {} physical entries ({} logical) to fastly config-store `{name}` (logical id `{logical}`, id={resolved_id})",
@@ -1107,9 +1115,7 @@ fn write_fastly_local_config_store(
             .map_or_else(|| Ok(Vec::new()), |value| prior_chunk_keys(root_key, value));
         plans.push(FastlyConfigGcPlan {
             new_keys: new_keys.clone(),
-            new_root_value: String::new(), // unused locally (no remote concurrency)
             prior_keys,
-            root_key: root_key.clone(),
         });
     }
 
@@ -1182,13 +1188,39 @@ fn orphan_chunk_keys(plan: &FastlyConfigGcPlan) -> Result<Vec<String>, String> {
 /// space, and could not be reclaimed correctly.
 fn reject_reserved_root_keys(entries: &[(String, String)]) -> Result<(), String> {
     for (key, _) in entries {
-        if key.contains(CHUNK_KEY_INFIX) {
-            return Err(format!(
-                "config key `{key}` contains the reserved infix `{CHUNK_KEY_INFIX}`, which collides with Fastly chunk storage; choose a different config key (or --key override)"
-            ));
+        for infix in [CHUNK_KEY_INFIX, GC_PENDING_INFIX] {
+            if key.contains(infix) {
+                return Err(format!(
+                    "config key `{key}` contains the reserved infix `{infix}`, which collides with Fastly chunk storage; choose a different config key (or --key override)"
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// Unix epoch seconds. Push-time only (the `cli` feature is native).
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// How long a superseded generation must age before it may be reclaimed.
+///
+/// Fastly's config store is eventually consistent and documents no
+/// propagation bound, so eager deletion can strip chunks from a POP that is
+/// still serving the previous pointer. We therefore retain generation N-1
+/// unconditionally and only reclaim older generations once they have aged
+/// past this window. Override with `EDGEZERO_FASTLY_GC_GRACE_SECS`
+/// (e.g. `0` in tests, or a smaller value for a fast deploy cadence).
+fn gc_grace_secs() -> u64 {
+    /// 24h — generous against any realistic propagation lag.
+    const DEFAULT_GRACE_SECS: u64 = 86_400;
+    env::var("EDGEZERO_FASTLY_GC_GRACE_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_GRACE_SECS)
 }
 
 /// Reject a batch that names the same logical root key more than once.
@@ -1313,6 +1345,117 @@ fn local_orphan_counts_for_dry_run(
 /// exists" error, which is the operator's signal to delete the
 /// entry (or use `config-store-entry update` manually) before
 /// re-running push.
+/// Post-commit deferred reclamation for ONE root.
+///
+/// Never deletes the generation this push just superseded: Fastly's config
+/// store is eventually consistent, so POPs may still be serving the previous
+/// pointer and need its chunks. Instead the superseded generation is RECORDED,
+/// and only generations that have aged past the grace window (and that nothing
+/// live references) are reclaimed. Returns status/warning lines; a failure here
+/// never fails the push.
+fn reclaim_and_record(
+    store_id: &str,
+    plan: FastlyCloudGcPlan,
+    now: u64,
+    grace: u64,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    // Last-writer-wins: only touch GC state while the root still holds exactly
+    // what this push wrote.
+    match fetch_remote_config_store_entry(store_id, &plan.root_key) {
+        Ok(Some(current)) if current == plan.new_root_value => {}
+        Ok(_) => {
+            warnings.push(format!(
+                "note: skipped chunk GC for `{}`: root changed since this push wrote it (concurrent push?); reclamation deferred to a later push",
+                plan.root_key
+            ));
+            return warnings;
+        }
+        Err(err) => {
+            warnings.push(format!(
+                "note: skipped chunk GC for `{}`: could not re-read the root ({err}); reclamation deferred to a later push",
+                plan.root_key
+            ));
+            return warnings;
+        }
+    }
+    let prior = match plan.prior {
+        Ok(prior) => prior,
+        Err(err) => {
+            warnings.push(format!("warning: {err}"));
+            return warnings;
+        }
+    };
+    let pending = match plan.pending {
+        Ok(pending) => pending,
+        Err(err) => {
+            warnings.push(format!("warning: {err}"));
+            return warnings;
+        }
+    };
+    // Keys that must NOT be reclaimed: the generation we just wrote, and the one
+    // we just superseded (still live at lagging POPs).
+    let mut protected: HashSet<String> = plan.new_keys.clone();
+    if let Some(generation) = &prior {
+        protected.extend(derive_chunk_keys(&plan.root_key, generation));
+    }
+
+    let mut retained: Vec<GcPendingGeneration> = Vec::with_capacity(pending.len());
+    for generation in pending {
+        let candidate = ChunkGeneration {
+            count: generation.count,
+            sha: generation.sha.clone(),
+        };
+        let keys = derive_chunk_keys(&plan.root_key, &candidate);
+        let aged = now.saturating_sub(generation.superseded_at) >= grace;
+        let live = keys.iter().any(|key| protected.contains(key));
+        if !aged || live {
+            retained.push(generation); // not yet safe to reclaim
+            continue;
+        }
+        // Aged out and unreferenced: reclaim. A failed delete keeps the
+        // generation pending so a later push retries (deletes are idempotent --
+        // a not-found is treated as success).
+        let mut all_deleted = true;
+        for key in keys {
+            if let Err(err) = delete_config_store_entry(store_id, &key) {
+                warnings.push(format!(
+                    "note: could not reclaim orphan chunk `{key}` for `{}` ({err}); it is inert and will be retried on a later push",
+                    plan.root_key
+                ));
+                all_deleted = false;
+            }
+        }
+        if !all_deleted {
+            retained.push(generation);
+        }
+    }
+    // Record the generation this push superseded, so a LATER push can reclaim it
+    // once it has aged out.
+    if let Some(generation) = prior {
+        retained.retain(|held| held.sha != generation.sha);
+        retained.push(GcPendingGeneration {
+            count: generation.count,
+            sha: generation.sha,
+            superseded_at: now,
+        });
+    }
+    match serialize_gc_pending(retained) {
+        Ok(raw) => {
+            if let Err(err) =
+                create_config_store_entry(store_id, &gc_pending_key(&plan.root_key), &raw)
+            {
+                warnings.push(format!(
+                    "note: could not update the GC pending record for `{}` ({err}); reclamation will retry on a later push",
+                    plan.root_key
+                ));
+            }
+        }
+        Err(err) => warnings.push(format!("warning: {err}")),
+    }
+    warnings
+}
+
 /// Drive a sequential per-entry commit loop and produce the
 /// partial-failure diagnostic when the committer fails mid-way.
 /// Pure (no I/O) so the diagnostic shape is unit-testable without
@@ -1814,6 +1957,32 @@ mod tests {
             match self.original.take() {
                 Some(prev) => env::set_var("PATH", prev),
                 None => env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// RAII guard for the GC grace-window override. Callers hold
+    /// `path_mutation_guard()` too, which serialises env mutation.
+    #[cfg(unix)]
+    struct GraceGuard {
+        original: Option<String>,
+    }
+
+    #[cfg(unix)]
+    impl GraceGuard {
+        fn set(secs: &str) -> Self {
+            let original = env::var("EDGEZERO_FASTLY_GC_GRACE_SECS").ok();
+            env::set_var("EDGEZERO_FASTLY_GC_GRACE_SECS", secs);
+            Self { original }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GraceGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(prev) => env::set_var("EDGEZERO_FASTLY_GC_GRACE_SECS", prev),
+                None => env::remove_var("EDGEZERO_FASTLY_GC_GRACE_SECS"),
             }
         }
     }
@@ -3148,14 +3317,35 @@ build = \"cargo build --release\"
     /// gives the successive raw `item_value`s returned when the ROOT key
     /// is described (call 1 = prior read, call 2 = read-back guard);
     /// exhausting the sequence yields "not found". `fail_delete_key`
-    /// makes that one delete exit non-zero. `describe_hard_error` makes
-    /// every describe fail with a non-not-found error (so
-    /// `fetch_remote_config_store_entry` returns `Err`, exercising the
-    /// prior-read-failure GC path).
+    /// makes that one delete exit non-zero. `describe_hard_error` makes the
+    /// FIRST describe of each key fail with a non-not-found error (so the
+    /// pre-commit prior read returns `Err` while the post-commit read-back
+    /// still succeeds — exercising the prior-read-failure GC path).
     #[cfg(unix)]
     fn fake_fastly_gc(
         root_key: &str,
         root_describe_seq: &[String],
+        fail_delete_key: Option<&str>,
+        describe_hard_error: bool,
+        oplog: &Path,
+    ) -> tempfile::TempDir {
+        fake_fastly_gc_with_pending(
+            root_key,
+            root_describe_seq,
+            None,
+            fail_delete_key,
+            describe_hard_error,
+            oplog,
+        )
+    }
+
+    /// As [`fake_fastly_gc`], plus an optional seeded pending-reclamation
+    /// record served when the `<root>.__edgezero_gc.pending` key is described.
+    #[cfg(unix)]
+    fn fake_fastly_gc_with_pending(
+        root_key: &str,
+        root_describe_seq: &[String],
+        pending_seed: Option<&str>,
         fail_delete_key: Option<&str>,
         describe_hard_error: bool,
         oplog: &Path,
@@ -3173,9 +3363,9 @@ if [ "$sub" = "update" ]; then cat >/dev/null; printf 'update %s\n' "$key" >> '{
 if [ "$sub" = "delete" ]; then printf 'delete %s\n' "$key" >> '{{{oplog}}}'; printf 'delete-argv %s\n' "$*" >> '{{{oplog}}}'; if [ "$key" = "{{{fail}}}" ]; then echo 'Error: boom' >&2; exit 1; fi; exit 0; fi
 if [ "$sub" = "describe" ]; then
   printf 'describe %s\n' "$key" >> '{{{oplog}}}'
-  {{#if hard_error}}echo 'Error: internal server error' >&2; exit 1{{/if}}
   cfile='{{{dir}}}/count_'"$key"
   n=0; [ -f "$cfile" ] && n=$(cat "$cfile"); n=$((n+1)); printf '%s' "$n" > "$cfile"
+  {{#if hard_error}}if [ "$n" = "1" ]; then echo 'Error: internal server error' >&2; exit 1; fi{{/if}}
   rf='{{{dir}}}/resp_'"$key"'_'"$n"'.json'
   if [ -f "$rf" ]; then cat "$rf"; exit 0; fi
   echo 'Error: item not found' >&2; exit 1
@@ -3201,6 +3391,14 @@ echo 'unexpected' >&2; exit 1
             )
             .expect("resp");
         }
+        if let Some(record) = pending_seed {
+            let key = gc_pending_key(root_key);
+            let wrapped = format!(
+                r#"{{"item_value":{}}}"#,
+                serde_json::to_string(record).expect("escape")
+            );
+            fs::write(dir.path().join(format!("resp_{key}_1.json")), wrapped).expect("pending");
+        }
         let data = serde_json::json!({
             "list": list_file.display().to_string(),
             "oplog": oplog.display().to_string(),
@@ -3217,6 +3415,26 @@ echo 'unexpected' >&2; exit 1
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod");
         dir
+    }
+
+    /// The chunk generation (sha + count) a chunked envelope produces.
+    #[cfg(unix)]
+    fn generation_of(root_key: &str, envelope: &str) -> ChunkGeneration {
+        let (_, pointer) = chunked_parts(root_key, envelope);
+        prior_chunk_generation(root_key, &pointer)
+            .expect("valid pointer")
+            .expect("chunked envelope has a generation")
+    }
+
+    /// A seeded pending-reclamation record holding one generation.
+    #[cfg(unix)]
+    fn pending_record_json(generation: &ChunkGeneration, superseded_at: u64) -> String {
+        serialize_gc_pending(vec![GcPendingGeneration {
+            count: generation.count,
+            sha: generation.sha.clone(),
+            superseded_at,
+        }])
+        .expect("serialize pending record")
     }
 
     /// Split a chunked envelope into (chunk keys, root pointer value).
@@ -3241,7 +3459,7 @@ echo 'unexpected' >&2; exit 1
 
     #[cfg(unix)]
     #[test]
-    fn push_config_entries_deletes_prior_chunks_and_keeps_new() {
+    fn push_config_entries_defers_prior_generation_instead_of_deleting() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
@@ -3277,14 +3495,16 @@ echo 'unexpected' >&2; exit 1
         // Every prior A-chunk is deleted; the root and new B-chunks are not.
         for key in &a_chunks {
             assert!(
-                oplog_has(&oplog, &format!("delete {key}")),
-                "prior chunk `{key}` must be deleted; log:\n{}",
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "prior chunk `{key}` must NOT be deleted eagerly — POPs may still \
+                 be serving the previous pointer; log:\n{}",
                 fs::read_to_string(&oplog).unwrap_or_default()
             );
         }
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
         assert!(
-            !oplog_has(&oplog, &format!("delete {TEST_CONFIG_ID}")),
-            "root pointer must never be deleted"
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "a push must never delete the generation it just superseded; log:\n{log}"
         );
         for key in &b_chunks {
             assert!(
@@ -3292,8 +3512,86 @@ echo 'unexpected' >&2; exit 1
                 "new chunk `{key}` must not be deleted"
             );
         }
-        // Deletes happen strictly after the root-pointer update (commit).
+        // Instead, the superseded generation is RECORDED for later reclamation.
+        assert!(
+            oplog_has(
+                &oplog,
+                &format!("update {}", gc_pending_key(TEST_CONFIG_ID))
+            ),
+            "the superseded generation must be recorded as pending; log:\n{log}"
+        );
+        assert!(out[0].contains("pushed"), "summary present: {out:?}");
+    }
+
+    /// Once a recorded generation has aged past the grace window and nothing
+    /// live references it, a later push reclaims it.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_reclaims_pending_generation_after_grace() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let _grace = GraceGuard::set("0"); // everything is immediately "aged"
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let make = |tag: &str, stamp: &str| {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, stamp.to_owned())).expect("envelope")
+        };
+        let envelope_a = make("gen_a", "2026-06-22T00:00:01Z");
+        let envelope_b = make("gen_b", "2026-06-22T00:00:02Z");
+        let envelope_c = make("gen_c", "2026-06-22T00:00:03Z");
+
+        let gen_a = generation_of(TEST_CONFIG_ID, &envelope_a);
+        let a_chunks = derive_chunk_keys(TEST_CONFIG_ID, &gen_a);
+        let (b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
+        let (_c_chunks, c_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_c);
+        // A was superseded long ago and is already pending; B is the live prior.
+        let pending = pending_record_json(&gen_a, 0);
+
+        let fake = fake_fastly_gc_with_pending(
+            TEST_CONFIG_ID,
+            &[b_pointer, c_pointer],
+            Some(&pending),
+            None,
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+        FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_c)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+
         let log = fs::read_to_string(&oplog).unwrap_or_default();
+        // The aged generation A is reclaimed...
+        for key in &a_chunks {
+            assert!(
+                oplog_has(&oplog, &format!("delete {key}")),
+                "aged pending chunk `{key}` must be reclaimed; log:\n{log}"
+            );
+        }
+        // ...but B (just superseded, still live at lagging POPs) is retained.
+        for key in &b_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "the just-superseded generation must be retained, not deleted: `{key}`"
+            );
+        }
+        assert!(
+            !oplog_has(&oplog, &format!("delete {TEST_CONFIG_ID}")),
+            "root pointer must never be deleted"
+        );
+        // Reclamation happens after the commit.
         let root_update = log
             .lines()
             .position(|line| line == format!("update {TEST_CONFIG_ID}"))
@@ -3304,9 +3602,63 @@ echo 'unexpected' >&2; exit 1
             .expect("a delete logged");
         assert!(
             first_delete > root_update,
-            "deletes must follow the root update; log:\n{log}"
+            "reclamation must follow the commit; log:\n{log}"
         );
-        assert!(out[0].contains("pushed"), "summary present: {out:?}");
+    }
+
+    /// A pending generation inside the grace window is retained, not deleted —
+    /// this is what protects POPs that have not yet seen the new pointer.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_retains_pending_generation_within_grace() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let _grace = GraceGuard::set("86400"); // 24h: nothing recent is aged
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let make = |tag: &str, stamp: &str| {
+            use edgezero_core::blob_envelope::BlobEnvelope;
+            use serde_json::json;
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, stamp.to_owned())).expect("envelope")
+        };
+        let envelope_a = make("gen_a", "2026-06-22T00:00:01Z");
+        let envelope_b = make("gen_b", "2026-06-22T00:00:02Z");
+        let envelope_c = make("gen_c", "2026-06-22T00:00:03Z");
+
+        let gen_a = generation_of(TEST_CONFIG_ID, &envelope_a);
+        let (_b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
+        let (_c_chunks, c_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_c);
+        // A was superseded just now -> still inside the grace window.
+        let pending = pending_record_json(&gen_a, unix_now_secs());
+
+        let fake = fake_fastly_gc_with_pending(
+            TEST_CONFIG_ID,
+            &[b_pointer, c_pointer],
+            Some(&pending),
+            None,
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+        FastlyCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                &[(TEST_CONFIG_ID.to_owned(), envelope_c)],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect("push succeeds");
+
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "nothing may be reclaimed inside the grace window; log:\n{log}"
+        );
     }
 
     #[cfg(unix)]
@@ -3400,8 +3752,8 @@ echo 'unexpected' >&2; exit 1
             .expect("dry-run must not error");
         assert!(
             out.iter()
-                .any(|line| line.contains("would delete orphaned prior-generation chunks")),
-            "dry-run reports GC intent: {out:?}"
+                .any(|line| line.contains("would defer reclamation")),
+            "dry-run reports deferred-reclamation intent: {out:?}"
         );
     }
 
@@ -3413,8 +3765,15 @@ echo 'unexpected' >&2; exit 1
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        // Empty describe sequence => root not found => no prior chunks.
-        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], None, false, &oplog);
+        // No prior pointer (slot 1 empty); slot 2 is the post-commit read-back.
+        let (_chunks, pointer) = chunked_parts(TEST_CONFIG_ID, &envelope);
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[String::new(), pointer],
+            None,
+            false,
+            &oplog,
+        );
         let _path = PathPrepend::new(fake.path());
         FastlyCliAdapter
             .push_config_entries(
@@ -3439,22 +3798,30 @@ echo 'unexpected' >&2; exit 1
     fn push_config_entries_delete_failure_warns_but_succeeds() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
+        let _grace = GraceGuard::set("0");
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
-        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        let envelope_b = {
+        let make = |tag: &str, stamp: &str| {
             use edgezero_core::blob_envelope::BlobEnvelope;
             use serde_json::json;
-            let data = json!({ "alt": "w".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
-            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:05Z".to_owned()))
-                .expect("B")
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, stamp.to_owned())).expect("envelope")
         };
-        let (a_chunks, a_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_a);
+        let envelope_a = make("gen_a", "2026-06-22T00:00:01Z");
+        let envelope_b = make("gen_b", "2026-06-22T00:00:02Z");
+        let envelope_c = make("gen_c", "2026-06-22T00:00:03Z");
+
+        let gen_a = generation_of(TEST_CONFIG_ID, &envelope_a);
+        let a_chunks = derive_chunk_keys(TEST_CONFIG_ID, &gen_a);
         let (_b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
-        let fail_key = a_chunks[0].clone();
-        let fake = fake_fastly_gc(
+        let (_c_chunks, c_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_c);
+        let pending = pending_record_json(&gen_a, 0);
+        let fail_key = a_chunks.first().expect("a chunk").clone();
+
+        let fake = fake_fastly_gc_with_pending(
             TEST_CONFIG_ID,
-            &[a_pointer, b_pointer],
+            &[b_pointer, c_pointer],
+            Some(&pending),
             Some(&fail_key),
             false,
             &oplog,
@@ -3466,16 +3833,21 @@ echo 'unexpected' >&2; exit 1
                 None,
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &[(TEST_CONFIG_ID.to_owned(), envelope_c)],
                 &AdapterPushContext::new(),
                 false,
             )
-            .expect("push still succeeds despite a failed delete");
+            .expect("push still succeeds despite a failed reclamation delete");
         assert!(
             out.iter()
                 .any(|line| line.contains("could not reclaim orphan chunk")
                     && line.contains(&fail_key)),
             "failed delete surfaces an informational warning: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("retried on a later push")),
+            "the generation stays pending so a later push retries: {out:?}"
         );
     }
 
@@ -3488,8 +3860,10 @@ echo 'unexpected' >&2; exit 1
         let oplog = dir.path().join("ops.log");
         let envelope_b = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
         // Prior is pointer-kind but invalid (version 2) => warn, no deletes.
+        // Slot 2 is the post-commit read-back, which must show our own write.
         let bad = r#"{"edgezero_kind":"fastly_config_chunks","version":2}"#.to_owned();
-        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[bad], None, false, &oplog);
+        let (_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[bad, b_pointer], None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
         let out = FastlyCliAdapter
             .push_config_entries(
@@ -3521,9 +3895,17 @@ echo 'unexpected' >&2; exit 1
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
         let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        // Describe fails hard (not a not-found) => prior read errors => GC
-        // is skipped for this root with a warning; the push still succeeds.
-        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], None, true, &oplog);
+        // The FIRST describe (the pre-commit prior read) fails hard; the
+        // post-commit read-back (slot 2) still returns what we wrote, so the
+        // LWW guard passes and we reach the prior-read warning.
+        let (_chunks, pointer) = chunked_parts(TEST_CONFIG_ID, &envelope);
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[String::new(), pointer],
+            None,
+            true,
+            &oplog,
+        );
         let _path = PathPrepend::new(fake.path());
         let out = FastlyCliAdapter
             .push_config_entries(
@@ -3623,19 +4005,30 @@ echo 'unexpected' >&2; exit 1
     fn push_config_entries_delete_uses_key_and_auto_yes_never_all() {
         use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
         let _lock = path_mutation_guard().lock().expect("guard");
+        let _grace = GraceGuard::set("0"); // force a reclamation so deletes occur
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
-        let envelope_a = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        let envelope_b = {
+        let make = |tag: &str, stamp: &str| {
             use edgezero_core::blob_envelope::BlobEnvelope;
             use serde_json::json;
-            let data = json!({ "alt": "k".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
-            serde_json::to_string(&BlobEnvelope::new(data, "2026-06-22T00:00:06Z".to_owned()))
-                .expect("B")
+            let data = json!({ tag: "x".repeat(FASTLY_CONFIG_ENTRY_LIMIT) });
+            serde_json::to_string(&BlobEnvelope::new(data, stamp.to_owned())).expect("envelope")
         };
-        let (_a_chunks, a_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_a);
+        let envelope_a = make("gen_a", "2026-06-22T00:00:01Z");
+        let envelope_b = make("gen_b", "2026-06-22T00:00:02Z");
+        let envelope_c = make("gen_c", "2026-06-22T00:00:03Z");
+        let gen_a = generation_of(TEST_CONFIG_ID, &envelope_a);
         let (_b_chunks, b_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_b);
-        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[a_pointer, b_pointer], None, false, &oplog);
+        let (_c_chunks, c_pointer) = chunked_parts(TEST_CONFIG_ID, &envelope_c);
+        let pending = pending_record_json(&gen_a, 0);
+        let fake = fake_fastly_gc_with_pending(
+            TEST_CONFIG_ID,
+            &[b_pointer, c_pointer],
+            Some(&pending),
+            None,
+            false,
+            &oplog,
+        );
         let _path = PathPrepend::new(fake.path());
         FastlyCliAdapter
             .push_config_entries(
@@ -3643,7 +4036,7 @@ echo 'unexpected' >&2; exit 1
                 None,
                 None,
                 &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-                &[(TEST_CONFIG_ID.to_owned(), envelope_b)],
+                &[(TEST_CONFIG_ID.to_owned(), envelope_c)],
                 &AdapterPushContext::new(),
                 false,
             )
@@ -3707,12 +4100,21 @@ echo 'unexpected' >&2; exit 1
                 false,
             )
             .expect("push succeeds");
+        // Shrinking to a direct value orphans the whole prior chunk set — but
+        // it is DEFERRED, not deleted now: POPs may still serve the old pointer.
         for key in &prior_chunks {
             assert!(
-                oplog_has(&oplog, &format!("delete {key}")),
-                "prior chunk `{key}` must be deleted on shrink-to-direct"
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "prior chunk `{key}` must be deferred, not deleted eagerly"
             );
         }
+        assert!(
+            oplog_has(
+                &oplog,
+                &format!("update {}", gc_pending_key(TEST_CONFIG_ID))
+            ),
+            "the orphaned generation must be recorded as pending"
+        );
         assert!(
             !oplog_has(&oplog, &format!("delete {TEST_CONFIG_ID}")),
             "root pointer must never be deleted"
@@ -4933,13 +5335,11 @@ echo 'unexpected' >&2; exit 1
         new_keys.insert("keep".to_owned());
         let plan = FastlyConfigGcPlan {
             new_keys,
-            new_root_value: String::new(),
             prior_keys: Ok(vec![
                 "gone1".to_owned(),
                 "keep".to_owned(),
                 "gone2".to_owned(),
             ]),
-            root_key: "app_config".to_owned(),
         };
         let orphans = orphan_chunk_keys(&plan).expect("ok");
         assert_eq!(orphans, vec!["gone1".to_owned(), "gone2".to_owned()]);
@@ -4949,9 +5349,7 @@ echo 'unexpected' >&2; exit 1
     fn orphan_chunk_keys_propagates_prior_err() {
         let plan = FastlyConfigGcPlan {
             new_keys: HashSet::new(),
-            new_root_value: String::new(),
             prior_keys: Err("suspicious".to_owned()),
-            root_key: "app_config".to_owned(),
         };
         orphan_chunk_keys(&plan).unwrap_err();
     }
