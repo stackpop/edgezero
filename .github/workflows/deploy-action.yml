@@ -186,20 +186,23 @@ jobs:
           path: cli-dl
 
       - name: Extract the app CLI
+        env:
+          CLI_BIN: ${{ steps.cli.outputs.cli-bin }}
         run: |
           set -euo pipefail
           mkdir -p cli-bin
           tar -xf cli-dl/*.tar -C cli-bin
-          chmod +x "cli-bin/${{ steps.cli.outputs.cli-bin }}"
+          chmod +x "cli-bin/$CLI_BIN"
 
       - name: Staged deploy (asserts --comment never reaches `compute update`)
         env:
+          CLI_BIN: ${{ steps.cli.outputs.cli-bin }}
           FASTLY_API_TOKEN: dummy-token
           FASTLY_SERVICE_ID: dummy-service
         run: |
           set -euo pipefail
           cd fixture-app
-          out=$("$GITHUB_WORKSPACE/cli-bin/${{ steps.cli.outputs.cli-bin }}" \
+          out=$("$GITHUB_WORKSPACE/cli-bin/$CLI_BIN" \
             deploy --adapter fastly --service-id dummy-service --stage -- --comment "staged smoke" 2>&1 | tee /dev/stderr)
           echo "$out" | grep -qE '^version=42$' || { echo "::error::staged deploy did not emit version=42"; exit 1; }
 
