@@ -446,7 +446,78 @@ impl Adapter for AxumCliAdapter {
                     format!("{app_name}-adapter-axum")
                 }
             });
-        Ok(vec![(rel, run::synthesise_axum_toml(&crate_name))])
+        // Compute `crate_dir` (relative path from the manifest's
+        // parent to the crate root). The scaffold convention
+        // `crates/<crate>/axum.toml` puts the manifest INSIDE the
+        // crate root so `crate_dir = "."`. A nested manifest like
+        // `crates/server/config/axum.toml` needs `".."` because
+        // the crate root sits one level above the manifest's
+        // parent — the axum-adapter loader consumes `crate_dir`
+        // to locate `Cargo.toml`, and without the right count of
+        // `..` it looks in `config/Cargo.toml` and fails
+        // discovery.
+        let crate_dir = derive_axum_crate_dir(manifest_root, adapter_manifest_path);
+        Ok(vec![(
+            rel,
+            run::synthesise_axum_toml(&crate_name, &crate_dir),
+        )])
+    }
+}
+
+/// Return the `crate_dir` string the synthesiser should emit for
+/// this manifest layout: the relative path from the manifest's
+/// parent to the crate root (the dir carrying `Cargo.toml`).
+///
+/// Falls back to `"."` when either:
+///   - `[adapters.axum.adapter].manifest` is unset (first-run
+///     scaffold — the crate hasn't been laid down yet), OR
+///   - no Cargo.toml is reachable along the upward walk from the
+///     manifest's parent to `manifest_root` (same fallback shape
+///     the crate-name lookup uses).
+///
+/// Both fallbacks land at the pre-2026-07-13 default of
+/// `crate_dir = "."`, which is correct for the scaffold-convention
+/// layout `crates/<crate>/axum.toml`.
+fn derive_axum_crate_dir(manifest_root: &Path, adapter_manifest_path: Option<&str>) -> String {
+    use std::iter;
+    use std::path::Component;
+    let Some(rel_str) = adapter_manifest_path else {
+        return ".".to_owned();
+    };
+    let Some(crate_root) =
+        cli_support::read_adapter_crate_root(manifest_root, adapter_manifest_path)
+    else {
+        return ".".to_owned();
+    };
+    let manifest_abs = manifest_root.join(rel_str);
+    let Some(manifest_parent) = manifest_abs.parent() else {
+        return ".".to_owned();
+    };
+    // Count directory hops from `manifest_parent` back up to
+    // `crate_root`. The walk is guaranteed monotone-upward:
+    // `read_adapter_crate_root` returns an ancestor of
+    // `manifest_parent`, so subtracting component counts gives the
+    // number of `..` levels needed. Falls back to `.` on any
+    // arithmetic surprise (mismatched canonicalisation, symlink
+    // resolution flipping directions, etc.) so a mis-derived
+    // `crate_dir` never lands in the synthesised manifest.
+    let manifest_parent_abs = manifest_parent
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_parent.to_path_buf());
+    let crate_root_abs = crate_root
+        .canonicalize()
+        .unwrap_or_else(|_| crate_root.clone());
+    let Ok(down_from_crate) = manifest_parent_abs.strip_prefix(&crate_root_abs) else {
+        return ".".to_owned();
+    };
+    let hops = down_from_crate
+        .components()
+        .filter(|comp| matches!(comp, Component::Normal(_)))
+        .count();
+    if hops == 0 {
+        ".".to_owned()
+    } else {
+        iter::repeat_n("..", hops).collect::<Vec<_>>().join("/")
     }
 }
 

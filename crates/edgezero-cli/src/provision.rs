@@ -857,10 +857,37 @@ pub(crate) fn merge_deployed_into_manifest(
         }
     }
 
+    let updated = doc.to_string();
     if dry_run {
+        // Regression (PR #287 second review, P2a): dry-run used to
+        // return silently here. Adapters like Fastly can emit a
+        // freshly-discovered `service_id` during cloud dry-run (the
+        // adapter shells `fastly service describe --json` which
+        // works read-only in dry-run), and the corresponding real
+        // run would then mutate tracked `edgezero.toml` with that
+        // value — WITHOUT the diff appearing in the operator's
+        // preview. Render the original-vs-updated unified diff so
+        // dry-run tells the truth about every write it would
+        // perform.
+        if updated == raw {
+            log::info!(
+                "[edgezero] dry-run: `{}` already carries the same deployed writeback for adapter `{adapter_name}`; no change",
+                manifest_path.display()
+            );
+        } else {
+            let diff = TextDiff::from_lines(&raw, &updated);
+            let path_display = manifest_path.display().to_string();
+            log::info!(
+                "[edgezero] dry-run: would rewrite `{}` with deployed writeback for adapter `{adapter_name}`:\n{}",
+                manifest_path.display(),
+                diff.unified_diff()
+                    .context_radius(3)
+                    .header(&path_display, &path_display),
+            );
+        }
         return Ok(());
     }
-    fs::write(manifest_path, doc.to_string())
+    fs::write(manifest_path, updated)
         .map_err(|err| format!("write {}: {err}", manifest_path.display()))?;
     Ok(())
 }

@@ -487,6 +487,55 @@ mod tests {
             !body.contains(r#"crate = "demo-app-adapter-axum""#),
             "MUST NOT fall back to scaffold convention when the crate Cargo.toml exists further up: {body}"
         );
+        // Regression (PR #287 second review, P2b): the pre-fix
+        // synthesiser hard-coded `crate_dir = "."`, which for a
+        // nested manifest points the loader at `config/Cargo.toml`
+        // (manifest parent) — where no Cargo.toml exists.
+        // Discovery then fails and `edgezero serve --adapter axum`
+        // errors out with the "expected `Cargo.toml` next to the
+        // manifest" message.
+        //
+        // With the manifest at `crates/server/config/axum.toml`
+        // and Cargo.toml at `crates/server/Cargo.toml`, the
+        // correct relative crate_dir is `..` (one hop up from
+        // the manifest's parent to the crate root).
+        assert!(
+            body.contains(r#"crate_dir = "..""#),
+            "nested manifest must emit `crate_dir = \"..\"` so the axum loader finds `crates/server/Cargo.toml`, not `crates/server/config/Cargo.toml` — got: {body}"
+        );
+    }
+
+    #[test]
+    fn synthesised_axum_toml_scaffold_convention_uses_dot_crate_dir() {
+        // The scaffold-convention layout `crates/<crate>/axum.toml`
+        // (2-deep) places the manifest AT the crate root. The
+        // synthesiser must emit `crate_dir = "."` — regression
+        // guard for the fix above (avoid over-correcting nested
+        // layouts and breaking the common case).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let crate_dir = root.join("crates/server");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let outcome = AxumCliAdapter
+            .synthesise_baseline_manifest(
+                root,
+                Some("crates/server/axum.toml"),
+                None,
+                "demo-app",
+                None,
+            )
+            .expect("baseline synthesis succeeds for scaffold-convention manifest");
+        let (_, body) = outcome.into_iter().next().unwrap();
+        assert!(
+            body.contains(r#"crate_dir = ".""#),
+            "scaffold-convention manifest must emit `crate_dir = \".\"` — got: {body}"
+        );
     }
 
     #[test]

@@ -83,6 +83,18 @@ pub(super) fn provision(
                 "binding `{binding}` (logical id `{logical}`) already provisioned (id={existing_id} in {}); skipping. To force a fresh namespace: delete the [[kv_namespaces]] entry for binding `{binding}` AND run `wrangler kv namespace delete --namespace-id={existing_id}` (the old remote namespace lingers otherwise), then re-run provision.",
                 wrangler_path.display()
             ));
+            // Record the already-existing id in `created_kv_ns` too
+            // so a retry after a partial failure still surfaces the
+            // full set in `ProvisionOutcome.deployed`. Without this,
+            // if attempt 1 creates A then fails on B (outcome
+            // discarded), the CLI's next attempt skips A (already
+            // in wrangler.toml) and only persists B into
+            // `[adapters.cloudflare.deployed].kv_namespaces` —
+            // permanently dropping A from the tracked deployed
+            // state. Teammates cloning fresh would then
+            // regenerate wrangler.toml without A's id and
+            // silently point the runtime at a missing namespace.
+            created_kv_ns.insert(logical.clone(), existing_id);
             continue;
         }
         // Pre-flight the writeback shape BEFORE shelling
@@ -693,6 +705,64 @@ id = "00112233445566778899aabbccddeeff"
         assert!(
             after.contains("00112233445566778899aabbccddeeff"),
             "did not touch existing id: {after}"
+        );
+    }
+
+    #[test]
+    fn skipped_existing_namespace_ids_still_surface_in_deployed_outcome() {
+        // Regression (PR #287 second review, P1b): if attempt 1 of
+        // provision creates namespace A then fails on B, the outcome
+        // is discarded. On retry, A is skipped (already present in
+        // wrangler.toml) and only B ends up in `created_kv_ns` —
+        // permanently dropping A from
+        // `[adapters.cloudflare.deployed].kv_namespaces` in
+        // edgezero.toml. Teammates cloning fresh would then
+        // regenerate wrangler.toml without A's id and point the
+        // runtime at a missing namespace.
+        //
+        // The fix records the already-existing id in `created_kv_ns`
+        // too, so a retry's outcome surfaces the FULL set (existing
+        // + newly-created), and the writeback captures A even when
+        // it was created on an earlier attempt.
+        let dir = tempdir().expect("tempdir");
+        // Real 32-char lowercase hex id already present for `sessions`.
+        write_wrangler(
+            dir.path(),
+            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"sessions\"\nid = \"00112233445566778899aabbccddeeff\"\n",
+        );
+        let kv_ids: Vec<ResolvedStoreId> = ResolvedStoreId::from_logicals(&[TEST_KV_ID]);
+        let stores = ProvisionStores {
+            config: &[],
+            kv: &kv_ids,
+            secrets: &[],
+        };
+        // Dry-run so no shell-out happens. The outcome's `deployed`
+        // is populated regardless of dry-run for existing IDs (we
+        // just record what we already see on disk).
+        let out = CloudflareCliAdapter
+            .provision(
+                dir.path(),
+                Some("wrangler.toml"),
+                None,
+                &stores,
+                None,
+                ProvisionMode::Cloud,
+                true,
+            )
+            .expect("dry-run succeeds");
+        let deployed = out
+            .deployed
+            .as_ref()
+            .expect("skipped existing id must still land in deployed writeback");
+        let kv_ns = deployed
+            .sub_tables
+            .get("kv_namespaces")
+            .expect("kv_namespaces sub-table present");
+        assert_eq!(
+            kv_ns.get(TEST_KV_ID).map(String::as_str),
+            Some("00112233445566778899aabbccddeeff"),
+            "existing id must be recorded under the LOGICAL key so \
+             edgezero.toml writeback captures it: {kv_ns:?}"
         );
     }
 

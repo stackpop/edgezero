@@ -787,7 +787,7 @@ mod tests {
     fn seed_baseline(dir: &Path, component_id: &str) {
         fs::write(
             dir.join("spin.toml"),
-            synthesise_spin_toml(component_id, Some(component_id)),
+            synthesise_spin_toml(component_id, Some(component_id), Path::new("spin.toml")),
         )
         .expect("seed spin.toml");
         fs::write(
@@ -936,7 +936,11 @@ mod tests {
         // re-synthesising an inconsistent tree).
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
+            synthesise_spin_toml(
+                TEST_COMPONENT_ID,
+                Some(TEST_COMPONENT_ID),
+                Path::new("spin.toml"),
+            ),
         )
         .expect("seed spin.toml");
 
@@ -977,7 +981,11 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
+            synthesise_spin_toml(
+                TEST_COMPONENT_ID,
+                Some(TEST_COMPONENT_ID),
+                Path::new("spin.toml"),
+            ),
         )
         .expect("seed spin.toml");
         // Malformed runtime-config.toml: scalar where a table
@@ -1188,7 +1196,11 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
+            synthesise_spin_toml(
+                TEST_COMPONENT_ID,
+                Some(TEST_COMPONENT_ID),
+                Path::new("spin.toml"),
+            ),
         )
         .unwrap();
 
@@ -1242,7 +1254,7 @@ mod tests {
         // [component.worker] table exists.
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml("demo", Some("worker")),
+            synthesise_spin_toml("demo", Some("worker"), Path::new("spin.toml")),
         )
         .unwrap();
 
@@ -1306,7 +1318,11 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
+            synthesise_spin_toml(
+                TEST_COMPONENT_ID,
+                Some(TEST_COMPONENT_ID),
+                Path::new("spin.toml"),
+            ),
         )
         .unwrap();
 
@@ -1694,7 +1710,11 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         fs::write(
             dir.path().join("spin.toml"),
-            synthesise_spin_toml(TEST_COMPONENT_ID, Some(TEST_COMPONENT_ID)),
+            synthesise_spin_toml(
+                TEST_COMPONENT_ID,
+                Some(TEST_COMPONENT_ID),
+                Path::new("spin.toml"),
+            ),
         )
         .unwrap();
 
@@ -1882,6 +1902,18 @@ mod tests {
         assert!(
             spin_body.contains("/release/spin_server.wasm"),
             "wasm basename must underscore the crate name (spin_server) even with a nested manifest: {spin_body}"
+        );
+        // Regression (PR #287 second review, P1c): the pre-fix
+        // synthesiser hard-coded `../../target/...`, correct for a
+        // 2-deep scaffold-convention manifest but WRONG for the
+        // nested layout — it would resolve to `crates/target/...`
+        // instead of the workspace's `target/...`. The full
+        // 3-deep prefix (`../../../target/...`) is required.
+        assert!(
+            spin_body.contains(
+                "source = \"../../../target/wasm32-wasip2/release/spin_server.wasm\""
+            ),
+            "nested manifest MUST prepend three `..` levels to reach the workspace `target/` dir: {spin_body}"
         );
     }
 

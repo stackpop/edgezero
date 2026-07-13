@@ -159,6 +159,42 @@ pub fn read_adapter_crate_name(
     }
 }
 
+/// Walk from the manifest's parent up to `manifest_root` and
+/// return the first ancestor directory that carries a
+/// `Cargo.toml`. Mirrors [`read_adapter_crate_name`]'s traversal
+/// but returns the DIRECTORY instead of the parsed package name —
+/// callers use it to resolve fields like Axum's `[adapter].crate_dir`
+/// (a relative path FROM the adapter manifest's parent TO the
+/// crate root that carries `Cargo.toml`).
+///
+/// Returns `None` when the manifest path is unset OR no ancestor
+/// up to `manifest_root` (inclusive) carries a `Cargo.toml`.
+#[inline]
+#[must_use]
+pub fn read_adapter_crate_root(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+) -> Option<PathBuf> {
+    let rel = adapter_manifest_path?;
+    let manifest_abs = manifest_root.join(rel);
+    let mut current = manifest_abs.parent()?;
+    let root_abs = manifest_root
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_root.to_path_buf());
+    loop {
+        if current.join("Cargo.toml").is_file() {
+            return Some(current.to_path_buf());
+        }
+        let current_abs = current
+            .canonicalize()
+            .unwrap_or_else(|_| current.to_path_buf());
+        if current_abs == root_abs {
+            return None;
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Reads the crate name from a `Cargo.toml`, supporting both the inline and `[package]` forms.
 ///
 /// # Errors

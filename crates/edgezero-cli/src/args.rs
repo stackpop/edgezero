@@ -297,23 +297,38 @@ impl Default for ConfigDiffArgs {
 /// a `ConfigCmdStubArgs` catch-all instead and redirects to the typed
 /// CLI at runtime.
 /// "Suppress this default behaviour" flags for `config push`. Hoisted
-/// out of [`ConfigPushArgs`] so that struct stays at 3 bools (the
-/// workspace `clippy::struct_excessive_bools` threshold) without a
-/// per-callsite suppression. Callers reach these via
-/// `args.suppress.no_diff` / `args.suppress.no_env`.
+/// Kept for internal grouping — the `#[command(flatten)]`
+/// on [`ConfigPushArgs`] made `--no-diff` / `--no-env` still
+/// top-level CLI flags. Re-hosted directly on [`ConfigPushArgs`]
+/// in the 2026-07-13 revision (see PR #287 second review, P2c) to
+/// restore source compatibility for downstream CLIs that construct
+/// `ConfigPushArgs` via `Default::default()` + field assignment
+/// (`args.no_diff = true;`, `args.no_env = true;`). The pre-fix
+/// flatten broke every such site with E0609.
+///
+/// Retained as an empty compat stub so an out-of-tree
+/// project that reached for `crate::args::ConfigPushSuppressions`
+/// still compiles; new code should assign the top-level fields.
 #[derive(clap::Args, Debug, Default)]
 #[non_exhaustive]
-pub struct ConfigPushSuppressions {
-    /// Skip the inline diff render.
-    #[arg(long)]
-    pub no_diff: bool,
-    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
-    /// typed app-config. The default loads the overlay so the runtime
-    /// and the push see the same resolved values.
-    #[arg(long)]
-    pub no_env: bool,
-}
+pub struct ConfigPushSuppressions;
 
+/// See PR #287 second review, P2c. `no_diff` and `no_env` live
+/// on this struct as top-level public fields to preserve source
+/// compatibility with downstream CLIs that predate the 2026-07-13
+/// changes. Total bool count is 5 (`dry_run`, `local`, `no_diff`,
+/// `no_env`, `yes`), which trips
+/// `clippy::struct_excessive_bools` (threshold 3). The lint
+/// prefers grouping into a sub-struct, but that would break
+/// `args.no_diff = true;` style construction downstream — a
+/// public API break `#[non_exhaustive]` explicitly does NOT
+/// insulate against.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "5 bools by design: source-compat for downstream CLIs that assign \
+              `args.no_diff` / `args.no_env` directly. Grouping into a sub-struct \
+              trips E0609 at every existing call site. See PR #287 second review."
+)]
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
 pub struct ConfigPushArgs {
@@ -359,13 +374,14 @@ pub struct ConfigPushArgs {
     /// `[stores.config].ids` has length 1).
     #[arg(long)]
     pub store: Option<String>,
-    /// Suppress-this-default-behaviour flags. Grouped under a nested
-    /// struct via `#[command(flatten)]` so `ConfigPushArgs` stays at
-    /// 3 bool fields (the workspace `clippy::struct_excessive_bools`
-    /// threshold). Clap treats `--no-diff` / `--no-env` as top-level
-    /// flags at the CLI surface.
-    #[command(flatten)]
-    pub suppress: ConfigPushSuppressions,
+    /// Skip the inline diff render.
+    #[arg(long)]
+    pub no_diff: bool,
+    /// Skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the
+    /// typed app-config. The default loads the overlay so the runtime
+    /// and the push see the same resolved values.
+    #[arg(long)]
+    pub no_env: bool,
     /// Skip the inline diff prompt and write unconditionally.
     #[arg(long, short)]
     pub yes: bool,
@@ -382,9 +398,10 @@ impl Default for ConfigPushArgs {
             key: None,
             local: false,
             manifest: default_manifest_path(),
+            no_diff: false,
+            no_env: false,
             runtime_config: None,
             store: None,
-            suppress: ConfigPushSuppressions::default(),
             yes: false,
         }
     }
@@ -499,8 +516,8 @@ mod tests {
         assert!(!args.dry_run);
         assert!(args.key.is_none());
         assert!(!args.local);
-        assert!(!args.suppress.no_diff);
-        assert!(!args.suppress.no_env);
+        assert!(!args.no_diff);
+        assert!(!args.no_env);
         assert!(args.runtime_config.is_none());
         assert!(args.store.is_none());
         assert!(!args.yes);
@@ -761,7 +778,7 @@ mod tests {
 
     #[test]
     fn config_push_args_no_diff_default_is_false() {
-        assert!(!ConfigPushArgs::default().suppress.no_diff);
+        assert!(!ConfigPushArgs::default().no_diff);
     }
 
     #[test]

@@ -113,7 +113,7 @@ fn push_args(manifest: &Path, adapter: &str, dry_run: bool) -> ConfigPushArgs {
     let mut args = ConfigPushArgs::default();
     args.adapter = adapter.to_owned();
     args.manifest = manifest.to_path_buf();
-    args.suppress.no_env = true;
+    args.no_env = true;
     args.dry_run = dry_run;
     // Tests run in non-TTY CI; bypass the interactive consent gate.
     args.yes = true;

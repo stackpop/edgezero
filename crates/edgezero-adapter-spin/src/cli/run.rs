@@ -219,7 +219,37 @@ pub(crate) fn synthesise_runtime_config_toml() -> String {
 /// package named `spin-server`: the synthesiser emitted
 /// `source = ".../worker.wasm"` while Cargo produced
 /// `spin_server.wasm`.
-pub(crate) fn synthesise_spin_toml(crate_name: &str, component: Option<&str>) -> String {
+/// Compute the `../` prefix that walks from a manifest sitting
+/// at `manifest_rel` (relative to the workspace root) back up to
+/// the workspace root itself. The synthesised
+/// `[component.<id>].source` joins this prefix with `target/...`
+/// so the emitted wasm path reaches the workspace target dir
+/// regardless of how deeply the operator nests `spin.toml`.
+///
+/// Pre-2026-07-13 the synthesiser hard-coded `../../target/...`
+/// (correct for the scaffold convention
+/// `crates/<crate>/spin.toml` — parent has 2 components), which
+/// silently mispointed on nested layouts like
+/// `crates/spin-server/config/spin.toml` (needs `../../../target/...`).
+///
+/// Empty `manifest_rel` (bare `spin.toml` at the workspace root)
+/// yields an empty prefix, so the source becomes plain
+/// `target/wasm32-wasip2/release/<crate>.wasm`.
+pub(crate) fn workspace_relative_target_prefix(manifest_rel: &Path) -> String {
+    use std::path::Component;
+    let parent = manifest_rel.parent().unwrap_or_else(|| Path::new(""));
+    let depth = parent
+        .components()
+        .filter(|comp| matches!(comp, Component::Normal(_)))
+        .count();
+    "../".repeat(depth)
+}
+
+pub(crate) fn synthesise_spin_toml(
+    crate_name: &str,
+    component: Option<&str>,
+    manifest_rel: &Path,
+) -> String {
     use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
     let component_id: &str = component.unwrap_or(crate_name);
@@ -268,10 +298,11 @@ pub(crate) fn synthesise_spin_toml(crate_name: &str, component: Option<&str>) ->
     // parent `component` table is implicit so the emitter renders
     // only `[component.<id>]` (no bare `[component]` header).
     let mut comp = Table::new();
+    let target_prefix = workspace_relative_target_prefix(manifest_rel);
     comp.insert(
         "source",
         value(format!(
-            "../../target/wasm32-wasip2/release/{crate_name_under}.wasm"
+            "{target_prefix}target/wasm32-wasip2/release/{crate_name_under}.wasm"
         )),
     );
     // Spin defaults outbound HTTP to deny-all; the operator-facing
@@ -383,7 +414,11 @@ mod tests {
         // + the component id + the underscored wasm path. Verifying
         // with the scaffold-convention name `demo-adapter-spin` so a
         // renamed-adapter regression is easy to spot.
-        let out = synthesise_spin_toml("demo-adapter-spin", None);
+        let out = synthesise_spin_toml(
+            "demo-adapter-spin",
+            None,
+            Path::new("crates/demo-adapter-spin/spin.toml"),
+        );
         assert!(out.starts_with("# edgezero-provision: v1"));
         assert!(out.contains("spin_manifest_version = 2"));
         assert!(out.contains(r#"name = "demo-adapter-spin""#));
@@ -402,7 +437,11 @@ mod tests {
         // The synth takes the crate name verbatim; the caller in
         // `cli/mod.rs` is responsible for resolving it from the
         // Cargo.toml — this test pins the synth half of the invariant.
-        let out = synthesise_spin_toml("spin-server", None);
+        let out = synthesise_spin_toml(
+            "spin-server",
+            None,
+            Path::new("crates/spin-server/spin.toml"),
+        );
         assert!(out.contains(r#"name = "spin-server""#));
         assert!(out.contains(r#"component = "spin-server""#));
         assert!(out.contains("[component.spin-server]"));
@@ -414,7 +453,11 @@ mod tests {
 
     #[test]
     fn synthesises_spin_toml_honors_component_selector() {
-        let out = synthesise_spin_toml("demo-adapter-spin", Some("worker"));
+        let out = synthesise_spin_toml(
+            "demo-adapter-spin",
+            Some("worker"),
+            Path::new("crates/demo-adapter-spin/spin.toml"),
+        );
         // Component selector drives the trigger/section keys...
         assert!(out.contains(r#"component = "worker""#));
         assert!(out.contains("[component.worker]"));
@@ -443,7 +486,11 @@ mod tests {
         // previous synth emitted `source = ".../worker.wasm"`
         // while Cargo produced `spin_server.wasm`. The two knobs
         // must be independent.
-        let out = synthesise_spin_toml("spin-server", Some("worker"));
+        let out = synthesise_spin_toml(
+            "spin-server",
+            Some("worker"),
+            Path::new("crates/spin-server/spin.toml"),
+        );
         assert!(
             out.contains(r#"name = "spin-server""#),
             "app.name = crate: {out}"
@@ -471,7 +518,11 @@ mod tests {
         // the scaffold `spin.toml.hbs` template; folding them into the
         // synth keeps `edgezero new` and clean-clone `provision --local`
         // byte-identical.
-        let out = synthesise_spin_toml("demo-adapter-spin", None);
+        let out = synthesise_spin_toml(
+            "demo-adapter-spin",
+            None,
+            Path::new("crates/demo-adapter-spin/spin.toml"),
+        );
         assert!(
             out.contains(r#"allowed_outbound_hosts = ["https://*:*"]"#),
             "synth must ship the scaffold's outbound-host allow-list: {out}"
@@ -502,7 +553,7 @@ mod tests {
             "has\nnewline",
             "has = equals",
         ] {
-            let out = synthesise_spin_toml(name, None);
+            let out = synthesise_spin_toml(name, None, Path::new("crates/x/spin.toml"));
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
             assert_eq!(
                 doc["application"]["name"].as_str(),
@@ -518,7 +569,7 @@ mod tests {
         // value AND the `[component.<id>]` table key — both must
         // round-trip cleanly.
         for cid in [r#"has"quote"#, r"has\backslash", "has\nnewline"] {
-            let out = synthesise_spin_toml("demo", Some(cid));
+            let out = synthesise_spin_toml("demo", Some(cid), Path::new("crates/demo/spin.toml"));
             let doc: toml_edit::DocumentMut = out.parse().unwrap();
             // trigger[0].component == cid
             let trigger_http = doc["trigger"]["http"]

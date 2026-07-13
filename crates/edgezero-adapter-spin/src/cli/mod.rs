@@ -539,11 +539,18 @@ impl Adapter for SpinCliAdapter {
                         format!("{app_name}-adapter-spin")
                     }
                 });
+        // `synthesise_spin_toml` needs the manifest's relative path
+        // so it can compute the correct `../` prefix from
+        // `[component.<id>].source` back to the workspace `target/`
+        // dir. Pre-2026-07-13 it hard-coded `../../target/...`,
+        // which mispointed for anything but the scaffold-convention
+        // `crates/<crate>/spin.toml` layout (2-deep). Nested paths
+        // like `crates/spin-server/config/spin.toml` (3-deep) need
+        // `../../../target/...`.
+        let spin_toml_body =
+            run::synthesise_spin_toml(&derived_crate_name, component_selector, &spin_rel);
         Ok(vec![
-            (
-                spin_rel,
-                run::synthesise_spin_toml(&derived_crate_name, component_selector),
-            ),
+            (spin_rel, spin_toml_body),
             (rc_rel, run::synthesise_runtime_config_toml()),
         ])
     }
