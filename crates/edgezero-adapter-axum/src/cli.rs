@@ -11,12 +11,12 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId,
+    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
@@ -63,8 +63,7 @@ static AXUM_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_axum",
         repo_crate: "crates/edgezero-adapter-axum",
-        fallback:
-            "edgezero-adapter-axum = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-axum\", default-features = false }",
+        fallback: "edgezero-adapter-axum = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-axum\", default-features = false }",
         features: &["axum"],
     },
 ];
@@ -1070,9 +1069,11 @@ mod tests {
     fn deploy_returns_error() {
         let result = deploy(&[]);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("does not define a deploy command"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("does not define a deploy command")
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::args::NewArgs;
 use crate::scaffold::{
-    register_templates, resolve_dep_line, sanitize_crate_name, write_tmpl, ResolvedDependency,
-    ScaffoldError,
+    ResolvedDependency, ScaffoldError, register_templates, resolve_dep_line, sanitize_crate_name,
+    write_tmpl,
 };
 use edgezero_adapter::scaffold;
 use edgezero_adapter::scaffold::AdapterBlueprint;
@@ -806,39 +806,12 @@ fn initialize_git_repo(out_dir: &Path) {
 mod tests {
     use super::*;
     use edgezero_core::app_config::app_name_prefix;
+    use edgezero_core::test_env::PathPrepend as PathOverride;
     use std::path::Path;
     use tempfile::TempDir;
 
     // `super::*` re-exports `env` and `fs` from outer `use` lines, so they're
     // already in scope here.
-
-    struct PathOverride {
-        original: Option<String>,
-    }
-
-    impl PathOverride {
-        fn prepend(path: &Path) -> Self {
-            let original = env::var("PATH").ok();
-            let sep = if cfg!(windows) { ";" } else { ":" };
-            let prefix = path.to_string_lossy();
-            let new_path = match &original {
-                Some(existing) if !existing.is_empty() => format!("{prefix}{sep}{existing}"),
-                _ => prefix.into_owned(),
-            };
-            env::set_var("PATH", &new_path);
-            Self { original }
-        }
-    }
-
-    impl Drop for PathOverride {
-        fn drop(&mut self) {
-            if let Some(original) = &self.original {
-                env::set_var("PATH", original);
-            } else {
-                env::remove_var("PATH");
-            }
-        }
-    }
 
     #[test]
     fn upper_camel_from_sanitized_covers_derivation_rules() {
@@ -1012,9 +985,10 @@ mod tests {
         // string carries the underlying error.
         let err: GeneratorError = fmt::Error.into();
         assert!(matches!(err, GeneratorError::Format(_)));
-        assert!(err
-            .to_string()
-            .contains("failed to format generator output"));
+        assert!(
+            err.to_string()
+                .contains("failed to format generator output")
+        );
     }
 
     fn write_git_stub(bin_dir: &Path) {
@@ -1260,7 +1234,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let bin_dir = temp.path().join("bin");
         write_git_stub(&bin_dir);
-        let _path_guard = PathOverride::prepend(&bin_dir);
+        let _path_guard = PathOverride::new(&bin_dir);
 
         let args = NewArgs {
             name: "demo-app".into(),

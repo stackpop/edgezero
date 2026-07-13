@@ -4,10 +4,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderValue};
-use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse, PROXY_HEADER};
+use edgezero_core::http::{HeaderValue, header};
+use edgezero_core::proxy::{PROXY_HEADER, ProxyClient, ProxyRequest, ProxyResponse};
 use spin_sdk::http::body::IncomingBodyExt as _;
-use spin_sdk::http::{send, FullBody, Request as SpinRequest};
+use spin_sdk::http::{FullBody, Request as SpinRequest, send};
 
 /// A proxy client that uses Spin's outbound HTTP (`spin_sdk::http::send`)
 /// to forward requests to upstream services.

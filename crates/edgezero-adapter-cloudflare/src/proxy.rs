@@ -3,14 +3,14 @@ use bytes::Bytes;
 use edgezero_core::body::Body;
 use edgezero_core::compression::{decode_brotli_stream, decode_gzip_stream};
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
-use edgezero_core::proxy::{ProxyClient, ProxyRequest, ProxyResponse, PROXY_HEADER};
-use futures_util::stream::{self, LocalBoxStream, StreamExt as _};
+use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
+use edgezero_core::proxy::{PROXY_HEADER, ProxyClient, ProxyRequest, ProxyResponse};
 use futures_util::TryStreamExt as _;
+use futures_util::stream::{self, LocalBoxStream, StreamExt as _};
 use std::io;
 use worker::{
-    wasm_bindgen::JsValue, Body as WorkerBody, Fetch, Headers, Method as CfMethod,
-    Request as CfRequest, RequestInit, Response as CfResponse,
+    Body as WorkerBody, Fetch, Headers, Method as CfMethod, Request as CfRequest, RequestInit,
+    Response as CfResponse, wasm_bindgen::JsValue,
 };
 
 type ChunkStream = LocalBoxStream<'static, Result<Vec<u8>, io::Error>>;
@@ -153,7 +153,7 @@ fn worker_error_to_io(err: &worker::Error) -> io::Error {
 mod tests {
     use super::*;
     use brotli::CompressorWriter;
-    use flate2::{write::GzEncoder, Compression};
+    use flate2::{Compression, write::GzEncoder};
     use futures::executor::block_on;
     use futures_util::stream;
     use std::io::Write as _;

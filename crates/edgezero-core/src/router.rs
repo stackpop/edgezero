@@ -236,12 +236,12 @@ impl RouterInner {
                 // Inject only the introspection payloads this route asked for —
                 // nothing for the vast majority of routes that need none.
                 let needs = entry.introspection_needs;
-                if needs.manifest {
-                    if let Some(json) = &self.manifest_json {
-                        request
-                            .extensions_mut()
-                            .insert(ManifestJson(Arc::clone(json)));
-                    }
+                if needs.manifest
+                    && let Some(json) = &self.manifest_json
+                {
+                    request
+                        .extensions_mut()
+                        .insert(ManifestJson(Arc::clone(json)));
                 }
                 if needs.routes {
                     request
@@ -267,17 +267,17 @@ impl RouterInner {
     }
 
     fn find_route(&self, method: &Method, path: &str) -> RouteMatch<'_> {
-        if let Some(router) = self.routes.get(method) {
-            if let Ok(matched) = router.at(path) {
-                let params = PathParams::new(
-                    matched
-                        .params
-                        .iter()
-                        .map(|(key, value)| (key.to_owned(), value.to_owned()))
-                        .collect(),
-                );
-                return RouteMatch::Found(matched.value, params);
-            }
+        if let Some(router) = self.routes.get(method)
+            && let Ok(matched) = router.at(path)
+        {
+            let params = PathParams::new(
+                matched
+                    .params
+                    .iter()
+                    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                    .collect(),
+            );
+            return RouteMatch::Found(matched.value, params);
         }
 
         let allowed: HashSet<Method> = self
@@ -509,7 +509,7 @@ mod tests {
     use crate::body::Body;
     use crate::context::RequestContext;
     use crate::error::EdgeError;
-    use crate::http::{request_builder, Method, Request, Response, StatusCode};
+    use crate::http::{Method, Request, Response, StatusCode, request_builder};
     use crate::params::PathParams;
     use crate::response::response_with_body;
     use futures::executor::block_on;
@@ -772,8 +772,8 @@ mod tests {
     #[test]
     fn streams_body_through_router() {
         use bytes::Bytes;
-        use futures_util::stream;
         use futures_util::StreamExt as _;
+        use futures_util::stream;
 
         async fn handler(_ctx: RequestContext) -> Result<Response, EdgeError> {
             let chunks = stream::iter(vec![
@@ -898,15 +898,15 @@ mod tests {
         let mut r1 = None;
         let mut r2 = None;
         while r1.is_none() || r2.is_none() {
-            if r1.is_none() {
-                if let Poll::Ready(value) = f1.as_mut().poll(&mut cx) {
-                    r1 = Some(value);
-                }
+            if r1.is_none()
+                && let Poll::Ready(value) = f1.as_mut().poll(&mut cx)
+            {
+                r1 = Some(value);
             }
-            if r2.is_none() {
-                if let Poll::Ready(value) = f2.as_mut().poll(&mut cx) {
-                    r2 = Some(value);
-                }
+            if r2.is_none()
+                && let Poll::Ready(value) = f2.as_mut().poll(&mut cx)
+            {
+                r2 = Some(value);
             }
         }
 
