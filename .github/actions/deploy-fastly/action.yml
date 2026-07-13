@@ -79,8 +79,15 @@ runs:
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
         FASTLY_API_ENDPOINT: ""
         FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
       run: |
         [[ "${INPUT_FASTLY_API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
         [[ -n "${INPUT_FASTLY_SERVICE_ID}" ]] || { echo "::error::missing required input 'fastly-service-id'"; exit 1; }
@@ -103,6 +110,16 @@ runs:
         INPUT_CLI_BIN: ${{ inputs['cli-bin'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-cli.sh
 
     - name: Resolve project
@@ -120,8 +137,15 @@ runs:
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
         FASTLY_API_ENDPOINT: ""
         FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/resolve-project.sh
 
     - name: Restore application target cache
@@ -152,6 +176,16 @@ runs:
         VERSIONS_JSON: ${{ github.action_path }}/versions.json
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
       run: $GITHUB_ACTION_PATH/scripts/install-fastly.sh
 
     - name: Build (validation)
@@ -166,6 +200,16 @@ runs:
         DEPLOY_PROVIDER_ENV_CLEAR_FILE: ${{ steps.validate.outputs['provider-env-clear-file'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/run-cli.sh build
 
     - name: Deploy
@@ -221,6 +265,16 @@ runs:
         SUMMARY_RESULT: ${{ steps.deploy.outcome }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/write-summary.sh
 
     - name: Cleanup
@@ -231,4 +285,14 @@ runs:
         EDGEZERO_TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh

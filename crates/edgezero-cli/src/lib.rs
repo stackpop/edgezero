@@ -281,22 +281,31 @@ fn parse_canonical_version_line(output: &str) -> Option<u64> {
     })
 }
 
-/// Last `version <N>` mention anywhere in `output` (case-insensitive),
-/// covering Fastly's `Deployed package (service abc, version 12)`.
+/// Last `, version <N>)` mention in `output` (case-insensitive) — the
+/// Fastly CLI's own success line, whose Go format string is
+/// `"Deployed package (service %s, version %v)"`.
+///
+/// Deliberately narrow: it previously accepted ANY digits appearing
+/// after the word "version", so `Fastly CLI version 15.2.0` or
+/// `... service 12345, version unchanged` parsed as a service version.
+/// A misparse here emits a WRONG `version=<N>` line, which the deploy →
+/// healthcheck → rollback chain would then act on. When this returns
+/// `None`, `run_deploy` falls back to the Fastly API's *active* version
+/// (the version the deploy actually activated) rather than guessing.
 #[cfg(feature = "cli")]
 fn parse_native_version_mention(output: &str) -> Option<u64> {
     let lower = output.to_ascii_lowercase();
     let mut result = None;
-    for (idx, _) in lower.match_indices("version") {
-        let after = idx.saturating_add("version".len());
+    for (idx, _) in lower.match_indices(", version ") {
+        let after = idx.saturating_add(", version ".len());
         let Some(rest) = lower.get(after..) else {
             continue;
         };
-        let digits: String = rest
-            .chars()
-            .skip_while(|ch| !ch.is_ascii_digit())
-            .take_while(char::is_ascii_digit)
-            .collect();
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        // The number must be closed by the success line's `)`.
+        if digits.is_empty() || rest.chars().nth(digits.len()) != Some(')') {
+            continue;
+        }
         if let Ok(parsed) = digits.parse::<u64>() {
             result = Some(parsed);
         }
@@ -602,9 +611,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_deploy_version_native_takes_last_mention() {
-        let output = "Cloning version 3... created version 4\n";
+    fn parse_deploy_version_native_takes_last_success_line() {
+        let output = "SUCCESS: Deployed package (service abc, version 3)\n\
+             SUCCESS: Deployed package (service abc, version 4)\n";
         assert_eq!(parse_deploy_version(output), Some(4));
+    }
+
+    #[test]
+    fn parse_deploy_version_rejects_confusable_mentions() {
+        // Loose `version <N>` narration is NOT a service version. Each of
+        // these used to parse (and would have emitted a wrong `version=<N>`
+        // for healthcheck/rollback to act on). `None` routes run_deploy to
+        // the Fastly API's *active* version instead — the safe answer.
+        assert_eq!(parse_deploy_version("Fastly CLI version 15.2.0\n"), None);
+        assert_eq!(
+            parse_deploy_version("Uploaded to service 12345, version unchanged\n"),
+            None
+        );
+        assert_eq!(
+            parse_deploy_version("Cloning version 3... created version 4\n"),
+            None
+        );
     }
 
     #[test]

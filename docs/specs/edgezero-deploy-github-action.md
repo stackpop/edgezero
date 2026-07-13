@@ -519,6 +519,20 @@ deploy args are rejected so caller input cannot override typed service selection
 authentication, non-interactive mode, endpoint, profile, or debug behavior. The
 allowlist ships with accept/reject tests.
 
+### 9.1 `deploy-args` under `--stage`
+
+A staged deploy does not run `fastly compute deploy`; it runs
+`fastly compute update` against a cloned draft version (§5.4). Flags that only
+exist on `compute deploy` — `--env`, `--domain`, `--status-check-*`, `--dir` /
+`-C`, `--no-default-domain` — are therefore **no-ops under `--stage`**: the
+adapter drops them with a warning rather than passing an unsupported flag to
+`compute update`.
+
+`--comment` is a special case. `compute update` has no `--comment`, so the
+adapter applies the comment out-of-band via `fastly service-version update
+--comment …` **before** staging the version, preserving the caller's intent
+without breaking the upload.
+
 ## 10. Provider credential contract
 
 Credentials flow through the `provider-env` JSON object, which `deploy-core`

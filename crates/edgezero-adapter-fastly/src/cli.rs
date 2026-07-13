@@ -130,7 +130,58 @@ const FASTLY_API_TOKEN_ENV: &str = "FASTLY_API_TOKEN";
 /// `--service-id` is not passed explicitly (spec §5.4).
 const FASTLY_SERVICE_ID_ENV: &str = "FASTLY_SERVICE_ID";
 
+/// Flags `fastly compute update` accepts that take a VALUE (either
+/// `--flag value` or `--flag=value`). Verified against
+/// `fastly compute update --help` (Fastly CLI v15): the command's
+/// `--service-id`/`-s`, `--service-name`, `--package`/`-p`, `--version`,
+/// plus the global `--token`/`-t`.
+const COMPUTE_UPDATE_VALUE_FLAGS: &[&str] = &[
+    "--service-id",
+    "-s",
+    "--service-name",
+    "--package",
+    "-p",
+    "--version",
+    "--token",
+    "-t",
+];
+
+/// Boolean flags `fastly compute update` accepts: the command's
+/// `--autoclone` plus the Fastly CLI globals. NOTE the absence of
+/// `--comment` -- `compute update` does NOT support it (unlike
+/// `compute deploy`), which is why an operator `--comment` is routed to
+/// `service-version update` instead (see `deploy_staged`).
+const COMPUTE_UPDATE_BOOL_FLAGS: &[&str] = &[
+    "--autoclone",
+    "--accept-defaults",
+    "-d",
+    "--auto-yes",
+    "-y",
+    "--debug-mode",
+    "--non-interactive",
+    "-i",
+    "--quiet",
+    "-q",
+    "--verbose",
+    "-v",
+];
+
 struct FastlyCliAdapter;
+
+/// An operator passthrough arg list split for a staged deploy (see
+/// `split_staged_passthrough`).
+struct StagedPassthrough {
+    /// The `--comment` value, applied to the version separately via
+    /// `fastly service-version update --comment` (`compute update` has
+    /// no `--comment` flag).
+    comment: Option<String>,
+    /// Args `compute update` does not support; dropped with a warning
+    /// rather than forwarded (forwarding them makes the CLI exit
+    /// non-zero and fails the whole staged deploy).
+    dropped: Vec<String>,
+    /// Args that `fastly compute update` actually supports.
+    forwarded: Vec<String>,
+}
 
 /// Outcome of scanning `fastly config-store list --json` for a
 /// platform store id by `name`. Distinguishes three cases the
@@ -1270,6 +1321,28 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Whether `args` already carries the Fastly CLI's non-interactive
+/// switch, in either its long (`--non-interactive`) or short (`-i`)
+/// form. Used to avoid passing the flag twice when a caller already
+/// supplied it via `deploy-args` passthrough.
+fn has_non_interactive(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--non-interactive" || arg == "-i")
+}
+
+/// Build the argv for `fastly compute deploy`, appending
+/// `--non-interactive` (a Fastly CLI *global* flag, supported by
+/// `compute deploy`) unless the caller already passed it. Without it a
+/// production deploy can block on an interactive prompt in CI.
+fn build_compute_deploy_args(extra_args: &[String]) -> Vec<String> {
+    let mut argv = vec!["compute".to_owned(), "deploy".to_owned()];
+    argv.extend_from_slice(extra_args);
+    if !has_non_interactive(extra_args) {
+        argv.push("--non-interactive".to_owned());
+    }
+    argv
+}
+
 /// # Errors
 /// Returns an error if the Fastly CLI deploy command fails.
 #[inline]
@@ -1281,8 +1354,7 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
 
     let status = Command::new("fastly")
-        .args(["compute", "deploy"])
-        .args(extra_args)
+        .args(build_compute_deploy_args(extra_args))
         .current_dir(manifest_dir)
         .status()
         .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
@@ -1465,6 +1537,56 @@ fn args_without_flag_value(args: &[String], flag: &str) -> Vec<String> {
     out
 }
 
+/// Split an arg on a leading `--flag=value`, returning `(flag, value)`.
+fn split_inline_value(arg: &str) -> (&str, Option<&str>) {
+    match arg.split_once('=') {
+        Some((flag, value)) if flag.starts_with('-') => (flag, Some(value)),
+        Some(_) | None => (arg, None),
+    }
+}
+
+/// Partition operator passthrough args for a staged deploy: forward only
+/// what `fastly compute update` supports, lift `--comment` out (it is a
+/// `compute deploy` / `service-version update` flag, NOT a
+/// `compute update` one), and drop the rest.
+///
+/// Both `--comment value` and `--comment=value` are recognised.
+fn split_staged_passthrough(args: &[String]) -> StagedPassthrough {
+    let mut split = StagedPassthrough {
+        forwarded: Vec::with_capacity(args.len()),
+        comment: None,
+        dropped: Vec::new(),
+    };
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let (flag, inline) = split_inline_value(arg);
+        if flag == "--comment" {
+            split.comment = match inline {
+                Some(value) => Some(value.to_owned()),
+                None => iter.next().cloned(),
+            };
+        } else if COMPUTE_UPDATE_VALUE_FLAGS.contains(&flag) {
+            split.forwarded.push(arg.clone());
+            if inline.is_none() {
+                if let Some(value) = iter.next() {
+                    split.forwarded.push(value.clone());
+                }
+            }
+        } else if COMPUTE_UPDATE_BOOL_FLAGS.contains(&flag) {
+            split.forwarded.push(arg.clone());
+        } else {
+            // Unsupported by `compute update`. Consume a detached value
+            // too, so a stray `stage` from `--env stage` is not left
+            // behind as a bogus positional.
+            split.dropped.push(flag.to_owned());
+            if inline.is_none() && iter.peek().is_some_and(|next| !next.starts_with('-')) {
+                iter.next();
+            }
+        }
+    }
+    split
+}
+
 /// Resolve the target service id from `--service-id` or, failing that,
 /// `FASTLY_SERVICE_ID`.
 fn resolve_service_id(args: &[String]) -> Result<String, String> {
@@ -1493,27 +1615,70 @@ fn previous_version(version: u64) -> Option<u64> {
     (version > 1).then(|| version.saturating_sub(1))
 }
 
-/// Best-effort scan of Fastly CLI output for a trailing version number
-/// (`... version 42`, `version=42`, etc.). Returns the LAST match,
-/// which is the freshly-created draft in `compute update` output.
-fn parse_fastly_version(text: &str) -> Option<u64> {
-    let lower = text.to_ascii_lowercase();
+/// Digits immediately following `marker` in `lower` (a lowercased
+/// haystack), for the LAST occurrence of `marker`. The number must be
+/// terminated by `terminator` — so a partial/confusable match (e.g. a
+/// semver `15.2.0`) yields `None` rather than a bogus version.
+fn last_version_after(lower: &str, marker: &str, terminator: char) -> Option<u64> {
     let mut result = None;
-    for (idx, _) in lower.match_indices("version") {
-        let after = idx.saturating_add("version".len());
+    for (idx, _) in lower.match_indices(marker) {
+        let after = idx.saturating_add(marker.len());
         let Some(rest) = lower.get(after..) else {
             continue;
         };
-        let digits: String = rest
-            .chars()
-            .skip_while(|ch| !ch.is_ascii_digit())
-            .take_while(char::is_ascii_digit)
-            .collect();
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || rest.chars().nth(digits.len()) != Some(terminator) {
+            continue;
+        }
         if let Ok(parsed) = digits.parse::<u64>() {
             result = Some(parsed);
         }
     }
     result
+}
+
+/// Parse a Fastly service version out of Fastly CLI output, accepting
+/// ONLY the shapes the CLI actually emits, in precedence order:
+///
+///   1. Our canonical `version=<N>` contract line (spec §5.4.2).
+///   2. The CLI's success line, whose Go format string is
+///      `"Updated package (service %s, version %v)"` (and
+///      `"Deployed package (...)"` for `compute deploy`) — matched as
+///      `, version <N>)`. This names the version the package landed on,
+///      so it wins over (3).
+///   3. The `--autoclone` notice, `"... Now operating on version %d."` —
+///      the freshly-cloned draft, used when the success line is absent.
+///
+/// Everything else yields `None` and the caller FAILS CLOSED.
+///
+/// Deliberately strict. The previous implementation took ANY digits
+/// appearing after the word "version" and let the last match win, so:
+///   * `Uploaded package to service 12345, version unchanged` parsed as
+///     version 12345, and
+///   * the autoclone notice's *pre-clone* version
+///     (`Service version 3 is not editable...`) could beat the real one,
+///     since stdout and stderr are concatenated and their relative order
+///     is not guaranteed.
+///
+/// A misparse here stages, comments, or rolls back the WRONG service
+/// version, so ambiguity must be an error, not a guess.
+fn parse_fastly_version(text: &str) -> Option<u64> {
+    let lower = text.to_ascii_lowercase();
+    parse_canonical_version_line(&lower)
+        .or_else(|| last_version_after(&lower, ", version ", ')'))
+        .or_else(|| last_version_after(&lower, "now operating on version ", '.'))
+}
+
+/// Last standalone `version=<N>` line (the whole trimmed line must be
+/// exactly that, so a `--version=active` flag echoed in a command line
+/// cannot masquerade as one).
+fn parse_canonical_version_line(lower: &str) -> Option<u64> {
+    lower.lines().rev().find_map(|line| {
+        let digits = line.trim().strip_prefix("version=")?;
+        (!digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+            .then(|| digits.parse().ok())
+            .flatten()
+    })
 }
 
 /// Parse `fastly service-version list --json` (or the Fastly API
@@ -1528,19 +1693,20 @@ fn parse_active_version(json: &str) -> Option<u64> {
     })
 }
 
-/// Highest `number` in a version-list JSON array — the fallback for
-/// resolving the just-created draft when output parsing fails.
-fn parse_latest_version(json: &str) -> Option<u64> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    value
-        .as_array()?
-        .iter()
-        .filter_map(|entry| entry.get("number").and_then(serde_json::Value::as_u64))
-        .max()
-}
-
-/// First staging IP found anywhere under a `staging_ips` array in the
-/// Fastly API `domain?include=staging_ips` response.
+/// First staging IP found in a Fastly
+/// `GET /service/<id>/version/<n>/domain?include=staging_ips` response.
+///
+/// The response is an ARRAY of domain objects, and the staging address
+/// is a SINGULAR, nullable STRING field named `staging_ip` on each
+/// domain (`staging_ips` is only the `include=` query-param value, never
+/// a field name). Verified against the go-fastly `Domain` model, whose
+/// field is `StagingIP` with the mapstructure tag `staging_ip`, and its
+/// recorded API fixture `fixtures/domains/list_with_staging_ips.yaml`,
+/// plus Fastly's "working with staging" guide. The field is absent from
+/// the published Domain data model, so it is treated as optional.
+///
+/// We also tolerate a plural `staging_ips` array, in case a Fastly
+/// response (or a future API version) carries that shape.
 fn parse_staging_ip(json: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     find_staging_ip(&value)
@@ -1549,6 +1715,11 @@ fn parse_staging_ip(json: &str) -> Option<String> {
 fn find_staging_ip(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::Object(map) => {
+            // The documented shape: a singular `staging_ip` string.
+            if let Some(ip) = map.get("staging_ip").and_then(serde_json::Value::as_str) {
+                return Some(ip.to_owned());
+            }
+            // Tolerated: a plural `staging_ips` array of strings.
             if let Some(ip) = map
                 .get("staging_ips")
                 .and_then(serde_json::Value::as_array)
@@ -1871,13 +2042,22 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
     let manifest_dir_buf = resolve_staged_manifest_dir(args)?;
     let manifest_dir = manifest_dir_buf.as_path();
     // Strip both the explicitly-threaded `--service-id` and the
-    // CLI-injected `--manifest-path` so neither is forwarded to
-    // `fastly compute update` (which doesn't understand
-    // `--manifest-path`).
+    // CLI-injected `--manifest-path` (which `fastly compute update`
+    // doesn't understand), then keep only the passthrough flags
+    // `compute update` actually supports. `--comment` in particular is
+    // NOT a `compute update` flag — it is lifted out here and applied to
+    // the version below.
     let extra = args_without_flag_value(
         &args_without_flag_value(args, "--service-id"),
         "--manifest-path",
     );
+    let passthrough = split_staged_passthrough(&extra);
+    if !passthrough.dropped.is_empty() {
+        log::warn!(
+            "[edgezero] ignoring deploy args not supported by `fastly compute update`: {}",
+            passthrough.dropped.join(" ")
+        );
+    }
 
     // 1. Build the wasm package (no deploy / activation).
     run_fastly_status(
@@ -1898,26 +2078,46 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
         "--autoclone".to_owned(),
         format!("--service-id={service_id}"),
         "--version=active".to_owned(),
-        "--non-interactive".to_owned(),
     ];
-    update.extend(extra);
+    update.extend(passthrough.forwarded.iter().cloned());
+    if !has_non_interactive(&passthrough.forwarded) {
+        update.push("--non-interactive".to_owned());
+    }
     let update_out = run_fastly_capture(&update, manifest_dir)?;
 
-    // Resolve the new draft version: parse the update output, falling
-    // back to the highest version reported by the Fastly API.
-    let version = if let Some(version) = parse_fastly_version(&update_out) {
-        version
-    } else {
-        let token = require_token()?;
-        let json = fastly_api_get(&format!("/service/{service_id}/version"), &token)?;
-        parse_latest_version(&json).ok_or_else(|| {
-            format!(
-                "could not determine the staged version from `fastly compute update` output or the Fastly API; raw output:\n{update_out}"
-            )
-        })?
-    };
+    // Resolve the new draft version from the update output. FAIL CLOSED:
+    // if the version cannot be parsed with confidence we return an error
+    // rather than guessing. The old fallback picked the service's
+    // HIGHEST version, which under concurrent deploys could silently
+    // stage/roll back a version created by someone else's run.
+    let version = parse_fastly_version(&update_out).ok_or_else(|| {
+        format!(
+            "could not determine the staged version from `fastly compute update` output; \
+             refusing to guess (a wrong version would stage another deploy's changes). \
+             Raw output:\n{update_out}"
+        )
+    })?;
 
-    // 3. Mark the draft version staged (no activation).
+    // 3. Apply the operator's `--comment` to the freshly-created draft.
+    //    `compute update` has no `--comment`; the version comment is set
+    //    with `service-version update`. Done BEFORE staging, while the
+    //    version is still an editable draft (and without `--autoclone`,
+    //    so it can never clone into yet another version).
+    if let Some(comment) = passthrough.comment.as_deref() {
+        run_fastly_status(
+            &[
+                "service-version".to_owned(),
+                "update".to_owned(),
+                format!("--service-id={service_id}"),
+                format!("--version={version}"),
+                "--comment".to_owned(),
+                comment.to_owned(),
+            ],
+            manifest_dir,
+        )?;
+    }
+
+    // 4. Mark the draft version staged (no activation).
     run_fastly_status(
         &[
             "service-version".to_owned(),
@@ -1928,7 +2128,7 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
         manifest_dir,
     )?;
 
-    // 4. Emit the staged version (spec §5.4.2 parseable contract).
+    // 5. Emit the staged version (spec §5.4.2 parseable contract).
     log::info!("version={version}");
     Ok(())
 }
@@ -2188,6 +2388,103 @@ mod tests {
         assert_eq!(resolve_service_id(&args).unwrap(), "SVC_FROM_ARG");
     }
 
+    // ── `compute update` passthrough filtering (`--comment`) ─────────
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn split_staged_passthrough_lifts_comment_out_of_compute_update() {
+        // `fastly compute update` has NO `--comment` flag (verified against
+        // `fastly compute update --help`, CLI v15) — forwarding it makes the
+        // command exit non-zero and fails the whole staged deploy. It must be
+        // lifted out and applied via `service-version update` instead.
+        for args in [owned(&["--comment", "ci run 12"]), owned(&["--comment=x"])] {
+            let split = split_staged_passthrough(&args);
+            assert!(
+                !split
+                    .forwarded
+                    .iter()
+                    .any(|arg| arg.starts_with("--comment")),
+                "--comment must never reach `compute update`: {:?}",
+                split.forwarded
+            );
+            assert!(
+                split.comment.is_some(),
+                "comment must be captured: {args:?}"
+            );
+        }
+        assert_eq!(
+            split_staged_passthrough(&owned(&["--comment", "ci run 12"])).comment,
+            Some("ci run 12".to_owned())
+        );
+        assert_eq!(
+            split_staged_passthrough(&owned(&["--comment=x"])).comment,
+            Some("x".to_owned())
+        );
+    }
+
+    #[test]
+    fn split_staged_passthrough_forwards_supported_flags_only() {
+        let args = owned(&[
+            "--package",
+            "pkg.tar.gz",
+            "--autoclone",
+            "--verbose",
+            "--comment",
+            "note",
+            "--env",
+            "stage",
+            "--status-check-off",
+        ]);
+        let split = split_staged_passthrough(&args);
+        // Supported by `compute update`: kept (value flags keep their value).
+        assert_eq!(
+            split.forwarded,
+            owned(&["--package", "pkg.tar.gz", "--autoclone", "--verbose"])
+        );
+        // `--env`/`--status-check-off` are `compute deploy` flags, not
+        // `compute update` ones: dropped, and `--env`'s detached value
+        // `stage` is dropped with it (never left as a bogus positional).
+        assert_eq!(split.dropped, owned(&["--env", "--status-check-off"]));
+        assert!(!split.forwarded.iter().any(|arg| arg == "stage"));
+        assert_eq!(split.comment, Some("note".to_owned()));
+    }
+
+    // ── non-interactive CI safety (`--non-interactive`) ───────────────
+
+    #[test]
+    fn build_compute_deploy_args_is_non_interactive() {
+        // Without this a production deploy can block on an interactive
+        // prompt in CI.
+        let argv = build_compute_deploy_args(&owned(&["--service-id", "SVC1"]));
+        assert_eq!(
+            argv,
+            owned(&[
+                "compute",
+                "deploy",
+                "--service-id",
+                "SVC1",
+                "--non-interactive"
+            ])
+        );
+    }
+
+    #[test]
+    fn build_compute_deploy_args_does_not_duplicate_caller_flag() {
+        for flag in ["--non-interactive", "-i"] {
+            let argv = build_compute_deploy_args(&owned(&[flag]));
+            assert_eq!(
+                argv.iter()
+                    .filter(|arg| *arg == "--non-interactive" || *arg == "-i")
+                    .count(),
+                1,
+                "must not pass the non-interactive switch twice ({flag})"
+            );
+        }
+    }
+
     // ── curl-config escaping + input validation (injection defence) ───
 
     #[test]
@@ -2276,18 +2573,61 @@ mod tests {
     }
 
     #[test]
-    fn parse_fastly_version_handles_common_shapes() {
+    fn parse_fastly_version_handles_the_shapes_fastly_emits() {
+        // The Fastly CLI's own success lines. Go format strings:
+        //   "Updated package (service %s, version %v)"  (compute update)
+        //   "Deployed package (service %s, version %v)" (compute deploy)
         assert_eq!(
             parse_fastly_version("SUCCESS: Deployed package (service abc, version 7)"),
             Some(7)
         );
-        assert_eq!(parse_fastly_version("Cloned to version=12"), Some(12));
-        // The LAST version mention wins (the freshly-created draft).
         assert_eq!(
-            parse_fastly_version("Cloning version 3... created version 4"),
+            parse_fastly_version("\nSUCCESS: Updated package (service SU1Z0, version 42)\n"),
+            Some(42)
+        );
+        // Our canonical contract line (spec §5.4.2).
+        assert_eq!(parse_fastly_version("version=12"), Some(12));
+        // The --autoclone notice, when no success line is present.
+        assert_eq!(
+            parse_fastly_version(
+                "Service version 3 is not editable, so it was automatically cloned because \
+                 --autoclone is enabled. Now operating on version 4."
+            ),
             Some(4)
         );
+        // Full autoclone + success output: the SUCCESS line wins, and the
+        // PRE-clone version (3) never does — even though stdout/stderr are
+        // concatenated and their relative order is not guaranteed.
+        let combined = "SUCCESS: \nUpdated package (service abc, version 4)\n\
+             Service version 3 is not editable, so it was automatically cloned. \
+             Now operating on version 4.";
+        assert_eq!(parse_fastly_version(combined), Some(4));
         assert_eq!(parse_fastly_version("no numbers here"), None);
+    }
+
+    #[test]
+    fn parse_fastly_version_rejects_confusable_lines() {
+        // The old parser took ANY digits after the word "version", so each
+        // of these silently produced a WRONG service version. They must now
+        // all be `None`, which makes `deploy_staged` fail closed.
+        assert_eq!(
+            parse_fastly_version("Uploaded package to service 12345, version unchanged"),
+            None
+        );
+        // The CLI's own semver must not be mistaken for a service version.
+        assert_eq!(parse_fastly_version("Fastly CLI version 15.2.0"), None);
+        assert_eq!(
+            parse_fastly_version("Checking version compatibility for service 99"),
+            None
+        );
+        // A bare `version <N>` mention with no success-line context is not
+        // trusted either.
+        assert_eq!(parse_fastly_version("cloning version 3"), None);
+        // `--version=active` echoed in a command line is not a contract line.
+        assert_eq!(
+            parse_fastly_version("running: fastly compute update --version=active"),
+            None
+        );
     }
 
     #[test]
@@ -2307,24 +2647,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_latest_version_returns_max_number() {
-        let json = r#"[{"number": 1},{"number": 5},{"number": 3}]"#;
-        assert_eq!(parse_latest_version(json), Some(5));
+    fn parse_staging_ip_reads_the_singular_staging_ip_field() {
+        // The REAL Fastly response shape for
+        // `GET /service/<id>/version/<n>/domain?include=staging_ips`:
+        // an array of domain objects, each with a SINGULAR `staging_ip`
+        // STRING. Body copied from go-fastly's recorded API fixture
+        // `fastly/fixtures/domains/list_with_staging_ips.yaml`, matching
+        // its `StagingIP *string `mapstructure:"staging_ip"`` field.
+        // (`staging_ips` is only the `include=` query value, never a
+        // field name — the previous parser looked for it as an array and
+        // therefore NEVER found a staging IP.)
+        let json = r#"[
+            {
+                "created_at": "2022-11-04T17:36:56Z",
+                "service_id": "kKJb5bOFI47uHeBVluGfX1",
+                "name": "integ-test-20221104.go-fastly-1.com",
+                "version": 73,
+                "comment": "comment",
+                "deleted_at": null,
+                "staging_ip": "167.82.81.194"
+            }
+        ]"#;
+        assert_eq!(parse_staging_ip(json).as_deref(), Some("167.82.81.194"));
     }
 
     #[test]
-    fn parse_staging_ip_finds_nested_ip() {
-        // Array of domain objects, each carrying a staging_ips array.
-        let json = r#"[
-            {"name": "example.com", "staging_ips": ["151.101.2.10", "151.101.66.10"]}
-        ]"#;
+    fn parse_staging_ip_tolerates_a_plural_array_shape() {
+        let json = r#"[{"name": "example.com", "staging_ips": ["151.101.2.10"]}]"#;
         assert_eq!(parse_staging_ip(json).as_deref(), Some("151.101.2.10"));
     }
 
     #[test]
-    fn parse_staging_ip_none_when_absent() {
-        let json = r#"[{"name": "example.com"}]"#;
-        assert_eq!(parse_staging_ip(json), None);
+    fn parse_staging_ip_none_when_absent_or_null() {
+        assert_eq!(parse_staging_ip(r#"[{"name": "example.com"}]"#), None);
+        // `staging_ip` is nullable for services without staging enabled.
+        assert_eq!(
+            parse_staging_ip(r#"[{"name": "example.com", "staging_ip": null}]"#),
+            None
+        );
     }
 
     #[test]
@@ -4428,6 +4788,152 @@ build = \"cargo build --release\"
         assert_ne!(
             value, envelope_a,
             "old envelope A's chunks must be inert -- read must NOT return A"
+        );
+    }
+
+    // ── staged deploy: end-to-end argv contract (fake `fastly`) ───────
+
+    /// Fake `fastly` on `$PATH` that appends every invocation's argv (one
+    /// space-joined line per call) to a record file, and echoes
+    /// `update_stdout` for `fastly compute update`. Returns the temp dir
+    /// (which must outlive the test) and the record path.
+    #[cfg(unix)]
+    fn fake_fastly_recorder(update_stdout: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let record = dir.path().join("argv.log");
+        let script_path = dir.path().join("fastly");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = \"compute\" ] && [ \"$2\" = \"update\" ]; then\n  printf '%s\\n' '{update_stdout}'\nfi\nexit 0\n",
+            record.display(),
+        );
+        fs::write(&script_path, script).expect("write fake fastly");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        (dir, record)
+    }
+
+    /// Run `deploy_staged` against a fake `fastly`, returning the result
+    /// and the recorded argv lines.
+    #[cfg(unix)]
+    fn run_deploy_staged_with_fake(
+        update_stdout: &str,
+        extra: &[&str],
+    ) -> (Result<(), String>, Vec<String>) {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let (fake, record) = fake_fastly_recorder(update_stdout);
+        let _path = PathPrepend::new(fake.path());
+        let app = tempdir().expect("app dir");
+        let manifest = app.path().join("fastly.toml");
+        fs::write(&manifest, "name = \"app\"\n").expect("write fastly.toml");
+
+        let previous_token = env::var_os(FASTLY_API_TOKEN_ENV);
+        env::set_var(FASTLY_API_TOKEN_ENV, "test-token");
+        let mut args = vec![
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+            "--manifest-path".to_owned(),
+            manifest.display().to_string(),
+        ];
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        let result = deploy_staged(&args);
+        match previous_token {
+            Some(prev) => env::set_var(FASTLY_API_TOKEN_ENV, prev),
+            None => env::remove_var(FASTLY_API_TOKEN_ENV),
+        }
+
+        let recorded = fs::read_to_string(&record).unwrap_or_default();
+        let lines = recorded.lines().map(str::to_owned).collect();
+        (result, lines)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_staged_routes_comment_to_service_version_update() {
+        // `--comment` is allowlisted for `deploy-args` and recommended by the
+        // adoption guide, but `fastly compute update` has no such flag. It
+        // must NOT be forwarded there (that would fail the deploy) and must
+        // instead land on the version via `service-version update`.
+        for comment_args in [vec!["--comment", "ci run 12"], vec!["--comment=ci run 12"]] {
+            let (result, argv) = run_deploy_staged_with_fake(
+                "SUCCESS: Updated package (service SVC1, version 7)",
+                &comment_args,
+            );
+            result.expect("staged deploy with --comment must succeed");
+
+            let update = argv
+                .iter()
+                .find(|line| line.starts_with("compute update"))
+                .expect("compute update was invoked");
+            assert!(
+                !update.contains("--comment"),
+                "--comment must not be forwarded to `compute update`: {update}"
+            );
+            assert!(
+                update.contains("--non-interactive"),
+                "compute update must be non-interactive: {update}"
+            );
+
+            let comment_call = argv
+                .iter()
+                .find(|line| line.starts_with("service-version update"))
+                .expect("`service-version update` must apply the version comment");
+            assert_eq!(
+                comment_call,
+                "service-version update --service-id=SVC1 --version=7 --comment ci run 12"
+            );
+
+            // The comment lands on the version BEFORE it is staged (while it
+            // is still an editable draft).
+            let comment_idx = argv
+                .iter()
+                .position(|line| line.starts_with("service-version update"))
+                .expect("comment call");
+            let stage_idx = argv
+                .iter()
+                .position(|line| line.starts_with("service-version stage"))
+                .expect("stage call");
+            assert!(comment_idx < stage_idx, "comment must precede staging");
+            assert_eq!(
+                argv[stage_idx],
+                "service-version stage --service-id=SVC1 --version=7"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_staged_without_comment_makes_no_version_comment_call() {
+        let (result, argv) =
+            run_deploy_staged_with_fake("SUCCESS: Updated package (service SVC1, version 7)", &[]);
+        result.expect("staged deploy must succeed");
+        assert!(
+            !argv
+                .iter()
+                .any(|line| line.starts_with("service-version update")),
+            "no comment => no `service-version update` call: {argv:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_staged_fails_closed_when_version_is_unparseable() {
+        // The old code fell back to the service's HIGHEST version here, which
+        // could silently adopt a version created by a CONCURRENT deploy. We
+        // must error out instead of guessing.
+        let (result, argv) = run_deploy_staged_with_fake("uploaded, but nothing parseable", &[]);
+        let err = result.expect_err("unparseable version must fail closed");
+        assert!(
+            err.contains("could not determine the staged version"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|line| line.starts_with("service-version stage")),
+            "must not stage a guessed version: {argv:?}"
         );
     }
 }

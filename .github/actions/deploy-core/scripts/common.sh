@@ -103,3 +103,30 @@ read_tool_version() {
 sanitize_ref() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9_.=-' '-'
 }
+
+# The CLI binary name becomes a path component and is then chmod'd and executed,
+# so it must be a bare filename — never a path, traversal, or dotfile.
+validate_cli_bin() {
+  local name="$1"
+  [[ -n "$name" ]] || fail "CLI binary name must not be empty"
+  case "$name" in
+    */* | *\\* | *..*) fail "CLI binary name must not contain path separators or '..': '$name'" ;;
+    .*) fail "CLI binary name must not start with '.': '$name'" ;;
+  esac
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    fail "CLI binary name may contain only letters, digits, '.', '_', '-': '$name'"
+}
+
+# Refuse an archive that could write outside the extraction directory: absolute
+# paths, traversal, or symlink/hardlink members.
+assert_safe_tarball() {
+  local tarball="$1" member
+  while IFS= read -r member; do
+    case "$member" in
+      /* | *..*) fail "refusing unsafe CLI archive member '$member'" ;;
+    esac
+  done < <(tar -tf "$tarball")
+  if tar -tvf "$tarball" | grep -qE '^[lh]'; then
+    fail "refusing CLI archive containing a symlink or hardlink member"
+  fi
+}

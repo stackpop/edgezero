@@ -88,8 +88,13 @@ main() {
   local working_directory="${INPUT_WORKING_DIRECTORY:-.}"
   local rust_toolchain_input="${INPUT_RUST_TOOLCHAIN:-auto}"
   local artifact_name="${INPUT_ARTIFACT_NAME:-edgezero-cli}"
-  local stage_root="${EDGEZERO_CLI_STAGE_ROOT:-${RUNNER_TEMP:-/tmp}/edgezero-cli-artifact}"
-  local build_target_dir="${CARGO_TARGET_DIR_OVERRIDE:-${RUNNER_TEMP:-/tmp}/edgezero-cli-build}"
+
+  # These directories are `rm -rf`d below, so they must NEVER come from the
+  # inherited environment — a colliding job-level variable could otherwise point
+  # them at the checkout. Always derive them from the action-owned temp root.
+  local runner_temp="${RUNNER_TEMP:-/tmp}"
+  local stage_root="$runner_temp/edgezero-cli-artifact"
+  local build_target_dir="$runner_temp/edgezero-cli-build"
 
   require_linux_x86_64
   require_cmd cargo
@@ -126,8 +131,7 @@ main() {
   cli_version=$(jq -r '.version' <<<"$package_json")
 
   # Build into an action-owned target dir so the checkout stays clean.
-  rm -rf "$build_target_dir"
-  mkdir -p "$build_target_dir"
+  reset_owned_dir "$build_target_dir" "$runner_temp"
   CARGO_TARGET_DIR="$build_target_dir" cargo +"$rust_toolchain" build \
     --locked --release -p "$cli_package" --bin "$cli_bin"
 
@@ -136,8 +140,7 @@ main() {
   "$bin_path" --help >/dev/null 2>&1 || fail "built CLI '$cli_bin' did not run '$cli_bin --help'"
 
   # Package the binary and self-describing metadata into a tar.
-  rm -rf "$stage_root"
-  mkdir -p "$stage_root"
+  reset_owned_dir "$stage_root" "$runner_temp"
   cp "$bin_path" "$stage_root/$cli_bin"
   chmod +x "$stage_root/$cli_bin"
   jq -n --arg bin "$cli_bin" --arg version "$cli_version" --arg package "$cli_package" \

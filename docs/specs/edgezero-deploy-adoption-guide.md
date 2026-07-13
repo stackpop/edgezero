@@ -79,6 +79,10 @@ steps:
     uses: actions/checkout@v4
     with:
       repository: stackpop/my-edgezero-app
+      # MUST be a trusted, immutable ref (a full commit SHA, or a protected tag)
+      # — never an arbitrary branch. Fastly's default `build-mode: never` means
+      # `fastly compute deploy` COMPILES the application while the API token is
+      # in scope, so untrusted code would run with your credentials (spec §10.1).
       ref: ${{ inputs.ref }}
       path: app
       persist-credentials: false

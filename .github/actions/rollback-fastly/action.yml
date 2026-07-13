@@ -75,4 +75,13 @@ runs:
         "${args[@]}" 2>&1 | tee "$log" || rc=$?
         rolled=$(grep -oE '^rolled-back-to=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)
         echo "rolled-back-to=${rolled}" >> "$GITHUB_OUTPUT"
-        exit "$rc"
+        # Fail closed: a rollback that did not report what it activated has not
+        # provably rolled anything back.
+        if [[ "$rc" -ne 0 ]]; then
+          echo "::error::rollback failed (CLI exit $rc)"
+          exit "$rc"
+        fi
+        if [[ "$DEPLOY_TO" == "production" && -z "$rolled" ]]; then
+          echo "::error::production rollback reported success but did not emit rolled-back-to"
+          exit 1
+        fi

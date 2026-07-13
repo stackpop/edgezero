@@ -34,6 +34,7 @@ main() {
   tarball=$(find_cli_tarball "$artifact_dir")
   [[ -n "$tarball" ]] || fail "no CLI tar found under the downloaded artifact at '$artifact_dir'"
 
+  assert_safe_tarball "$tarball"
   tar -xf "$tarball" -C "$tool_root/bin"
   [[ -f "$tool_root/bin/cli-meta.json" ]] || fail "CLI artifact is missing cli-meta.json"
 
@@ -41,10 +42,16 @@ main() {
   meta_bin=$(jq -er '."cli-bin"' "$tool_root/bin/cli-meta.json") || fail "cli-meta.json has no cli-bin"
   cli_version=$(jq -er '."cli-version"' "$tool_root/bin/cli-meta.json") || fail "cli-meta.json has no cli-version"
   cli_bin="${cli_bin_override:-$meta_bin}"
+  validate_cli_bin "$cli_bin"
 
-  [[ -f "$tool_root/bin/$cli_bin" ]] || fail "CLI binary '$cli_bin' not present in the artifact"
-  chmod +x "$tool_root/bin/$cli_bin"
-  "$tool_root/bin/$cli_bin" --help >/dev/null 2>&1 || fail "downloaded CLI '$cli_bin' did not run '--help'"
+  local cli_path="$tool_root/bin/$cli_bin"
+  [[ -f "$cli_path" && ! -L "$cli_path" ]] || fail "CLI binary '$cli_bin' is not a regular file in the artifact"
+  chmod +x "$cli_path"
+
+  # Smoke-check with a scrubbed environment: no inherited provider credential
+  # (FASTLY_KEY, FASTLY_AUTH_TOKEN, ...) may reach the app CLI here.
+  env -i PATH="/usr/bin:/bin" HOME="${HOME:-/tmp}" "$cli_path" --help >/dev/null 2>&1 ||
+    fail "downloaded CLI '$cli_bin' did not run '--help'"
 
   printf '%s\n' "$tool_root/bin" >>"${GITHUB_PATH:-/dev/null}"
   export PATH="$tool_root/bin:$PATH"

@@ -113,6 +113,69 @@ test_artifact_name() {
 }
 
 # ---------------------------------------------------------------------------
+# build-cli reset_owned_dir — never rm -rf outside the action-owned temp root
+# ---------------------------------------------------------------------------
+check_owned_dir() {
+  bash -c 'source "$1"; reset_owned_dir "$2" "$3"' _ \
+    "$ACTIONS_DIR/build-cli/scripts/common.sh" "$1" "$2"
+}
+
+test_owned_dir_confinement() {
+  section "build-cli owned-dir confinement"
+  local temp_root="$WORK_DIR/temproot"
+  mkdir -p "$temp_root"
+  assert_succeeds "recreates a dir beneath the temp root" \
+    check_owned_dir "$temp_root/build" "$temp_root"
+  # An inherited value pointing at the checkout must be refused, not deleted.
+  assert_fails "refuses a dir outside the temp root (would delete the checkout)" \
+    check_owned_dir "$WORK_DIR/not-temp" "$temp_root"
+  assert_fails "refuses a traversal path" \
+    check_owned_dir "$temp_root/../escape" "$temp_root"
+  # Prove the refusal did not delete anything.
+  mkdir -p "$WORK_DIR/not-temp"
+  check_owned_dir "$WORK_DIR/not-temp" "$temp_root" >/dev/null 2>&1 || true
+  if [[ -d "$WORK_DIR/not-temp" ]]; then
+    pass "the refused directory still exists (nothing was removed)"
+  else
+    fail "the refused directory was deleted"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# download-cli — cli-bin confinement + unsafe archive rejection
+# ---------------------------------------------------------------------------
+check_cli_bin() {
+  bash -c 'source "$1"; validate_cli_bin "$2"' _ "$CORE_SCRIPTS/common.sh" "$1"
+}
+
+check_tarball() {
+  bash -c 'source "$1"; assert_safe_tarball "$2"' _ "$CORE_SCRIPTS/common.sh" "$1"
+}
+
+test_cli_bin_confinement() {
+  section "download-cli cli-bin + archive safety"
+  assert_succeeds "accepts a bare binary name" check_cli_bin "myapp-cli"
+  assert_fails "rejects a traversal cli-bin ('../../outside/tool')" check_cli_bin "../../outside/tool"
+  assert_fails "rejects a cli-bin with a separator" check_cli_bin "sub/tool"
+  assert_fails "rejects an empty cli-bin" check_cli_bin ""
+
+  # A tar carrying a symlink member must be refused before extraction.
+  local evil="$WORK_DIR/evil"
+  mkdir -p "$evil/stage"
+  ln -sf /etc/passwd "$evil/stage/pwned"
+  tar -C "$evil/stage" -cf "$evil/evil.tar" pwned 2>/dev/null
+  assert_fails "refuses an archive containing a symlink member" check_tarball "$evil/evil.tar"
+
+  # A well-formed archive is accepted.
+  local good="$WORK_DIR/good"
+  mkdir -p "$good/stage"
+  echo x >"$good/stage/myapp-cli"
+  printf '{}' >"$good/stage/cli-meta.json"
+  tar -C "$good/stage" -cf "$good/good.tar" myapp-cli cli-meta.json
+  assert_succeeds "accepts a well-formed archive" check_tarball "$good/good.tar"
+}
+
+# ---------------------------------------------------------------------------
 # run-cli.sh — provider-env credential boundary
 # ---------------------------------------------------------------------------
 # A fake CLI records the FASTLY_* it actually saw; run-cli must clear inherited
@@ -256,6 +319,8 @@ test_fastly_versions() {
 main() {
   test_validate_inputs
   test_artifact_name
+  test_owned_dir_confinement
+  test_cli_bin_confinement
   test_run_cli_argv
   test_provider_env_boundary
   test_download_cli_metadata

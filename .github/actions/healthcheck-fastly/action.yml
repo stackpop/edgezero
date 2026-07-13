@@ -99,4 +99,14 @@ runs:
         status=$(grep -oE '^status-code=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)
         echo "healthy=${healthy:-false}" >> "$GITHUB_OUTPUT"
         echo "status-code=${status}" >> "$GITHUB_OUTPUT"
-        exit "$rc"
+        # Fail closed. A zero-exit CLI that reports healthy=false, or emits no
+        # verdict at all, must NOT let this action succeed — callers gate their
+        # rollback on this step failing.
+        if [[ "$rc" -ne 0 ]]; then
+          echo "::error::health check failed (CLI exit $rc, healthy=${healthy:-<none>}, status=${status:-<none>})"
+          exit "$rc"
+        fi
+        if [[ "$healthy" != "true" ]]; then
+          echo "::error::health check did not report healthy=true (got '${healthy:-<no verdict emitted>}')"
+          exit 1
+        fi

@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Creates the minimal fixture application the composite smoke test deploys:
-# a standalone Cargo package (kept out of the surrounding edgezero workspace),
-# a committed clean tree, and an edgezero.toml whose Fastly deploy command is
-# overridden by a marker script. The script emits `version=<N>` (so version
-# threading is exercised), records what credentials it actually saw (so the
-# provider-env boundary is exercised), and records its argv — all without
-# contacting Fastly.
+# Builds the fixture the composite smoke test deploys.
+#
+# This is a REAL app-owned CLI: a standalone Cargo workspace (kept out of the
+# surrounding edgezero workspace) whose own crate depends on `edgezero-cli` and
+# exposes deploy / healthcheck / rollback. That exercises the actual contract —
+# "the application provides the CLI package" — instead of building the monorepo's
+# own CLI.
+#
+# The Fastly deploy command is overridden by a marker script that emits
+# `version=<N>` (version threading), records the credentials it actually saw
+# (provider-env boundary), and records its argv — all without contacting Fastly.
 #
 # Inputs (environment): GITHUB_WORKSPACE (required).
 
@@ -15,29 +19,74 @@ main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local app_dir="$workspace/fixture-app"
 
-  mkdir -p "$app_dir/src"
+  mkdir -p "$app_dir/crates/fixture-app-cli/src"
   cd "$app_dir"
 
   git init -q
   git config user.email test@example.com
   git config user.name Test
 
+  # Standalone workspace: not a member of the surrounding edgezero workspace.
   cat >Cargo.toml <<'TOML'
-[package]
-name = "fixture-app"
-version = "0.0.0"
-edition = "2021"
-
-# Standalone: keep the fixture out of the surrounding edgezero workspace.
 [workspace]
+members = ["crates/fixture-app-cli"]
+resolver = "2"
 TOML
 
-  echo 'fn main() {}' >src/main.rs
-  cargo generate-lockfile
+  # The app's OWN CLI crate, built on edgezero-cli (path dep into the checkout).
+  cat >crates/fixture-app-cli/Cargo.toml <<'TOML'
+[package]
+name = "fixture-app-cli"
+version = "0.1.0"
+edition = "2021"
 
-  # Marker "deploy" script the CLI runs in place of `fastly compute deploy`.
-  # It records the credentials it actually saw and its argv, and emits a version
-  # line so `deploy-fastly` can thread `fastly-version`.
+[[bin]]
+name = "fixture-app-cli"
+path = "src/main.rs"
+
+[dependencies]
+edgezero-cli = { path = "../../../crates/edgezero-cli", default-features = false, features = [
+  "cli",
+  "edgezero-adapter-fastly",
+] }
+clap = { version = "4", features = ["derive"] }
+TOML
+
+  cat >crates/fixture-app-cli/src/main.rs <<'RS'
+//! Fixture app CLI: the smoke test's stand-in for an application-owned CLI.
+use clap::{Parser, Subcommand};
+use edgezero_cli::args::{DeployArgs, HealthcheckArgs, RollbackArgs};
+
+#[derive(Parser, Debug)]
+#[command(name = "fixture-app-cli", version, about = "fixture app edge CLI")]
+struct Args {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    Deploy(DeployArgs),
+    Healthcheck(HealthcheckArgs),
+    Rollback(RollbackArgs),
+}
+
+fn main() {
+    edgezero_cli::init_cli_logger();
+    let result = match Args::parse().cmd {
+        Cmd::Deploy(args) => edgezero_cli::run_deploy(&args),
+        Cmd::Healthcheck(args) => edgezero_cli::run_healthcheck(&args),
+        Cmd::Rollback(args) => edgezero_cli::run_rollback(&args),
+    };
+    if let Err(err) = result {
+        eprintln!("[fixture-app] {err}");
+        std::process::exit(2);
+    }
+}
+RS
+
+  # Marker "deploy" the CLI runs instead of `fastly compute deploy`. It records
+  # the credentials it saw and its argv, and emits a version line.
   cat >fake-deploy.sh <<'SH'
 #!/usr/bin/env bash
 {
@@ -51,13 +100,20 @@ echo "version=7"
 SH
   chmod +x fake-deploy.sh
 
-  # Override the Fastly deploy command so `edgezero deploy --adapter fastly` runs
-  # the marker script instead of the real `fastly compute deploy` (which would
-  # need a built package and live credentials).
   cat >edgezero.toml <<'ETOML'
 [adapters.fastly.commands]
 deploy = "bash fake-deploy.sh"
 ETOML
+
+  # The staged-deploy path bypasses manifest commands and drives the Fastly CLI,
+  # so it needs a Fastly manifest to resolve its working directory.
+  cat >fastly.toml <<'FTOML'
+manifest_version = 3
+name = "fixture-app"
+language = "rust"
+FTOML
+
+  cargo generate-lockfile
 
   git add -A
   git commit -q -m fixture

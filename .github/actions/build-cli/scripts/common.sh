@@ -117,3 +117,17 @@ validate_artifact_name() {
   [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
     fail "input 'artifact-name' may contain only letters, digits, '.', '_', '-': '$name'"
 }
+
+# Recreate an action-owned scratch directory. Refuses to remove anything not
+# beneath the temp root, so a stray/inherited value can never delete the checkout.
+reset_owned_dir() {
+  local dir="$1" temp_root="$2"
+  [[ -n "$dir" && -n "$temp_root" ]] || fail "internal: reset_owned_dir needs a dir and a temp root"
+  case "$dir" in
+    *..*) fail "refusing to remove '$dir': path traversal" ;;
+  esac
+  [[ "$dir" == "$temp_root"/* ]] ||
+    fail "refusing to remove '$dir': not beneath the action-owned temp root '$temp_root'"
+  rm -rf "$dir"
+  mkdir -p "$dir"
+}
