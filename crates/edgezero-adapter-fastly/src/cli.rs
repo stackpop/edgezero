@@ -680,7 +680,7 @@ impl Adapter for FastlyCliAdapter {
         Err(format!(
             "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` exited with status {}\nstderr: {}",
             output.status,
-            stderr.trim()
+            redact_stderr(&stderr)
         ))
     }
 
@@ -828,7 +828,7 @@ fn fetch_remote_config_store_entry(store_id: &str, key: &str) -> Result<Option<S
         "`fastly config-store-entry describe --store-id={store_id} --key={key} --json` \
          exited with status {}\nstderr: {}",
         output.status,
-        stderr.trim()
+        redact_stderr(&stderr)
     ))
 }
 
@@ -1558,7 +1558,7 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
     Err(format!(
         "`fastly config-store-entry update --store-id={store_id} --key={key} --upsert --stdin` exited with status {}\nstderr: {}",
         output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
+        redact_stderr(&String::from_utf8_lossy(&output.stderr))
     ))
 }
 
@@ -1682,6 +1682,20 @@ fn redact_describe_response(stdout: &str) -> String {
                 format!("{len} bytes, JSON {}", shape_summary(&other))
             }
         },
+    )
+}
+
+/// Summarise a failing `fastly` invocation's stderr WITHOUT echoing it.
+///
+/// The `describe` and `update --stdin` paths carry the stored config value, so
+/// a Fastly error that quotes the payload back would put credentials straight
+/// into CI logs — the same exposure as the stdout leak, via the failure branch.
+/// Not-found *classification* still inspects stderr internally; only the
+/// user-facing string is redacted.
+fn redact_stderr(stderr: &str) -> String {
+    let len = stderr.trim().len();
+    format!(
+        "{len} bytes suppressed (may echo the stored config value); re-run the `fastly` command directly to inspect it"
     )
 }
 
@@ -3962,6 +3976,73 @@ echo 'unexpected' >&2; exit 1
         assert!(
             err.contains("bytes"),
             "error should carry a redacted size/shape summary: {err}"
+        );
+    }
+
+    /// The FAILURE branch leaks too: a Fastly error that quotes the stored
+    /// value back in stderr must not reach the user-facing error.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_entry_stderr_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_stderr1";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        // Not a "not found" — a hard failure that echoes the value.
+        let stderr = format!("Error: internal failure processing value {SENTINEL}");
+        let fake = fake_fastly_returning("", &stderr, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let result = FastlyCliAdapter.read_config_entry(
+            dir.path(),
+            Some("fastly.toml"),
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            "cfg",
+            &AdapterPushContext::new(),
+        );
+        let Err(err) = result else {
+            panic!("hard stderr failure must error")
+        };
+        assert!(
+            !err.contains(SENTINEL),
+            "stderr must be redacted, not echoed: {err}"
+        );
+        assert!(
+            err.contains("suppressed"),
+            "error should say the stderr was suppressed: {err}"
+        );
+    }
+
+    /// Same for the push path's GC prior-read, which runs on every cloud push.
+    #[cfg(unix)]
+    #[test]
+    fn push_config_entries_stderr_failure_does_not_leak_payload() {
+        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_stderr2";
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let stderr = format!("Error: internal failure processing value {SENTINEL}");
+        let fake = fake_fastly_returning("", &stderr, 1);
+        let _path = PathPrepend::new(fake.path());
+
+        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let result = FastlyCliAdapter.push_config_entries(
+            dir.path(),
+            None,
+            None,
+            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+            &[(TEST_CONFIG_ID.to_owned(), envelope)],
+            &AdapterPushContext::new(),
+            false,
+        );
+        // Whether it errors or warns, the payload must never appear.
+        let rendered = match result {
+            Ok(lines) => lines.join("\n"),
+            Err(err) => err,
+        };
+        assert!(
+            !rendered.contains(SENTINEL),
+            "push output must not echo the stored value from stderr: {rendered}"
         );
     }
 
