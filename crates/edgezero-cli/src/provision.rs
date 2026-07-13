@@ -1413,7 +1413,8 @@ mod tests {
     use edgezero_adapter::registry::{
         get_adapter, register_adapter, Adapter, AdapterAction, ProvisionMode, ProvisionOutcome,
     };
-    use edgezero_core::app_config::{SecretField, SecretKind};
+    use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
+    use std::borrow::Cow;
     use std::collections::BTreeMap;
     use std::env;
     use std::fs;
@@ -1547,7 +1548,7 @@ serve = "echo"
                 slot.extend(typed_secrets.iter().map(|entry| {
                     (
                         entry.store_id.to_owned(),
-                        entry.field_name.to_owned(),
+                        entry.field_name.clone(),
                         entry.key_value.to_owned(),
                     )
                 }));
@@ -3386,10 +3387,13 @@ manifest = "crates/cf/wrangler.toml"
     }
 
     impl AppConfigMeta for TypedTestConfig {
-        const SECRET_FIELDS: &'static [SecretField] = &[SecretField {
-            kind: SecretKind::KeyInDefault,
-            name: "api_token",
-        }];
+        fn secret_fields() -> Vec<SecretField> {
+            vec![SecretField {
+                kind: SecretKind::KeyInDefault,
+                optional: false,
+                path: vec![SecretPathSegment::Field(Cow::Borrowed("api_token"))],
+            }]
+        }
     }
 
     const TYPED_APP_CONFIG: &str = r#"

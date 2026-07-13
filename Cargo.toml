@@ -84,7 +84,7 @@ subtle = "2"
 # up` (where a runtime mismatch surfaces as opaque WIT linker errors).
 spin-sdk = { version = "~6.0", default-features = false, features = ["http", "key-value", "variables"] }
 tempfile = "3"
-toml_edit = "0.23"
+toml_edit = "0.25"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 trybuild = "1"

@@ -633,7 +633,7 @@ impl Adapter for SpinCliAdapter {
                     value = entry.key_value,
                 ));
             }
-            if let Some(prev_field) = seen.insert(spin_var.clone(), entry.field_name) {
+            if let Some(prev_field) = seen.insert(spin_var.clone(), entry.field_name.as_str()) {
                 return Err(format!(
                     "Spin variable `{spin_var}` would receive values from BOTH `#[secret]` field `{prev_field}` AND `#[secret]` field `{this_field}`; Spin's flat variable namespace cannot disambiguate them. Pick distinct `#[secret]` values whose lowercased forms differ.",
                     this_field = entry.field_name,

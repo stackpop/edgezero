@@ -57,7 +57,7 @@ problems made that untenable as projects grew:
   blob model writes ONE envelope per `[stores.config]` key.
 - **Secret resolution was per-handler.** Every handler that read a
   `#[secret]` field had to remember to call `require_str`. The new
-  `AppConfig<C>` extractor walks `C::SECRET_FIELDS` once and replaces
+  `AppConfig<C>` extractor walks `C::secret_fields()` once and replaces
   each key NAME with the resolved value before handing `cfg` to the
   handler.
 
@@ -230,7 +230,8 @@ new` already ran the `--local` form for you when scaffolding, so
    The CLI prints an inline unified diff against the current remote
    state. `--yes` (`-y`) skips the consent prompt; `--no-diff`
    suppresses the render; `--dry-run` shows the diff and exits without
-   writing.
+   writing — except against **Spin Cloud**, whose read-back is
+   unsupported, so dry-run errors there (use `--local` or `--yes`).
 
 ### Per-environment key override
 

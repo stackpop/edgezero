@@ -195,9 +195,11 @@ only fills in missing stanzas.
 
 ### Seeding the store
 
-`edgezero config push --adapter spin` reads `runtime-config.toml` and
+`<your-cli> config push --adapter spin` reads `runtime-config.toml` and
 dispatches to the right per-backend writer — no embedded HTTP endpoint,
-no token to manage. Resolution order:
+no token to manage. (Typed push runs from your downstream app CLI; the
+bundled `edgezero config push` errors with a pointer to it, since the
+blob model needs the typed `AppConfig<C>`.) Resolution order:
 
 1. **`--local` set**: forces SQLite-direct against
    `<spin.toml dir>/.spin/sqlite_key_value.db` (Spin's local KV file).
@@ -244,11 +246,11 @@ the schema until the operator opts in.
 
 ```bash
 # Local dev: writes through to .spin/sqlite_key_value.db.
-edgezero config push --adapter spin --local
+<your-cli> config push --adapter spin --local
 
 # Production (Fermyon Cloud): shells `spin cloud key-value set`.
 spin cloud login    # one-time
-edgezero config push --adapter spin
+<your-cli> config push --adapter spin
 ```
 
 ## Secret Store

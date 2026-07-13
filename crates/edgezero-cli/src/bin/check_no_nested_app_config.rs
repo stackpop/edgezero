@@ -30,6 +30,19 @@
 //! normal workspace build does not pull in `syn` / `walkdir` / `proc-macro2`.
 
 #![cfg(feature = "nested-app-config-check")]
+// stdout/stderr writes go through `edgezero_cli::stream::{stdout_line,
+// info_line}` so the workspace-wide `clippy::print_stdout` /
+// `clippy::print_stderr` restrictions still catch stray `println!` /
+// `eprintln!` regressions. The stream helpers wrap the writes with the
+// `#[expect]` at their definition site.
+// Free helpers (`struct_derives_app_config`, `type_contains_app_config_struct`,
+// `rs_files_in`) are grouped with the pass they belong to, so they sit
+// between the visitor `impl` blocks rather than below them. Reads better than
+// hoisting every free fn to the bottom of the file.
+#![expect(
+    clippy::arbitrary_source_item_ordering,
+    reason = "items are grouped by pass (collector pass / nesting pass / type-unwrap helpers / entry point), not by item kind"
+)]
 
 use std::collections::HashSet;
 use std::env;
@@ -50,6 +63,7 @@ use walkdir::WalkDir;
 // Pass 1: collect struct identifiers that derive AppConfig
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct AppConfigStructCollector {
     app_config_structs: HashSet<String>,
 }
@@ -153,6 +167,9 @@ impl<'ast> Visit<'ast> for NestedAppConfigVisitor<'_, '_> {
             if let Some(inner_name) =
                 type_contains_app_config_struct(&field.ty, self.app_config_structs)
             {
+                if field_has_nested_optin(field) {
+                    continue; // opted in via #[app_config(nested)] — allowed
+                }
                 let span = field
                     .ident
                     .as_ref()
@@ -162,6 +179,33 @@ impl<'ast> Visit<'ast> for NestedAppConfigVisitor<'_, '_> {
         }
         visit::visit_item_struct(self, i);
     }
+}
+
+/// Returns `true` only for a well-formed `#[app_config(nested)]`. A malformed
+/// `#[app_config(...)]` returns `false` -> the field is treated as NOT opted
+/// in, so the guard still FLAGS the nesting (loud CI failure) rather than
+/// silently waving it through. This is safe here (unlike the derive's
+/// `nested_optin`, which must hard-error): the guard runs only over
+/// already-compiling code, and the derive's strict `nested_optin` has already
+/// rejected any malformed `#[app_config(...)]` before this binary ever runs.
+fn field_has_nested_optin(field: &syn::Field) -> bool {
+    field.attrs.iter().any(|attr| {
+        if !attr.path().is_ident("app_config") {
+            return false;
+        }
+        // Must actually see `nested`. A bare `#[app_config()]` parses Ok but
+        // never sets `found`, so `.is_ok()` alone would wrongly report opt-in.
+        let mut found = false;
+        let parsed = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("nested") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown app_config option"))
+            }
+        });
+        parsed.is_ok() && found
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +220,10 @@ impl<'ast> Visit<'ast> for NestedAppConfigVisitor<'_, '_> {
 /// future minor releases; new variants that don't involve a named path cannot
 /// contain an `AppConfig`-derived reference, so `None` is the correct
 /// forward-compatible answer.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "syn may add Type variants; forward-compat fallback returns None"
+)]
 fn type_contains_app_config_struct(ty: &Type, set: &HashSet<String>) -> Option<String> {
     match ty {
         Type::Path(tp) => {
@@ -208,25 +256,7 @@ fn type_contains_app_config_struct(ty: &Type, set: &HashSet<String>) -> Option<S
             .elems
             .iter()
             .find_map(|inner| type_contains_app_config_struct(inner, set)),
-        // These variants cannot contain a named AppConfig-derived path
-        // reference: function pointers, trait objects, never types,
-        // `impl Trait`, macros, `_` inference, raw pointers, and the
-        // opaque `Verbatim` (verbatim tokens the syn version doesn't
-        // model structurally) all bottom out without a path segment
-        // we could match against. Enumerated explicitly to force a
-        // reviewer decision if syn adds a variant that DOES carry a
-        // path (e.g. a hypothetical `Type::Alias(...)`).
-        Type::BareFn(_)
-        | Type::Group(_)
-        | Type::ImplTrait(_)
-        | Type::Infer(_)
-        | Type::Macro(_)
-        | Type::Never(_)
-        | Type::Ptr(_)
-        | Type::TraitObject(_)
-        | Type::Verbatim(_) => None,
-        // syn::Type is #[non_exhaustive]; future variants default to None.
-        _future => None,
+        _ => None,
     }
 }
 
@@ -340,9 +370,11 @@ fn main() {
     if violations > 0 {
         info_line(&format!(
             "\n{violations} nested-AppConfig violation(s). \
-             A struct with #[derive(AppConfig)] must not contain fields whose \
-             type resolves to another #[derive(AppConfig)] struct, even through \
-             Option/Vec/Box wrappers (spec \u{00a7}3.3)."
+             A field whose type resolves to another #[derive(AppConfig)] struct \
+             (detected even through Option/Vec/Box wrappers) must opt in with \
+             #[app_config(nested)]. Opt-in supports a direct `T` or `Vec<T>` field \
+             only — restructure Option/Box-wrapped nesting to one of those. \
+             Otherwise nesting is rejected (spec \u{00a7}3.3)."
         ));
         process::exit(1);
     }
@@ -356,6 +388,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NESTED_VEC_WITH_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { #[app_config(nested)] inner: Vec<Inner> }
+    ";
+
+    const NESTED_WITHOUT_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { inner: Inner }
+    ";
+
+    const NESTED_WITH_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { #[app_config(nested)] inner: Inner }
+    ";
 
     fn known(names: &[&str]) -> HashSet<String> {
         names.iter().map(|name| String::from(*name)).collect()
@@ -492,6 +539,21 @@ mod tests {
             NestedAppConfigVisitor::new(Path::new("test.rs"), &collector.app_config_structs);
         visitor.visit_file(&file);
         visitor.violations
+    }
+
+    #[test]
+    fn allows_nesting_with_opt_in() {
+        assert_eq!(violations_in(NESTED_WITH_OPT_IN), 0);
+    }
+
+    #[test]
+    fn allows_vec_nesting_with_opt_in() {
+        assert_eq!(violations_in(NESTED_VEC_WITH_OPT_IN), 0);
+    }
+
+    #[test]
+    fn flags_nesting_without_opt_in() {
+        assert_eq!(violations_in(NESTED_WITHOUT_OPT_IN), 1);
     }
 
     #[test]

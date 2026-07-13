@@ -237,8 +237,8 @@ impl<'ctx> AdapterPushContext<'ctx> {
 /// v2 source-compat; construction goes through `new`.
 #[non_exhaustive]
 pub struct TypedSecretEntry<'entry> {
-    /// Rust struct field name (e.g. `"api_token"`).
-    pub field_name: &'entry str,
+    /// Dotted secret-field path label (e.g. `"partners[3].api_key"`).
+    pub field_name: String,
     /// Blob value — i.e. the secret-store KEY NAME.
     pub key_value: &'entry str,
     /// Logical secret-store id this key targets.
@@ -249,9 +249,13 @@ impl<'entry> TypedSecretEntry<'entry> {
     /// Construct a new entry from its three components.
     #[must_use]
     #[inline]
-    pub fn new(store_id: &'entry str, field_name: &'entry str, key_value: &'entry str) -> Self {
+    pub fn new<Name: Into<String>>(
+        store_id: &'entry str,
+        field_name: Name,
+        key_value: &'entry str,
+    ) -> Self {
         Self {
-            field_name,
+            field_name: field_name.into(),
             key_value,
             store_id,
         }
