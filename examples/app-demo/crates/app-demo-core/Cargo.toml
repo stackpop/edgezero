@@ -1,5 +1,6 @@
 [package]
 name = "app-demo-core"
+description = "Core handlers and configuration for the EdgeZero app-demo example"
 authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
