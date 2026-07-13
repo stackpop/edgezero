@@ -35,7 +35,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust tool chain
@@ -126,7 +126,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust tool chain

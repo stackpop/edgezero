@@ -1,0 +1,131 @@
+name: Deploy action
+
+on:
+  pull_request:
+    paths:
+      - .github/actions/deploy/**
+      - .github/workflows/deploy-action.yml
+      - crates/edgezero-adapter/**
+      - crates/edgezero-adapter-fastly/**
+      - crates/edgezero-cli/**
+      - docs/guide/deploy-github-actions.md
+      - docs/.vitepress/config.mts
+      - docs/specs/**
+  push:
+    branches: [main]
+    paths:
+      - .github/actions/deploy/**
+      - .github/workflows/deploy-action.yml
+      - crates/edgezero-adapter/**
+      - crates/edgezero-adapter-fastly/**
+      - crates/edgezero-cli/**
+      - docs/guide/deploy-github-actions.md
+      - docs/.vitepress/config.mts
+      - docs/specs/**
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Actionlint workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106
+      - name: Workflow security checks
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          checked = [
+              Path('.github/actions/deploy/action.yml'),
+              Path('.github/workflows/deploy-action.yml'),
+          ]
+          remote_use = re.compile(r'uses:\s+([^\s#]+)')
+          full_sha = re.compile(r'.+@[0-9a-fA-F]{40}$')
+          for path in checked:
+              for line_no, line in enumerate(path.read_text().splitlines(), 1):
+                  match = remote_use.search(line)
+                  if not match:
+                      continue
+                  target = match.group(1).strip('"\'')
+                  if target.startswith('./') or target.startswith('docker://'):
+                      continue
+                  if not full_sha.fullmatch(target):
+                      raise SystemExit(f'{path}:{line_no}: remote action is not pinned to a full SHA: {target}')
+          PY
+      - name: Run zizmor workflow scanner
+        run: |
+          python3 -m pip install --user zizmor==1.16.3
+          "$(python3 -m site --user-base)/bin/zizmor" --offline .github/actions/deploy/action.yml .github/workflows/deploy-action.yml
+      - name: Run deploy action script contract tests
+        run: .github/actions/deploy/tests/run.sh
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+      - name: Shellcheck deploy action scripts
+        run: shellcheck .github/actions/deploy/scripts/*.sh .github/actions/deploy/tests/run.sh
+      - name: Verify Fastly checksum metadata
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          with open('.github/actions/deploy/versions.json', encoding='utf-8') as f:
+              data = json.load(f)
+          tool_versions = dict(
+              line.split(None, 1) for line in Path('.tool-versions').read_text().splitlines() if line.strip()
+          )
+          assert data['fastly']['version'] == tool_versions['fastly']
+          checksum = data['fastly']['linux_amd64']['sha256']
+          assert len(checksum) == 64 and all(c in '0123456789abcdef' for c in checksum)
+          PY
+      - name: Validate deploy action documentation
+        run: |
+          cd docs
+          npm ci
+          npm run format
+          npm run lint
+          npm run build
+
+  composite-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Create fixture app
+        run: |
+          set -euo pipefail
+          mkdir -p fixture-app
+          cd fixture-app
+          git init -q
+          git config user.email test@example.com
+          git config user.name Test
+          cat >Cargo.lock <<'LOCK'
+          # fixture lockfile
+          LOCK
+          cat >edgezero.toml <<'TOML'
+          [adapters.fastly.commands]
+          deploy = "printf '%s\\n' > deploy-args.txt"
+          TOML
+          git add .
+          git commit -q -m fixture
+      - name: Deploy fixture with local action
+        uses: ./.github/actions/deploy
+        with:
+          adapter: fastly
+          working-directory: fixture-app
+          manifest: edgezero.toml
+          deploy-args: '["--comment", "smoke"]'
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+      - name: Assert fixture deploy command
+        run: |
+          set -euo pipefail
+          diff -u <(printf '%s\n' --service-id dummy-service --non-interactive --comment smoke) fixture-app/deploy-args.txt
