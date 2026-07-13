@@ -147,6 +147,84 @@ pointer no longer does.
    whole file in one in-memory rewrite and has no remote-concurrency
    window.
 
+## Two further invariants (PR #314 review)
+
+**Diagnostics must never echo config payloads.** The `describe` shell-outs
+interpolated their raw stdout — i.e. the stored config envelope, which may hold
+credentials — into errors that the CLI logs verbatim. Because the GC prior-read
+runs on *every* cloud push, this exposed the previous config on any schema
+drift. Errors now report only the response's **size and top-level field-name
+shape** (`redact_describe_response`), never a value. Enforced by sentinel-secret
+tests on both the read and push paths.
+
+**A batch must not name the same logical root twice.** GC builds one plan per
+entry and snapshots every plan against the *same* prior generation. With
+`[(root, A), (root, B)]` the last tuple wins the upsert (root = B), yet A's plan
+would still reclaim `prior − A_keys` — which includes B's freshly-written chunks
+— leaving the final pointer dangling. Duplicate root keys are therefore a **hard
+error** in both push paths, before any expansion or I/O. (Rejecting beats
+silently coalescing: a duplicated key is a caller bug, and picking a winner would
+hide it.)
+
+## Cloud reclamation is DEFERRED (eventual consistency)
+
+> **Design correction (PR #314 review).** An earlier revision of this spec had
+> the cloud push delete the superseded generation immediately, guarded only by a
+> post-commit read-back. That is **unsafe**: Fastly Config Store is eventually
+> consistent, and the read-back observes only the **control plane**. After we
+> write pointer N, POPs may still be serving pointer N-1 — which references
+> N-1's chunks. Deleting them immediately strips chunks out from under those
+> POPs, breaking reads on *every* re-push, not merely under concurrent writers.
+> Knowing precisely *what* to delete was never the problem; knowing *when* it is
+> safe is, and no control-plane read can answer that.
+
+So a cloud push **never deletes the generation it just superseded**. It
+*records* it, and a **later** push reclaims it once it has aged out:
+
+```
+push N (root R):
+  1. read prior pointer   -> prior generation (N-1)
+  2. read pending record  -> generations superseded by EARLIER pushes
+  3. commit N's chunks + N's pointer            <- commit point
+  4. LWW read-back: is the root still exactly what we wrote?  (else yield)
+  5. RECLAIM each pending generation g where
+        age(g.superseded_at) >= GRACE
+        and keys(g) disjoint from N's keep-set
+        and keys(g) disjoint from keys(N-1)     <- may still be live at POPs
+  6. RECORD pending += { N-1, superseded_at: now }
+```
+
+**Pending record** at `<root>.__edgezero_gc.pending` (a reserved namespace —
+`GC_PENDING_INFIX`, rejected in logical keys exactly like the chunk infix):
+
+```json
+{ "edgezero_kind": "fastly_config_gc_pending", "version": 1,
+  "generations": [ { "sha": "<envelope_sha256>", "count": 12, "superseded_at": 1720000000 } ] }
+```
+
+Two properties that are load-bearing:
+
+- **Compact, not raw keys.** Chunk keys are derivable
+  (`<root>.__edgezero_chunks.<sha>.<idx>`), so the record stores `(sha, count)`.
+  Storing the raw key list would exceed the record's own 8 000-char entry limit
+  after ~2 generations.
+- **A list, not a slot.** If a push outpaces the grace window, the un-reclaimed
+  generation must not be overwritten — that would leak it *untracked*, forever.
+
+**Grace window:** `EDGEZERO_FASTLY_GC_GRACE_SECS`, default **86 400 (24h)**.
+Fastly documents no propagation bound, so the default is deliberately generous;
+operators on a faster cadence can lower it. Generation N-1 is retained
+unconditionally regardless of the window.
+
+**Failure handling:** a failed delete leaves the generation pending, so a later
+push retries (deletes are idempotent — not-found is success). A malformed
+pending record warns and touches nothing rather than clobbering state it cannot
+understand.
+
+**The LOCAL path still prunes eagerly** and that is correct: `fastly.toml` is a
+single file Viceroy reads at startup — there is no propagation window and no POP
+that could still be serving the previous pointer.
+
 ## Concurrency model: last-writer-wins
 
 The config value follows **last-writer-wins (LWW)**. The root key is a
@@ -165,18 +243,20 @@ last writer own reclamation. This is what keeps LWW honest — a
 superseded (losing) push never deletes the *winner's* live chunks, so
 the winner's config stays readable.
 
-Best-effort boundary (stated honestly): the read-back narrows but does
-not fully close the window, because Fastly exposes no compare-and-delete.
-A newer push can still supersede us *between* our read-back and an
-individual delete, so in a rare interleaving a losing push can delete a
-chunk the new winner references. The blast radius is one store's chunk
-data — never another store, never the root pointer. The next read of
-that config then surfaces an integrity error (missing chunk) rather than
-serving wrong data, and re-pushing the winning config restores it
-(chunks are written before the pointer). GC is therefore a best-effort
-reclaimer under LWW, not a transactional one. If that residual ever
-matters, the deferred `config gc` non-goal is the path to fully
-lease-guarded reclamation.
+Best-effort boundary (stated honestly): Fastly exposes no
+compare-and-delete, so a newer push can still supersede us *between* the
+read-back and a delete. Deferral makes that residual far narrower than it
+was under eager deletion, because the only thing a sweep can ever delete
+is a generation that (a) was superseded at least one push ago, (b) has
+aged past the grace window, and (c) is referenced by neither the new
+generation nor the just-superseded one. A losing push therefore cannot
+touch the winner's live chunks in the ordinary case; it would take a
+concurrent revert to a *stale, aged-out* generation inside the sweep
+window. The blast radius stays bounded to one store's chunk data — never
+another store, never the root pointer — and a missing chunk surfaces as
+an integrity error on read rather than wrong data, recoverable by
+re-pushing (chunks are written before the pointer). GC remains a
+best-effort reclaimer under LWW, not a transactional one.
 
 ## `prior_chunk_keys` helper (`chunked_config.rs`)
 
