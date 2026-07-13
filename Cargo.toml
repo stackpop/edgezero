@@ -13,10 +13,11 @@ exclude = ["examples/app-demo"]
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
-version = "0.1.0"
 authors = ["EdgeZero Team <dev@edgezero.dev>"]
+edition = "2021"
 license = "Apache-2.0"
+publish = false
+version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1"
