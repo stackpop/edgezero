@@ -1,5 +1,30 @@
 # Fastly Chunk GC Implementation Plan
 
+> ## ⚠️ SUPERSEDED — historical build guide, NOT the contract
+>
+> This plan was written against the ORIGINAL design, in which a cloud push
+> **eagerly deleted** the generation it had just superseded. **That design is
+> unsafe and was rejected during the PR #314 review**: Fastly's config store is
+> eventually consistent, so POPs may still be serving the previous pointer and
+> need its chunks.
+>
+> A second attempt (a metadata "pending record" sidecar) was also rejected — no
+> compare-and-swap means a failed write or a concurrent push permanently loses a
+> generation, and the record overflows the 8 000-char entry limit at ~71
+> generations.
+>
+> **The shipped cloud design derives everything from the store itself** (group
+> the store's actual chunk keys into generations; a generation is superseded when
+> the next one is written; reclaim only unreferenced generations that have aged
+> past a grace window; never touch the just-superseded one).
+>
+> **The authoritative contract is the spec:**
+> `docs/superpowers/specs/2026-07-07-fastly-chunk-gc.md`.
+>
+> Everything below is retained only as a record of how the work was sequenced,
+> and of the two designs that were tried and discarded. Do not implement from it.
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reclaim obsolete Fastly chunked config-store entries after a successful re-push without changing push success semantics.
