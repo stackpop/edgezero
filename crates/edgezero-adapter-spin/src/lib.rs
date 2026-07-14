@@ -111,8 +111,11 @@ pub fn init_logger() -> Result<(), log::SetLoggerError> {
 pub async fn run_app<A: Hooks>(req: SpinRequest) -> anyhow::Result<SpinFullResponse> {
     // Best-effort: every Spin `#[http_service]` re-enters this function, so a
     // second `log::set_logger` call returns Err — drop the result instead of
-    // `.expect()` to avoid panicking on every subsequent request.
-    drop(init_logger());
+    // `.expect()` to avoid panicking on every subsequent request. Skipped
+    // entirely when the app owns logging.
+    if !A::owns_logging() {
+        drop(init_logger());
+    }
     let env = EnvConfig::from_env();
     let stores = A::stores();
     let app = A::build_app();
