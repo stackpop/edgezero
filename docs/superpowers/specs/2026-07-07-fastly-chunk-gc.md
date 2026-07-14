@@ -98,38 +98,30 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 
 ## Invariants (MUST)
 
-1. **Nothing is deleted until the new root pointer is committed.** The pointer
-   write is the cutover: before it lands, the live pointer still references the
-   prior chunks. Deletes run strictly after the commit.
+1. **A cloud push never deletes.** It writes chunks, then the pointer. Any
+   reclamation is a separate, operator-invoked `config gc`.
 
-   (Locally, this is one in-memory `DocumentMut` rewrite followed by the single
-   existing `fs::write` — not a durable atomic rename, but from GC's perspective
-   there is no partial-commit window: the new entries and the removals land in
-   the same rewrite.)
+2. **Nothing is deleted that a live pointer references.** `config gc` computes
+   the live set by parsing every root's pointer. Local prunes only
+   `prior_chunk_keys − new_keep_set`.
 
-2. **The just-superseded generation is NEVER deleted by the push that
-   supersedes it (cloud).** Fastly's config store is eventually consistent: POPs
-   may still be serving the previous pointer. This is unconditional — it holds
-   even with a zero grace window. Local is exempt: one file, no POPs.
+3. **Only canonical, root-scoped keys are delete candidates.** A key must parse
+   as `<root>.__edgezero_chunks.<hex-sha>.<index>`. Deletes target the store's
+   ACTUAL keys — never keys re-derived from a content address.
 
-3. **Only validated, root-scoped keys are ever delete candidates.** A key must
-   parse as `<root>.__edgezero_chunks.<hex-sha>.<index>` for that exact root.
-   Deletes target the store's **actual** keys — never keys re-derived from a
-   content address — so a hand-edited pointer cannot retarget a delete onto keys
-   it never referenced.
+4. **Destructive paths FAIL CLOSED.** If `config gc` cannot classify a root, or
+   cannot read an entry's `created_at`, it aborts and deletes **nothing**. An
+   unreadable state must never fail open into deletion.
 
-4. **A key in the live keep-set is never deleted.** An identical-bytes re-push
-   is therefore a no-op.
+5. **The operator's `--older-than` is the safety assertion.** The machine cannot
+   know when a pointer stopped being served; the operator can. A `--dry-run`
+   prints every key and age it would delete so that assertion is reviewable.
 
-5. **GC failure never fails or blocks the push.** Any read/list/parse/delete
-   failure degrades to a warning; the push still succeeds. Reclamation is
-   **stateless and idempotent**, so a later push simply recomputes and retries.
-   A leaked chunk is harmless; a failed push is not.
+6. **Local eager pruning is safe and stays.** One file, read at Viceroy startup:
+   no propagation window, no POPs.
 
-6. **Cloud reclamation obeys last-writer-wins.** It runs only while a post-commit
-   read-back confirms the root still holds exactly what this push wrote. If a
-   newer push has superseded us, we yield — costing nothing, because there is no
-   state to go stale.
+7. **Push failure semantics are unchanged.** Reclamation is never part of a
+   push, so it can never fail one.
 
 ## Two further invariants (PR #314 review)
 
@@ -150,158 +142,132 @@ error** in both push paths, before any expansion or I/O. (Rejecting beats
 silently coalescing: a duplicated key is a caller bug, and picking a winner would
 hide it.)
 
-## Cloud reclamation: store-derived and grace-gated
+## Cloud reclamation: NOT automatic. `config gc`, invoked by the operator.
 
-> **Design history (PR #314 review).** Two earlier revisions were wrong and are
-> recorded here so the mistakes are not repeated.
+> **This is the single most important section. Three automatic designs were
+> built and each was demolished in review. They are recorded so nobody tries a
+> fourth.**
 >
-> 1. **Eager deletion** (delete the superseded generation right after the
->    commit, guarded by a read-back) is **unsafe**. Fastly Config Store is
->    eventually consistent and the read-back observes only the **control
->    plane**. After we write pointer N, POPs may still serve pointer N-1, which
->    references N-1's chunks. Deleting them immediately strips chunks from those
->    POPs — breaking reads on *every* re-push, not merely under concurrency.
->    Knowing *what* to delete was never the problem; knowing *when* it is safe is.
-> 2. **A metadata sidecar** (record the superseded generation, reclaim it later)
->    is **unsound**. Fastly has no compare-and-swap, so a failed sidecar write, a
->    failed read-back, or a concurrent read-modify-write **permanently loses** a
->    generation, which can never be rediscovered. And the record itself overflows
->    the 8 000-char entry limit at ~71 generations, after which every subsequent
->    generation is silently lost.
+> 1. **Eager delete** (remove the superseded generation right after the commit,
+>    guarded by a read-back) — **unsafe**. The store is eventually consistent and
+>    the read-back only observes the **control plane**. POPs may still be serving
+>    the previous pointer, which references the chunks being deleted. This breaks
+>    reads on *every* re-push, not merely under concurrency.
+> 2. **Metadata sidecar** (record the superseded generation; reclaim it later) —
+>    **unsound**. Fastly has no compare-and-swap, so a failed write, a failed
+>    read-back, or a concurrent push **permanently loses** a generation; and the
+>    record overflows the 8 000-char entry limit at ~71 generations.
+> 3. **Store-derived clock** (`superseded_at(G) = created_at(successor(G))`) —
+>    **unsound**. Chunk creation is not a pointer transition. Counterexample:
+>    chunked **A** → direct **B** → direct **C**. During C, A is the only chunk
+>    generation listed, so it has *no successor* and ages from its own creation —
+>    and is deleted, though B superseded it seconds ago and POPs may still serve
+>    A. Partial pushes and chunk/pointer write gaps break it identically.
 
-The design carries **no metadata at all — the store IS the state.**
+**The impossibility, stated plainly.** To delete a chunk safely you must know
+that *the pointer which referenced it has stopped being served everywhere, for
+longer than the propagation window*. Fastly:
 
-**Verified against the live Fastly API:**
+- **does not record** that fact — `updated_at` is **not** bumped by
+  `update --upsert` (verified against the live API: a root reading `updated_at =
+  2026-07-07` was pointing at chunks created `2026-07-13`);
+- **offers no CAS** with which we could record it ourselves safely;
+- and its chunk `created_at` **is not a proxy** for it (design 3 above).
 
-- `fastly config-store-entry list --store-id=<id> --json` returns, per item,
-  `item_key` and **`created_at`** (also `updated_at`, `store_id`, `item_value`).
-- **The root entry's own `updated_at` is NOT usable.** Fastly does **not** bump
-  it on `update --upsert`. Observed live: a root whose `updated_at` read
-  `2026-07-07` was pointing at chunks created `2026-07-13`. Using it as the
-  supersession clock would conclude the current generation had been stable for
-  six days and reclaim the previous one immediately — the exact unsafe outcome
-  we are trying to avoid.
-- Chunk entries' own `created_at` **is** accurate and monotonic.
+The fact simply is not available to the machine. **It is available to the
+operator**, who knows their own deploy history. So the operator supplies it.
 
-**The supersession clock, derived from the store.** A generation is superseded
-exactly when **the next one is written**. So, ordering generations by
-`created_at`:
+### What a cloud `config push` does
 
-```
-superseded_at(G) = created_at( successor(G) )
-```
+**It reclaims nothing.** It writes chunks, then the pointer. That is all. Cloud
+storage therefore accretes orphaned generations exactly as it does today — this
+is **not a regression**, and it is the only safe automatic behaviour.
 
-with no successor meaning the generation was never referenced by any pointer
-(e.g. a partially-committed push), in which case it ages from its own creation.
-
-**Per root, after the commit:**
+### `config gc` (`Adapter::gc_config_entries`)
 
 ```
-1. LWW read-back: does the root still hold exactly what we wrote?   (else yield)
-2. list the store; group THIS root's actual chunk keys by content address
-   -> generations, each with created_at = max(created_at of its chunks)
-3. protected = keys(N, what we just wrote) ∪ keys(N-1, what we just superseded)
-4. for each generation G, in created_at order:
-       if keys(G) ∩ protected ≠ ∅            -> skip (live, or still at POPs)
-       if now - superseded_at(G) < GRACE     -> skip (inside the grace window)
-       else delete G's ACTUAL keys from the listing
+config gc --adapter fastly [--older-than <dur>] [--dry-run]
 ```
 
-Three properties this buys:
+1. One `config-store-entry list --json`.
+2. Classify every non-chunk entry as a **root**; parse its value with
+   `prior_chunk_keys` → the chunk keys that root's pointer **references**. The
+   union over all roots is the **live** set. (The listing already carries
+   `item_value`, so this costs no extra `describe` calls.)
+3. Candidates = chunk entries **not** in the live set, whose `created_at` is
+   older than `--older-than`.
+4. Delete them.
 
-- **N-1 is always protected**, unconditionally, regardless of the grace window.
-  That is the eventual-consistency guarantee: a POP still serving the previous
-  pointer keeps its chunks.
-- **Deletes target the store's real keys**, never keys re-derived from a content
-  address — so a hand-edited pointer whose SHA and key suffixes disagree can
-  never retarget a delete onto keys the pointer never referenced.
-- **The pre-existing backlog is reclaimed for free.** Orphans leaked before this
-  feature existed are ordinary unreferenced generations; no tracking was needed.
+**`--older-than` is the operator's safety assertion**: *"nothing created before
+this is still being served."* Only they can make it.
 
-**Grace window:** `EDGEZERO_FASTLY_GC_GRACE_SECS`, default **86 400 (24h)**.
-Fastly documents no propagation bound, so the default is deliberately generous;
-operators on a faster cadence can lower it.
+**It fails CLOSED.** If a root's value cannot be classified, or an entry's
+`created_at` cannot be read, `config gc` **aborts and deletes nothing** — an
+unreadable state must never fail open on a destructive path.
 
-**Key-shape validation.** `chunk_key_generation` only recognises
-`<root>.__edgezero_chunks.<hex-sha>.<index>`. A foreign or malformed key is
-never grouped, and therefore never becomes a delete target.
+**A `--dry-run` prints every key it would delete, with its age**, so the
+assertion is reviewable before it is acted on.
 
-**Failure handling.** A failing `list`, a failing read-back, a suspicious prior
-pointer, or a failing delete all degrade to a warning; the push still succeeds
-and a later push simply retries (reclamation is idempotent and stateless — there
-is nothing to lose).
+Only ever `--key` on delete; the subcommand also accepts `-a/--all`, which would
+wipe the store — never construct that flag.
 
-**The LOCAL path prunes eagerly** and that is correct: `fastly.toml` is a single
-file Viceroy reads at startup — no propagation window, no POPs.
+### Local is different, and eager pruning there is correct
 
-## Concurrency model: last-writer-wins
+`fastly.toml` is a single file Viceroy reads at startup: there is no propagation
+window and no POP that could still be serving the previous pointer. The local
+path prunes the prior generation immediately, inside the same rewrite.
 
-The config value is last-writer-wins: the root key is one entry and
-`update --upsert` means the push whose pointer lands last defines the live
-config. Concurrent pushes are supported.
+## Concurrency model
 
-Reclamation only runs while a post-commit read-back confirms the root still
-holds exactly what this push wrote; if a newer push has superseded us, we yield
-and let that push reclaim. Because the design is **stateless**, yielding costs
-nothing — there is no record to go stale, and the next push recomputes
-everything from the store.
+The config value is last-writer-wins: the root is one entry and `update --upsert`
+means the push whose pointer lands last defines the live config. Concurrent
+pushes are supported.
 
-Residual (stated honestly): Fastly exposes no compare-and-delete, so a newer
-push could in principle intervene between our read-back and a delete. The blast
-radius is bounded by the same three gates that govern every delete — the key
-must be unreferenced by the live pointer, not in the just-superseded generation,
-and older than the grace window. GC is a best-effort reclaimer, not a
-transactional one, and a missing chunk surfaces as an integrity error on read
-rather than wrong data.
+Because a push **never deletes**, there is no push-time reclamation race to
+reason about at all. `config gc` is a separate, operator-timed action; it deletes
+only what no live pointer references and what the operator has asserted is old
+enough. Running it concurrently with a push is still the operator's call — the
+`--older-than` assertion is what makes it safe.
 
 ## `prior_chunk_keys` helper (`chunked_config.rs`)
 
-Unchanged from the original design and still load-bearing: it yields the
-just-superseded generation's keys (validated, prefix-scoped to the root) which
-the cloud path adds to `protected`, and which the local path prunes against.
+Load-bearing in both paths: it yields the chunk keys a pointer **references**,
+validated and prefix-scoped to that root.
 
-- `Ok(keys)` — a valid v1 chunk pointer, keys prefix-matched to this root.
+- `Ok(keys)` — a valid v1 chunk pointer.
 - `Ok(vec![])` — a direct `BlobEnvelope`, absent, or not pointer-shaped (silent).
-- `Err(msg)` — pointer-*kind* but invalid (bad version, foreign-prefix key):
-  warn and reclaim nothing for that root.
+- `Err(msg)` — pointer-*kind* but invalid (bad version, foreign-prefix key).
 
 Parsed `serde_json::Value`-first, so a pointer-kind value with missing fields
-reaches the warning path instead of being silently dropped.
+reaches the error path instead of being silently dropped. In `config gc` an
+`Err` here **aborts the whole run** (we cannot know what that root references).
+
+`chunk_key_generation` recognises only the canonical shape
+`<root>.__edgezero_chunks.<hex-sha>.<index>`, so a foreign or hand-edited key is
+never a delete candidate.
 
 ## Algorithm
 
 ```
-# validate first (both paths), before any expansion or I/O
+# validate first (both push paths), before any expansion or I/O
 reject if any logical key contains CHUNK_KEY_INFIX      # reserved namespace
-reject if any logical key appears more than once        # see the duplicate-root invariant
+reject if any logical key appears more than once        # duplicate-root invariant
 
 for each logical (root_key, body):
-    expanded       = prepare_fastly_config_entries(root_key, body)   # this root only
-    new_keys       = { k for (k, _) in expanded }                    # includes root_key
-    new_root_value = value of expanded.last()
+    expanded = prepare_fastly_config_entries(root_key, body)   # this root only
+    new_keys = { k for (k, _) in expanded }                    # includes root_key
 
-# --- cloud ---
-prior_keys = prior_chunk_keys(root, read(root))     # BEFORE the commit
-push expanded                                       # chunks first, pointer last (commit)
-reclaim_orphan_generations(root, new_keys, new_root_value, prior_keys, now, grace)
+# --- cloud push ---
+commit expanded (chunks first, pointer last).  NO deletes.
 
-# --- local ---
-prune orphans (prior_keys - new_keys) inside the same fastly.toml rewrite
+# --- local push ---
+prune (prior_chunk_keys - new_keys) inside the same fastly.toml rewrite
+
+# --- config gc (operator) ---
+list -> live = union of prior_chunk_keys(root, root_value) over all roots
+doomed = chunk entries not in live, older than --older-than
+delete doomed        # fails closed on any unclassifiable/unreadable state
 ```
-
-## Cloud path (`push_config_entries`)
-
-- **Dry-run stays offline** — no store-id resolution, no remote read. It reports
-  reclamation intent without a count (the count depends on the listing).
-- **Pre-commit:** read each root's prior pointer → `prior_keys` (the generation
-  about to be superseded). `Err` → warn, reclaim nothing for that root.
-- **Commit:** unchanged — all roots' physical entries in one committer loop.
-- **Post-commit:** `reclaim_orphan_generations` per root, as specified above.
-- **Delete helper:** `fastly config-store-entry delete --store-id --key
-  --auto-yes`. Only ever `--key`; the subcommand also accepts `-a/--all`, which
-  would wipe the whole store — never construct that flag.
-- **Cost:** one `describe` per root pre-commit, one read-back per root, one
-  `list` per root post-commit, plus one `delete` per reclaimed chunk.
 
 ## Local path (`push_config_entries_local` / `write_fastly_local_config_store`)
 
@@ -383,27 +349,24 @@ in the `cli.rs` test module.
 - A `chunks[].key` outside `"{root_key}.__edgezero_chunks."` → `Err`,
   returns no keys.
 
-### Cloud (`push_config_entries`)
+### Cloud push (`push_config_entries`)
 
-- **Never reclaims the just-superseded generation** — even with `GRACE=0`. This
-  is the eventual-consistency guarantee and the single most important test.
-- **Reclaims an aged orphan generation**: an older generation, superseded before
-  the prior one and past the grace window, IS deleted; the live and
-  just-superseded generations survive.
-- **Retains an orphan inside the grace window**: nothing is deleted.
-- **Yields when the root changed**: a differing read-back → no deletes, warning.
-- **Identical re-push**: the sole generation is both the keep-set and the prior
-  → doubly protected, no deletes.
-- **Shrink-to-direct**: the whole chunk set is orphaned, but the just-superseded
-  generation is still retained.
-- **Suspicious prior pointer** / **prior-read failure** / **listing failure**:
-  warn, delete nothing, push still succeeds.
-- **Delete failure**: warns, push succeeds.
-- **Delete argv**: every delete passes `--key` + `--auto-yes` and **never**
-  `--all` (store-wide wipe).
-- **Dry-run stays offline**: no `list`/`describe`/`delete`, reports intent only.
+- **Never deletes anything** — a push writes chunks + pointer, nothing else.
+- Reserved-key and duplicate-root keys are hard errors before any I/O.
+- Dry-run stays offline (no `list`/`describe`/`delete`).
 - **Payload redaction**: schema-drift stdout *and* failing stderr never echo the
   stored value (sentinel-secret tests on both the read and push paths).
+
+### `config gc` (`gc_config_entries`)
+
+- **Never deletes a live chunk**, however old it is (referenced by a root
+  pointer ⇒ untouchable).
+- **Reclaims unreferenced chunks older than `--older-than`.**
+- **Retains unreferenced chunks younger than `--older-than`.**
+- **Dry-run** names every key + age it would delete, and deletes nothing.
+- **Fails closed on an unreadable `created_at`** — aborts, deletes nothing.
+- **Fails closed on an unclassifiable root** — aborts, deletes nothing.
+- Delete argv passes `--key` + `--auto-yes` and **never** `--all`.
 
 ### Local (`push_config_entries_local` / `write_fastly_local_config_store`)
 
@@ -439,15 +402,10 @@ in the `cli.rs` test module.
 
 ## Non-goals
 
-- **Reclaiming pre-existing leaks.** This sweep only deletes the
-  generation the *current* live pointer references. Chunks orphaned by
-  pushes that predate this feature (or by a prior sweep that partially
-  failed) are not enumerated and not reclaimed. Steady state going
-  forward: each push cleans the immediately-prior generation, so at most
-  one stale generation exists between pushes. A one-time full reclaim
-  (prefix-scan the store and delete unreferenced `__edgezero_chunks`
-  keys) is deferred to a possible future `config gc` command and is out
-  of scope here.
+- **Automatic cloud reclamation.** Out of scope because it is not achievable
+  safely (see "Cloud reclamation"). Cloud orphans — including those that predate
+  this feature — are reclaimed by the operator running `config gc`, which is IN
+  scope and implemented.
 - **Transactional multi-key GC.** Each root key is swept independently;
   there is no cross-key atomicity beyond what each path already
   provides (per-entry for cloud, whole-file for local).

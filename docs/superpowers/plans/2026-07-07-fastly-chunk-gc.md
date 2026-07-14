@@ -3,26 +3,33 @@
 > ## ⚠️ SUPERSEDED — historical build guide, NOT the contract
 >
 > This plan was written against the ORIGINAL design, in which a cloud push
-> **eagerly deleted** the generation it had just superseded. **That design is
-> unsafe and was rejected during the PR #314 review**: Fastly's config store is
-> eventually consistent, so POPs may still be serving the previous pointer and
-> need its chunks.
+> **eagerly deleted** the generation it had just superseded.
 >
-> A second attempt (a metadata "pending record" sidecar) was also rejected — no
-> compare-and-swap means a failed write or a concurrent push permanently loses a
-> generation, and the record overflows the 8 000-char entry limit at ~71
-> generations.
+> **Three automatic cloud designs were built and each was demolished in review:**
 >
-> **The shipped cloud design derives everything from the store itself** (group
-> the store's actual chunk keys into generations; a generation is superseded when
-> the next one is written; reclaim only unreferenced generations that have aged
-> past a grace window; never touch the just-superseded one).
+> 1. **eager delete** — unsafe: the store is eventually consistent, so POPs may
+>    still serve the previous pointer, and the read-back only sees the control plane;
+> 2. **metadata sidecar** — unsound: no compare-and-swap ⇒ lost updates, plus an
+>    8 000-char overflow at ~71 generations;
+> 3. **store-derived clock** — unsound: chunk `created_at` is not a pointer
+>    transition (chunked → direct → direct leaves the old generation with no
+>    "successor" at all).
+>
+> **Conclusion: safe AUTOMATIC cloud reclamation is not achievable with Fastly's
+> primitives.** The needed fact — "the pointer that referenced these chunks has
+> stopped being served everywhere" — is one Fastly does not record and we cannot
+> safely synthesise. Only the operator knows it.
+>
+> **What shipped:** a cloud push reclaims **nothing**; the local path prunes
+> eagerly (safe — one file, no POPs); and reclamation is an explicit, operator-
+> invoked **`config gc --older-than <dur>`** that fails closed and offers a
+> reviewable dry-run.
 >
 > **The authoritative contract is the spec:**
 > `docs/superpowers/specs/2026-07-07-fastly-chunk-gc.md`.
 >
-> Everything below is retained only as a record of how the work was sequenced,
-> and of the two designs that were tried and discarded. Do not implement from it.
+> Everything below is retained only as a record of how the work was sequenced and
+> of the designs that were tried and discarded. Do not implement from it.
 
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
