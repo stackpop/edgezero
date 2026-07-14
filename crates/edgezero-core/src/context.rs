@@ -219,7 +219,7 @@ impl RequestContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::{request_builder, HeaderValue, Method, StatusCode, Uri};
+    use crate::http::{HeaderValue, Method, StatusCode, Uri, request_builder};
     use crate::params::PathParams;
     use crate::proxy::{ProxyClient, ProxyHandle, ProxyRequest, ProxyResponse};
     use async_trait::async_trait;
@@ -290,9 +290,10 @@ mod tests {
         let ctx = ctx("/submit", body, PathParams::default());
         let err = ctx.form::<serde_json::Value>().expect_err("expected error");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        assert!(err
-            .message()
-            .contains("streaming bodies are not supported for form extraction"));
+        assert!(
+            err.message()
+                .contains("streaming bodies are not supported for form extraction")
+        );
     }
 
     #[test]

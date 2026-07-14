@@ -11,12 +11,12 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId,
+    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 use walkdir::WalkDir;
 
@@ -66,15 +66,13 @@ static FASTLY_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_fastly",
         repo_crate: "crates/edgezero-adapter-fastly",
-        fallback:
-            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false }",
+        fallback: "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_fastly_wasm",
         repo_crate: "crates/edgezero-adapter-fastly",
-        fallback:
-            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
+        fallback: "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
         features: &["fastly"],
     },
 ];
@@ -117,8 +115,7 @@ static FASTLY_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     },
 ];
 
-const FASTLY_INSTALL_HINT: &str =
-    "install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again";
+const FASTLY_INSTALL_HINT: &str = "install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again";
 
 struct FastlyCliAdapter;
 
@@ -596,7 +593,7 @@ impl Adapter for FastlyCliAdapter {
         let raw = match fs::read_to_string(&fastly_path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Ok(ReadConfigEntry::MissingStore)
+                return Ok(ReadConfigEntry::MissingStore);
             }
             Err(err) => {
                 return Err(format!("failed to read {}: {err}", fastly_path.display()));
@@ -879,7 +876,7 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
 /// server seeding moved to `config push --local` (config-stores
 /// only), so provision only owns the remote / setup half.
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
-    use toml_edit::{table, DocumentMut, Item};
+    use toml_edit::{DocumentMut, Item, table};
 
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -928,7 +925,7 @@ fn write_fastly_local_config_store(
     platform_name: &str,
     entries: &[(String, String)],
 ) -> Result<(), String> {
-    use toml_edit::{table, DocumentMut, Item, Table, Value};
+    use toml_edit::{DocumentMut, Item, Table, Value, table};
 
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -1391,7 +1388,8 @@ mod tests {
     use super::*;
     use edgezero_adapter::cli_support::read_package_name;
     #[cfg(unix)]
-    use std::ffi::OsString;
+    use edgezero_core::test_env::PathPrepend;
+
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -1405,41 +1403,6 @@ mod tests {
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
-
-    /// RAII guard: prepends a directory to `$PATH` and restores the original
-    /// value on drop.
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new_path = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new_path);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     #[test]
     fn finds_closest_manifest_when_multiple_exist() {

@@ -249,9 +249,8 @@ pub(crate) fn write_batch(
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::env;
-    #[cfg(unix)]
-    use std::ffi::OsString;
+    use edgezero_core::test_env::PathPrepend;
+
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -263,7 +262,7 @@ mod tests {
     #[cfg(unix)]
     use std::sync::{Mutex, OnceLock};
     #[cfg(unix)]
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     #[test]
     fn detect_fermyon_cloud_from_spin_deploy() {
@@ -469,41 +468,6 @@ exit {exit}
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).expect("chmod +x");
         dir
-    }
-
-    /// RAII guard that prepends a temp dir to `$PATH` and restores
-    /// the prior value on drop.
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &StdPath) -> Self {
-            let original = env::var_os("PATH");
-            let new = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
     }
 
     /// A process-wide mutex serialising `PATH`-mutating tests in
