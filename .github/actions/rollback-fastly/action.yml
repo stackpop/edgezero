@@ -59,7 +59,7 @@ runs:
       env:
         EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
         EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
-        EDGEZERO__INPUT__APP_CLI_BIN: ${{ inputs['app-cli-bin'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_TOKEN: ""
         FASTLY_KEY: ""

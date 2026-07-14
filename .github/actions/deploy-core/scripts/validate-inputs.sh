@@ -6,10 +6,28 @@ set -euo pipefail
 # allowlist, and validates booleans. It never learns provider credential names
 # or provider CLI flags — those arrive from the wrapper as opaque data.
 #
-# Inputs (environment): EDGEZERO__INPUT__ADAPTER, EDGEZERO__INPUT__BUILD_MODE, EDGEZERO__INPUT__CACHE,
-# EDGEZERO__INPUT__BUILD_ARGS, EDGEZERO__INPUT__DEPLOY_ARGS, EDGEZERO__INPUT__DEPLOY_ARGS_PREPEND,
-# EDGEZERO__INPUT__DEPLOY_FLAGS, EDGEZERO__INPUT__PROVIDER_ENV_CLEAR, EDGEZERO__INPUT__DEPLOY_ARG_ALLOW,
-# EDGEZERO__RUNNER__OS/ARCH.
+# Reads (env):
+#   EDGEZERO__ADAPTER                     required  adapter token (well-formedness only)
+#   EDGEZERO__RUNNER__OS                  required  runner OS guard (Linux)
+#   EDGEZERO__RUNNER__ARCH                required  runner arch guard (X64)
+#   EDGEZERO__BUILD__MODE                 optional  auto | always | never (default: auto)
+#   EDGEZERO__BUILD__CACHE                optional  true | false (default: false)
+#   EDGEZERO__DEPLOY__STAGE               optional  true | false (default: false)
+#   EDGEZERO__BUILD__ARGS                 optional  JSON string array (default: [])
+#   EDGEZERO__DEPLOY__ARGS                optional  caller JSON string array (default: [])
+#   EDGEZERO__DEPLOY__ARGS_PREPEND        optional  action-owned JSON array, prepended (default: [])
+#   EDGEZERO__DEPLOY__FLAGS               optional  typed JSON string array (default: [])
+#   EDGEZERO__DEPLOY__ARG_ALLOW           optional  space-separated deploy-arg allowlist
+#   EDGEZERO__PROVIDER__ENV_CLEAR         optional  JSON array of alias names to clear (default: [])
+#   EDGEZERO__ACTION__STATE_DIR           optional  where the .nul files are written (default: under RUNNER_TEMP)
+# Writes (outputs):
+#   adapter                               the validated adapter
+#   build-args-file                       NUL-delimited build args
+#   deploy-args-file                      NUL-delimited deploy args (prepend + allowlisted caller)
+#   deploy-flags-file                     NUL-delimited typed deploy flags
+#   provider-env-clear-file               NUL-delimited alias names to clear
+#   requested-build-mode                  the validated build mode
+#   cache                                 the validated cache flag
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -66,11 +84,11 @@ enforce_deploy_arg_allowlist() {
 }
 
 main() {
-  local adapter="${EDGEZERO__INPUT__ADAPTER:-}"
-  local build_mode="${EDGEZERO__INPUT__BUILD_MODE:-auto}"
-  local cache="${EDGEZERO__INPUT__CACHE:-false}"
-  local stage="${EDGEZERO__INPUT__STAGE:-false}"
-  local deploy_arg_allow="${EDGEZERO__INPUT__DEPLOY_ARG_ALLOW:-}"
+  local adapter="${EDGEZERO__ADAPTER:-}"
+  local build_mode="${EDGEZERO__BUILD__MODE:-auto}"
+  local cache="${EDGEZERO__BUILD__CACHE:-false}"
+  local stage="${EDGEZERO__DEPLOY__STAGE:-false}"
+  local deploy_arg_allow="${EDGEZERO__DEPLOY__ARG_ALLOW:-}"
 
   require_supported_runner "${EDGEZERO__RUNNER__OS:-}" "${EDGEZERO__RUNNER__ARCH:-}"
 
@@ -101,10 +119,10 @@ main() {
   local deploy_flags_file="$state_dir/deploy-flags.nul"
   local provider_env_clear_file="$state_dir/provider-env-clear.nul"
 
-  parse_json_string_array "build-args" "${EDGEZERO__INPUT__BUILD_ARGS:-[]}" "$build_args_file"
-  parse_json_string_array "deploy-args" "${EDGEZERO__INPUT__DEPLOY_ARGS:-[]}" "$deploy_args_file"
-  parse_json_string_array "deploy-flags" "${EDGEZERO__INPUT__DEPLOY_FLAGS:-[]}" "$deploy_flags_file"
-  parse_json_string_array "provider-env-clear" "${EDGEZERO__INPUT__PROVIDER_ENV_CLEAR:-[]}" "$provider_env_clear_file"
+  parse_json_string_array "build-args" "${EDGEZERO__BUILD__ARGS:-[]}" "$build_args_file"
+  parse_json_string_array "deploy-args" "${EDGEZERO__DEPLOY__ARGS:-[]}" "$deploy_args_file"
+  parse_json_string_array "deploy-flags" "${EDGEZERO__DEPLOY__FLAGS:-[]}" "$deploy_flags_file"
+  parse_json_string_array "provider-env-clear" "${EDGEZERO__PROVIDER__ENV_CLEAR:-[]}" "$provider_env_clear_file"
 
   # The allowlist governs CALLER deploy-args only.
   enforce_deploy_arg_allowlist "$deploy_args_file" "$deploy_arg_allow"
@@ -117,7 +135,7 @@ main() {
   # deploy could block on a TTY prompt). They go first so a caller arg can still
   # override them where the provider CLI takes last-wins.
   local prepend_file="$state_dir/deploy-args-prepend.nul"
-  parse_json_string_array "deploy-args-prepend" "${EDGEZERO__INPUT__DEPLOY_ARGS_PREPEND:-[]}" "$prepend_file"
+  parse_json_string_array "deploy-args-prepend" "${EDGEZERO__DEPLOY__ARGS_PREPEND:-[]}" "$prepend_file"
   if [[ -s "$prepend_file" ]]; then
     cat "$prepend_file" "$deploy_args_file" >"$deploy_args_file.merged"
     mv "$deploy_args_file.merged" "$deploy_args_file"

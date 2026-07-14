@@ -6,9 +6,26 @@ set -euo pipefail
 # (Cargo.lock hash + target/ cache), so nested-workspace monorepos cache the
 # right artifacts. Provider-neutral: no provider names appear here.
 #
-# Inputs (environment): EDGEZERO__INPUT__WORKING_DIRECTORY, EDGEZERO__INPUT__MANIFEST,
-# EDGEZERO__INPUT__RUST_TOOLCHAIN, EDGEZERO__INPUT__TARGET (required), EDGEZERO__INPUT__BUILD_MODE, EDGEZERO__INPUT__CACHE,
-# EDGEZERO__ACTION__ROOT (required), EDGEZERO__APP__CLI__VERSION.
+# Reads (env):
+#   EDGEZERO__PROJECT__TARGET             required  concrete build target (e.g. wasm32-wasip1)
+#   EDGEZERO__ACTION__ROOT                required  EdgeZero action repo (toolchain fallback)
+#   GITHUB_WORKSPACE                      required  checkout root; the search ceiling
+#   EDGEZERO__PROJECT__WORKING_DIRECTORY  optional  app dir under the workspace (default: ".")
+#   EDGEZERO__PROJECT__MANIFEST           optional  edgezero.toml path, relative to the app dir
+#   EDGEZERO__PROJECT__RUST_TOOLCHAIN     optional  explicit toolchain or "auto" (default: "auto")
+#   EDGEZERO__BUILD__MODE                 optional  auto | always | never (default: auto)
+#   EDGEZERO__BUILD__CACHE                optional  true | false (default: false)
+#   EDGEZERO__APP__CLI__VERSION           optional  folded into the cache key (default: unknown)
+# Writes (outputs):
+#   working-directory                     resolved absolute app directory
+#   working-directory-relative            app directory relative to the workspace
+#   app-git-root                          enclosing Git repository (source revision)
+#   cargo-workspace-root                  Cargo workspace root (Cargo.lock + target/)
+#   source-revision                       Git revision of the app
+#   manifest / manifest-summary           resolved manifest path (and a display form)
+#   rust-toolchain                        resolved toolchain
+#   effective-build-mode                  build mode after auto resolution
+#   cache-key / cache-path                exact cache key and the target/ path it covers
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -86,11 +103,11 @@ assert_committed_source() {
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"
-  local working_directory="${EDGEZERO__INPUT__WORKING_DIRECTORY:-.}"
-  local manifest="${EDGEZERO__INPUT__MANIFEST:-}"
-  local rust_toolchain_input="${EDGEZERO__INPUT__RUST_TOOLCHAIN:-auto}"
-  local target="${EDGEZERO__INPUT__TARGET:?EDGEZERO__INPUT__TARGET is required (wrapper-provided concrete target)}"
-  local cache="${EDGEZERO__INPUT__CACHE:-false}"
+  local working_directory="${EDGEZERO__PROJECT__WORKING_DIRECTORY:-.}"
+  local manifest="${EDGEZERO__PROJECT__MANIFEST:-}"
+  local rust_toolchain_input="${EDGEZERO__PROJECT__RUST_TOOLCHAIN:-auto}"
+  local target="${EDGEZERO__PROJECT__TARGET:?EDGEZERO__PROJECT__TARGET is required (wrapper-provided concrete target)}"
+  local cache="${EDGEZERO__BUILD__CACHE:-false}"
   local cli_version="${EDGEZERO__APP__CLI__VERSION:-unknown}"
 
   require_cmd git
@@ -144,7 +161,7 @@ main() {
 
   local rust_toolchain effective_build_mode cache_key
   rust_toolchain=$(resolve_rust_toolchain "$rust_toolchain_input" "$app_dir" "$git_root" "$action_root")
-  effective_build_mode=$(resolve_effective_build_mode "${EDGEZERO__INPUT__BUILD_MODE:-auto}")
+  effective_build_mode=$(resolve_effective_build_mode "${EDGEZERO__BUILD__MODE:-auto}")
   cache_key="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$rust_toolchain")-$(sanitize_ref "$target")-$(sanitize_ref "$cli_version")-${source_revision}-${lock_hash}"
 
   append_output working-directory "$app_dir"

@@ -65,15 +65,15 @@ run_validate_inputs() {
   local state_dir
   state_dir=$(mktemp -d "$WORK_DIR/validate.XXXXXX")
   env -i PATH="$PATH" \
-    EDGEZERO__INPUT__ADAPTER="${VALIDATE_ADAPTER:-fastly}" \
-    EDGEZERO__INPUT__CACHE="${VALIDATE_CACHE:-false}" \
-    EDGEZERO__INPUT__BUILD_MODE="${VALIDATE_BUILD_MODE:-auto}" \
-    EDGEZERO__INPUT__BUILD_ARGS="${VALIDATE_BUILD_ARGS:-[]}" \
-    EDGEZERO__INPUT__DEPLOY_ARGS="${VALIDATE_DEPLOY_ARGS:-[]}" \
-    EDGEZERO__INPUT__DEPLOY_FLAGS="${VALIDATE_DEPLOY_FLAGS:-[]}" \
-    EDGEZERO__INPUT__PROVIDER_ENV_CLEAR="${VALIDATE_PROVIDER_ENV_CLEAR:-[]}" \
-    EDGEZERO__INPUT__DEPLOY_ARG_ALLOW="${VALIDATE_ALLOW:-}" \
-    EDGEZERO__INPUT__STAGE="${VALIDATE_STAGE:-false}" \
+    EDGEZERO__ADAPTER="${VALIDATE_ADAPTER:-fastly}" \
+    EDGEZERO__BUILD__CACHE="${VALIDATE_CACHE:-false}" \
+    EDGEZERO__BUILD__MODE="${VALIDATE_BUILD_MODE:-auto}" \
+    EDGEZERO__BUILD__ARGS="${VALIDATE_BUILD_ARGS:-[]}" \
+    EDGEZERO__DEPLOY__ARGS="${VALIDATE_DEPLOY_ARGS:-[]}" \
+    EDGEZERO__DEPLOY__FLAGS="${VALIDATE_DEPLOY_FLAGS:-[]}" \
+    EDGEZERO__PROVIDER__ENV_CLEAR="${VALIDATE_PROVIDER_ENV_CLEAR:-[]}" \
+    EDGEZERO__DEPLOY__ARG_ALLOW="${VALIDATE_ALLOW:-}" \
+    EDGEZERO__DEPLOY__STAGE="${VALIDATE_STAGE:-false}" \
     EDGEZERO__ACTION__STATE_DIR="$state_dir" \
     GITHUB_OUTPUT="$state_dir/output.txt" \
     bash "$CORE_SCRIPTS/validate-inputs.sh"
@@ -397,10 +397,10 @@ test_deploy_args_prepend() {
   local state="$WORK_DIR/prepend"
   local out args
   out=$(
-    EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__INPUT__ADAPTER=fastly \
-      EDGEZERO__INPUT__DEPLOY_ARG_ALLOW="--comment" \
-      EDGEZERO__INPUT__DEPLOY_ARGS='["--comment","hi"]' \
-      EDGEZERO__INPUT__DEPLOY_ARGS_PREPEND='["--non-interactive"]' \
+    EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__ADAPTER=fastly \
+      EDGEZERO__DEPLOY__ARG_ALLOW="--comment" \
+      EDGEZERO__DEPLOY__ARGS='["--comment","hi"]' \
+      EDGEZERO__DEPLOY__ARGS_PREPEND='["--non-interactive"]' \
       "$CORE_SCRIPTS/validate-inputs.sh"
   )
   args=$(tr '\0' '\n' <"$state/deploy-args.nul")
@@ -412,9 +412,9 @@ test_deploy_args_prepend() {
 
   # A caller still cannot smuggle it in themselves.
   assert_fails "the caller allowlist still rejects --non-interactive from deploy-args" \
-    env EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__INPUT__ADAPTER=fastly \
-    EDGEZERO__INPUT__DEPLOY_ARG_ALLOW="--comment" \
-    EDGEZERO__INPUT__DEPLOY_ARGS='["--non-interactive"]' \
+    env EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__ADAPTER=fastly \
+    EDGEZERO__DEPLOY__ARG_ALLOW="--comment" \
+    EDGEZERO__DEPLOY__ARGS='["--non-interactive"]' \
     "$CORE_SCRIPTS/validate-inputs.sh"
 }
 

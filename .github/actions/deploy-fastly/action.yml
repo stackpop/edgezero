@@ -62,21 +62,21 @@ runs:
       id: validate
       shell: bash
       env:
-        EDGEZERO__INPUT__ADAPTER: fastly
-        EDGEZERO__INPUT__BUILD_MODE: ${{ inputs['build-mode'] }}
-        EDGEZERO__INPUT__CACHE: ${{ inputs.cache }}
-        EDGEZERO__INPUT__BUILD_ARGS: ${{ inputs['build-args'] }}
-        EDGEZERO__INPUT__DEPLOY_ARGS: ${{ inputs['deploy-args'] }}
-        EDGEZERO__INPUT__DEPLOY_ARG_ALLOW: "--comment"
+        EDGEZERO__ADAPTER: fastly
+        EDGEZERO__BUILD__MODE: ${{ inputs['build-mode'] }}
+        EDGEZERO__BUILD__CACHE: ${{ inputs.cache }}
+        EDGEZERO__BUILD__ARGS: ${{ inputs['build-args'] }}
+        EDGEZERO__DEPLOY__ARGS: ${{ inputs['deploy-args'] }}
+        EDGEZERO__DEPLOY__ARG_ALLOW: "--comment"
         # Action-owned (not caller input, not allowlist-checked): keeps a
         # manifest-command deploy from blocking on a TTY prompt in CI. The
         # built-in Fastly deploy path de-duplicates it.
-        EDGEZERO__INPUT__DEPLOY_ARGS_PREPEND: '["--non-interactive"]'
-        EDGEZERO__INPUT__STAGE: ${{ inputs.stage }}
-        EDGEZERO__INPUT__DEPLOY_FLAGS: ${{ inputs.stage == 'true' && format('["--service-id","{0}","--stage"]', inputs['fastly-service-id']) || format('["--service-id","{0}"]', inputs['fastly-service-id']) }}
-        EDGEZERO__INPUT__PROVIDER_ENV_CLEAR: '["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_HOME"]'
-        EDGEZERO__INPUT__FASTLY_API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
-        EDGEZERO__INPUT__FASTLY_SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        EDGEZERO__DEPLOY__ARGS_PREPEND: '["--non-interactive"]'
+        EDGEZERO__DEPLOY__STAGE: ${{ inputs.stage }}
+        EDGEZERO__DEPLOY__FLAGS: ${{ inputs.stage == 'true' && format('["--service-id","{0}","--stage"]', inputs['fastly-service-id']) || format('["--service-id","{0}"]', inputs['fastly-service-id']) }}
+        EDGEZERO__PROVIDER__ENV_CLEAR: '["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_HOME"]'
+        EDGEZERO__FASTLY__API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
+        EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         EDGEZERO__RUNNER__OS: ${{ runner.os }}
         EDGEZERO__RUNNER__ARCH: ${{ runner.arch }}
         EDGEZERO__ACTION__STATE_DIR: ${{ runner.temp }}/edgezero-deploy-state
@@ -96,9 +96,9 @@ runs:
         FASTLY_CONFIG_FILE: ""
         FASTLY_HOME: ""
       run: |
-        [[ "${EDGEZERO__INPUT__FASTLY_API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
-        [[ -n "${EDGEZERO__INPUT__FASTLY_SERVICE_ID}" ]] || { echo "::error::missing required input 'fastly-service-id'"; exit 1; }
-        [[ "${EDGEZERO__INPUT__FASTLY_SERVICE_ID}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::input 'fastly-service-id' must match ^[A-Za-z0-9_-]+$"; exit 1; }
+        [[ "${EDGEZERO__FASTLY__API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
+        [[ -n "${EDGEZERO__FASTLY__SERVICE_ID}" ]] || { echo "::error::missing required input 'fastly-service-id'"; exit 1; }
+        [[ "${EDGEZERO__FASTLY__SERVICE_ID}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::input 'fastly-service-id' must match ^[A-Za-z0-9_-]+$"; exit 1; }
         # validate-inputs.sh also rejects a non-boolean 'stage' before any deploy.
         "$GITHUB_ACTION_PATH/../deploy-core/scripts/validate-inputs.sh"
 
@@ -130,7 +130,7 @@ runs:
       env:
         EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
         EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
-        EDGEZERO__INPUT__APP_CLI_BIN: ${{ inputs['app-cli-bin'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
@@ -154,12 +154,12 @@ runs:
       env:
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
         EDGEZERO__APP__CLI__VERSION: ${{ steps.cli.outputs['app-cli-version'] }}
-        EDGEZERO__INPUT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
-        EDGEZERO__INPUT__MANIFEST: ${{ inputs.manifest }}
-        EDGEZERO__INPUT__RUST_TOOLCHAIN: auto
-        EDGEZERO__INPUT__TARGET: wasm32-wasip1
-        EDGEZERO__INPUT__BUILD_MODE: ${{ inputs['build-mode'] }}
-        EDGEZERO__INPUT__CACHE: ${{ inputs.cache }}
+        EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        EDGEZERO__PROJECT__MANIFEST: ${{ inputs.manifest }}
+        EDGEZERO__PROJECT__RUST_TOOLCHAIN: auto
+        EDGEZERO__PROJECT__TARGET: wasm32-wasip1
+        EDGEZERO__BUILD__MODE: ${{ inputs['build-mode'] }}
+        EDGEZERO__BUILD__CACHE: ${{ inputs.cache }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""

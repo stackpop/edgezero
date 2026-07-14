@@ -7,8 +7,20 @@ set -euo pipefail
 # prove the deployment is healthy must exit non-zero: a non-zero CLI, a
 # `healthy=false` verdict, and — critically — no verdict at all.
 #
-# Inputs (environment): EDGEZERO__APP__CLI__BIN, EDGEZERO__LIFECYCLE__SERVICE_ID, EDGEZERO__LIFECYCLE__VERSION, EDGEZERO__LIFECYCLE__DOMAIN, EDGEZERO__DEPLOY__TO, EDGEZERO__LIFECYCLE__RETRY,
-# EDGEZERO__LIFECYCLE__RETRY_DELAY, EDGEZERO__LIFECYCLE__TIMEOUT, FASTLY_API_TOKEN.
+# Reads (env):
+#   EDGEZERO__APP__CLI__BIN               required  app CLI binary to invoke
+#   EDGEZERO__LIFECYCLE__SERVICE_ID       required  Fastly service id
+#   EDGEZERO__LIFECYCLE__VERSION          required  version to probe
+#   EDGEZERO__LIFECYCLE__DOMAIN           required  domain to probe
+#   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
+#   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
+#   EDGEZERO__LIFECYCLE__RETRY            optional  attempts before unhealthy (default: 3)
+#   EDGEZERO__LIFECYCLE__RETRY_DELAY      optional  seconds between attempts (default: 5)
+#   EDGEZERO__LIFECYCLE__TIMEOUT          optional  per-attempt timeout seconds (default: 10)
+# Writes (outputs):
+#   healthy                               true | false
+#   status-code                           last HTTP status observed
+# Exits non-zero when the deployment is not provably healthy (the rollback gate).
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../deploy-core/scripts/common.sh

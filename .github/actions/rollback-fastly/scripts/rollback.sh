@@ -7,8 +7,14 @@ set -euo pipefail
 # Fails closed: a rollback that cannot say what it activated has not provably
 # rolled anything back.
 #
-# Inputs (environment): EDGEZERO__APP__CLI__BIN, EDGEZERO__LIFECYCLE__SERVICE_ID, EDGEZERO__LIFECYCLE__VERSION, EDGEZERO__DEPLOY__TO,
-# FASTLY_API_TOKEN.
+# Reads (env):
+#   EDGEZERO__APP__CLI__BIN               required  app CLI binary to invoke
+#   EDGEZERO__LIFECYCLE__SERVICE_ID       required  Fastly service id
+#   EDGEZERO__LIFECYCLE__VERSION          required  the current (bad) version to roll back from
+#   FASTLY_API_TOKEN                      required  provider token (Fastly's own convention)
+#   EDGEZERO__DEPLOY__TO                  optional  production | staging (default: production)
+# Writes (outputs):
+#   rolled-back-to                        the activated version (production only)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../deploy-core/scripts/common.sh

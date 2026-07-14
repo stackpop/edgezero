@@ -44,11 +44,11 @@ runs:
       shell: bash
       env:
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
-        EDGEZERO__INPUT__APP_CLI_PACKAGE: ${{ inputs['app-cli-package'] }}
-        EDGEZERO__INPUT__APP_CLI_BIN: ${{ inputs['app-cli-bin'] }}
-        EDGEZERO__INPUT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
-        EDGEZERO__INPUT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
-        EDGEZERO__INPUT__APP_CLI_ARTIFACT: ${{ inputs['app-cli-artifact'] }}
+        EDGEZERO__APP__CLI__PACKAGE: ${{ inputs['app-cli-package'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
+        EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        EDGEZERO__PROJECT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
+        EDGEZERO__APP__CLI__ARTIFACT: ${{ inputs['app-cli-artifact'] }}
       run: $GITHUB_ACTION_PATH/scripts/build-app-cli.sh
 
     - name: Upload CLI artifact

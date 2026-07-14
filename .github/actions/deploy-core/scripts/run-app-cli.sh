@@ -15,16 +15,20 @@ set -euo pipefail
 # that are declared in the clear list. So inherited endpoint/token aliases can
 # never survive into the deploy. Build mode is credential-free and only clears.
 #
-# Inputs (environment):
-#   EDGEZERO__APP__CLI__BIN                   required binary name to invoke (on PATH)
-#   EDGEZERO__ADAPTER                    required adapter passed as --adapter
-#   EDGEZERO__PROJECT__WORKING_DIRECTORY required directory to run the CLI from
-#   EDGEZERO__PROJECT__MANIFEST_PATH     optional exported as EDGEZERO_MANIFEST when set
-#   EDGEZERO__BUILD__ARGS_FILE           optional NUL-delimited build passthrough (build)
-#   EDGEZERO__DEPLOY__FLAGS_FILE         optional NUL-delimited typed flags     (deploy)
-#   EDGEZERO__DEPLOY__ARGS_FILE          optional NUL-delimited passthrough     (deploy)
-#   EDGEZERO__PROVIDER__ENV_CLEAR_FILE   optional NUL-delimited env names to clear
-#   EDGEZERO__PROVIDER__ENV              optional JSON object of typed creds     (deploy)
+# Reads (env):
+#   EDGEZERO__APP__CLI__BIN               required  binary name to invoke (on PATH)
+#   EDGEZERO__ADAPTER                     required  adapter passed as --adapter
+#   EDGEZERO__PROJECT__WORKING_DIRECTORY  required  directory to run the CLI from
+#   EDGEZERO__PROJECT__MANIFEST_PATH      optional  exported as EDGEZERO_MANIFEST when set
+#   EDGEZERO__BUILD__ARGS_FILE            optional  NUL-delimited build passthrough (build)
+#   EDGEZERO__DEPLOY__FLAGS_FILE          optional  NUL-delimited typed flags (deploy)
+#   EDGEZERO__DEPLOY__ARGS_FILE           optional  NUL-delimited passthrough (deploy)
+#   EDGEZERO__PROVIDER__ENV_CLEAR_FILE    optional  NUL-delimited alias names to clear
+#   EDGEZERO__PROVIDER__ENV               optional  JSON object of typed creds (deploy)
+# Writes:
+#   nothing — execs the app CLI, which owns stdout/stderr and the exit status.
+#   EDGEZERO_MANIFEST is exported to the CLI; the whole EDGEZERO__* namespace is
+#   scrubbed first (see scrub_action_private_env).
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh

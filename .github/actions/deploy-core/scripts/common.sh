@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Sourced helper library for the deploy engine and adapter wrappers. Defines the
+# shared shell helpers (annotations, output/env writers, input guards, lifecycle
+# log and version-parse helpers, tar and cli-bin safety checks). It is never
+# executed directly and reads no environment of its own; callers source it right
+# after their own strict-mode preamble.
+
 escape_annotation() {
   local value="$*"
   value=${value//%/%25}

@@ -11,8 +11,12 @@ set -euo pipefail
 # `$EDGEZERO_FASTLY_HOME`, a variable nothing in the action ever set: its value
 # could only ever come from the caller's environment.)
 #
-# Inputs (environment): RUNNER_TEMP, EDGEZERO__ACTION__STATE_DIR,
-# EDGEZERO__ACTION__TOOL_ROOT.
+# Reads (env):
+#   RUNNER_TEMP                           required  the only root anything may be removed beneath
+#   EDGEZERO__ACTION__STATE_DIR           optional  action-owned state dir to remove
+#   EDGEZERO__ACTION__TOOL_ROOT           optional  action-owned tool install to remove
+# Writes:
+#   nothing — removes action-owned dirs; emits no outputs.
 
 remove_owned_dir() {
   local dir="$1" temp_root="$2"

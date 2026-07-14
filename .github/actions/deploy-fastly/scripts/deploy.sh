@@ -11,8 +11,12 @@ set -euo pipefail
 # CLI. Building the JSON here, from step `env:`, is also what keeps the secret out
 # of an interpolated `run:` block.
 #
-# Inputs (environment): EDGEZERO__FASTLY__API_TOKEN,
-# EDGEZERO__FASTLY__SERVICE_ID, plus the run-app-cli.sh contract.
+# Reads (env):
+#   EDGEZERO__FASTLY__API_TOKEN           required  typed Fastly API token
+#   EDGEZERO__FASTLY__SERVICE_ID          required  typed Fastly service id
+#   (plus the run-app-cli.sh Reads contract, which this delegates to)
+# Writes (outputs):
+#   fastly-version                        the deployed/staged Fastly version
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../deploy-core/scripts/common.sh

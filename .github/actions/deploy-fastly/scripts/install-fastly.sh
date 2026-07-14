@@ -5,9 +5,14 @@ set -euo pipefail
 # checksum, into an action-owned dir on PATH. This is the Fastly wrapper's
 # provider-tool responsibility; the provider-neutral engine never installs it.
 #
-# Inputs (environment):
-#   EDGEZERO__ACTION__ROOT               optional repo root holding .tool-versions (defaults up)
-#   EDGEZERO__FASTLY__VERSIONS_JSON      optional pinned metadata (defaults alongside this dir)
+# Reads (env):
+#   EDGEZERO__ACTION__ROOT                optional  repo root holding .tool-versions (default: walk up)
+#   EDGEZERO__FASTLY__VERSIONS_JSON       optional  pinned metadata (default: alongside this dir)
+#   EDGEZERO__ACTION__TOOL_ROOT           optional  install dir (default: under RUNNER_TEMP)
+# Writes (outputs):
+#   provider-cli-version                  the installed Fastly CLI version
+# Writes (PATH):
+#   the tool root's bin/, so `fastly` is callable
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh

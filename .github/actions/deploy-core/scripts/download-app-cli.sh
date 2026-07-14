@@ -4,12 +4,19 @@ set -euo pipefail
 # Extracts the build-app-cli artifact tar (downloaded by actions/download-artifact)
 # into an action-owned tool dir, preserving the executable bit, reads the
 # self-describing app-cli-meta.json, and prepends the dir to PATH for action steps.
-# A wrapper-supplied EDGEZERO__INPUT__APP_CLI_BIN overrides the metadata's binary name.
+# A wrapper-supplied EDGEZERO__APP__CLI__BIN overrides the metadata's binary name.
 #
-# Inputs (environment):
-#   EDGEZERO__APP__CLI__ARTIFACT_DIR          required dir containing the downloaded tar
-#   EDGEZERO__INPUT__APP_CLI_BIN             optional override for the binary name
-#   EDGEZERO__ACTION__TOOL_ROOT          optional install dir (defaults under RUNNER_TEMP)
+# Reads (env):
+#   EDGEZERO__APP__CLI__ARTIFACT_DIR      required  dir containing the downloaded tar
+#   EDGEZERO__APP__CLI__BIN               optional  override for the binary name
+#   EDGEZERO__ACTION__TOOL_ROOT           optional  install dir (default: under RUNNER_TEMP)
+# Writes (outputs):
+#   app-cli-bin                           resolved binary name
+#   app-cli-version                       version from app-cli-meta.json
+# Writes (env):
+#   EDGEZERO__ACTION__TOOL_ROOT           the install dir (for later steps + cleanup)
+# Writes (PATH):
+#   the install dir's bin/, so the app CLI is callable by name
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -23,7 +30,7 @@ find_cli_tarball() {
 
 main() {
   local artifact_dir="${EDGEZERO__APP__CLI__ARTIFACT_DIR:?EDGEZERO__APP__CLI__ARTIFACT_DIR is required}"
-  local cli_bin_override="${EDGEZERO__INPUT__APP_CLI_BIN:-}"
+  local cli_bin_override="${EDGEZERO__APP__CLI__BIN:-}"
   local tool_root="${EDGEZERO__ACTION__TOOL_ROOT:-${RUNNER_TEMP:-/tmp}/edgezero-action-tools}"
 
   require_cmd jq

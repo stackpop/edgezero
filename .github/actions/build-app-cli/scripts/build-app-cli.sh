@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compiles the CLI package the *application* provides (a crate in the app's own
-# workspace, named by EDGEZERO__INPUT__APP_CLI_PACKAGE) into an action-owned CARGO_TARGET_DIR,
-# then packages the binary plus a self-describing app-cli-meta.json into a tar so the
-# executable bit survives actions/upload-artifact. Never builds the EdgeZero
-# monorepo CLI.
+# Compiles the CLI package the APPLICATION provides — a crate in the app's own
+# workspace — into an action-owned CARGO_TARGET_DIR, then packages the binary
+# plus a self-describing app-cli-meta.json into a tar so the executable bit
+# survives actions/upload-artifact. Never builds the EdgeZero monorepo CLI.
 #
-# Inputs (environment):
-#   EDGEZERO__INPUT__APP_CLI_PACKAGE         required Cargo package name to build
-#   EDGEZERO__INPUT__APP_CLI_BIN             optional binary name (defaults to the package name)
-#   EDGEZERO__INPUT__WORKING_DIRECTORY   optional app dir relative to github.workspace (".")
-#   EDGEZERO__INPUT__RUST_TOOLCHAIN      optional explicit toolchain or "auto"
-#   EDGEZERO__INPUT__APP_CLI_ARTIFACT       optional uploaded artifact name ("edgezero-cli")
+# Reads (env):
+#   EDGEZERO__APP__CLI__PACKAGE           required  Cargo package name to build
+#   EDGEZERO__ACTION__ROOT                required  EdgeZero action repo (toolchain fallback)
+#   GITHUB_WORKSPACE                      required  checkout root; the search ceiling
+#   EDGEZERO__APP__CLI__BIN               optional  binary name (default: the package name)
+#   EDGEZERO__PROJECT__WORKING_DIRECTORY  optional  app dir under the workspace (default: ".")
+#   EDGEZERO__PROJECT__RUST_TOOLCHAIN     optional  explicit toolchain or "auto" (default: "auto")
+#   EDGEZERO__APP__CLI__ARTIFACT          optional  uploaded artifact name (default: "edgezero-cli")
+#   RUNNER_TEMP                           optional  action-owned scratch root (default: /tmp)
+# Writes (outputs):
+#   app-cli-package                       the package that was built
+#   app-cli-bin                           the binary name inside the artifact
+#   app-cli-version                       version from cargo metadata
+#   app-cli-artifact                      uploaded artifact name for downstream download
+#   tarball-path                          absolute path of the staged tar
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -125,11 +133,11 @@ require_linux_x86_64() {
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"
-  local cli_package="${EDGEZERO__INPUT__APP_CLI_PACKAGE:?input 'app-cli-package' is required}"
-  local cli_bin="${EDGEZERO__INPUT__APP_CLI_BIN:-}"
-  local working_directory="${EDGEZERO__INPUT__WORKING_DIRECTORY:-.}"
-  local rust_toolchain_input="${EDGEZERO__INPUT__RUST_TOOLCHAIN:-auto}"
-  local artifact_name="${EDGEZERO__INPUT__APP_CLI_ARTIFACT:-edgezero-cli}"
+  local cli_package="${EDGEZERO__APP__CLI__PACKAGE:?input 'app-cli-package' is required}"
+  local cli_bin="${EDGEZERO__APP__CLI__BIN:-}"
+  local working_directory="${EDGEZERO__PROJECT__WORKING_DIRECTORY:-.}"
+  local rust_toolchain_input="${EDGEZERO__PROJECT__RUST_TOOLCHAIN:-auto}"
+  local artifact_name="${EDGEZERO__APP__CLI__ARTIFACT:-edgezero-cli}"
 
   # These directories are `rm -rf`d below, so they must NEVER come from the
   # inherited environment — a colliding job-level variable could otherwise point

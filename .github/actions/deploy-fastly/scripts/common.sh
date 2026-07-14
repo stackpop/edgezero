@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Sourced helper library for the Fastly wrapper. Defines the shared shell helpers
+# (annotations, output/env writers, version pinning and checksum helpers). It is
+# never executed directly and reads no environment of its own; callers source it
+# right after their own strict-mode preamble.
+
 escape_annotation() {
   local value="$*"
   value=${value//%/%25}
