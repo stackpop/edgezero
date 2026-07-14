@@ -16,6 +16,13 @@ resolver = "2"
 authors = ["EdgeZero Team <dev@edgezero.dev>"]
 edition = "2024"
 license = "Apache-2.0"
+# Nothing in CI publishes these crates, so `false` guards against an accidental
+# `cargo publish`. Flipping this to `true` is necessary but not sufficient to
+# release: the internal `edgezero-*` deps are path-only (crates.io requires a
+# `version` on every dependency), and `edgezero-cli`'s optional `demo-example`
+# feature depends on `app-demo-core`, which lives in the excluded
+# `examples/app-demo` workspace and is not published at all. Both need resolving
+# before the first release.
 publish = false
 version = "0.1.0"
 

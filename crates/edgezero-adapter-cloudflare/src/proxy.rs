@@ -93,12 +93,12 @@ fn convert_response(cf_response: &mut CfResponse) -> Result<ProxyResponse, EdgeE
         if name.eq_ignore_ascii_case(header::CONTENT_ENCODING.as_str()) {
             encoding = Some(value.to_ascii_lowercase());
         }
-        if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) {
-            if let Ok(header_value) = HeaderValue::from_str(&value) {
-                proxy_response
-                    .headers_mut()
-                    .insert(header_name, header_value);
-            }
+        if let Ok(header_name) = HeaderName::from_bytes(name.as_bytes())
+            && let Ok(header_value) = HeaderValue::from_str(&value)
+        {
+            proxy_response
+                .headers_mut()
+                .insert(header_name, header_value);
         }
     }
 
