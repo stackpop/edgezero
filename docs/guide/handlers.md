@@ -214,6 +214,93 @@ async fn inspect(ctx: RequestContext) -> Result<Text<String>, EdgeError> {
 | `into_request()` | `Request` - consume context, take request  |
 | `proxy_handle()` | `Option<ProxyHandle>` - adapter proxy hook |
 
+## Sharing app state
+
+Request-derived extractors (`Json`, `Query`, `Path`, …) cover per-request data.
+For app-owned state that outlives a single request — a settings object, a
+connection registry, an orchestrator — register it once on the router and read
+it back with the `State<T>` extractor.
+
+Register the value with `RouterBuilder::with_state`. It is cloned into every
+request's extensions before dispatch, so `T` must be `Clone + Send + Sync +
+'static` — typically an `Arc<AppState>`, where the clone is a cheap refcount
+bump:
+
+```rust
+use std::sync::Arc;
+use edgezero_core::extractor::State;
+use edgezero_core::router::RouterService;
+
+#[derive(Clone)]
+struct AppState {
+    greeting: String,
+}
+
+let state = Arc::new(AppState { greeting: "hello".into() });
+
+let service = RouterService::builder()
+    .with_state(Arc::clone(&state))
+    .get("/greet", greet)
+    .build();
+```
+
+Read it in any `#[action]` handler by adding a `State<T>` argument — it composes
+with the other extractors:
+
+```rust
+use edgezero_core::action;
+use edgezero_core::error::EdgeError;
+use edgezero_core::extractor::State;
+use std::sync::Arc;
+
+#[action]
+async fn greet(
+    State(state): State<Arc<AppState>>,
+) -> Result<String, EdgeError> {
+    Ok(state.greeting.clone())
+}
+```
+
+Register different types independently (`with_state(a).with_state(b)`); each is
+resolved by its own type. Registering the same `T` twice is last-write-wins. If
+a handler asks for a `State<T>` that was never registered, extraction fails with
+a `500` — register it before `build()`.
+
+### With the `app!` macro
+
+If your app is fully macro-driven (`app!("edgezero.toml")` builds the router from
+the manifest), you don't hand-write `RouterBuilder::with_state`. Instead pass a
+`state` argument — the macro emits `.with_state(<expr>)` into the generated
+router:
+
+```rust
+// lib.rs
+use std::sync::{Arc, OnceLock};
+
+pub struct AppState { /* settings, registries, orchestrator, … */ }
+
+pub fn app_state() -> Arc<AppState> {
+    static STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+    Arc::clone(STATE.get_or_init(|| Arc::new(AppState { /* … */ })))
+}
+
+edgezero_core::app!("edgezero.toml", state = crate::app_state());
+```
+
+`state = <expr>` is any expression evaluating to the state value — write the call
+(`crate::app_state()`), not a bare function path. Handlers then extract
+`State<Arc<AppState>>` exactly as above. Only **one** `state = <expr>` is
+allowed per `app!` — to share more than one value, wrap them in an aggregate
+app-state struct and register that.
+
+> **Make `app_state()` cheap.** The macro emits the `state` expression inside the
+> generated `build_router()`, which each adapter's `run_app` calls through
+> `A::build_app()` — **once at startup** for long-lived runtimes (Axum), but
+> **once per request** on Fastly Compute (each request is a fresh Wasm instance).
+> So the `state` expression runs on that cadence: build heavy state **once** and
+> hand out clones (e.g. a `OnceLock<Arc<AppState>>` as above, or a `static`), and
+> let `T = Arc<AppState>` so each call is just a refcount bump. Do **not** `Arc::new(HeavyThing::build())` directly in the `state` expression.
+
 ## Response Types
 
 ### Text Responses

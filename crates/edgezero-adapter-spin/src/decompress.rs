@@ -73,8 +73,8 @@ pub(crate) fn decompress_body(body: Vec<u8>, encoding: Option<&str>) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write as _;
 
     #[test]

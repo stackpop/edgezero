@@ -13,8 +13,13 @@
 //! can share the harness without each duplicating the BASIC /
 //! PROVISION manifest fixtures.
 
-use std::env;
 use std::sync::{Mutex, OnceLock};
+
+/// RAII guard that overrides a process-global env var for the duration of a
+/// test and restores the prior value on drop. Acquire [`manifest_guard`] BEFORE
+/// constructing one, and hold it for the guard's lifetime — that is the safety
+/// contract documented on `edgezero_core::test_env`.
+pub(crate) use edgezero_core::test_env::EnvOverride;
 
 /// `provision` dispatch fixture: declares axum + fastly +
 /// cloudflare + spin (every adapter the build registers), with
@@ -93,46 +98,6 @@ auth-login = "echo logged in"
 auth-logout = "echo logged out"
 auth-status = "echo whoami"
 "#;
-
-/// RAII guard that sets a process-global env var for the duration
-/// of a test and restores the prior value (or removes it) on drop.
-/// Use together with [`manifest_guard`] when overriding
-/// `EDGEZERO_MANIFEST` so concurrent tests don't observe the
-/// override.
-pub(crate) struct EnvOverride {
-    key: &'static str,
-    original: Option<String>,
-}
-
-impl Drop for EnvOverride {
-    fn drop(&mut self) {
-        if let Some(original) = &self.original {
-            env::set_var(self.key, original);
-        } else {
-            env::remove_var(self.key);
-        }
-    }
-}
-
-impl EnvOverride {
-    /// Remove the env var (if set) for the duration of the test
-    /// scope, capturing the prior value so drop can restore it.
-    /// Use when a test needs the "no override" code path but the
-    /// parent shell may have exported a value.
-    pub(crate) fn remove(key: &'static str) -> Self {
-        let original = env::var(key).ok();
-        env::remove_var(key);
-        Self { key, original }
-    }
-
-    /// Set the env var to `value` for the duration of the test
-    /// scope, capturing the prior value so drop can restore it.
-    pub(crate) fn set(key: &'static str, value: &str) -> Self {
-        let original = env::var(key).ok();
-        env::set_var(key, value);
-        Self { key, original }
-    }
-}
 
 /// Process-wide mutex serialising tests that mutate `EDGEZERO_MANIFEST`
 /// or otherwise observe global adapter-registry state. Acquire it

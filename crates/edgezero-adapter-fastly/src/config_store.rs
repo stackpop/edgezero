@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use crate::chunked_config::resolve_fastly_config_value;
 use async_trait::async_trait;
 use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
-use fastly::config_store::{LookupError, OpenError};
 use fastly::ConfigStore as FastlyConfigStoreInner;
+use fastly::config_store::{LookupError, OpenError};
 
 /// Config store backed by a Fastly Config Store resource link.
 pub struct FastlyConfigStore {
@@ -76,18 +76,18 @@ impl ConfigStore for FastlyConfigStore {
         // transient unavailable. Mapping to `internal` surfaces as HTTP
         // 500 and pushes operators toward `<app-cli> config push` instead
         // of waiting for a 503 to clear.
-        let resolved =
-            resolve_fastly_config_value(key, value, |chunk_key| self.get_sync(chunk_key)).map_err(
-                |err| {
-                    log::warn!(
-                        "Fastly config-store chunk resolution failed for `{key}`: {err}. \
+        let resolved = resolve_fastly_config_value(key, value, |chunk_key| {
+            self.get_sync(chunk_key)
+        })
+        .map_err(|err| {
+            log::warn!(
+                "Fastly config-store chunk resolution failed for `{key}`: {err}. \
                      Re-run `<app-cli> config push` to repair the store."
-                    );
-                    ConfigStoreError::internal(anyhow::anyhow!(
+            );
+            ConfigStoreError::internal(anyhow::anyhow!(
                 "config store entry is corrupt or incomplete; re-run config push to repair: {err}"
             ))
-                },
-            )?;
+        })?;
         Ok(Some(resolved))
     }
 }

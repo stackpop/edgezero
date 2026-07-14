@@ -16,17 +16,17 @@ mod secret_store_compile_check {
 mod tests {
     use bytes::Bytes;
     use edgezero_adapter_fastly::context::FastlyRequestContext;
-    use edgezero_adapter_fastly::request::{into_core_request, FastlyService};
+    use edgezero_adapter_fastly::request::{FastlyService, into_core_request};
     use edgezero_adapter_fastly::response::from_core_response;
     use edgezero_core::app::App;
     use edgezero_core::body::Body;
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{response_builder, Method, Response, StatusCode};
+    use edgezero_core::http::{Method, Response, StatusCode, response_builder};
     use edgezero_core::router::RouterService;
-    use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
     use fastly::Request as FastlyRequest;
+    use fastly::http::{Method as FastlyMethod, StatusCode as FastlyStatus};
     use futures::stream;
     use std::sync::Arc;
 

@@ -56,13 +56,14 @@ use std::string::ToString;
 use proc_macro2::{Ident, Span};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
-use syn::{visit, GenericArgument, PathArguments, Token, Type};
+use syn::{GenericArgument, PathArguments, Token, Type, visit};
 use walkdir::WalkDir;
 
 // ---------------------------------------------------------------------------
 // Pass 1: collect struct identifiers that derive AppConfig
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct AppConfigStructCollector {
     app_config_structs: HashSet<String>,
 }
@@ -166,6 +167,9 @@ impl<'ast> Visit<'ast> for NestedAppConfigVisitor<'_, '_> {
             if let Some(inner_name) =
                 type_contains_app_config_struct(&field.ty, self.app_config_structs)
             {
+                if field_has_nested_optin(field) {
+                    continue; // opted in via #[app_config(nested)] — allowed
+                }
                 let span = field
                     .ident
                     .as_ref()
@@ -175,6 +179,33 @@ impl<'ast> Visit<'ast> for NestedAppConfigVisitor<'_, '_> {
         }
         visit::visit_item_struct(self, i);
     }
+}
+
+/// Returns `true` only for a well-formed `#[app_config(nested)]`. A malformed
+/// `#[app_config(...)]` returns `false` -> the field is treated as NOT opted
+/// in, so the guard still FLAGS the nesting (loud CI failure) rather than
+/// silently waving it through. This is safe here (unlike the derive's
+/// `nested_optin`, which must hard-error): the guard runs only over
+/// already-compiling code, and the derive's strict `nested_optin` has already
+/// rejected any malformed `#[app_config(...)]` before this binary ever runs.
+fn field_has_nested_optin(field: &syn::Field) -> bool {
+    field.attrs.iter().any(|attr| {
+        if !attr.path().is_ident("app_config") {
+            return false;
+        }
+        // Must actually see `nested`. A bare `#[app_config()]` parses Ok but
+        // never sets `found`, so `.is_ok()` alone would wrongly report opt-in.
+        let mut found = false;
+        let parsed = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("nested") {
+                found = true;
+                Ok(())
+            } else {
+                Err(meta.error("unknown app_config option"))
+            }
+        });
+        parsed.is_ok() && found
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -202,10 +233,10 @@ fn type_contains_app_config_struct(ty: &Type, set: &HashSet<String>) -> Option<S
             if matches!(ident.as_str(), "Option" | "Vec" | "Box" | "Rc" | "Arc") {
                 if let PathArguments::AngleBracketed(ab) = &last.arguments {
                     for arg in &ab.args {
-                        if let GenericArgument::Type(inner) = arg {
-                            if let Some(found) = type_contains_app_config_struct(inner, set) {
-                                return Some(found);
-                            }
+                        if let GenericArgument::Type(inner) = arg
+                            && let Some(found) = type_contains_app_config_struct(inner, set)
+                        {
+                            return Some(found);
                         }
                     }
                 }
@@ -339,9 +370,11 @@ fn main() {
     if violations > 0 {
         eprintln!(
             "\n{violations} nested-AppConfig violation(s). \
-             A struct with #[derive(AppConfig)] must not contain fields whose \
-             type resolves to another #[derive(AppConfig)] struct, even through \
-             Option/Vec/Box wrappers (spec \u{00a7}3.3)."
+             A field whose type resolves to another #[derive(AppConfig)] struct \
+             (detected even through Option/Vec/Box wrappers) must opt in with \
+             #[app_config(nested)]. Opt-in supports a direct `T` or `Vec<T>` field \
+             only — restructure Option/Box-wrapped nesting to one of those. \
+             Otherwise nesting is rejected (spec \u{00a7}3.3)."
         );
         process::exit(1);
     }
@@ -355,6 +388,21 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NESTED_VEC_WITH_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { #[app_config(nested)] inner: Vec<Inner> }
+    ";
+
+    const NESTED_WITHOUT_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { inner: Inner }
+    ";
+
+    const NESTED_WITH_OPT_IN: &str = "
+        #[derive(edgezero_core::AppConfig)] struct Inner { #[secret] k: String }
+        #[derive(edgezero_core::AppConfig)] struct Outer { #[app_config(nested)] inner: Inner }
+    ";
 
     fn known(names: &[&str]) -> HashSet<String> {
         names.iter().map(|name| String::from(*name)).collect()
@@ -491,6 +539,21 @@ mod tests {
             NestedAppConfigVisitor::new(Path::new("test.rs"), &collector.app_config_structs);
         visitor.visit_file(&file);
         visitor.violations
+    }
+
+    #[test]
+    fn allows_nesting_with_opt_in() {
+        assert_eq!(violations_in(NESTED_WITH_OPT_IN), 0);
+    }
+
+    #[test]
+    fn allows_vec_nesting_with_opt_in() {
+        assert_eq!(violations_in(NESTED_VEC_WITH_OPT_IN), 0);
+    }
+
+    #[test]
+    fn flags_nesting_without_opt_in() {
+        assert_eq!(violations_in(NESTED_WITHOUT_OPT_IN), 1);
     }
 
     #[test]

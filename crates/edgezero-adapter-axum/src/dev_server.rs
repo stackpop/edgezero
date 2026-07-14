@@ -11,7 +11,7 @@ use axum::Router;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::signal;
-use tower::{service_fn, Service as _};
+use tower::{Service as _, service_fn};
 
 use edgezero_core::addr;
 use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
@@ -340,7 +340,9 @@ pub fn run_app<A: Hooks>() -> anyhow::Result<()> {
         .and_then(|raw| LevelFilter::from_str(raw).ok())
         .unwrap_or(LevelFilter::Info);
 
-    let _logger_init = SimpleLogger::new().with_level(level).init();
+    if !A::owns_logging() {
+        let _logger_init = SimpleLogger::new().with_level(level).init();
+    }
 
     let resolution = resolve_addr(&env);
     for warning in &resolution.warnings {
@@ -740,7 +742,7 @@ mod integration_tests {
     use edgezero_core::router::RouterService;
     use edgezero_core::secret_store::SecretHandle as CoreSecretHandle;
     use std::time::{Duration, Instant};
-    use tokio::task::{spawn_blocking, JoinHandle};
+    use tokio::task::{JoinHandle, spawn_blocking};
     use tokio::time::sleep;
 
     struct TestServer {

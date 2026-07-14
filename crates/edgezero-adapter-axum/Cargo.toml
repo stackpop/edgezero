@@ -1,9 +1,11 @@
 [package]
 name = "edgezero-adapter-axum"
-edition = { workspace = true }
-version = { workspace = true }
+description = "Axum adapter for EdgeZero: native Tokio dev server"
 authors = { workspace = true }
+edition = { workspace = true }
 license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true

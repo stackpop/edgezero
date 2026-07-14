@@ -17,12 +17,12 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId, TypedSecretEntry,
+    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 use walkdir::WalkDir;
 
@@ -76,15 +76,13 @@ static SPIN_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_spin",
         repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
+        fallback: "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_spin_wasm",
         repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
+        fallback: "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
         features: &["spin"],
     },
 ];
@@ -541,7 +539,7 @@ impl Adapter for SpinCliAdapter {
                     value = entry.key_value,
                 ));
             }
-            if let Some(prev_field) = seen.insert(spin_var.clone(), entry.field_name) {
+            if let Some(prev_field) = seen.insert(spin_var.clone(), entry.field_name.as_str()) {
                 return Err(format!(
                     "Spin variable `{spin_var}` would receive values from BOTH `#[secret]` field `{prev_field}` AND `#[secret]` field `{this_field}`; Spin's flat variable namespace cannot disambiguate them. Pick distinct `#[secret]` values whose lowercased forms differ.",
                     this_field = entry.field_name,
@@ -895,7 +893,7 @@ fn write_sqlite(
 /// - `MissingKey` if the row is absent.
 /// - `Present(value)` on a hit (value decoded from UTF-8 BLOB).
 fn read_sqlite_entry(db_path: &Path, store: &str, key: &str) -> Result<ReadConfigEntry, String> {
-    use rusqlite::{params, Connection, OptionalExtension as _};
+    use rusqlite::{Connection, OptionalExtension as _, params};
 
     if !db_path.exists() {
         return Ok(ReadConfigEntry::MissingStore);
@@ -991,7 +989,7 @@ fn ensure_kv_label_in_component(
     component_id: &str,
     label: &str,
 ) -> Result<bool, String> {
-    use toml_edit::{value, Array, DocumentMut, Value};
+    use toml_edit::{Array, DocumentMut, Value, value};
 
     let raw = fs::read_to_string(spin_path)
         .map_err(|err| format!("failed to read {}: {err}", spin_path.display()))?;
@@ -1638,8 +1636,7 @@ mod tests {
     #[test]
     fn provision_dry_run_does_not_edit_spin_toml() {
         let dir = tempdir().expect("tempdir");
-        let original =
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
+        let original = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
         let path = write_spin(dir.path(), original);
         let kv_ids: Vec<ResolvedStoreId> =
             ResolvedStoreId::from_logicals(&[TEST_KV_ID, TEST_KV_ID_ALT]);
