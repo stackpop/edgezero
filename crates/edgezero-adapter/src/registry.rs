@@ -239,6 +239,43 @@ pub trait Adapter: Sync + Send {
     /// Returns an error string if the requested adapter action fails.
     fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
 
+    /// Reclaim chunk entries that no LIVE config pointer references.
+    ///
+    /// Deliberately NOT part of `config push`. On an eventually-consistent
+    /// store, a chunk may only be deleted once the pointer that referenced it
+    /// has stopped being served everywhere — and the platform may record no
+    /// pointer-supersession time (Fastly does not: `updated_at` is not bumped
+    /// by an upsert) and offer no compare-and-swap with which to record one
+    /// safely. Only the OPERATOR knows their deploy history, so `older_than`
+    /// carries that assertion: "nothing created before this is still being
+    /// served". A `dry_run` lists exactly what would be deleted, for review.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the adapter has no `config gc` impl, if the platform
+    /// state cannot be read, or if it cannot be classified with confidence —
+    /// reclamation FAILS CLOSED: when in doubt, nothing is deleted.
+    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors `push_config_entries`: manifest root, adapter manifest path, component selector, resolved store, push-time overlay, the operator's age assertion, and dry-run — each distinct; an aggregate struct is a worse ergonomic trade for implementers."
+    )]
+    fn gc_config_entries(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _store: &ResolvedStoreId,
+        _push_ctx: &AdapterPushContext<'_>,
+        _older_than_secs: u64,
+        _dry_run: bool,
+    ) -> Result<Vec<String>, String> {
+        Err(format!(
+            "adapter `{}` does not implement `config gc`",
+            self.name()
+        ))
+    }
+
     /// Store kinds whose logical-id namespaces the adapter merges into
     /// a single backend at runtime — declaring the SAME logical id
     /// under two merged kinds causes silent write collisions because
