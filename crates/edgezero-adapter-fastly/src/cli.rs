@@ -1345,17 +1345,21 @@ fn build_compute_deploy_args(extra_args: &[String]) -> Vec<String> {
 
 /// # Errors
 /// Returns an error if the Fastly CLI deploy command fails.
+///
+/// Honours a CLI-threaded `--manifest-path <abs fastly.toml>` (see
+/// [`resolve_manifest_dir`]) so a monorepo with several Fastly apps
+/// deploys the one the operator's `edgezero.toml` selected, rather than
+/// whichever `fastly.toml` a bare working-directory search finds first.
+/// The flag is EdgeZero-internal — `fastly compute deploy` has no such
+/// flag — so it is stripped from the forwarded argv.
 #[inline]
 pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest =
-        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
-    let manifest_dir = manifest
-        .parent()
-        .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
+    let manifest_dir = resolve_manifest_dir(extra_args)?;
+    let forwarded = args_without_flag_value(extra_args, "--manifest-path");
 
     let status = Command::new("fastly")
-        .args(build_compute_deploy_args(extra_args))
-        .current_dir(manifest_dir)
+        .args(build_compute_deploy_args(&forwarded))
+        .current_dir(&manifest_dir)
         .status()
         .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
@@ -1998,20 +2002,19 @@ fn fastly_api_put(path: &str, token: &str) -> Result<u16, String> {
     }
 }
 
-/// Resolve the directory containing the Fastly manifest for a staged
-/// deploy.
+/// Resolve the directory containing the Fastly manifest for a deploy
+/// (production [`deploy`] or [`deploy_staged`]).
 ///
 /// The CLI (`edgezero_cli::run_deploy`) resolves the `edgezero.toml`
 /// manifest — honouring `EDGEZERO_MANIFEST` — and threads the
 /// manifest-configured `[adapters.fastly.adapter].manifest` path in as
 /// `--manifest-path <abs fastly.toml>`. Prefer that so a monorepo with
-/// multiple Fastly apps stages the app the operator actually selected,
-/// rather than whichever `fastly.toml` a bare working-directory search
-/// happens to find first. Only when no `--manifest-path` is threaded
-/// (e.g. a manifest that declares Fastly commands but no adapter
-/// `manifest` key) do we fall back to the working-directory search the
-/// legacy `deploy` path used.
-fn resolve_staged_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
+/// multiple Fastly apps deploys/stages the app the operator actually
+/// selected, rather than whichever `fastly.toml` a bare working-directory
+/// search happens to find first. Only when no `--manifest-path` is
+/// threaded (e.g. a manifest that declares Fastly commands but no adapter
+/// `manifest` key) do we fall back to the working-directory search.
+fn resolve_manifest_dir(args: &[String]) -> Result<PathBuf, String> {
     if let Some(raw) = arg_value(args, "--manifest-path") {
         let path = PathBuf::from(raw);
         return path
@@ -2039,7 +2042,7 @@ fn deploy_staged(args: &[String]) -> Result<(), String> {
     // `fastly compute update` error.
     require_token()?;
 
-    let manifest_dir_buf = resolve_staged_manifest_dir(args)?;
+    let manifest_dir_buf = resolve_manifest_dir(args)?;
     let manifest_dir = manifest_dir_buf.as_path();
     // Strip both the explicitly-threaded `--service-id` and the
     // CLI-injected `--manifest-path` (which `fastly compute update`
@@ -2151,10 +2154,22 @@ fn emit_active_version(args: &[String]) -> Result<(), String> {
 /// (production) or the version's staging IP (`--staging`), retrying up
 /// to `--retry` times. Emits `status-code` / `healthy` and returns
 /// `Err` (non-zero exit) when unhealthy after retries.
+///
+/// `--domain`, `--service-id` and `--version` are REQUIRED and validated
+/// on BOTH the production and the staging path. GitHub Actions' `required:
+/// true` does not actually fail a workflow when an input is omitted or
+/// empty, so this is the real guard: a production healthcheck must never
+/// probe on behalf of an absent/empty version it never verified — the
+/// caller chains that same version into rollback.
 fn healthcheck(args: &[String]) -> Result<(), String> {
     let domain =
         arg_value(args, "--domain").ok_or_else(|| "healthcheck requires --domain".to_owned())?;
     validate_domain(domain)?;
+    let service_id = resolve_service_id(args)?;
+    validate_service_id(&service_id)?;
+    let version_str =
+        arg_value(args, "--version").ok_or_else(|| "healthcheck requires --version".to_owned())?;
+    let version = validate_version_str(version_str)?;
     let retry = arg_value(args, "--retry")
         .and_then(|value| value.parse().ok())
         .unwrap_or(3_u32);
@@ -2166,11 +2181,6 @@ fn healthcheck(args: &[String]) -> Result<(), String> {
         .unwrap_or(10_u64);
 
     let staging_ip = if arg_flag(args, "--staging") {
-        let service_id = resolve_service_id(args)?;
-        validate_service_id(&service_id)?;
-        let version_str = arg_value(args, "--version")
-            .ok_or_else(|| "staging healthcheck requires --version".to_owned())?;
-        let version = validate_version_str(version_str)?;
         let token = require_token()?;
         let json = fastly_api_get(
             &format!("/service/{service_id}/version/{version}/domain?include=staging_ips"),
@@ -2367,18 +2377,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_staged_manifest_dir_prefers_manifest_path_flag() {
+    fn resolve_manifest_dir_prefers_manifest_path_flag() {
         // When the CLI threads `--manifest-path <abs fastly.toml>`, the
-        // staged deploy must use its parent directory rather than a bare
-        // working-directory search (which in a monorepo could pick a
-        // different app's fastly.toml).
+        // deploy (production AND staged) must use its parent directory
+        // rather than a bare working-directory search (which in a
+        // monorepo could pick a different app's fastly.toml).
         let args = vec![
             "--service-id".to_owned(),
             "SVC1".to_owned(),
             "--manifest-path".to_owned(),
             "/repo/apps/edge/fastly.toml".to_owned(),
         ];
-        let dir = resolve_staged_manifest_dir(&args).expect("resolves from --manifest-path");
+        let dir = resolve_manifest_dir(&args).expect("resolves from --manifest-path");
         assert_eq!(dir, PathBuf::from("/repo/apps/edge"));
     }
 
@@ -2482,6 +2492,114 @@ mod tests {
                 1,
                 "must not pass the non-interactive switch twice ({flag})"
             );
+        }
+    }
+
+    // ── healthcheck / rollback input validation (spec §5.4) ───────────
+    //
+    // GitHub Actions' `required: true` does NOT fail when an input is
+    // omitted or empty, so the CLI is the real guard. An absent / empty /
+    // malformed `--service-id` or `--version` must be rejected on BOTH
+    // the production and the staging path — a production healthcheck
+    // that probes anyway "verifies" a version it never looked at, and
+    // the caller chains that same version into rollback.
+
+    #[test]
+    fn healthcheck_rejects_missing_or_empty_required_values_on_production() {
+        for (args, needle) in [
+            (
+                owned(&["--domain", "example.com", "--service-id", "SVC1"]),
+                "--version",
+            ),
+            (
+                owned(&[
+                    "--domain",
+                    "example.com",
+                    "--service-id",
+                    "SVC1",
+                    "--version",
+                    "",
+                ]),
+                "invalid version",
+            ),
+            (
+                owned(&[
+                    "--domain",
+                    "example.com",
+                    "--service-id",
+                    "SVC1",
+                    "--version",
+                    "15.2.0",
+                ]),
+                "invalid version",
+            ),
+            (
+                owned(&[
+                    "--domain",
+                    "example.com",
+                    "--service-id",
+                    "",
+                    "--version",
+                    "7",
+                ]),
+                "invalid service id",
+            ),
+            (
+                owned(&["--domain", "", "--service-id", "SVC1", "--version", "7"]),
+                "invalid domain",
+            ),
+            (
+                owned(&["--service-id", "SVC1", "--version", "7"]),
+                "--domain",
+            ),
+        ] {
+            let err = healthcheck(&args).expect_err("must reject absent/empty required value");
+            assert!(
+                err.contains(needle),
+                "expected {needle:?} in error for {args:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn healthcheck_rejects_empty_required_values_on_staging() {
+        for args in [
+            owned(&[
+                "--staging",
+                "--domain",
+                "example.com",
+                "--service-id",
+                "",
+                "--version",
+                "7",
+            ]),
+            owned(&[
+                "--staging",
+                "--domain",
+                "example.com",
+                "--service-id",
+                "SVC1",
+                "--version",
+                "",
+            ]),
+        ] {
+            healthcheck(&args).expect_err("staging must reject empty required values");
+        }
+    }
+
+    #[test]
+    fn rollback_rejects_missing_or_invalid_required_values() {
+        for staging in [&[][..], &["--staging".to_owned()][..]] {
+            for bad in [
+                owned(&["--service-id", "SVC1"]),
+                owned(&["--service-id", "SVC1", "--version", ""]),
+                owned(&["--service-id", "SVC1", "--version", "12abc"]),
+                owned(&["--service-id", "", "--version", "7"]),
+            ] {
+                let mut args = bad.clone();
+                args.extend_from_slice(staging);
+                rollback(&args).expect_err("rollback must reject invalid required values");
+            }
         }
     }
 
@@ -4934,6 +5052,90 @@ build = \"cargo build --release\"
                 .iter()
                 .any(|line| line.starts_with("service-version stage")),
             "must not stage a guessed version: {argv:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_staged_does_not_duplicate_non_interactive_from_passthrough() {
+        // `--non-interactive` is an allowlisted `compute update` flag, so a
+        // caller-supplied one is FORWARDED. We must not then append our own:
+        // passing the switch twice makes the Fastly CLI exit non-zero.
+        let (result, argv) = run_deploy_staged_with_fake(
+            "SUCCESS: Updated package (service SVC1, version 7)",
+            &["--non-interactive"],
+        );
+        result.expect("staged deploy with a passthrough --non-interactive must succeed");
+        let update = argv
+            .iter()
+            .find(|line| line.starts_with("compute update"))
+            .expect("compute update was invoked");
+        assert_eq!(
+            update.matches("--non-interactive").count(),
+            1,
+            "the non-interactive switch must appear exactly once: {update}"
+        );
+    }
+
+    /// Fake `fastly` on `$PATH` that records `<cwd>\t<argv>` for every
+    /// invocation. Used to prove the production deploy runs in the
+    /// manifest-selected app directory.
+    #[cfg(unix)]
+    fn fake_fastly_cwd_recorder() -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let record = dir.path().join("argv.log");
+        let script_path = dir.path().join("fastly");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\t%s\\n' \"$PWD\" \"$*\" >> '{}'\nexit 0\n",
+            record.display(),
+        );
+        fs::write(&script_path, script).expect("write fake fastly");
+        let mut perms = fs::metadata(&script_path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod +x");
+        (dir, record)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_honours_threaded_manifest_path_and_strips_it_from_the_fastly_argv() {
+        // Production deploys used to ignore the CLI-threaded
+        // `--manifest-path` and fall back to `find_fastly_manifest(cwd)`,
+        // which in a monorepo picks the CLOSEST fastly.toml — the wrong
+        // app. The threaded path must select the app directory, and must
+        // be STRIPPED from the argv (`fastly compute deploy` has no such
+        // flag and would exit non-zero).
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let (fake, record) = fake_fastly_cwd_recorder();
+        let _path = PathPrepend::new(fake.path());
+
+        let app = tempdir().expect("app dir");
+        let manifest = app.path().join("fastly.toml");
+        fs::write(&manifest, "name = \"app\"\n").expect("write fastly.toml");
+
+        let args = vec![
+            "--manifest-path".to_owned(),
+            manifest.display().to_string(),
+            "--service-id".to_owned(),
+            "SVC1".to_owned(),
+        ];
+        deploy(&args).expect("deploy must run against the threaded manifest");
+
+        let recorded = fs::read_to_string(&record).expect("fastly was invoked");
+        let (cwd, recorded_argv) = recorded
+            .trim_end()
+            .split_once('\t')
+            .expect("recorded `<cwd>\\t<argv>`");
+        assert_eq!(
+            fs::canonicalize(cwd).expect("cwd"),
+            fs::canonicalize(app.path()).expect("app dir"),
+            "deploy must run in the manifest-selected app directory"
+        );
+        assert_eq!(
+            recorded_argv,
+            "compute deploy --service-id SVC1 --non-interactive"
         );
     }
 }

@@ -9,14 +9,14 @@
 Implement the layered deploy actions in the EdgeZero monorepo:
 
 ```text
-.github/actions/build-cli
+.github/actions/build-app-cli
 .github/actions/deploy-core
 .github/actions/deploy-fastly
 .github/actions/healthcheck-fastly
 .github/actions/rollback-fastly
 ```
 
-`build-cli` compiles the app-provided CLI package once and publishes it as an
+`build-app-cli` compiles the app-provided CLI package once and publishes it as an
 artifact. `deploy-core` is the adapter-independent deploy engine that consumes
 the prebuilt CLI. `deploy-fastly` is a minimal wrapper that types Fastly
 credentials and calls the engine, with an optional `stage` mode. `healthcheck-fastly`
@@ -35,25 +35,25 @@ This design **supersedes** the monolithic Fastly action from #303
 (`.github/actions/deploy/`). That branch is not the base; its scripts are a
 reference to port from. Most transfer with light changes:
 
-| Existing `.github/actions/deploy/`           | New home                        | Disposition                                                                                                                                                                                  |
-| -------------------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scripts/common.sh`                          | `deploy-core/scripts/`          | Reuse ~as-is (annotation escaping, helpers).                                                                                                                                                 |
-| `scripts/cleanup.sh`                         | `deploy-core/scripts/`          | Reuse.                                                                                                                                                                                       |
-| `scripts/write-summary.sh`                   | `deploy-core/scripts/`          | Reuse; update summary field names.                                                                                                                                                           |
-| `scripts/validate-inputs.sh`                 | `deploy-core/scripts/`          | Reuse; move Fastly-specific allowlist to the wrapper.                                                                                                                                        |
-| `scripts/resolve-project.sh`                 | `deploy-core/scripts/`          | Reuse + split Git root vs Cargo workspace root.                                                                                                                                              |
-| `scripts/install-rust.sh`                    | dropped                         | Replaced by `actions-rust-lang/setup-rust-toolchain@v1` in deploy-fastly (toolchain from resolve output + wasm target). build-cli keeps `rustup` for dynamic app-resolved toolchain install. |
-| `scripts/run-edgezero.sh`                    | `deploy-core/scripts/`          | Adapt to invoke `<cli-bin>` from the artifact + provider-env.                                                                                                                                |
-| `tests/run.sh`                               | `deploy-core/tests/`            | Reuse the harness; add new cases.                                                                                                                                                            |
-| `scripts/install-fastly.sh`, `versions.json` | `deploy-fastly/`                | Move (provider-specific install + checksum).                                                                                                                                                 |
-| `scripts/install-edgezero.sh`                | → `build-cli`                   | Rewrite: build the **app's** CLI package, not the monorepo CLI.                                                                                                                              |
-| `action.yml` (one composite)                 | `build-cli/` + `deploy-fastly/` | Split into build + wrapper; engine is sourced scripts.                                                                                                                                       |
-| `.github/workflows/deploy-action.yml`        | same path                       | Rewrite: de-Python, repin actions to tags.                                                                                                                                                   |
-| cache `uses: actions/cache@<sha>`            | `actions/cache@v4`              | Repin to readable tag.                                                                                                                                                                       |
+| Existing `.github/actions/deploy/`           | New home                            | Disposition                                                                                                                                                                                      |
+| -------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `scripts/common.sh`                          | `deploy-core/scripts/`              | Reuse ~as-is (annotation escaping, helpers).                                                                                                                                                     |
+| `scripts/cleanup.sh`                         | `deploy-core/scripts/`              | Reuse.                                                                                                                                                                                           |
+| `scripts/write-summary.sh`                   | `deploy-core/scripts/`              | Reuse; update summary field names.                                                                                                                                                               |
+| `scripts/validate-inputs.sh`                 | `deploy-core/scripts/`              | Reuse; move Fastly-specific allowlist to the wrapper.                                                                                                                                            |
+| `scripts/resolve-project.sh`                 | `deploy-core/scripts/`              | Reuse + split Git root vs Cargo workspace root.                                                                                                                                                  |
+| `scripts/install-rust.sh`                    | dropped                             | Replaced by `actions-rust-lang/setup-rust-toolchain@v1` in deploy-fastly (toolchain from resolve output + wasm target). build-app-cli keeps `rustup` for dynamic app-resolved toolchain install. |
+| `scripts/run-edgezero.sh`                    | `deploy-core/scripts/`              | Adapt to invoke `<cli-bin>` from the artifact + provider-env.                                                                                                                                    |
+| `tests/run.sh`                               | `deploy-core/tests/`                | Reuse the harness; add new cases.                                                                                                                                                                |
+| `scripts/install-fastly.sh`, `versions.json` | `deploy-fastly/`                    | Move (provider-specific install + checksum).                                                                                                                                                     |
+| `scripts/install-edgezero.sh`                | → `build-app-cli`                   | Rewrite: build the **app's** CLI package, not the monorepo CLI.                                                                                                                                  |
+| `action.yml` (one composite)                 | `build-app-cli/` + `deploy-fastly/` | Split into build + wrapper; engine is sourced scripts.                                                                                                                                           |
+| `.github/workflows/deploy-action.yml`        | same path                           | Rewrite: de-Python, repin actions to tags.                                                                                                                                                       |
+| cache `uses: actions/cache@<sha>`            | `actions/cache@v4`                  | Repin to readable tag.                                                                                                                                                                           |
 
 ## Implementation phases
 
-1. **`build-cli` action**
+1. **`build-app-cli` action**
    - Required `cli-package` input: the Cargo package name of the CLI defined in
      the application's own workspace. Fail if missing or not found in the app
      workspace under `working-directory`.
@@ -101,7 +101,7 @@ reference to port from. Most transfer with light changes:
    - Confine `working-directory` and `manifest` inside `github.workspace`
      (canonical paths, symlink resolution).
    - Resolve **Git root** for `source-revision` and the dirty-source guard
-     (`build-cli`'s isolated target dir keeps this clean).
+     (`build-app-cli`'s isolated target dir keeps this clean).
    - Resolve the **Cargo workspace root** (`cargo locate-project --workspace`)
      for lockfile hashing and `target/` caching — in a monorepo this may be under
      `working-directory`, not the Git root (spec §11.1).
@@ -164,7 +164,7 @@ reference to port from. Most transfer with light changes:
 5. **Scripts layout**
    - Provider-neutral scripts under `deploy-core/`; the Fastly install + checksum
      step lives with `deploy-fastly/` (or a shared script keyed by adapter).
-   - No CLI-build script here — CLI build lives entirely in `build-cli`.
+   - No CLI-build script here — CLI build lives entirely in `build-app-cli`.
 
 6. **CI workflow (`.github/workflows/deploy-action.yml`) — no Python**
    - Pin third-party actions to readable released tags (`actions/checkout@v4`,
@@ -173,7 +173,7 @@ reference to port from. Most transfer with light changes:
    - Run `zizmor` from a pinned release binary or `cargo install zizmor --locked`
      (no `pip`).
    - Port the metadata-validation heredocs into `tests/run.sh`.
-   - Composite smoke test: `build-cli` → `deploy-fastly` (both production and
+   - Composite smoke test: `build-app-cli` → `deploy-fastly` (both production and
      `stage: true`) → `healthcheck-fastly` → `rollback-fastly`. Fake each action's
      real dependency: a fake `fastly` binary (marker files + printed version) for
      `deploy-fastly`; a fake app CLI or stubbed Fastly API/`curl` responses for
@@ -192,7 +192,7 @@ reference to port from. Most transfer with light changes:
 8. **Companion CLI scaffolding (`crates/edgezero-cli`, `edgezero-adapter-fastly`)**
    - Add `#[command(version)]` to the downstream CLI template
      (`crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`) so generated app
-     CLIs expose `--version`. Until adopted, `build-cli` reads the version from
+     CLIs expose `--version`. Until adopted, `build-app-cli` reads the version from
      `cargo metadata` and smoke-checks with `--help`.
    - Fastly staging deploy: extend the Fastly adapter `deploy` path with
      `--stage` → `fastly compute update --autoclone --version=active` +

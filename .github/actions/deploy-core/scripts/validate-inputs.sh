@@ -6,9 +6,10 @@ set -euo pipefail
 # allowlist, and validates booleans. It never learns provider credential names
 # or provider CLI flags — those arrive from the wrapper as opaque data.
 #
-# Inputs (environment): INPUT_ADAPTER, INPUT_BUILD_MODE, INPUT_CACHE,
-# INPUT_BUILD_ARGS, INPUT_DEPLOY_ARGS, INPUT_DEPLOY_FLAGS,
-# INPUT_PROVIDER_ENV_CLEAR, INPUT_DEPLOY_ARG_ALLOW, EDGEZERO_RUNNER_OS/ARCH.
+# Inputs (environment): EDGEZERO__INPUT__ADAPTER, EDGEZERO__INPUT__BUILD_MODE, EDGEZERO__INPUT__CACHE,
+# EDGEZERO__INPUT__BUILD_ARGS, EDGEZERO__INPUT__DEPLOY_ARGS, EDGEZERO__INPUT__DEPLOY_ARGS_PREPEND,
+# EDGEZERO__INPUT__DEPLOY_FLAGS, EDGEZERO__INPUT__PROVIDER_ENV_CLEAR, EDGEZERO__INPUT__DEPLOY_ARG_ALLOW,
+# EDGEZERO__RUNNER__OS/ARCH.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -65,13 +66,13 @@ enforce_deploy_arg_allowlist() {
 }
 
 main() {
-  local adapter="${INPUT_ADAPTER:-}"
-  local build_mode="${INPUT_BUILD_MODE:-auto}"
-  local cache="${INPUT_CACHE:-false}"
-  local stage="${INPUT_STAGE:-false}"
-  local deploy_arg_allow="${INPUT_DEPLOY_ARG_ALLOW:-}"
+  local adapter="${EDGEZERO__INPUT__ADAPTER:-}"
+  local build_mode="${EDGEZERO__INPUT__BUILD_MODE:-auto}"
+  local cache="${EDGEZERO__INPUT__CACHE:-false}"
+  local stage="${EDGEZERO__INPUT__STAGE:-false}"
+  local deploy_arg_allow="${EDGEZERO__INPUT__DEPLOY_ARG_ALLOW:-}"
 
-  require_supported_runner "${EDGEZERO_RUNNER_OS:-}" "${EDGEZERO_RUNNER_ARCH:-}"
+  require_supported_runner "${EDGEZERO__RUNNER__OS:-}" "${EDGEZERO__RUNNER__ARCH:-}"
 
   # Well-formedness only: the CLI decides whether the adapter is supported.
   [[ -n "$adapter" ]] || fail "internal parameter 'adapter' is required"
@@ -93,19 +94,34 @@ main() {
 
   require_cmd jq
 
-  local state_dir="${EDGEZERO_ACTION_STATE_DIR:-${RUNNER_TEMP:-/tmp}/edgezero-action-state}"
+  local state_dir="${EDGEZERO__ACTION__STATE_DIR:-${RUNNER_TEMP:-/tmp}/edgezero-action-state}"
   mkdir -p "$state_dir"
   local build_args_file="$state_dir/build-args.nul"
   local deploy_args_file="$state_dir/deploy-args.nul"
   local deploy_flags_file="$state_dir/deploy-flags.nul"
   local provider_env_clear_file="$state_dir/provider-env-clear.nul"
 
-  parse_json_string_array "build-args" "${INPUT_BUILD_ARGS:-[]}" "$build_args_file"
-  parse_json_string_array "deploy-args" "${INPUT_DEPLOY_ARGS:-[]}" "$deploy_args_file"
-  parse_json_string_array "deploy-flags" "${INPUT_DEPLOY_FLAGS:-[]}" "$deploy_flags_file"
-  parse_json_string_array "provider-env-clear" "${INPUT_PROVIDER_ENV_CLEAR:-[]}" "$provider_env_clear_file"
+  parse_json_string_array "build-args" "${EDGEZERO__INPUT__BUILD_ARGS:-[]}" "$build_args_file"
+  parse_json_string_array "deploy-args" "${EDGEZERO__INPUT__DEPLOY_ARGS:-[]}" "$deploy_args_file"
+  parse_json_string_array "deploy-flags" "${EDGEZERO__INPUT__DEPLOY_FLAGS:-[]}" "$deploy_flags_file"
+  parse_json_string_array "provider-env-clear" "${EDGEZERO__INPUT__PROVIDER_ENV_CLEAR:-[]}" "$provider_env_clear_file"
 
+  # The allowlist governs CALLER deploy-args only.
   enforce_deploy_arg_allowlist "$deploy_args_file" "$deploy_arg_allow"
+
+  # Action-owned passthrough args are prepended AFTER the allowlist check,
+  # because they are not caller input — the wrapper supplies them to make the
+  # deploy safe in CI (for Fastly: `--non-interactive`, which the built-in
+  # deploy path adds for itself but a manifest `[adapters.fastly.commands]
+  # deploy = "fastly compute deploy"` override would otherwise never get, so the
+  # deploy could block on a TTY prompt). They go first so a caller arg can still
+  # override them where the provider CLI takes last-wins.
+  local prepend_file="$state_dir/deploy-args-prepend.nul"
+  parse_json_string_array "deploy-args-prepend" "${EDGEZERO__INPUT__DEPLOY_ARGS_PREPEND:-[]}" "$prepend_file"
+  if [[ -s "$prepend_file" ]]; then
+    cat "$prepend_file" "$deploy_args_file" >"$deploy_args_file.merged"
+    mv "$deploy_args_file.merged" "$deploy_args_file"
+  fi
 
   append_output adapter "$adapter"
   append_output build-args-file "$build_args_file"

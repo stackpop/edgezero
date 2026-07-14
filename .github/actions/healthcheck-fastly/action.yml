@@ -3,7 +3,7 @@ description: Probe a deployed Fastly version's health via the app CLI. Exits non
 
 inputs:
   cli-artifact:
-    description: Name of the build-cli artifact to download and run.
+    description: Name of the build-app-cli artifact to download and run.
     required: true
   cli-bin:
     description: Binary name inside the artifact. Defaults to the artifact metadata.
@@ -54,29 +54,59 @@ runs:
       with:
         name: ${{ inputs['cli-artifact'] }}
         path: ${{ runner.temp }}/edgezero-cli-download
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
 
     - name: Extract CLI
       id: cli
       shell: bash
       env:
-        EDGEZERO_CLI_ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
-        EDGEZERO_TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
-        INPUT_CLI_BIN: ${{ inputs['cli-bin'] }}
+        EDGEZERO__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        EDGEZERO__INPUT__CLI_BIN: ${{ inputs['cli-bin'] }}
         FASTLY_API_TOKEN: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-cli.sh
 
     - name: Health check
       id: check
       shell: bash
       env:
-        CLI_BIN: ${{ steps.cli.outputs['cli-bin'] }}
-        SERVICE_ID: ${{ inputs['fastly-service-id'] }}
-        VERSION: ${{ inputs['fastly-version'] }}
-        DOMAIN: ${{ inputs.domain }}
-        DEPLOY_TO: ${{ inputs['deploy-to'] }}
-        RETRY: ${{ inputs.retry }}
-        RETRY_DELAY: ${{ inputs['retry-delay'] }}
-        TIMEOUT: ${{ inputs.timeout }}
+        EDGEZERO__CLI__BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        EDGEZERO__LIFECYCLE__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        EDGEZERO__LIFECYCLE__VERSION: ${{ inputs['fastly-version'] }}
+        EDGEZERO__LIFECYCLE__DOMAIN: ${{ inputs.domain }}
+        EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
+        EDGEZERO__LIFECYCLE__RETRY: ${{ inputs.retry }}
+        EDGEZERO__LIFECYCLE__RETRY_DELAY: ${{ inputs['retry-delay'] }}
+        EDGEZERO__LIFECYCLE__TIMEOUT: ${{ inputs.timeout }}
         # Only the typed token reaches the CLI; blank any inherited alias.
         FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
         FASTLY_TOKEN: ""
@@ -87,26 +117,17 @@ runs:
         FASTLY_API_ENDPOINT: ""
         FASTLY_API_URL: ""
         FASTLY_PROFILE: ""
-      run: |
-        # A typo in deploy-to must never silently probe production.
-        case "$DEPLOY_TO" in production | staging) ;; *) echo "::error::input 'deploy-to' must be 'production' or 'staging' (got '$DEPLOY_TO')"; exit 1 ;; esac
-        log="${RUNNER_TEMP:-/tmp}/edgezero-healthcheck.log"
-        args=("$CLI_BIN" healthcheck --adapter fastly --service-id "$SERVICE_ID" --version "$VERSION" --domain "$DOMAIN" --retry "$RETRY" --retry-delay "$RETRY_DELAY" --timeout "$TIMEOUT")
-        if [[ "$DEPLOY_TO" == "staging" ]]; then args+=(--staging); fi
-        rc=0
-        "${args[@]}" 2>&1 | tee "$log" || rc=$?
-        healthy=$(grep -oE '^healthy=(true|false)' "$log" | tail -n 1 | cut -d= -f2 || true)
-        status=$(grep -oE '^status-code=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)
-        echo "healthy=${healthy:-false}" >> "$GITHUB_OUTPUT"
-        echo "status-code=${status}" >> "$GITHUB_OUTPUT"
-        # Fail closed. A zero-exit CLI that reports healthy=false, or emits no
-        # verdict at all, must NOT let this action succeed — callers gate their
-        # rollback on this step failing.
-        if [[ "$rc" -ne 0 ]]; then
-          echo "::error::health check failed (CLI exit $rc, healthy=${healthy:-<none>}, status=${status:-<none>})"
-          exit "$rc"
-        fi
-        if [[ "$healthy" != "true" ]]; then
-          echo "::error::health check did not report healthy=true (got '${healthy:-<no verdict emitted>}')"
-          exit 1
-        fi
+        FASTLY_SERVICE_ID: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/scripts/healthcheck.sh
+
+    - name: Cleanup
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh

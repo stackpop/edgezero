@@ -1,39 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Asserts the exact Fastly call sequence a staged deploy must produce.
+# Asserts the exact Fastly call sequence a STAGED deploy through the
+# deploy-fastly wrapper must produce, and that the staged version threaded out
+# of the action.
 #
-# Regression test for two real defects a review found:
+# Regression test for real defects a review found:
 #   * `--comment` was forwarded to `fastly compute update`, which has no such
-#     flag — the upload failed. It must instead be applied via
-#     `fastly service-version update --comment`, BEFORE the version is staged.
-#   * The staged upload must clone the active version and stay non-interactive.
+#     flag, so the upload failed. It must be applied via
+#     `fastly service-version update --comment` BEFORE the version is staged.
+#   * A manifest-command deploy never received `--non-interactive` and could
+#     block on a TTY prompt in CI. The wrapper now supplies it as an
+#     action-owned passthrough arg.
+#   * The staged upload must clone the active version.
 #
-# Inputs (environment): FAKE_CALL_LOG.
+# Inputs (environment): EDGEZERO__TEST__FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION.
 
-require_call() {
-  local pattern="$1" what="$2" log="$3"
-  if ! grep -qE -- "$pattern" "$log"; then
-    echo "::error::$what" >&2
-    return 1
-  fi
-}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../scripts/common.sh
+source "$SCRIPT_DIR/../scripts/common.sh"
 
 assert_update_flags() {
   local update="$1" flag
   for flag in --autoclone --version=active --non-interactive --service-id; do
-    if [[ "$update" != *"$flag"* ]]; then
-      echo "::error::'compute update' is missing $flag (got: $update)" >&2
-      return 1
-    fi
+    [[ "$update" == *"$flag"* ]] ||
+      fail "'compute update' is missing $flag (got: $update)"
   done
 }
 
 assert_no_comment_on_update() {
   local log="$1"
   if grep -qE '^fastly compute update .*--comment' "$log"; then
-    echo "::error::--comment was forwarded to 'compute update', which does not support it" >&2
-    return 1
+    fail "--comment was forwarded to 'compute update', which does not support it"
   fi
 }
 
@@ -42,38 +40,33 @@ assert_comment_precedes_stage() {
   comment_line=$(grep -nE '^fastly service-version update .*--comment' "$log" | head -n 1 | cut -d: -f1)
   stage_line=$(grep -nE '^fastly service-version stage ' "$log" | head -n 1 | cut -d: -f1)
 
-  if [[ -z "$comment_line" ]]; then
-    echo "::error::the comment was never applied via 'service-version update'" >&2
-    return 1
-  fi
-  if [[ -z "$stage_line" ]]; then
-    echo "::error::the version was never staged" >&2
-    return 1
-  fi
-  if [[ "$comment_line" -ge "$stage_line" ]]; then
-    echo "::error::the comment was applied after staging; it must precede it" >&2
-    return 1
-  fi
+  [[ -n "$comment_line" ]] || fail "the comment was never applied via 'service-version update'"
+  [[ -n "$stage_line" ]] || fail "the version was never staged"
+  [[ "$comment_line" -lt "$stage_line" ]] ||
+    fail "the comment was applied after staging; it must precede it"
 }
 
 main() {
-  local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
-  local update
+  local log="${EDGEZERO__TEST__FAKE_CALL_LOG:?EDGEZERO__TEST__FAKE_CALL_LOG is required}"
+  local staged_version="${EDGEZERO__TEST__STAGED_VERSION:-}"
 
   echo "--- recorded fastly/curl calls:"
   cat "$log"
 
+  local update
   update=$(grep -E '^fastly compute update ' "$log" | head -n 1 || true)
-  if [[ -z "$update" ]]; then
-    echo "::error::the staged deploy never ran 'fastly compute update'" >&2
-    return 1
-  fi
+  [[ -n "$update" ]] || fail "the staged deploy never ran 'fastly compute update'"
 
   assert_update_flags "$update"
   assert_no_comment_on_update "$log"
   assert_comment_precedes_stage "$log"
 
-  echo "staged call sequence is correct"
+  # The staged version must thread out of deploy-fastly, or the healthcheck and
+  # rollback that follow have nothing to act on.
+  [[ "$staged_version" == "42" ]] ||
+    fail "expected fastly-version=42 out of the staged deploy, got '${staged_version:-<empty>}'"
+
+  notice "staged call sequence is correct and fastly-version=$staged_version threaded out"
 }
 
 main "$@"

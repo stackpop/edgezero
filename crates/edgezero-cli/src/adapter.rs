@@ -190,6 +190,22 @@ pub fn execute_capture(
     Ok(None)
 }
 
+/// Whether `action` for `adapter_name` resolves to a manifest-declared
+/// shell command (rather than the registered adapter's built-in logic).
+///
+/// Callers use this to decide whether an EdgeZero-internal directive
+/// (e.g. `--manifest-path`, understood only by the built-in adapter) is
+/// safe to thread into `adapter_args`: a manifest shell command receives
+/// those args verbatim and would choke on a flag its own CLI lacks.
+pub fn has_manifest_command(
+    manifest_loader: Option<&ManifestLoader>,
+    adapter_name: &str,
+    action: Action,
+) -> bool {
+    manifest_loader
+        .is_some_and(|loader| manifest_command(loader.manifest(), adapter_name, action).is_some())
+}
+
 fn manifest_command<'manifest>(
     manifest: &'manifest Manifest,
     adapter_name: &str,

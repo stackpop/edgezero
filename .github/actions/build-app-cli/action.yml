@@ -1,4 +1,4 @@
-name: EdgeZero build-cli
+name: EdgeZero build-app-cli
 description: Compile the CLI package the application provides and publish it as a self-describing artifact.
 
 inputs:
@@ -43,13 +43,13 @@ runs:
       id: build
       shell: bash
       env:
-        EDGEZERO_ACTION_ROOT: ${{ github.action_path }}/../../..
-        INPUT_CLI_PACKAGE: ${{ inputs['cli-package'] }}
-        INPUT_CLI_BIN: ${{ inputs['cli-bin'] }}
-        INPUT_WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
-        INPUT_RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
-        INPUT_ARTIFACT_NAME: ${{ inputs['artifact-name'] }}
-      run: $GITHUB_ACTION_PATH/scripts/build-cli.sh
+        EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
+        EDGEZERO__INPUT__CLI_PACKAGE: ${{ inputs['cli-package'] }}
+        EDGEZERO__INPUT__CLI_BIN: ${{ inputs['cli-bin'] }}
+        EDGEZERO__INPUT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        EDGEZERO__INPUT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
+        EDGEZERO__INPUT__ARTIFACT_NAME: ${{ inputs['artifact-name'] }}
+      run: $GITHUB_ACTION_PATH/scripts/build-app-cli.sh
 
     - name: Upload CLI artifact
       uses: actions/upload-artifact@v4

@@ -2,17 +2,17 @@
 set -euo pipefail
 
 # Compiles the CLI package the *application* provides (a crate in the app's own
-# workspace, named by INPUT_CLI_PACKAGE) into an action-owned CARGO_TARGET_DIR,
+# workspace, named by EDGEZERO__INPUT__CLI_PACKAGE) into an action-owned CARGO_TARGET_DIR,
 # then packages the binary plus a self-describing cli-meta.json into a tar so the
 # executable bit survives actions/upload-artifact. Never builds the EdgeZero
 # monorepo CLI.
 #
 # Inputs (environment):
-#   INPUT_CLI_PACKAGE       required  Cargo package name to build
-#   INPUT_CLI_BIN           optional  binary name (defaults to the package name)
-#   INPUT_WORKING_DIRECTORY optional  app dir relative to github.workspace (".")
-#   INPUT_RUST_TOOLCHAIN    optional  explicit toolchain or "auto"
-#   INPUT_ARTIFACT_NAME     optional  uploaded artifact name ("edgezero-cli")
+#   EDGEZERO__INPUT__CLI_PACKAGE         required Cargo package name to build
+#   EDGEZERO__INPUT__CLI_BIN             optional binary name (defaults to the package name)
+#   EDGEZERO__INPUT__WORKING_DIRECTORY   optional app dir relative to github.workspace (".")
+#   EDGEZERO__INPUT__RUST_TOOLCHAIN      optional explicit toolchain or "auto"
+#   EDGEZERO__INPUT__ARTIFACT_NAME       optional uploaded artifact name ("edgezero-cli")
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -35,8 +35,41 @@ parse_toolchain_from_toml() {
   printf '%s\n' "$value"
 }
 
+# The upward search for a toolchain file must not leave the APPLICATION's
+# repository.
+#
+# The adoption guide's recommended layout checks the app out into a subdirectory
+# of a separate deployer repo. Walking to github.workspace would then cross the
+# app's Git boundary and let the *deployer's* `.tool-versions` silently decide
+# which Rust compiles the app. The app's Git root is the honest boundary; fall
+# back to github.workspace when the app dir is not a Git checkout at all.
+#
+# Every path here is canonicalized before comparison. The walk below tests the
+# boundary with a string equality, so a symlinked TMPDIR or checkout would
+# otherwise never match it — and the search would climb straight past the Git
+# root it was meant to stop at.
+resolve_search_boundary() {
+  local app_dir="$1" workspace_root="$2"
+  workspace_root=$(canonical_path "$workspace_root")
+
+  local git_root
+  git_root=$(git -C "$app_dir" rev-parse --show-toplevel 2>/dev/null) || {
+    printf '%s\n' "$workspace_root"
+    return
+  }
+  git_root=$(canonical_path "$git_root")
+
+  # Never search above github.workspace, even if the app's Git root is higher
+  # (a checkout mounted from outside the workspace).
+  if is_under "$workspace_root" "$git_root"; then
+    printf '%s\n' "$git_root"
+  else
+    printf '%s\n' "$workspace_root"
+  fi
+}
+
 # Resolve the application toolchain: explicit input > rustup files (walking up to
-# github.workspace) > .tool-versions > the EdgeZero action repo fallback.
+# the app's Git root) > .tool-versions > the EdgeZero action repo fallback.
 resolve_rust_toolchain() {
   local input="$1" app_dir="$2" workspace_root="$3" action_root="$4"
   if [[ "$input" != "auto" ]]; then
@@ -45,7 +78,12 @@ resolve_rust_toolchain() {
     return
   fi
 
-  local directory="$app_dir" value
+  # Stop at the application repository boundary, not github.workspace.
+  local boundary
+  boundary=$(resolve_search_boundary "$app_dir" "$workspace_root")
+
+  local directory value
+  directory=$(canonical_path "$app_dir")
   while true; do
     if [[ -f "$directory/rust-toolchain.toml" ]]; then
       parse_toolchain_from_toml "$directory/rust-toolchain.toml"
@@ -59,10 +97,14 @@ resolve_rust_toolchain() {
       printf '%s\n' "$value"
       return
     fi
-    [[ "$directory" == "$workspace_root" ]] && break
+    if [[ "$directory" == "$boundary" ]]; then
+      break
+    fi
     local parent
     parent=$(dirname "$directory")
-    [[ "$parent" == "$directory" ]] && break
+    if [[ "$parent" == "$directory" ]]; then
+      break
+    fi
     directory="$parent"
   done
 
@@ -76,18 +118,18 @@ resolve_rust_toolchain() {
 require_linux_x86_64() {
   case "$(uname -s)-$(uname -m)" in
     Linux-x86_64 | Linux-amd64) ;;
-    *) fail "build-cli supports only Linux x86-64 runners" ;;
+    *) fail "build-app-cli supports only Linux x86-64 runners" ;;
   esac
 }
 
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
-  local action_root="${EDGEZERO_ACTION_ROOT:?EDGEZERO_ACTION_ROOT is required}"
-  local cli_package="${INPUT_CLI_PACKAGE:?input 'cli-package' is required}"
-  local cli_bin="${INPUT_CLI_BIN:-}"
-  local working_directory="${INPUT_WORKING_DIRECTORY:-.}"
-  local rust_toolchain_input="${INPUT_RUST_TOOLCHAIN:-auto}"
-  local artifact_name="${INPUT_ARTIFACT_NAME:-edgezero-cli}"
+  local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"
+  local cli_package="${EDGEZERO__INPUT__CLI_PACKAGE:?input 'cli-package' is required}"
+  local cli_bin="${EDGEZERO__INPUT__CLI_BIN:-}"
+  local working_directory="${EDGEZERO__INPUT__WORKING_DIRECTORY:-.}"
+  local rust_toolchain_input="${EDGEZERO__INPUT__RUST_TOOLCHAIN:-auto}"
+  local artifact_name="${EDGEZERO__INPUT__ARTIFACT_NAME:-edgezero-cli}"
 
   # These directories are `rm -rf`d below, so they must NEVER come from the
   # inherited environment — a colliding job-level variable could otherwise point
@@ -160,4 +202,8 @@ main() {
   append_output tarball-path "$tarball"
 }
 
-main "$@"
+# Sourcing this file exposes its functions without running a build, so the
+# contract tests can exercise toolchain resolution directly.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

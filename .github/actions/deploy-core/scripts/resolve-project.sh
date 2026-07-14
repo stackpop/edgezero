@@ -6,9 +6,9 @@ set -euo pipefail
 # (Cargo.lock hash + target/ cache), so nested-workspace monorepos cache the
 # right artifacts. Provider-neutral: no provider names appear here.
 #
-# Inputs (environment): INPUT_WORKING_DIRECTORY, INPUT_MANIFEST,
-# INPUT_RUST_TOOLCHAIN, INPUT_TARGET (required), INPUT_BUILD_MODE, INPUT_CACHE,
-# EDGEZERO_ACTION_ROOT (required), EDGEZERO_CLI_VERSION.
+# Inputs (environment): EDGEZERO__INPUT__WORKING_DIRECTORY, EDGEZERO__INPUT__MANIFEST,
+# EDGEZERO__INPUT__RUST_TOOLCHAIN, EDGEZERO__INPUT__TARGET (required), EDGEZERO__INPUT__BUILD_MODE, EDGEZERO__INPUT__CACHE,
+# EDGEZERO__ACTION__ROOT (required), EDGEZERO__CLI__VERSION.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -85,13 +85,13 @@ assert_committed_source() {
 
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
-  local action_root="${EDGEZERO_ACTION_ROOT:?EDGEZERO_ACTION_ROOT is required}"
-  local working_directory="${INPUT_WORKING_DIRECTORY:-.}"
-  local manifest="${INPUT_MANIFEST:-}"
-  local rust_toolchain_input="${INPUT_RUST_TOOLCHAIN:-auto}"
-  local target="${INPUT_TARGET:?INPUT_TARGET is required (wrapper-provided concrete target)}"
-  local cache="${INPUT_CACHE:-false}"
-  local cli_version="${EDGEZERO_CLI_VERSION:-unknown}"
+  local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"
+  local working_directory="${EDGEZERO__INPUT__WORKING_DIRECTORY:-.}"
+  local manifest="${EDGEZERO__INPUT__MANIFEST:-}"
+  local rust_toolchain_input="${EDGEZERO__INPUT__RUST_TOOLCHAIN:-auto}"
+  local target="${EDGEZERO__INPUT__TARGET:?EDGEZERO__INPUT__TARGET is required (wrapper-provided concrete target)}"
+  local cache="${EDGEZERO__INPUT__CACHE:-false}"
+  local cli_version="${EDGEZERO__CLI__VERSION:-unknown}"
 
   require_cmd git
   require_cmd cargo
@@ -144,7 +144,7 @@ main() {
 
   local rust_toolchain effective_build_mode cache_key
   rust_toolchain=$(resolve_rust_toolchain "$rust_toolchain_input" "$app_dir" "$git_root" "$action_root")
-  effective_build_mode=$(resolve_effective_build_mode "${INPUT_BUILD_MODE:-auto}")
+  effective_build_mode=$(resolve_effective_build_mode "${EDGEZERO__INPUT__BUILD_MODE:-auto}")
   cache_key="edgezero-deploy-${RUNNER_OS:-Linux}-${RUNNER_ARCH:-X64}-$(sanitize_ref "$rust_toolchain")-$(sanitize_ref "$target")-$(sanitize_ref "$cli_version")-${source_revision}-${lock_hash}"
 
   append_output working-directory "$app_dir"

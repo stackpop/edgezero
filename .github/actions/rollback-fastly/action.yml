@@ -3,7 +3,7 @@ description: Roll back a Fastly deployment via the app CLI. Production activates
 
 inputs:
   cli-artifact:
-    description: Name of the build-cli artifact to download and run.
+    description: Name of the build-app-cli artifact to download and run.
     required: true
   cli-bin:
     description: Binary name inside the artifact. Defaults to the artifact metadata.
@@ -36,25 +36,55 @@ runs:
       with:
         name: ${{ inputs['cli-artifact'] }}
         path: ${{ runner.temp }}/edgezero-cli-download
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
 
     - name: Extract CLI
       id: cli
       shell: bash
       env:
-        EDGEZERO_CLI_ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
-        EDGEZERO_TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
-        INPUT_CLI_BIN: ${{ inputs['cli-bin'] }}
+        EDGEZERO__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        EDGEZERO__INPUT__CLI_BIN: ${{ inputs['cli-bin'] }}
         FASTLY_API_TOKEN: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-cli.sh
 
     - name: Rollback
       id: rollback
       shell: bash
       env:
-        CLI_BIN: ${{ steps.cli.outputs['cli-bin'] }}
-        SERVICE_ID: ${{ inputs['fastly-service-id'] }}
-        VERSION: ${{ inputs['fastly-version'] }}
-        DEPLOY_TO: ${{ inputs['deploy-to'] }}
+        EDGEZERO__CLI__BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        EDGEZERO__LIFECYCLE__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
+        EDGEZERO__LIFECYCLE__VERSION: ${{ inputs['fastly-version'] }}
+        EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
         # Only the typed token reaches the CLI; blank any inherited alias.
         FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
         FASTLY_TOKEN: ""
@@ -65,23 +95,17 @@ runs:
         FASTLY_API_ENDPOINT: ""
         FASTLY_API_URL: ""
         FASTLY_PROFILE: ""
-      run: |
-        # A typo in deploy-to must never silently roll back production.
-        case "$DEPLOY_TO" in production | staging) ;; *) echo "::error::input 'deploy-to' must be 'production' or 'staging' (got '$DEPLOY_TO')"; exit 1 ;; esac
-        log="${RUNNER_TEMP:-/tmp}/edgezero-rollback.log"
-        args=("$CLI_BIN" rollback --adapter fastly --service-id "$SERVICE_ID" --version "$VERSION")
-        if [[ "$DEPLOY_TO" == "staging" ]]; then args+=(--staging); fi
-        rc=0
-        "${args[@]}" 2>&1 | tee "$log" || rc=$?
-        rolled=$(grep -oE '^rolled-back-to=[0-9]+' "$log" | tail -n 1 | cut -d= -f2 || true)
-        echo "rolled-back-to=${rolled}" >> "$GITHUB_OUTPUT"
-        # Fail closed: a rollback that did not report what it activated has not
-        # provably rolled anything back.
-        if [[ "$rc" -ne 0 ]]; then
-          echo "::error::rollback failed (CLI exit $rc)"
-          exit "$rc"
-        fi
-        if [[ "$DEPLOY_TO" == "production" && -z "$rolled" ]]; then
-          echo "::error::production rollback reported success but did not emit rolled-back-to"
-          exit 1
-        fi
+        FASTLY_SERVICE_ID: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/scripts/rollback.sh
+
+    - name: Cleanup
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh

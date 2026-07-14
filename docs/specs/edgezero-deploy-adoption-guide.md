@@ -12,7 +12,7 @@ through the Trusted Server deployer as one concrete migration example.
 
 Composable actions:
 
-- `build-cli` — compile the CLI package the application provides (a crate in the
+- `build-app-cli` — compile the CLI package the application provides (a crate in the
   app's own workspace) once, publish it as an artifact;
 - `deploy-fastly` — deploy a checked-out Fastly application using the prebuilt
   CLI artifact, to production or (with `stage: true`) a staged draft version;
@@ -26,7 +26,7 @@ timeouts, and **orchestrating** the health-check / rollback flow.
 ## 2. Checkout layouts
 
 The adapters your CLI supports come from your app's own `Cargo.toml`, so
-`build-cli` takes no `adapters` input — it builds your CLI package as declared.
+`build-app-cli` takes no `adapters` input — it builds your CLI package as declared.
 
 ### 2.1 Same-repository application
 
@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
 
       - id: cli
-        uses: stackpop/edgezero/.github/actions/build-cli@<ref>
+        uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
         with:
           cli-package: my-app-cli # the CLI crate in your app's workspace
 
@@ -93,7 +93,7 @@ steps:
       token: ${{ steps.app-token.outputs.token }}
 
   - id: cli
-    uses: stackpop/edgezero/.github/actions/build-cli@<ref>
+    uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
     with:
       cli-package: my-app-cli
       working-directory: app
@@ -120,7 +120,7 @@ steps:
       persist-credentials: false
 
   - id: cli
-    uses: stackpop/edgezero/.github/actions/build-cli@<ref>
+    uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
     with:
       cli-package: api-cli
       working-directory: apps/api
@@ -140,13 +140,13 @@ steps:
 - Check out application source yourself; the actions never call
   `actions/checkout`.
 - Provide a CLI package in your own workspace and name it via `cli-package`;
-  `build-cli` compiles that package from your checkout, so the CLI and your app
-  never disagree on schema. `build-cli` does not use the EdgeZero monorepo CLI.
+  `build-app-cli` compiles that package from your checkout, so the CLI and your app
+  never disagree on schema. `build-app-cli` does not use the EdgeZero monorepo CLI.
 - Provide typed provider credentials through wrapper inputs, not caller `env:`.
 - Ensure the deployed ref has committed source (no dirty working tree) and a
   `Cargo.lock` at your app's **Cargo workspace root** (the workspace that owns
   `cli-package` — in a nested-workspace monorepo this may be your app
-  subdirectory, not the repo root). `build-cli` requires it, and caching keys on
+  subdirectory, not the repo root). `build-app-cli` requires it, and caching keys on
   it.
 - Pin action references to readable released tags, or full SHAs for production
   reproducibility.
@@ -205,18 +205,18 @@ deployer must handle itself are: internal checkout, `trusted-server-ref`,
 
 Map the legacy trio onto the EdgeZero staging trio:
 
-| Legacy action                              | EdgeZero replacement                           |
-| ------------------------------------------ | ---------------------------------------------- |
-| `fastly/deploy@v2` (with `fastly-staging`) | `build-cli` + `deploy-fastly` (`stage:` input) |
-| `fastly/healthcheck@v2`                    | `healthcheck-fastly`                           |
-| `fastly/rollback@v2`                       | `rollback-fastly`                              |
+| Legacy action                              | EdgeZero replacement                               |
+| ------------------------------------------ | -------------------------------------------------- |
+| `fastly/deploy@v2` (with `fastly-staging`) | `build-app-cli` + `deploy-fastly` (`stage:` input) |
+| `fastly/healthcheck@v2`                    | `healthcheck-fastly`                               |
+| `fastly/rollback@v2`                       | `rollback-fastly`                                  |
 
 Workflow shape:
 
 1. check out `trusted-server-deployer` with `persist-credentials: false`;
 2. check out Trusted Server source separately at the selected ref into
    `trusted-server`;
-3. run `build-cli` with `cli-package: <trusted-server-cli-crate>` and
+3. run `build-app-cli` with `cli-package: <trusted-server-cli-crate>` and
    `working-directory: trusted-server` (Trusted Server's own CLI package, whose
    `Cargo.toml` already pins the Fastly adapter);
 4. run `deploy-fastly` (set `stage: true` for staging) with the CLI artifact,
@@ -234,7 +234,7 @@ Workflow shape:
 
 - Add explicit Trusted Server checkout; the EdgeZero actions do not call
   `actions/checkout`.
-- Replace the legacy `fastly/*@v2` trio with `build-cli` + `deploy-fastly` +
+- Replace the legacy `fastly/*@v2` trio with `build-app-cli` + `deploy-fastly` +
   `healthcheck-fastly` + `rollback-fastly`.
 - Pin action references to readable released tags, or full SHAs for production.
 - Read the version from `steps.<deploy>.outputs.fastly-version` (same concept as

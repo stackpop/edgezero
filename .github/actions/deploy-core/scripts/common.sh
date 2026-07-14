@@ -130,3 +130,60 @@ assert_safe_tarball() {
     fail "refusing CLI archive containing a symlink or hardlink member"
   fi
 }
+
+# ── Lifecycle helpers (deploy / healthcheck / rollback wrappers) ──────────────
+
+# GitHub Actions does NOT enforce `required: true` on action inputs: an omitted
+# or empty input is simply the empty string, and the step runs anyway. So the
+# wrappers must check for themselves — otherwise an empty service-id or version
+# silently reaches the provider.
+require_input() {
+  local name="$1" value="$2"
+  [[ -n "$value" ]] || fail "missing required input '$name'"
+}
+
+require_input_matching() {
+  local name="$1" value="$2" pattern="$3"
+  require_input "$name" "$value"
+  [[ "$value" =~ $pattern ]] || fail "input '$name' must match $pattern"
+}
+
+# The Fastly provider tooling and its pinned release binary are Linux x86-64
+# only. Fail with a clear message rather than a confusing exec error later.
+require_linux_x86_64() {
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64 | Linux-amd64) ;;
+    *) fail "the Fastly wrapper supports only Linux x86-64 runners" ;;
+  esac
+}
+
+# Create a private log file that is REMOVED when the caller exits, whatever the
+# exit status. Provider CLIs print request URLs, service metadata, and — with
+# debug flags — credential material; leaving a raw log behind in RUNNER_TEMP
+# hands it to every later step in the job.
+#
+# Sets the global LIFECYCLE_LOG. Callers must have `set -euo pipefail`.
+LIFECYCLE_LOG=""
+new_private_log() {
+  local dir="${RUNNER_TEMP:-/tmp}"
+  LIFECYCLE_LOG=$(mktemp "$dir/edgezero-lifecycle.XXXXXX")
+  chmod 600 "$LIFECYCLE_LOG"
+  # shellcheck disable=SC2064  # expand LIFECYCLE_LOG now, not at trap time
+  trap "rm -f -- '$LIFECYCLE_LOG'" EXIT
+}
+
+# Read a canonical `<key>=<digits>` line from a log.
+#
+# ANCHORED at both ends on purpose. An unanchored prefix match reads
+# `version=15.2.0` as `15` and `version=12abc` as `12`, threading a version that
+# was never deployed into the healthcheck and rollback that follow. If the value
+# is not exactly digits, we have not parsed a version — we have guessed one.
+read_numeric_line() {
+  local key="$1" log="$2"
+  grep -oE "^${key}=[0-9]+\$" "$log" | tail -n 1 | cut -d= -f2 || true
+}
+
+read_bool_line() {
+  local key="$1" log="$2"
+  grep -oE "^${key}=(true|false)\$" "$log" | tail -n 1 | cut -d= -f2 || true
+}

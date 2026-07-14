@@ -92,8 +92,13 @@ RS
 {
   printf 'token=%s\n' "${FASTLY_API_TOKEN:-MISSING}"
   printf 'service-id=%s\n' "${FASTLY_SERVICE_ID:-MISSING}"
-  # Boundary check: an inherited endpoint alias must have been cleared.
+  # Boundary: inherited provider aliases must have been cleared...
   printf 'endpoint=%s\n' "${FASTLY_ENDPOINT:-CLEARED}"
+  printf 'home=%s\n' "${FASTLY_HOME:-CLEARED}"
+  # ...and the action's own secret-bearing helpers must NOT have survived into
+  # this process: they carry the raw token under names we never promised.
+  printf 'action-token-carrier=%s\n' "${EDGEZERO__FASTLY__API_TOKEN:-CLEARED}"
+  printf 'provider-env-json=%s\n' "${EDGEZERO__PROVIDER__ENV:-CLEARED}"
 } >"${GITHUB_WORKSPACE}/fixture-app/env-seen.txt"
 printf '%s\n' "$@" >"${GITHUB_WORKSPACE}/fixture-app/deploy-argv.txt"
 echo "version=7"

@@ -6,24 +6,26 @@ set -euo pipefail
 #
 # Regression test: the Fastly domain API returns a SINGULAR `staging_ip` string
 # per domain object (`staging_ips` is only the `include=` query param). Reading
-# it as an array silently found no IP and probed production instead.
+# it as an array silently found no IP and probed PRODUCTION instead — a staging
+# check that was quietly testing the wrong thing.
 #
-# Inputs (environment): FAKE_CALL_LOG.
+# Inputs (environment): EDGEZERO__TEST__FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION.
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../scripts/common.sh
+source "$SCRIPT_DIR/../scripts/common.sh"
 
 main() {
-  local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
+  local log="${EDGEZERO__TEST__FAKE_CALL_LOG:?EDGEZERO__TEST__FAKE_CALL_LOG is required}"
+  local staged="${EDGEZERO__TEST__STAGED_VERSION:?EDGEZERO__TEST__STAGED_VERSION is required}"
 
-  if ! grep -qE '^GET https://api\.fastly\.com/service/dummy-service/version/42/domain\?include=staging_ips$' "$log"; then
-    echo "::error::the staging-IP lookup was never performed" >&2
-    return 1
-  fi
+  grep -qE "^GET https://api\.fastly\.com/service/dummy-service/version/$staged/domain\?include=staging_ips\$" "$log" ||
+    fail "the staging-IP lookup was never performed for version $staged"
 
-  if ! grep -qE '^PROBE .*--connect-to ::151\.101\.2\.10:443 .*https://staging\.example\.com/' "$log"; then
-    echo "::error::the probe was not rerouted to the staging IP (singular staging_ip not read?)" >&2
-    return 1
-  fi
+  grep -qE '^PROBE .*--connect-to ::151\.101\.2\.10:443 .*https://staging\.example\.com/' "$log" ||
+    fail "the probe was not rerouted to the staging IP (was the singular staging_ip read?)"
 
-  echo "staging probe was rerouted through the resolved staging IP"
+  notice "staging probe was rerouted through the resolved staging IP"
 }
 
 main "$@"

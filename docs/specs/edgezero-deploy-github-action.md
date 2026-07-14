@@ -9,7 +9,7 @@
 **Action paths:**
 
 ```text
-.github/actions/build-cli
+.github/actions/build-app-cli
 .github/actions/deploy-core
 .github/actions/deploy-fastly
 .github/actions/healthcheck-fastly
@@ -28,9 +28,9 @@ adapter needs (`edgezero build`, `edgezero deploy`, `edgezero config push`,
 `edgezero provision`) already lives in the CLI; the actions only compile the
 CLI, scope credentials, and invoke the right subcommand.
 
-The CLI is **the app's own CLI package.** The application tells `build-cli` which
+The CLI is **the app's own CLI package.** The application tells `build-app-cli` which
 CLI package to compile (a crate in the application's own workspace), and
-`build-cli` builds it from the application checkout. It is **not** the EdgeZero
+`build-app-cli` builds it from the application checkout. It is **not** the EdgeZero
 monorepo CLI and **not** the action's own repository revision. Because the CLI is
 the app's own package, built from the app's source and lockfile, the CLI and the
 application always agree on the manifest, adapter, and config schema — and an app
@@ -40,7 +40,7 @@ Three layers:
 
 | Layer           | Action              | Responsibility                                                                        |
 | --------------- | ------------------- | ------------------------------------------------------------------------------------- |
-| Build           | `build-cli`         | Compile the app-provided CLI package **once** and publish it.                         |
+| Build           | `build-app-cli`     | Compile the app-provided CLI package **once** and publish it.                         |
 | Engine (shared) | `deploy-core`       | Adapter-independent engine **scripts** sourced by wrappers; consume the prebuilt CLI. |
 | Adapter wrapper | `deploy-fastly` (…) | Minimal per-adapter shim: type provider credentials, call the engine.                 |
 
@@ -56,7 +56,7 @@ The core boundary is EdgeZero itself:
 <cli> deploy --adapter <adapter>
 ```
 
-where `<cli>` is the application's own CLI binary built by `build-cli`.
+where `<cli>` is the application's own CLI binary built by `build-app-cli`.
 
 The generic engine stays provider-neutral. Provider-specific staging, health
 checks, and rollback are supported for Fastly as a separate lifecycle (§5.4) —
@@ -73,12 +73,12 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
    credentials and the adapter name. Adding an adapter adds a wrapper; it does
    not fork the engine.
 3. **The caller owns source.** The actions never call `actions/checkout`.
-4. **The application provides the CLI package.** The app tells `build-cli` which
-   CLI package to compile via a required `cli-package` input, and `build-cli`
+4. **The application provides the CLI package.** The app tells `build-app-cli` which
+   CLI package to compile via a required `cli-package` input, and `build-app-cli`
    builds that package from the application's own checkout. It never builds the
    EdgeZero monorepo CLI or the action's own repository revision. The
    application owns which CLI deploys it.
-5. **Compile once, reuse everywhere.** `build-cli` compiles the CLI a single
+5. **Compile once, reuse everywhere.** `build-app-cli` compiles the CLI a single
    time per workflow and publishes it as an artifact. Deploy actions consume the
    prebuilt binary and never recompile it.
 6. **Typed provider credentials.** Credentials are passed through wrapper action
@@ -133,7 +133,7 @@ The **generic** engine (`deploy-core`) will not:
 7. support Windows or macOS runners;
 8. publish a stable version alias; or
 9. provide a general `setup` action for running arbitrary EdgeZero commands
-   (the CLI is available via the `build-cli` artifact for callers who need it).
+   (the CLI is available via the `build-app-cli` artifact for callers who need it).
 
 Staging deploy, health checks, and rollback **are** supported for Fastly, as a
 provider-specific lifecycle (§5.4). The engine stays neutral; the capability is
@@ -142,20 +142,20 @@ own CLI, with thin action wrappers.
 
 ## 5. Architecture
 
-### 5.1 Layer 1 — `build-cli`
+### 5.1 Layer 1 — `build-app-cli`
 
 Compiles the **CLI package the application provides** — a crate in the
 application's own workspace, named by the required `cli-package` input — once,
 and publishes it as a workflow artifact so every downstream deploy step consumes
 the same binary. The CLI is built from the application checkout and its lockfile,
-so it matches the application and may include app-specific commands. `build-cli`
+so it matches the application and may include app-specific commands. `build-app-cli`
 never builds the EdgeZero monorepo CLI.
 
 **Inputs**
 
 | Input               | Required | Default         | Contract                                                                                                                                                     |
 | ------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `cli-package`       | Yes      | none            | Cargo package name of the CLI to build, defined in the application's own workspace. `build-cli` builds this package from the application checkout.           |
+| `cli-package`       | Yes      | none            | Cargo package name of the CLI to build, defined in the application's own workspace. `build-app-cli` builds this package from the application checkout.       |
 | `cli-bin`           | No       | `<cli-package>` | Binary name produced by `cli-package`. Defaults to the package name (the generated downstream CLI names its bin after the package).                          |
 | `working-directory` | No       | `.`             | Application directory (relative to `github.workspace`) containing the workspace/lockfile that defines `cli-package`. Must resolve inside `github.workspace`. |
 | `rust-toolchain`    | No       | `auto`          | Explicit toolchain, or `auto` to follow the application toolchain resolution precedence (§7).                                                                |
@@ -163,7 +163,7 @@ never builds the EdgeZero monorepo CLI.
 
 There is intentionally no `adapters` / features input. The application's own
 `Cargo.toml` already pins which adapters compile into its CLI (through the
-`edgezero-cli` dependency it declares); `build-cli` builds the package exactly as
+`edgezero-cli` dependency it declares); `build-app-cli` builds the package exactly as
 the application declares it, so the app owns adapter selection.
 
 **Outputs**
@@ -208,7 +208,7 @@ The artifact is self-describing: the engine reads `cli-meta.json` to learn the
 binary name and version, so callers do not have to re-pass `cli-bin`/`cli-version`
 (a wrapper `cli-bin` input, if given, overrides the metadata).
 
-`build-cli` never receives provider credentials and leaves the app checkout
+`build-app-cli` never receives provider credentials and leaves the app checkout
 clean (no `target/`, no lockfile mutation), so a later dirty-source guard passes.
 
 > **Companion CLI improvement (tracked separately):** the generated downstream
@@ -233,7 +233,7 @@ The engine is parameterized by the values the wrapper passes to those scripts
 | Parameter            | Meaning                                                                                                                                                                                                                                            |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `adapter`            | Passed to `<cli> deploy --adapter <adapter>`. The engine does **not** enumerate compiled adapters; the CLI rejects an unknown adapter with its own error.                                                                                          |
-| `cli-artifact`       | Name of the `build-cli` artifact to download. The engine reads `cli-bin` and `cli-version` from the artifact's `cli-meta.json`.                                                                                                                    |
+| `cli-artifact`       | Name of the `build-app-cli` artifact to download. The engine reads `cli-bin` and `cli-version` from the artifact's `cli-meta.json`.                                                                                                                |
 | `cli-bin`            | Optional override for the binary name; if empty, taken from `cli-meta.json`.                                                                                                                                                                       |
 | `working-directory`  | Application directory relative to `github.workspace`. Must resolve inside `github.workspace`.                                                                                                                                                      |
 | `manifest`           | Optional `edgezero.toml` path relative to `working-directory`. If set, must exist; exported as `EDGEZERO_MANIFEST`.                                                                                                                                |
@@ -280,7 +280,7 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 | Input               | Required | Default       | Contract                                                                                       |
 | ------------------- | -------- | ------------- | ---------------------------------------------------------------------------------------------- |
-| `cli-artifact`      | Yes      | none          | `build-cli` artifact name. Forwarded to the engine.                                            |
+| `cli-artifact`      | Yes      | none          | `build-app-cli` artifact name. Forwarded to the engine.                                        |
 | `cli-bin`           | No       | from artifact | Binary name inside the artifact. Forwarded to the engine.                                      |
 | `fastly-api-token`  | Yes      | none          | Mapped into `provider-env` as `FASTLY_API_TOKEN`, deploy step only.                            |
 | `fastly-service-id` | Yes      | none          | Mapped into action-owned `deploy-flags` as `--service-id <id>` to prevent accidental creation. |
@@ -329,7 +329,7 @@ The capability is scaffolded into the CLI, not reproduced in action shell:
 
 Every Fastly subcommand takes `--service-id <id>` (the service the operation
 targets) and reads `FASTLY_API_TOKEN` from the environment. The app CLI (built by
-`build-cli`) exposes these subcommands the same way it exposes `deploy`/`config`.
+`build-app-cli`) exposes these subcommands the same way it exposes `deploy`/`config`.
 The downstream CLI template gains `Healthcheck` and `Rollback` arms and a
 deployment-version surface, tracked with the other companion CLI changes.
 
@@ -376,7 +376,7 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
 
 ```yaml
 - id: cli
-  uses: stackpop/edgezero/.github/actions/build-cli@<ref>
+  uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
   with: { cli-package: my-app-cli }
 
 - id: stage
@@ -436,7 +436,7 @@ adapter adds its own lifecycle actions if its provider supports staging.
     escapes `github.workspace` or is not a regular file, and export
     `EDGEZERO_MANIFEST`.
 11. Resolve the application **Git root**; record `source-revision`; fail on a
-    dirty working tree (`build-cli` used an isolated `CARGO_TARGET_DIR`, so its
+    dirty working tree (`build-app-cli` used an isolated `CARGO_TARGET_DIR`, so its
     CLI build did not dirty this tree).
 12. Resolve the **Cargo workspace root** for `working-directory` (§11.1) for all
     Cargo-scoped operations that follow.
@@ -480,7 +480,7 @@ Application Rust toolchain resolution precedence:
 
 At each directory, Rustup-native files take precedence over `.tool-versions`.
 Malformed toolchain files fail instead of silently selecting a different
-compiler. `build-cli` uses the same precedence for the CLI build.
+compiler. `build-app-cli` uses the same precedence for the CLI build.
 
 ## 8. Build behavior
 
@@ -545,7 +545,7 @@ wrapper inputs (typed) → provider-env {NAME: value} → deploy step env → CL
 Rules:
 
 - **`provider-env` is bound only to the deploy step's own `env:`** — a
-  step-scoped environment, not a job/engine-global variable. Setup, `build-cli`,
+  step-scoped environment, not a job/engine-global variable. Setup, `build-app-cli`,
   and separate build steps never receive the `provider-env` variable at all, so
   the secret-bearing blob is absent from their environments (not merely unset
   after the fact). The engine parses `provider-env` only inside the deploy step.
@@ -557,11 +557,68 @@ Rules:
   provider names, so caller `env:` cannot override the typed contract.
 - `provider-env` values never reach `GITHUB_ENV`, `GITHUB_OUTPUT`, caches, or
   summaries.
+- **The engine's own private environment is scrubbed before the CLI is exec'd.**
+  The wrapper necessarily carries the token into the deploy step twice — once as
+  `EDGEZERO__<PROVIDER>_API_TOKEN` (so the step's YAML can build the JSON without
+  interpolating a secret into a `run:` block, itself a template-injection sink),
+  and once inside `EDGEZERO__PROVIDER_ENV`. Both are secret-bearing. `run-cli.sh`
+  therefore unsets its entire private namespace (§10.2) after reading it, so the
+  app CLI — and every subprocess it spawns, including a manifest
+  `[adapters.*.commands]` shell command — receives **only** the typed provider
+  aliases plus `EDGEZERO_MANIFEST`. Without this, an `env`-dumping build script
+  would print the raw token under a name we never promised.
+- Every step of a wrapper — shell steps and third-party `uses:` steps alike —
+  blanks the full alias list in its own `env:`. The list a wrapper blanks and the
+  list it passes as `provider-env-clear` are the same list.
 
 Application (non-credential) configuration may still pass through normal
 workflow `env:`.
 
-### 10.1 Build-in-deploy caveat (trusted source requirement)
+### 10.1 Action-owned passthrough arguments
+
+The deploy-arg allowlist (§9) governs **caller** input. A wrapper may also
+prepend args of its own, which are not caller input and so are not
+allowlist-checked. For Fastly that is `--non-interactive`.
+
+It is needed because the two deploy paths differ. The built-in Fastly deploy
+appends `--non-interactive` for itself, but a deploy declared as a manifest
+command (`[adapters.fastly.commands] deploy = "fastly compute deploy"` — a
+documented, common configuration) is run as a shell command with the adapter args
+appended verbatim, so nothing would add it and the deploy could block on a TTY
+prompt in CI. Supplying it from the wrapper covers both paths; the built-in path
+de-duplicates it (both `--non-interactive` and `-i`).
+
+Action-owned args are prepended, so a caller arg still wins where the provider
+CLI takes last-wins. A caller cannot smuggle one in through `deploy-args` — the
+allowlist still rejects it.
+
+### 10.2 Environment variable convention
+
+Every variable the actions own lives in one namespace:
+
+```text
+EDGEZERO__<SECTION>__<NAME>
+         ^^        ^^
+         `__` separates sections; `_` separates words within a section.
+```
+
+Sections in use: `ACTION` (action-owned dirs), `INPUT` (raw wrapper inputs),
+`PROJECT` (working directory, manifest), `CLI` (the app CLI artifact), `BUILD` /
+`DEPLOY` (argument files), `PROVIDER` (the credential JSON and its clear list),
+`RUNNER`, `LIFECYCLE` (healthcheck/rollback parameters), `SUMMARY`, `FASTLY`
+(provider-specific), and `TEST`.
+
+This is not cosmetic. It is what makes the credential boundary (§10) a **single
+rule**: `run-cli.sh` unsets everything matching `EDGEZERO__*` before exec'ing the
+app CLI. With the previous mix of `DEPLOY_*`, `INPUT_*`, `SUMMARY_*`, and bare
+`CLI_BIN` / `VERSION`, the scrub needed a hand-maintained list — and a variable
+added later without touching that list would have silently leaked.
+
+`EDGEZERO_MANIFEST` (**single** underscore) is deliberately outside the
+namespace: it is the CLI's own public contract, not an action variable, and it is
+the one variable the actions deliberately pass through.
+
+### 10.3 Build-in-deploy caveat (trusted source requirement)
 
 Some adapters compile the application **inside** the deploy step. Fastly's
 default `build-mode: never` relies on `<cli> deploy`, which runs
@@ -571,7 +628,7 @@ application is compiled while `FASTLY_API_TOKEN` is in scope.
 
 This is an explicit, accepted boundary, not an oversight:
 
-- The action still guarantees credentials are absent from setup, `build-cli`,
+- The action still guarantees credentials are absent from setup, `build-app-cli`,
   and any separate `build-mode: always` build step.
 - Because deploy may still recompile, a credential-free `always` prebuild does
   not remove the exposure; it only front-loads a validation build.
@@ -603,6 +660,19 @@ Cargo-scoped operations — lockfile hashing, lockfile presence checks, and
 `target/` caching — use the **Cargo workspace root**. Git-scoped operations use
 the **Git root**.
 
+The **application's Git root is also the toolchain search boundary.**
+`build-app-cli` resolves the Rust toolchain by walking up from
+`working-directory` looking for `rust-toolchain.toml`, `rust-toolchain`, then
+`.tool-versions` — and that walk stops at the app's Git root, never at
+`github.workspace`. In the separate-repository layout the deployer repo sits at
+`github.workspace` with the application checked out into a subdirectory; walking
+to `github.workspace` would cross the app's Git boundary and let the _deployer's_
+`.tool-versions` silently decide which Rust compiles the application. Every path
+is canonicalized before comparison, because a symlinked `TMPDIR` or checkout
+would otherwise never match the boundary and the walk would climb straight past
+it. When the app directory is not a Git checkout, the boundary falls back to
+`github.workspace`; the walk never rises above it either way.
+
 ### 11.2 Cache contents and key
 
 When enabled, cache only the resolved **Cargo workspace root** `target/`. Never
@@ -625,6 +695,30 @@ enabled/disabled and key fingerprint, and final result.
 Never log provider credentials, full process environments, application secret
 values, or provider auth state.
 
+### 12.1 Action-owned logs are private and transient
+
+The deploy, healthcheck, and rollback wrappers tee the CLI's combined output to a
+file so they can parse a canonical `version=<N>` / `healthy=<bool>` line out of
+it. Provider CLIs print request URLs and service metadata, and under debug flags
+can print credential material — so that file is created with `mktemp` at mode
+`600` and removed by an `EXIT` trap whatever the outcome. It is never left behind
+in `RUNNER_TEMP` for a later step in the job to read.
+
+Canonical lines are matched with a **fully anchored** pattern (`^<key>=[0-9]+$`).
+A prefix match reads `version=15.2.0` as `15` and `version=12abc` as `12` —
+threading a version that was never deployed into the healthcheck and rollback that
+follow. If the value is not exactly digits, the version has not been parsed, it
+has been guessed; the wrapper fails instead. The CLI's own parser is anchored the
+same way, and falls back to the Fastly API rather than guessing.
+
+### 12.2 Cleanup removes only what the action owns
+
+Cleanup runs `rm -rf`, so it removes only real paths strictly beneath
+`RUNNER_TEMP`, resolving symlinks before comparing. A directory named by an
+inherited variable — or any path outside the action-owned temp root — is refused
+with a diagnostic, not deleted. Every wrapper that installs a tool or extracts the
+CLI artifact runs cleanup with `if: always()`.
+
 ## 13. Error handling
 
 All validation and setup failures stop before invoking provider deployment.
@@ -632,7 +726,7 @@ All validation and setup failures stop before invoking provider deployment.
 | Failure                                         | Required diagnostic                                                             |
 | ----------------------------------------------- | ------------------------------------------------------------------------------- |
 | Missing/unknown `cli-package`                   | State that the app must name a CLI package present in its own workspace.        |
-| Missing `cli-artifact`                          | State that a compiled CLI artifact from `build-cli` is required.                |
+| Missing `cli-artifact`                          | State that a compiled CLI artifact from `build-app-cli` is required.            |
 | Malformed `adapter` token                       | Name the input and its allowed shape (the CLI validates support at run time).   |
 | Invalid boolean                                 | Name the input and allowed values.                                              |
 | Missing working directory                       | Print the workspace-relative requested path.                                    |
@@ -663,7 +757,7 @@ actions never construct error messages containing credentials.
 2. Compile the CLI package the application provides, from the application
    checkout and its lockfile; do not build the EdgeZero monorepo CLI or the
    action's own revision.
-3. Compile the CLI once in `build-cli`; deploy steps consume the artifact and
+3. Compile the CLI once in `build-app-cli`; deploy steps consume the artifact and
    never recompile.
 4. Download provider tools and validation binaries only from official release
    locations and verify SHA-256 checksums.
@@ -727,7 +821,7 @@ Fastly wrapper:
   profile/interactive/short-flag/debug overrides);
 - build-mode resolution and build-failure-prevents-deploy;
 - deploy exit-code propagation;
-- credential presence validation and scoping (absent from build-cli/setup/build,
+- credential presence validation and scoping (absent from build-app-cli/setup/build,
   present only in deploy);
 - cache key construction and missing-lockfile failure;
 - staging lifecycle: `stage` flag adds `--stage`; `fastly-version` parsed from CLI
@@ -742,7 +836,7 @@ Tests must not need live provider credentials.
 ### 15.3 Composite smoke test
 
 A workflow exercises the layered actions end to end with a minimal fixture
-EdgeZero app: run `build-cli`, then `deploy-fastly` (both production and
+EdgeZero app: run `build-app-cli`, then `deploy-fastly` (both production and
 `stage: true`), then `healthcheck-fastly` and `rollback-fastly`. Fake the
 dependencies each action actually uses:
 
@@ -768,7 +862,7 @@ healthcheck → rollback, cache behavior, credential scope, and public outputs.
 ## 16. Documentation requirements
 
 User-facing docs must cover: the three-layer model and when to use each action;
-how `build-cli` compiles the app-provided CLI package; supported adapters and how new adapters
+how `build-app-cli` compiles the app-provided CLI package; supported adapters and how new adapters
 layer on; runner support; same-repo, separate-repo, and monorepo checkout
 examples; complete input/output tables per action; typed provider credential
 guidance and why credentials must not pass through caller `env:`; build-mode and
@@ -780,9 +874,9 @@ adapter notes.
 
 The design is implemented when:
 
-1. A caller can compile the CLI once with `build-cli` and deploy a checked-out
+1. A caller can compile the CLI once with `build-app-cli` and deploy a checked-out
    EdgeZero application with `deploy-fastly`, reusing the same CLI artifact.
-2. `build-cli` compiles the app-provided `cli-package` from the application
+2. `build-app-cli` compiles the app-provided `cli-package` from the application
    checkout and never builds the EdgeZero monorepo CLI or the action's own
    revision.
 3. `deploy-core` contains no provider-specific credential names, service

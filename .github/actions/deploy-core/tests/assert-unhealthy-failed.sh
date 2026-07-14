@@ -7,11 +7,11 @@ set -euo pipefail
 # probe lets the action succeed, no caller would ever roll back — so this is the
 # single most important contract in the lifecycle.
 #
-# Inputs (environment): OUTCOME (the step's outcome), HEALTHY (its output).
+# Inputs (environment): EDGEZERO__TEST__OUTCOME (the step's outcome), EDGEZERO__TEST__HEALTHY (its output).
 
 main() {
-  local outcome="${OUTCOME:?OUTCOME is required}"
-  local healthy="${HEALTHY:-}"
+  local outcome="${EDGEZERO__TEST__OUTCOME:?EDGEZERO__TEST__OUTCOME is required}"
+  local healthy="${EDGEZERO__TEST__HEALTHY:-}"
 
   if [[ "$outcome" != "failure" ]]; then
     echo "::error::an unhealthy probe did not fail healthcheck-fastly (outcome=$outcome)" >&2

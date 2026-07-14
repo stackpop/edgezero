@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Extracts the build-cli artifact tar (downloaded by actions/download-artifact)
+# Extracts the build-app-cli artifact tar (downloaded by actions/download-artifact)
 # into an action-owned tool dir, preserving the executable bit, reads the
 # self-describing cli-meta.json, and prepends the dir to PATH for action steps.
-# A wrapper-supplied INPUT_CLI_BIN overrides the metadata's binary name.
+# A wrapper-supplied EDGEZERO__INPUT__CLI_BIN overrides the metadata's binary name.
 #
 # Inputs (environment):
-#   EDGEZERO_CLI_ARTIFACT_DIR  required  dir containing the downloaded tar
-#   INPUT_CLI_BIN              optional  override for the binary name
-#   EDGEZERO_TOOL_ROOT         optional  install dir (defaults under RUNNER_TEMP)
+#   EDGEZERO__CLI__ARTIFACT_DIR          required dir containing the downloaded tar
+#   EDGEZERO__INPUT__CLI_BIN             optional override for the binary name
+#   EDGEZERO__ACTION__TOOL_ROOT          optional install dir (defaults under RUNNER_TEMP)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-# Locate the single CLI tar produced by build-cli within the downloaded artifact.
+# Locate the single CLI tar produced by build-app-cli within the downloaded artifact.
 find_cli_tarball() {
   local artifact_dir="$1"
   find "$artifact_dir" -maxdepth 2 -type f -name '*.tar' | head -n 1
 }
 
 main() {
-  local artifact_dir="${EDGEZERO_CLI_ARTIFACT_DIR:?EDGEZERO_CLI_ARTIFACT_DIR is required}"
-  local cli_bin_override="${INPUT_CLI_BIN:-}"
-  local tool_root="${EDGEZERO_TOOL_ROOT:-${RUNNER_TEMP:-/tmp}/edgezero-action-tools}"
+  local artifact_dir="${EDGEZERO__CLI__ARTIFACT_DIR:?EDGEZERO__CLI__ARTIFACT_DIR is required}"
+  local cli_bin_override="${EDGEZERO__INPUT__CLI_BIN:-}"
+  local tool_root="${EDGEZERO__ACTION__TOOL_ROOT:-${RUNNER_TEMP:-/tmp}/edgezero-action-tools}"
 
   require_cmd jq
   require_cmd tar
@@ -59,7 +59,7 @@ main() {
   notice "using app CLI '$cli_bin' v$cli_version from artifact"
   append_output cli-bin "$cli_bin"
   append_output cli-version "$cli_version"
-  append_env EDGEZERO_TOOL_ROOT "$tool_root"
+  append_env EDGEZERO__ACTION__TOOL_ROOT "$tool_root"
 }
 
 main "$@"

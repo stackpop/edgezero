@@ -3,7 +3,7 @@ name: Deploy actions
 on:
   pull_request:
     paths:
-      - .github/actions/build-cli/**
+      - .github/actions/build-app-cli/**
       - .github/actions/deploy-core/**
       - .github/actions/deploy-fastly/**
       - .github/actions/healthcheck-fastly/**
@@ -17,7 +17,7 @@ on:
   push:
     branches: [main]
     paths:
-      - .github/actions/build-cli/**
+      - .github/actions/build-app-cli/**
       - .github/actions/deploy-core/**
       - .github/actions/deploy-fastly/**
       - .github/actions/healthcheck-fastly/**
@@ -70,7 +70,7 @@ jobs:
         run: |
           zizmor --offline \
             .github/workflows/deploy-action.yml \
-            .github/actions/build-cli/action.yml \
+            .github/actions/build-app-cli/action.yml \
             .github/actions/deploy-fastly/action.yml \
             .github/actions/healthcheck-fastly/action.yml \
             .github/actions/rollback-fastly/action.yml
@@ -86,7 +86,7 @@ jobs:
         # not a real defect. Everything else is checked.
         run: |
           shellcheck -e SC1091 \
-            .github/actions/build-cli/scripts/*.sh \
+            .github/actions/build-app-cli/scripts/*.sh \
             .github/actions/deploy-core/scripts/*.sh \
             .github/actions/deploy-core/tests/*.sh \
             .github/actions/deploy-fastly/scripts/*.sh
@@ -108,22 +108,23 @@ jobs:
   # and readable outside the YAML.
   composite-smoke:
     runs-on: ubuntu-24.04
-    # An inherited provider alias the deploy MUST clear (provider-env boundary).
+    # Inherited provider aliases the deploy MUST clear (provider-env boundary).
     env:
       FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
       # The fixture is a REAL app-owned CLI (its own crate depending on
-      # edgezero-cli) — the contract build-cli actually promises.
+      # edgezero-cli) — the contract build-app-cli actually promises.
       - name: Create fixture app (app-owned CLI)
         run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
 
       - name: Build the APP's own CLI package
         id: cli
-        uses: ./.github/actions/build-cli
+        uses: ./.github/actions/build-app-cli
         with:
           cli-package: fixture-app-cli
           working-directory: fixture-app
@@ -141,15 +142,24 @@ jobs:
 
       - name: Assert production deploy, version threading, and credential boundary
         env:
-          FASTLY_VERSION_OUT: ${{ steps.deploy.outputs['fastly-version'] }}
+          EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs['fastly-version'] }}
         run: .github/actions/deploy-core/tests/assert-production-deploy.sh
 
-  # Staging path: the full lifecycle (stage -> healthcheck -> rollback) against
-  # fake `fastly`/`curl` binaries that mirror the real contracts. Because the
-  # bugs a review found were argv/verb bugs, the assertions check argv and verbs
-  # — see the assert-*.sh scripts for what each one regression-tests.
+  # Staging path: the full lifecycle through the REAL wrappers — deploy-fastly
+  # with `stage: true`, then healthcheck-fastly, then rollback-fastly — against
+  # fake `fastly`/`curl` binaries that mirror the real contracts.
+  #
+  # The version is never hard-coded: it is threaded out of the deploy action's
+  # `fastly-version` output and into the two lifecycle actions, which is the
+  # contract an operator's workflow depends on. Because the defects a review
+  # found were argv/verb defects, the assertions check argv and verbs — see the
+  # assert-*.sh scripts for what each one regression-tests.
   lifecycle-smoke:
     runs-on: ubuntu-24.04
+    # Inherited provider aliases that every step MUST clear.
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
     steps:
       - uses: actions/checkout@v4
         with:
@@ -160,33 +170,31 @@ jobs:
 
       - name: Build the APP's own CLI package
         id: cli
-        uses: ./.github/actions/build-cli
+        uses: ./.github/actions/build-app-cli
         with:
           cli-package: fixture-app-cli
           working-directory: fixture-app
 
+      # Seeds the action-owned tool root with a fake `fastly` reporting the
+      # pinned version, so install-fastly.sh adopts it and the staged path runs
+      # through the real wrapper without contacting Fastly.
       - name: Install fake fastly + curl
         run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
 
-      - name: Download the app CLI artifact
-        uses: actions/download-artifact@v4
+      - name: Staged deploy through the deploy-fastly wrapper
+        id: stage
+        uses: ./.github/actions/deploy-fastly
         with:
-          name: ${{ steps.cli.outputs.artifact-name }}
-          path: cli-dl
-
-      - name: Extract the app CLI
-        env:
-          CLI_BIN: ${{ steps.cli.outputs.cli-bin }}
-        run: .github/actions/deploy-core/tests/extract-cli.sh
-
-      - name: Staged deploy
-        env:
-          CLI_BIN: ${{ steps.cli.outputs.cli-bin }}
-          FASTLY_API_TOKEN: dummy-token
-          FASTLY_SERVICE_ID: dummy-service
-        run: .github/actions/deploy-core/tests/staged-deploy.sh
+          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          fastly-service-id: dummy-service
+          deploy-args: '["--comment","staged smoke"]'
+          stage: true
 
       - name: Assert the staged Fastly call sequence
+        env:
+          EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
         run: .github/actions/deploy-core/tests/assert-staged-calls.sh
 
       - name: Health check the staged version
@@ -195,13 +203,15 @@ jobs:
           cli-artifact: ${{ steps.cli.outputs.artifact-name }}
           deploy-to: staging
           domain: staging.example.com
-          fastly-version: "42"
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
           retry: "1"
           retry-delay: "1"
 
       - name: Assert the staging IP was resolved and probed
+        env:
+          EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
         run: .github/actions/deploy-core/tests/assert-staging-probe.sh
 
       - name: Health check must FAIL when the probe is unhealthy
@@ -212,19 +222,19 @@ jobs:
           cli-artifact: ${{ steps.cli.outputs.artifact-name }}
           deploy-to: staging
           domain: staging.example.com
-          fastly-version: "42"
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
           retry: "1"
           retry-delay: "1"
         env:
           # Flips the fake probe to 503 for this step only.
-          FORCE_UNHEALTHY: "1"
+          EDGEZERO__TEST__FORCE_UNHEALTHY: "1"
 
       - name: Assert the unhealthy check failed the wrapper
         env:
-          OUTCOME: ${{ steps.unhealthy.outcome }}
-          HEALTHY: ${{ steps.unhealthy.outputs.healthy }}
+          EDGEZERO__TEST__OUTCOME: ${{ steps.unhealthy.outcome }}
+          EDGEZERO__TEST__HEALTHY: ${{ steps.unhealthy.outputs.healthy }}
         run: .github/actions/deploy-core/tests/assert-unhealthy-failed.sh
 
       - name: Roll back the staged version
@@ -232,7 +242,7 @@ jobs:
         with:
           cli-artifact: ${{ steps.cli.outputs.artifact-name }}
           deploy-to: staging
-          fastly-version: "42"
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
 
@@ -242,11 +252,12 @@ jobs:
         with:
           cli-artifact: ${{ steps.cli.outputs.artifact-name }}
           deploy-to: production
-          fastly-version: "42"
+          fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
 
       - name: Assert rollback verbs, paths, and version threading
         env:
-          ROLLED_BACK_TO: ${{ steps.prod-rollback.outputs['rolled-back-to'] }}
+          EDGEZERO__TEST__STAGED_VERSION: ${{ steps.stage.outputs['fastly-version'] }}
+          EDGEZERO__TEST__ROLLED_BACK_TO: ${{ steps.prod-rollback.outputs['rolled-back-to'] }}
         run: .github/actions/deploy-core/tests/assert-rollback-calls.sh

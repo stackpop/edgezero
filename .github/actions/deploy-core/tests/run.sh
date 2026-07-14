@@ -65,16 +65,16 @@ run_validate_inputs() {
   local state_dir
   state_dir=$(mktemp -d "$WORK_DIR/validate.XXXXXX")
   env -i PATH="$PATH" \
-    INPUT_ADAPTER="${VALIDATE_ADAPTER:-fastly}" \
-    INPUT_CACHE="${VALIDATE_CACHE:-false}" \
-    INPUT_BUILD_MODE="${VALIDATE_BUILD_MODE:-auto}" \
-    INPUT_BUILD_ARGS="${VALIDATE_BUILD_ARGS:-[]}" \
-    INPUT_DEPLOY_ARGS="${VALIDATE_DEPLOY_ARGS:-[]}" \
-    INPUT_DEPLOY_FLAGS="${VALIDATE_DEPLOY_FLAGS:-[]}" \
-    INPUT_PROVIDER_ENV_CLEAR="${VALIDATE_PROVIDER_ENV_CLEAR:-[]}" \
-    INPUT_DEPLOY_ARG_ALLOW="${VALIDATE_ALLOW:-}" \
-    INPUT_STAGE="${VALIDATE_STAGE:-false}" \
-    EDGEZERO_ACTION_STATE_DIR="$state_dir" \
+    EDGEZERO__INPUT__ADAPTER="${VALIDATE_ADAPTER:-fastly}" \
+    EDGEZERO__INPUT__CACHE="${VALIDATE_CACHE:-false}" \
+    EDGEZERO__INPUT__BUILD_MODE="${VALIDATE_BUILD_MODE:-auto}" \
+    EDGEZERO__INPUT__BUILD_ARGS="${VALIDATE_BUILD_ARGS:-[]}" \
+    EDGEZERO__INPUT__DEPLOY_ARGS="${VALIDATE_DEPLOY_ARGS:-[]}" \
+    EDGEZERO__INPUT__DEPLOY_FLAGS="${VALIDATE_DEPLOY_FLAGS:-[]}" \
+    EDGEZERO__INPUT__PROVIDER_ENV_CLEAR="${VALIDATE_PROVIDER_ENV_CLEAR:-[]}" \
+    EDGEZERO__INPUT__DEPLOY_ARG_ALLOW="${VALIDATE_ALLOW:-}" \
+    EDGEZERO__INPUT__STAGE="${VALIDATE_STAGE:-false}" \
+    EDGEZERO__ACTION__STATE_DIR="$state_dir" \
     GITHUB_OUTPUT="$state_dir/output.txt" \
     bash "$CORE_SCRIPTS/validate-inputs.sh"
 }
@@ -95,16 +95,16 @@ test_validate_inputs() {
 }
 
 # ---------------------------------------------------------------------------
-# build-cli artifact-name — never usable as a path traversal
+# build-app-cli artifact-name — never usable as a path traversal
 # ---------------------------------------------------------------------------
 check_artifact_name() {
-  # Run validate_artifact_name from build-cli's common.sh in a subshell.
+  # Run validate_artifact_name from build-app-cli's common.sh in a subshell.
   bash -c 'source "$1"; validate_artifact_name "$2"' _ \
-    "$ACTIONS_DIR/build-cli/scripts/common.sh" "$1"
+    "$ACTIONS_DIR/build-app-cli/scripts/common.sh" "$1"
 }
 
 test_artifact_name() {
-  section "build-cli artifact-name"
+  section "build-app-cli artifact-name"
   assert_succeeds "accepts a conservative artifact name" check_artifact_name "edgezero-cli.v1"
   assert_fails "rejects path traversal ('../x')" check_artifact_name "../x"
   assert_fails "rejects path separators ('a/b')" check_artifact_name "a/b"
@@ -113,15 +113,15 @@ test_artifact_name() {
 }
 
 # ---------------------------------------------------------------------------
-# build-cli reset_owned_dir — never rm -rf outside the action-owned temp root
+# build-app-cli reset_owned_dir — never rm -rf outside the action-owned temp root
 # ---------------------------------------------------------------------------
 check_owned_dir() {
   bash -c 'source "$1"; reset_owned_dir "$2" "$3"' _ \
-    "$ACTIONS_DIR/build-cli/scripts/common.sh" "$1" "$2"
+    "$ACTIONS_DIR/build-app-cli/scripts/common.sh" "$1" "$2"
 }
 
 test_owned_dir_confinement() {
-  section "build-cli owned-dir confinement"
+  section "build-app-cli owned-dir confinement"
   local temp_root="$WORK_DIR/temproot"
   mkdir -p "$temp_root"
   assert_succeeds "recreates a dir beneath the temp root" \
@@ -198,10 +198,10 @@ EOF
 
   run_deploy_pe() {
     env -i PATH="$bin_dir:$PATH" \
-      EDGEZERO_CLI_BIN=fakecli EDGEZERO_ADAPTER=fastly \
-      EDGEZERO_WORKING_DIRECTORY="$app_dir" \
-      DEPLOY_PROVIDER_ENV_CLEAR_FILE="$clear" \
-      DEPLOY_PROVIDER_ENV="$1" \
+      EDGEZERO__CLI__BIN=fakecli EDGEZERO__ADAPTER=fastly \
+      EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
+      EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$clear" \
+      EDGEZERO__PROVIDER__ENV="$1" \
       FASTLY_API_TOKEN=inherited-BAD FASTLY_ENDPOINT=https://inherited.invalid \
       bash "$CORE_SCRIPTS/run-cli.sh" deploy
   }
@@ -242,11 +242,11 @@ EOF
   printf -- '--comment\0hello\0' >"$WORK_DIR/deploy-args.nul"
 
   if env -i PATH="$bin_dir:$PATH" \
-    EDGEZERO_CLI_BIN=fakecli \
-    EDGEZERO_ADAPTER=fastly \
-    EDGEZERO_WORKING_DIRECTORY="$app_dir" \
-    DEPLOY_FLAGS_FILE="$WORK_DIR/deploy-flags.nul" \
-    DEPLOY_ARGS_FILE="$WORK_DIR/deploy-args.nul" \
+    EDGEZERO__CLI__BIN=fakecli \
+    EDGEZERO__ADAPTER=fastly \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
+    EDGEZERO__DEPLOY__FLAGS_FILE="$WORK_DIR/deploy-flags.nul" \
+    EDGEZERO__DEPLOY__ARGS_FILE="$WORK_DIR/deploy-args.nul" \
     bash "$CORE_SCRIPTS/run-cli.sh" deploy >/dev/null 2>&1; then
     local expected
     expected=$'deploy\n--adapter\nfastly\n--service-id\nabc\n--stage\n--\n--comment\nhello'
@@ -279,8 +279,8 @@ EOF
 
   local output_file="$WORK_DIR/download-output.txt"
   if env -i PATH="$PATH" \
-    EDGEZERO_CLI_ARTIFACT_DIR="$artifact_dir" \
-    EDGEZERO_TOOL_ROOT="$WORK_DIR/tools" \
+    EDGEZERO__CLI__ARTIFACT_DIR="$artifact_dir" \
+    EDGEZERO__ACTION__TOOL_ROOT="$WORK_DIR/tools" \
     GITHUB_OUTPUT="$output_file" \
     GITHUB_PATH="$WORK_DIR/download-path.txt" \
     bash "$CORE_SCRIPTS/download-cli.sh" >/dev/null 2>&1; then
@@ -316,6 +316,191 @@ test_fastly_versions() {
 }
 
 # ---------------------------------------------------------------------------
+# cleanup.sh — it runs `rm -rf`, so confinement is the whole contract
+# ---------------------------------------------------------------------------
+test_cleanup_confinement() {
+  section "cleanup confinement"
+  local temp_root="$WORK_DIR/cleanup-temp" outside="$WORK_DIR/cleanup-outside"
+  mkdir -p "$temp_root/owned" "$outside/checkout"
+
+  RUNNER_TEMP="$temp_root" EDGEZERO__ACTION__TOOL_ROOT="$temp_root/owned" \
+    EDGEZERO__ACTION__STATE_DIR="" "$CORE_SCRIPTS/cleanup.sh" >/dev/null 2>&1 || true
+  assert_fails "removes an action-owned dir beneath RUNNER_TEMP" test -d "$temp_root/owned"
+
+  # The original defect: cleanup removed $EDGEZERO_FASTLY_HOME, a variable the
+  # action never set — so its value could only ever be inherited. Any dir handed
+  # to cleanup from outside the temp root must be refused, not deleted.
+  RUNNER_TEMP="$temp_root" EDGEZERO__ACTION__TOOL_ROOT="$outside/checkout" \
+    EDGEZERO__ACTION__STATE_DIR="" "$CORE_SCRIPTS/cleanup.sh" >/dev/null 2>&1 || true
+  assert_succeeds "refuses a dir outside RUNNER_TEMP (the checkout survives)" test -d "$outside/checkout"
+
+  # A symlink must not smuggle the removal out of the temp root either.
+  ln -s "$outside/checkout" "$temp_root/link-out"
+  RUNNER_TEMP="$temp_root" EDGEZERO__ACTION__TOOL_ROOT="$temp_root/link-out" \
+    EDGEZERO__ACTION__STATE_DIR="" "$CORE_SCRIPTS/cleanup.sh" >/dev/null 2>&1 || true
+  assert_succeeds "refuses a symlink pointing outside RUNNER_TEMP" test -d "$outside/checkout"
+
+  RUNNER_TEMP="" EDGEZERO__ACTION__TOOL_ROOT="$outside/checkout" \
+    assert_succeeds "no RUNNER_TEMP: removes nothing" "$CORE_SCRIPTS/cleanup.sh"
+}
+
+# ---------------------------------------------------------------------------
+# run-cli.sh — the action's private env must not survive into the app CLI
+# ---------------------------------------------------------------------------
+test_action_env_scrub() {
+  section "action-private env scrub"
+  local dir="$WORK_DIR/scrub"
+  mkdir -p "$dir/bin"
+  # A stand-in CLI that reports the environment it was handed.
+  cat >"$dir/bin/scrub-cli" <<'CLI'
+#!/usr/bin/env bash
+printf 'FASTLY_API_TOKEN=%s\n' "${FASTLY_API_TOKEN:-ABSENT}"
+printf 'EDGEZERO__PROVIDER__ENV=%s\n' "${EDGEZERO__PROVIDER__ENV:-ABSENT}"
+printf 'EDGEZERO__FASTLY__API_TOKEN=%s\n' "${EDGEZERO__FASTLY__API_TOKEN:-ABSENT}"
+printf 'EDGEZERO__DEPLOY__ARGS_FILE=%s\n' "${EDGEZERO__DEPLOY__ARGS_FILE:-ABSENT}"
+printf 'EDGEZERO_MANIFEST=%s\n' "${EDGEZERO_MANIFEST:-ABSENT}"
+CLI
+  chmod +x "$dir/bin/scrub-cli"
+  printf 'FASTLY_API_TOKEN\0' >"$dir/clear.nul"
+
+  local out
+  out=$(
+    PATH="$dir/bin:$PATH" \
+      EDGEZERO__CLI__BIN=scrub-cli EDGEZERO__ADAPTER=fastly EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir" \
+      EDGEZERO__PROJECT__MANIFEST_PATH="$dir/edgezero.toml" \
+      EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
+      EDGEZERO__PROVIDER__ENV='{"FASTLY_API_TOKEN":"s3cret"}' \
+      EDGEZERO__FASTLY__API_TOKEN='s3cret' \
+      "$CORE_SCRIPTS/run-cli.sh" deploy 2>/dev/null
+  )
+
+  # What the CLI IS promised.
+  assert_equals "the typed provider alias is delivered" \
+    "FASTLY_API_TOKEN=s3cret" "$(grep '^FASTLY_API_TOKEN=' <<<"$out")"
+  assert_equals "EDGEZERO_MANIFEST is delivered" \
+    "EDGEZERO_MANIFEST=$dir/edgezero.toml" "$(grep '^EDGEZERO_MANIFEST=' <<<"$out")"
+
+  # What it must NEVER see: the same secret under names we never promised.
+  assert_equals "the provider-env JSON blob does not survive" \
+    "EDGEZERO__PROVIDER__ENV=ABSENT" "$(grep '^EDGEZERO__PROVIDER__ENV=' <<<"$out")"
+  assert_equals "the action's token carrier does not survive" \
+    "EDGEZERO__FASTLY__API_TOKEN=ABSENT" "$(grep '^EDGEZERO__FASTLY__API_TOKEN=' <<<"$out")"
+  assert_equals "action-private file handles do not survive" \
+    "EDGEZERO__DEPLOY__ARGS_FILE=ABSENT" "$(grep '^EDGEZERO__DEPLOY__ARGS_FILE=' <<<"$out")"
+}
+
+# ---------------------------------------------------------------------------
+# validate-inputs.sh — action-owned passthrough bypasses the caller allowlist
+# ---------------------------------------------------------------------------
+test_deploy_args_prepend() {
+  section "action-owned deploy-args prepend"
+  local state="$WORK_DIR/prepend"
+  local out args
+  out=$(
+    EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__INPUT__ADAPTER=fastly \
+      EDGEZERO__INPUT__DEPLOY_ARG_ALLOW="--comment" \
+      EDGEZERO__INPUT__DEPLOY_ARGS='["--comment","hi"]' \
+      EDGEZERO__INPUT__DEPLOY_ARGS_PREPEND='["--non-interactive"]' \
+      "$CORE_SCRIPTS/validate-inputs.sh"
+  )
+  args=$(tr '\0' '\n' <"$state/deploy-args.nul")
+  # `--non-interactive` is action-owned: it is NOT caller input, so it is not
+  # allowlist-checked, and it must come first.
+  assert_equals "action-owned args are prepended, caller args preserved" \
+    $'--non-interactive\n--comment\nhi' "$args"
+  [[ -n "$out" ]] || true
+
+  # A caller still cannot smuggle it in themselves.
+  assert_fails "the caller allowlist still rejects --non-interactive from deploy-args" \
+    env EDGEZERO__ACTION__STATE_DIR="$state" EDGEZERO__INPUT__ADAPTER=fastly \
+    EDGEZERO__INPUT__DEPLOY_ARG_ALLOW="--comment" \
+    EDGEZERO__INPUT__DEPLOY_ARGS='["--non-interactive"]' \
+    "$CORE_SCRIPTS/validate-inputs.sh"
+}
+
+# ---------------------------------------------------------------------------
+# common.sh — anchored version parsing, required inputs, private logs
+# ---------------------------------------------------------------------------
+test_lifecycle_helpers() {
+  section "lifecycle helpers"
+  # NB: sourced in subshells only — common.sh defines its own `fail`, which would
+  # otherwise clobber this harness's.
+  local helpers="source '$CORE_SCRIPTS/common.sh'"
+
+  local log="$WORK_DIR/version.log"
+  # An UNanchored parser reads `version=15.2.0` as 15 and `version=12abc` as 12,
+  # threading a version that was never deployed into healthcheck and rollback.
+  printf 'version=15.2.0\nversion=12abc\n' >"$log"
+  assert_equals "a malformed version line yields nothing (never a prefix guess)" \
+    "" "$(bash -c "$helpers; read_numeric_line version '$log'")"
+  printf 'noise\nversion=41\nversion=42\n' >"$log"
+  assert_equals "the last well-formed version line wins" \
+    "42" "$(bash -c "$helpers; read_numeric_line version '$log'")"
+  printf 'healthy=maybe\n' >"$log"
+  assert_equals "a non-boolean verdict yields nothing" \
+    "" "$(bash -c "$helpers; read_bool_line healthy '$log'")"
+
+  # GitHub Actions does not enforce `required: true`, so these are the real guard.
+  assert_fails "an empty required input is rejected" \
+    bash -c "source '$CORE_SCRIPTS/common.sh'; require_input fastly-service-id ''"
+  assert_fails "a required input that fails its pattern is rejected" \
+    bash -c "source '$CORE_SCRIPTS/common.sh'; require_input_matching fastly-version '15.2.0' '^[0-9]+\$'"
+  assert_succeeds "a well-formed required input is accepted" \
+    bash -c "source '$CORE_SCRIPTS/common.sh'; require_input_matching fastly-version '42' '^[0-9]+\$'"
+
+  # Provider CLIs print request URLs and service metadata; the log must not be
+  # left behind in RUNNER_TEMP for later steps in the job to read.
+  local leaked
+  leaked=$(
+    RUNNER_TEMP="$WORK_DIR" bash -c "
+      source '$CORE_SCRIPTS/common.sh'
+      new_private_log
+      printf '%s\n' \"\$LIFECYCLE_LOG\"
+    "
+  )
+  assert_fails "the private log is removed when its owner exits" test -e "$leaked"
+}
+
+# ---------------------------------------------------------------------------
+# build-app-cli.sh — the toolchain search must not cross the app's Git boundary
+# ---------------------------------------------------------------------------
+test_toolchain_boundary() {
+  section "toolchain search boundary"
+  # The adoption guide's layout: a deployer repo at github.workspace, with the
+  # application checked out into a subdirectory. The DEPLOYER's .tool-versions
+  # must never decide which Rust compiles the APPLICATION.
+  local ws="$WORK_DIR/tc-workspace"
+  mkdir -p "$ws/app"
+  printf 'rust 1.60.0\n' >"$ws/.tool-versions"
+  git -C "$ws/app" init -q 2>/dev/null || return 0
+  printf 'rust 1.95.0\n' >"$ws/app/.tool-versions"
+
+  local resolved
+  resolved=$(
+    bash -c "
+      source '$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh'
+      resolve_rust_toolchain auto '$ws/app' '$ws' '$REPO_ROOT'
+    "
+  )
+  assert_equals "the app's own .tool-versions wins over the deployer's" "1.95.0" "$resolved"
+
+  # With no toolchain file in the app repo, the search must STOP at the app's
+  # Git root rather than picking up the deployer's file one level up.
+  rm -f "$ws/app/.tool-versions"
+  local fallback
+  fallback=$(
+    bash -c "
+      source '$ACTIONS_DIR/build-app-cli/scripts/build-app-cli.sh'
+      resolve_rust_toolchain auto '$ws/app' '$ws' '$REPO_ROOT'
+    "
+  )
+  local edgezero_rust
+  edgezero_rust=$(awk '$1 == "rust" { print $2 }' "$REPO_ROOT/.tool-versions")
+  assert_equals "the search stops at the app's Git root (deployer's 1.60.0 ignored)" \
+    "$edgezero_rust" "$fallback"
+}
+
+# ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
@@ -325,6 +510,11 @@ main() {
   test_provider_env_boundary
   test_download_cli_metadata
   test_fastly_versions
+  test_cleanup_confinement
+  test_action_env_scrub
+  test_deploy_args_prepend
+  test_lifecycle_helpers
+  test_toolchain_boundary
 
   printf '\nPassed: %d  Failed: %d\n' "$tests_passed" "$tests_failed"
   [[ "$tests_failed" -eq 0 ]]

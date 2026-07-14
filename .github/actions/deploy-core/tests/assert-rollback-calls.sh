@@ -3,38 +3,38 @@ set -euo pipefail
 
 # Asserts the rollback verbs, paths, and version threading.
 #
-# Regression test for two real defects a review found:
+# Regression test for real defects a review found:
 #   * Rollback used POST; the Fastly API requires PUT.
 #   * Staging rollback hit `/deactivate`, which deactivates the LIVE version.
 #     Undoing a stage is `/deactivate/staging`.
 #
-# Inputs (environment): FAKE_CALL_LOG, ROLLED_BACK_TO.
+# Inputs (environment): EDGEZERO__TEST__FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION, EDGEZERO__TEST__ROLLED_BACK_TO.
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../scripts/common.sh
+source "$SCRIPT_DIR/../scripts/common.sh"
 
 main() {
-  local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
-  local rolled_back_to="${ROLLED_BACK_TO:-}"
-  local api="https://api\.fastly\.com/service/dummy-service"
+  local log="${EDGEZERO__TEST__FAKE_CALL_LOG:?EDGEZERO__TEST__FAKE_CALL_LOG is required}"
+  local staged="${EDGEZERO__TEST__STAGED_VERSION:?EDGEZERO__TEST__STAGED_VERSION is required}"
+  local rolled_back_to="${EDGEZERO__TEST__ROLLED_BACK_TO:-}"
+  local api='https://api\.fastly\.com/service/dummy-service'
+  local previous=$((staged - 1))
 
   echo "--- recorded fastly/curl calls:"
   cat "$log"
 
-  if ! grep -qE "^PUT $api/version/42/deactivate/staging\$" "$log"; then
-    echo "::error::staging rollback did not PUT /version/42/deactivate/staging" >&2
-    return 1
-  fi
+  grep -qE "^PUT $api/version/$staged/deactivate/staging\$" "$log" ||
+    fail "staging rollback did not PUT /version/$staged/deactivate/staging"
 
-  # Production rollback activates the PREVIOUS version (42 -> 41).
-  if ! grep -qE "^PUT $api/version/41/activate\$" "$log"; then
-    echo "::error::production rollback did not PUT /version/41/activate" >&2
-    return 1
-  fi
+  # Production rollback activates the PREVIOUS version.
+  grep -qE "^PUT $api/version/$previous/activate\$" "$log" ||
+    fail "production rollback did not PUT /version/$previous/activate"
 
-  if [[ "$rolled_back_to" != "41" ]]; then
-    echo "::error::expected rolled-back-to=41, got '${rolled_back_to:-<empty>}'" >&2
-    return 1
-  fi
+  [[ "$rolled_back_to" == "$previous" ]] ||
+    fail "expected rolled-back-to=$previous, got '${rolled_back_to:-<empty>}'"
 
-  echo "rollback used PUT with the correct paths, and rolled-back-to=41 threaded out"
+  notice "rollback used PUT with the correct paths; rolled-back-to=$previous threaded out"
 }
 
 main "$@"
