@@ -25,8 +25,11 @@ pub fn from_core_response(response: Response) -> Result<FastlyResponse, EdgeErro
         }
     }
 
+    // `append_header` preserves multi-value headers (e.g. N `Set-Cookie`). The
+    // response starts empty (`from_status`) and `http::HeaderMap` iteration
+    // yields one entry per value, so appending is unconditionally correct.
     for (name, value) in &parts.headers {
-        fastly_response.set_header(name.as_str(), value.as_bytes());
+        fastly_response.append_header(name.as_str(), value.as_bytes());
     }
 
     Ok(fastly_response)
@@ -55,6 +58,25 @@ mod tests {
     fn parse_invalid_uri() {
         let err = parse_uri("::invalid uri::").expect_err("should fail");
         assert_eq!(err.status().as_u16(), 400);
+    }
+
+    #[test]
+    fn multi_value_set_cookie_survives_conversion() {
+        // http::response::Builder::header APPENDS, so this is two Set-Cookie values.
+        let response = response_builder()
+            .status(200)
+            .header("set-cookie", "a=1")
+            .header("set-cookie", "b=2")
+            .body(Body::empty())
+            .expect("response");
+
+        let fastly_response = from_core_response(response).expect("fastly response");
+
+        let cookies: Vec<String> = fastly_response
+            .get_header_all("set-cookie")
+            .map(|value| value.to_str().expect("utf8").to_owned())
+            .collect();
+        assert_eq!(cookies, vec!["a=1".to_owned(), "b=2".to_owned()]);
     }
 
     #[test]

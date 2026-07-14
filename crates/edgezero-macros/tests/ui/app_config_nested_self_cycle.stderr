@@ -1,0 +1,5 @@
+error: `#[app_config(nested)]` cannot reference the enclosing type (cyclic nesting): `secret_fields()` would recurse forever
+ --> tests/ui/app_config_nested_self_cycle.rs:8:19
+  |
+8 |     children: Vec<Config>,
+  |                   ^^^^^^

@@ -1,0 +1,5 @@
+error: `#[secret]` is incompatible with `#[serde(rename)]` — the derive emits the Rust field name verbatim and config validate / push round-trip it via TOML
+  --> tests/ui/nested_field_serde_rename.rs:13:5
+   |
+13 |     #[serde(rename = "x")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^

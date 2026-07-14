@@ -1,0 +1,40 @@
+error[E0277]: the trait bound `NotAppConfig: AppConfigRoot` is not satisfied
+  --> tests/ui/app_config_nested_on_non_appconfig.rs:12:12
+   |
+12 |     child: NotAppConfig,
+   |            ^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AppConfigRoot` is not implemented for `NotAppConfig`
+  --> tests/ui/app_config_nested_on_non_appconfig.rs:5:1
+   |
+ 5 | struct NotAppConfig {
+   | ^^^^^^^^^^^^^^^^^^^
+help: the trait `AppConfigRoot` is implemented for `Config`
+  --> tests/ui/app_config_nested_on_non_appconfig.rs:9:51
+   |
+ 9 | #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `__assert_app_config_root`
+  --> tests/ui/app_config_nested_on_non_appconfig.rs:9:51
+   |
+ 9 | #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__assert_app_config_root`
+   = note: this error originates in the derive macro `edgezero_core::AppConfig` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `NotAppConfig: AppConfigMeta` is not satisfied
+  --> tests/ui/app_config_nested_on_non_appconfig.rs:12:12
+   |
+12 |     child: NotAppConfig,
+   |            ^^^^^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `AppConfigMeta` is not implemented for `NotAppConfig`
+  --> tests/ui/app_config_nested_on_non_appconfig.rs:5:1
+   |
+ 5 | struct NotAppConfig {
+   | ^^^^^^^^^^^^^^^^^^^
+help: the trait `AppConfigMeta` is implemented for `Config`
+  --> tests/ui/app_config_nested_on_non_appconfig.rs:9:51
+   |
+ 9 | #[derive(serde::Deserialize, validator::Validate, edgezero_core::AppConfig)]
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: this error originates in the derive macro `edgezero_core::AppConfig` (in Nightly builds, run with -Z macro-backtrace for more info)

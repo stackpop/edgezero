@@ -84,15 +84,19 @@ the spec, §6.6):
 `__` (double underscore) separates segments. Absent variables fall
 back to their listed defaults.
 
-| Variable                                | Role                                                       | Default         |
-| --------------------------------------- | ---------------------------------------------------------- | --------------- |
-| `EDGEZERO__STORES__<KIND>__<ID>__NAME`  | platform name for logical store `<id>`                     | the logical id  |
-| `EDGEZERO__STORES__<KIND>__<ID>__<KEY>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`) | —               |
-| `EDGEZERO__ADAPTER__HOST`               | bind host (axum)                                           | `127.0.0.1`     |
-| `EDGEZERO__ADAPTER__PORT`               | bind port (axum)                                           | `8787`          |
-| `EDGEZERO__LOGGING__LEVEL`              | log level                                                  | adapter default |
+| Variable                                   | Role                                                                                                                   | Default         |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | --------------- |
+| `EDGEZERO__STORES__<KIND>__<ID>__NAME`     | platform name for logical store `<id>`                                                                                 | the logical id  |
+| `EDGEZERO__STORES__CONFIG__<ID>__KEY`      | config-store **key** the runtime reads the blob from — the staging/canary selector that pairs with `config push --key` | the logical id  |
+| `EDGEZERO__STORES__<KIND>__<ID>__<SUFFIX>` | free-form per-adapter tuning (e.g. spin's `MAX_LIST_KEYS`)                                                             | —               |
+| `EDGEZERO__ADAPTER__HOST`                  | bind host (axum)                                                                                                       | `127.0.0.1`     |
+| `EDGEZERO__ADAPTER__PORT`                  | bind port (axum)                                                                                                       | `8787`          |
+| `EDGEZERO__LOGGING__LEVEL`                 | log level                                                                                                              | adapter default |
 
-`<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-case logical id.
+`<KIND>` ∈ `KV` / `CONFIG` / `SECRETS`; `<ID>` is the upper-case logical
+id. The literal `__KEY` selector is config-only — it swaps which blob
+the `AppConfig<C>` extractor loads (see
+[the blob migration guide](./blob-app-config-migration.md#per-environment-key-override)).
 
 ## What this means for handler code
 
@@ -141,11 +145,12 @@ store.
 The pre-rewrite `[stores.config.defaults]` table seeded the axum
 config store from the manifest. That table is gone. The axum config
 store now reads `.edgezero/local-config-<id>.json` (one file per
-declared config id). Use the `edgezero config push --adapter axum`
+declared config id). Use the `<your-cli> config push --adapter axum`
 command (spec §13, [CLI reference](./cli-reference#edgezero-config-push))
-to write that file from your typed `<name>.toml` app-config — or
-hand-edit the JSON directly when you just need a quick fixture for
-local testing.
+to write that file from your typed `<name>.toml` app-config — the typed
+push runs from your downstream app CLI (the bundled `edgezero config
+push` errors, pointing at it) — or hand-edit the JSON directly when you
+just need a quick fixture for local testing.
 
 ## Cloudflare config store: `[vars]` → KV namespace
 

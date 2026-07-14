@@ -25,7 +25,10 @@ validator = { workspace = true, features = ["derive"] }
 # `edgezero-core` re-exports `AppConfig`; the derive tests assert
 # against the trait/types over the re-export path the way downstream
 # users will. Cargo allows dev-dep cycles (only the main dep edge
-# matters for build ordering).
-edgezero-core = { workspace = true }
+# matters for build ordering). `test-utils` exposes `InMemorySecretStore`
+# so the end-to-end nested-secret test can drive the runtime secret walk.
+async-trait = { workspace = true }
+edgezero-core = { workspace = true, features = ["test-utils"] }
+futures = { workspace = true }
 tempfile = { workspace = true }
 trybuild = { workspace = true }
