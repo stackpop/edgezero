@@ -3,8 +3,8 @@
 > **Status:** Draft, revised through review rounds 1–51 (round 51 = round-50 carry-over fixes: early Fastly dynamic-backend paragraph reconciled with the corrected `NameInUse` algorithm, `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` added for the buffered passthrough fallback, §5.4 lazy-passthrough rows rebucketed so Fastly is no longer grouped with CF/Spin, residual `between_bytes_timeout` write-side claims scrubbed from §5.4 + §8 risk 7, Spin host-write race rewritten against actual WASI nonblocking + readiness-poll semantics, two appendix entries flagged as superseded by AY) · **Date:** 2026-06-08
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
-> **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **not yet merged into `main`**. PR #269 introduces the multi-store manifest (`ManifestStores { config, kv, secrets }`), the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, the expanded `AdapterAction` (`AuthLogin` / `AuthLogout` / `AuthStatus` / `Build` / `Deploy` / `Serve`), separate `Adapter::provision(..)` and config-validation hooks, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the new `examples/app-demo/crates/app-demo-cli` integration crate.
-> **Current checkout (pre-#269):** `crates/edgezero-cli/src/args.rs` still has `Command::{Build, Deploy, Dev, New, Serve}`; `crates/edgezero-adapter/src/registry.rs` still has `AdapterAction::{Build, Deploy, Serve}`; `main.rs` still handles `Command::Dev`. **The CLI rows in §3.5.3 / §5.4 / §7 / Appendix AR are contingent on PR #269 landing.** If PR #269 ships in a different shape, the affected rows must be re-rebased; if it never lands, the spec's CLI surface degrades to the current `build` / `serve` / `deploy` / `dev` set plus the `ensure_capabilities` gate applied at each of those four call sites (the round-1–43 wording). Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of PR #269 and lands either way.
+> **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). The current tree has *since* gained further work the spec has not fully reconciled: typed config-push (`run_config_push_typed`), pluggable introspection routes, and expanded CI. PR #269 introduces the multi-store manifest (`ManifestStores { config, kv, secrets }`), the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, the expanded `AdapterAction` (`AuthLogin` / `AuthLogout` / `AuthStatus` / `Build` / `Deploy` / `Serve`), separate `Adapter::provision(..)` and config-validation hooks, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the new `examples/app-demo/crates/app-demo-cli` integration crate.
+> **Current checkout (post-#269):** the CLI surface is now the #269 shape — `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`, `AdapterAction::{AuthLogin/Logout/Status, Build, Deploy, Serve}`, and the `edgezero_cli::adapter::execute(..)` dispatcher; `dev` is gone. **Known gap (see the implementation plan's decisions register):** the §3.5.3 / §5.4 / §7 CLI gate rows still name `run_config_push` / `run_config_validate` as the gate sites, but in the merged tree `run_config_push` is a stub that errors (real writes go through `run_config_push_typed`), `ConfigValidateArgs` has no `adapter` field, and the adapter-selecting `run_config_diff_typed` is un-gated. Those rows must be re-pointed at the typed entry points before implementation (locked resolution: gate the typed paths, evaluate `config validate` against all configured adapters, add a `config diff` sibling gate). Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of the CLI surface and lands either way.
 > **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape (showing both the pre-#269 and PR-#269 forms), §5.4 capability test rows mentioning `demo` / `auth` / `provision` / `config push|validate`, and the §7 `edgezero-cli` migration bullet. Earlier appendices that quote `handle_build` / `handle_serve` / `handle_deploy` / `handle_dev` / `edgezero dev` are the round-1–43 historical resolution journal and remain accurate against the current checkout. **Appendix AR is the round-44 rebase snapshot and is now superseded by Appendices AS / AT / AU / AV / AW / AX / AY / AZ** (rounds 44–51): AR still describes the gate as "a single `Adapter::execute` dispatch point" — that wording was corrected to "four pre-dispatch gates" in AS, then to "five gate sites" in AU. Treat AR as round-44 history; the §3.5.3 + §7 active text is authoritative.
 
 ## 1. Overview
@@ -847,6 +847,99 @@ lossiness for headers that matter.
   every valid entry even if one duplicate is invalid. The adapter emits a `log::warn!`
   naming each dropped header. The rest of the response is delivered normally so a
   malformed exotic header cannot poison an otherwise valid fan-out batch response.
+- ***Cloudflare degradation — precisely scoped (verified against `worker` 0.8.3 +
+  workerd source).*** Earlier drafts said CF simply "cannot do multi-value headers."
+  That is **too pessimistic and wrong for `set-cookie`**. The actual split:
+
+  - **`set-cookie` IS preserved on Cloudflare.** workerd's `getDisplayedHeaders`
+    special-cases it: with the `httpHeadersGetSetCookie` compatibility flag on, each
+    `set-cookie` is yielded as its **own** `entries()` tuple. **This repo already
+    qualifies** — `wrangler.toml.hbs` pins `compatibility_date = "2023-05-01"`, and the
+    flag enables at `2023-03-01`. So the collapse today is **not** a platform limit but
+    an **EdgeZero bug**: `cloudflare/src/proxy.rs` calls `HeaderMap::insert`, which
+    *removes all previous values*. **Fix: `insert` → `append`.** (`worker`'s own
+    `http`-feature conversion does exactly this.) A compat-flag-independent hardening
+    is to skip `set-cookie` in the `entries()` loop and re-add it via
+    `Headers::get_all("set-cookie")`.
+  - **Repeated *non*-`set-cookie` headers are irrecoverably comma-joined.** workerd
+    joins same-name values (`kj::strArray(values, ", ")`) in both `entries()` and
+    `get()`, and its `getAll()` **throws `TypeError` for any name except
+    `set-cookie`**. There is **no API** to recover the original separate field lines —
+    two `x-foo` headers arrive as `x-foo: a, b`. Per RFC 9110 §5.3 that is semantically
+    equivalent for list-valued fields (exactly why the standard special-cases
+    `Set-Cookie`), but it is **not byte-faithful**. This is the real, narrow CF
+    limitation.
+  - **Raw bytes are unreachable; invalid UTF-8 is lost upstream of EdgeZero.** Header
+    values cross `v8::String::NewFromUtf8` before the guest sees them, arriving as Rust
+    `String`. So on CF the adapter **cannot detect** whether an upstream value was
+    invalid UTF-8, and the "drop the invalid value, keep valid siblings" rule degrades
+    to "whatever the runtime already decided". Axum, Fastly, and Spin expose raw bytes
+    and honour the rule as written.
+
+  > **⚠️ `get_all` landmine.** `worker-sys`'s `getAll` binding has **no `catch`**, and
+  > workerd throws `TypeError` for any name other than `set-cookie`. A
+  > `get_all("x-foo")` therefore **unwinds across the wasm boundary** rather than
+  > returning `Err`. **Only ever call `get_all("set-cookie")`.**
+
+  Narrowing the portable contract to ASCII-only was **rejected** — it would degrade the
+  three adapters that *can* do this correctly. The §5.4 non-ASCII round-trip row is
+  asserted on Axum / Fastly / Spin and is **best-effort on Cloudflare**.
+
+**Method and request-body portability.** `OutboundRequest` accepts an arbitrary
+`Method`, but the platforms do not. Cloudflare's `fetch` restricts the method set and
+**forbids a body on `GET`/`HEAD`**; today the CF adapter silently coerces unsupported
+methods to `GET`, which is a correctness bug — a `DELETE` would be issued as a `GET`.
+The portable contract:
+
+- **Supported methods** (all four adapters): `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
+  `DELETE`, `OPTIONS`. These are guaranteed to reach the upstream with the method
+  intact.
+- **Custom / extension methods** are **not portable**. An `OutboundRequest` carrying a
+  method outside the list above is rejected at **preflight** with
+  `Err(EdgeError::bad_request("method <M> is not portable; supported: GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"))`
+  — on **every** adapter, so the failure is uniform rather than "works on Fastly,
+  silently becomes GET on Cloudflare".
+- **`GET`/`HEAD` with a non-empty body** is rejected at preflight with
+  `Err(EdgeError::bad_request("GET/HEAD request must not carry a body"))` on every
+  adapter (CF's `fetch` forbids it; the others would happily send it, so EdgeZero
+  normalises to the strictest platform).
+- **No silent coercion, ever.** An adapter MUST NOT rewrite the method to make a
+  request sendable. Preflight rejects; it never downgrades.
+
+**Enforcement point: one core validator, run at DISPATCH — not at construction.**
+Validating at construction is **not enforceable**: `OutboundRequest::body(..)` is an
+infallible chainable setter (`pub fn body(self, body: impl Into<Body>) -> Self`), so a
+`GET` that passed a construction-time check can acquire a body immediately afterwards
+(`OutboundRequest::get(url)?.body(payload)`) and reach the wire unchecked. The rules
+above are therefore enforced by a **single core function**:
+
+```rust
+// edgezero-core/src/outbound.rs — the ONLY place these rules live.
+pub(crate) fn validate_for_dispatch(req: &OutboundRequest) -> Result<(), EdgeError>;
+```
+
+It is called **exactly once per request, immediately before dispatch**, from **both**
+paths: every adapter's `send` (first statement, before any platform request is built)
+and `send_all`'s per-slot preflight. Neither path may skip it and no adapter re-implements
+it — that is what makes the failure identical on all four adapters, keeps a single
+`send` and a one-slot `send_all` equivalent (§5.4), and preserves slot-index alignment
+(§3.1.1).
+
+**`GET`/`HEAD` + `Body::Stream` is always rejected.** "Non-empty body" is not decidable
+for a stream: `Body::Stream` has **no observable emptiness** without polling it, and
+polling consumes it. The validator therefore does **not** attempt to peek-and-rechain.
+The rule is:
+
+| Method | Body | Outcome |
+| --- | --- | --- |
+| `GET` / `HEAD` | `Body::Once(empty)` | `Ok` |
+| `GET` / `HEAD` | `Body::Once(non-empty)` | `bad_request("GET/HEAD request must not carry a body")` |
+| `GET` / `HEAD` | **`Body::Stream` (any)** | `bad_request("GET/HEAD request must not carry a streamed body; emptiness cannot be determined without consuming the stream")` — rejected **unconditionally**, even if the stream would have yielded nothing |
+| other methods | any | `Ok` (subject to the portable-method check above) |
+
+Rejecting an empty-but-streamed `GET` is a deliberate, documented false-positive: the
+alternative (peek the first chunk and re-chain it) adds a buffering seam to every
+request for a case with no legitimate use.
 
 *Implementation guardrail.* The UTF-8 check uses `std::str::from_utf8(value.as_bytes())`,
 **not** `HeaderValue::to_str()`. `to_str()` is stricter than UTF-8 — it rejects any
@@ -1040,6 +1133,23 @@ pub struct DispatchBudget {
 /// and therefore different dynamic-backend identities for the same host under one
 /// batch deadline (§4.3). `send` (single request) just passes
 /// `web_time::Instant::now()`.
+// PRIVACY CONTRACT. `time.rs` is a **sibling module** of `outbound.rs`, so it cannot
+// read `OutboundRequest`'s private `timeout` / `deadline` / `max_response_bytes`
+// fields directly — earlier drafts of this pseudocode did, which does not compile.
+// `OutboundRequest` therefore exposes crate-visible accessors, and `dispatch_budget`
+// consumes **only** these:
+//
+//     impl OutboundRequest {
+//         pub(crate) fn timeout(&self) -> Option<Duration>;
+//         pub(crate) fn deadline(&self) -> Option<Deadline>;
+//         pub(crate) fn max_response_bytes(&self) -> usize;
+//     }
+//
+// (`pub(crate)`, not `pub` — these are an internal contract between `outbound.rs` and
+// `time.rs`, not app surface. The alternative — colocating `dispatch_budget` inside
+// `outbound.rs` — is rejected: `time.rs` must stay independently unit-testable and
+// free of the outbound client's platform-shaped code.) Read `req.timeout()` /
+// `req.deadline()` below as those accessors, not field access.
 pub fn dispatch_budget(
     req: &OutboundRequest,
     now: web_time::Instant,
@@ -1498,14 +1608,17 @@ compressed metadata. Existing Cloudflare and Fastly proxy code already does this
 the contract codifies it.
 
 **Streaming-decompressor design (Streamed mode).** Lazy
-`lazy-streamed-response-passthrough` on **CF / Spin** coexists with the cap
-obligation because each adapter wraps the raw compressed byte stream with a
-**streaming decoder** that emits decompressed chunks as they arrive, never buffering
-the full body. (Fastly is `BestEffort` for lazy passthrough per capability footnote
-6 — its response converter performs buffered passthrough through
-`FASTLY_RESPONSE_STREAM_BUFFER_BYTES`, so its streaming-decompressor wrapper still
-runs but the converter buffers downstream of it. Axum is also `BestEffort` for an
-unrelated `Send`-bounds reason — see footnote 3.) The decoder's *only*
+`lazy-streamed-response-passthrough` on **Cloudflare** (the only `Native` adapter)
+coexists with the cap obligation because the adapter wraps the raw compressed byte
+stream with a **streaming decoder** that emits decompressed chunks as they arrive,
+never buffering the full body. (**Axum, Fastly, and Spin are all `BestEffort`** for
+lazy passthrough, for three different reasons — non-Send `LocalBoxStream`
+[footnote 3], `stream_to_client()` vs `#[fastly::main]` [footnote 6], and Spin's
+buffered `FullBody` public response surface [footnote 7]. On all three the
+streaming-decompressor wrapper still runs, but the response converter buffers
+downstream of it within its adapter-level constant —
+`AXUM_RESPONSE_STREAM_BUFFER_BYTES` / `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` /
+`SPIN_RESPONSE_STREAM_BUFFER_BYTES`, all 16 MiB.) The decoder's *only*
 responsibilities are decoding bytes, stripping the two compressed-only headers, and
 surfacing decoder errors — it deliberately does **not** enforce a byte cap, because
 `ResponseMode::Streamed` carries no `max_bytes` (§3.1.3) and the cap lives with the
@@ -1723,8 +1836,76 @@ the Fastly and Spin paths fully materialize the body too). This migration change
   }
   ```
 
+  **`StoredError` — why the cell cannot just store an `EdgeError`.** The poison
+  contract requires that *every* subsequent access (`body_bytes`, `json_within`,
+  `form_within`, `into_request`) returns **the same error**. That needs the error to be
+  reproducible — but **`EdgeError` is not `Clone`**: its `Internal` variant wraps
+  `anyhow::Error` (`error.rs`: `Internal { #[from] source: AnyError }`), which is
+  deliberately not clonable. Storing an `EdgeError` and handing out copies therefore
+  does not compile. `StoredError` is the clonable, reconstructable **essence** of the
+  error that poisoned the cell:
+
+  ```rust
+  #[derive(Clone)]
+  struct StoredError {
+      kind: ErrorKind,   // which EdgeError variant (bad_request / internal / bad_gateway / …)
+      message: String,   // the rendered message at poison time
+  }
+
+  impl StoredError {
+      /// Rebuild an equivalent `EdgeError` — same variant, same message, same status.
+      fn to_edge_error(&self) -> EdgeError { /* dispatch on `kind` via the semantic ctors */ }
+  }
+  ```
+
+  **Decomposition happens once, at poison time.** The drain's `EdgeError` is decomposed
+  into `StoredError` and the cell returns `stored.to_edge_error()` — so *even the first*
+  read gets a reconstructed error, and all later reads are byte-identical to it. This
+  keeps every accessor's signature as `Result<_, EdgeError>` (no `Rc<EdgeError>` leaking
+  into the public API).
+
+  **Documented loss:** for the `Internal` variant the **`anyhow` source chain and
+  backtrace are not preserved** — only the rendered message and the variant/status are.
+  A reconstructed `internal` error's `inner()` yields a fresh `anyhow::Error` carrying
+  that message, not the original chain. This is an accepted trade: the alternatives are
+  making `EdgeError: Clone` (impossible without dropping `anyhow`) or returning
+  `Rc<EdgeError>` from every body accessor (an API wart for a diagnostic-only benefit).
+  Adapters that need the full chain must log it at the point of failure, before it
+  poisons the cell.
+
+  **Cancelled drain.** A drain future dropped while `Draining` transitions the cell to
+  `Poisoned(StoredError { kind: Internal, message: "inbound body drain cancelled" })`
+  via a drop guard (§5.4), so a cancelled read is indistinguishable in shape from any
+  other poison — the next access returns that stored error rather than silently
+  re-reading a half-consumed body.
+
   `RefCell` (unsync) is fine because a `RequestContext` is owned per-request and
   EdgeZero's async traits already use `?Send`. No `tokio` dependency in core.
+
+  **Construction contract — `RequestContext::new(Request, PathParams)` is PRESERVED.**
+  `parts` and `body` are **private**, and `BodyCell` / `BodyState` are **not public
+  types**. Adapters therefore do **not** — and cannot — construct the context from
+  "parts + a body cell"; earlier drafts said they should, which both leaks an internal
+  type and misassigns ownership (adapters build a `Request`; the **router** builds the
+  `RequestContext`). The existing signature is kept verbatim:
+
+  ```rust
+  impl RequestContext {
+      pub fn new(request: Request, params: PathParams) -> Self {
+          let (parts, body) = request.into_parts();   // split INTERNALLY
+          Self { path_params: params, parts, body: BodyCell::initial(body) }
+      }
+  }
+  ```
+
+  So the migration is **source-compatible for every caller of `new(..)`** — adapters
+  and the router keep passing a `Request` exactly as they do today, and the
+  parts/body split becomes an implementation detail. What adapters *do* change is
+  **what they put in that `Request`**: a lazy `Body::Stream` instead of a
+  pre-buffered body (first bullet above). `BodyCell` never appears in any public
+  signature; the only new public surface is the accessor set (`parts()`,
+  `parts_mut()`, `body_kind()`, `body_bytes`, `json_within`, `form_within`,
+  `take_body`, `into_request`).
 
   **Async drain protocol.** A naive "borrow_mut across .await" implementation would
   panic on reentrant access or hold the borrow indefinitely if the future is dropped
@@ -1863,8 +2044,15 @@ pub enum Capability {
                                         // (Fastly = BestEffort)
     LazyStreamedResponsePassthrough,    // `into_response()` on a streamed body
                                         // delivers chunks without first collecting
-                                        // the whole body (Axum = BestEffort,
-                                        // see §3.5.2 footnote 3)
+                                        // the whole body. **Cloudflare is the only
+                                        // `Native` adapter.** Axum = BestEffort
+                                        // (non-Send `LocalBoxStream`, footnote 3),
+                                        // Fastly = BestEffort (`stream_to_client()`
+                                        // incompatible with `#[fastly::main]`,
+                                        // footnote 6), Spin = BestEffort (buffered
+                                        // `FullBody` public response surface,
+                                        // footnote 7). All three fall back to
+                                        // bounded buffered passthrough.
     ConfigStore,                        // adapter can back a `[stores.config]`
                                         // binding — read-only key/value config
                                         // resolved at request time. Gated
@@ -2012,8 +2200,8 @@ This spec only adds `capability(..)`. The `provision` / config-validation method
 owned by PR #269 and shown above purely so readers don't misread the `Adapter`
 reference in §3.5.3 as an exhaustive declaration. The `Adapter::provision(..)` and
 config-validation hooks referenced in §3.5.3 / §6 / §7 are called from the **sibling
-pre-dispatch gates** on `run_provision` / `run_config_push` / `run_config_validate`,
-not from `Adapter::execute`. (The pre-#269 checkout had no `provision` / `config`
+pre-dispatch gates** on `run_provision` / `run_config_push_typed` /
+`run_config_diff_typed` / `run_config_validate`, not from `Adapter::execute`. (The pre-#269 checkout had no `provision` / `config`
 surface; that fallback is now historical — appendix rounds 1–43 reflect it.)
 
 Capability matrix (all four adapters):
@@ -2025,7 +2213,7 @@ Capability matrix (all four adapters):
 | `outbound-flexible-phase-budget` | Native | Native | BestEffort⁵ | Native |
 | `send-all-slot-isolation` | Native | Native | BestEffort⁴ | Native |
 | `streamed-upload-deadlines` | Native | Native | BestEffort² | Native |
-| `lazy-streamed-response-passthrough` | BestEffort³ | Native | BestEffort⁶ | Native |
+| `lazy-streamed-response-passthrough` | BestEffort³ | Native | BestEffort⁶ | BestEffort⁷ |
 | `config-store` | Native | Native | Native | Native |
 | `kv-store` | Native | Native | Native | Native |
 | `secret-store` | Native | Native | Native | Native |
@@ -2108,7 +2296,9 @@ small bodies do.
 
 ³ `lazy-streamed-response-passthrough` captures whether
 `OutboundResponse::into_response()` delivers a streamed upstream body to the platform
-response **without buffering**. On Cloudflare / Spin the platform SDKs accept a
+response **without buffering**. **Cloudflare is the only `Native` adapter** (Axum,
+Fastly, and Spin are all `BestEffort` — footnotes 3 / 6 / 7 — and each falls back to
+bounded buffered passthrough). On Cloudflare the platform SDK accepts a
 non-`Send` stream natively (WASM single-threaded guest), and the response converter
 chains the wrapped `Body::Stream` through — first chunks flow before the upstream stream
 ends. On Axum, `axum::body::Body::from_stream` requires `Send + 'static` and core's
@@ -2149,11 +2339,38 @@ adapter-level constant is what the converter uses. Over-cap during the buffered
 drain → `bad_gateway` (502) — same shape as Axum. After draining, the buffered
 `Bytes` is returned through the normal `#[fastly::main]` flow. Apps that need
 lazy passthrough on Fastly declare this capability required and get a hard
-build failure; the migration path is either (a) target a different adapter
-(CF or Spin) or (b) wait for the §8 risk 12
+build failure; the migration path is either (a) target **Cloudflare** (the only
+`Native` adapter for this capability) or (b) wait for the §8 risk 12
 follow-up that adds a non-`#[fastly::main]` entry-point template + the
 `stream_to_client()` plumbing. Buffered passthrough still works on Fastly
 unconditionally — only the *lazy* variant is gated.
+
+⁷ `lazy-streamed-response-passthrough` is `BestEffort` on **Spin** for an
+**EdgeZero-side public-API** reason — **not** a platform limitation, and not a
+WASM-`Send` one. **Spin SDK 6 fully supports lazy response streaming**: its
+`Response` body is `IncomingBody<types::Response>`, which implements
+`http_body::Body` and reads in 16 KiB frames via `poll_frame`, and
+`IncomingBodyExt::stream()` yields a lazy `BodyDataStream`. The SDK is not the
+blocker — **EdgeZero's own alias is**. The adapter currently *chooses* the buffered
+path (`crates/edgezero-adapter-spin/src/proxy.rs` calls `.bytes()`), and
+`crates/edgezero-adapter-spin/src/lib.rs` pins `SpinFullResponse =
+Response<FullBody<Bytes>>` across `AppExt::dispatch`, `request::dispatch*`,
+`from_core_response`, and `run_app`. Delivering lazy passthrough therefore requires
+**migrating those public aliases and signatures** to a streamable response shape — a
+breaking public-API change that ripples into `examples/app-demo`, the Spin scaffold
+templates, and every downstream consumer of `SpinFullResponse`. It carries its own
+design and test surface, so it is **deliberately out of scope for this change**:
+Spin's response converter performs **buffered passthrough** (drain the wrapped
+`Body::Stream` to `Bytes` within a `SPIN_RESPONSE_STREAM_BUFFER_BYTES` constant,
+default 16 MiB, mirroring Axum and Fastly; over-cap → `bad_gateway` (502)), exactly
+the Axum/Fastly fallback shape. Apps that need lazy passthrough today declare the
+capability required and target **Cloudflare**. Because the platform *does* support it,
+lifting Spin to `Native` is a pure EdgeZero refactor and is tracked as a follow-up
+(§8 risk 13) — unlike Fastly's footnote 6, which is a genuine platform constraint.
+This affects only the **response-out** direction; Spin's **outbound streamed-upload**
+path is `Native` for `streamed-upload-deadlines` via the hand-built `wasi:http`
+request in §4.4 (the SDK's high-level `send` is **not** used for streamed bodies —
+it spawns an uncancellable body pump).
 
 #### 3.5.3 Build / startup enforcement
 
@@ -2169,10 +2386,18 @@ not fire for shell-overridden adapters, and a gate placed *inside* a single
 hooks. So the gate sits one level up — at the top of every PR-#269 `run_*`
 entry point that selects an adapter.
 
-In PR #269 there are **five concrete gate sites**, listed below. Earlier drafts of
-this section called the set "one + two siblings" and "four gates"; the
-controlling count is **five** (one inside `execute(..)`, four siblings on the
-PR-#269 entry points that don't flow through `execute(..)`).
+There are **six concrete gate sites**, listed below. Earlier drafts of this section
+called the set "one + two siblings", "four gates", and "five gates"; the controlling
+count is **six** — one inside `execute(..)`, plus **five siblings** on the entry points
+that don't flow through `execute(..)`: `run_provision`, `run_config_push_typed`,
+`run_config_diff_typed`, `run_config_validate`, and `run_demo`.
+
+> **Note — gate the *typed* entry points.** In the merged tree the bundled
+> `run_config_push` is a **v1 stub that errors**; real config writeback happens in
+> `run_config_push_typed`, and the adapter-selecting diff is `run_config_diff_typed`
+> (`crates/edgezero-cli/src/config.rs`). Gating the stubs would enforce nothing. Any
+> remaining reference below or in §5.4 / §7 to a bare `run_config_push` /
+> `run_config_*` means the **typed** function.
 
 ```rust
 // 1. crates/edgezero-cli/src/adapter.rs — first statement of execute(..)
@@ -2238,7 +2463,7 @@ adapter stub). An app that declares any capability requires a registered adapter
 can answer the `capability(Capability) -> CapabilitySupport` question; there is no
 silent bypass.
 
-Commands covered by the five gate sites above (one inside `execute(..)`, four siblings):
+Commands covered by the six gate sites above (one inside `execute(..)`, five siblings):
 
 | PR-#269 command | Entry point | Gate site |
 | --- | --- | --- |
@@ -2247,9 +2472,54 @@ Commands covered by the five gate sites above (one inside `execute(..)`, four si
 | `edgezero deploy` | `run_deploy` → `execute(Action::Deploy, ..)` | `execute(..)` |
 | `edgezero auth login` / `logout` / `status` | `run_auth` → `execute(Action::AuthLogin/Logout/Status, ..)` | `execute(..)` |
 | `edgezero provision` | `run_provision` → `Adapter::provision(..)` | `run_provision(..)` sibling |
-| `edgezero config push` | `run_config_push` → adapter push hook (or `--local`) | `run_config_push(..)` sibling |
-| `edgezero config validate` | `run_config_validate` → adapter validation hook | `run_config_validate(..)` sibling |
-| `edgezero demo` (feature `demo-example`) | `run_demo` → Axum runner | `run_demo(..)` calls `ensure_capabilities("axum", ..)` |
+| `edgezero config push` | real writeback is **`run_config_push_typed`** in the downstream typed CLI (the bundled `run_config_push` is a v1 stub that errors) | `run_config_push_typed(..)` sibling |
+| `edgezero config diff` | `run_config_diff_typed` → resolves an adapter via `run_shared_checks` | `run_config_diff_typed(..)` sibling (locked: `config diff` is gated) |
+| `edgezero config validate` | `run_config_validate` — **adapter-less** (`ConfigValidateArgs` has no `adapter` field); validates the manifest against **all configured adapters** in `[adapters]` (locked resolution) | `run_config_validate(..)` sibling, looping every configured adapter |
+| `edgezero demo` (feature `demo-example`) | `run_demo` → Axum runner. `run_demo()` takes **no path or loader** and reads no manifest file, so a file-based gate is impossible. **Locked resolution — gate on baked manifest metadata via a new `Hooks` accessor** (see below) | `run_demo()` calls `ensure_capabilities("axum", <App as Hooks>::manifest())` before the Axum runner starts |
+
+**The `demo` gate needs a baked-manifest accessor — `app!` must emit one.**
+`run_demo()` (`crates/edgezero-cli/src/demo_server.rs`) just calls `run_app::<App>()`;
+it has no path, no `ManifestLoader`, and no way to find `edgezero.toml` at runtime. But
+the `app!` macro **already parses, validates, and serializes the manifest at compile
+time** (`crates/edgezero-macros/src/app.rs`: `manifest.finalize()` →
+`serde_json::to_string(&manifest)` → `manifest_json_lit`) — it just embeds that JSON for
+the router and never exposes it. Today `Hooks`
+(`crates/edgezero-core/src/app.rs`) has `routes()` / `stores()` / `name()` and **no
+manifest accessor**, so the gate has nothing to consult. Add one:
+
+```rust
+// edgezero-core/src/app.rs — extend the existing Hooks trait (additive, defaulted).
+pub trait Hooks {
+    // …existing: build_app / configure / name / routes / stores…
+
+    /// Raw manifest JSON baked in at compile time by `app!`.
+    /// Default `None` for hand-written `Hooks` impls that never ran the macro.
+    fn manifest_json() -> Option<&'static str> { None }
+
+    /// Parsed, cached view of the above. Parsed **once** on first call.
+    fn manifest() -> Option<&'static Manifest> { /* OnceLock<Option<Manifest>> */ }
+}
+```
+
+- **`app!` emits `fn manifest_json() -> Option<&'static str> { Some(#manifest_json_lit) }`**
+  in the `impl Hooks for #app_ident` block it already generates — reusing the literal it
+  computes today. No new parsing at compile time, no new macro dependency.
+- **Ownership / lifetime:** the JSON is a `&'static str` in the binary; `manifest()`
+  parses it into a `OnceLock<Option<Manifest>>` **owned by core**, so the cost is paid
+  once per process and the result is `&'static`. This requires `Manifest: Deserialize`
+  (already true) — and note it is the same `Serialize` requirement that forces the
+  capability types to derive `Serialize` (§3.5.1), since `app!` serializes the whole
+  `Manifest`.
+- **Failure mode:** the JSON was produced by `serde_json::to_string` on a validated
+  `Manifest`, so a parse failure is an **adapter/macro contract bug**, not user error →
+  `EdgeError::internal`. `manifest()` returning `None` (hand-written `Hooks`, no macro)
+  means *no capability contract*, and `ensure_capabilities` short-circuits `Ok(())` —
+  the same policy already used for "no manifest" elsewhere in §3.5.3.
+- **Test seam:** capability-gate failure tests need to drive `demo` with a manifest that
+  *requires* a `BestEffort` capability. Since the manifest is compile-time baked, the
+  fixture is a **test-only `Hooks` impl** that overrides `manifest_json()` to return a
+  crafted JSON string — no file, no macro re-expansion. (This is why `manifest_json()`
+  is a trait method with a default rather than a free function or a bare `const`.)
 
 Commands **not** covered (and why):
 - `edgezero new` — generates source files; no adapter is selected, so capabilities
@@ -2269,12 +2539,17 @@ above, which is now the active topology. The wording in rounds 1–43 of the
 appendices reflects that pre-#269 shape and is retained as history.
 
 ```rust
+// NOTE: takes an already-parsed `&Manifest`, NOT a `ManifestLoader`. The `demo` gate
+// has no manifest *file* to load — it reads the manifest baked in by `app!` via
+// `<App as Hooks>::manifest()` (see the demo row above). File-backed callers pass
+// `loader.map(|l| l.manifest())`; `demo` passes the baked one. `None` = no manifest,
+// hence no capability contract → `Ok(())`.
 fn ensure_capabilities(
     adapter_name: &str,
-    manifest: Option<&ManifestLoader>,
+    manifest: Option<&Manifest>,
 ) -> Result<(), String> {
-    let Some(loader) = manifest else { return Ok(()) };
-    let caps = &loader.manifest().capabilities;
+    let Some(manifest) = manifest else { return Ok(()) };
+    let caps = &manifest.capabilities;
     let Some(adapter) = registry::get_adapter(adapter_name) else {
         // Missing-from-registry policy (see §3.5.3 table). If the manifest
         // declares no capabilities, we can't verify anything anyway — log
@@ -2366,8 +2641,61 @@ fn ensure_capabilities(
 Apps still enforce their own target allowlist in handler code. Adapter use of `hosts`:
 
 - **Spin** requires `allowed_outbound_hosts` in `spin.toml`. The Spin adapter renders
-  each entry per the rules below. (`spin.toml.hbs:13` currently hardcodes
-  `["https://*:*"]`; that template line is replaced by a render of this list.)
+  each entry per the rules below. (`spin.toml.hbs:13` currently hardcodes the literal
+  `["https://*:*"]` — not a Handlebars expression; that line becomes a render of this
+  list.)
+
+  **Synchronization lifecycle — `provision` writes, `build`/`serve`/`deploy` validate.**
+  Rendering at scaffold time alone is **not sufficient**: `spin.toml` is generated only
+  by `edgezero new`, which **cannot re-run** over an existing project
+  (`ProjectLayout::new` hard-errors with `OutputDirExists`). So a user who later edits
+  `[capabilities.outbound].hosts` would keep a **stale** `allowed_outbound_hosts` and
+  the Spin app would silently over- or under-permit at runtime. The lifecycle:
+
+  1. **`edgezero new`** renders the initial list from the manifest (as today, but from
+     `[capabilities.outbound].hosts` instead of the hardcoded literal).
+  2. **`edgezero provision`** (re-)renders `allowed_outbound_hosts` into `spin.toml`.
+     This is the **only** command that writes it. `provision` already edits `spin.toml`
+     in place via `toml_edit::DocumentMut` (`ensure_kv_label_in_component`), already
+     receives `manifest_root` + `adapter_manifest_path`, and already honours
+     `--dry-run` — so this needs **one helper, no `Adapter` trait-signature change, no
+     CLI dispatch change**. Sibling fields and comments are preserved (the existing
+     behaviour is test-pinned, on a fixture that already contains
+     `allowed_outbound_hosts`). Writing at provision matches EdgeZero's existing model:
+     *platform manifests are written during provision, not during build.*
+  3. **`edgezero build` / `serve` / `deploy`** **validate only — they never write.**
+     They compare `spin.toml`'s `allowed_outbound_hosts` against the manifest and
+     **hard-fail on drift** with an actionable message that renders the expected list
+     verbatim for the user to paste (or to fix by re-running `provision`).
+
+  **Why validate-not-rewrite on the build path.** `spin.toml` is **git-tracked and
+  user-owned** — the scaffold's `.gitignore` does not exclude it, and real projects
+  hand-edit it (the demo's carries hand-written `[variables]`, a custom `source`, and
+  comments). Rewriting it on every build would dirty the working tree and **clobber
+  intentional edits**. Validation enforces correctness without taking ownership of the
+  user's file.
+
+  **Drift comparison is over canonicalized SETS, not raw strings.** Compare after
+  applying the canonicalization below (lowercase scheme/host, strip default ports),
+  order-insensitively. A raw string compare would false-positive on
+  semantically-identical spellings (`https://x:443` vs `https://x`, or a reordered
+  list) and make the gate unusable.
+
+  > **⚠️ The hook must live in `edgezero_cli::adapter::execute`, NOT in
+  > `SpinCliAdapter::execute`.** The scaffolder **always** writes
+  > `[adapters.spin.commands].build/deploy/serve` into `edgezero.toml`, so for any
+  > scaffolded project `edgezero build|serve|deploy --adapter spin` takes the
+  > `manifest_command` → `run_shell` branch and **`SpinCliAdapter::execute` is never
+  > reached**. A validation hook placed in the adapter would be **dead code**. Put it in
+  > `edgezero_cli::adapter::execute` *before* the `manifest_command` branch — the same
+  > seam `ensure_capabilities` uses (§3.5.3), which is the only funnel that sees the
+  > parsed `Manifest` **and** still fires for shell-overridden commands.
+
+  **Default when `[capabilities.outbound].hosts` is absent: `["https://*:*"]`** — i.e.
+  **preserve today's https-only wildcard**. The default is deliberately **not** widened
+  to include `http://*:*`: doing so would silently grant every existing app permission
+  to make **cleartext** outbound calls, and a security posture must not broaden as a
+  side effect of a refactor. Apps that need cleartext outbound declare it explicitly.
 
   Every entry is **first canonicalized** by the host-authority subset of
   `OutboundRequest`'s URI rules (§3.1.3): scheme and host are lowercased;
@@ -2508,9 +2836,40 @@ impl with an `OutboundHttpClient` impl, adds `capability()`, and gains a
   `dispatch_budget`). The wrapper yields a `gateway_timeout` error chunk past the
   deadline so the streamed body honours the deadline end-to-end per §3.3.3.
 - Errors: `worker::Delay` expiry → `gateway_timeout`; `worker::fetch` transport
-  failure (DNS/TLS/connection refused) → `bad_gateway`; over-cap → `bad_request`.
-  Any completed exchange (incl. non-2xx) → `Ok`. (§3.4.3 is the fallback for
-  variants not enumerated here.)
+  failure (DNS/TLS/connection refused) → `bad_gateway`; **request**-body over-cap →
+  `bad_request` (400); **response**-body over-cap (decompressed count) → `bad_gateway`
+  (502, per the global response-overflow rule §3.4.1). Any completed exchange
+  (incl. non-2xx) → `Ok`. (§3.4.3 is the fallback for variants not enumerated here.)
+- **Method / body preflight — no silent coercion.** The current adapter maps
+  unsupported methods to `GET`; that is **removed**. Per §3.1.4, a non-portable method
+  or a `GET`/`HEAD` carrying a body is rejected in **core preflight** with
+  `bad_request`, identically on every adapter. The CF adapter never rewrites the
+  method to satisfy `fetch`'s restrictions.
+- **Multi-value response headers — two real bugs to fix, not a platform limit.**
+  `worker::Headers` has both `append(&self, ..)` and `get_all(&self, ..)`, and this
+  repo's pinned `compatibility_date = "2023-05-01"` already enables workerd's
+  per-`set-cookie` `entries()` behaviour. `set-cookie` is therefore **fully
+  preservable** on CF; today it is dropped by EdgeZero's own code:
+  1. **`src/proxy.rs` (upstream → core):** the `entries()` loop calls
+     `HeaderMap::insert`, which **removes all previous values** — two upstream
+     `set-cookie`s collapse to the last one. **Fix: `insert` → `append`.**
+  2. **`src/response.rs` (core → client):** the `&parts.headers` loop calls
+     `Headers::set`, which **replaces** — a handler emitting two `Set-Cookie`s ships
+     only the last to the browser. **Fix: `set` → `append`.** (`&HeaderMap` iteration
+     already yields the name once per value, so `append` is correct and complete.)
+- **Panic hazard in the outbound request path — must be fixed.** `Headers::from(&HeaderMap)`
+  does `value.to_str().unwrap()`, and `HeaderValue::to_str` **errors on any byte outside
+  visible ASCII**. A proxied non-ASCII (but perfectly valid UTF-8) header such as
+  `x-app-display-name: café` therefore **panics the worker**. Replace `Headers::from(..)`
+  with an explicit loop (`Headers::append` takes `&self`, so no `mut` needed) that
+  handles the non-ASCII case per §3.1.4 instead of unwrapping. Duplicate preservation in
+  this direction is already correct (`Headers::from` appends per value) — the defect is
+  the panic, not the multi-value handling.
+- **What stays irrecoverable (§3.1.4):** repeated **non**-`set-cookie` headers are
+  comma-joined by workerd (`x-foo: a, b`) with no API to recover the separate field
+  lines, and raw upstream bytes / invalid UTF-8 are lost before the guest sees them.
+  **Never call `get_all` with any name but `"set-cookie"`** — the binding lacks `catch`
+  and workerd throws, unwinding across the wasm boundary.
 - `capability()` per §3.5.2: `Native` for **all nine** capabilities
   (`outbound-http`, `outbound-deadlines`, `outbound-flexible-phase-budget` (single
   `worker::Delay` for the total race, no per-phase split), `send-all-slot-isolation`,
@@ -2818,9 +3177,12 @@ async fn send_all(
   §5.4 has a row that locks this. The test cannot use a handler-side sleep before
   `send_all` — that runs *before* the adapter captures `batch_now`, so it never
   exercises the slack guard. The test instead uses an **adapter-internal injection
-  hook** (a `#[cfg(test)]` `Fn` slot on `FastlyOutboundClient` invoked between
-  `batch_now` capture and per-slot `dispatch()`) to introduce a synthetic delay
-  exceeding `BATCH_DISPATCH_SLACK_MAX`. With the hook set, late slots return
+  hook** (a **`#[cfg(feature = "test-utils")]`** `Fn` slot on `FastlyOutboundClient`
+  invoked between `batch_now` capture and per-slot `dispatch()`) to introduce a
+  synthetic delay exceeding `BATCH_DISPATCH_SLACK_MAX`. **It must be feature-gated,
+  not `#[cfg(test)]`** — `tests/contract.rs` is an external integration test and
+  compiles the adapter *without* `cfg(test)`, so a `#[cfg(test)]` hook would be
+  invisible to it (§5.5 *Executable test seams*). With the hook set, late slots return
   `internal("Fastly send_all adapter overhead between batch_now and SDK arming \
    (preflight + dynamic-backend lookup/creation + SDK setup) exceeded \
    BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration")`;
@@ -2846,7 +3208,8 @@ async fn send_all(
        the cached backend by name alone, which would have silently bound a new
        request to whichever identity got cached first — that bug is fixed by the
        explicit identity comparison here. Drop the lock. §5.4 has a row that
-       exercises this path via an injectable hash collision under `#[cfg(test)]`.
+       exercises this path via an injectable hash collision under the `test-utils` feature
+       (**not** `#[cfg(test)]` — see §5.5 *Executable test seams*).
   3. Otherwise (name is absent), call `Backend::builder(..).finish()` **with the
      lock still held**. The earlier "lock-not-across-host-call" rule from round 20
      is reversed here: Fastly's `finish()` is a short host call that never blocks
@@ -2900,6 +3263,35 @@ async fn send_all(
      violations the adapter itself should have prevented (the unfilled-slot case
      in the harvest loop, the `BATCH_DISPATCH_SLACK_MAX` overshoot, this
      section's `NameInUse` external-registration case). Drop the lock.
+
+  **Backend *creation* errors are not the transport errors.** The list above covers
+  `Backend::builder(..).finish()` — i.e. *registering* a dynamic backend. **DNS, TLS,
+  and connection failures do not surface there**; they arrive later, from the **send**
+  itself, as a `SendError` whose `SendErrorCause` names the failure. Mapping the two
+  stages together (as earlier drafts did) would mislabel a connect failure as a
+  "backend setup" error. The normative **send-stage** mapping — applied at
+  `pending.wait()` / `poll()` in the harvest loop and on the single-`send` path,
+  replacing today's blanket `EdgeError::internal(..)` on `wait()` failure:
+
+  | Fastly `SendErrorCause` | EdgeError | Status |
+  | --- | --- | --- |
+  | **Timeout** causes (connect / first-byte / between-bytes timer fired) | `gateway_timeout` | **504** |
+  | DNS resolution failure | `bad_gateway` | 502 |
+  | TLS / certificate failure | `bad_gateway` | 502 |
+  | Connection refused / reset / other transport failure | `bad_gateway` | 502 |
+  | Any other `SendErrorCause` | `bad_gateway` | 502 |
+
+  Rationale: a fired host timer is a **deadline** outcome (504) and must be
+  distinguishable from an upstream that was unreachable (502) — the fan-out caller
+  retries those differently. `EdgeError::internal` is **never** correct for a
+  send-stage failure; it stays reserved for adapter contract bugs. A completed
+  exchange, including any non-2xx, is `Ok`.
+
+  **`BackendCreationError::Disallowed`** (dynamic backends not enabled on the
+  service) is the one creation error that gets its own diagnostic rather than a bare
+  502: map to
+  `EdgeError::bad_gateway("Fastly dynamic backends are disabled on this service; enable them or declare static backends — see §4.3 'Service prerequisite'")`,
+  so the operator gets an actionable message instead of a generic bad-gateway.
 
   There is no `BackendSlot::Building` / `Failed` variant and no condvar — holding
   the outer lock through the build means no other thread can observe an
@@ -3104,57 +3496,122 @@ service — this distinction is explicit so a green capability check is not misr
   `Body::Stream`, with a per-chunk race against a wasi monotonic-clock timer bounded
   by `budget.deadline`; the wrapper yields a `gateway_timeout` error chunk past the
   deadline so the streamed body honours the deadline end-to-end per §3.3.3.
-- **Streamed request bodies.** Spin/WASI outgoing-body supports streamed writes; the
-  adapter feeds chunks from `Body::Stream` to the WASI outgoing-body up to
-  `req.max_request_body_bytes` (default 8 MiB), with pre-append checked accounting and
-  `bad_request` on overflow. **Two distinct races bound the upload** so
-  `streamed-upload-deadlines = Native` is real on Spin (not just claimed):
-  1. *Source-pull race*: `futures::select!` between `source_stream.next()` and a
-     wasi monotonic-clock timer for `budget.deadline.remaining()`. A
-     `stream.next().await` that never yields is preempted at the deadline and the
-     slot returns `gateway_timeout` — this is what makes Spin Native for the
-     capability (vs. Fastly BestEffort, which cannot preempt this path, §4.3).
-  2. *Host-write race*: WASI `output-stream` is **nonblocking + readiness-polled**,
-     not blocking. For each chunk the adapter has from the source, the
-     implementable pattern is:
-     a. obtain the stream's `subscribe()` pollable (one `Pollable` per
-        `OutputStream`);
-     b. `futures::select!` the pollable's ready signal against a wasi
-        monotonic-clock timer for `budget.deadline.remaining()`;
-     c. if the timer fires first → drop the outgoing handle and return
-        `gateway_timeout`;
-     d. if the pollable fires first → call nonblocking `check_write()` to obtain
-        the **permitted byte count** the stream can accept now, then call
-        `write(bytes)` with at most that many bytes; loop until the current
-        chunk is fully written, repeating step (a) when `check_write()` returns
-        zero or the chunk has remainder.
+- **Streamed request bodies — hand-built `wasi:http` request (SDK 6 / WASI 0.3).**
 
-     A slow host that never accepts bytes therefore stalls at the pollable
-     subscription, where the timer preempts at the deadline — `gateway_timeout`
-     within one timer-resolution tick of `budget.deadline`, not unbounded.
-     `write()` itself never blocks on host I/O so there is no in-progress
-     `write()` to race against the timer.
-  After upload completion the adapter calls `budget.deadline.remaining()`; if
-  `None`, the outgoing handle is dropped and the slot returns `gateway_timeout`
-  immediately — no response wait. Otherwise the remaining duration governs the
-  response race, so upload time is included in the batch budget rather than
-  added on top.
+  > **⚠️ Corrected against verified SDK source.** Earlier drafts of this section
+  > prescribed a WASI-**0.2** loop — `OutputStream::subscribe()` → `Pollable`,
+  > `check_write()` for a permitted byte count, then `write()`. **That API does not
+  > exist in Spin SDK 6.** WASI 0.3 deletes `wasi:io` entirely: there is no
+  > `pollable`, `output-stream`, `check-write`, or `subscribe` anywhere in `wasip3`'s
+  > WIT or in spin-sdk 6's Rust, and `wasi:http@0.3.0`'s `request.new` takes
+  > `contents: option<stream<u8>>` (a component-model stream), not an `OutputStream`
+  > resource. The old algorithm was not merely deprecated — it was **unimplementable**.
+  >
+  > **Nor can the upload go through `spin_sdk::http::send`.** Its `IntoRequest` impl
+  > (`http_into_wasi_request`) hands a streaming `http_body::Body` to a **detached,
+  > uncancellable** pump (`wit_bindgen::spawn`; the runtime's own docs: *"cannot be
+  > cancelled or monitored"*). Dropping the `send` future cancels the **subtask** but
+  > **not the pump** — so a *stalled source* (precisely what this capability exists to
+  > bound) leaves the pump parked in `poll_frame` forever, and the export executor
+  > will not exit until spawned tasks drain. That is not a weak timing guarantee; it
+  > **pins the component task alive indefinitely**. Routing streamed uploads through
+  > the SDK's high-level `send` would make Spin `BestEffort` *and* leak.
+
+  The adapter therefore **builds the `wasi:http` request by hand** for streamed bodies
+  and keeps the body pump **inside** the raced future, so a single drop cancels
+  everything. All of this is public API — `spin_sdk` re-exports `wasip3`, `wit_stream`,
+  and `wit_future`:
+
+  ```rust
+  use spin_sdk::wasip3::{http::{types, client}, wit_stream, wit_future};
+  use futures::future::{select, Either};
+
+  let (mut writer, contents_rx) = wit_stream::new::<u8>();
+  let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
+
+  let opts = types::RequestOptions::new();
+  let _ = opts.set_connect_timeout(Some(connect_ns));   // transport-only; see note below
+
+  let (req, _transmit) = types::Request::new(headers, Some(contents_rx), trailers_rx, Some(opts));
+  req.set_method(&method)?;   req.set_scheme(scheme.as_ref())?;
+  req.set_authority(auth)?;   req.set_path_with_query(pq)?;
+
+  // The pump lives INSIDE the raced future — no `wit_bindgen::spawn`.
+  let pump = async move {
+      let mut sent = 0usize;
+      while let Some(chunk) = source.next().await {              // cancellable
+          // pre-append cap check (§3.4.1) against max_request_body_bytes
+          if sent.checked_add(chunk.len()).is_none_or(|n| n > max_req) {
+              return Err(EdgeError::bad_request("request body exceeded max_request_body_bytes"));
+          }
+          sent += chunk.len();
+          let unwritten = writer.write_all(chunk.to_vec()).await; // backpressure; cancellable
+          if !unwritten.is_empty() { break; }                     // reader gone
+      }
+      drop(writer);                                               // EOF
+      let _ = trailers_tx.write(Ok(None)).await;                  // completion signal
+      Ok(())
+  };
+
+  // ONE droppable future covering pump + send.
+  let exchange = async move { futures::join!(pump, client::send(req)).1 };
+
+  match select(pin!(exchange), pin!(spin_sdk::time::sleep(budget.deadline.remaining()?))).await {
+      Either::Left((resp, _)) => resp,
+      Either::Right(_) => Err(EdgeError::gateway_timeout("deadline expired during upload")),
+  }
+  ```
+
+  **Why this earns `Native`.** Dropping `exchange` drops **both** halves: `client::send`'s
+  subtask fires the `[subtask-cancel]` canonical-ABI intrinsic (a *synchronous* host-side
+  teardown of the in-flight request), and the pump's in-flight `write_all` fires
+  `stream.cancel-write` while its pending `source.next()` future is simply dropped.
+  Nothing is left spawned, so the component task exits cleanly. Preemption is bounded by
+  **one monotonic-clock tick** past `budget.deadline` — for both a stalled *source pull*
+  and a stalled *host write*. This is the same guarantee the old (impossible) two-race
+  design claimed, obtained by making the whole exchange one cancellable future instead.
+
+  **Completion signalling.** EOF is `drop(writer)`; the result/trailers channel is
+  `trailers_tx.write(..)`. (This is the SDK's own `BodyWriter` reimplemented **without**
+  the `spawn`.) The `max_request_body_bytes` cap (default 8 MiB) is enforced with
+  pre-append checked accounting **inside the pump loop**, `bad_request` on overflow.
+
+  **`RequestOptions` do not bound the upload.** WASI 0.3 keeps `set-connect-timeout` /
+  `set-first-byte-timeout` / `set-between-bytes-timeout`, but these are transport /
+  response-side only — the WIT states they are *"separate from any the user may use to
+  bound an asynchronous call."* They are **not** a substitute for the race above; set
+  `connect_timeout` as a courtesy, and let the raced timer own the deadline.
+
+  After the exchange completes the adapter re-reads `budget.deadline.remaining()`; if
+  `None`, the response is dropped and the slot returns `gateway_timeout` — no response
+  wait. Otherwise the remaining duration governs the response race, so upload time is
+  included in the batch budget rather than added on top.
 - Existing gzip/br decompression is kept; decompressed-byte cap enforced incrementally
   (§3.4.1). `Streamed` mode wraps the response body as `Body::Stream`.
-- Errors: wasi-timer expiry → `gateway_timeout`; `spin_sdk::http::send` transport
-  failure (DNS/TLS/connection refused) → `bad_gateway`; over-cap → `bad_request`.
-  Any completed exchange (incl. non-2xx) → `Ok`. (§3.4.3 is the fallback for
-  variants not enumerated here.)
+- Errors: wasi-timer expiry → `gateway_timeout`; transport failure (DNS/TLS/connection
+  refused) from `spin_sdk::http::send` (buffered path) or `wasip3::http::client::send`
+  (hand-built streamed path, §4.4) → `bad_gateway`; **request**-body over-cap →
+  `bad_request` (400); **response**-body over-cap (decompressed count) → `bad_gateway`
+  (502, per the global response-overflow rule §3.4.1). Any completed exchange
+  (incl. non-2xx) → `Ok`. (§3.4.3 is the fallback for variants not enumerated here.)
 - Spin requires `allowed_outbound_hosts`; the adapter renders it from
   `[capabilities.outbound].hosts` per §3.5.4 when generating `spin.toml`.
-- `capability()` per §3.5.2: `Native` for **all nine** capabilities. Spin's wasi
+- `capability()` per §3.5.2: `Native` for **eight of the nine**;
+  `lazy-streamed-response-passthrough` is **`BestEffort`** (footnote 7). Spin's wasi
   monotonic-clock timer covers `outbound-deadlines` and `streamed-upload-deadlines`;
   the single wasi-timer race is one total budget (no per-phase split), so
-  `outbound-flexible-phase-budget` is `Native` too; the WASI outgoing-body sink
-  accepts a non-Send stream so `lazy-streamed-response-passthrough` is `Native`;
-  and `join_all` of `spin_sdk::http::send` futures fans out body drains
-  concurrently so `send-all-slot-isolation` is `Native`. `config-store` / `kv-store`
-  / `secret-store` are `Native` for Spin too.
+  `outbound-flexible-phase-budget` is `Native` too; and `join_all` of
+  `spin_sdk::http::send` futures fans out body drains concurrently so
+  `send-all-slot-isolation` is `Native`. `config-store` / `kv-store` /
+  `secret-store` are `Native` for Spin too.
+- **Response-out passthrough is buffered (BestEffort), not lazy.** Spin's public
+  response surface is `Response<FullBody<Bytes>>` (`SpinFullResponse`, used by
+  `AppExt::dispatch` / `request::dispatch*` / `from_core_response` / `run_app`), so
+  lazy passthrough would require a breaking public-API migration plus a WASI-0.3
+  rewrite — deferred (footnote 7, §8 risk 13). The converter therefore drains the
+  wrapped `Body::Stream` to `Bytes` within `SPIN_RESPONSE_STREAM_BUFFER_BYTES`
+  (16 MiB); over-cap → `bad_gateway` (502). The **outbound streamed-upload** path
+  above is unaffected and stays `Native`.
 
 ## 5. Test plan
 
@@ -3162,25 +3619,55 @@ CLAUDE.md forbids tests needing a network connection or platform credentials. "N
 means the public internet — a **locally spawned mock origin** is allowed and is how
 concurrency and timing are proven. Tests are tiered.
 
-### 5.1 Tier 1 — core contract suite
+**Tiers are defined by *owning crate and runtime*, not by abstraction level.** An earlier
+draft defined Tier 1 as "core-only" while §5.4 assigned CLI-gate, registry, `demo`, and
+Spin-render rows to it — those do not live in `edgezero-core` and could not have run
+there. The tiers below are the ones the rows actually map onto.
 
-Location: `crates/edgezero-core/src/outbound.rs` `#[cfg(test)]`, plus a
-`MockOutboundClient` exposed behind the existing `test-utils` feature. Runs on native and
-wasm targets; async tests use `futures::executor::block_on`.
+### 5.1 Tier 1 — host-native, no platform runtime
+
+**Owning crates:** `edgezero-core` (in-crate `#[cfg(test)]`, plus `MockOutboundClient`
+behind the existing `test-utils` feature), `edgezero-adapter` (registry + `capability()`),
+and `edgezero-cli` (the six capability gates, manifest parsing/validation, the Spin
+`allowed_outbound_hosts` render + drift comparison — pure `toml_edit` logic needing no
+Spin runtime). Runs under `cargo test --workspace --all-targets`; async tests use
+`futures::executor::block_on`.
 
 `MockOutboundClient` is scripted per request: status, headers, body, byte size, simulated
-failure, simulated latency, and compressed-payload simulation. It validates the **shared**
-logic — `send_all` aggregation, index alignment, `send_all(vec![])` → `vec![]`,
-partial-failure isolation, deadline cutoff, decompressed-byte cap, error mapping, non-2xx
-passthrough, URI validation, fallible header construction.
+failure, simulated latency, and compressed-payload simulation.
 
-### 5.2 Tier 2 — per-adapter translation tests
+> **⚠️ Tier 1 CANNOT prove `send_all` behaviour. There is no shared `send_all`.**
+> Every adapter implements `send_all` **independently** (Fastly's dispatch-all-then-harvest
+> engine has nothing in common with the others' `join_all`), so `MockOutboundClient` has no
+> shipped orchestration to exercise — it only exercises **its own** implementation. A Tier 1
+> `send_all` row therefore proves the **contract shape** (index alignment, `send_all(vec![])`
+> → `vec![]`, per-slot `Ok`/`Err`, partial-failure isolation) against a *reference*
+> implementation, and proves **nothing** about the four shipped ones. Earlier drafts claiming
+> Tier 1 validated "the shared `send_all` logic" were wrong.
 
-Location: `tests/contract.rs` in each adapter crate (**created for Axum**; extended for
-the other three). No network. Covers request→platform and platform→response conversion,
-header preservation, non-2xx mapping, buffered vs. streamed body handling, and
-compressed-body decompression, using each adapter's existing harness (`#[tokio::test]`,
-`#[wasm_bindgen_test]`, `block_on`).
+What Tier 1 *does* own: the pure-core logic — `dispatch_budget` classification, `Deadline`
+clamping, URI canonicalization + the four accessors, `validate_for_dispatch`, pre-append
+bounds, `BodyCell` state transitions, `StoredError` reconstruction, 502/504 mapping,
+extractor caps, manifest/host-grammar parsing, capability-gate outcomes, and the
+`CapabilitySupport` matrix.
+
+### 5.2 Tier 2 — per-adapter contract tests (no network)
+
+**Location:** `tests/contract.rs` in each adapter crate — **native** for Axum, and on the
+adapter's **wasm target** for Fastly / Cloudflare / Spin (§5.5). Covers request→platform
+and platform→response conversion, header preservation (incl. multi-value), method/body
+preflight, non-2xx mapping, buffered vs. streamed handling, decompression, and error
+mapping. Requires the **`test-utils` seams and provider fakes** of §5.5 — a Tier 2 row
+whose seam does not exist yet is **not required** and must not be listed as such.
+
+**The `send_all` conformance suite lives here.** Because orchestration is per-adapter, the
+only way to hold all four to one standard is a **reusable suite** — a set of assertions
+exported from `edgezero-core` under `test-utils` and **invoked by every adapter's
+`contract.rs` against its real client**: index alignment, empty batch, partial-failure
+isolation, `send ≡ send_all(vec![req]).pop()` equivalence, streamed-body/streamed-response
+preflight rejection. This is what makes "portable" a tested claim rather than an assertion,
+and it is the direct replacement for the Tier-1 `send_all` rows that could never have
+proven it.
 
 ### 5.3 Tier 3 — per-adapter live behaviour
 
@@ -3194,10 +3681,20 @@ Proves real fan-out and timing against a locally spawned mock origin.
   `join_all` concurrency runs under the real wasi executor (bare `block_on` will not fan
   out).
 
-Each wasm Tier 3 test is a dedicated CI job. Axum's lands with the implementation; the
-three runtime-backed jobs land as the matching runtimes are wired into CI. Until then,
-that adapter's behaviour is still covered by Tier 1 (logic) and Tier 2 (translation); the
-gap is the live wall-clock/timing proof only, and it is tracked, not silently skipped.
+**Which Tier 3 jobs block completion — explicit, because earlier drafts had Tier 3
+simultaneously "required" and "deferred".**
+
+| Tier 3 job | Blocks completion? | Rationale |
+| --- | --- | --- |
+| **Axum** (tokio mock origin) | **YES — blocking** | Native, no external runtime to install. It is the reference adapter and the *only* place real fan-out wall-clock is proven in this change. |
+| **Fastly** (Viceroy) | **No — deferred** | Per the locked decision, Fastly ships with **deterministic unit tests only** (dispatch/harvest ordering, backend identity, phase-split, slack guard). Live Viceroy concurrency lands when CI runtime support does. |
+| **Cloudflare** (`workerd`/miniflare) | **No — deferred** | Lands with the runtime job. |
+| **Spin** (`spin` runtime) | **No — deferred** | Lands with the runtime job. **Note:** this is the *only* place Spin's `join_all` concurrency actually fans out — a bare `block_on` will not. So Spin's concurrency claim is **unproven until this job exists**, and that must be stated rather than implied by a green Tier 1/2. |
+
+A deferred job means the adapter's **logic** (Tier 1) and **translation + conformance
+suite** (Tier 2) still run and still gate the merge; what is missing is the **live
+wall-clock/timing proof** only. That gap is tracked here, not silently skipped — and no
+row may claim a wall-clock guarantee whose only proof lives in a deferred job.
 
 Reference concurrency assertion (Axum):
 
@@ -3253,7 +3750,7 @@ async fn send_all_runs_requests_concurrently() {
 | Multi-value response headers preserved (e.g. duplicate `set-cookie`) | yes | yes | yes |
 | Multi-value outbound request headers preserved on the wire | yes | yes | yes |
 | Inbound body: adapter exposes `Body::Stream`; `body_bytes(max)` drains and caches; second call returns clone without re-reading | yes | yes | — |
-| Required `BestEffort` capability → **every adapter-selecting CLI command** (`edgezero build`, `edgezero serve`, `edgezero deploy`, `edgezero auth login` / `logout` / `status`, `edgezero provision`, `edgezero config push` / `config validate`, `edgezero demo`) exits non-zero with a clear message — matches the §3.5.3 enforcement set (PR #269: pre-dispatch gate inside `execute(..)` for `build`/`serve`/`deploy`/`auth`, plus sibling gates at the top of `run_provision`, `run_config_push`, `run_config_validate`, and `run_demo`). `edgezero dev` is gone; `demo` is its contributor-only replacement | yes | — | — |
+| Required `BestEffort` capability → **every adapter-selecting CLI command** (`edgezero build`, `edgezero serve`, `edgezero deploy`, `edgezero auth login` / `logout` / `status`, `edgezero provision`, `edgezero config push` / `config diff` / `config validate`, `edgezero demo`) exits non-zero with a clear message — matches the §3.5.3 enforcement set: pre-dispatch gate inside `execute(..)` for `build`/`serve`/`deploy`/`auth`, plus **five** sibling gates at the top of `run_provision`, `run_config_push_typed`, `run_config_diff_typed`, `run_config_validate`, and `run_demo` (**six** gate sites total). `edgezero dev` is gone; `demo` is its contributor-only replacement | yes | — | — |
 | Axum response converter mapping for a wrapped streamed body: `Err(GatewayTimeout)` chunk during buffered drain → axum response **504**; `Err(BadGateway)` chunk → **502**; over-cap → **502**; `Ok` chunks under cap append normally. The buffering boundary lets Axum preserve the correct status code (no silent coalesce to 502) | — | yes | yes |
 | `OutboundRequest::into_parts` / `OutboundResponse::new` / `OutboundResponse::into_parts` round-trip every field (adapter API completeness) | yes | yes | — |
 | `body_bytes` cap exceeded → subsequent `body_bytes` / `json_within` / `form_within` calls return the same stored error (poison semantics); `into_request()` returns `Err(stored_err)` (per §3.4.5 round-18 / round-19 — **not** an empty body) | yes | yes | — |
@@ -3277,17 +3774,31 @@ async fn send_all_runs_requests_concurrently() {
 | `.timeout(short).deadline(long)` honours the *shorter* effective — **dispatch_budget classification (Tier 1):** the core helper returns `DispatchBudget { duration: short, deadline: now + short }`. Mock-driven test asserts the classification | yes | — | — |
 | `.timeout(short).deadline(long)` honours the *shorter* effective deadline end-to-end (streamed body returns 504 at `now + short`, not `now + long`) — **adapter wrapper (Tier 2 / Tier 3):** wrapper armed with `budget.duration` actually fires at `now + short` against a real platform timer | — | yes | yes |
 | Streamed request body over `max_request_body_bytes` → per-slot `bad_request` (400) on every adapter | yes | yes | — |
-| Stalled streamed-request-body upload, mechanics differ per adapter — this row is **Tier 2/3 only** because Tier 1's `MockOutboundClient` cannot prove the Axum tokio / Cloudflare `worker::Delay` / Spin WASI-readiness / Fastly host-timer behaviour; Tier 1 covers the cross-adapter *contract* (504 on stall, index alignment) via the mock, marked separately. **Axum / Cloudflare** drain `Body::Stream` into `Bytes` **before** constructing the platform request (§4.1 / §4.2), so the relevant stall is the *source-pull* during the drain — tokio / `worker::Delay` races it against `budget.deadline` and returns 504 at the deadline (no separate "host-write" race because by the time the SDK request is constructed the body is already in hand). **Spin** has both phases explicit per §4.4: (a) source-pull race — `futures::select!` of `source_stream.next()` against a wasi monotonic-clock timer for the remaining deadline; (b) host-write race — subscribe to the WASI output-stream readiness pollable, race the pollable's ready signal against the wasi timer, then call nonblocking `check_write()` to obtain the permitted byte count and `write()` within that bound (WASI output streams are nonblocking / readiness-polled). Both phases return 504 at the deadline. **Fastly** has a single phase where source-pull cannot be preempted (BestEffort per `streamed-upload-deadlines`); the cooperative `budget.deadline.is_expired()` check **between** chunks is the only adapter-side bound, and Fastly's `between_bytes_timeout` is documented as receive-side only — it does **not** bound guest-to-origin writes (BestEffort for the write phase too, no per-chunk-gap claim). The slot returns 504 at the next inter-chunk check after `budget.deadline` expires. Test asserts per-adapter mechanics | — | yes | yes |
+| Stalled streamed-request-body upload, mechanics differ per adapter — this row is **Tier 2/3 only** because Tier 1's `MockOutboundClient` cannot prove the Axum tokio / Cloudflare `worker::Delay` / Spin WASI-readiness / Fastly host-timer behaviour; Tier 1 covers the cross-adapter *contract* (504 on stall, index alignment) via the mock, marked separately. **Axum / Cloudflare** drain `Body::Stream` into `Bytes` **before** constructing the platform request (§4.1 / §4.2), so the relevant stall is the *source-pull* during the drain — tokio / `worker::Delay` races it against `budget.deadline` and returns 504 at the deadline (no separate "host-write" race because by the time the SDK request is constructed the body is already in hand). **Spin** uses the hand-built `wasi:http` request per §4.4 — the SDK's high-level `spin_sdk::http::send` is **not** used for streamed bodies because its `IntoRequest` impl spawns an **uncancellable** body pump (`wit_bindgen::spawn`), which would leave a stalled source pumping forever and pin the component task alive. Instead the body pump (`wit_stream` writer + `write_all`) lives **inside** a single raced future together with `wasip3::http::client::send`; racing that future against `spin_sdk::time::sleep(remaining)` and dropping it on expiry cancels **both** halves — `[subtask-cancel]` tears the request down host-side and the in-flight `write_all` fires `stream.cancel-write`. A stalled source-pull *and* a stalled host-write are therefore both preempted within one monotonic-clock tick of `budget.deadline` → 504. (The WASI-0.2 `subscribe()` / `check_write()` readiness-poll model earlier drafts described **does not exist** in SDK 6 / WASI 0.3.) The test asserts the drop actually cancels — i.e. a stalled upload returns 504 **and** leaves no spawned pump running. **Fastly** has a single phase where source-pull cannot be preempted (BestEffort per `streamed-upload-deadlines`); the cooperative `budget.deadline.is_expired()` check **between** chunks is the only adapter-side bound, and Fastly's `between_bytes_timeout` is documented as receive-side only — it does **not** bound guest-to-origin writes (BestEffort for the write phase too, no per-chunk-gap claim). The slot returns 504 at the next inter-chunk check after `budget.deadline` expires. Test asserts per-adapter mechanics | — | yes | yes |
 | Stalled streamed-request-body upload **contract only** (Tier 1, via `MockOutboundClient` with scripted stalls): on the **preemptible-source** adapters (Axum / Cloudflare / Spin) a stalled upload returns `Err(EdgeError::gateway_timeout(..))` to the caller within the configured deadline, slot index alignment is preserved, and other slots are unaffected. **Fastly is excluded from the "within the configured deadline" half of this contract** because `streamed-upload-deadlines` is `BestEffort` on Fastly (§3.5.1 / §3.5.2): a source-pull stall (`stream.next().await` that never yields) is unbounded on Fastly per §4.3, so Tier 1 cannot assert wall-clock containment there. Fastly still observes the index-alignment + partial-failure-isolation half of the contract. The `MockOutboundClient` sets the adapter under test on the mock so this row's Fastly invocation skips the wall-clock assertion and runs only the structural assertions. Mechanics-level wall-clock assertions for all four adapters (including Fastly's `BoundedCooperative` between-chunk bound) live in the Tier 2/3 row above | yes | — | — |
 | `body_bytes` / `json_within` / `form_within` after `take_body()` → `internal("body already consumed via take_body")` (no body resurrection) | yes | — | — |
-| Valid non-ASCII UTF-8 header (e.g. `x-app-display-name: café`) round-trips through every adapter on request and response | yes | yes | yes |
+| Valid non-ASCII UTF-8 header (e.g. `x-app-display-name: café`) round-trips through every adapter on request and response. **Asserted on Axum / Fastly / Spin (raw-byte adapters); best-effort on Cloudflare** — `worker::Headers` exposes post-WebIDL strings, so byte-faithful round-trip is not guaranteed there (§3.1.4 *Cloudflare degradation*) | yes | yes | yes |
+| **Non-portable method → preflight `bad_request` (400) on every adapter** (§3.1.4): an `OutboundRequest` with a method outside `{GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS}` is rejected in core preflight with `"method <M> is not portable; …"`. Identical for single `send` and for a `send_all` slot (index alignment preserved). **Regression guard:** Cloudflare must **not** silently coerce the method to `GET` — the test asserts a `DELETE`-shaped custom method never reaches the wire as `GET` | yes | yes | — |
+| **`GET`/`HEAD` with a non-empty body → preflight `bad_request` (400) on every adapter** (§3.1.4): CF's `fetch` forbids it, so EdgeZero normalises to the strictest platform rather than letting the request succeed on three adapters and fail on one. Asserts uniform rejection, not per-adapter divergence | yes | yes | — |
+| **Supported-method matrix:** each of `GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS` reaches the upstream with the method **intact** on every adapter (no coercion, no rewrite) | — | yes | yes |
+| **`validate_for_dispatch` runs at DISPATCH, not construction** (§3.1.4): `OutboundRequest::get(url)?.body(payload)` — a `GET` validated at construction that then acquires a body via the infallible `.body()` setter — is still rejected with `bad_request` when it reaches `send` / `send_all`. **This is the regression guard**: a construction-only check passes this test vacuously, so the test must assert the rejection happens with the body attached *after* a successful `get(..)` | yes | yes | — |
+| **`GET`/`HEAD` + `Body::Stream` → `bad_request` unconditionally** (§3.1.4), even for a stream that would yield zero bytes — emptiness is not observable without consuming the stream, and the validator does not peek-and-rechain. Asserts the documented false-positive is deliberate | yes | yes | — |
+| **`StoredError` reconstruction** (§3.4.5): after a poisoning drain, **every** access (`body_bytes` / `json_within` / `form_within` / `into_request`) returns an `EdgeError` with the **same variant, status, and message**. Asserts poison is reproducible even though `EdgeError` is not `Clone` (its `Internal` variant wraps non-clonable `anyhow::Error`). Also asserts the documented loss: a reconstructed `internal` error's `inner()` carries the message but **not** the original `anyhow` source chain | yes | — | — |
+| **`demo` capability gate reads the baked manifest** (§3.5.3): a test-only `Hooks` impl overriding `manifest_json()` to return a crafted manifest that `required`s a capability Axum only `BestEffort`-supports causes `run_demo()` to exit non-zero. Asserts the gate works with **no manifest file on disk** — the whole point of the baked accessor. A `Hooks` impl with the default `manifest_json() == None` → no capability contract → `demo` runs | yes | — | — |
+| **Spin `allowed_outbound_hosts` — `provision` writes** (§3.5.4): `edgezero provision --adapter spin` renders `[capabilities.outbound].hosts` into `spin.toml`, **preserving sibling fields and comments** (`toml_edit`), and is a no-op under `--dry-run`. Absent `[capabilities.outbound].hosts` → writes `["https://*:*"]` and **never** widens to include `http://*:*` (security-default regression guard) | yes | — | — |
+| **Spin `allowed_outbound_hosts` — `build`/`serve`/`deploy` validate, never write** (§3.5.4): drift between `spin.toml` and the manifest hard-fails with the expected list rendered; `spin.toml` is **byte-identical** afterwards (asserts the build path does not rewrite a git-tracked, user-owned file). Comparison is over **canonicalized sets**: `https://x:443` vs `https://x`, and a reordered list, must **not** report drift | yes | — | — |
+| **Spin sync hook fires for shell-overridden commands** (§3.5.4) — **dead-code regression guard.** A scaffolded manifest declares `[adapters.spin.commands].build`, so `edgezero build --adapter spin` takes the `manifest_command` → `run_shell` branch and **never reaches `SpinCliAdapter::execute`**. The test asserts the drift check **still fires** — proving the hook lives in `edgezero_cli::adapter::execute` *before* the `manifest_command` branch, not in the adapter. A hook placed in the adapter passes every other Spin test and silently fails only this one | yes | — | — |
+| **Cloudflare `set-cookie` multi-value, upstream → core** (§4.2): two upstream `set-cookie` headers survive as **two** values in the core `HeaderMap`. Regression guard for `HeaderMap::insert` (which removes all previous values) — the test must assert **both** cookies are present, not just that a `set-cookie` exists. Valid on this repo's pinned `compatibility_date = "2023-05-01"`, which enables workerd's per-`set-cookie` `entries()` behaviour | — | yes | yes |
+| **Cloudflare `Set-Cookie` multi-value, core → client** (§4.2): a handler emitting **two** `Set-Cookie` headers ships **both** to the client. Regression guard for `Headers::set` (which replaces) on the client-facing response path — distinct from the row above, which is the upstream-response path. Both must use `append` | — | yes | yes |
+| **Cloudflare non-ASCII request header does not panic** (§4.2): proxying `x-app-display-name: café` through the CF outbound path completes without unwinding. Regression guard for `Headers::from(&HeaderMap)`'s `value.to_str().unwrap()` — `HeaderValue::to_str` errors on any byte outside visible ASCII, so this **panics the worker** today | — | yes | yes |
+| **Cloudflare repeated non-`set-cookie` headers are comma-joined (documented loss)** (§3.1.4): two upstream `x-foo` headers arrive as a single `x-foo: a, b`. The test **asserts the documented degradation** rather than a faithful round-trip — workerd comma-joins them and `getAll()` refuses any name but `set-cookie`, so separate field lines are unrecoverable. Axum / Fastly / Spin preserve them separately | — | yes | yes |
 | Header containing a `\x80` byte is rejected on outbound request (400) and dropped on inbound-of-outbound response with a `warn!` naming the header | yes | yes | — |
 | RFC 7230 hop-by-hop strip removes `trailer` (singular) end-to-end; an inbound `trailer: foo` never reaches the outbound wire | yes | yes | — |
 | Fastly `send` with `Body::Stream` request body: over `max_request_body_bytes` mid-upload → 400; stalled upload **between** yielded chunks (next cooperative `budget.deadline.is_expired()` check fires) → 504 within one chunk-iteration of `budget.deadline`; stalled `stream.next()` AND stalled in-progress `StreamingBody::write_all` are **both BestEffort gaps** on Fastly (no preemption, and `between_bytes_timeout` is documented as *receive-side only* — it does not bound guest-to-origin writes); upload time reduces remaining budget for response. **Adapter-specific mechanics (cooperative inter-chunk check, source-pull and host-write non-preemption) live in Tier 2 / Tier 3 only** — Tier 1's `MockOutboundClient` cannot reproduce Fastly's chunk-iteration timing | — | yes | yes |
 | `dispatch_budget(req)` table: every row of §3.3.2 holds (timeout-only, deadline-only, both, expired, zero-effective, no-deadline-no-timeout) | yes | — | — |
 | Fastly `send_all` with mixed budgets, **headers phase**: short-budget slot's *headers* result reflects its own budget (host enforces independently); but its wall-clock-observed *delivery* can be delayed behind an earlier `wait()` (harvest order). **Adapter-specific** — harvest order and per-slot host-timer behaviour belong to Tier 2 (Fastly contract crate) and Tier 3 (Viceroy) | — | yes | yes |
 | Fastly `send_all` Buffered mode, **body phase**: a slot whose own `budget.deadline` would have covered its body in isolation can still return `gateway_timeout` because an earlier slot's body drain monopolised harvest. The contract explicitly admits these harvest-order-induced 504s on Fastly Buffered. **Adapter-specific harvest mechanics** — Tier 1's mock has no harvest queue and cannot reproduce the head-of-line block; covered by Tier 2 (deterministic harvest ordering against a host-side fake) and Tier 3 (Viceroy wall-clock) | — | yes | yes |
-| `[capabilities] required = ["send-all-slot-isolation"]` on a Fastly target → **every adapter-selecting CLI command** (`build` / `serve` / `deploy` / `auth` / `provision` / `config push` / `config validate` / `demo`) exits non-zero with the BestEffort + required hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)`, siblings on `run_provision` / `run_config_*` / `run_demo`, PR #269); same manifest on Axum/CF/Spin passes | yes | — | — |
+| `[capabilities] required = ["send-all-slot-isolation"]` on a Fastly target → **every adapter-selecting CLI command** (`build` / `serve` / `deploy` / `auth` / `provision` / `config push` / `config diff` / `config validate` / `demo`) exits non-zero with the BestEffort + required hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)`, five siblings on `run_provision` / `run_config_push_typed` / `run_config_diff_typed` / `run_config_validate` / `run_demo`); same manifest on Axum/CF/Spin passes | yes | — | — |
 | Fastly mixed-budget `send_all` to the **same host**: slots with `50 ms` and `3 s` budgets create **distinct** dynamic backends (identity tuple includes `budget_ms`); the 50 ms slot's host timeout is not silently inherited by the 3 s slot or vice versa. **Asserts the Fastly identity tuple** — Tier 1's mock has no dynamic-backend abstraction; Tier 2 (Fastly contract crate) inspects the registered-backend map and Tier 3 (Viceroy) observes the wall-clock divergence | — | yes | yes |
 | `RequestContext::into_request()` after `body_bytes` poison: returns `Err(stored_err)`, not `Ok(Request<Body::empty()>)` — a permissive proxy-forward cannot mask a stricter middleware's poisoned read | yes | — | — |
 | Fastly + `outbound-http = required`: `ensure_capabilities` emits the dynamic-backends informational log | yes | — | — |
@@ -3303,9 +3814,9 @@ async fn send_all_runs_requests_concurrently() {
 | Fastly streamed-upload **tiny-positive-remainder edge case** — the upload drain completes with `budget.deadline.remaining() == Some(small)` (say 10 ms left out of a 200 ms budget). The cooperative check at the `wait()` boundary passes (remaining is positive), and the host then waits up to the dispatch-time `first_byte_ms` (150 ms in this example, 3/4 of `budget.duration`) for the upstream's response headers. The test asserts (a) total wall-clock from dispatch to return is bounded by `budget.duration + first_byte_ms + between_bytes_timeout` (closed-form, **not** per-chunk-accumulating), (b) the response wrapper's `is_expired()` check preempts after the first body chunk read returns rather than waiting another `between_bytes_timeout` per chunk, (c) the slot ultimately returns `gateway_timeout` with a `partial_send = true` diagnostic in the error chain. Fastly-specific (response-phase overshoot is the documented behaviour of `send_async_streaming`); Tier 2 (contract crate, time-injection hook) + Tier 3 (Viceroy wall-clock observation) | — | yes | yes |
 | `batch_deadline = Deadline::after(batch_deadline_ms)` computed once and copied into every target request → all targets share one absolute wall-clock cap (no drift); recomputing `Deadline::after(batch_deadline_ms)` per target would let later targets drift past the batch deadline (counter-example test) | yes | — | yes |
 | Outbound request header from `headers_mut()` containing a non-UTF-8 value is **dropped with `warn!`** by `normalize_for_dispatch` (lossy proxy-forward path) — distinct from `header(..)` which **rejects** with 400 (loud construction path) | yes | yes | — |
-| Adapter response-out converter (`response.rs`) on **CF / Spin**: `OutboundResponse::into_response()` with a streamed body yields first bytes before the upstream stream ends (no buffer-then-return); driven by a `MockOutboundClient`-fed stream in-process, no platform runtime needed. **Fastly is excluded from this row** — `Response::stream_to_client()` is incompatible with `#[fastly::main]` (capability footnote 6), so Fastly's converter falls back to buffered passthrough (see the Axum/Fastly row below) | — | yes | yes |
-| Adapter response-out converter on **CF / Spin**: stream errors after headers **abort the downstream response stream** — once headers have been written, HTTP cannot change status to 502/504, so the adapter aborts the chunked body (TCP close on HTTP/1.1, RST_STREAM on HTTP/2) and emits a `log::warn!` naming the originating `EdgeError` variant (`gateway_timeout` or `bad_gateway`). Clients observe an early connection close, not a synthetic 502/504. The originating EdgeError is in the server log. **Fastly is excluded** because it never reaches "headers already written" — its buffered fallback materialises the whole body before the response is returned via `#[fastly::main]`, so a mid-stream error becomes a clean 502/504 in the buffered drain | — | yes | yes |
-| Adapter response-out converter buffered fallback on **Axum and Fastly**: streamed body is buffered to `Bytes` within the adapter-level constant (`AXUM_RESPONSE_STREAM_BUFFER_BYTES` on Axum, `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` on Fastly — both default 16 MiB, documented adapter-specific limitations). First bytes only flow after full collection. Over-cap → 502. The per-outbound-request `max_response_bytes` is unavailable by the time the converter runs (`OutboundResponse` carries only status / headers / body); the adapter-level constant is what the converter uses. Apps needing lazy passthrough declare `lazy-streamed-response-passthrough` required and target CF / Spin (both adapters Native; Axum + Fastly BestEffort) | — | yes | yes |
+| Adapter response-out converter (`response.rs`) on **Cloudflare** (the only lazy-`Native` adapter): `OutboundResponse::into_response()` with a streamed body yields first bytes before the upstream stream ends (no buffer-then-return); driven by a `MockOutboundClient`-fed stream in-process, no platform runtime needed. **Axum, Fastly, and Spin are excluded from this row** — all three are `BestEffort` and fall back to bounded buffered passthrough, for three distinct reasons: non-Send `LocalBoxStream` (footnote 3), `Response::stream_to_client()` incompatible with `#[fastly::main]` (footnote 6), and Spin's buffered `FullBody` public response surface (footnote 7). See the buffered-fallback row below | — | yes | yes |
+| Adapter response-out converter on **Cloudflare**: stream errors after headers **abort the downstream response stream** — once headers have been written, HTTP cannot change status to 502/504, so the adapter aborts the chunked body (TCP close on HTTP/1.1, RST_STREAM on HTTP/2) and emits a `log::warn!` naming the originating `EdgeError` variant (`gateway_timeout` or `bad_gateway`). Clients observe an early connection close, not a synthetic 502/504. The originating EdgeError is in the server log. **Axum, Fastly, and Spin are excluded** because none of them reaches "headers already written" — each buffers the whole body before the response is returned, so a mid-stream error becomes a clean 502/504 in the buffered drain | — | yes | yes |
+| Adapter response-out converter buffered fallback on **Axum, Fastly, and Spin**: streamed body is buffered to `Bytes` within the adapter-level constant (`AXUM_RESPONSE_STREAM_BUFFER_BYTES` / `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` / `SPIN_RESPONSE_STREAM_BUFFER_BYTES` — all default 16 MiB, documented adapter-specific limitations). First bytes only flow after full collection. Over-cap → 502. The per-outbound-request `max_response_bytes` is unavailable by the time the converter runs (`OutboundResponse` carries only status / headers / body); the adapter-level constant is what the converter uses. Apps needing lazy passthrough declare `lazy-streamed-response-passthrough` required and target **Cloudflare** (the only `Native` adapter; Axum + Fastly + Spin are `BestEffort`, footnotes 3 / 6 / 7) | — | yes | yes |
 | `Deadline::after(d)` and `dispatch_budget`'s `saturating(d)` clamp at `DEADLINE_FAR_FUTURE` (7 d) — `Duration::MAX` does not panic, never produces an `Instant` past the clamp, and `fastly_timeout_ms` of the clamped value fits within Fastly's `u32` ms ceiling without rejection | yes | yes | — |
 | `OutboundRequest::is_stream_body()` returns `true` for `Body::Stream` requests and `false` for `Body::Once`; `send_all` preflight uses this to reject without consuming | yes | — | — |
 | `OutboundRequest::is_stream_response()` returns `true` for `stream_response()`-marked requests; `send_all` preflight uses this to reject with `bad_request` without consuming, on every adapter | yes | yes | — |
@@ -3322,13 +3833,13 @@ async fn send_all_runs_requests_concurrently() {
 | `OutboundRequest::get("https://example.com/p#anchor")` and `::post(..)` return `bad_request("outbound URI must not contain a fragment")` — fragment detected on the raw input string *before* `http::Uri` truncates at `#`. `OutboundRequest::new(method, uri)` accepts a `Uri` that has already lost the fragment (documented asymmetry per §3.1.3) | yes | — | — |
 | Capability enforcement: a manifest requiring `lazy-streamed-response-passthrough` causes the **`edgezero demo` runner** (contributor-only, the PR-#269 replacement for the removed `dev` command) to exit non-zero with the Axum BestEffort hard-fail message — via `run_demo(..)`'s sibling pre-dispatch gate against the Axum adapter, *not* via the `execute(..)` path (`demo` does not flow through it). The same hard-fail also fires via `execute(..)`'s pre-dispatch gate on `build` / `serve` / `deploy` / `auth`, and via the `run_config_*` / `run_provision` siblings for those commands. Test asserts every command exits non-zero | yes | — | — |
 | `[capabilities.outbound].hosts` Spin render output is canonicalized: `["HTTPS://EXAMPLE.com:443", "api.example.com"]` → rendered `spin.toml` shows `["https://example.com", "https://api.example.com"]` (lowercase scheme/host, default port stripped, default-scheme https for bare hosts) | yes | — | — |
-| Fastly `send_all` dispatch-overhead slack hard-bounded: with the adapter's `#[cfg(test)]` injection hook set to `Duration::from_millis(50)`, a `send_all` of N requests returns an `EdgeError::internal` whose message **contains the stable substring `"BATCH_DISPATCH_SLACK_MAX"`** (the full normative diagnostic per §4.3 is `"Fastly send_all adapter overhead between batch_now and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) exceeded BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration"`) for the slots dispatched after the cumulative delay crosses `BATCH_DISPATCH_SLACK_MAX` (25 ms). Without the hook, no slot ever returns that error. A handler-side `thread::sleep` before `send_all` is **not** sufficient — it runs before `batch_now` is captured and cannot exercise the guard. Tests assert against the substring, not the full string, so future wording polish doesn't break them. **The hook lives in the Fastly adapter crate**, so this row is Tier 2 (substring assertion in `crates/edgezero-adapter-fastly/tests/contract.rs`) + Tier 3 (Viceroy with hook) — not Tier 1 (Tier 1's `MockOutboundClient` has no SDK arming step to wrap) | — | yes | yes |
+| Fastly `send_all` dispatch-overhead slack hard-bounded: with the adapter's **`test-utils`-gated** injection hook (NOT `#[cfg(test)]` — external integration tests compile the lib without it, §5.5) set to `Duration::from_millis(50)`, a `send_all` of N requests returns an `EdgeError::internal` whose message **contains the stable substring `"BATCH_DISPATCH_SLACK_MAX"`** (the full normative diagnostic per §4.3 is `"Fastly send_all adapter overhead between batch_now and SDK arming (preflight + dynamic-backend lookup/creation + SDK setup) exceeded BATCH_DISPATCH_SLACK_MAX; refusing to arm SDK timers with stale duration"`) for the slots dispatched after the cumulative delay crosses `BATCH_DISPATCH_SLACK_MAX` (25 ms). Without the hook, no slot ever returns that error. A handler-side `thread::sleep` before `send_all` is **not** sufficient — it runs before `batch_now` is captured and cannot exercise the guard. Tests assert against the substring, not the full string, so future wording polish doesn't break them. **The hook lives in the Fastly adapter crate**, so this row is Tier 2 (substring assertion in `crates/edgezero-adapter-fastly/tests/contract.rs`) + Tier 3 (Viceroy with hook) — not Tier 1 (Tier 1's `MockOutboundClient` has no SDK arming step to wrap) | — | yes | yes |
 | Fastly dispatch+headers phase-budget split **(common case, `total_ms ≥ 4`)**: a single `send` to a target that never returns headers fires the host timeout at `connect_ms + first_byte_ms = budget.duration`, **not** `2 × budget.duration`. Two separate test fakes — one that hangs the TCP connect, one that hangs after request bytes are sent — each return 504 within `budget.duration + BATCH_DISPATCH_SLACK_MAX + ms_rounding` (< 29 + budget ms), never twice the budget. The sub-4 ms degenerate branch is covered by the row below | — | yes | yes |
-| Fastly single-`send` dispatch-overhead slack guard: the same `#[cfg(test)]` injection hook used for `send_all` (round 31) also wraps the single-send path between `dispatch_budget` and `send_async`; with the hook set to 50 ms, a single `send` returns `internal("Fastly send adapter overhead between dispatch_budget and SDK arming exceeded BATCH_DISPATCH_SLACK_MAX; …")`. Single send is **not** "structurally 0 slack" — the same hard constant applies (round 38) | — | yes | yes |
+| Fastly single-`send` dispatch-overhead slack guard: the same **`test-utils`-gated** injection hook used for `send_all` (round 31) also wraps the single-send path between `dispatch_budget` and `send_async`; with the hook set to 50 ms, a single `send` returns `internal("Fastly send adapter overhead between dispatch_budget and SDK arming exceeded BATCH_DISPATCH_SLACK_MAX; …")`. Single send is **not** "structurally 0 slack" — the same hard constant applies (round 38) | — | yes | yes |
 | Fastly body-phase EOF deadline: an upstream that sends headers + N-1 chunks within budget but holds the final read so EOF arrives *after* `budget.deadline` returns `gateway_timeout`, not `Ok(resp)`. Buffered drain checks `is_expired()` after every blocking read including EOF; streamed wrapper checks before and after each underlying read so the consumer sees an `Err` chunk instead of clean stream-end | — | yes | yes |
 | `OutboundResponse::into_bytes_bounded_until(max, until)` with `until` **tighter** than `dispatch_budget(req).deadline`: the helper drives a streamed body whose adapter wrapper has 500 ms of effective budget left, but the caller passes `until = now + 100 ms`. The upstream sends data for 90 ms then holds the final read; EOF arrives at 110 ms. The helper returns `gateway_timeout` (not `Ok(bytes)`) because its `until_deadline.is_expired()` check fires before and after the EOF read. (`OutboundResponse` carries no effective-deadline state; the wrapper enforces the request budget separately — whichever fires first wins) | — | yes | yes |
 | Fastly phase-split trade-off, documented: a 1 s `send` to a target that takes 300 ms to connect and 10 ms to send first-byte **fails** at the `connect_ms = 250 ms` timer (1/4 of budget) even though the entire exchange would have fit within 1 s. This is the explicit deviation §4.3 documents — preferring the absolute-deadline bound over the "every legal slow-connect request succeeds" property. The `outbound-flexible-phase-budget` capability is `BestEffort` on Fastly (§3.5.1 / §3.5.2 footnote 5); apps that need elastic phase budget declare it required and get the hard build failure on Fastly. §8 risk 9 tracks the configurable-split follow-up | — | yes | yes |
-| Required `outbound-flexible-phase-budget` on Fastly → every adapter-selecting CLI command (`build` / `serve` / `deploy` / `auth` / `provision` / `config push` / `config validate` / `demo`) exits non-zero with the BestEffort hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)`, siblings on `run_provision` / `run_config_*` / `run_demo`, PR #269); same manifest on Axum / Cloudflare / Spin passes | yes | — | — |
+| Required `outbound-flexible-phase-budget` on Fastly → every adapter-selecting CLI command (`build` / `serve` / `deploy` / `auth` / `provision` / `config push` / `config diff` / `config validate` / `demo`) exits non-zero with the BestEffort hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)`, five siblings on `run_provision` / `run_config_push_typed` / `run_config_diff_typed` / `run_config_validate` / `run_demo`); same manifest on Axum / Cloudflare / Spin passes | yes | — | — |
 | Sub-4 ms Fastly budget: `total_ms = 3` produces `connect_ms = first_byte_ms = 3` (sum 6, not 3) by the explicit `total_ms < 4` degenerate branch in §4.3 code. The absolute-deadline bound shifts to 2× total_ms at this scale; ms rounding already dominates so the test asserts ≤ 2× rather than = | — | yes | yes |
 | URI userinfo is rejected at construction: `OutboundRequest::get("https://user:pass@example.com")` → `Err(EdgeError::bad_request("outbound URI must not contain userinfo; pass credentials via the `authorization` header"))`. Credentials never reach `override_host` or any platform SDK | yes | — | — |
 | Fastly HTTPS to IP literals: `https://127.0.0.1` and `https://[::1]` build dynamic backends with `.enable_ssl().check_certificate("127.0.0.1")` / `.check_certificate("::1")` (brackets stripped) and **skip** `.sni_hostname()` (SNI is DNS-only per RFC 6066). HTTPS to a DNS host still calls both setters. Identity-tuple round-trip works for both | — | yes | yes |
@@ -3354,6 +3865,67 @@ wasm-target matrix step — `cargo test -p edgezero-adapter-<adapter> --features
 assertions (registered-backend map inspection, SDK call/chunk counters, harvest
 ordering against host-side fakes) run there; Tier 3 wall-clock jobs remain the
 separate runtime jobs above.
+
+**Two additional CI gates are directly broken by this change and must be updated
+(previously omitted from this section).** Both are hard gates, not optional:
+
+1. **Generated-project gate** — `edgezero new` scaffolds against the outbound API.
+   The `proxy → outbound` rename means the scaffold templates (`handlers.rs.hbs`,
+   `spin.toml.hbs`, adapter templates) emit code against **removed** APIs until they
+   are migrated. The existing generated-project CI job must build a freshly scaffolded
+   project for each adapter and fail if it references any `Proxy*` symbol.
+2. **`examples/app-demo` gate** — app-demo is excluded from the workspace and has its
+   own CI job and `Cargo.lock`. It is a first-class consumer of `ProxyHandle` /
+   `proxy_handle()` and of `RequestContext`'s removed `request()` / `json()` / `form()`
+   accessors, so it breaks on both the rename **and** the §3.4.5 context restructure.
+   Its job must be green before merge.
+
+**Executable test seams — must be `test-utils`-gated, NOT `#[cfg(test)]`.** Several
+Tier 2 assertions in §5.4 depend on seams that do not exist today. They are
+**first-class deliverables**, not incidental scaffolding.
+
+> **⚠️ `#[cfg(test)]` does not work here.** Each adapter's contract tests live in
+> `crates/edgezero-adapter-*/tests/contract.rs` — an **external integration test**.
+> Cargo compiles the library as a *dependency* of that test target, **without**
+> `cfg(test)`, so any `#[cfg(test)]` item in the adapter's `src/` is **invisible** to
+> `tests/contract.rs` and the test will not compile. Earlier drafts specified these
+> hooks as `#[cfg(test)]`, which is unimplementable. **Every seam below is gated on a
+> `test-utils` cargo feature** (the same mechanism `edgezero-core` already uses for
+> `MockOutboundClient` — §7), enabled by the adapter's own `[dev-dependencies]`
+> self-reference so it is on for the test target and off in production builds. The
+> alternative — moving these assertions into in-crate `#[cfg(test)]` unit tests under
+> `src/` — is acceptable per-assertion, but the seam must then not be referenced from
+> `tests/`. Pick one per assertion and say which.
+
+Seams required, **per adapter** (not Fastly-only — CF and Spin need transport/timer
+seams for their own Tier 2 rows):
+
+- **Fastly — registered-backend map inspector.** `#[cfg(feature = "test-utils")]`
+  accessor on `FastlyOutboundClient` exposing the adapter-local
+  `Mutex<HashMap<String, (BackendIdentity, Backend)>>`, so the identity / collision /
+  one-backend-per-canonical-tuple rows assert without a network.
+- **Fastly — injectable clock / dispatch-overhead hook.** A `test-utils` `Duration`
+  injection point between `dispatch_budget` and SDK arming, used by both the `send_all`
+  and single-`send` `BATCH_DISPATCH_SLACK_MAX` rows. Without it the slack guard is
+  **untestable**: a handler-side `sleep` runs *before* `batch_now` is captured and
+  cannot exercise the guard.
+- **All adapters — dispatch counters.** `did_dispatch()` / chunk-write count behind
+  `test-utils`, so "deadline expired during drain → 504 **and** no upstream send" and
+  the partial-upload rows can assert the *absence* of a dispatch.
+- **Cloudflare / Spin — transport + timer fakes.** Their Tier 2 rows (deadline expiry
+  per phase, transport-error mapping, upload-stall) assert platform-observable
+  behaviour and currently have **no provider fake**. Each needs a `test-utils` seam
+  that (a) substitutes the outbound transport (`worker::fetch` / `spin_sdk::http::send`)
+  with a scriptable fake, and (b) drives the platform timer deterministically. Until
+  these exist, the affected rows are **not executable** and must not be listed as
+  required — see §5.4 tier assignments.
+
+**Capability diagnostics must not point into `docs/superpowers/`.** The hard-fail
+messages emitted by `ensure_capabilities` currently reference capability footnotes in
+this spec, but `docs/superpowers/**` is `srcExclude`d from the published VitePress site
+— a user hitting the error has no reachable link. User-facing capability documentation
+(the nine capabilities, the support matrix, and the per-adapter caveats) must be
+mirrored into a published page under `docs/guide/` and the diagnostics must link there.
 
 **Spin gate triple — now wasip2 (PR #269 merged).** The fifth gate's literal
 command string changed with PR #269, which has since merged to main:
@@ -3397,14 +3969,16 @@ Other changes:
   (`#[serde(default)]`); existing manifests parse unchanged.
 - **`Adapter` trait** gains `capability()` — all four registered adapters implement it.
 - **CLI** dispatch (PR #269, now on main): `ensure_capabilities` is wired in at
-  **five pre-dispatch gate sites** (§3.5.3) — one inside
+  **six pre-dispatch gate sites** (§3.5.3) — one inside
   `edgezero_cli::adapter::execute(..)` (covering `build` / `serve` / `deploy` /
   `auth login` / `auth logout` / `auth status`, *before* the manifest-shell-command
-  branch and *before* the registry lookup), and **four siblings** at the top of
-  `run_provision`, `run_config_push`, `run_config_validate`, and the
-  contributor-only `run_demo`. Every adapter-selecting command runs the
-  capability check exactly once at its entry point. `dev` is gone; `demo` is the
-  contributor-only replacement that routes through Axum via its own sibling gate.
+  branch and *before* the registry lookup), and **five siblings** at the top of
+  `run_provision`, **`run_config_push_typed`**, **`run_config_diff_typed`**,
+  `run_config_validate`, and the contributor-only `run_demo`. (The bundled
+  `run_config_push` is a v1 stub that errors — the **typed** functions are the real
+  writeback/diff paths, so they are the gate sites.) Every adapter-selecting command
+  runs the capability check exactly once at its entry point. `dev` is gone; `demo` is
+  the contributor-only replacement that routes through Axum via its own sibling gate.
 - **Scaffolding templates** — `handlers.rs.hbs` and any adapter templates that emit
   proxy code are updated to the new types; `spin.toml.hbs:13` renders
   `allowed_outbound_hosts` from `[capabilities.outbound].hosts` instead of the hardcoded
@@ -3458,8 +4032,19 @@ Other changes:
   `DispatchBudget` and the explicit `now` parameter; this is the complete
   current contents of the file.
 - `src/capability.rs` — new: `Capability`, `CapabilitySupport`.
-- `src/error.rs` — add `BadGateway` (502), `GatewayTimeout` (504) + constructors;
-  extend `status()`.
+- `src/error.rs` — add two variants and their **complete** surface (the existing
+  `EdgeError` is `#[non_exhaustive]` with per-variant `kind_str()` / `message()` /
+  `status()` / `inner()` arms and an exhaustive `IntoResponse` JSON body, so every
+  arm must be updated or the crate won't compile):
+  - `BadGateway { message: String }` — `bad_gateway(msg)` constructor; `status()` →
+    `502`; `kind_str()` → `"bad_gateway"`; `message()` → the stored `message`;
+    `inner()` → `None`.
+  - `GatewayTimeout { message: String }` — `gateway_timeout(msg)` constructor;
+    `status()` → `504`; `kind_str()` → `"gateway_timeout"`; `message()` → the stored
+    `message`; `inner()` → `None`.
+  - Both serialize through the existing `IntoResponse` JSON shape
+    (`{ "error": { "kind", "message" } }`); add exhaustive-match tests covering
+    status code, `kind` string, and serialized body for each.
 - `src/extractor.rs` — extractor migration per §3.4.5: `Json<T>` /
   `ValidatedJson<T>` route through `ctx.json_within(DEFAULT_INBOUND_JSON_BYTES)`;
   `Form<T>` / `ValidatedForm<T>` route through `ctx.form_within(DEFAULT_INBOUND_FORM_BYTES)`;
@@ -3490,8 +4075,39 @@ Other changes:
   checked accounting and bounded-byte rewrite of `into_bytes_bounded` (§3.4.1).
 - `src/manifest.rs` — add `ManifestCapabilities` + `ManifestOutboundCapability` +
   `Manifest::capabilities`.
+- `src/app.rs` — extend the `Hooks` trait with the **baked-manifest accessors** the
+  `demo` capability gate depends on (§3.5.3): `fn manifest_json() -> Option<&'static str>`
+  (defaulted `None`) and `fn manifest() -> Option<&'static Manifest>` (parses
+  `manifest_json()` once into a core-owned `OnceLock<Option<Manifest>>`). Additive and
+  defaulted, so hand-written `Hooks` impls keep compiling.
 - `src/lib.rs` — re-export new modules; drop proxy re-exports.
 - `Cargo.toml` — `MockOutboundClient` under the existing `test-utils` feature.
+
+**`crates/edgezero-macros`** *(previously omitted from this inventory — it is not
+optional: the macro crate **textually includes** core's `manifest.rs`, so every manifest
+change lands here whether intended or not)*
+- `src/manifest_definitions.rs` — **the constraint, not a task.** This file does
+  `include!(concat!(…, "/../edgezero-core/src/manifest.rs"))`, so `manifest.rs` is
+  compiled **a second time inside the macro crate**, where `edgezero_core` does not
+  exist as a path. And the dependency runs **core → macros** (`edgezero-core/Cargo.toml`
+  depends on `edgezero-macros`), so macros **cannot** depend on core to fix it — that
+  would be a cycle. Consequences, both mandatory:
+  1. `Capability`, `CapabilitySupport`, `ManifestCapabilities`, and
+     `ManifestOutboundCapability` must be defined **inside `manifest.rs` itself** and
+     must not `use` anything the include context lacks. A separate
+     `edgezero-core/src/capability.rs` that `manifest.rs` imports **will not compile in
+     the macro crate**. Core re-exports them (`pub use manifest::{Capability, …}`) so
+     the rest of core still refers to them by their normal path.
+  2. They must derive **`Serialize`** as well as `Deserialize` — `Manifest` derives
+     `Serialize` and `app!` calls `serde_json::to_string(&manifest)`. A capability type
+     that is `Deserialize`-only breaks the `Manifest` derive.
+  **Gate:** `cargo build -p edgezero-macros` must be run after *every* `manifest.rs`
+  edit; a workspace `cargo check` alone will surface this only via the macro crate.
+- `src/app.rs` — emit the baked-manifest accessor in the generated `impl Hooks` block:
+  `fn manifest_json() -> Option<&'static str> { Some(#manifest_json_lit) }`. The literal
+  already exists (`manifest.finalize()` → `serde_json::to_string(&manifest)` →
+  `manifest_json_lit`); today it is embedded for the router and never exposed. No new
+  compile-time parsing, no new macro dependency.
 
 **`crates/edgezero-adapter`**
 - `Cargo.toml` — **add `edgezero-core` as a workspace dependency.** `Capability` /
@@ -3506,12 +4122,15 @@ Other changes:
   `OutboundHttpClient::send` and `send_all`, buffered + streamed modes,
   decompressed-byte cap, header normalization for decompressed responses
   (strip `content-encoding` / `content-length`).
-- `src/request.rs` — update the platform-request → `RequestContext` materialisation
-  for the round-6 / §3.4.5 restructure: build the context from `parts` + a
-  `BodyCell` instead of an owned `Request`, and route inbound body access through
-  `body_bytes` / `json_within` / `form_within` (per the §6 `RequestContext` sweep).
-  Applies to the Axum and Cloudflare `request.rs` modules that wrap `Body::Stream`
-  (§3.4.1); Fastly and Spin adjust their equivalent request-materialisation site.
+- `src/request.rs` — **stop pre-buffering the inbound body.** The adapter keeps
+  building a core `Request` and keeps calling `RequestContext::new(request, params)`
+  unchanged (the parts/`BodyCell` split is internal — §3.4.5 *Construction contract*;
+  `BodyCell` is **not** public and adapters never construct it). What changes is the
+  **body** placed in that `Request`: wrap the platform body as a lazy `Body::Stream`
+  instead of draining it eagerly (Axum buffers JSON with `usize::MAX` today;
+  Cloudflare calls `req.bytes()`; Fastly and Spin fully materialize). Callers of the
+  removed `ctx.request()` / `ctx.json()` / `ctx.form()` move to `parts()` /
+  `body_bytes` / `json_within` / `form_within` (§6 sweep). All four adapters.
 - `src/response.rs` — **per-adapter streaming policy.** Today each adapter's
   response converter (`crates/edgezero-adapter-{axum,fastly,spin}/src/response.rs`)
   buffers `Body::Stream` before producing the platform response. The migration
@@ -3525,14 +4144,30 @@ Other changes:
     Fastly's lazy/early-streaming API (`Response::stream_to_client`) is
     incompatible with `#[fastly::main]` (Fastly SDK docs, capability footnote 6).
     The default scaffold therefore performs **buffered passthrough**: drain the
-    wrapped `Body::Stream` to `Bytes` within `max_response_bytes`, then return
-    through the normal `#[fastly::main]` flow. Apps that need lazy passthrough
+    wrapped `Body::Stream` to `Bytes` within the adapter-level constant
+    `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` (16 MiB) — the per-request
+    `max_response_bytes` is unavailable here (`OutboundResponse` carries only
+    status / headers / body, no cap metadata) — then return through the normal
+    `#[fastly::main]` flow. Apps that need lazy passthrough
     on Fastly declare `lazy-streamed-response-passthrough` required and get a
     hard build failure (Fastly = `BestEffort` for this capability). The
     deadline-aware stream wrapper still runs on the buffered drain path — only
     the *passthrough* is buffered.
-  - **Spin** — WASM, WASI async, no `Send` requirement. The WASI outgoing-body
-    chunk-write path consumes the `Body::Stream` directly.
+  - **Spin** — WASM, WASI async, no `Send` requirement, **but** the public response
+    surface is concretely buffered: `spin_sdk::http::FullBody` backs the
+    `SpinFullResponse` alias (`Response<FullBody<Bytes>>`), which appears in
+    `AppExt::dispatch`, `request::dispatch*`, `from_core_response`, and `run_app`.
+    Lazy passthrough would require migrating those **public aliases and signatures**
+    plus a WASI-0.3 rewrite — a breaking API change deferred to §8 risk 13. The Spin
+    response converter therefore performs **buffered passthrough**: drain the wrapped
+    `Body::Stream` to `Bytes` within the adapter-level constant
+    `SPIN_RESPONSE_STREAM_BUFFER_BYTES` (default 16 MiB, mirroring Axum and Fastly),
+    over-cap → `bad_gateway` (502), then return the buffered `Bytes` through the
+    existing `FullBody` flow. Spin is `BestEffort` for
+    `lazy-streamed-response-passthrough` (footnote 7). The deadline-aware stream
+    wrapper still runs on the buffered drain path — only the *passthrough* is
+    buffered. The **outbound streamed-upload** path (§4.4) is unaffected and stays
+    `Native`.
   - **Axum** — native, multi-threaded tokio. `axum::body::Body::from_stream` requires
     `Send + 'static`, which conflicts with core `Body::Stream = LocalBoxStream`
     (intentionally non-Send for WASM compat — `body.rs:14`). Designing a real
@@ -3565,10 +4200,11 @@ Other changes:
 
     Source: the wrapped streamed body's `EdgeError` chunks already encode the
     intended status; Axum just lifts them to the response. No silent
-    coalescing-to-502, no panic. This is the documented Axum-specific
-    limitation: lazy streaming proxy-forward works on Cloudflare, Fastly, and
-    Spin; Axum buffers, *but the buffering boundary lets it preserve the
-    correct status code*. For fan-out handlers and most edge-shaped
+    coalescing-to-502, no panic. This is the documented buffered-fallback
+    behaviour: lazy streaming proxy-forward works **only on Cloudflare**
+    (the sole `Native` adapter). Axum, Fastly, and Spin all buffer — for three
+    distinct reasons (footnotes 3 / 6 / 7) — *but the buffering boundary lets each
+    preserve the correct status code*. For fan-out handlers and most edge-shaped
     apps this is a non-issue; if true lazy streaming on Axum becomes a
     requirement later, an mpsc bridge is a separate follow-up. Capability text
     and risk section reflect this (see §3.5.2 footnote 3 and §8).
@@ -3612,7 +4248,22 @@ Other changes:
     The backend is passed to `send_async` / `send_async_streaming` at send time
     via `impl ToBackend`; there is no
     `with_backend(..)` setter on `Request`.
-- Spin: render `allowed_outbound_hosts` from the manifest per §3.5.4.
+- Spin: `allowed_outbound_hosts` synchronization per §3.5.4 — **three touch points, not
+  one**:
+  - `src/templates/spin.toml.hbs:13` — replace the hardcoded literal `["https://*:*"]`
+    with a render of `[capabilities.outbound].hosts` (absent → keep `["https://*:*"]`;
+    the default is **not** widened to include `http://*:*`).
+  - `src/cli.rs` — a new `toml_edit::DocumentMut` helper alongside
+    `ensure_kv_label_in_component` that **sets** (not appends) `allowed_outbound_hosts`
+    on the resolved component, preserving sibling fields and comments, honouring
+    `--dry-run`. Called from `SpinCliAdapter::provision` — **`provision` is the only
+    command that writes `spin.toml`.**
+  - `crates/edgezero-cli/src/adapter.rs::execute` — the **validate-on-drift** check for
+    `build` / `serve` / `deploy`, placed *before* the `manifest_command` branch.
+    **It cannot go in `SpinCliAdapter::execute`:** scaffolded projects always declare
+    `[adapters.spin.commands]`, so those commands shell out and never reach the
+    adapter trait — a hook there is dead code. Compare **canonicalized sets**,
+    order-insensitively; hard-fail with the expected list rendered for the user.
 - `tests/contract.rs` — created for Axum; extended for the other three (§5).
 - Tier 3 mock origin — new `MockServer` helper (`start_with_delay`, §5.3), a tokio
   loopback HTTP server used only by the native Tier 3 tests. It lives in the Axum
@@ -3627,19 +4278,21 @@ Other changes:
   (PR #269), *before* `manifest_command(..)` is consulted and *before* the
   registry lookup. This covers `run_build`, `run_serve`, `run_deploy`, and the
   three `run_auth` sub-actions (which all dispatch through `execute(..)`). The
-  three commands that don't flow through `execute(..)` — `run_provision`,
-  `run_config_push`, `run_config_validate` — get **sibling pre-dispatch gates**:
-  each is the first statement of its `run_*` function and calls the same
-  `ensure_capabilities` helper. Concretely those functions live at
+  **four** commands that don't flow through `execute(..)` — `run_provision`,
+  `run_config_push_typed`, `run_config_diff_typed`, `run_config_validate` — get
+  **sibling pre-dispatch gates**: each is the first statement of its function and
+  calls the same `ensure_capabilities` helper. Concretely those functions live at
   `crates/edgezero-cli/src/provision.rs::run_provision` and
-  `crates/edgezero-cli/src/config.rs::{run_config_push, run_config_validate}`; the
+  `crates/edgezero-cli/src/config.rs::{run_config_push_typed, run_config_diff_typed, run_config_validate}`
+  (the bundled `run_config_push` is a v1 stub that errors — gating it would enforce
+  nothing); the
   contributor-only `run_demo` (`crates/edgezero-cli/src/demo_server.rs`, re-exported
   via `src/lib.rs`) also calls `ensure_capabilities("axum", ..)` at its top before
   the Axum runner starts. The `ensure_capabilities` helper itself is **defined new in
   `src/adapter.rs`** (alongside `execute`) and imported by the sibling gate sites.
-  **All five gate sites** (one inside `execute(..)`, the four siblings on
-  `run_provision` / `run_config_push` / `run_config_validate` / `run_demo`) are
-  documented in §3.5.3's gate table. The legacy `handle_build` / `handle_serve`
+  **All six gate sites** (one inside `execute(..)`, the five siblings on
+  `run_provision` / `run_config_push_typed` / `run_config_diff_typed` /
+  `run_config_validate` / `run_demo`) are documented in §3.5.3's gate table. The legacy `handle_build` / `handle_serve`
   / `handle_deploy` / `handle_dev` functions referenced in earlier appendices
   were removed by PR #269.
 - scaffolding templates (`handlers.rs.hbs`, `spin.toml.hbs`, adapter templates) — update
@@ -3768,7 +4421,9 @@ Other changes:
     response bytes to the client lazily — is documented as incompatible
     with `#[fastly::main]`. As a result, the Fastly adapter currently
     falls back to buffered passthrough (drain `Body::Stream` to `Bytes`
-    within `max_response_bytes` before returning), and
+    within `FASTLY_RESPONSE_STREAM_BUFFER_BYTES` (16 MiB) before returning —
+    the per-request `max_response_bytes` is not available at the response
+    converter), and
     `lazy-streamed-response-passthrough` is `BestEffort` on Fastly per
     footnote 6. The follow-up would either: (a) scaffold a non-attribute
     entry (`fn main() { let req = Request::from_client(); … resp.stream_to_client() … }`)
@@ -3783,6 +4438,32 @@ Other changes:
     docs. **Deferred** until an app explicitly requires lazy Fastly
     passthrough; the §3.5.2 footnote 6 documents the exact constraint
     so adopters aren't surprised.
+13. **Spin lazy-streamed-response-passthrough via a streamable public response
+    surface.** Spin's response path is buffered by construction today:
+    `spin_sdk::http::FullBody` backs the `SpinFullResponse` alias
+    (`Response<FullBody<Bytes>>`), which appears in `AppExt::dispatch`,
+    `request::dispatch*`, `from_core_response`, and `run_app`. Delivering lazy
+    passthrough is therefore **not** an outbound-client change — it is a **breaking
+    public-API migration** of those aliases and signatures to a streamable response
+    shape. **The platform is not the blocker:** Spin SDK 6 already supports lazy
+    response streaming (`IncomingBody: http_body::Body`, 16 KiB `poll_frame`,
+    `IncomingBodyExt::stream()`), and the adapter simply *chooses* `.bytes()` today
+    (`spin/proxy.rs`). Lifting Spin to `Native` is therefore a **pure EdgeZero
+    refactor**, not a platform lift — unlike Fastly's risk 12, which is a real
+    platform constraint. (Separately: the WASI-0.2 `check_write()` shape that earlier
+    drafts used for the *request-upload* path does not exist in SDK 6 at all; that is
+    now corrected in §4.4 via a hand-built `wasi:http` request.) Because the alias
+    migration carries its own design, migration, and test surface — and would
+    ripple into `examples/app-demo`, the Spin scaffold templates, and every
+    downstream consumer of `SpinFullResponse` — Spin is **`BestEffort`** for this
+    capability in the current change (footnote 7), with a bounded buffered fallback
+    through `SPIN_RESPONSE_STREAM_BUFFER_BYTES` (16 MiB) identical in shape to Axum's
+    and Fastly's. **Cloudflare remains the only `Native` adapter** for lazy
+    passthrough; apps that require it declare the capability and target CF, getting a
+    hard build failure elsewhere. Lifting Spin to `Native` is **deferred** to its own
+    change. Note this affects only the response-out direction — Spin's outbound
+    streamed-*upload* path is unchanged and stays `Native` for
+    `streamed-upload-deadlines`.
 
 Appendices A through the last `## Appendix` heading in the document (use that
 heading as the canonical upper bound — the index doesn't pin an exact letter
