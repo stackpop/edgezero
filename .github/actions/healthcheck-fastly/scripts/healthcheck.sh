@@ -7,7 +7,7 @@ set -euo pipefail
 # prove the deployment is healthy must exit non-zero: a non-zero CLI, a
 # `healthy=false` verdict, and — critically — no verdict at all.
 #
-# Inputs (environment): EDGEZERO__CLI__BIN, EDGEZERO__LIFECYCLE__SERVICE_ID, EDGEZERO__LIFECYCLE__VERSION, EDGEZERO__LIFECYCLE__DOMAIN, EDGEZERO__DEPLOY__TO, EDGEZERO__LIFECYCLE__RETRY,
+# Inputs (environment): EDGEZERO__APP__CLI__BIN, EDGEZERO__LIFECYCLE__SERVICE_ID, EDGEZERO__LIFECYCLE__VERSION, EDGEZERO__LIFECYCLE__DOMAIN, EDGEZERO__DEPLOY__TO, EDGEZERO__LIFECYCLE__RETRY,
 # EDGEZERO__LIFECYCLE__RETRY_DELAY, EDGEZERO__LIFECYCLE__TIMEOUT, FASTLY_API_TOKEN.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -36,7 +36,7 @@ main() {
   validate_inputs
 
   local argv=(
-    "$EDGEZERO__CLI__BIN" healthcheck
+    "$EDGEZERO__APP__CLI__BIN" healthcheck
     --adapter fastly
     --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID"
     --version "$EDGEZERO__LIFECYCLE__VERSION"

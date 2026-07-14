@@ -126,14 +126,14 @@ jobs:
         id: cli
         uses: ./.github/actions/build-app-cli
         with:
-          cli-package: fixture-app-cli
+          app-cli-package: fixture-app-cli
           working-directory: fixture-app
 
       - name: Deploy fixture (production) with local action
         id: deploy
         uses: ./.github/actions/deploy-fastly
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
@@ -172,7 +172,7 @@ jobs:
         id: cli
         uses: ./.github/actions/build-app-cli
         with:
-          cli-package: fixture-app-cli
+          app-cli-package: fixture-app-cli
           working-directory: fixture-app
 
       # Seeds the action-owned tool root with a fake `fastly` reporting the
@@ -185,7 +185,7 @@ jobs:
         id: stage
         uses: ./.github/actions/deploy-fastly
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           working-directory: fixture-app
           fastly-api-token: dummy-token
           fastly-service-id: dummy-service
@@ -200,7 +200,7 @@ jobs:
       - name: Health check the staged version
         uses: ./.github/actions/healthcheck-fastly
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           deploy-to: staging
           domain: staging.example.com
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
@@ -219,7 +219,7 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/healthcheck-fastly
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           deploy-to: staging
           domain: staging.example.com
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
@@ -240,7 +240,7 @@ jobs:
       - name: Roll back the staged version
         uses: ./.github/actions/rollback-fastly
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           deploy-to: staging
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token
@@ -250,7 +250,7 @@ jobs:
         id: prod-rollback
         uses: ./.github/actions/rollback-fastly
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           deploy-to: production
           fastly-version: ${{ steps.stage.outputs['fastly-version'] }}
           fastly-api-token: dummy-token

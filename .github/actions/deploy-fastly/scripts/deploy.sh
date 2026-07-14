@@ -4,15 +4,15 @@ set -euo pipefail
 # Runs the application CLI's deploy through the provider-env credential boundary
 # and emits the resulting Fastly version.
 #
-# Credentials are handed to run-cli.sh as DATA (a JSON object), not as FASTLY_*
-# aliases on this step. run-cli.sh clears every declared alias — including any
+# Credentials are handed to run-app-cli.sh as DATA (a JSON object), not as FASTLY_*
+# aliases on this step. run-app-cli.sh clears every declared alias — including any
 # inherited FASTLY_ENDPOINT / FASTLY_TOKEN — exports only these typed values, and
 # then scrubs its own private variables (including this JSON) before exec'ing the
 # CLI. Building the JSON here, from step `env:`, is also what keeps the secret out
 # of an interpolated `run:` block.
 #
 # Inputs (environment): EDGEZERO__FASTLY__API_TOKEN,
-# EDGEZERO__FASTLY__SERVICE_ID, plus the run-cli.sh contract.
+# EDGEZERO__FASTLY__SERVICE_ID, plus the run-app-cli.sh contract.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../../deploy-core/scripts/common.sh
@@ -31,7 +31,7 @@ main() {
   export EDGEZERO__PROVIDER__ENV
 
   new_private_log
-  "$SCRIPT_DIR/../../deploy-core/scripts/run-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG"
+  "$SCRIPT_DIR/../../deploy-core/scripts/run-app-cli.sh" deploy 2>&1 | tee "$LIFECYCLE_LOG"
 
   local version
   version=$(read_numeric_line version "$LIFECYCLE_LOG")

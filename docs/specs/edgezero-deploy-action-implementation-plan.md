@@ -43,7 +43,7 @@ reference to port from. Most transfer with light changes:
 | `scripts/validate-inputs.sh`                 | `deploy-core/scripts/`              | Reuse; move Fastly-specific allowlist to the wrapper.                                                                                                                                            |
 | `scripts/resolve-project.sh`                 | `deploy-core/scripts/`              | Reuse + split Git root vs Cargo workspace root.                                                                                                                                                  |
 | `scripts/install-rust.sh`                    | dropped                             | Replaced by `actions-rust-lang/setup-rust-toolchain@v1` in deploy-fastly (toolchain from resolve output + wasm target). build-app-cli keeps `rustup` for dynamic app-resolved toolchain install. |
-| `scripts/run-edgezero.sh`                    | `deploy-core/scripts/`              | Adapt to invoke `<cli-bin>` from the artifact + provider-env.                                                                                                                                    |
+| `scripts/run-edgezero.sh`                    | `deploy-core/scripts/`              | Adapt to invoke `<app-cli-bin>` from the artifact + provider-env.                                                                                                                                |
 | `tests/run.sh`                               | `deploy-core/tests/`                | Reuse the harness; add new cases.                                                                                                                                                                |
 | `scripts/install-fastly.sh`, `versions.json` | `deploy-fastly/`                    | Move (provider-specific install + checksum).                                                                                                                                                     |
 | `scripts/install-edgezero.sh`                | → `build-app-cli`                   | Rewrite: build the **app's** CLI package, not the monorepo CLI.                                                                                                                                  |
@@ -54,37 +54,37 @@ reference to port from. Most transfer with light changes:
 ## Implementation phases
 
 1. **`build-app-cli` action**
-   - Required `cli-package` input: the Cargo package name of the CLI defined in
+   - Required `app-cli-package` input: the Cargo package name of the CLI defined in
      the application's own workspace. Fail if missing or not found in the app
      workspace under `working-directory`.
    - `working-directory`, `rust-toolchain`, `artifact-name` inputs (no `adapters`
      input — the app's `Cargo.toml` pins adapters).
-   - Optional `cli-bin` input (default = `cli-package`; the generated CLI names
+   - Optional `app-cli-bin` input (default = `app-cli-package`; the generated CLI names
      its bin after the package).
    - Require a `Cargo.lock` at the app's Cargo workspace root; run all Cargo
      commands with `--locked` (never mutate the lockfile). Validate via
-     `cargo metadata --locked` that `cli-package` exists and declares a
-     `<cli-bin>` binary target.
+     `cargo metadata --locked` that `app-cli-package` exists and declares a
+     `<app-cli-bin>` binary target.
    - Install the host toolchain (no WASM target — the CLI is a native tool);
      build into an **action-owned `CARGO_TARGET_DIR` under `RUNNER_TEMP`** (never
      the checkout) so the CLI build leaves the app tree clean for the later
      dirty-source guard, via
-     `cargo build --locked --release -p <cli-package> --bin <cli-bin>`. No
+     `cargo build --locked --release -p <app-cli-package> --bin <app-cli-bin>`. No
      `--features` injection: the app's own `Cargo.toml` pins its adapters.
-   - Read `cli-version` from `cargo metadata`; smoke-check with `<cli-bin> --help`
-     (today's CLI has no `--version`); write `cli-meta.json` (`cli-bin`,
-     `cli-version`, `cli-package`) next to the binary and upload both as one
+   - Read `app-cli-version` from `cargo metadata`; smoke-check with `<app-cli-bin> --help`
+     (today's CLI has no `--version`); write `app-cli-meta.json` (`app-cli-bin`,
+     `app-cli-version`, `app-cli-package`) next to the binary and upload both as one
      **tar** so the executable bit survives `actions/upload-artifact` and the
      artifact is self-describing.
-   - Outputs: `cli-version`, `cli-package`, `cli-bin`, `artifact-name`.
+   - Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `artifact-name`.
    - No provider credentials in scope. Never builds the EdgeZero monorepo CLI.
 
 2. **`deploy-core` shared engine scripts (provider-neutral)**
    - A directory of scripts under `.github/actions/deploy-core/`, **not** a
      standalone composite action. Wrappers source them via
      `$GITHUB_ACTION_PATH/../deploy-core/…`.
-   - Non-secret parameters (available to all steps): `adapter`, `cli-artifact`,
-     `cli-bin`, `working-directory`, `manifest`, `rust-toolchain`, `target`,
+   - Non-secret parameters (available to all steps): `adapter`, `app-cli-artifact`,
+     `app-cli-bin`, `working-directory`, `manifest`, `rust-toolchain`, `target`,
      `build-mode`, `build-args`, `deploy-args`, `deploy-arg-allow`,
      `provider-env-clear`, `deploy-flags`, `cache`.
    - **`provider-env` is NOT one of these.** It is bound only to the deploy
@@ -93,8 +93,8 @@ reference to port from. Most transfer with light changes:
      §5.2, §10). Setup/build see only the non-secret parameters plus
      `provider-env-clear`.
    - Download the CLI artifact (tar) under `RUNNER_TEMP`, extract preserving the
-     executable bit (or `chmod +x <cli-bin>`), read `cli-meta.json` for
-     `cli-bin`/`cli-version` (wrapper `cli-bin` overrides), and PATH-scope it.
+     executable bit (or `chmod +x <app-cli-bin>`), read `app-cli-meta.json` for
+     `app-cli-bin`/`app-cli-version` (wrapper `app-cli-bin` overrides), and PATH-scope it.
    - Validate `adapter` well-formedness (no compiled-adapter enumeration — the
      CLI rejects unknown adapters itself), booleans, JSON arrays/object, NUL
      bytes.
@@ -116,17 +116,17 @@ reference to port from. Most transfer with light changes:
    - Deploy step only (its `env:` carries `provider-env`): clear the
      `provider-env-clear` aliases, parse `provider-env` and export only its
      values, then run
-     `<cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>` via
+     `<app-cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>` via
      Bash arrays. Note the build-in-deploy caveat: Fastly's default `never`
      compiles the app during deploy with the token in scope, so require trusted
      immutable refs (spec §10.1).
-   - Surface results to the wrapper: `adapter`, `source-revision`, `cli-version`,
+   - Surface results to the wrapper: `adapter`, `source-revision`, `app-cli-version`,
      `effective-build-mode`.
    - Contains no provider-specific credential names, service concepts, endpoints,
-     or CLI flags; invokes `<cli-bin>`, never a hard-coded `edgezero`.
+     or CLI flags; invokes `<app-cli-bin>`, never a hard-coded `edgezero`.
 
 3. **`deploy-fastly` wrapper (minimal composite action)**
-   - Typed inputs: `cli-artifact`, `cli-bin`, `fastly-api-token`,
+   - Typed inputs: `app-cli-artifact`, `app-cli-bin`, `fastly-api-token`,
      `fastly-service-id`, plus forwarded `working-directory`, `manifest`,
      `build-mode`, `build-args`, `deploy-args`, `cache`, and `stage` (§5.4).
    - Map `fastly-api-token` → `provider-env: {FASTLY_API_TOKEN: …}` and
@@ -145,12 +145,12 @@ reference to port from. Most transfer with light changes:
      `deploy-core` scripts; no build, toolchain, or path logic of its own.
 
 4. **Fastly staging lifecycle actions (§5.4)**
-   - `healthcheck-fastly`: thin wrapper — inputs `cli-artifact`, `cli-bin`,
+   - `healthcheck-fastly`: thin wrapper — inputs `app-cli-artifact`, `app-cli-bin`,
      `fastly-api-token`, `fastly-service-id`, `fastly-version`, `domain`,
      `deploy-to` (`production`/`staging`), retry/timeout; runs
      `<cli> healthcheck --adapter fastly --service-id <id> --version <v> …` with
      `FASTLY_API_TOKEN` in the step env; outputs `healthy`, `status-code`.
-   - `rollback-fastly`: thin wrapper — inputs `cli-artifact`, `cli-bin`,
+   - `rollback-fastly`: thin wrapper — inputs `app-cli-artifact`, `app-cli-bin`,
      `fastly-api-token`, `fastly-service-id`, `fastly-version`, `deploy-to`;
      runs `<cli> rollback --adapter fastly --service-id <id> --version <v> …` with
      `FASTLY_API_TOKEN` in the step env; outputs `rolled-back-to`.

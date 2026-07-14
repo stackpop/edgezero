@@ -29,7 +29,7 @@ provider-neutral behavior; the wrappers above are thin.
 - **Checkout.** The actions never call `actions/checkout` — you own checkout, ref
   selection, permissions, environments, concurrency, and timeouts.
 - **A CLI package.** Name a Cargo package in your own workspace (the crate that
-  builds your `edgezero`-based CLI binary) via `cli-package`. `build-app-cli`
+  builds your `edgezero`-based CLI binary) via `app-cli-package`. `build-app-cli`
   compiles exactly that, from your checkout's `Cargo.lock`, so the CLI and your
   app can never disagree on schema.
 - **Typed provider credentials.** Pass `fastly-api-token` / `fastly-service-id`
@@ -52,11 +52,11 @@ jobs:
       - id: cli
         uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
         with:
-          cli-package: my-app-cli # the CLI crate in your workspace
+          app-cli-package: my-app-cli # the CLI crate in your workspace
 
       - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
@@ -91,12 +91,12 @@ steps:
   - id: cli
     uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
     with:
-      cli-package: my-app-cli
+      app-cli-package: my-app-cli
       working-directory: app
 
   - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
     with:
-      cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
       working-directory: app
       fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
       fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
@@ -113,12 +113,12 @@ workspace may be the subdirectory itself), so a monorepo caches the right
 - id: cli
   uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
   with:
-    cli-package: api-cli
+    app-cli-package: api-cli
     working-directory: apps/api
 
 - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
-    cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     working-directory: apps/api
     manifest: edgezero.toml
     cache: true
@@ -132,22 +132,22 @@ workspace may be the subdirectory itself), so a monorepo caches the right
 
 | Input               | Required | Default         | Meaning                                                          |
 | ------------------- | -------- | --------------- | ---------------------------------------------------------------- |
-| `cli-package`       | Yes      | —               | Cargo package name of the CLI, in your app's workspace.          |
-| `cli-bin`           | No       | `<cli-package>` | Binary name the package produces.                                |
+| `app-cli-package`   | Yes      | —               | Cargo package name of the CLI, in your app's workspace.          |
+| `app-cli-bin`       | No       | `<cli-package>` | Binary name the package produces.                                |
 | `working-directory` | No       | `.`             | App directory (relative to `github.workspace`).                  |
 | `rust-toolchain`    | No       | `auto`          | Explicit toolchain, or `auto` (rustup files → `.tool-versions`). |
-| `artifact-name`     | No       | `edgezero-cli`  | Uploaded artifact name.                                          |
+| `app-cli-artifact`  | No       | `edgezero-cli`  | Uploaded artifact name.                                          |
 
-Outputs: `cli-version`, `cli-package`, `cli-bin`, `artifact-name`.
+Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `artifact-name`.
 
 ### `deploy-fastly`
 
 | Input               | Required | Default         | Meaning                                                         |
 | ------------------- | -------- | --------------- | --------------------------------------------------------------- |
-| `cli-artifact`      | Yes      | —               | The `build-app-cli` artifact to run.                            |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                            |
 | `fastly-api-token`  | Yes      | —               | Injected only into the deploy step.                             |
 | `fastly-service-id` | Yes      | —               | Passed as the typed `--service-id` flag.                        |
-| `cli-bin`           | No       | artifact's name | Binary name inside the artifact.                                |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                |
 | `working-directory` | No       | `.`             | App directory.                                                  |
 | `manifest`          | No       | empty           | Optional `edgezero.toml` path relative to `working-directory`.  |
 | `build-mode`        | No       | `auto`          | `auto` (→ `never` for Fastly), `always`, or `never`.            |
@@ -156,7 +156,7 @@ Outputs: `cli-version`, `cli-package`, `cli-bin`, `artifact-name`.
 | `stage`             | No       | `false`         | Deploy to a staged draft version instead of activating.         |
 | `cache`             | No       | `false`         | Exact-key Cargo-workspace `target/` caching.                    |
 
-Outputs: `fastly-version`, `source-revision`, `cli-version`.
+Outputs: `fastly-version`, `source-revision`, `app-cli-version`.
 
 The action always adds `--non-interactive` to the deploy itself, so a deploy
 declared as an `edgezero.toml` command (`[adapters.fastly.commands] deploy =
@@ -167,12 +167,12 @@ and cannot — pass it through `deploy-args`.
 
 | Input               | Required | Default         | Meaning                                                       |
 | ------------------- | -------- | --------------- | ------------------------------------------------------------- |
-| `cli-artifact`      | Yes      | —               | The `build-app-cli` artifact to run.                          |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                          |
 | `fastly-api-token`  | Yes      | —               | Needed to resolve a staged version's IP.                      |
 | `fastly-service-id` | Yes      | —               | Service to probe.                                             |
 | `fastly-version`    | Yes      | —               | Version to probe — thread the deploy's `fastly-version`.      |
 | `domain`            | Yes      | —               | Domain to probe, e.g. `www.example.com`.                      |
-| `cli-bin`           | No       | artifact's name | Binary name inside the artifact.                              |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                              |
 | `deploy-to`         | No       | `production`    | `staging` probes the staged version via its resolved edge IP. |
 | `retry`             | No       | `3`             | Attempts before declaring the deployment unhealthy.           |
 | `retry-delay`       | No       | `5`             | Seconds between attempts.                                     |
@@ -187,11 +187,11 @@ your rollback on the step failing (`if: failure()`), not on the `healthy` output
 
 | Input               | Required | Default         | Meaning                                                                            |
 | ------------------- | -------- | --------------- | ---------------------------------------------------------------------------------- |
-| `cli-artifact`      | Yes      | —               | The `build-app-cli` artifact to run.                                               |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                               |
 | `fastly-api-token`  | Yes      | —               | Fastly API token.                                                                  |
 | `fastly-service-id` | Yes      | —               | Service to roll back.                                                              |
 | `fastly-version`    | Yes      | —               | The current (bad) version to roll back **from**.                                   |
-| `cli-bin`           | No       | artifact's name | Binary name inside the artifact.                                                   |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                                   |
 | `deploy-to`         | No       | `production`    | `production` activates the previous version; `staging` deactivates the staged one. |
 
 Outputs: `rolled-back-to` (production only — the version that was activated).
@@ -235,12 +235,12 @@ carry no orchestration policy of their own.
 ```yaml
 - id: cli
   uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-  with: { cli-package: my-app-cli }
+  with: { app-cli-package: my-app-cli }
 
 - id: stage
   uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
-    cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     stage: true
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
@@ -248,7 +248,7 @@ carry no orchestration policy of their own.
 - id: check
   uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<ref>
   with:
-    cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     deploy-to: staging
     domain: staging.example.com
     fastly-version: ${{ steps.stage.outputs.fastly-version }}
@@ -258,7 +258,7 @@ carry no orchestration policy of their own.
 - if: failure() && steps.stage.outputs.fastly-version != ''
   uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
   with:
-    cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     deploy-to: staging
     fastly-version: ${{ steps.stage.outputs.fastly-version }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}

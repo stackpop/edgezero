@@ -74,7 +74,7 @@ own CLI, with thin action wrappers — so the engine never grows provider logic.
    not fork the engine.
 3. **The caller owns source.** The actions never call `actions/checkout`.
 4. **The application provides the CLI package.** The app tells `build-app-cli` which
-   CLI package to compile via a required `cli-package` input, and `build-app-cli`
+   CLI package to compile via a required `app-cli-package` input, and `build-app-cli`
    builds that package from the application's own checkout. It never builds the
    EdgeZero monorepo CLI or the action's own repository revision. The
    application owns which CLI deploys it.
@@ -145,7 +145,7 @@ own CLI, with thin action wrappers.
 ### 5.1 Layer 1 — `build-app-cli`
 
 Compiles the **CLI package the application provides** — a crate in the
-application's own workspace, named by the required `cli-package` input — once,
+application's own workspace, named by the required `app-cli-package` input — once,
 and publishes it as a workflow artifact so every downstream deploy step consumes
 the same binary. The CLI is built from the application checkout and its lockfile,
 so it matches the application and may include app-specific commands. `build-app-cli`
@@ -153,13 +153,13 @@ never builds the EdgeZero monorepo CLI.
 
 **Inputs**
 
-| Input               | Required | Default         | Contract                                                                                                                                                     |
-| ------------------- | -------- | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `cli-package`       | Yes      | none            | Cargo package name of the CLI to build, defined in the application's own workspace. `build-app-cli` builds this package from the application checkout.       |
-| `cli-bin`           | No       | `<cli-package>` | Binary name produced by `cli-package`. Defaults to the package name (the generated downstream CLI names its bin after the package).                          |
-| `working-directory` | No       | `.`             | Application directory (relative to `github.workspace`) containing the workspace/lockfile that defines `cli-package`. Must resolve inside `github.workspace`. |
-| `rust-toolchain`    | No       | `auto`          | Explicit toolchain, or `auto` to follow the application toolchain resolution precedence (§7).                                                                |
-| `artifact-name`     | No       | `edgezero-cli`  | Name of the uploaded artifact.                                                                                                                               |
+| Input               | Required | Default             | Contract                                                                                                                                                         |
+| ------------------- | -------- | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app-cli-package`   | Yes      | none                | Cargo package name of the CLI to build, defined in the application's own workspace. `build-app-cli` builds this package from the application checkout.           |
+| `app-cli-bin`       | No       | `<app-cli-package>` | Binary name produced by `app-cli-package`. Defaults to the package name (the generated downstream CLI names its bin after the package).                          |
+| `working-directory` | No       | `.`                 | Application directory (relative to `github.workspace`) containing the workspace/lockfile that defines `app-cli-package`. Must resolve inside `github.workspace`. |
+| `rust-toolchain`    | No       | `auto`              | Explicit toolchain, or `auto` to follow the application toolchain resolution precedence (§7).                                                                    |
+| `app-cli-artifact`  | No       | `edgezero-cli`      | Name of the uploaded artifact.                                                                                                                                   |
 
 There is intentionally no `adapters` / features input. The application's own
 `Cargo.toml` already pins which adapters compile into its CLI (through the
@@ -168,21 +168,21 @@ the application declares it, so the app owns adapter selection.
 
 **Outputs**
 
-| Output          | Meaning                                                        |
-| --------------- | -------------------------------------------------------------- |
-| `cli-version`   | CLI package version, read from `cargo metadata` at build time. |
-| `cli-package`   | The application CLI package that was built.                    |
-| `cli-bin`       | The binary name inside the artifact.                           |
-| `artifact-name` | Name of the uploaded CLI artifact for downstream `download`.   |
+| Output            | Meaning                                                        |
+| ----------------- | -------------------------------------------------------------- |
+| `app-cli-version` | CLI package version, read from `cargo metadata` at build time. |
+| `app-cli-package` | The application CLI package that was built.                    |
+| `app-cli-bin`     | The binary name inside the artifact.                           |
+| `artifact-name`   | Name of the uploaded CLI artifact for downstream `download`.   |
 
 **Behavior**
 
 1. Require a `Cargo.lock` at the app's Cargo workspace root (see §11.1); fail
    with a remediation message if it is missing. All Cargo commands run with
    `--locked` so the build never creates or updates the lockfile.
-2. Confirm via `cargo metadata --locked` that `cli-package` exists in the
+2. Confirm via `cargo metadata --locked` that `app-cli-package` exists in the
    application workspace under `working-directory` and that it declares a binary
-   target named `<cli-bin>` (default `<cli-package>`). Fail if either is absent.
+   target named `<app-cli-bin>` (default `<app-cli-package>`). Fail if either is absent.
 3. Install the resolved host Rust toolchain (§7). The CLI is a native host tool;
    the WASM target needed to build the _application_ is installed later by the
    deploy engine, not here.
@@ -192,21 +192,21 @@ the application declares it, so the app owns adapter selection.
 
    ```text
    CARGO_TARGET_DIR=<RUNNER_TEMP>/edgezero-cli-build \
-     cargo build --locked --release -p <cli-package> --bin <cli-bin>
+     cargo build --locked --release -p <app-cli-package> --bin <app-cli-bin>
    ```
 
-5. Read `cli-version` from `cargo metadata` for `cli-package`, and smoke-check
-   the binary with `<cli-bin> --help` (today's CLI has no `--version`; see the
+5. Read `app-cli-version` from `cargo metadata` for `app-cli-package`, and smoke-check
+   the binary with `<app-cli-bin> --help` (today's CLI has no `--version`; see the
    note below).
-6. Write a small metadata file (`cli-meta.json`) next to the binary containing
-   `cli-bin`, `cli-version`, and `cli-package`.
-7. Upload the binary **and `cli-meta.json`** as a single **tar archive** so the
+6. Write a small metadata file (`app-cli-meta.json`) next to the binary containing
+   `app-cli-bin`, `app-cli-version`, and `app-cli-package`.
+7. Upload the binary **and `app-cli-meta.json`** as a single **tar archive** so the
    executable bit survives the round trip (`actions/upload-artifact` zips and
    drops POSIX permissions).
 
-The artifact is self-describing: the engine reads `cli-meta.json` to learn the
-binary name and version, so callers do not have to re-pass `cli-bin`/`cli-version`
-(a wrapper `cli-bin` input, if given, overrides the metadata).
+The artifact is self-describing: the engine reads `app-cli-meta.json` to learn the
+binary name and version, so callers do not have to re-pass `app-cli-bin`/`app-cli-version`
+(a wrapper `app-cli-bin` input, if given, overrides the metadata).
 
 `build-app-cli` never receives provider credentials and leaves the app checkout
 clean (no `target/`, no lockfile mutation), so a later dirty-source guard passes.
@@ -214,7 +214,7 @@ clean (no `target/`, no lockfile mutation), so a later dirty-source guard passes
 > **Companion CLI improvement (tracked separately):** the generated downstream
 > CLI template currently sets no clap `version`, so `<cli> --version` fails. Add
 > `#[command(version)]` to the downstream CLI template so future apps expose a
-> version surface. Until then, `cli-version` comes from `cargo metadata` and the
+> version surface. Until then, `app-cli-version` comes from `cargo metadata` and the
 > runnability check uses `--help`.
 
 ### 5.2 Layer 2 — `deploy-core` (shared engine scripts)
@@ -233,8 +233,8 @@ The engine is parameterized by the values the wrapper passes to those scripts
 | Parameter            | Meaning                                                                                                                                                                                                                                            |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `adapter`            | Passed to `<cli> deploy --adapter <adapter>`. The engine does **not** enumerate compiled adapters; the CLI rejects an unknown adapter with its own error.                                                                                          |
-| `cli-artifact`       | Name of the `build-app-cli` artifact to download. The engine reads `cli-bin` and `cli-version` from the artifact's `cli-meta.json`.                                                                                                                |
-| `cli-bin`            | Optional override for the binary name; if empty, taken from `cli-meta.json`.                                                                                                                                                                       |
+| `app-cli-artifact`   | Name of the `build-app-cli` artifact to download. The engine reads `app-cli-bin` and `app-cli-version` from the artifact's `app-cli-meta.json`.                                                                                                    |
+| `app-cli-bin`        | Optional override for the binary name; if empty, taken from `app-cli-meta.json`.                                                                                                                                                                   |
 | `working-directory`  | Application directory relative to `github.workspace`. Must resolve inside `github.workspace`.                                                                                                                                                      |
 | `manifest`           | Optional `edgezero.toml` path relative to `working-directory`. If set, must exist; exported as `EDGEZERO_MANIFEST`.                                                                                                                                |
 | `rust-toolchain`     | Application Rust toolchain for the deploy build. `auto` follows §7.                                                                                                                                                                                |
@@ -249,12 +249,12 @@ The engine is parameterized by the values the wrapper passes to those scripts
 | `cache`              | Enable exact-key application `target/` caching (`true`/`false`).                                                                                                                                                                                   |
 
 The wrapper surfaces engine results as its own outputs: `adapter`,
-`source-revision`, `cli-version`, `effective-build-mode`.
+`source-revision`, `app-cli-version`, `effective-build-mode`.
 
 The engine contains no provider-specific credential names, service concepts,
 endpoints, or CLI flags — those, and the list of aliases to clear
 (`provider-env-clear`), all arrive from the wrapper. It invokes the application's
-CLI binary (`<cli-bin>`), not a hard-coded `edgezero`.
+CLI binary (`<app-cli-bin>`), not a hard-coded `edgezero`.
 
 ### 5.3 Layer 3 — adapter wrappers (`deploy-fastly`, …)
 
@@ -280,8 +280,8 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 
 | Input               | Required | Default       | Contract                                                                                       |
 | ------------------- | -------- | ------------- | ---------------------------------------------------------------------------------------------- |
-| `cli-artifact`      | Yes      | none          | `build-app-cli` artifact name. Forwarded to the engine.                                        |
-| `cli-bin`           | No       | from artifact | Binary name inside the artifact. Forwarded to the engine.                                      |
+| `app-cli-artifact`  | Yes      | none          | `build-app-cli` artifact name. Forwarded to the engine.                                        |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact. Forwarded to the engine.                                      |
 | `fastly-api-token`  | Yes      | none          | Mapped into `provider-env` as `FASTLY_API_TOKEN`, deploy step only.                            |
 | `fastly-service-id` | Yes      | none          | Mapped into action-owned `deploy-flags` as `--service-id <id>` to prevent accidental creation. |
 | `working-directory` | No       | `.`           | Forwarded to the engine.                                                                       |
@@ -298,7 +298,7 @@ is a wrapper concern; the engine assumes the provider CLI is already on `PATH`.
 | ----------------- | ------------------------------------------------------------------------------------------ |
 | `fastly-version`  | The Fastly service version deployed (production) or staged. Emitted by the app CLI (§5.4). |
 | `source-revision` | Passthrough from the engine.                                                               |
-| `cli-version`     | Passthrough from the engine.                                                               |
+| `app-cli-version` | Passthrough from the engine.                                                               |
 
 The wrapper sets `adapter: fastly`, `target: wasm32-wasip1`, the action-owned
 `deploy-flags` (`--service-id …`, `--non-interactive`) so deployments cannot
@@ -377,12 +377,12 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
 ```yaml
 - id: cli
   uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
-  with: { cli-package: my-app-cli }
+  with: { app-cli-package: my-app-cli }
 
 - id: stage
   uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
   with:
-    cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     stage: true
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
     fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
@@ -390,7 +390,7 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
 - id: check
   uses: stackpop/edgezero/.github/actions/healthcheck-fastly@<ref>
   with:
-    cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     deploy-to: staging
     domain: staging.example.com
     fastly-version: ${{ steps.stage.outputs.fastly-version }}
@@ -400,7 +400,7 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
 - if: failure() && steps.stage.outputs.fastly-version != ''
   uses: stackpop/edgezero/.github/actions/rollback-fastly@<ref>
   with:
-    cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+    app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
     deploy-to: staging
     fastly-version: ${{ steps.stage.outputs.fastly-version }}
     fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
@@ -418,9 +418,9 @@ adapter adds its own lifecycle actions if its provider supports staging.
    command); an unsupported adapter surfaces as the CLI's own error at build or
    deploy time.
 3. Validate exact boolean inputs.
-4. Download the `cli-artifact` (a tar) into an action-owned directory below
-   `RUNNER_TEMP`, extract it preserving permissions (or `chmod +x <cli-bin>`),
-   read `cli-meta.json` for `cli-bin`/`cli-version` (a wrapper `cli-bin` input
+4. Download the `app-cli-artifact` (a tar) into an action-owned directory below
+   `RUNNER_TEMP`, extract it preserving permissions (or `chmod +x <app-cli-bin>`),
+   read `app-cli-meta.json` for `app-cli-bin`/`app-cli-version` (a wrapper `app-cli-bin` input
    overrides), and prepend the directory to `PATH` for action steps only.
 5. Parse `build-args`, `deploy-args`, `deploy-flags`, `provider-env-clear` as
    JSON string arrays. **`provider-env` is not present in these steps** — it is
@@ -447,14 +447,14 @@ adapter adds its own lifecycle actions if its provider supports staging.
     cache.
 15. Print non-sensitive diagnostics.
 16. Resolve `build-mode` (§8). If `always`, run
-    `<cli-bin> build --adapter <adapter> -- <build-args…>` with **no** provider
+    `<app-cli-bin> build --adapter <adapter> -- <build-args…>` with **no** provider
     credentials in scope (the `provider-env-clear` names stay unset here).
 17. In a separate deploy step whose step-scoped `env:` is the **only** place
     `provider-env` is exposed: clear the `provider-env-clear` aliases, parse
     `provider-env` and export only its values, and run:
 
     ```text
-    <cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>
+    <app-cli-bin> deploy --adapter <adapter> -- <deploy-flags…> <deploy-args…>
     ```
 
     For adapters whose deploy also compiles the application (Fastly's default),
@@ -561,7 +561,7 @@ Rules:
   The wrapper necessarily carries the token into the deploy step twice — once as
   `EDGEZERO__<PROVIDER>_API_TOKEN` (so the step's YAML can build the JSON without
   interpolating a secret into a `run:` block, itself a template-injection sink),
-  and once inside `EDGEZERO__PROVIDER_ENV`. Both are secret-bearing. `run-cli.sh`
+  and once inside `EDGEZERO__PROVIDER_ENV`. Both are secret-bearing. `run-app-cli.sh`
   therefore unsets its entire private namespace (§10.2) after reading it, so the
   app CLI — and every subprocess it spawns, including a manifest
   `[adapters.*.commands]` shell command — receives **only** the typed provider
@@ -609,7 +609,7 @@ Sections in use: `ACTION` (action-owned dirs), `INPUT` (raw wrapper inputs),
 (provider-specific), and `TEST`.
 
 This is not cosmetic. It is what makes the credential boundary (§10) a **single
-rule**: `run-cli.sh` unsets everything matching `EDGEZERO__*` before exec'ing the
+rule**: `run-app-cli.sh` unsets everything matching `EDGEZERO__*` before exec'ing the
 app CLI. With the previous mix of `DEPLOY_*`, `INPUT_*`, `SUMMARY_*`, and bare
 `CLI_BIN` / `VERSION`, the scrub needed a hand-maintained list — and a variable
 added later without touching that list would have silently leaked.
@@ -725,8 +725,8 @@ All validation and setup failures stop before invoking provider deployment.
 
 | Failure                                         | Required diagnostic                                                             |
 | ----------------------------------------------- | ------------------------------------------------------------------------------- |
-| Missing/unknown `cli-package`                   | State that the app must name a CLI package present in its own workspace.        |
-| Missing `cli-artifact`                          | State that a compiled CLI artifact from `build-app-cli` is required.            |
+| Missing/unknown `app-cli-package`               | State that the app must name a CLI package present in its own workspace.        |
+| Missing `app-cli-artifact`                      | State that a compiled CLI artifact from `build-app-cli` is required.            |
 | Malformed `adapter` token                       | Name the input and its allowed shape (the CLI validates support at run time).   |
 | Invalid boolean                                 | Name the input and allowed values.                                              |
 | Missing working directory                       | Print the workspace-relative requested path.                                    |
@@ -808,7 +808,7 @@ Fastly wrapper:
 
 - `adapter` well-formedness validation (unknown adapters surface as the CLI's
   own error, not an engine allowlist);
-- app-provided `cli-package` build (fail on missing/unknown package), tar
+- app-provided `app-cli-package` build (fail on missing/unknown package), tar
   round-trip preserving the executable bit, and artifact consumption;
 - exact boolean parsing;
 - toolchain precedence and malformed-file failure;
@@ -876,7 +876,7 @@ The design is implemented when:
 
 1. A caller can compile the CLI once with `build-app-cli` and deploy a checked-out
    EdgeZero application with `deploy-fastly`, reusing the same CLI artifact.
-2. `build-app-cli` compiles the app-provided `cli-package` from the application
+2. `build-app-cli` compiles the app-provided `app-cli-package` from the application
    checkout and never builds the EdgeZero monorepo CLI or the action's own
    revision.
 3. `deploy-core` contains no provider-specific credential names, service

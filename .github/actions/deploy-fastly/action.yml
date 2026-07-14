@@ -2,10 +2,10 @@ name: EdgeZero deploy-fastly
 description: Deploy a checked-out EdgeZero application to Fastly Compute using a prebuilt app CLI artifact.
 
 inputs:
-  cli-artifact:
+  app-cli-artifact:
     description: Name of the build-app-cli artifact to download and run.
     required: true
-  cli-bin:
+  app-cli-bin:
     description: Binary name inside the artifact. Defaults to the artifact metadata.
     required: false
     default: ""
@@ -51,9 +51,9 @@ outputs:
   source-revision:
     description: Git revision deployed from working-directory.
     value: ${{ steps.resolve.outputs['source-revision'] }}
-  cli-version:
+  app-cli-version:
     description: Version of the app CLI consumed from the artifact.
-    value: ${{ steps.cli.outputs['cli-version'] }}
+    value: ${{ steps.cli.outputs['app-cli-version'] }}
 
 runs:
   using: composite
@@ -105,7 +105,7 @@ runs:
     - name: Download CLI artifact
       uses: actions/download-artifact@v4
       with:
-        name: ${{ inputs['cli-artifact'] }}
+        name: ${{ inputs['app-cli-artifact'] }}
         path: ${{ runner.temp }}/edgezero-cli-download
       env:
         FASTLY_API_TOKEN: ""
@@ -128,9 +128,9 @@ runs:
       id: cli
       shell: bash
       env:
-        EDGEZERO__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
         EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
-        EDGEZERO__INPUT__CLI_BIN: ${{ inputs['cli-bin'] }}
+        EDGEZERO__INPUT__APP_CLI_BIN: ${{ inputs['app-cli-bin'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_SERVICE_ID: ""
         FASTLY_TOKEN: ""
@@ -146,14 +146,14 @@ runs:
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-cli.sh
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
 
     - name: Resolve project
       id: resolve
       shell: bash
       env:
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
-        EDGEZERO__CLI__VERSION: ${{ steps.cli.outputs['cli-version'] }}
+        EDGEZERO__APP__CLI__VERSION: ${{ steps.cli.outputs['app-cli-version'] }}
         EDGEZERO__INPUT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__INPUT__MANIFEST: ${{ inputs.manifest }}
         EDGEZERO__INPUT__RUST_TOOLCHAIN: auto
@@ -256,7 +256,7 @@ runs:
       if: ${{ steps.resolve.outputs['effective-build-mode'] == 'always' }}
       shell: bash
       env:
-        EDGEZERO__CLI__BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__ADAPTER: fastly
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory'] }}
         EDGEZERO__PROJECT__MANIFEST_PATH: ${{ steps.resolve.outputs['manifest'] }}
@@ -277,20 +277,20 @@ runs:
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/run-cli.sh build
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/run-app-cli.sh build
 
     - name: Deploy
       id: deploy
       shell: bash
       env:
-        EDGEZERO__CLI__BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__ADAPTER: fastly
         EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ steps.resolve.outputs['working-directory'] }}
         EDGEZERO__PROJECT__MANIFEST_PATH: ${{ steps.resolve.outputs['manifest'] }}
         EDGEZERO__DEPLOY__FLAGS_FILE: ${{ steps.validate.outputs['deploy-flags-file'] }}
         EDGEZERO__DEPLOY__ARGS_FILE: ${{ steps.validate.outputs['deploy-args-file'] }}
         # Credential boundary: pass the typed values as data (not as FASTLY_*
-        # aliases). run-cli.sh clears every provider-env-clear alias — including
+        # aliases). run-app-cli.sh clears every provider-env-clear alias — including
         # any inherited FASTLY_ENDPOINT/FASTLY_TOKEN — and then exports only these.
         EDGEZERO__PROVIDER__ENV_CLEAR_FILE: ${{ steps.validate.outputs['provider-env-clear-file'] }}
         EDGEZERO__FASTLY__API_TOKEN: ${{ inputs['fastly-api-token'] }}
@@ -330,7 +330,7 @@ runs:
         EDGEZERO__SUMMARY__MANIFEST: ${{ steps.resolve.outputs['manifest-summary'] }}
         EDGEZERO__SUMMARY__RUST_TOOLCHAIN: ${{ steps.resolve.outputs['rust-toolchain'] }}
         EDGEZERO__SUMMARY__TARGET: wasm32-wasip1
-        EDGEZERO__SUMMARY__CLI_VERSION: ${{ steps.cli.outputs['cli-version'] }}
+        EDGEZERO__SUMMARY__APP_CLI_VERSION: ${{ steps.cli.outputs['app-cli-version'] }}
         EDGEZERO__SUMMARY__EFFECTIVE_BUILD_MODE: ${{ steps.resolve.outputs['effective-build-mode'] }}
         EDGEZERO__SUMMARY__CACHE: ${{ inputs.cache }}
         EDGEZERO__SUMMARY__RESULT: ${{ steps.deploy.outcome }}

@@ -2,10 +2,10 @@ name: EdgeZero rollback-fastly
 description: Roll back a Fastly deployment via the app CLI. Production activates the previous version; staging deactivates the staged version.
 
 inputs:
-  cli-artifact:
+  app-cli-artifact:
     description: Name of the build-app-cli artifact to download and run.
     required: true
-  cli-bin:
+  app-cli-bin:
     description: Binary name inside the artifact. Defaults to the artifact metadata.
     required: false
     default: ""
@@ -34,7 +34,7 @@ runs:
     - name: Download CLI artifact
       uses: actions/download-artifact@v4
       with:
-        name: ${{ inputs['cli-artifact'] }}
+        name: ${{ inputs['app-cli-artifact'] }}
         path: ${{ runner.temp }}/edgezero-cli-download
       env:
         FASTLY_API_TOKEN: ""
@@ -57,9 +57,9 @@ runs:
       id: cli
       shell: bash
       env:
-        EDGEZERO__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
         EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
-        EDGEZERO__INPUT__CLI_BIN: ${{ inputs['cli-bin'] }}
+        EDGEZERO__INPUT__APP_CLI_BIN: ${{ inputs['app-cli-bin'] }}
         FASTLY_API_TOKEN: ""
         FASTLY_TOKEN: ""
         FASTLY_KEY: ""
@@ -75,13 +75,13 @@ runs:
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
         FASTLY_HOME: ""
-      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-cli.sh
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
 
     - name: Rollback
       id: rollback
       shell: bash
       env:
-        EDGEZERO__CLI__BIN: ${{ steps.cli.outputs['cli-bin'] }}
+        EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
         EDGEZERO__LIFECYCLE__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         EDGEZERO__LIFECYCLE__VERSION: ${{ inputs['fastly-version'] }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}

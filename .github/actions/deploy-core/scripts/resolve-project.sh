@@ -8,7 +8,7 @@ set -euo pipefail
 #
 # Inputs (environment): EDGEZERO__INPUT__WORKING_DIRECTORY, EDGEZERO__INPUT__MANIFEST,
 # EDGEZERO__INPUT__RUST_TOOLCHAIN, EDGEZERO__INPUT__TARGET (required), EDGEZERO__INPUT__BUILD_MODE, EDGEZERO__INPUT__CACHE,
-# EDGEZERO__ACTION__ROOT (required), EDGEZERO__CLI__VERSION.
+# EDGEZERO__ACTION__ROOT (required), EDGEZERO__APP__CLI__VERSION.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -91,7 +91,7 @@ main() {
   local rust_toolchain_input="${EDGEZERO__INPUT__RUST_TOOLCHAIN:-auto}"
   local target="${EDGEZERO__INPUT__TARGET:?EDGEZERO__INPUT__TARGET is required (wrapper-provided concrete target)}"
   local cache="${EDGEZERO__INPUT__CACHE:-false}"
-  local cli_version="${EDGEZERO__CLI__VERSION:-unknown}"
+  local cli_version="${EDGEZERO__APP__CLI__VERSION:-unknown}"
 
   require_cmd git
   require_cmd cargo

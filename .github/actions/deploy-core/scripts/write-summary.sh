@@ -18,7 +18,7 @@ main() {
     echo "| Manifest | ${EDGEZERO__SUMMARY__MANIFEST:-EdgeZero default discovery} |"
     echo "| Rust toolchain | ${EDGEZERO__SUMMARY__RUST_TOOLCHAIN:-unknown} |"
     echo "| Target | ${EDGEZERO__SUMMARY__TARGET:-unknown} |"
-    echo "| CLI version | ${EDGEZERO__SUMMARY__CLI_VERSION:-unknown} |"
+    echo "| CLI version | ${EDGEZERO__SUMMARY__APP_CLI_VERSION:-unknown} |"
     echo "| Effective build mode | ${EDGEZERO__SUMMARY__EFFECTIVE_BUILD_MODE:-unknown} |"
     echo "| Cache | ${EDGEZERO__SUMMARY__CACHE:-false} |"
     echo "| Result | ${EDGEZERO__SUMMARY__RESULT:-unknown} |"

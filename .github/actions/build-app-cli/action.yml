@@ -2,39 +2,39 @@ name: EdgeZero build-app-cli
 description: Compile the CLI package the application provides and publish it as a self-describing artifact.
 
 inputs:
-  cli-package:
+  app-cli-package:
     description: Cargo package name of the CLI to build, defined in the application's own workspace.
     required: true
-  cli-bin:
-    description: Binary name produced by cli-package. Defaults to the package name.
+  app-cli-bin:
+    description: Binary name produced by app-cli-package. Defaults to the package name.
     required: false
     default: ""
   working-directory:
-    description: Application directory (relative to github.workspace) whose workspace defines cli-package.
+    description: Application directory (relative to github.workspace) whose workspace defines app-cli-package.
     required: false
     default: .
   rust-toolchain:
     description: Explicit host Rust toolchain, or 'auto' to follow application discovery.
     required: false
     default: auto
-  artifact-name:
-    description: Name of the uploaded CLI artifact.
+  app-cli-artifact:
+    description: Name for the uploaded app-CLI artifact.
     required: false
     default: edgezero-cli
 
 outputs:
-  cli-version:
+  app-cli-version:
     description: CLI package version read from cargo metadata.
-    value: ${{ steps.build.outputs['cli-version'] }}
-  cli-package:
+    value: ${{ steps.build.outputs['app-cli-version'] }}
+  app-cli-package:
     description: The application CLI package that was built.
-    value: ${{ steps.build.outputs['cli-package'] }}
-  cli-bin:
+    value: ${{ steps.build.outputs['app-cli-package'] }}
+  app-cli-bin:
     description: The binary name inside the artifact.
-    value: ${{ steps.build.outputs['cli-bin'] }}
-  artifact-name:
-    description: Name of the uploaded CLI artifact for downstream download.
-    value: ${{ steps.build.outputs['artifact-name'] }}
+    value: ${{ steps.build.outputs['app-cli-bin'] }}
+  app-cli-artifact:
+    description: Artifact name the deploy, healthcheck, and rollback actions consume.
+    value: ${{ steps.build.outputs['app-cli-artifact'] }}
 
 runs:
   using: composite
@@ -44,17 +44,17 @@ runs:
       shell: bash
       env:
         EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
-        EDGEZERO__INPUT__CLI_PACKAGE: ${{ inputs['cli-package'] }}
-        EDGEZERO__INPUT__CLI_BIN: ${{ inputs['cli-bin'] }}
+        EDGEZERO__INPUT__APP_CLI_PACKAGE: ${{ inputs['app-cli-package'] }}
+        EDGEZERO__INPUT__APP_CLI_BIN: ${{ inputs['app-cli-bin'] }}
         EDGEZERO__INPUT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
         EDGEZERO__INPUT__RUST_TOOLCHAIN: ${{ inputs['rust-toolchain'] }}
-        EDGEZERO__INPUT__ARTIFACT_NAME: ${{ inputs['artifact-name'] }}
+        EDGEZERO__INPUT__APP_CLI_ARTIFACT: ${{ inputs['app-cli-artifact'] }}
       run: $GITHUB_ACTION_PATH/scripts/build-app-cli.sh
 
     - name: Upload CLI artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ steps.build.outputs['artifact-name'] }}
+        name: ${{ steps.build.outputs['app-cli-artifact'] }}
         path: ${{ steps.build.outputs['tarball-path'] }}
         if-no-files-found: error
         retention-days: 1

@@ -142,7 +142,7 @@ test_owned_dir_confinement() {
 }
 
 # ---------------------------------------------------------------------------
-# download-cli — cli-bin confinement + unsafe archive rejection
+# download-app-cli — app-cli-bin confinement + unsafe archive rejection
 # ---------------------------------------------------------------------------
 check_cli_bin() {
   bash -c 'source "$1"; validate_cli_bin "$2"' _ "$CORE_SCRIPTS/common.sh" "$1"
@@ -153,11 +153,11 @@ check_tarball() {
 }
 
 test_cli_bin_confinement() {
-  section "download-cli cli-bin + archive safety"
-  assert_succeeds "accepts a bare binary name" check_cli_bin "myapp-cli"
-  assert_fails "rejects a traversal cli-bin ('../../outside/tool')" check_cli_bin "../../outside/tool"
-  assert_fails "rejects a cli-bin with a separator" check_cli_bin "sub/tool"
-  assert_fails "rejects an empty cli-bin" check_cli_bin ""
+  section "download-app-cli app-cli-bin + archive safety"
+  assert_succeeds "accepts a bare app-cli-bin" check_cli_bin "myapp-cli"
+  assert_fails "rejects a traversal app-cli-bin ('../../outside/tool')" check_cli_bin "../../outside/tool"
+  assert_fails "rejects an app-cli-bin with a separator" check_cli_bin "sub/tool"
+  assert_fails "rejects an empty app-cli-bin" check_cli_bin ""
 
   # A tar carrying a symlink member must be refused before extraction.
   local evil="$WORK_DIR/evil"
@@ -170,13 +170,13 @@ test_cli_bin_confinement() {
   local good="$WORK_DIR/good"
   mkdir -p "$good/stage"
   echo x >"$good/stage/myapp-cli"
-  printf '{}' >"$good/stage/cli-meta.json"
-  tar -C "$good/stage" -cf "$good/good.tar" myapp-cli cli-meta.json
+  printf '{}' >"$good/stage/app-cli-meta.json"
+  tar -C "$good/stage" -cf "$good/good.tar" myapp-cli app-cli-meta.json
   assert_succeeds "accepts a well-formed archive" check_tarball "$good/good.tar"
 }
 
 # ---------------------------------------------------------------------------
-# run-cli.sh — provider-env credential boundary
+# run-app-cli.sh — provider-env credential boundary
 # ---------------------------------------------------------------------------
 # A fake CLI records the FASTLY_* it actually saw; run-cli must clear inherited
 # aliases and export only the declared, typed values.
@@ -198,12 +198,12 @@ EOF
 
   run_deploy_pe() {
     env -i PATH="$bin_dir:$PATH" \
-      EDGEZERO__CLI__BIN=fakecli EDGEZERO__ADAPTER=fastly \
+      EDGEZERO__APP__CLI__BIN=fakecli EDGEZERO__ADAPTER=fastly \
       EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
       EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$clear" \
       EDGEZERO__PROVIDER__ENV="$1" \
       FASTLY_API_TOKEN=inherited-BAD FASTLY_ENDPOINT=https://inherited.invalid \
-      bash "$CORE_SCRIPTS/run-cli.sh" deploy
+      bash "$CORE_SCRIPTS/run-app-cli.sh" deploy
   }
 
   if run_deploy_pe '{"FASTLY_API_TOKEN":"typed-tok"}' >/dev/null 2>&1; then
@@ -219,7 +219,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# run-cli.sh — CLI argv construction
+# run-app-cli.sh — CLI argv construction
 # ---------------------------------------------------------------------------
 # Installs a fake CLI that records its argv, then asserts run-cli places typed
 # deploy-flags before `--` and caller passthrough after `--`.
@@ -242,12 +242,12 @@ EOF
   printf -- '--comment\0hello\0' >"$WORK_DIR/deploy-args.nul"
 
   if env -i PATH="$bin_dir:$PATH" \
-    EDGEZERO__CLI__BIN=fakecli \
+    EDGEZERO__APP__CLI__BIN=fakecli \
     EDGEZERO__ADAPTER=fastly \
     EDGEZERO__PROJECT__WORKING_DIRECTORY="$app_dir" \
     EDGEZERO__DEPLOY__FLAGS_FILE="$WORK_DIR/deploy-flags.nul" \
     EDGEZERO__DEPLOY__ARGS_FILE="$WORK_DIR/deploy-args.nul" \
-    bash "$CORE_SCRIPTS/run-cli.sh" deploy >/dev/null 2>&1; then
+    bash "$CORE_SCRIPTS/run-app-cli.sh" deploy >/dev/null 2>&1; then
     local expected
     expected=$'deploy\n--adapter\nfastly\n--service-id\nabc\n--stage\n--\n--comment\nhello'
     assert_equals "flags precede --, passthrough follows --" "$expected" "$(cat "$argv_file")"
@@ -257,12 +257,12 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# download-cli.sh — self-describing artifact
+# download-app-cli.sh — self-describing artifact
 # ---------------------------------------------------------------------------
-# Builds a fake artifact tar (binary + cli-meta.json) and asserts download-cli
+# Builds a fake artifact tar (binary + app-cli-meta.json) and asserts download-cli
 # extracts it and surfaces the metadata.
 test_download_cli_metadata() {
-  section "download-cli metadata"
+  section "download-app-cli metadata"
 
   local artifact_dir="$WORK_DIR/artifact"
   local stage_dir="$artifact_dir/stage"
@@ -273,24 +273,24 @@ test_download_cli_metadata() {
 exit 0
 EOF
   chmod +x "$stage_dir/myapp-cli"
-  printf '{"cli-bin":"myapp-cli","cli-version":"1.2.3","cli-package":"myapp-cli"}\n' \
-    >"$stage_dir/cli-meta.json"
-  tar -C "$stage_dir" -cf "$artifact_dir/edgezero-cli.tar" myapp-cli cli-meta.json
+  printf '{"app-cli-bin":"myapp-cli","app-cli-version":"1.2.3","app-cli-package":"myapp-cli"}\n' \
+    >"$stage_dir/app-cli-meta.json"
+  tar -C "$stage_dir" -cf "$artifact_dir/edgezero-cli.tar" myapp-cli app-cli-meta.json
 
   local output_file="$WORK_DIR/download-output.txt"
   if env -i PATH="$PATH" \
-    EDGEZERO__CLI__ARTIFACT_DIR="$artifact_dir" \
+    EDGEZERO__APP__CLI__ARTIFACT_DIR="$artifact_dir" \
     EDGEZERO__ACTION__TOOL_ROOT="$WORK_DIR/tools" \
     GITHUB_OUTPUT="$output_file" \
     GITHUB_PATH="$WORK_DIR/download-path.txt" \
-    bash "$CORE_SCRIPTS/download-cli.sh" >/dev/null 2>&1; then
-    if grep -qx 'cli-bin=myapp-cli' "$output_file" && grep -qx 'cli-version=1.2.3' "$output_file"; then
-      pass "extracts the tar and reads cli-meta.json"
+    bash "$CORE_SCRIPTS/download-app-cli.sh" >/dev/null 2>&1; then
+    if grep -qx 'app-cli-bin=myapp-cli' "$output_file" && grep -qx 'app-cli-version=1.2.3' "$output_file"; then
+      pass "extracts the tar and reads app-cli-meta.json"
     else
-      fail "download-cli did not surface the expected metadata"
+      fail "download-app-cli did not surface the expected metadata"
     fi
   else
-    fail "download-cli failed to execute"
+    fail "download-app-cli failed to execute"
   fi
 }
 
@@ -345,7 +345,7 @@ test_cleanup_confinement() {
 }
 
 # ---------------------------------------------------------------------------
-# run-cli.sh — the action's private env must not survive into the app CLI
+# run-app-cli.sh — the action's private env must not survive into the app CLI
 # ---------------------------------------------------------------------------
 test_action_env_scrub() {
   section "action-private env scrub"
@@ -366,12 +366,12 @@ CLI
   local out
   out=$(
     PATH="$dir/bin:$PATH" \
-      EDGEZERO__CLI__BIN=scrub-cli EDGEZERO__ADAPTER=fastly EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir" \
+      EDGEZERO__APP__CLI__BIN=scrub-cli EDGEZERO__ADAPTER=fastly EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir" \
       EDGEZERO__PROJECT__MANIFEST_PATH="$dir/edgezero.toml" \
       EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
       EDGEZERO__PROVIDER__ENV='{"FASTLY_API_TOKEN":"s3cret"}' \
       EDGEZERO__FASTLY__API_TOKEN='s3cret' \
-      "$CORE_SCRIPTS/run-cli.sh" deploy 2>/dev/null
+      "$CORE_SCRIPTS/run-app-cli.sh" deploy 2>/dev/null
   )
 
   # What the CLI IS promised.

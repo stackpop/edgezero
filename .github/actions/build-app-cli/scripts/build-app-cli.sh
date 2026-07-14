@@ -2,17 +2,17 @@
 set -euo pipefail
 
 # Compiles the CLI package the *application* provides (a crate in the app's own
-# workspace, named by EDGEZERO__INPUT__CLI_PACKAGE) into an action-owned CARGO_TARGET_DIR,
-# then packages the binary plus a self-describing cli-meta.json into a tar so the
+# workspace, named by EDGEZERO__INPUT__APP_CLI_PACKAGE) into an action-owned CARGO_TARGET_DIR,
+# then packages the binary plus a self-describing app-cli-meta.json into a tar so the
 # executable bit survives actions/upload-artifact. Never builds the EdgeZero
 # monorepo CLI.
 #
 # Inputs (environment):
-#   EDGEZERO__INPUT__CLI_PACKAGE         required Cargo package name to build
-#   EDGEZERO__INPUT__CLI_BIN             optional binary name (defaults to the package name)
+#   EDGEZERO__INPUT__APP_CLI_PACKAGE         required Cargo package name to build
+#   EDGEZERO__INPUT__APP_CLI_BIN             optional binary name (defaults to the package name)
 #   EDGEZERO__INPUT__WORKING_DIRECTORY   optional app dir relative to github.workspace (".")
 #   EDGEZERO__INPUT__RUST_TOOLCHAIN      optional explicit toolchain or "auto"
-#   EDGEZERO__INPUT__ARTIFACT_NAME       optional uploaded artifact name ("edgezero-cli")
+#   EDGEZERO__INPUT__APP_CLI_ARTIFACT       optional uploaded artifact name ("edgezero-cli")
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
@@ -125,11 +125,11 @@ require_linux_x86_64() {
 main() {
   local workspace="${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required}"
   local action_root="${EDGEZERO__ACTION__ROOT:?EDGEZERO__ACTION__ROOT is required}"
-  local cli_package="${EDGEZERO__INPUT__CLI_PACKAGE:?input 'cli-package' is required}"
-  local cli_bin="${EDGEZERO__INPUT__CLI_BIN:-}"
+  local cli_package="${EDGEZERO__INPUT__APP_CLI_PACKAGE:?input 'app-cli-package' is required}"
+  local cli_bin="${EDGEZERO__INPUT__APP_CLI_BIN:-}"
   local working_directory="${EDGEZERO__INPUT__WORKING_DIRECTORY:-.}"
   local rust_toolchain_input="${EDGEZERO__INPUT__RUST_TOOLCHAIN:-auto}"
-  local artifact_name="${EDGEZERO__INPUT__ARTIFACT_NAME:-edgezero-cli}"
+  local artifact_name="${EDGEZERO__INPUT__APP_CLI_ARTIFACT:-edgezero-cli}"
 
   # These directories are `rm -rf`d below, so they must NEVER come from the
   # inherited environment — a colliding job-level variable could otherwise point
@@ -164,12 +164,12 @@ main() {
   metadata=$(cargo +"$rust_toolchain" metadata --locked --no-deps --format-version 1) ||
     fail "cargo metadata --locked failed; ensure Cargo.lock is present and up to date"
   package_json=$(jq -c --arg p "$cli_package" '.packages[] | select(.name == $p)' <<<"$metadata")
-  [[ -n "$package_json" ]] || fail "cli-package '$cli_package' was not found in the application workspace"
+  [[ -n "$package_json" ]] || fail "app-cli-package '$cli_package' was not found in the application workspace"
 
   [[ -n "$cli_bin" ]] || cli_bin="$cli_package"
   local has_bin cli_version
   has_bin=$(jq -r --arg b "$cli_bin" '[.targets[] | select(.kind | index("bin")) | .name] | index($b) != null' <<<"$package_json")
-  [[ "$has_bin" == "true" ]] || fail "cli-package '$cli_package' declares no binary target named '$cli_bin'"
+  [[ "$has_bin" == "true" ]] || fail "app-cli-package '$cli_package' declares no binary target named '$cli_bin'"
   cli_version=$(jq -r '.version' <<<"$package_json")
 
   # Build into an action-owned target dir so the checkout stays clean.
@@ -186,19 +186,19 @@ main() {
   cp "$bin_path" "$stage_root/$cli_bin"
   chmod +x "$stage_root/$cli_bin"
   jq -n --arg bin "$cli_bin" --arg version "$cli_version" --arg package "$cli_package" \
-    '{"cli-bin": $bin, "cli-version": $version, "cli-package": $package}' \
-    >"$stage_root/cli-meta.json"
+    '{"app-cli-bin": $bin, "app-cli-version": $version, "app-cli-package": $package}' \
+    >"$stage_root/app-cli-meta.json"
 
   # Fixed tarball name — never derive a path component from caller input.
   local tarball="$stage_root/../edgezero-cli.tar"
-  tar -C "$stage_root" -cf "$tarball" "$cli_bin" cli-meta.json
+  tar -C "$stage_root" -cf "$tarball" "$cli_bin" app-cli-meta.json
   tarball=$(canonical_path "$tarball")
 
   notice "built app CLI '$cli_bin' v$cli_version from package '$cli_package'"
-  append_output cli-version "$cli_version"
-  append_output cli-package "$cli_package"
-  append_output cli-bin "$cli_bin"
-  append_output artifact-name "$artifact_name"
+  append_output app-cli-version "$cli_version"
+  append_output app-cli-package "$cli_package"
+  append_output app-cli-bin "$cli_bin"
+  append_output app-cli-artifact "$artifact_name"
   append_output tarball-path "$tarball"
 }
 

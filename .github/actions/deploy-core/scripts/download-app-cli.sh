@@ -3,12 +3,12 @@ set -euo pipefail
 
 # Extracts the build-app-cli artifact tar (downloaded by actions/download-artifact)
 # into an action-owned tool dir, preserving the executable bit, reads the
-# self-describing cli-meta.json, and prepends the dir to PATH for action steps.
-# A wrapper-supplied EDGEZERO__INPUT__CLI_BIN overrides the metadata's binary name.
+# self-describing app-cli-meta.json, and prepends the dir to PATH for action steps.
+# A wrapper-supplied EDGEZERO__INPUT__APP_CLI_BIN overrides the metadata's binary name.
 #
 # Inputs (environment):
-#   EDGEZERO__CLI__ARTIFACT_DIR          required dir containing the downloaded tar
-#   EDGEZERO__INPUT__CLI_BIN             optional override for the binary name
+#   EDGEZERO__APP__CLI__ARTIFACT_DIR          required dir containing the downloaded tar
+#   EDGEZERO__INPUT__APP_CLI_BIN             optional override for the binary name
 #   EDGEZERO__ACTION__TOOL_ROOT          optional install dir (defaults under RUNNER_TEMP)
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -22,8 +22,8 @@ find_cli_tarball() {
 }
 
 main() {
-  local artifact_dir="${EDGEZERO__CLI__ARTIFACT_DIR:?EDGEZERO__CLI__ARTIFACT_DIR is required}"
-  local cli_bin_override="${EDGEZERO__INPUT__CLI_BIN:-}"
+  local artifact_dir="${EDGEZERO__APP__CLI__ARTIFACT_DIR:?EDGEZERO__APP__CLI__ARTIFACT_DIR is required}"
+  local cli_bin_override="${EDGEZERO__INPUT__APP_CLI_BIN:-}"
   local tool_root="${EDGEZERO__ACTION__TOOL_ROOT:-${RUNNER_TEMP:-/tmp}/edgezero-action-tools}"
 
   require_cmd jq
@@ -36,11 +36,11 @@ main() {
 
   assert_safe_tarball "$tarball"
   tar -xf "$tarball" -C "$tool_root/bin"
-  [[ -f "$tool_root/bin/cli-meta.json" ]] || fail "CLI artifact is missing cli-meta.json"
+  [[ -f "$tool_root/bin/app-cli-meta.json" ]] || fail "CLI artifact is missing app-cli-meta.json"
 
   local meta_bin cli_version cli_bin
-  meta_bin=$(jq -er '."cli-bin"' "$tool_root/bin/cli-meta.json") || fail "cli-meta.json has no cli-bin"
-  cli_version=$(jq -er '."cli-version"' "$tool_root/bin/cli-meta.json") || fail "cli-meta.json has no cli-version"
+  meta_bin=$(jq -er '."app-cli-bin"' "$tool_root/bin/app-cli-meta.json") || fail "app-cli-meta.json has no app-cli-bin"
+  cli_version=$(jq -er '."app-cli-version"' "$tool_root/bin/app-cli-meta.json") || fail "app-cli-meta.json has no app-cli-version"
   cli_bin="${cli_bin_override:-$meta_bin}"
   validate_cli_bin "$cli_bin"
 
@@ -57,8 +57,8 @@ main() {
   export PATH="$tool_root/bin:$PATH"
 
   notice "using app CLI '$cli_bin' v$cli_version from artifact"
-  append_output cli-bin "$cli_bin"
-  append_output cli-version "$cli_version"
+  append_output app-cli-bin "$cli_bin"
+  append_output app-cli-version "$cli_version"
   append_env EDGEZERO__ACTION__TOOL_ROOT "$tool_root"
 }
 

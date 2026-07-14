@@ -46,11 +46,11 @@ jobs:
       - id: cli
         uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
         with:
-          cli-package: my-app-cli # the CLI crate in your app's workspace
+          app-cli-package: my-app-cli # the CLI crate in your app's workspace
 
       - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
         with:
-          cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
           fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
           fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
 ```
@@ -95,12 +95,12 @@ steps:
   - id: cli
     uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
     with:
-      cli-package: my-app-cli
+      app-cli-package: my-app-cli
       working-directory: app
 
   - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
     with:
-      cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
       working-directory: app
       fastly-api-token: ${{ secrets.FASTLY_API_TOKEN }}
       fastly-service-id: ${{ vars.FASTLY_SERVICE_ID }}
@@ -122,12 +122,12 @@ steps:
   - id: cli
     uses: stackpop/edgezero/.github/actions/build-app-cli@<ref>
     with:
-      cli-package: api-cli
+      app-cli-package: api-cli
       working-directory: apps/api
 
   - uses: stackpop/edgezero/.github/actions/deploy-fastly@<ref>
     with:
-      cli-artifact: ${{ steps.cli.outputs.artifact-name }}
+      app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
       working-directory: apps/api
       manifest: edgezero.toml
       cache: true
@@ -139,13 +139,13 @@ steps:
 
 - Check out application source yourself; the actions never call
   `actions/checkout`.
-- Provide a CLI package in your own workspace and name it via `cli-package`;
+- Provide a CLI package in your own workspace and name it via `app-cli-package`;
   `build-app-cli` compiles that package from your checkout, so the CLI and your app
   never disagree on schema. `build-app-cli` does not use the EdgeZero monorepo CLI.
 - Provide typed provider credentials through wrapper inputs, not caller `env:`.
 - Ensure the deployed ref has committed source (no dirty working tree) and a
   `Cargo.lock` at your app's **Cargo workspace root** (the workspace that owns
-  `cli-package` — in a nested-workspace monorepo this may be your app
+  `app-cli-package` — in a nested-workspace monorepo this may be your app
   subdirectory, not the repo root). `build-app-cli` requires it, and caching keys on
   it.
 - Pin action references to readable released tags, or full SHAs for production
@@ -216,7 +216,7 @@ Workflow shape:
 1. check out `trusted-server-deployer` with `persist-credentials: false`;
 2. check out Trusted Server source separately at the selected ref into
    `trusted-server`;
-3. run `build-app-cli` with `cli-package: <trusted-server-cli-crate>` and
+3. run `build-app-cli` with `app-cli-package: <trusted-server-cli-crate>` and
    `working-directory: trusted-server` (Trusted Server's own CLI package, whose
    `Cargo.toml` already pins the Fastly adapter);
 4. run `deploy-fastly` (set `stage: true` for staging) with the CLI artifact,

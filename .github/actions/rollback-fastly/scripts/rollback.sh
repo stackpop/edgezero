@@ -7,7 +7,7 @@ set -euo pipefail
 # Fails closed: a rollback that cannot say what it activated has not provably
 # rolled anything back.
 #
-# Inputs (environment): EDGEZERO__CLI__BIN, EDGEZERO__LIFECYCLE__SERVICE_ID, EDGEZERO__LIFECYCLE__VERSION, EDGEZERO__DEPLOY__TO,
+# Inputs (environment): EDGEZERO__APP__CLI__BIN, EDGEZERO__LIFECYCLE__SERVICE_ID, EDGEZERO__LIFECYCLE__VERSION, EDGEZERO__DEPLOY__TO,
 # FASTLY_API_TOKEN.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -29,7 +29,7 @@ validate_inputs() {
 main() {
   validate_inputs
 
-  local argv=("$EDGEZERO__CLI__BIN" rollback --adapter fastly --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID" --version "$EDGEZERO__LIFECYCLE__VERSION")
+  local argv=("$EDGEZERO__APP__CLI__BIN" rollback --adapter fastly --service-id "$EDGEZERO__LIFECYCLE__SERVICE_ID" --version "$EDGEZERO__LIFECYCLE__VERSION")
   if [[ "$EDGEZERO__DEPLOY__TO" == "staging" ]]; then
     argv+=(--staging)
   fi

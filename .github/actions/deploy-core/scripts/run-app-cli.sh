@@ -16,7 +16,7 @@ set -euo pipefail
 # never survive into the deploy. Build mode is credential-free and only clears.
 #
 # Inputs (environment):
-#   EDGEZERO__CLI__BIN                   required binary name to invoke (on PATH)
+#   EDGEZERO__APP__CLI__BIN                   required binary name to invoke (on PATH)
 #   EDGEZERO__ADAPTER                    required adapter passed as --adapter
 #   EDGEZERO__PROJECT__WORKING_DIRECTORY required directory to run the CLI from
 #   EDGEZERO__PROJECT__MANIFEST_PATH     optional exported as EDGEZERO_MANIFEST when set
@@ -153,10 +153,10 @@ main() {
   local mode="${1:-}"
   case "$mode" in
     build | deploy) ;;
-    *) fail "usage: run-cli.sh build|deploy" ;;
+    *) fail "usage: run-app-cli.sh build|deploy" ;;
   esac
 
-  local cli_bin="${EDGEZERO__CLI__BIN:?EDGEZERO__CLI__BIN is required}"
+  local cli_bin="${EDGEZERO__APP__CLI__BIN:?EDGEZERO__APP__CLI__BIN is required}"
   local adapter="${EDGEZERO__ADAPTER:?EDGEZERO__ADAPTER is required}"
   local working_directory="${EDGEZERO__PROJECT__WORKING_DIRECTORY:?EDGEZERO__PROJECT__WORKING_DIRECTORY is required}"
   local manifest="${EDGEZERO__PROJECT__MANIFEST_PATH:-}"
