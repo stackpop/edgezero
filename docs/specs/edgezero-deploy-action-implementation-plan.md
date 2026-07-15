@@ -161,12 +161,37 @@ reference to port from. Most transfer with light changes:
      Carry no orchestration policy — the caller wires stage → healthcheck →
      rollback.
 
-5. **Scripts layout**
+5. **`config-push-fastly` action + CLI staging support (§5.5)**
+   - CLI (`edgezero-adapter-fastly` + `edgezero-cli`): add `--staging` to
+     `config push`. `config.rs` already resolves one push entry
+     `(key, body)` where `key = args.key.unwrap_or(logical_store_id)`; when
+     `--staging` is set, derive the staging variant `<key>_staging` (same
+     resolved store, different key). Mirror the derivation in `config diff` so a
+     staged diff compares against the staged key. Colocated tests: production key
+     unchanged, `--staging` suffixes, explicit `--key` + `--staging` composes.
+   - Engine (`deploy-core/scripts/run-app-cli.sh`): add a `config-push` mode
+     beside `build`/`deploy`. Same credential boundary — `provider-env` in, the
+     `EDGEZERO__*` namespace scrubbed before exec — invoking
+     `<cli> config push --adapter <adapter>` with the wrapper's typed flags
+     (`--store`, `--key`, `--staging`).
+   - `config-push-fastly` wrapper: thin composite mirroring `deploy-fastly`.
+     Inputs `app-cli-artifact`, `app-cli-bin`, `fastly-api-token`,
+     `working-directory`, `manifest`, `app-config`, `store`, `key`, `deploy-to`
+     (`production`/`staging`, validated + fail-closed). Maps `fastly-api-token`
+     → `provider-env: {FASTLY_API_TOKEN: …}`; blanks the full alias list on every
+     step; installs the pinned Fastly CLI (the push shells out to
+     `fastly config-store-entry update`). Outputs `pushed-key`, `store`.
+   - Contract + smoke coverage: a `config-push` engine argv test; the lifecycle
+     smoke job's fake `fastly` gains `config-store list` / `config-store-entry
+update` handlers, and a staged push asserts the `<key>_staging` key reached
+     the store.
+
+6. **Scripts layout**
    - Provider-neutral scripts under `deploy-core/`; the Fastly install + checksum
      step lives with `deploy-fastly/` (or a shared script keyed by adapter).
    - No CLI-build script here — CLI build lives entirely in `build-app-cli`.
 
-6. **CI workflow (`.github/workflows/deploy-action.yml`) — no Python**
+7. **CI workflow (`.github/workflows/deploy-action.yml`) — no Python**
    - Pin third-party actions to readable released tags (`actions/checkout@v4`,
      `actions/cache@v4`, artifact upload/download at released tags).
    - Run `actionlint` from a pinned release binary (no `go run @<commit>`).
@@ -181,7 +206,7 @@ reference to port from. Most transfer with light changes:
      Assert CLI-artifact reuse, credential scoping, and `fastly-version`
      threading.
 
-7. **Bash contract tests (`tests/run.sh`)**
+8. **Bash contract tests (`tests/run.sh`)**
    - Cover engine + wrappers: adapter/boolean/JSON validation, path confinement,
      symlink escape, dirty source, toolchain precedence, cache keys, credential
      scoping, deploy-arg allowlist, build/deploy argv, cleanup, log redaction,
@@ -189,7 +214,7 @@ reference to port from. Most transfer with light changes:
      output parsing, healthcheck/rollback argv, staging vs production paths).
    - No Python; no live provider credentials.
 
-8. **Companion CLI scaffolding (`crates/edgezero-cli`, `edgezero-adapter-fastly`)**
+9. **Companion CLI scaffolding (`crates/edgezero-cli`, `edgezero-adapter-fastly`)**
    - Add `#[command(version)]` to the downstream CLI template
      (`crates/edgezero-cli/src/templates/cli/src/main.rs.hbs`) so generated app
      CLIs expose `--version`. Until adopted, `build-app-cli` reads the version from
@@ -202,13 +227,14 @@ reference to port from. Most transfer with light changes:
      previous / deactivate staged), and wire `Healthcheck` / `Rollback` arms into
      the downstream CLI template so app CLIs expose them.
 
-9. **Docs**
-   - Write `docs/guide/deploy-github-actions.md` around the three-layer model,
-     general EdgeZero-app-repo adoption, and the Fastly staging lifecycle.
-   - Document the app-provided CLI package build, artifact reuse, credential
-     scoping, adapter layering, staging trio, and non-goals.
+10. **Docs**
 
-10. **Validation**
+- Write `docs/guide/deploy-github-actions.md` around the three-layer model,
+  general EdgeZero-app-repo adoption, and the Fastly staging lifecycle.
+- Document the app-provided CLI package build, artifact reuse, credential
+  scoping, adapter layering, staging trio, and non-goals.
+
+11. **Validation**
     - Bash contract tests, `actionlint`, `shellcheck`, `zizmor`, checksum
       metadata, docs validation, composite smoke test.
     - Workspace Rust tests, format, clippy, and feature checks.

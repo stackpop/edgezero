@@ -14,6 +14,7 @@
 .github/actions/deploy-fastly
 .github/actions/healthcheck-fastly
 .github/actions/rollback-fastly
+.github/actions/config-push-fastly
 ```
 
 ## 1. Executive summary
@@ -124,7 +125,8 @@ The **generic** engine (`deploy-core`) will not:
 2. choose an application ref;
 3. deploy more than one adapter per `deploy-*` invocation;
 4. provision provider resources or push runtime config as a side effect of
-   deploy (these remain explicit CLI subcommands the caller may run separately);
+   deploy — config push is its own action (`config-push-fastly`, §5.5), and
+   provision remains an explicit CLI subcommand the caller may run separately;
 5. implement provider staging, health checks, rollback, or deployment-version
    parsing **in the provider-neutral engine** — these are provider-specific and
    live in the Fastly staging lifecycle actions (§5.4), driven by the app CLI;
@@ -255,6 +257,13 @@ The engine contains no provider-specific credential names, service concepts,
 endpoints, or CLI flags — those, and the list of aliases to clear
 (`provider-env-clear`), all arrive from the wrapper. It invokes the application's
 CLI binary (`<app-cli-bin>`), not a hard-coded `edgezero`.
+
+The engine runs one of three modes: `build`, `deploy`, and `config-push` (§5.5).
+`config-push` reuses the same credential boundary as `deploy` — the token is
+delivered through `provider-env`, and the private `EDGEZERO__*` namespace is
+scrubbed before the CLI runs — but invokes the app CLI's `config push` subcommand
+(with the wrapper's typed `store`, `key`, and `--staging` flags) instead of
+`deploy`.
 
 ### 5.3 Layer 3 — adapter wrappers (`deploy-fastly`, …)
 
@@ -409,6 +418,61 @@ A caller wires the trio; the actions carry no orchestration policy of their own:
 
 Because these are Fastly-specific, future adapters do not inherit them; a new
 adapter adds its own lifecycle actions if its provider supports staging.
+
+### 5.5 Config push (`config-push-fastly`)
+
+Deploy activates code; it never writes runtime config (§4). Pushing the typed
+app config to the provider's config store is a **separate** action,
+`config-push-fastly`, so a caller decides when config moves and can push it
+independently of a code deploy.
+
+It follows the deploy pattern exactly: it consumes the prebuilt `build-app-cli`
+artifact, takes typed provider credentials, and drives the **app's own CLI**
+(`<app-cli> config push --adapter fastly`). The engine adds a `config-push` mode
+alongside `build`/`deploy` (§5.2); the credential boundary (§10) is identical —
+the token reaches only this step, and the private namespace is scrubbed before
+the CLI runs.
+
+#### 5.5.1 Staging model — same store, different key
+
+Fastly config stores are **not versioned** like the draft service versions the
+deploy-staging path clones, so "push config to staging" cannot mean a draft. It
+means the **same config store, a different key**:
+
+- **Production** writes the config blob under the resolved key (the logical store
+  id, or an explicit `--key`).
+- **Staging** writes under the staging variant of that key — `<key>_staging` —
+  in the **same** store.
+
+This mirrors the runtime-override store the Fastly adapter already scaffolds
+(`provision` emits a store whose `EDGEZERO__STORES__CONFIG__APP_CONFIG__KEY`
+entry selects `app_config` vs `app_config_staging`). The service reads whichever
+key that override selects, so pushing staging config never touches the key the
+production service is reading. The CLI gains a `config push --staging` flag (the
+same `--staging` verb `deploy`/`healthcheck`/`rollback` already use); the wrapper
+exposes it as `deploy-to: production | staging`, validated exactly and
+fail-closed like the lifecycle actions.
+
+#### 5.5.2 Inputs / outputs
+
+| Input               | Required | Default       | Meaning                                                         |
+| ------------------- | -------- | ------------- | --------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —             | The `build-app-cli` artifact to run.                            |
+| `fastly-api-token`  | Yes      | —             | Injected only into the push step.                               |
+| `working-directory` | No       | `.`           | App directory (holds the manifest + typed config).              |
+| `app-cli-bin`       | No       | from artifact | Binary name inside the artifact.                                |
+| `manifest`          | No       | empty         | `edgezero.toml` path relative to `working-directory`.           |
+| `app-config`        | No       | empty         | Typed config file path (default: resolved from the manifest).   |
+| `store`             | No       | empty         | Logical config-store id (default: the manifest's resolved id).  |
+| `key`               | No       | empty         | Explicit base key (default: the logical store id).              |
+| `deploy-to`         | No       | `production`  | `staging` writes the `<key>_staging` variant in the same store. |
+
+Outputs: `pushed-key` (the key that was written — the base key, or its
+`_staging` variant), `store` (the resolved logical store id).
+
+A staged deploy plus a staged config push and a healthcheck compose the same way
+the lifecycle trio does (§5.4.4): push staging config, deploy the staged version,
+probe it, roll back on failure.
 
 ## 6. Execution flow (engine)
 
