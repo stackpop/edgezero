@@ -18,7 +18,10 @@
 //! env-overlay unless `--no-env` is passed, so the validation sees
 //! the values the runtime would.
 
-use crate::args::{ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat};
+use crate::args::{
+    ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat,
+    parse_duration_secs,
+};
 use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
 use edgezero_adapter::registry::{
@@ -36,6 +39,7 @@ use serde::de::DeserializeOwned;
 use similar::TextDiff;
 use std::collections::BTreeMap;
 use std::io::{Error as IoError, IsTerminal as _, Write, stdin};
+use std::iter;
 use std::path::{Path, PathBuf};
 use toml::Value;
 use toml::value::Table;
@@ -270,6 +274,90 @@ pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
          AppConfig<C>. See docs/superpowers/specs/2026-06-16-blob-app-config.md \u{00a7}3.2.1."
             .to_owned(),
     )
+}
+
+/// `config gc` — reclaim chunk entries no live config pointer references.
+///
+/// Runs in-band in the bundled binary: unlike `push` / `diff` it needs no typed
+/// app-config, only the store's own contents.
+///
+/// SAFE BY DEFAULT: without `--yes` this is a dry-run. The adapter fails closed
+/// — if it cannot classify the store's state with confidence it deletes nothing.
+///
+/// # Errors
+///
+/// Returns `Err` if the manifest/adapter cannot be resolved, `--older-than` is
+/// unparseable, or the adapter refuses to reclaim (unreadable/unclassifiable
+/// state).
+#[inline]
+pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
+    let older_than_secs = parse_duration_secs(&args.older_than)?;
+
+    // Manifest-only resolution. Unlike `push`/`diff`, `gc` reclaims by
+    // inspecting the STORE, so it must NOT require the typed app-config file to
+    // exist — resolve the adapter + store straight from `edgezero.toml`.
+    let manifest_loader = ManifestLoader::from_path(&args.manifest)
+        .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
+    let manifest = manifest_loader.manifest();
+    ensure_adapter_defined(&args.adapter, Some(&manifest_loader))?;
+    let adapter = adapter_registry::get_adapter(&args.adapter).ok_or_else(|| {
+        format!(
+            "adapter `{}` is declared in {} but not registered in this build (rebuild the CLI with its feature enabled)",
+            args.adapter,
+            args.manifest.display()
+        )
+    })?;
+    let (_canonical, adapter_cfg) = manifest.adapter_entry(adapter.name()).ok_or_else(|| {
+        format!(
+            "adapter `{}` has no `[adapters.{}]` block",
+            args.adapter, args.adapter
+        )
+    })?;
+
+    let logical = resolve_config_store_id(args.store.as_deref(), manifest)?;
+    // `--no-env` means: do not overlay `EDGEZERO__*`. An empty config yields the
+    // logical id as the platform name (`store_name`'s fallback).
+    let env_config = if args.no_env {
+        EnvConfig::from_vars(iter::empty::<(String, String)>())
+    } else {
+        EnvConfig::from_env()
+    };
+    let platform = env_config.store_name("config", &logical);
+    let store = ResolvedStoreId::new(logical, platform);
+
+    let manifest_root = args
+        .manifest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
+    let component_selector = adapter_cfg.adapter.component.clone();
+    let mut push_ctx = adapter_registry::AdapterPushContext::new();
+    if let Some(deploy_cmd) = adapter_cfg.commands.deploy.as_deref() {
+        push_ctx = push_ctx.with_manifest_adapter_deploy_cmd(deploy_cmd);
+    }
+
+    // A run without --yes is a dry-run: report, delete nothing.
+    let dry_run = !args.yes;
+    let lines = adapter.gc_config_entries(
+        manifest_root,
+        adapter_manifest_path.as_deref(),
+        component_selector.as_deref(),
+        &store,
+        &push_ctx,
+        older_than_secs,
+        dry_run,
+    )?;
+    for line in lines {
+        log::info!("[edgezero] {line}");
+    }
+    if dry_run {
+        log::info!(
+            "[edgezero] dry-run (no --yes): nothing was deleted. `--older-than {}` asserts that nothing created before then is still being served.",
+            args.older_than
+        );
+    }
+    Ok(())
 }
 
 /// Typed flow — push the user's `C` struct. Runs strict pre-flight

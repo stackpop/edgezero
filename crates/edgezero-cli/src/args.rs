@@ -56,6 +56,19 @@ pub enum ConfigCmd {
     /// (Bundled `edgezero` stub — see after-help for the typed CLI.)
     #[command(after_help = STUB_POINTER_AFTER_HELP)]
     Diff(ConfigCmdStubArgs),
+    /// Reclaim chunk entries in the adapter's config store that no live
+    /// config pointer references.
+    ///
+    /// Deliberately NOT part of `config push`. On an eventually-consistent
+    /// store a chunk may only be deleted once the pointer that referenced it
+    /// has stopped being served everywhere — and the platform may record no
+    /// such timestamp (Fastly does not). Only YOU know your deploy history,
+    /// so `--older-than` is your assertion: "nothing created before this is
+    /// still being served".
+    ///
+    /// SAFE BY DEFAULT: without `--yes` this only reports what it would
+    /// delete. Nothing is removed until you pass `--yes`.
+    Gc(ConfigGcArgs),
     /// Push the typed `<name>.toml` as a single blob envelope to the
     /// adapter's config store. The blob carries every field verbatim
     /// (per spec 3.3 Model A — `#[secret]` fields store the key NAME,
@@ -77,6 +90,50 @@ pub struct ConfigCmdStubArgs {
     /// Hidden catch-all sink (see spec 3.2.2).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
     pub trailing: Vec<String>,
+}
+
+/// Arguments for `config gc`.
+///
+/// Unlike `push` / `diff`, `gc` needs no typed app-config: it reclaims
+/// unreferenced chunk entries by inspecting the store, so it runs in-band in
+/// the bundled `edgezero` binary.
+#[derive(clap::Args, Debug)]
+#[non_exhaustive]
+pub struct ConfigGcArgs {
+    /// Adapter whose config store to reclaim (e.g. `fastly`).
+    #[arg(long)]
+    pub adapter: String,
+    /// Path to `edgezero.toml`.
+    #[arg(long, default_value = "edgezero.toml")]
+    pub manifest: PathBuf,
+    /// Do not overlay `EDGEZERO__*` environment variables.
+    #[arg(long)]
+    pub no_env: bool,
+    /// Only reclaim entries older than this. YOUR SAFETY ASSERTION: nothing
+    /// created before this is still being served. Accepts `s`/`m`/`h`/`d`
+    /// suffixes (e.g. `7d`, `24h`, `90m`); a bare number means seconds.
+    #[arg(long, default_value = "7d")]
+    pub older_than: String,
+    /// Override the config-store id (defaults to the manifest's).
+    #[arg(long)]
+    pub store: Option<String>,
+    /// Actually delete. Without this, `gc` only reports what it WOULD delete.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+impl Default for ConfigGcArgs {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            adapter: String::new(),
+            manifest: PathBuf::from("edgezero.toml"),
+            no_env: false,
+            older_than: "7d".to_owned(),
+            store: None,
+            yes: false,
+        }
+    }
 }
 
 /// Arguments for the `auth` command.
@@ -415,6 +472,44 @@ impl Default for ConfigValidateArgs {
 /// impls above.
 fn default_manifest_path() -> PathBuf {
     PathBuf::from("edgezero.toml")
+}
+
+/// Parse a human duration (`7d`, `24h`, `90m`, `30s`, or bare seconds) into
+/// seconds.
+///
+/// # Errors
+///
+/// Returns `Err` when the value is empty, non-numeric, or carries an unknown
+/// suffix — a destructive command must never guess at its safety threshold.
+#[must_use = "the parsed threshold gates a destructive command"]
+#[inline]
+pub fn parse_duration_secs(raw: &str) -> Result<u64, String> {
+    let trimmed = raw.trim();
+    let unknown = || {
+        format!(
+            "could not parse `--older-than {raw}`; expected e.g. `7d`, `24h`, `90m`, `30s`, or a number of seconds"
+        )
+    };
+    let (digits, multiplier) = match trimmed.strip_suffix('s') {
+        Some(rest) => (rest, 1_u64),
+        None => match trimmed.strip_suffix('m') {
+            Some(rest) => (rest, 60_u64),
+            None => match trimmed.strip_suffix('h') {
+                Some(rest) => (rest, 3_600_u64),
+                None => match trimmed.strip_suffix('d') {
+                    Some(rest) => (rest, 86_400_u64),
+                    None => (trimmed, 1_u64),
+                },
+            },
+        },
+    };
+    if digits.is_empty() {
+        return Err(unknown());
+    }
+    let value: u64 = digits.parse().map_err(|_err| unknown())?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("`--older-than {raw}` overflows"))
 }
 
 #[cfg(test)]
@@ -843,5 +938,24 @@ mod tests {
             !help.contains("[TRAILING]"),
             "`[TRAILING]` placeholder leaked into push help: {help}"
         );
+    }
+    #[test]
+    fn parse_duration_secs_accepts_suffixes_and_bare_seconds() {
+        assert_eq!(parse_duration_secs("30s").unwrap(), 30);
+        assert_eq!(parse_duration_secs("90m").unwrap(), 5_400);
+        assert_eq!(parse_duration_secs("24h").unwrap(), 86_400);
+        assert_eq!(parse_duration_secs("7d").unwrap(), 604_800);
+        assert_eq!(parse_duration_secs("3600").unwrap(), 3_600);
+        assert_eq!(parse_duration_secs("  7d  ").unwrap(), 604_800);
+    }
+
+    /// A destructive command must never guess at its safety threshold.
+    #[test]
+    fn parse_duration_secs_rejects_garbage() {
+        parse_duration_secs("").unwrap_err();
+        parse_duration_secs("soon").unwrap_err();
+        parse_duration_secs("7w").unwrap_err();
+        parse_duration_secs("-1d").unwrap_err();
+        parse_duration_secs("d").unwrap_err();
     }
 }

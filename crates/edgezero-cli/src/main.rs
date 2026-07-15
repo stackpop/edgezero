@@ -25,6 +25,9 @@ fn main() {
             };
             process::exit(2);
         }
+        // `config gc` needs no typed app-config -- it reclaims unreferenced
+        // chunk entries by inspecting the store -- so it runs in-band here.
+        Command::Config(ConfigCmd::Gc(cmd_args)) => edgezero_cli::run_config_gc(&cmd_args),
         Command::Config(ConfigCmd::Validate(cmd_args)) => {
             edgezero_cli::run_config_validate(&cmd_args)
         }
