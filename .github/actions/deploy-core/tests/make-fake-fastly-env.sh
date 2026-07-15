@@ -20,7 +20,13 @@ set -euo pipefail
 # the real deploy-fastly wrapper rather than by calling the CLI directly.
 # The fake `curl` goes on PATH, which nothing reinstalls.
 #
-# Inputs (environment): GITHUB_WORKSPACE, GITHUB_PATH, GITHUB_ENV, RUNNER_TEMP.
+# The fake binaries write their call log to FAKE_CALL_LOG and read FORCE_UNHEALTHY.
+# These are deliberately OUTSIDE the EDGEZERO__ namespace: the app CLI scrubs
+# every EDGEZERO__* var before exec, and these must survive that scrub because
+# the fake fastly/curl are spawned BY the app CLI and read them there.
+#
+# Reads (env): GITHUB_WORKSPACE, GITHUB_PATH, GITHUB_ENV, RUNNER_TEMP.
+# Writes (env): FAKE_CALL_LOG (the call-log path).
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
@@ -30,7 +36,7 @@ write_fake_fastly() {
   local path="$1" version="$2"
   cat >"$path" <<SHIM
 #!/usr/bin/env bash
-printf 'fastly %s\n' "\$*" >>"\$EDGEZERO__TEST__FAKE_CALL_LOG"
+printf 'fastly %s\n' "\$*" >>"\$FAKE_CALL_LOG"
 case "\${1:-} \${2:-}" in
   "version ") echo "Fastly CLI version v$version (fake)" ;;
   "compute build") echo "Built package (fixture)" ;;
@@ -63,17 +69,17 @@ if [[ "$*" == *"--config"* ]]; then
   config=$(cat)
   url=$(printf '%s\n' "$config" | sed -nE 's/^url = "(.*)"$/\1/p')
   if printf '%s\n' "$config" | grep -q '^request = "PUT"$'; then
-    printf 'PUT %s\n' "$url" >>"$EDGEZERO__TEST__FAKE_CALL_LOG"
+    printf 'PUT %s\n' "$url" >>"$FAKE_CALL_LOG"
     echo 200
     exit 0
   fi
-  printf 'GET %s\n' "$url" >>"$EDGEZERO__TEST__FAKE_CALL_LOG"
+  printf 'GET %s\n' "$url" >>"$FAKE_CALL_LOG"
   # Fastly returns a SINGULAR `staging_ip` string per domain object.
   printf '[{"name":"staging.example.com","staging_ip":"151.101.2.10"}]\n'
   exit 0
 fi
-printf 'PROBE %s\n' "$*" >>"$EDGEZERO__TEST__FAKE_CALL_LOG"
-if [[ -n "${EDGEZERO__TEST__FORCE_UNHEALTHY:-}" ]]; then
+printf 'PROBE %s\n' "$*" >>"$FAKE_CALL_LOG"
+if [[ -n "${FORCE_UNHEALTHY:-}" ]]; then
   echo 503
 else
   echo 200
@@ -105,7 +111,7 @@ main() {
 
   printf '%s\n' "$path_dir" >>"${GITHUB_PATH:?GITHUB_PATH is required}"
   {
-    printf 'EDGEZERO__TEST__FAKE_CALL_LOG=%s\n' "$log"
+    printf 'FAKE_CALL_LOG=%s\n' "$log"
   } >>"${GITHUB_ENV:?GITHUB_ENV is required}"
 
   notice "fake fastly (v$pinned) installed in the tool root and on PATH; fake curl on PATH"

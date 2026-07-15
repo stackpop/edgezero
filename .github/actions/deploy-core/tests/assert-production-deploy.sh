@@ -8,7 +8,7 @@ set -euo pipefail
 # deploy, inherited aliases are CLEARED, and the action's own secret-bearing
 # helper variables do NOT survive into the CLI's environment.
 #
-# Inputs (environment): GITHUB_WORKSPACE, EDGEZERO__TEST__FASTLY_VERSION.
+# Reads (env): GITHUB_WORKSPACE, EDGEZERO__TEST__FASTLY_VERSION.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh

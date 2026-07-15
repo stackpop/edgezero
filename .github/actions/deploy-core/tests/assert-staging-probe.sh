@@ -9,14 +9,14 @@ set -euo pipefail
 # it as an array silently found no IP and probed PRODUCTION instead — a staging
 # check that was quietly testing the wrong thing.
 #
-# Inputs (environment): EDGEZERO__TEST__FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION.
+# Reads (env): FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
 source "$SCRIPT_DIR/../scripts/common.sh"
 
 main() {
-  local log="${EDGEZERO__TEST__FAKE_CALL_LOG:?EDGEZERO__TEST__FAKE_CALL_LOG is required}"
+  local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
   local staged="${EDGEZERO__TEST__STAGED_VERSION:?EDGEZERO__TEST__STAGED_VERSION is required}"
 
   grep -qE "^GET https://api\.fastly\.com/service/dummy-service/version/$staged/domain\?include=staging_ips\$" "$log" ||

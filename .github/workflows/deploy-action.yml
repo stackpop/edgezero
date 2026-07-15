@@ -229,7 +229,7 @@ jobs:
           retry-delay: "1"
         env:
           # Flips the fake probe to 503 for this step only.
-          EDGEZERO__TEST__FORCE_UNHEALTHY: "1"
+          FORCE_UNHEALTHY: "1"
 
       - name: Assert the unhealthy check failed the wrapper
         env:

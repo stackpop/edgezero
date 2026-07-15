@@ -8,14 +8,14 @@ set -euo pipefail
 #   * Staging rollback hit `/deactivate`, which deactivates the LIVE version.
 #     Undoing a stage is `/deactivate/staging`.
 #
-# Inputs (environment): EDGEZERO__TEST__FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION, EDGEZERO__TEST__ROLLED_BACK_TO.
+# Reads (env): FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION, EDGEZERO__TEST__ROLLED_BACK_TO.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
 source "$SCRIPT_DIR/../scripts/common.sh"
 
 main() {
-  local log="${EDGEZERO__TEST__FAKE_CALL_LOG:?EDGEZERO__TEST__FAKE_CALL_LOG is required}"
+  local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
   local staged="${EDGEZERO__TEST__STAGED_VERSION:?EDGEZERO__TEST__STAGED_VERSION is required}"
   local rolled_back_to="${EDGEZERO__TEST__ROLLED_BACK_TO:-}"
   local api='https://api\.fastly\.com/service/dummy-service'

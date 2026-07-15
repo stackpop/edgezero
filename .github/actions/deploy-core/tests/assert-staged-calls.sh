@@ -14,7 +14,7 @@ set -euo pipefail
 #     action-owned passthrough arg.
 #   * The staged upload must clone the active version.
 #
-# Inputs (environment): EDGEZERO__TEST__FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION.
+# Reads (env): FAKE_CALL_LOG, EDGEZERO__TEST__STAGED_VERSION.
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../scripts/common.sh
@@ -47,7 +47,7 @@ assert_comment_precedes_stage() {
 }
 
 main() {
-  local log="${EDGEZERO__TEST__FAKE_CALL_LOG:?EDGEZERO__TEST__FAKE_CALL_LOG is required}"
+  local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
   local staged_version="${EDGEZERO__TEST__STAGED_VERSION:-}"
 
   echo "--- recorded fastly/curl calls:"
