@@ -10,12 +10,12 @@ use edgezero_adapter::cli_support::{
     find_manifest_upwards, find_workspace_root, path_distance, read_package_name, run_native_cli,
 };
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry,
-    ResolvedStoreId,
+    Adapter, AdapterAction, AdapterPushContext, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 use walkdir::WalkDir;
 
@@ -65,15 +65,13 @@ static CLOUDFLARE_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_cloudflare",
         repo_crate: "crates/edgezero-adapter-cloudflare",
-        fallback:
-            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
+        fallback: "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_cloudflare_wasm",
         repo_crate: "crates/edgezero-adapter-cloudflare",
-        fallback:
-            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
+        fallback: "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
         features: &["cloudflare"],
     },
 ];
@@ -795,7 +793,7 @@ fn item_kind(item: &toml_edit::Item) -> &'static str {
 /// becomes an orphan in the Cloudflare account. `EdgeZero` does not
 /// take a lockfile; operators must serialise provision themselves.
 fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), String> {
-    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+    use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
     // Treat NotFound as "start with empty document" symmetrically with
     // `read_namespace_id` so the orphan-namespace hazard goes away: if
@@ -1138,7 +1136,8 @@ pub fn serve(extra_args: &[String]) -> Result<(), String> {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use std::ffi::OsString;
+    use edgezero_core::test_env::PathPrepend;
+
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::tempdir;
@@ -1154,41 +1153,6 @@ mod tests {
     const TEST_KV_ID_ALT: &str = "cache";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
-
-    /// RAII guard: prepends a directory to `$PATH` and restores the original
-    /// value on drop. Mirrors the `PathPrepend` used in `push_cloud.rs`.
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     // ---------- extract_namespace_id ----------
 
@@ -1819,8 +1783,7 @@ id = "00112233445566778899aabbccddeeff"
     #[test]
     fn push_dry_run_resolves_namespace_id_and_does_not_invoke_wrangler() {
         let dir = tempdir().expect("tempdir");
-        let original =
-            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"00112233445566778899aabbccddeeff\"\n";
+        let original = "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"00112233445566778899aabbccddeeff\"\n";
         let path = write_wrangler(dir.path(), original);
         let entries = vec![
             ("greeting".to_owned(), "hello".to_owned()),

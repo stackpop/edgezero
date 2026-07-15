@@ -220,7 +220,7 @@ mod tests {
     use edgezero_core::config_store::{ConfigStore, ConfigStoreError, ConfigStoreHandle};
     use edgezero_core::context::RequestContext;
     use edgezero_core::error::EdgeError;
-    use edgezero_core::http::{response_builder, StatusCode};
+    use edgezero_core::http::{StatusCode, response_builder};
     use edgezero_core::key_value_store::KvStore;
     use std::sync::Arc;
     use tower::ServiceExt as _;

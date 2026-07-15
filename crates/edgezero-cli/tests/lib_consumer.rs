@@ -13,7 +13,7 @@
 mod tests {
     use edgezero_cli::args::BuildArgs;
     use edgezero_cli::run_build;
-    use std::env;
+    use edgezero_core::test_env::EnvOverride;
     use std::fs;
     use tempfile::TempDir;
 
@@ -28,35 +28,13 @@ deploy = "echo deploy"
 serve = "echo serve"
 "#;
 
-    /// RAII guard that restores `EDGEZERO_MANIFEST` to its prior value on drop.
-    struct EnvOverride {
-        original: Option<String>,
-    }
-
-    impl Drop for EnvOverride {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => env::set_var("EDGEZERO_MANIFEST", value),
-                None => env::remove_var("EDGEZERO_MANIFEST"),
-            }
-        }
-    }
-
-    impl EnvOverride {
-        fn set(value: &str) -> Self {
-            let original = env::var("EDGEZERO_MANIFEST").ok();
-            env::set_var("EDGEZERO_MANIFEST", value);
-            Self { original }
-        }
-    }
-
     #[cfg(not(windows))]
     #[test]
     fn external_consumer_can_call_run_build() {
         let temp = TempDir::new().expect("temp dir");
         let manifest_path = temp.path().join("edgezero.toml");
         fs::write(&manifest_path, BASIC_MANIFEST).expect("write manifest");
-        let _env = EnvOverride::set(&manifest_path.to_string_lossy());
+        let _env = EnvOverride::set("EDGEZERO_MANIFEST", &*manifest_path.to_string_lossy());
 
         // Construct via `Default` + field mutation — the path that works for
         // an external crate even though `BuildArgs` is `#[non_exhaustive]`.

@@ -1,9 +1,11 @@
 [package]
 name = "edgezero-adapter-spin"
-edition = { workspace = true }
-version = { workspace = true }
+description = "Fermyon Spin adapter for EdgeZero"
 authors = { workspace = true }
+edition = { workspace = true }
 license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
 
 [lints]
 workspace = true

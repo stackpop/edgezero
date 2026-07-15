@@ -31,14 +31,14 @@ use edgezero_core::app_config::{
 use edgezero_core::blob_envelope::BlobEnvelope;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader, StoreDeclaration};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use similar::TextDiff;
 use std::collections::BTreeMap;
-use std::io::{stdin, Error as IoError, IsTerminal as _, Write};
+use std::io::{Error as IoError, IsTerminal as _, Write, stdin};
 use std::path::{Path, PathBuf};
-use toml::value::Table;
 use toml::Value;
+use toml::value::Table;
 use validator::Validate;
 
 /// Pre-loaded state for either push flow. Shares
@@ -1292,12 +1292,11 @@ pub(crate) fn reject_merged_id_collisions(
             let platform = env_config.store_name(kind, id);
             if let Some((prior_kind, prior_id)) =
                 seen_platform.insert(platform.clone(), (kind, id.clone()))
+                && (prior_kind != *kind || prior_id != *id)
             {
-                if prior_kind != *kind || prior_id != *id {
-                    return Err(format!(
-                        "stores `[stores.{prior_kind}].{prior_id}` and `[stores.{kind}].{id}` both resolve to platform label `{platform}` (via the `EDGEZERO__STORES__<KIND>__<ID>__NAME` overlay or matching logical-id default), but adapter `{adapter_name}` backs those kinds with the same runtime store. Renaming one of the env overrides (or removing them so the logical ids stay distinct) fixes this -- both writes currently land on the same `key_value_stores` label.",
-                    ));
-                }
+                return Err(format!(
+                    "stores `[stores.{prior_kind}].{prior_id}` and `[stores.{kind}].{id}` both resolve to platform label `{platform}` (via the `EDGEZERO__STORES__<KIND>__<ID>__NAME` overlay or matching logical-id default), but adapter `{adapter_name}` backs those kinds with the same runtime store. Renaming one of the env overrides (or removing them so the logical ids stay distinct) fixes this -- both writes currently land on the same `key_value_stores` label.",
+                ));
             }
         }
     }
@@ -1630,11 +1629,12 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 )]
 mod tests {
     use super::*;
-    use crate::test_support::{manifest_guard, EnvOverride};
+    use crate::test_support::{EnvOverride, manifest_guard};
+    #[cfg(unix)]
+    use edgezero_core::test_env::PathPrepend;
     use serde::{Deserialize, Serialize};
     use std::borrow::Cow;
-    #[cfg(unix)]
-    use std::ffi::OsString;
+
     use std::fs;
     #[cfg(unix)]
     use std::sync::Mutex;
@@ -3318,44 +3318,6 @@ ids = ["default"]
     // the Fermyon Cloud detection path inside `read_config_entry`.
 
     // --- PATH-mutation helpers (mirrors Cloudflare adapter test pattern) ---
-
-    /// RAII guard: prepends `extra` to `$PATH` and restores the original
-    /// value on drop. Serialise with [`path_mutation_guard`] so parallel
-    /// tests don't race on PATH.
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            use std::env;
-            let original = env::var_os("PATH");
-            let new_path = match &original {
-                Some(prev) => {
-                    let mut acc = OsString::from(extra);
-                    acc.push(":");
-                    acc.push(prev);
-                    acc
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new_path);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            use std::env;
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     /// Process-wide mutex serialising PATH-mutating tests so parallel
     /// test threads don't race on the `$PATH` environment variable.

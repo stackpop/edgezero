@@ -48,8 +48,8 @@ pub mod args;
 pub use auth::run_auth;
 #[cfg(feature = "cli")]
 pub use config::{
-    run_config_diff_typed, run_config_push, run_config_push_typed, run_config_validate,
-    run_config_validate_typed, DiffExit,
+    DiffExit, run_config_diff_typed, run_config_push, run_config_push_typed, run_config_validate,
+    run_config_validate_typed,
 };
 #[cfg(feature = "cli")]
 pub use provision::run_provision;
@@ -187,12 +187,11 @@ pub fn run_deploy(args: &DeployArgs) -> Result<(), String> {
     // command already runs in the manifest root and picks its own
     // project directory. (Staged deploys are never manifest-declared
     // commands, so they always get the flag.)
-    if !adapter::has_manifest_command(manifest.as_ref(), &args.adapter, action) {
-        if let Some(manifest_path) = resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)
-        {
-            passthrough.push("--manifest-path".to_owned());
-            passthrough.push(manifest_path);
-        }
+    if !adapter::has_manifest_command(manifest.as_ref(), &args.adapter, action)
+        && let Some(manifest_path) = resolve_adapter_manifest_path(manifest.as_ref(), &args.adapter)
+    {
+        passthrough.push("--manifest-path".to_owned());
+        passthrough.push(manifest_path);
     }
     if let Some(service_id) = &args.service_id {
         passthrough.push("--service-id".to_owned());
@@ -475,9 +474,15 @@ fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Opti
     // metadata from secret material), and adapters/operators can read the
     // binding name from their own `edgezero.toml` if they need to verify it.
     let message = match adapter_name {
-        "axum" => "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs",
-        "cloudflare" => "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler",
-        _ => "[edgezero] secrets enabled -- ensure the configured secret store is provisioned on the target platform",
+        "axum" => {
+            "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs"
+        }
+        "cloudflare" => {
+            "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler"
+        }
+        _ => {
+            "[edgezero] secrets enabled -- ensure the configured secret store is provisioned on the target platform"
+        }
     };
 
     Some(message.to_owned())
@@ -538,7 +543,7 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 #[cfg(feature = "cli")]
 mod tests {
     use super::*;
-    use crate::test_support::{manifest_guard, EnvOverride, BASIC_MANIFEST};
+    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use edgezero_core::manifest::ManifestLoader;
     use std::fs;
     use tempfile::TempDir;

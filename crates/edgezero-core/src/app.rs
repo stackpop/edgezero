@@ -156,7 +156,7 @@ mod tests {
     use crate::body::Body;
     use crate::context::RequestContext;
     use crate::error::EdgeError;
-    use crate::http::{request_builder, Method, StatusCode};
+    use crate::http::{Method, StatusCode, request_builder};
     use futures::executor::block_on;
     use tower_service::Service as _;
 
