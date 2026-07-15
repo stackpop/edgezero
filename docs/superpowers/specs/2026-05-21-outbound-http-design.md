@@ -4,7 +4,7 @@
 > **Branch:** `docs/outbound-http-spec` · **Audience:** EdgeZero maintainers
 > **Driving pattern:** fan-out HTTP workloads — N concurrent outbound requests under a shared wall-clock deadline, results harvested in input order. The spec is written against this pattern as a portable substrate; it deliberately does not name a specific consumer.
 > **Target codebase baseline:** [`stackpop/edgezero` PR #269](https://github.com/stackpop/edgezero/pull/269) (`feature/extensible-cli`, rev `b4c80e9`) — **now merged into `main`** (squash-merged as `e483723`). The current tree has *since* gained further work the spec has not fully reconciled: typed config-push (`run_config_push_typed`), pluggable introspection routes, and expanded CI. PR #269 introduces the multi-store manifest (`ManifestStores { config, kv, secrets }`), the `edgezero_cli::adapter::execute(..)` shell-or-registry dispatcher, the expanded `AdapterAction` (`AuthLogin` / `AuthLogout` / `AuthStatus` / `Build` / `Deploy` / `Serve`), separate `Adapter::provision(..)` and config-validation hooks, Spin SDK 6 / wasip2, the contributor-only `demo` command replacing `dev`, and the new `examples/app-demo/crates/app-demo-cli` integration crate.
-> **Current checkout (post-#269):** the CLI surface is now the #269 shape — `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`, `AdapterAction::{AuthLogin/Logout/Status, Build, Deploy, Serve}`, and the `edgezero_cli::adapter::execute(..)` dispatcher; `dev` is gone. **Known gap (see the implementation plan's decisions register):** the §3.5.3 / §5.4 / §7 CLI gate rows still name `run_config_push` / `run_config_validate` as the gate sites, but in the merged tree `run_config_push` is a stub that errors (real writes go through `run_config_push_typed`), `ConfigValidateArgs` has no `adapter` field, and the adapter-selecting `run_config_diff_typed` is un-gated. Those rows must be re-pointed at the typed entry points before implementation (locked resolution: gate the typed paths, evaluate `config validate` against all configured adapters, add a `config diff` sibling gate). Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of the CLI surface and lands either way.
+> **Current checkout (post-#269):** the CLI surface is now the #269 shape — `Command::{Build, Serve, Deploy, Auth, Provision, Config, Demo, New}`, `AdapterAction::{AuthLogin/Logout/Status, Build, Deploy, Serve}`, and the `edgezero_cli::adapter::execute(..)` dispatcher; `dev` is gone. **Known gap (see the implementation plan's decisions register):** the §3.5.3 / §5.4 / §7 CLI gate rows still name `run_config_push` / `run_config_validate` as the gate sites, but in the merged tree `run_config_push` is a stub that errors (real writes go through `run_config_push_typed`), `ConfigValidateArgs` has no `adapter` field, and the adapter-selecting `run_config_diff_typed` is un-gated. Those rows must be re-pointed at the typed entry points before implementation (locked resolution: gate the typed paths by command CLASS — `config diff` and `auth *` are **exempt** — and evaluate `config validate` against all configured adapters). Spec §1 / §3.1 / §3.2 / §3.3 / §3.4 / §4 (the outbound HTTP design itself) is independent of the CLI surface and lands either way.
 > **Where rebase claims live (authoritative surfaces):** §3.5.3 build-enforcement, §3.5.2 `Adapter` trait shape (showing both the pre-#269 and PR-#269 forms), §5.4 capability test rows mentioning `demo` / `auth` / `provision` / `config push|validate`, and the §7 `edgezero-cli` migration bullet. Earlier appendices that quote `handle_build` / `handle_serve` / `handle_deploy` / `handle_dev` / `edgezero dev` are the round-1–43 historical resolution journal and remain accurate against the current checkout. **Appendix AR is the round-44 rebase snapshot and is now superseded by Appendices AS / AT / AU / AV / AW / AX / AY / AZ** (rounds 44–51): AR still describes the gate as "a single `Adapter::execute` dispatch point" — that wording was corrected to "four pre-dispatch gates" in AS, then to "five gate sites" in AU. Treat AR as round-44 history; the §3.5.3 + §7 active text is authoritative.
 
 ## 1. Overview
@@ -1612,7 +1612,30 @@ Decompression-cap responsibility per adapter:
   incrementally while the adapter drains the response. The Cargo.toml change is part of
   the file-by-file summary (§7).
 
-Whenever an adapter decompresses, the `OutboundResponse.headers` it returns MUST have
+**Portable `content-encoding` policy (identical on all four adapters).** CF and Fastly
+already diverge here today, so the rule is stated normatively rather than left to each
+adapter:
+
+| `content-encoding` value | Action |
+| --- | --- |
+| absent, or `identity` | **Passthrough** — no decode; body delivered as-is. `identity` is treated exactly as absent. |
+| a single `gzip` | **Decode** one gzip layer; strip `content-encoding` + `content-length`. |
+| a single `br` | **Decode** one brotli layer; strip `content-encoding` + `content-length`. |
+| anything else — an **unknown** token (`zstd`, `deflate`, `compress`, …) **or a stacked list** (`gzip, br`, `br, gzip`, …) | **Passthrough, untouched** — do **not** attempt to decode; deliver the raw bytes **and leave `content-encoding` / `content-length` intact** so the app can decode itself. Never a hard failure. |
+
+- **Matching is case-insensitive** on the token (`GZIP` == `gzip`) and tolerant of
+  optional whitespace / a single trailing `;q=` weight, per RFC 9110 — but only the two
+  known single-layer forms decode; everything else passes through.
+- **A repeated `content-encoding` field** (two header lines) is treated as the stacked
+  case → passthrough untouched.
+- Passthrough here means the byte cap (`max_response_bytes` / decompressed-count) is
+  applied to the **raw** bytes, since no decode happens.
+- Rationale: decoding stacked/unknown encodings is unbounded surface for little value on
+  edge fan-out; failing them hard (`502`) would break apps that can decode a `zstd` body
+  themselves. Passthrough is deterministic and never worse than "the app got the bytes."
+
+Whenever an adapter **does** decompress (the two known single-layer cases above), the
+`OutboundResponse.headers` it returns MUST have
 both `content-encoding` and `content-length` removed — the original values describe
 compressed wire bytes and no longer match the app-visible body. This applies in both
 `Buffered` and `Streamed` modes: callers must never see decoded bytes alongside stale
@@ -2246,7 +2269,8 @@ owned by PR #269 and shown above purely so readers don't misread the `Adapter`
 reference in §3.5.3 as an exhaustive declaration. The `Adapter::provision(..)` and
 config-validation hooks referenced in §3.5.3 / §6 / §7 are called from the **sibling
 pre-dispatch gates** on `run_provision` / `run_config_push_typed` /
-`run_config_diff_typed` / `run_config_validate`, not from `Adapter::execute`. (The pre-#269 checkout had no `provision` / `config`
+`run_config_validate`, not from `Adapter::execute` (`run_config_diff_typed` is
+**exempt** — read-only diagnostic, §3.5.3 command-class gating). (The pre-#269 checkout had no `provision` / `config`
 surface; that fallback is now historical — appendix rounds 1–43 reflect it.)
 
 Capability matrix (all four adapters):
@@ -2431,11 +2455,25 @@ not fire for shell-overridden adapters, and a gate placed *inside* a single
 hooks. So the gate sits one level up — at the top of every PR-#269 `run_*`
 entry point that selects an adapter.
 
-There are **six concrete gate sites**, listed below. Earlier drafts of this section
-called the set "one + two siblings", "four gates", and "five gates"; the controlling
-count is **six** — one inside `execute(..)`, plus **five siblings** on the entry points
-that don't flow through `execute(..)`: `run_provision`, `run_config_push_typed`,
-`run_config_diff_typed`, `run_config_validate`, and `run_demo`.
+**Gating is by command CLASS, not "every adapter-selecting command".** Hard-failing on a
+capability mismatch is correct only where the mismatch means the *outcome* is broken; it
+is wrong where it would block an unrelated operation. The classes:
+
+| Class | Commands | Gated? | Why |
+| --- | --- | --- | --- |
+| Runtime-producing / mutating | `build`, `serve`, `deploy`, `provision`, `config push` | **YES** | These stand up or mutate a runtime that a capability mismatch would make silently broken — fail early. |
+| Validation | `config validate` | **YES** | Catching exactly this mismatch is its purpose. |
+| Read-only diagnostic | `config diff`, `auth status` | **NO — exempt** | Read-only. Blocking a diff or a status read on a *runtime* capability mismatch prevents the diagnosis you need to fix it. |
+| Credential | `auth login`, `auth logout` | **NO — exempt** | Credential lifecycle is orthogonal to runtime capabilities; a mismatch must never block credential cleanup. |
+
+This **reverses an earlier draft that gated `config diff`** — a read-only command must not
+hard-fail on an unrelated runtime mismatch.
+
+So there are **five concrete gate sites** — one inside `execute(..)` **but only for the
+runtime-producing actions** it dispatches (`build` / `serve` / `deploy`; **not** `auth`),
+plus **four siblings** on `run_provision`, `run_config_push_typed`, `run_config_validate`,
+and `run_demo`. `config diff` and all `auth` sub-actions are **exempt** (the `execute(..)`
+gate must therefore branch on the action, not gate unconditionally).
 
 > **Note — gate the *typed* entry points, and note validation has TWO public entries.**
 > In the merged tree the bundled `run_config_push` is a **v1 stub that errors**; real
@@ -2516,18 +2554,18 @@ adapter stub). An app that declares any capability requires a registered adapter
 can answer the `capability(Capability) -> CapabilitySupport` question; there is no
 silent bypass.
 
-Commands covered by the six gate sites above (one inside `execute(..)`, five siblings):
+Commands covered by the **five** gate sites above (one inside `execute(..)` — branching to skip `auth` — and four siblings on `run_provision` / `run_config_push_typed` / `run_config_validate` / `run_demo`). `config diff` and `auth *` are **exempt** (read-only / credential classes):
 
 | PR-#269 command | Entry point | Gate site |
 | --- | --- | --- |
-| `edgezero build` | `run_build` → `execute(Action::Build, ..)` | `execute(..)` |
-| `edgezero serve` | `run_serve` → `execute(Action::Serve, ..)` | `execute(..)` |
-| `edgezero deploy` | `run_deploy` → `execute(Action::Deploy, ..)` | `execute(..)` |
-| `edgezero auth login` / `logout` / `status` | `run_auth` → `execute(Action::AuthLogin/Logout/Status, ..)` | `execute(..)` |
-| `edgezero provision` | `run_provision` → `Adapter::provision(..)` | `run_provision(..)` sibling |
-| `edgezero config push` | real writeback is **`run_config_push_typed`** in the downstream typed CLI (the bundled `run_config_push` is a v1 stub that errors) | `run_config_push_typed(..)` sibling |
-| `edgezero config diff` | `run_config_diff_typed` → resolves an adapter via `run_shared_checks` | `run_config_diff_typed(..)` sibling (locked: `config diff` is gated) |
-| `edgezero config validate` | `run_config_validate` — **adapter-less** (`ConfigValidateArgs` has no `adapter` field); validates the manifest against **all configured adapters** in `[adapters]` (locked resolution) | `run_config_validate(..)` sibling, looping every configured adapter |
+| `edgezero build` | `run_build` → `execute(Action::Build, ..)` | `execute(..)` — **gated** |
+| `edgezero serve` | `run_serve` → `execute(Action::Serve, ..)` | `execute(..)` — **gated** |
+| `edgezero deploy` | `run_deploy` → `execute(Action::Deploy, ..)` | `execute(..)` — **gated** |
+| `edgezero auth login` / `logout` / `status` | `run_auth` → `execute(Action::AuthLogin/Logout/Status, ..)` | **EXEMPT** (credential + read-only class). The `execute(..)` gate must **branch on the action** and skip the `Auth*` actions. |
+| `edgezero provision` | `run_provision` → `Adapter::provision(..)` | `run_provision(..)` sibling — **gated** |
+| `edgezero config push` | real writeback is **`run_config_push_typed`** in the downstream typed CLI (the bundled `run_config_push` is a v1 stub that errors) | `run_config_push_typed(..)` — **gated** (via the shared inner op, both entries) |
+| `edgezero config diff` | `run_config_diff_typed` → resolves an adapter via `run_shared_checks` | **EXEMPT** (read-only diagnostic class). Reverses the earlier "gate `config diff`" draft — a read-only diff must not hard-fail on a runtime mismatch. |
+| `edgezero config validate` | `run_config_validate` / `run_config_validate_typed` — **adapter-less** (`ConfigValidateArgs` has no `adapter` field); validates against **all configured adapters** in `[adapters]` | **gated** via the shared inner op (§ note above) that **both** the bundled and typed entries call, looping every configured adapter |
 | `edgezero demo` (feature `demo-example`) | `run_demo` → Axum runner. `run_demo()` takes **no path or loader** and reads no manifest file, so a file-based gate is impossible. **Locked resolution — gate on baked manifest metadata via a new `Hooks` accessor** (see below) | `run_demo()` calls `ensure_capabilities("axum", <App as Hooks>::manifest())` before the Axum runner starts |
 
 **The `demo` gate needs a baked-manifest accessor — `app!` must emit one.**
@@ -3733,9 +3771,16 @@ service — this distinction is explicit so a green capability check is not misr
 
 ## 5. Test plan
 
-CLAUDE.md forbids tests needing a network connection or platform credentials. "Network"
-means the public internet — a **locally spawned mock origin** is allowed and is how
-concurrency and timing are proven. Tests are tiered.
+CLAUDE.md forbids tests needing a network connection or platform credentials. That rule
+is **unqualified today**, so this spec's blocking Axum Tier 3 test (a loopback mock
+origin) would violate it as written. **Resolution (locked): amend CLAUDE.md** to qualify
+the rule — "network" means the **public internet**; a **loopback / `127.0.0.1` mock
+origin bound to an ephemeral port** is explicitly permitted (no external connectivity, no
+credentials). That amendment is a deliverable of this change (§7 *Project meta* / the
+CLAUDE.md refresh), not an assumption. A locally-spawned loopback mock origin is how real
+fan-out concurrency and wall-clock timing are proven — an in-process transport fake was
+considered and rejected because it cannot exercise real socket concurrency, which is the
+one thing Tier 3 exists to prove. Tests are tiered.
 
 **Tiers are defined by *owning crate and runtime*, not by abstraction level.** An earlier
 draft defined Tier 1 as "core-only" while §5.4 assigned CLI-gate, registry, `demo`, and
@@ -3868,7 +3913,8 @@ async fn send_all_runs_requests_concurrently() {
 | Multi-value response headers preserved (e.g. duplicate `set-cookie`) | yes | yes | yes |
 | Multi-value outbound request headers preserved on the wire | yes | yes | yes |
 | Inbound body: adapter exposes `Body::Stream`; `body_bytes(max)` drains and caches; second call returns clone without re-reading | yes | yes | — |
-| Required `BestEffort` capability → **every adapter-selecting CLI command** (`edgezero build`, `edgezero serve`, `edgezero deploy`, `edgezero auth login` / `logout` / `status`, `edgezero provision`, `edgezero config push` / `config diff` / `config validate`, `edgezero demo`) exits non-zero with a clear message — matches the §3.5.3 enforcement set: pre-dispatch gate inside `execute(..)` for `build`/`serve`/`deploy`/`auth`, plus **five** sibling gates at the top of `run_provision`, `run_config_push_typed`, `run_config_diff_typed`, `run_config_validate`, and `run_demo` (**six** gate sites total). `edgezero dev` is gone; `demo` is its contributor-only replacement | yes | — | — |
+| Required `BestEffort` capability → the **gated** command classes (`edgezero build`, `serve`, `deploy`, `provision`, `config push`, `config validate`, `demo`) each exit non-zero with a clear message — matches the §3.5.3 enforcement set: gate inside `execute(..)` for `build`/`serve`/`deploy` (branching to skip `auth`), plus four siblings on `run_provision`, `run_config_push_typed`, `run_config_validate`, and `run_demo` (**five** gate sites). `edgezero dev` is gone; `demo` is its contributor-only replacement | yes | — | — |
+| **Exempt command classes do NOT hard-fail** on a required-`BestEffort` mismatch (§3.5.3 command-class gating): the *same* manifest that fails the gated commands above leaves `edgezero config diff` (read-only diagnostic) and `edgezero auth login` / `logout` / `status` (credential) exiting **normally**. Regression guard against re-adding a blanket "every adapter-selecting command" gate — blocking a read-only diff or credential cleanup on an unrelated runtime mismatch is the bug this class split fixes | yes | — | — |
 | Axum response converter mapping for a wrapped streamed body: `Err(GatewayTimeout)` chunk during buffered drain → axum response **504**; `Err(BadGateway)` chunk → **502**; over-cap → **502**; `Ok` chunks under cap append normally. The buffering boundary lets Axum preserve the correct status code (no silent coalesce to 502) | — | yes | yes |
 | `OutboundRequest::into_parts` / `OutboundResponse::new` / `OutboundResponse::into_parts` round-trip every field (adapter API completeness) | yes | yes | — |
 | `body_bytes` cap exceeded → subsequent `body_bytes` / `json_within` / `form_within` calls return the same stored error (poison semantics); `into_request()` returns `Err(stored_err)` (per §3.4.5 round-18 / round-19 — **not** an empty body) | yes | yes | — |
@@ -3916,7 +3962,7 @@ async fn send_all_runs_requests_concurrently() {
 | `dispatch_budget(req)` table: every row of §3.3.2 holds (timeout-only, deadline-only, both, expired, zero-effective, no-deadline-no-timeout) | yes | — | — |
 | Fastly `send_all` with mixed budgets, **headers phase**: short-budget slot's *headers* result reflects its own budget (host enforces independently); but its wall-clock-observed *delivery* can be delayed behind an earlier `wait()` (harvest order). **Adapter-specific** — harvest order and per-slot host-timer behaviour belong to Tier 2 (Fastly contract crate) and Tier 3 (Viceroy) | — | yes | yes |
 | Fastly `send_all` Buffered mode, **body phase**: a slot whose own `budget.deadline` would have covered its body in isolation can still return `gateway_timeout` because an earlier slot's body drain monopolised harvest. The contract explicitly admits these harvest-order-induced 504s on Fastly Buffered. **Adapter-specific harvest mechanics** — Tier 1's mock has no harvest queue and cannot reproduce the head-of-line block; covered by Tier 2 (deterministic harvest ordering against a host-side fake) and Tier 3 (Viceroy wall-clock) | — | yes | yes |
-| `[capabilities] required = ["send-all-slot-isolation"]` on a Fastly target → **every adapter-selecting CLI command** (`build` / `serve` / `deploy` / `auth` / `provision` / `config push` / `config diff` / `config validate` / `demo`) exits non-zero with the BestEffort + required hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)`, five siblings on `run_provision` / `run_config_push_typed` / `run_config_diff_typed` / `run_config_validate` / `run_demo`); same manifest on Axum/CF/Spin passes | yes | — | — |
+| `[capabilities] required = ["send-all-slot-isolation"]` on a Fastly target → **every adapter-selecting CLI command** (`build` / `serve` / `deploy` / `provision` / `config push` / `config validate` / `demo` — the gated classes) exits non-zero with the BestEffort + required hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)` branching to skip `auth`, four siblings on `run_provision` / `run_config_push_typed` / `run_config_validate` / `run_demo`); `config diff` and `auth *` are exempt; same manifest on Axum/CF/Spin passes | yes | — | — |
 | Fastly mixed-budget `send_all` to the **same host**: slots with `50 ms` and `3 s` budgets create **distinct** dynamic backends (identity tuple includes `budget_ms`); the 50 ms slot's host timeout is not silently inherited by the 3 s slot or vice versa. **Asserts the Fastly identity tuple** — Tier 1's mock has no dynamic-backend abstraction; Tier 2 (Fastly contract crate) inspects the registered-backend map and Tier 3 (Viceroy) observes the wall-clock divergence | — | yes | yes |
 | `RequestContext::into_request()` after `body_bytes` poison: returns `Err(stored_err)`, not `Ok(Request<Body::empty()>)` — a permissive proxy-forward cannot mask a stricter middleware's poisoned read | yes | — | — |
 | Fastly + `outbound-http = required`: `ensure_capabilities` emits the dynamic-backends informational log | yes | — | — |
@@ -3957,7 +4003,7 @@ async fn send_all_runs_requests_concurrently() {
 | Fastly body-phase EOF deadline: an upstream that sends headers + N-1 chunks within budget but holds the final read so EOF arrives *after* `budget.deadline` returns `gateway_timeout`, not `Ok(resp)`. Buffered drain checks `is_expired()` after every blocking read including EOF; streamed wrapper checks before and after each underlying read so the consumer sees an `Err` chunk instead of clean stream-end | — | yes | yes |
 | `OutboundResponse::into_bytes_bounded_until(max, until)` with `until` **tighter** than `dispatch_budget(req).deadline`: the helper drives a streamed body whose adapter wrapper has 500 ms of effective budget left, but the caller passes `until = now + 100 ms`. The upstream sends data for 90 ms then holds the final read; EOF arrives at 110 ms. The helper returns `gateway_timeout` (not `Ok(bytes)`) because its `until_deadline.is_expired()` check fires before and after the EOF read. (`OutboundResponse` carries no effective-deadline state; the wrapper enforces the request budget separately — whichever fires first wins) | — | yes | yes |
 | Fastly phase-split trade-off, documented: a 1 s `send` to a target that takes 300 ms to connect and 10 ms to send first-byte **fails** at the `connect_ms = 250 ms` timer (1/4 of budget) even though the entire exchange would have fit within 1 s. This is the explicit deviation §4.3 documents — preferring the absolute-deadline bound over the "every legal slow-connect request succeeds" property. The `outbound-flexible-phase-budget` capability is `BestEffort` on Fastly (§3.5.1 / §3.5.2 footnote 5); apps that need elastic phase budget declare it required and get the hard build failure on Fastly. §8 risk 9 tracks the configurable-split follow-up | — | yes | yes |
-| Required `outbound-flexible-phase-budget` on Fastly → every adapter-selecting CLI command (`build` / `serve` / `deploy` / `auth` / `provision` / `config push` / `config diff` / `config validate` / `demo`) exits non-zero with the BestEffort hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)`, five siblings on `run_provision` / `run_config_push_typed` / `run_config_diff_typed` / `run_config_validate` / `run_demo`); same manifest on Axum / Cloudflare / Spin passes | yes | — | — |
+| Required `outbound-flexible-phase-budget` on Fastly → every **gated** CLI command (`build` / `serve` / `deploy` / `provision` / `config push` / `config validate` / `demo`) exits non-zero with the BestEffort hard-fail message via the §3.5.3 pre-dispatch gates (one inside `execute(..)` branching to skip `auth`, four siblings on `run_provision` / `run_config_push_typed` / `run_config_validate` / `run_demo`); `config diff` and `auth *` are exempt (read-only / credential); same manifest on Axum / Cloudflare / Spin passes | yes | — | — |
 | Sub-4 ms Fastly budget: `total_ms = 3` produces `connect_ms = first_byte_ms = 3` (sum 6, not 3) by the explicit `total_ms < 4` degenerate branch in §4.3 code. The absolute-deadline bound shifts to 2× total_ms at this scale; ms rounding already dominates so the test asserts ≤ 2× rather than = | — | yes | yes |
 | URI userinfo is rejected at construction: `OutboundRequest::get("https://user:pass@example.com")` → `Err(EdgeError::bad_request("outbound URI must not contain userinfo; pass credentials via the `authorization` header"))`. Credentials never reach `override_host` or any platform SDK | yes | — | — |
 | Fastly HTTPS to IP literals: `https://127.0.0.1` and `https://[::1]` build dynamic backends with `.enable_ssl().check_certificate("127.0.0.1")` / `.check_certificate("::1")` (brackets stripped) and **skip** `.sni_hostname()` (SNI is DNS-only per RFC 6066). HTTPS to a DNS host still calls both setters. Identity-tuple round-trip works for both | — | yes | yes |
@@ -4087,7 +4133,22 @@ Other changes:
 
 - **Body stays unified.** `OutboundRequest`/`OutboundResponse` use the core `Body` type;
   buffered is the default, streaming is opt-in via `stream_response()`. Streaming
-  proxy-forward (`from_request`) is **preserved** — no public capability is lost.
+  proxy-forward (`from_request`) is **preserved**.
+- **Public-surface removals — this is a breaking migration, not "no capability lost".**
+  Earlier drafts claimed nothing public was dropped; that is false. The current
+  `crates/edgezero-core/src/proxy.rs` exposes several public items the new types
+  deliberately do **not** carry. Each is an explicit decision, not an oversight:
+
+  | Removed public item (proxy.rs) | Disposition |
+  | --- | --- |
+  | `ProxyHandle::client() -> Arc<dyn ProxyClient>` | **Dropped, no analogue.** `HttpClient` intentionally does not expose the underlying client trait object — apps call `send` / `send_all`, not the raw client. Any downstream caller of `.client()` migrates to the request methods. |
+  | `ProxyRequest::body_mut()` / `extensions()` / `extensions_mut()`, `ProxyResponse::body_mut()` / `extensions()` / `extensions_mut()` | **Dropped.** The new types are builder-style (immutable after construction) and carry **no `Extensions`** — mutation and extension-stashing were only used internally and are replaced by the body-cell model. No public re-add. |
+  | `RequestContext::request_mut()` | **Dropped** — the §3.4.5 restructure removes it (`parts_mut()` covers header/method mutation; the body is a cell). |
+  | `PROXY_HEADER` (`x-edgezero-proxy`) + each adapter's `x-edgezero-proxy: <name>` response insert | **PRESERVED (locked).** It is public, observable behavior; every adapter keeps inserting it on proxied responses under the new `*OutboundClient` types. The `PROXY_HEADER` constant moves to `outbound.rs` but keeps its value `"x-edgezero-proxy"`. |
+
+  A `rg 'ProxyHandle::client|\.body_mut\(|extensions_mut\(|request_mut\('` sweep is part of
+  the migration completion gate (§7) — every hit is either migrated or confirmed
+  in-tree-only.
 - **Adapters** set `HttpClient` (not `ProxyHandle`) into request extensions — same
   mechanism, new type.
 - **`EdgeError`** gains `BadGateway` / `GatewayTimeout` — additive (`#[non_exhaustive]`).
@@ -4095,7 +4156,7 @@ Other changes:
   (`#[serde(default)]`); existing manifests parse unchanged.
 - **`Adapter` trait** gains `capability()` — all four registered adapters implement it.
 - **CLI** dispatch (PR #269, now on main): `ensure_capabilities` is wired in at
-  **six pre-dispatch gate sites** (§3.5.3) — one inside
+  **five pre-dispatch gate sites** (§3.5.3, gated by command class — `auth` and `config diff` are exempt) — one inside
   `edgezero_cli::adapter::execute(..)` (covering `build` / `serve` / `deploy` /
   `auth login` / `auth logout` / `auth status`, *before* the manifest-shell-command
   branch and *before* the registry lookup), and **five siblings** at the top of
@@ -4171,8 +4232,13 @@ Other changes:
   - `GatewayTimeout { message: String }` — `gateway_timeout(msg)` constructor;
     `status()` → `504`; `kind_str()` → `"gateway_timeout"`; `message()` → the stored
     `message`; `inner()` → `None`.
-  - Both serialize through the existing `IntoResponse` JSON shape
-    (`{ "error": { "kind", "message" } }`); add exhaustive-match tests covering
+  - Both serialize through the existing `IntoResponse` JSON shape — which is
+    **`{ "error": { "status", "kind", "message", "field_path"? } }`**, not
+    `{kind, message}`. The real converter (`error.rs`) inserts `status` (the numeric
+    code), `kind`, `message`, and `field_path` **when present**. `BadGateway` /
+    `GatewayTimeout` carry no `field_path`, so their bodies are
+    `{ "error": { "status": 502|504, "kind": "bad_gateway"|"gateway_timeout", "message": … } }`.
+    Add exhaustive-match tests covering
     status code, `kind` string, and serialized body for each.
 - `src/extractor.rs` — extractor migration per §3.4.5: `Json<T>` /
   `ValidatedJson<T>` route through `ctx.json_within(DEFAULT_INBOUND_JSON_BYTES)`;
@@ -4429,7 +4495,7 @@ change lands here whether intended or not)*
   via `src/lib.rs`) also calls `ensure_capabilities("axum", ..)` at its top before
   the Axum runner starts. The `ensure_capabilities` helper itself is **defined new in
   `src/adapter.rs`** (alongside `execute`) and imported by the sibling gate sites.
-  **All six gate sites** (one inside `execute(..)`, the five siblings on
+  **All five gate sites** (one inside `execute(..)` — branching to skip `auth` — the four siblings on
   `run_provision` / `run_config_push_typed` / `run_config_diff_typed` /
   `run_config_validate` / `run_demo`) are documented in §3.5.3's gate table. The legacy `handle_build` / `handle_serve`
   / `handle_deploy` / `handle_dev` functions referenced in earlier appendices
