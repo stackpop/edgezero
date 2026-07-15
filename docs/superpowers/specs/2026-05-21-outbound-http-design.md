@@ -915,7 +915,10 @@ above are therefore enforced by a **single core function**:
 
 ```rust
 // edgezero-core/src/outbound.rs — the ONLY place these rules live.
-pub(crate) fn validate_for_dispatch(req: &OutboundRequest) -> Result<(), EdgeError>;
+// PUBLIC, not pub(crate): the four adapters are SEPARATE crates and must call it.
+// (A pub(crate) fn is unreachable from edgezero-adapter-{axum,cloudflare,fastly,spin};
+// verified — a pub(crate) validator fails to compile at the adapter call site.)
+pub fn validate_for_dispatch(req: &OutboundRequest) -> Result<(), EdgeError>;
 ```
 
 It is called **exactly once per request, immediately before dispatch**, from **both**
@@ -1133,31 +1136,40 @@ pub struct DispatchBudget {
 /// and therefore different dynamic-backend identities for the same host under one
 /// batch deadline (§4.3). `send` (single request) just passes
 /// `web_time::Instant::now()`.
-// PRIVACY CONTRACT. `time.rs` is a **sibling module** of `outbound.rs`, so it cannot
-// read `OutboundRequest`'s private `timeout` / `deadline` / `max_response_bytes`
-// fields directly — earlier drafts of this pseudocode did, which does not compile.
-// `OutboundRequest` therefore exposes crate-visible accessors, and `dispatch_budget`
-// consumes **only** these:
+// PRIVACY + NAME-COLLISION CONTRACT (both verified by compiling a skeleton).
+// `time.rs` is a sibling module of `outbound.rs` and cannot read `OutboundRequest`'s
+// private fields directly — earlier pseudocode did, which does not compile.
+// **Crucially, the accessors CANNOT be named `timeout()` / `deadline()` /
+// `max_response_bytes()`**: those names are already taken by the PUBLIC BUILDER SETTERS
+// (§3.1.3 — `pub fn timeout(self, d: Duration) -> Self`, etc.). Rust does not overload
+// inherent methods, so a same-named getter on the same type is a hard `E0592`
+// duplicate-definition error. The inputs are therefore exposed through **one**
+// crate-visible accessor returning a struct — no name clash with any setter:
 //
+//     pub(crate) struct BudgetInputs {
+//         pub timeout: Option<Duration>,
+//         pub deadline: Option<Deadline>,
+//         pub max_response_bytes: usize,
+//     }
 //     impl OutboundRequest {
-//         pub(crate) fn timeout(&self) -> Option<Duration>;
-//         pub(crate) fn deadline(&self) -> Option<Deadline>;
-//         pub(crate) fn max_response_bytes(&self) -> usize;
+//         pub(crate) fn budget_inputs(&self) -> BudgetInputs;
 //     }
 //
-// (`pub(crate)`, not `pub` — these are an internal contract between `outbound.rs` and
-// `time.rs`, not app surface. The alternative — colocating `dispatch_budget` inside
-// `outbound.rs` — is rejected: `time.rs` must stay independently unit-testable and
-// free of the outbound client's platform-shaped code.) Read `req.timeout()` /
-// `req.deadline()` below as those accessors, not field access.
+// (`pub(crate)` — an internal contract between `outbound.rs` and `time.rs`, not app
+// surface. Colocating `dispatch_budget` inside `outbound.rs` is rejected: `time.rs`
+// must stay independently unit-testable and free of platform-shaped code.) The
+// pseudocode below reads `let inputs = req.budget_inputs();` then `inputs.timeout` /
+// `inputs.deadline` — **never** `req.timeout` (field) or `req.timeout()` (setter).
 pub fn dispatch_budget(
     req: &OutboundRequest,
     now: web_time::Instant,
 ) -> Result<DispatchBudget, EdgeError> {
+    let inputs = req.budget_inputs();   // single crate-visible accessor (see contract above)
+
     // (1) Expired-deadline check using the *single* now snapshot — no remaining()
     //     round-trip that could lose the distinction between "no deadline" and
     //     "deadline expired" (both produce None from remaining()).
-    if let Some(dl) = req.deadline {
+    if let Some(dl) = inputs.deadline {
         if dl.instant() <= now {
             return Err(EdgeError::gateway_timeout("deadline expired before dispatch"));
         }
@@ -1174,18 +1186,18 @@ pub fn dispatch_budget(
         let inst = now.checked_add(clamped).unwrap_or(now);   // last-resort: now (immediate)
         Deadline::at_instant(inst)
     };
-    let from_timeout      = req.timeout.map(&saturating);
+    let from_timeout      = inputs.timeout.map(&saturating);
     // `Deadline::at_instant` is public (§3.3.1), so a caller could construct a
     // Deadline well past DEADLINE_FAR_FUTURE and bypass Deadline::after's clamp.
     // Re-clamp `from_caller` here: the caller's deadline is never honoured beyond
     // `now + DEADLINE_FAR_FUTURE`. This only tightens; a caller's deadline closer
     // than that is unaffected.
-    let from_caller       = req.deadline.map(|d| {
+    let from_caller       = inputs.deadline.map(|d| {
         let far = now.checked_add(DEADLINE_FAR_FUTURE).unwrap_or(now);
         Deadline::at_instant(d.instant().min(far))
     });
     let from_default_only =
-        (req.timeout.is_none() && req.deadline.is_none())
+        (inputs.timeout.is_none() && inputs.deadline.is_none())
             .then(|| saturating(DEFAULT_NO_DEADLINE_BUDGET));
 
     // (3) Effective deadline = min of the candidates (always at least one).
@@ -1845,33 +1857,53 @@ the Fastly and Spin paths fully materialize the body too). This migration change
   does not compile. `StoredError` is the clonable, reconstructable **essence** of the
   error that poisoned the cell:
 
+  It **must be a variant-specific snapshot enum, NOT `{ kind, message }`** — that flat
+  shape cannot rebuild `EdgeError` faithfully, on two counts a compiler forces:
+  (a) `EdgeError::Internal`'s `message()` already renders as `"internal error: {source}"`,
+  so rebuilding via `internal(anyhow!(message))` **doubles the prefix**; (b)
+  `ConfigOutOfDate` (`field_path`), `MethodNotAllowed` (`method`, `allowed`), and
+  `NotFound` (`path`) carry structured payloads a single `message` string cannot hold. So
+  `StoredError` mirrors the variants and captures each payload:
+
   ```rust
   #[derive(Clone)]
-  struct StoredError {
-      kind: ErrorKind,   // which EdgeError variant (bad_request / internal / bad_gateway / …)
-      message: String,   // the rendered message at poison time
+  enum StoredError {
+      BadRequest       { message: String },
+      BadGateway       { message: String },
+      GatewayTimeout   { message: String },
+      Validation       { message: String },
+      Internal         { rendered: String },   // ALREADY-rendered source; no re-prefixing
+      ConfigOutOfDate  { message: String, field_path: String },
+      MethodNotAllowed { method: String, allowed: String },
+      NotFound         { path: String },
   }
 
   impl StoredError {
-      /// Rebuild an equivalent `EdgeError` — same variant, same message, same status.
-      fn to_edge_error(&self) -> EdgeError { /* dispatch on `kind` via the semantic ctors */ }
+      /// Capture an EdgeError's essence at poison time (total match — cannot silently
+      /// drop a variant). For `Internal`, store `source.to_string()` (already rendered),
+      /// NOT `err.message()`, so reconstruction does not re-add the "internal error: "
+      /// prefix.
+      fn capture(err: &EdgeError) -> Self { /* one arm per variant */ }
+      /// Rebuild an equivalent `EdgeError` — same variant, same fields, same status.
+      /// `Internal { rendered }` → `EdgeError::internal(anyhow!(rendered))`.
+      fn to_edge_error(&self) -> EdgeError { /* inverse of capture */ }
   }
   ```
 
-  **Decomposition happens once, at poison time.** The drain's `EdgeError` is decomposed
+  **Decomposition happens once, at poison time.** The drain's `EdgeError` is captured
   into `StoredError` and the cell returns `stored.to_edge_error()` — so *even the first*
-  read gets a reconstructed error, and all later reads are byte-identical to it. This
-  keeps every accessor's signature as `Result<_, EdgeError>` (no `Rc<EdgeError>` leaking
-  into the public API).
+  read gets a reconstructed error, and all later reads are identical. Every accessor's
+  signature stays `Result<_, EdgeError>` (no `Rc<EdgeError>` leaking into the public API).
 
   **Documented loss:** for the `Internal` variant the **`anyhow` source chain and
-  backtrace are not preserved** — only the rendered message and the variant/status are.
-  A reconstructed `internal` error's `inner()` yields a fresh `anyhow::Error` carrying
-  that message, not the original chain. This is an accepted trade: the alternatives are
-  making `EdgeError: Clone` (impossible without dropping `anyhow`) or returning
-  `Rc<EdgeError>` from every body accessor (an API wart for a diagnostic-only benefit).
-  Adapters that need the full chain must log it at the point of failure, before it
-  poisons the cell.
+  backtrace are not preserved** — only the rendered string. A reconstructed `internal`
+  error's `inner()` yields a fresh `anyhow::Error` carrying that string, not the original
+  chain. Accepted trade: the alternatives are `EdgeError: Clone` (impossible without
+  dropping `anyhow`) or `Rc<EdgeError>` on every accessor (an API wart for a
+  diagnostic-only benefit). Adapters needing the full chain log it before it poisons the
+  cell. *(A `BodyCell` drain only ever produces `bad_request` / `bad_gateway` /
+  `gateway_timeout` / `internal`; the structured variants are still covered so the enum
+  is total and `capture` never needs a lossy fallback arm.)*
 
   **Cancelled drain.** A drain future dropped while `Draining` transitions the cell to
   `Poisoned(StoredError { kind: Internal, message: "inbound body drain cancelled" })`
@@ -2000,9 +2032,18 @@ hosts = ["*"]   # optional plumbing; default ["*"]
 ```
 
 ```rust
-// crates/edgezero-core/src/capability.rs  (new module)
+// crates/edgezero-core/src/manifest.rs — defined INLINE here, NOT in a separate
+// capability.rs. `manifest.rs` is textually `include!`d by edgezero-macros
+// (manifest_definitions.rs), and edgezero-core depends on edgezero-macros, so the
+// macro crate can neither see `edgezero_core::` paths nor add core as a dep (cycle).
+// A separate `capability.rs` that `manifest.rs` imports would fail to compile in the
+// macro crate. Core re-exports these: `pub use manifest::{Capability, CapabilitySupport};`.
+//
+// MUST derive Serialize as well as Deserialize: `Manifest` derives `Serialize` and
+// `app!` calls `serde_json::to_string(&manifest)` — a Deserialize-only capability type
+// breaks the `Manifest` derive. (Both facts verified against the current tree.)
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Capability {
     OutboundHttp,                       // can issue outbound HTTP at all
@@ -2072,6 +2113,10 @@ impl Capability {
     pub fn as_str(&self) -> &'static str;   // kebab-case, for messages
 }
 
+// Also inline in manifest.rs (see Capability note above). `Serialize` is needed only if
+// it ever appears in a serialized manifest field; it does not today (support is computed
+// per-adapter via `Adapter::capability`, not stored), so `Deserialize`/`Serialize` are
+// omitted here. If a future manifest field carries a `CapabilitySupport`, add both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilitySupport {
     /// Fully supported with no documented caveats.
@@ -2392,12 +2437,20 @@ count is **six** — one inside `execute(..)`, plus **five siblings** on the ent
 that don't flow through `execute(..)`: `run_provision`, `run_config_push_typed`,
 `run_config_diff_typed`, `run_config_validate`, and `run_demo`.
 
-> **Note — gate the *typed* entry points.** In the merged tree the bundled
-> `run_config_push` is a **v1 stub that errors**; real config writeback happens in
-> `run_config_push_typed`, and the adapter-selecting diff is `run_config_diff_typed`
-> (`crates/edgezero-cli/src/config.rs`). Gating the stubs would enforce nothing. Any
-> remaining reference below or in §5.4 / §7 to a bare `run_config_push` /
-> `run_config_*` means the **typed** function.
+> **Note — gate the *typed* entry points, and note validation has TWO public entries.**
+> In the merged tree the bundled `run_config_push` is a **v1 stub that errors**; real
+> config writeback happens in `run_config_push_typed`, and the adapter-selecting diff is
+> `run_config_diff_typed` (`crates/edgezero-cli/src/config.rs`). Gating the stubs would
+> enforce nothing. **Validation is worse:** `run_config_validate` *and*
+> `run_config_validate_typed` are **both public entry points** — generated downstream
+> CLIs call `run_config_validate_typed` **directly** (`examples/app-demo/crates/
+> app-demo-cli/src/main.rs`), bypassing the bundled `run_config_validate` entirely. So a
+> gate placed only on the bundled path is silently skipped by every typed CLI. The gate
+> must be a **shared inner operation** both entry points call (e.g. a private
+> `gated_validate(..)` invoked by both `run_config_validate` and
+> `run_config_validate_typed`), not a check bolted onto one. The same applies to
+> push/diff (typed vs bundled). Any bare `run_config_*` reference below or in §5.4 / §7
+> means "the shared gated operation behind both the typed and bundled entry points."
 
 ```rust
 // 1. crates/edgezero-cli/src/adapter.rs — first statement of execute(..)
@@ -2488,7 +2541,7 @@ the router and never exposes it. Today `Hooks`
 manifest accessor**, so the gate has nothing to consult. Add one:
 
 ```rust
-// edgezero-core/src/app.rs — extend the existing Hooks trait (additive, defaulted).
+// edgezero-core/src/app.rs — extend the existing Hooks trait.
 pub trait Hooks {
     // …existing: build_app / configure / name / routes / stores…
 
@@ -2496,30 +2549,59 @@ pub trait Hooks {
     /// Default `None` for hand-written `Hooks` impls that never ran the macro.
     fn manifest_json() -> Option<&'static str> { None }
 
-    /// Parsed, cached view of the above. Parsed **once** on first call.
-    fn manifest() -> Option<&'static Manifest> { /* OnceLock<Option<Manifest>> */ }
+    /// Parsed + finalized, cached view of the above. See notes on why this
+    /// delegates to a PUBLIC core parser and holds a per-impl `OnceLock`.
+    fn manifest() -> Option<&'static Manifest> {
+        static CACHE: OnceLock<Option<Manifest>> = OnceLock::new();          // per-impl
+        CACHE.get_or_init(|| Manifest::from_baked_json(Self::manifest_json()?)).as_ref()
+    }
+}
+
+// edgezero-core/src/manifest.rs — the accessor CANNOT parse+finalize itself, because
+// `Manifest::finalize()` is `pub(crate)` and the `app!`-generated `manifest()` lives in
+// the DOWNSTREAM crate, which can't reach it. Core exposes a public constructor:
+impl Manifest {
+    /// Parse baked JSON and rebuild derived state (`finalize`). Returns `None` on a
+    /// parse failure (an adapter/macro contract bug — the JSON came from
+    /// `serde_json::to_string` on an already-validated Manifest).
+    pub fn from_baked_json(json: &'static str) -> Option<Manifest> {
+        let mut m: Manifest = serde_json::from_str(json).ok()?;
+        m.finalize();   // pub(crate) — reachable here, inside core
+        Some(m)
+    }
 }
 ```
 
-- **`app!` emits `fn manifest_json() -> Option<&'static str> { Some(#manifest_json_lit) }`**
-  in the `impl Hooks for #app_ident` block it already generates — reusing the literal it
-  computes today. No new parsing at compile time, no new macro dependency.
-- **Ownership / lifetime:** the JSON is a `&'static str` in the binary; `manifest()`
-  parses it into a `OnceLock<Option<Manifest>>` **owned by core**, so the cost is paid
-  once per process and the result is `&'static`. This requires `Manifest: Deserialize`
-  (already true) — and note it is the same `Serialize` requirement that forces the
-  capability types to derive `Serialize` (§3.5.1), since `app!` serializes the whole
-  `Manifest`.
-- **Failure mode:** the JSON was produced by `serde_json::to_string` on a validated
-  `Manifest`, so a parse failure is an **adapter/macro contract bug**, not user error →
-  `EdgeError::internal`. `manifest()` returning `None` (hand-written `Hooks`, no macro)
-  means *no capability contract*, and `ensure_capabilities` short-circuits `Ok(())` —
-  the same policy already used for "no manifest" elsewhere in §3.5.3.
-- **Test seam:** capability-gate failure tests need to drive `demo` with a manifest that
-  *requires* a `BestEffort` capability. Since the manifest is compile-time baked, the
-  fixture is a **test-only `Hooks` impl** that overrides `manifest_json()` to return a
-  crafted JSON string — no file, no macro re-expansion. (This is why `manifest_json()`
-  is a trait method with a default rather than a free function or a bare `const`.)
+- **`app!` MUST emit BOTH methods explicitly.** The macro's generated `impl Hooks`
+  cannot rely on the trait defaults: `crates/edgezero-macros/src/app.rs` sets
+  **`clippy::missing_trait_methods = deny`** (verified — a generated impl that omits a
+  defaulted method is a hard clippy error: *"missing trait method provided by default"*).
+  So the macro emits `manifest_json()` (returning `Some(#manifest_json_lit)`) **and**
+  `manifest()` (the `OnceLock` + `from_baked_json` body above), exactly as it already
+  emits `configure`/`build_app` for the same reason. **Any hand-written `Hooks` impl in
+  the codebase must also emit both** (or locally `#[allow]` the lint) — "additive and
+  defaulted" is **not** free here.
+- **Reparsing JSON alone is WRONG — it skips `finalize()`.** `Manifest::finalize()`
+  rebuilds derived state (e.g. resolved routes) that is **not** in the serialized JSON,
+  and several fields are `#[serde(skip)]`. A bare `serde_json::from_str` yields a
+  half-built `Manifest`. Hence `from_baked_json` calls `finalize()` — and hence it must
+  live in **core** (only core can call the `pub(crate)` `finalize`), not in the generated
+  downstream impl.
+- **Ownership / lifetime:** the JSON is a `&'static str` in the binary; the `OnceLock` is
+  a **function-local `static` inside the generated `manifest()`**, so it is naturally
+  **per-impl** (each `App`'s `manifest()` has its own) and the parse cost is paid once per
+  process — verified to compile and be per-impl. A single core-global `OnceLock` would
+  **not** be per-impl and is rejected.
+- **Failure mode:** `from_baked_json` returning `None` on parse failure is an
+  adapter/macro contract bug. `manifest()` returning `None` (hand-written `Hooks`, no
+  macro) means *no capability contract*, and `ensure_capabilities` short-circuits `Ok(())`
+  — the same "no manifest" policy already used in §3.5.3.
+- **Test seam:** capability-gate failure tests drive `demo` with a **test-only `Hooks`
+  impl** overriding `manifest_json()` to return crafted JSON (which then flows through
+  the real `from_baked_json` + `finalize`) — no file, no macro re-expansion. This is why
+  `manifest_json()` is a trait method with a default, not a free function or bare `const`.
+  (The test impl must also emit `manifest()` — or `#[allow(clippy::missing_trait_methods)]`
+  — per the lint above.)
 
 Commands **not** covered (and why):
 - `edgezero new` — generates source files; no adapter is selected, so capabilities
@@ -2656,13 +2738,21 @@ Apps still enforce their own target allowlist in handler code. Adapter use of `h
      `[capabilities.outbound].hosts` instead of the hardcoded literal).
   2. **`edgezero provision`** (re-)renders `allowed_outbound_hosts` into `spin.toml`.
      This is the **only** command that writes it. `provision` already edits `spin.toml`
-     in place via `toml_edit::DocumentMut` (`ensure_kv_label_in_component`), already
-     receives `manifest_root` + `adapter_manifest_path`, and already honours
-     `--dry-run` — so this needs **one helper, no `Adapter` trait-signature change, no
-     CLI dispatch change**. Sibling fields and comments are preserved (the existing
-     behaviour is test-pinned, on a fixture that already contains
-     `allowed_outbound_hosts`). Writing at provision matches EdgeZero's existing model:
-     *platform manifests are written during provision, not during build.*
+     in place via `toml_edit::DocumentMut` (`ensure_kv_label_in_component`) and already
+     honours `--dry-run`. **But `Adapter::provision` receives no host data** — its
+     signature is `(manifest_root, adapter_manifest_path, component_selector,
+     stores: &ProvisionStores, dry_run)`, and `ProvisionStores` carries only store info,
+     **not** `[capabilities.outbound].hosts`. So my earlier "no trait-signature change"
+     was wrong; the hosts must be made reachable, two options: (a) `provision` **re-reads**
+     the manifest from `manifest_root` (which it already has) and pulls
+     `[capabilities.outbound].hosts` itself — smallest change, no trait edit, at the cost
+     of a re-parse; or (b) thread the hosts into the provision context (widen
+     `ProvisionStores` or add a param) — cleaner data-flow, but a trait-signature change
+     touching all four adapters. *(Recommend (a): `provision` already owns
+     `manifest_root`; a re-read is local to the Spin adapter and changes no shared
+     interface.)* Sibling fields and comments are preserved (test-pinned, on a fixture
+     that already contains `allowed_outbound_hosts`). Writing at provision matches
+     EdgeZero's model: *platform manifests are written during provision, not build.*
   3. **`edgezero build` / `serve` / `deploy`** **validate only — they never write.**
      They compare `spin.toml`'s `allowed_outbound_hosts` against the manifest and
      **hard-fail on drift** with an actionable message that renders the expected list
@@ -3304,10 +3394,23 @@ async fn send_all(
     identity, reuse; if it maps to a *different* identity, fail closed with
     `EdgeError::internal("dynamic backend name collision — refusing to reuse")`.
   - **Single `send`** — same lookup path; same fail-closed behaviour.
-  - **Across calls** — the map persists for the lifetime of the
-    `FastlyOutboundClient` (one per request context), so a second `send` in the same
-    handler reuses the same backend cheaply and a SHA-256-128 collision against an
-    earlier call is still caught.
+  - **Across calls — the cache MUST be session/process-scoped, NOT per-client.**
+    Fastly dynamic-backend **names are session-global**: once `Backend::builder(name,..)`
+    registers a name, it stays registered for the whole Compute session (across inbound
+    requests), and re-registering the same name returns `NameInUse`. But
+    `FastlyOutboundClient` (a.k.a. today's `FastlyProxyClient`) is **constructed per
+    inbound request** (`crates/edgezero-adapter-fastly/src/request.rs` inserts a fresh one
+    into each request's extensions). A cache *field on the client* would therefore start
+    **empty on every request** — so request #2 to the same host rebuilds the name, hits
+    `NameInUse`, and (having no cached identity to verify against) **fails closed**. That
+    is a latent bug the current adapter avoids only because it has no cache at all today.
+    The cache must live at **session scope**: a module-level `thread_local!`
+    (the Fastly guest is single-threaded, so no `Mutex` is needed) holding the
+    `HashMap<name, (BackendIdentity, Backend)>`, populated across requests for the life of
+    the instance. Each per-request `FastlyOutboundClient` reads/writes that shared map
+    rather than owning it. A second `send` — in the *same* handler **or a later inbound
+    request** — then reuses the backend cheaply, and a SHA-256-128 collision against any
+    earlier registration (this session) is still caught.
   - **`Backend::builder` returns `NameInUse`** — the adapter cannot fully verify
     the registered identity. Fastly's `Backend::from_name` returns a handle to the
     existing backend but its public getters do not round-trip every builder field
@@ -3539,25 +3642,40 @@ service — this distinction is explicit so a green capability check is not misr
   // The pump lives INSIDE the raced future — no `wit_bindgen::spawn`.
   let pump = async move {
       let mut sent = 0usize;
-      while let Some(chunk) = source.next().await {              // cancellable
+      // `source` is a `Body::Stream`, so `.next()` yields `Option<Result<Bytes, EdgeError>>`
+      // (the §7 error-type change). The item MUST be unwrapped — a source error is a real
+      // failure (`bad_gateway` from the wrapped stream, or a `gateway_timeout` chunk), not
+      // a `Bytes`. Dropping it would silently upload a truncated body.
+      while let Some(item) = source.next().await {                // cancellable
+          let chunk: Bytes = item?;                               // propagate source error
           // pre-append cap check (§3.4.1) against max_request_body_bytes
           if sent.checked_add(chunk.len()).is_none_or(|n| n > max_req) {
               return Err(EdgeError::bad_request("request body exceeded max_request_body_bytes"));
           }
           sent += chunk.len();
           let unwritten = writer.write_all(chunk.to_vec()).await; // backpressure; cancellable
-          if !unwritten.is_empty() { break; }                     // reader gone
+          if !unwritten.is_empty() {                              // reader gone (send failed/cancelled)
+              return Err(EdgeError::bad_gateway("outbound upload stream closed by peer"));
+          }
       }
       drop(writer);                                               // EOF
       let _ = trailers_tx.write(Ok(None)).await;                  // completion signal
-      Ok(())
+      Ok::<(), EdgeError>(())
   };
 
-  // ONE droppable future covering pump + send.
-  let exchange = async move { futures::join!(pump, client::send(req)).1 };
+  // ONE droppable future covering pump + send. Both results are kept and the PUMP's
+  // result takes precedence: a `join!` returns `(pump_result, send_result)`, and a pump
+  // failure (source error / cap overflow) must win over whatever `send` reports, because
+  // a truncated or cap-violating upload is the *root cause*. Earlier drafts wrote
+  // `join!(pump, send).1`, which discarded the pump result entirely — a silent data bug.
+  let exchange = async move {
+      let (pump_res, send_res) = futures::join!(pump, client::send(req));
+      pump_res?;                          // pump error wins (bad_request / bad_gateway)
+      send_res.map_err(map_spin_send_err) // else the send outcome (transport → §4.4 Errors)
+  };
 
   match select(pin!(exchange), pin!(spin_sdk::time::sleep(budget.deadline.remaining()?))).await {
-      Either::Left((resp, _)) => resp,
+      Either::Left((resp, _)) => resp,    // resp is already Result<Response, EdgeError>
       Either::Right(_) => Err(EdgeError::gateway_timeout("deadline expired during upload")),
   }
   ```
@@ -3900,10 +4018,18 @@ Tier 2 assertions in §5.4 depend on seams that do not exist today. They are
 Seams required, **per adapter** (not Fastly-only — CF and Spin need transport/timer
 seams for their own Tier 2 rows):
 
-- **Fastly — registered-backend map inspector.** `#[cfg(feature = "test-utils")]`
-  accessor on `FastlyOutboundClient` exposing the adapter-local
-  `Mutex<HashMap<String, (BackendIdentity, Backend)>>`, so the identity / collision /
-  one-backend-per-canonical-tuple rows assert without a network.
+- **Fastly — recording builder, NOT a backend inspector.** A cache/`Backend` inspector
+  **cannot** prove the SSL / SNI / certificate / host-override calls: Fastly's `Backend`
+  is **opaque** — its public getters do not round-trip `sni_hostname` / `check_certificate`
+  / `override_host` / the timeout phase split, so inspecting a cached `Backend` observes
+  almost nothing the §5.4 rows assert. The seam must instead be a
+  `#[cfg(feature = "test-utils")]` **recording `BackendBuilder`** — a thin trait the
+  adapter builds through (`.override_host(..)`, `.sni_hostname(..)`,
+  `.check_certificate(..)`, `.connect_timeout(..)`, …) whose test impl **records every
+  call** into an observable log. The identity / canonical-accessor / phase-split rows
+  assert against that recording. (The session cache — now a `thread_local!`, §4.3 — still
+  gets a `test-utils` accessor for the *collision/reuse* rows, but that only proves
+  name→identity bookkeeping, not the builder calls.)
 - **Fastly — injectable clock / dispatch-overhead hook.** A `test-utils` `Duration`
   injection point between `dispatch_budget` and SDK arming, used by both the `send_all`
   and single-`send` `BATCH_DISPATCH_SLACK_MAX` rows. Without it the slack guard is
@@ -4031,7 +4157,10 @@ Other changes:
   The earlier "value type only" wording was stale before round 23 introduced
   `DispatchBudget` and the explicit `now` parameter; this is the complete
   current contents of the file.
-- `src/capability.rs` — new: `Capability`, `CapabilitySupport`.
+- **No `src/capability.rs`.** `Capability` / `CapabilitySupport` are defined **inline in
+  `src/manifest.rs`** (the `include!`d file — see the `edgezero-macros` block below) and
+  re-exported: `pub use manifest::{Capability, CapabilitySupport};`. A standalone
+  `capability.rs` that `manifest.rs` imported would fail to compile in the macro crate.
 - `src/error.rs` — add two variants and their **complete** surface (the existing
   `EdgeError` is `#[non_exhaustive]` with per-variant `kind_str()` / `message()` /
   `status()` / `inner()` arms and an exhaustive `IntoResponse` JSON body, so every
@@ -4073,13 +4202,20 @@ Other changes:
   `Body::from_stream` map their source errors into `EdgeError::internal(..)` (the
   honest mapping for an unknown stream-source error). Also implement the pre-append
   checked accounting and bounded-byte rewrite of `into_bytes_bounded` (§3.4.1).
-- `src/manifest.rs` — add `ManifestCapabilities` + `ManifestOutboundCapability` +
-  `Manifest::capabilities`.
+- `src/manifest.rs` — add `Capability` / `CapabilitySupport` (inline; §3.5.1),
+  `ManifestCapabilities` + `ManifestOutboundCapability` (with `hosts: Option<Vec<String>>`
+  — §3.5.4, so *absent* is distinguishable from explicit `["*"]`), and
+  `Manifest::capabilities`. Also add **`pub fn Manifest::from_baked_json(&'static str)
+  -> Option<Manifest>`** — parse **plus `finalize()`** — because the `app!`-generated
+  `manifest()` accessor lives downstream and cannot call the `pub(crate)` `finalize()`
+  itself (§3.5.3).
 - `src/app.rs` — extend the `Hooks` trait with the **baked-manifest accessors** the
   `demo` capability gate depends on (§3.5.3): `fn manifest_json() -> Option<&'static str>`
-  (defaulted `None`) and `fn manifest() -> Option<&'static Manifest>` (parses
-  `manifest_json()` once into a core-owned `OnceLock<Option<Manifest>>`). Additive and
-  defaulted, so hand-written `Hooks` impls keep compiling.
+  (defaulted `None`) and `fn manifest() -> Option<&'static Manifest>` (per-impl
+  function-local `OnceLock` calling `Manifest::from_baked_json`). **Not "free because
+  defaulted":** `app!` and every hand-written `Hooks` impl must **emit both** — the macro
+  crate denies `clippy::missing_trait_methods`, so relying on a trait default is a hard
+  error (verified).
 - `src/lib.rs` — re-export new modules; drop proxy re-exports.
 - `Cargo.toml` — `MockOutboundClient` under the existing `test-utils` feature.
 
@@ -4103,8 +4239,11 @@ change lands here whether intended or not)*
      that is `Deserialize`-only breaks the `Manifest` derive.
   **Gate:** `cargo build -p edgezero-macros` must be run after *every* `manifest.rs`
   edit; a workspace `cargo check` alone will surface this only via the macro crate.
-- `src/app.rs` — emit the baked-manifest accessor in the generated `impl Hooks` block:
-  `fn manifest_json() -> Option<&'static str> { Some(#manifest_json_lit) }`. The literal
+- `src/app.rs` — emit **both** baked-manifest accessors in the generated `impl Hooks`
+  block (the macro already denies `clippy::missing_trait_methods`, so it cannot rely on
+  the trait defaults — same reason it already emits `configure`/`build_app`):
+  `fn manifest_json() -> Option<&'static str> { Some(#manifest_json_lit) }` and the
+  `manifest()` body (per-impl `OnceLock` → `Manifest::from_baked_json`). The JSON literal
   already exists (`manifest.finalize()` → `serde_json::to_string(&manifest)` →
   `manifest_json_lit`); today it is embedded for the router and never exposed. No new
   compile-time parsing, no new macro dependency.
