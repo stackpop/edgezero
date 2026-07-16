@@ -250,7 +250,7 @@ pub(crate) fn synthesise_spin_toml(
     component: Option<&str>,
     manifest_rel: &Path,
 ) -> String {
-    use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
+    use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, value};
 
     let component_id: &str = component.unwrap_or(crate_name);
     // Wasm source path underscores the CARGO CRATE name — NOT the

@@ -1072,13 +1072,13 @@ fn validate_store_declaration(declaration: &StoreDeclaration) -> Result<(), Vali
         return Err(error);
     }
 
-    if let Some(default) = declaration.default.as_deref() {
-        if !declaration.ids.iter().any(|id| id == default) {
-            let mut error = ValidationError::new("store_default_unknown");
-            error.message =
-                Some(format!("`default` (`{default}`) must be one of the declared `ids`").into());
-            return Err(error);
-        }
+    if let Some(default) = declaration.default.as_deref()
+        && !declaration.ids.iter().any(|id| id == default)
+    {
+        let mut error = ValidationError::new("store_default_unknown");
+        error.message =
+            Some(format!("`default` (`{default}`) must be one of the declared `ids`").into());
+        return Err(error);
     }
 
     Ok(())
@@ -1089,7 +1089,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process;
-    use tempfile::{tempdir, tempdir_in, NamedTempFile};
+    use tempfile::{NamedTempFile, tempdir, tempdir_in};
 
     const SAMPLE: &str = r#"
 [app]
@@ -1519,9 +1519,10 @@ level = "off"
     fn log_level_rejects_invalid_value() {
         let err = toml::from_str::<ManifestLoggingConfig>("level = \"loud\"")
             .expect_err("invalid log level");
-        assert!(err
-            .to_string()
-            .contains("logging level must be trace, debug, info, warn, error, or off"));
+        assert!(
+            err.to_string()
+                .contains("logging level must be trace, debug, info, warn, error, or off")
+        );
     }
 
     #[test]

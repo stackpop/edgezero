@@ -5,15 +5,15 @@ use std::path::{Path, PathBuf};
 
 use ctor::ctor;
 use edgezero_adapter::cli_support;
-use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
+use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
-    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    TypedSecretEntry,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
+    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
+    register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 
 mod provision_local;
@@ -62,8 +62,7 @@ static AXUM_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_axum",
         repo_crate: "crates/edgezero-adapter-axum",
-        fallback:
-            "edgezero-adapter-axum = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-axum\", default-features = false }",
+        fallback: "edgezero-adapter-axum = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-axum\", default-features = false }",
         features: &["axum"],
     },
 ];
@@ -185,14 +184,14 @@ impl Adapter for AxumCliAdapter {
         match mode {
             ProvisionMode::Cloud => {}
             ProvisionMode::Local => {
-                return provision_local::provision(manifest_root, stores, dry_run)
+                return provision_local::provision(manifest_root, stores, dry_run);
             }
             // ProvisionMode is #[non_exhaustive]; explicit error so a
             // future mode variant doesn't quietly fall through.
             other => {
                 return Err(format!(
                     "axum adapter does not implement provision mode {other:?}"
-                ))
+                ));
             }
         }
         //: axum has no remote resources. Print one note per

@@ -210,7 +210,7 @@ fn upsert_local_kv_store(
     doc: &mut toml_edit::DocumentMut,
     platform_name: &str,
 ) -> Result<(), String> {
-    use toml_edit::{value, ArrayOfTables, Item, Table};
+    use toml_edit::{ArrayOfTables, Item, Table, value};
 
     let local_server_entry = doc
         .entry("local_server")
@@ -248,7 +248,7 @@ fn upsert_local_config_store(
     doc: &mut toml_edit::DocumentMut,
     platform_name: &str,
 ) -> Result<(), String> {
-    use toml_edit::{value, Item, Table};
+    use toml_edit::{Item, Table, value};
 
     let local_server_entry = doc
         .entry("local_server")
@@ -302,7 +302,7 @@ fn upsert_runtime_env_config_store(
     doc: &mut toml_edit::DocumentMut,
     stores: &ProvisionStores<'_>,
 ) -> Result<bool, String> {
-    use toml_edit::{value, Item, Table};
+    use toml_edit::{Item, Table, value};
 
     const RUNTIME_ENV_NAME: &str = "edgezero_runtime_env";
 
@@ -407,10 +407,10 @@ fn upsert_runtime_env_config_store(
     if !comment_suffix.is_empty() {
         let last_key = contents_tbl.iter().last().map(|(key, _)| key.to_owned());
         if let Some(last) = last_key {
-            if let Some(item) = contents_tbl.get_mut(&last) {
-                if let Some(val) = item.as_value_mut() {
-                    val.decor_mut().set_suffix(comment_suffix);
-                }
+            if let Some(item) = contents_tbl.get_mut(&last)
+                && let Some(val) = item.as_value_mut()
+            {
+                val.decor_mut().set_suffix(comment_suffix);
             }
         } else {
             // Edge case: no declared stores at all (contents_tbl is
@@ -444,7 +444,7 @@ fn upsert_secret_store_entry(
     store_id: &str,
     key_value: &str,
 ) -> Result<bool, String> {
-    use toml_edit::{value, ArrayOfTables, Item, Table};
+    use toml_edit::{ArrayOfTables, Item, Table, value};
 
     let local_server_entry = doc
         .entry("local_server")
@@ -492,7 +492,7 @@ pub(super) fn write_fastly_local_config_store(
     entries: &[(String, String)],
 ) -> Result<(), String> {
     use std::io::ErrorKind;
-    use toml_edit::{table, DocumentMut, Item, Table, Value};
+    use toml_edit::{DocumentMut, Item, Table, Value, table};
 
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -567,18 +567,15 @@ pub(super) fn write_fastly_local_config_store(
 
 #[cfg(test)]
 mod tests {
+    use super::super::FastlyCliAdapter;
     #[cfg(unix)]
     use super::super::path_mutation_guard;
     use super::super::run::synthesise_fastly_toml;
-    use super::super::FastlyCliAdapter;
     use super::*;
     use edgezero_adapter::registry::{
         Adapter as _, ProvisionMode, ResolvedStoreId, TypedSecretEntry,
     };
-    #[cfg(unix)]
-    use std::env;
-    #[cfg(unix)]
-    use std::ffi::OsString;
+    use edgezero_core::test_env::PathPrepend;
     use tempfile::tempdir;
 
     // Shared fixture names. Pinning these as consts (instead of
@@ -589,41 +586,6 @@ mod tests {
     // store ids the fastly adapter operates on, not arbitrary strings.
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
-
-    /// RAII guard: prepends a directory to `$PATH` and restores the original
-    /// value on drop.
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new_path = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new_path);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     /// A shell script named `fastly` that exits non-zero and prints an
     /// unambiguous diagnostic to stderr — installed on `$PATH` to
@@ -892,8 +854,7 @@ mod tests {
         );
         // Additive: new CONFIG line inserted into the existing block.
         assert!(
-            after_second
-                .contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME = "app_config""#),
+            after_second.contains(r#"EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME = "app_config""#),
             "second provision must ADD the new CONFIG __NAME line into the existing runtime-env block: {after_second}"
         );
         // No duplicate runtime-env block header.

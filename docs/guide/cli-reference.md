@@ -508,11 +508,20 @@ Install the provider CLI:
 
 ## Building Your Own CLI
 
-`edgezero-cli` is published as a library as well as a binary. Every downstream
-command is exposed as a `(*Args, run_*)` pair (`BuildArgs` / `run_build`,
-`DeployArgs` / `run_deploy`, `NewArgs` / `run_new`, `ServeArgs` / `run_serve`),
-so a downstream project can build its own CLI binary that reuses any subset of
-the built-ins and adds its own subcommands:
+`edgezero-cli` ships a library as well as a binary. Every downstream command is
+exposed as a `(*Args, run_*)` pair (`BuildArgs` / `run_build`, `DeployArgs` /
+`run_deploy`, `NewArgs` / `run_new`, `ServeArgs` / `run_serve`), so a downstream
+project can build its own CLI binary that reuses any subset of the built-ins and
+adds its own subcommands.
+
+The crate is not on crates.io — EdgeZero crates are `publish = false` until the
+first registry release — so depend on it by Git (or by path, in a local
+checkout):
+
+```toml
+[dependencies]
+edgezero-cli = { git = "https://github.com/stackpop/edgezero.git", default-features = false }
+```
 
 ```rust
 use clap::{Parser, Subcommand};

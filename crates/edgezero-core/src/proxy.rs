@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::body::Body;
 use crate::error::EdgeError;
 use crate::http::{
-    response_builder, Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri,
+    Extensions, HeaderMap, Method, Request, Response, StatusCode, Uri, response_builder,
 };
 
 /// Header name attached to proxied responses to identify which adapter
@@ -258,10 +258,10 @@ mod tests {
     use super::*;
     use crate::body::Body;
     use crate::http::header::HeaderName;
-    use crate::http::{request_builder, HeaderValue, Method, StatusCode, Uri};
+    use crate::http::{HeaderValue, Method, StatusCode, Uri, request_builder};
     use bytes::Bytes;
     use futures::executor::block_on;
-    use futures_util::{stream, StreamExt as _};
+    use futures_util::{StreamExt as _, stream};
 
     struct EchoBodyClient;
 

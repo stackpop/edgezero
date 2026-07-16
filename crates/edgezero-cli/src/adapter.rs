@@ -114,22 +114,22 @@ pub(crate) fn execute_with_env_overlay(
     adapter_args: &[String],
     env_overlay: &[(String, String)],
 ) -> Result<(), String> {
-    if let Some(loader) = manifest_loader {
-        if let Some(command) = manifest_command(loader.manifest(), adapter_name, action) {
-            let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
-            let env = loader.manifest().environment_for(adapter_name);
-            let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
-            return run_shell(
-                command,
-                root,
-                adapter_name,
-                action,
-                Some(env),
-                adapter_bind,
-                adapter_args,
-                env_overlay,
-            );
-        }
+    if let Some(loader) = manifest_loader
+        && let Some(command) = manifest_command(loader.manifest(), adapter_name, action)
+    {
+        let root = loader.manifest().root().unwrap_or_else(|| Path::new("."));
+        let env = loader.manifest().environment_for(adapter_name);
+        let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
+        return run_shell(
+            command,
+            root,
+            adapter_name,
+            action,
+            Some(env),
+            adapter_bind,
+            adapter_args,
+            env_overlay,
+        );
     }
 
     let adapter = adapter_registry::get_adapter(adapter_name).ok_or_else(|| {
@@ -236,15 +236,15 @@ fn run_shell(
     // when the parent env already has the canonical variable so the
     // user's CLI-invocation override wins over everything.
     let (manifest_host, manifest_port) = adapter_bind;
-    if let Some(host) = manifest_host {
-        if env::var_os("EDGEZERO__ADAPTER__HOST").is_none() {
-            cmd.env("EDGEZERO__ADAPTER__HOST", host);
-        }
+    if let Some(host) = manifest_host
+        && env::var_os("EDGEZERO__ADAPTER__HOST").is_none()
+    {
+        cmd.env("EDGEZERO__ADAPTER__HOST", host);
     }
-    if let Some(port) = manifest_port {
-        if env::var_os("EDGEZERO__ADAPTER__PORT").is_none() {
-            cmd.env("EDGEZERO__ADAPTER__PORT", port.to_string());
-        }
+    if let Some(port) = manifest_port
+        && env::var_os("EDGEZERO__ADAPTER__PORT").is_none()
+    {
+        cmd.env("EDGEZERO__ADAPTER__PORT", port.to_string());
     }
 
     if let Some(env) = environment {
@@ -300,18 +300,17 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_environment, ResolvedEnvironment};
-    use crate::shared_test_guards::env_mutation_guard;
+    use super::{ResolvedEnvironment, apply_environment};
+    use crate::test_support::manifest_guard;
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
-    use std::env;
+    use edgezero_core::test_env::EnvOverride;
     use std::process::Command;
 
     #[test]
     fn apply_environment_sets_defaults_and_checks_secrets() {
-        let _lock = env_mutation_guard()
-            .lock()
-            .expect("env mutation guard poisoned");
-        env::remove_var("EDGEZERO_TEST_SECRET");
+        let _lock = manifest_guard().lock().expect("env lock");
+        // Unset for the missing-secret path; restores the parent value on drop.
+        let _unset = EnvOverride::remove("EDGEZERO_TEST_SECRET");
 
         let env = ResolvedEnvironment {
             secrets: vec![ResolvedEnvironmentBinding {
@@ -333,7 +332,7 @@ mod tests {
         let result = apply_environment(adapter_name, &env, &mut Command::new("echo"));
         assert!(result.is_err());
 
-        env::set_var("EDGEZERO_TEST_SECRET", "set");
+        let _secret = EnvOverride::set("EDGEZERO_TEST_SECRET", "set");
         let mut cmd = Command::new("echo");
         apply_environment(adapter_name, &env, &mut cmd).expect("environment applied");
         let has_var = cmd.get_envs().any(|(key, value)| {
@@ -341,8 +340,6 @@ mod tests {
                 && value.and_then(|val| val.to_str()) == Some("https://demo")
         });
         assert!(has_var);
-
-        env::remove_var("EDGEZERO_TEST_SECRET");
     }
 
     #[test]
@@ -355,10 +352,8 @@ mod tests {
         // would inject the manifest value and the parent override
         // would be lost.
         const KEY: &str = "EDGEZERO_TEST_PARENT_WINS";
-        let _lock = env_mutation_guard()
-            .lock()
-            .expect("env mutation guard poisoned");
-        env::set_var(KEY, "from_parent_shell");
+        let _lock = manifest_guard().lock().expect("env lock");
+        let _parent = EnvOverride::set(KEY, "from_parent_shell");
 
         let env = ResolvedEnvironment {
             secrets: vec![],
@@ -384,8 +379,6 @@ mod tests {
             "manifest default must NOT be injected when parent env is already set; \
              parent value would otherwise be shadowed"
         );
-
-        env::remove_var(KEY);
     }
 
     #[test]
@@ -393,10 +386,8 @@ mod tests {
         // Mirror of the above: when the parent shell has NOT set the
         // env var, the manifest default fills it in.
         const KEY: &str = "EDGEZERO_TEST_MANIFEST_FILLS";
-        let _lock = env_mutation_guard()
-            .lock()
-            .expect("env mutation guard poisoned");
-        env::remove_var(KEY);
+        let _lock = manifest_guard().lock().expect("env lock");
+        let _unset = EnvOverride::remove(KEY);
 
         let env = ResolvedEnvironment {
             secrets: vec![],

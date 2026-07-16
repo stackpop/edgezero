@@ -100,11 +100,10 @@ pub fn append_lines_dedup_with_header(
     if (to_append.is_empty() && header_needed.is_none()) || dry_run {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("create {}: {err}", parent.display()))?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
     }
 
     let mut combined = String::new();

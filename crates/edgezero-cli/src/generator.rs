@@ -1,8 +1,8 @@
 use crate::args::{NewArgs, ProvisionArgs};
 use crate::provision::run_provision;
 use crate::scaffold::{
-    register_templates, resolve_dep_line, sanitize_crate_name, write_tmpl, ResolvedDependency,
-    ScaffoldError,
+    ResolvedDependency, ScaffoldError, register_templates, resolve_dep_line, sanitize_crate_name,
+    write_tmpl,
 };
 use edgezero_adapter::scaffold;
 use edgezero_adapter::scaffold::AdapterBlueprint;
@@ -865,65 +865,12 @@ mod tests {
     #[cfg(unix)]
     use crate::shared_test_guards::path_mutation_guard;
     use edgezero_core::app_config::app_name_prefix;
+    use edgezero_core::test_env::PathPrepend as PathOverride;
     use std::path::{Path, PathBuf};
-    #[cfg(unix)]
-    use std::sync::MutexGuard;
     use tempfile::TempDir;
 
     // `super::*` re-exports `env` and `fs` from outer `use` lines, so they're
     // already in scope here.
-
-    // Holds the shared crate-level PATH guard for the lifetime of the
-    // override so scaffold tests running concurrently with config's
-    // push-shim tests can't stomp each other's PATH restores.
-
-    #[cfg(unix)]
-    struct PathOverride {
-        _guard: MutexGuard<'static, ()>,
-        original: Option<String>,
-    }
-    #[cfg(not(unix))]
-    struct PathOverride {
-        original: Option<String>,
-    }
-
-    impl PathOverride {
-        fn prepend(path: &Path) -> Self {
-            #[cfg(unix)]
-            let guard = path_mutation_guard()
-                .lock()
-                .expect("PATH mutation guard poisoned");
-            let original = env::var("PATH").ok();
-            let sep = if cfg!(windows) { ";" } else { ":" };
-            let prefix = path.to_string_lossy();
-            let new_path = match &original {
-                Some(existing) if !existing.is_empty() => format!("{prefix}{sep}{existing}"),
-                _ => prefix.into_owned(),
-            };
-            env::set_var("PATH", &new_path);
-            #[cfg(unix)]
-            {
-                Self {
-                    original,
-                    _guard: guard,
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                Self { original }
-            }
-        }
-    }
-
-    impl Drop for PathOverride {
-        fn drop(&mut self) {
-            if let Some(original) = &self.original {
-                env::set_var("PATH", original);
-            } else {
-                env::remove_var("PATH");
-            }
-        }
-    }
 
     #[test]
     fn upper_camel_from_sanitized_covers_derivation_rules() {
@@ -1097,9 +1044,10 @@ mod tests {
         // string carries the underlying error.
         let err: GeneratorError = fmt::Error.into();
         assert!(matches!(err, GeneratorError::Format(_)));
-        assert!(err
-            .to_string()
-            .contains("failed to format generator output"));
+        assert!(
+            err.to_string()
+                .contains("failed to format generator output")
+        );
     }
 
     fn write_git_stub(bin_dir: &Path) {
@@ -1339,6 +1287,80 @@ mod tests {
                  (synthesise_fastly_toml omits it when None): {fastly_toml}"
             );
         }
+
+        assert_scaffold_package_metadata(project_dir, &cargo_toml);
+    }
+
+    /// The generated manifests must keep the package-metadata contract: the
+    /// root declares the five shared fields once, and EVERY member inherits
+    /// all five rather than hardcoding them. Asserted structurally (not with
+    /// `contains`) so template drift cannot silently reintroduce a crate that
+    /// pins its own `version`/`edition` or drops `publish`.
+    fn assert_scaffold_package_metadata(project_dir: &Path, cargo_toml: &str) {
+        let root: toml::Value = toml::from_str(cargo_toml).expect("parse root Cargo.toml");
+        let shared = root
+            .get("workspace")
+            .and_then(|ws| ws.get("package"))
+            .expect("root [workspace.package]");
+        assert_eq!(
+            shared.get("edition").and_then(toml::Value::as_str),
+            Some("2024"),
+            "generated workspace must pin the Rust edition"
+        );
+        assert_eq!(
+            shared.get("publish").and_then(toml::Value::as_bool),
+            Some(false),
+            "generated crates must not be publishable by default"
+        );
+        assert_eq!(
+            shared.get("version").and_then(toml::Value::as_str),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            shared.get("license").and_then(toml::Value::as_str),
+            Some("Apache-2.0")
+        );
+        assert!(
+            shared
+                .get("authors")
+                .and_then(toml::Value::as_array)
+                .is_some(),
+            "root [workspace.package] must declare authors"
+        );
+
+        let members: Vec<PathBuf> = fs::read_dir(project_dir.join("crates"))
+            .expect("read crates dir")
+            .map(|entry| entry.expect("crate dir entry").path())
+            .collect();
+        assert!(
+            members.len() >= 2,
+            "expected at least the generated core and cli crates"
+        );
+        for dir in members {
+            let raw = fs::read_to_string(dir.join("Cargo.toml")).expect("read member Cargo.toml");
+            let parsed: toml::Value = toml::from_str(&raw).expect("parse member Cargo.toml");
+            let package = parsed.get("package").expect("member [package]");
+            let label = dir.display();
+
+            for field in ["authors", "edition", "license", "publish", "version"] {
+                let inherited = package
+                    .get(field)
+                    .and_then(|value| value.get("workspace"))
+                    .and_then(toml::Value::as_bool);
+                assert_eq!(
+                    inherited,
+                    Some(true),
+                    "{label}: `{field}` must be inherited via {{ workspace = true }}"
+                );
+            }
+            for field in ["name", "description"] {
+                let value = package.get(field).and_then(toml::Value::as_str);
+                assert!(
+                    value.is_some_and(|found| !found.trim().is_empty()),
+                    "{label}: `{field}` must be present and non-empty"
+                );
+            }
+        }
     }
 
     /// Init a temporary git repo in `project_dir`, plant a
@@ -1551,16 +1573,27 @@ mod tests {
                 walk_toml_templates(&path, visit);
                 continue;
             }
-            if name_str.ends_with(".toml.hbs") {
-                if let Ok(body) = fs::read_to_string(&path) {
-                    visit(&path, &body);
-                }
+            if name_str.ends_with(".toml.hbs")
+                && let Ok(body) = fs::read_to_string(&path)
+            {
+                visit(&path, &body);
             }
         }
     }
 
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
+        // Serialise PATH mutation against config.rs's push-shim tests
+        // (both run in the same edgezero-cli test binary and mutate
+        // `$PATH`). The shared `PathPrepend` guard does its own
+        // `unsafe env::set_var`; holding this crate-wide mutex for the
+        // override's lifetime keeps the two callsites from interleaving
+        // their PATH restores.
+        #[cfg(unix)]
+        let _path_lock = path_mutation_guard()
+            .lock()
+            .expect("PATH mutation guard poisoned");
+
         let temp = TempDir::new().expect("temp dir");
         // Resolve the REAL git binary BEFORE the PATH stub goes in
         // so `assert_scaffold_workspace`'s git-check-ignore probe
@@ -1569,7 +1602,7 @@ mod tests {
 
         let bin_dir = temp.path().join("bin");
         write_git_stub(&bin_dir);
-        let _path_guard = PathOverride::prepend(&bin_dir);
+        let _path_guard = PathOverride::new(&bin_dir);
 
         let args = NewArgs {
             name: "demo-app".into(),

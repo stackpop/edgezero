@@ -13,7 +13,7 @@
 //! then catches accidental `eprint!` / `eprintln!` in ANY other call
 //! site as a real bug (the mistaken use of stderr for a payload).
 
-use std::io::{stderr, Write as _};
+use std::io::{Write as _, stderr};
 
 /// Write `msg` + newline to stderr. Best-effort: write errors on a
 /// closed stderr are swallowed because the caller has no useful

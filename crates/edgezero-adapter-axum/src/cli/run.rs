@@ -767,9 +767,11 @@ mod tests {
     fn deploy_returns_error() {
         let result = deploy(&[]);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("does not define a deploy command"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("does not define a deploy command")
+        );
     }
 
     #[test]

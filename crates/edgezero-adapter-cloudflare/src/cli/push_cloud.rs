@@ -5,8 +5,8 @@ use std::process::Command;
 
 use edgezero_adapter::registry::{ReadConfigEntry, ResolvedStoreId};
 
-use super::provision_cloud::find_namespace_id;
 use super::WRANGLER_INSTALL_HINT;
+use super::provision_cloud::find_namespace_id;
 
 /// Push `entries` to the remote KV namespace bound to `store` (looked
 /// up in `wrangler.toml`) via `wrangler kv bulk put <tempfile.json>
@@ -306,54 +306,18 @@ pub(super) fn read_wrangler_kv_key(
 
 #[cfg(test)]
 mod tests {
+    use super::super::CloudflareCliAdapter;
     #[cfg(unix)]
     use super::super::path_mutation_guard;
-    use super::super::CloudflareCliAdapter;
     use super::*;
     use edgezero_adapter::registry::{
         Adapter as _, AdapterPushContext, ReadConfigEntry, ResolvedStoreId,
     };
-    #[cfg(unix)]
-    use std::env;
-    #[cfg(unix)]
-    use std::ffi::OsString;
+    use edgezero_core::test_env::PathPrepend;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
     const TEST_CONFIG_ID: &str = "app_config";
-
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     #[cfg(unix)]
     fn fake_wrangler_returning(
@@ -433,8 +397,7 @@ mod tests {
     #[test]
     fn push_dry_run_resolves_namespace_id_and_does_not_invoke_wrangler() {
         let dir = tempdir().expect("tempdir");
-        let original =
-            "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"00112233445566778899aabbccddeeff\"\n";
+        let original = "name = \"demo\"\n[[kv_namespaces]]\nbinding = \"app_config\"\nid = \"00112233445566778899aabbccddeeff\"\n";
         let path = write_wrangler(dir.path(), original);
         let entries = vec![
             ("greeting".to_owned(), "hello".to_owned()),

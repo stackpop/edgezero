@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use ctor::ctor;
 use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
-use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
+use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
-    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    TypedSecretEntry,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
+    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
+    register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 
 mod provision_cloud;
@@ -65,15 +65,13 @@ static CLOUDFLARE_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_cloudflare",
         repo_crate: "crates/edgezero-adapter-cloudflare",
-        fallback:
-            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
+        fallback: "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_cloudflare_wasm",
         repo_crate: "crates/edgezero-adapter-cloudflare",
-        fallback:
-            "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
+        fallback: "edgezero-adapter-cloudflare = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-cloudflare\", default-features = false, features = [\"cloudflare\"] }",
         features: &["cloudflare"],
     },
 ];

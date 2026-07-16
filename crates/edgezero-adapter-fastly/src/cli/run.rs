@@ -183,7 +183,7 @@ fn locate_artifact(
 /// §"Writeback ownership" — we deliberately don't emit
 /// `service_id = ""`).
 pub(crate) fn synthesise_fastly_toml(crate_name: &str, service_id: Option<&str>) -> String {
-    use toml_edit::{value, Array, DocumentMut, Item, Table};
+    use toml_edit::{Array, DocumentMut, Item, Table, value};
 
     // The `name` field spells the adapter crate's Cargo package
     // name. The caller in `cli/mod.rs` reads this from the

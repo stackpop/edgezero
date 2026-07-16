@@ -3,27 +3,27 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 
+use crate::SpinFullResponse;
 use crate::config_store::SpinConfigStore;
-use crate::context::{parse_client_addr, SpinRequestContext};
-use crate::key_value_store::{SpinKvStore, DEFAULT_MAX_LIST_KEYS};
+use crate::context::{SpinRequestContext, parse_client_addr};
+use crate::key_value_store::{DEFAULT_MAX_LIST_KEYS, SpinKvStore};
 use crate::proxy::SpinProxyClient;
 use crate::response::from_core_response;
 use crate::secret_store::SpinSecretStore;
-use crate::SpinFullResponse;
 use edgezero_core::app::{App, StoreMetadata};
 use edgezero_core::body::Body;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{request_builder, Request};
+use edgezero_core::http::{Request, request_builder};
 use edgezero_core::key_value_store::KvHandle;
 use edgezero_core::proxy::ProxyHandle;
 use edgezero_core::secret_store::SecretHandle;
 use edgezero_core::store_registry::{
     BoundSecretStore, ConfigRegistry, ConfigStoreBinding, KvRegistry, SecretRegistry, StoreRegistry,
 };
-use spin_sdk::http::body::IncomingBodyExt as _;
 use spin_sdk::http::Request as SpinRequest;
+use spin_sdk::http::body::IncomingBodyExt as _;
 
 /// Per-dispatch store wiring assembled before the request enters the router.
 /// The struct itself is `pub(crate)` because `dispatch_with_handles` takes it

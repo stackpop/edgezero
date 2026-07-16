@@ -7,13 +7,13 @@ use ctor::ctor;
 use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
-    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    TypedSecretEntry,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
+    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
+    register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 
 mod provision_local;
@@ -68,15 +68,13 @@ static SPIN_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_spin",
         repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
+        fallback: "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_spin_wasm",
         repo_crate: "crates/edgezero-adapter-spin",
-        fallback:
-            "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
+        fallback: "edgezero-adapter-spin = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-spin\", default-features = false, features = [\"spin\"] }",
         features: &["spin"],
     },
 ];
@@ -200,7 +198,7 @@ impl Adapter for SpinCliAdapter {
             other => {
                 return Err(format!(
                     "spin adapter does not implement provision mode {other:?}"
-                ))
+                ));
             }
         }
         //: spin provision is pure spin.toml editing — no
@@ -777,7 +775,7 @@ fn ensure_kv_label_in_component(
     component_id: &str,
     label: &str,
 ) -> Result<bool, String> {
-    use toml_edit::{value, Array, DocumentMut, Value};
+    use toml_edit::{Array, DocumentMut, Value, value};
 
     let raw = fs::read_to_string(spin_path)
         .map_err(|err| format!("failed to read {}: {err}", spin_path.display()))?;

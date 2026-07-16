@@ -419,15 +419,12 @@ fn resolve_remote_config_store_id(name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::FastlyCliAdapter;
     #[cfg(unix)]
     use super::super::path_mutation_guard;
-    use super::super::FastlyCliAdapter;
     use super::*;
     use edgezero_adapter::registry::{Adapter as _, AdapterPushContext};
-    #[cfg(unix)]
-    use std::env;
-    #[cfg(unix)]
-    use std::ffi::OsString;
+    use edgezero_core::test_env::PathPrepend;
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
@@ -436,41 +433,6 @@ mod tests {
 
     // Shared fixture names.
     const TEST_CONFIG_ID: &str = "app_config";
-
-    /// RAII guard: prepends a directory to `$PATH` and restores the original
-    /// value on drop.
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new_path = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new_path);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     /// Build a tempdir containing a `fastly` shim script that:
     /// - Responds to `config-store list --json` with a store-list JSON containing

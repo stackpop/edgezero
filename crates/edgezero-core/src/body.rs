@@ -3,8 +3,8 @@ use std::io;
 
 use bytes::Bytes;
 use futures_util::stream::{LocalBoxStream, Stream, StreamExt};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::error::EdgeError;
 

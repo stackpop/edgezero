@@ -8,9 +8,10 @@
 //! downstream process calling `run_serve` from one thread while
 //! another thread reads `std::env::var(...)` observes a torn
 //! read that the C standard flags as undefined behaviour. The
-//! repository's own `shared_test_guards::env_mutation_guard()`
-//! documents this constraint for tests but the same rule applies
-//! at runtime.
+//! repository's own `shared_test_guards` + `edgezero_core::test_env`
+//! guards document this constraint for tests (and edition 2024 marks
+//! `env::set_var` `unsafe` for exactly this reason) — the same rule
+//! applies at runtime.
 //!
 //! The parser returns an owned `Vec<(String, String)>` overlay
 //! that `run_serve` threads into the spawned child via

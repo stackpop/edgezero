@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
+use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
 use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores};
 
 /// Local-mode `provision` arm.
@@ -142,8 +142,7 @@ mod tests {
         // byte-identical.
         let dir = tempdir().unwrap();
         let axum_toml = dir.path().join("axum.toml");
-        let operator_content =
-            "# operator-edited\n[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"0.0.0.0\"\nport = 3000\n";
+        let operator_content = "# operator-edited\n[adapter]\ncrate = \"demo\"\ncrate_dir = \".\"\nhost = \"0.0.0.0\"\nport = 3000\n";
         fs::write(&axum_toml, operator_content).unwrap();
         let config_ids = ResolvedStoreId::from_logicals(&["app_config"]);
         let stores = ProvisionStores {

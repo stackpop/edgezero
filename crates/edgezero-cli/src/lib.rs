@@ -66,8 +66,8 @@ pub mod args;
 pub use auth::run_auth;
 #[cfg(feature = "cli")]
 pub use config::{
-    run_config_diff_typed, run_config_push, run_config_push_typed, run_config_validate,
-    run_config_validate_typed, DiffExit,
+    DiffExit, run_config_diff_typed, run_config_push, run_config_push_typed, run_config_validate,
+    run_config_validate_typed,
 };
 #[cfg(feature = "cli")]
 pub use provision::{run_provision, run_provision_typed};
@@ -217,21 +217,21 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), String> {
     // the overlay through `Command::env` keeps every mutation on
     // the `Command`'s private map — no shared state, no race.
     let mut env_overlay: Vec<(String, String)> = Vec::new();
-    if let Some(loader) = manifest.as_ref() {
-        if let Some(root) = loader.manifest().root() {
-            let manifest_data = loader.manifest();
-            if let Some((_key, adapter_cfg)) = manifest_data.adapter_entry(&args.adapter) {
-                assert_provision_paths_safe(
-                    root,
-                    adapter_cfg.adapter.manifest.as_deref(),
-                    adapter_cfg.adapter.crate_path.as_deref(),
-                )?;
-            }
-            if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root) {
-                if env_path.exists() {
-                    env_overlay = env_file::parse_env_overlay(&env_path)?;
-                }
-            }
+    if let Some(loader) = manifest.as_ref()
+        && let Some(root) = loader.manifest().root()
+    {
+        let manifest_data = loader.manifest();
+        if let Some((_key, adapter_cfg)) = manifest_data.adapter_entry(&args.adapter) {
+            assert_provision_paths_safe(
+                root,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        }
+        if let Some(env_path) = resolve_serve_env_file(manifest_data, &args.adapter, root)
+            && env_path.exists()
+        {
+            env_overlay = env_file::parse_env_overlay(&env_path)?;
         }
     }
 
@@ -344,9 +344,15 @@ fn store_bindings_message(adapter_name: &str, manifest: &ManifestLoader) -> Opti
     // metadata from secret material), and adapters/operators can read the
     // binding name from their own `edgezero.toml` if they need to verify it.
     let message = match adapter_name {
-        "axum" => "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs",
-        "cloudflare" => "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler",
-        _ => "[edgezero] secrets enabled -- ensure the configured secret store is provisioned on the target platform",
+        "axum" => {
+            "[edgezero] secrets enabled for axum -- ensure the required environment variables are set for local runs"
+        }
+        "cloudflare" => {
+            "[edgezero] secrets enabled for cloudflare -- ensure the required secret bindings exist in wrangler"
+        }
+        _ => {
+            "[edgezero] secrets enabled -- ensure the configured secret store is provisioned on the target platform"
+        }
     };
 
     Some(message.to_owned())
@@ -407,7 +413,7 @@ fn load_manifest_optional() -> Result<Option<ManifestLoader>, String> {
 #[cfg(feature = "cli")]
 mod tests {
     use super::*;
-    use crate::test_support::{manifest_guard, EnvOverride, BASIC_MANIFEST};
+    use crate::test_support::{BASIC_MANIFEST, EnvOverride, manifest_guard};
     use edgezero_core::manifest::ManifestLoader;
     use std::fs;
     use tempfile::TempDir;

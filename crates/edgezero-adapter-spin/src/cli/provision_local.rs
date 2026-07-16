@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
+use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
 use edgezero_adapter::registry::{ProvisionOutcome, ProvisionStores, TypedSecretEntry};
 
 /// Local-mode provision arm: extend `[component.<id>].key_value_stores`
@@ -306,7 +306,7 @@ fn upsert_component_variable(
     spin_var: &str,
     spin_path: &Path,
 ) -> Result<bool, String> {
-    use toml_edit::{value, Item, Table};
+    use toml_edit::{Item, Table, value};
 
     let component_root = doc.get_mut("component").ok_or_else(|| {
         format!(
@@ -357,7 +357,7 @@ fn append_kv_store_to_component(
     platform: &str,
     spin_path: &Path,
 ) -> Result<bool, String> {
-    use toml_edit::{value, Array, Value};
+    use toml_edit::{Array, Value, value};
 
     let component_root = doc.get_mut("component").ok_or_else(|| {
         format!(
@@ -412,7 +412,7 @@ fn append_key_value_store_block(
     doc: &mut toml_edit::DocumentMut,
     platform: &str,
 ) -> Result<bool, String> {
-    use toml_edit::{value, Item, Table};
+    use toml_edit::{Item, Table, value};
 
     // Fast-path idempotency check: if a stanza for this platform
     // already exists, no work to do.
@@ -525,11 +525,12 @@ fn build_env_lines(stores: &ProvisionStores<'_>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::run::{synthesise_runtime_config_toml, synthesise_spin_toml};
     use super::super::SpinCliAdapter;
+    use super::super::run::{synthesise_runtime_config_toml, synthesise_spin_toml};
     use edgezero_adapter::registry::{
         Adapter as _, ProvisionMode, ProvisionStores, ResolvedStoreId, TypedSecretEntry,
     };
+    use edgezero_core::test_env::{EnvOverride, PathPrepend};
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
@@ -558,8 +559,7 @@ mod tests {
     #[test]
     fn provision_dry_run_does_not_edit_spin_toml() {
         let dir = tempdir().expect("tempdir");
-        let original =
-            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
+        let original = "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"demo.wasm\"\n";
         let path = write_spin(dir.path(), original);
         let kv_ids: Vec<ResolvedStoreId> =
             ResolvedStoreId::from_logicals(&[TEST_KV_ID, TEST_KV_ID_ALT]);
@@ -1454,73 +1454,6 @@ mod tests {
 
     use super::super::env_mutation_guard;
     use std::collections::BTreeSet;
-    use std::env;
-    use std::ffi::OsString;
-
-    /// RAII guard: prepends `extra` to `$PATH` on construct,
-    /// restores the original value on drop. Must be held while
-    /// `env_mutation_guard()` is locked.
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new_path = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new_path);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
-
-    /// RAII guard for a single arbitrary env var. Sets on
-    /// construct, restores the previous value (or removes) on
-    /// drop. Must be held while `env_mutation_guard()` is
-    /// locked.
-    struct SetVar {
-        key: String,
-        original: Option<OsString>,
-    }
-
-    impl SetVar {
-        fn new(key: &str, value: &str) -> Self {
-            let original = env::var_os(key);
-            env::set_var(key, value);
-            Self {
-                key: key.to_owned(),
-                original,
-            }
-        }
-    }
-
-    impl Drop for SetVar {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var(&self.key, prev),
-                None => env::remove_var(&self.key),
-            }
-        }
-    }
 
     /// Shell-script shim named `spin` that fails loudly if ever
     /// invoked. The Spin local-mode provision path is pure file
@@ -1849,9 +1782,7 @@ mod tests {
             "trigger component id must match the renamed adapter crate: {spin_body}"
         );
         assert!(
-            spin_body.contains(
-                "source = \"../../target/wasm32-wasip2/release/spin_server.wasm\""
-            ),
+            spin_body.contains("source = \"../../target/wasm32-wasip2/release/spin_server.wasm\""),
             "wasm source path must underscore the renamed crate name (spin_server.wasm) — got: {spin_body}"
         );
         assert!(
@@ -1910,9 +1841,8 @@ mod tests {
         // instead of the workspace's `target/...`. The full
         // 3-deep prefix (`../../../target/...`) is required.
         assert!(
-            spin_body.contains(
-                "source = \"../../../target/wasm32-wasip2/release/spin_server.wasm\""
-            ),
+            spin_body
+                .contains("source = \"../../../target/wasm32-wasip2/release/spin_server.wasm\""),
             "nested manifest MUST prepend three `..` levels to reach the workspace `target/` dir: {spin_body}"
         );
     }
@@ -2081,7 +2011,7 @@ mod tests {
         // because the process env is shared with parallel
         // test threads.
         let _lock = env_mutation_guard().lock().expect("guard");
-        let _var = SetVar::new("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "prod_config");
+        let _var = EnvOverride::set("EDGEZERO__STORES__CONFIG__APP_CONFIG__NAME", "prod_config");
 
         let dir = tempdir().expect("tempdir");
         seed_baseline(dir.path(), TEST_COMPONENT_ID);

@@ -192,7 +192,7 @@ fn locate_artifact(
 /// legal name — including values with TOML-significant characters
 /// like `"`, `\`, or newlines — is escaped correctly.
 pub(super) fn synthesise_wrangler_toml(crate_name: &str) -> String {
-    use toml_edit::{value, DocumentMut, Item, Table};
+    use toml_edit::{DocumentMut, Item, Table, value};
 
     let mut doc = DocumentMut::new();
     doc.decor_mut().set_prefix("# edgezero-provision: v1\n");

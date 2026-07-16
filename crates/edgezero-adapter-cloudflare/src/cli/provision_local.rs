@@ -2,7 +2,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
-use edgezero_adapter::env_file::{append_lines_dedup_with_header, EDGEZERO_PROVISION_HEADER};
+use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
 use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
 
 use super::provision_cloud::is_real_namespace_id;
@@ -150,7 +150,7 @@ fn item_kind(item: &toml_edit::Item) -> &'static str {
 /// becomes an orphan in the Cloudflare account. `EdgeZero` does not
 /// take a lockfile; operators must serialise provision themselves.
 pub(super) fn upsert_kv_namespace(path: &Path, binding: &str, id: &str) -> Result<(), String> {
-    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+    use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
     // Treat NotFound as "start with empty document" symmetrically with
     // `read_namespace_id` so the orphan-namespace hazard goes away: if
@@ -363,7 +363,7 @@ fn upsert_kv_namespace_entry(
     deployed_preview: Option<&str>,
     placeholder: &str,
 ) -> Result<String, String> {
-    use toml_edit::{value, ArrayOfTables, Item, Table};
+    use toml_edit::{ArrayOfTables, Item, Table, value};
 
     let entry = doc
         .entry("kv_namespaces")
@@ -414,59 +414,23 @@ fn upsert_kv_namespace_entry(
 
 #[cfg(test)]
 mod tests {
+    use super::super::CloudflareCliAdapter;
     #[cfg(unix)]
     use super::super::path_mutation_guard;
     use super::super::run::synthesise_wrangler_toml;
-    use super::super::CloudflareCliAdapter;
     use super::*;
     use edgezero_adapter::env_file::EDGEZERO_PROVISION_HEADER;
     use edgezero_adapter::registry::{
         Adapter as _, AdapterDeployedState, ProvisionMode, ProvisionStores, ResolvedStoreId,
     };
+    use edgezero_core::test_env::PathPrepend;
     use std::collections::BTreeMap;
-    #[cfg(unix)]
-    use std::env;
-    #[cfg(unix)]
-    use std::ffi::OsString;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
     const TEST_KV_ID: &str = "sessions";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
-
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     /// A wrangler shim that fails loudly if invoked. Used by
     /// `provision_local_zero_cloud_calls` to prove local-mode

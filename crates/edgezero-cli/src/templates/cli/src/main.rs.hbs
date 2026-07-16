@@ -11,11 +11,11 @@
 //! checks, and the Spin namespace collision check all run.
 
 use clap::{Parser, Subcommand};
+use edgezero_cli::DiffExit;
 use edgezero_cli::args::{
     AuthArgs, BuildArgs, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DeployArgs, NewArgs,
     ProvisionArgs, ServeArgs,
 };
-use edgezero_cli::DiffExit;
 use {{proj_core_mod}}::config::{{NameUpperCamel}}Config;
 
 #[derive(Parser, Debug)]

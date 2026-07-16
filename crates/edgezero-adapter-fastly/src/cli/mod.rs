@@ -4,13 +4,13 @@ use ctor::ctor;
 use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::registry::{
-    register_adapter, Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext,
-    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
-    TypedSecretEntry,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
+    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
+    register_adapter,
 };
 use edgezero_adapter::scaffold::{
-    register_adapter_blueprint, AdapterBlueprint, AdapterFileSpec, CommandTemplates,
-    DependencySpec, LoggingDefaults, ManifestSpec, ReadmeInfo, TemplateRegistration,
+    AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
+    ManifestSpec, ReadmeInfo, TemplateRegistration, register_adapter_blueprint,
 };
 
 mod provision_cloud;
@@ -65,15 +65,13 @@ static FASTLY_DEPENDENCIES: &[DependencySpec] = &[
     DependencySpec {
         key: "dep_edgezero_adapter_fastly",
         repo_crate: "crates/edgezero-adapter-fastly",
-        fallback:
-            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false }",
+        fallback: "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false }",
         features: &[],
     },
     DependencySpec {
         key: "dep_edgezero_adapter_fastly_wasm",
         repo_crate: "crates/edgezero-adapter-fastly",
-        fallback:
-            "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
+        fallback: "edgezero-adapter-fastly = { git = \"https://git@github.com/stackpop/edgezero.git\", package = \"edgezero-adapter-fastly\", default-features = false, features = [\"fastly\"] }",
         features: &["fastly"],
     },
 ];
@@ -118,8 +116,7 @@ static FASTLY_TEMPLATE_REGISTRATIONS: &[TemplateRegistration] = &[
     },
 ];
 
-pub(super) const FASTLY_INSTALL_HINT: &str =
-    "install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again";
+pub(super) const FASTLY_INSTALL_HINT: &str = "install the Fastly CLI (https://www.fastly.com/documentation/reference/tools/cli/) and try again";
 
 pub(super) struct FastlyCliAdapter;
 

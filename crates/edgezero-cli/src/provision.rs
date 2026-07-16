@@ -13,23 +13,23 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use similar::TextDiff;
-use toml_edit::{table, value, DocumentMut};
+use toml_edit::{DocumentMut, table, value};
 
 use crate::args::ProvisionArgs;
 use crate::config::{
-    build_typed_secret_entries, enforce_single_store_capability,
+    ValidationContext, build_typed_secret_entries, enforce_single_store_capability,
     load_validation_context_with_options, reject_merged_id_collisions,
     resolve_app_config_path_primitive, run_typed_preflight, strict_handler_paths,
-    validate_deployed_field_ownership, ValidationContext,
+    validate_deployed_field_ownership,
 };
 use crate::copy_tree::copy_dir_recursive;
 use crate::ensure_adapter_defined;
 use crate::path_safety::{assert_provision_paths_contained, assert_provision_paths_safe};
 use crate::provision_lock::ProvisionLock;
+use edgezero_adapter::AdapterDeployedState;
 use edgezero_adapter::registry::{
     self as adapter_registry, ProvisionOutcome, ProvisionStores, ResolvedStoreId, TypedSecretEntry,
 };
-use edgezero_adapter::AdapterDeployedState;
 use edgezero_core::app_config::{self, AppConfigLoadOptions, AppConfigMeta};
 use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestAdapter, ManifestLoader, StoreDeclaration};
@@ -1436,9 +1436,9 @@ where
 mod tests {
     use super::*;
     use crate::args::ProvisionArgs;
-    use crate::test_support::{manifest_guard, EnvOverride, PROVISION_MANIFEST};
+    use crate::test_support::{EnvOverride, PROVISION_MANIFEST, manifest_guard};
     use edgezero_adapter::registry::{
-        get_adapter, register_adapter, Adapter, AdapterAction, ProvisionMode, ProvisionOutcome,
+        Adapter, AdapterAction, ProvisionMode, ProvisionOutcome, get_adapter, register_adapter,
     };
     use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
     use std::borrow::Cow;
@@ -1447,8 +1447,8 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
 
     // ----- fixtures for CLI-owned first-run bootstrap synthesis -----

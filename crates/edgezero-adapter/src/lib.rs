@@ -18,6 +18,6 @@ pub mod cli_support;
 // `edgezero_adapter::registry::TypeName`. Mirrors the surface
 // adapters already touch via `registry::*` imports today.
 pub use registry::{
-    get_adapter, Adapter, AdapterDeployedState, ProvisionMode, ProvisionOutcome, ProvisionStores,
-    ResolvedStoreId, TypedSecretEntry,
+    Adapter, AdapterDeployedState, ProvisionMode, ProvisionOutcome, ProvisionStores,
+    ResolvedStoreId, TypedSecretEntry, get_adapter,
 };

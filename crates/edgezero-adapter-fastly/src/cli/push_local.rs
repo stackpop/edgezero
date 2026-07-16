@@ -144,8 +144,8 @@ pub(super) fn read_entry(
 
 #[cfg(test)]
 mod tests {
-    use super::super::provision_local::write_fastly_local_config_store;
     use super::super::FastlyCliAdapter;
+    use super::super::provision_local::write_fastly_local_config_store;
     use super::*;
     use edgezero_adapter::registry::{Adapter as _, AdapterPushContext, ResolvedStoreId};
     use tempfile::tempdir;

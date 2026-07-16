@@ -5,11 +5,11 @@ use std::process::Command;
 
 use edgezero_adapter::registry::{AdapterDeployedState, ProvisionOutcome, ProvisionStores};
 
+use super::WRANGLER_INSTALL_HINT;
 use super::provision_local::{
     check_kv_namespaces_writeback_shape, existing_real_namespace_id, read_namespace_id,
     upsert_kv_namespace,
 };
-use super::WRANGLER_INSTALL_HINT;
 
 /// Cloud-mode `provision` arm: shells out to `wrangler kv namespace
 /// create <binding>` for every declared KV / config store that isn't
@@ -330,17 +330,14 @@ pub(super) fn find_namespace_id(wrangler_path: &Path, binding: &str) -> Result<S
 // against the parsed namespace id).
 #[cfg(test)]
 mod tests {
+    use super::super::CloudflareCliAdapter;
     #[cfg(unix)]
     use super::super::path_mutation_guard;
-    use super::super::CloudflareCliAdapter;
     use super::*;
     use edgezero_adapter::registry::{
         Adapter as _, ProvisionMode, ProvisionStores, ResolvedStoreId,
     };
-    #[cfg(unix)]
-    use std::env;
-    #[cfg(unix)]
-    use std::ffi::OsString;
+    use edgezero_core::test_env::PathPrepend;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -349,39 +346,6 @@ mod tests {
     const TEST_KV_ID_ALT: &str = "cache";
     const TEST_CONFIG_ID: &str = "app_config";
     const TEST_SECRET_ID: &str = "default";
-
-    #[cfg(unix)]
-    struct PathPrepend {
-        original: Option<OsString>,
-    }
-
-    #[cfg(unix)]
-    impl PathPrepend {
-        fn new(extra: &Path) -> Self {
-            let original = env::var_os("PATH");
-            let new = match &original {
-                Some(prev) => {
-                    let mut accum = OsString::from(extra);
-                    accum.push(":");
-                    accum.push(prev);
-                    accum
-                }
-                None => OsString::from(extra),
-            };
-            env::set_var("PATH", new);
-            Self { original }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for PathPrepend {
-        fn drop(&mut self) {
-            match self.original.take() {
-                Some(prev) => env::set_var("PATH", prev),
-                None => env::remove_var("PATH"),
-            }
-        }
-    }
 
     #[cfg(unix)]
     fn fake_wrangler_returning(
@@ -594,7 +558,9 @@ id = "00112233445566778899aabbccddeeff"
         assert_eq!(out.status_lines.len(), 4);
         assert!(out.status_lines[0].contains("would run `wrangler kv namespace create sessions`"));
         assert!(out.status_lines[1].contains("would run `wrangler kv namespace create cache`"));
-        assert!(out.status_lines[2].contains("would run `wrangler kv namespace create app_config`"));
+        assert!(
+            out.status_lines[2].contains("would run `wrangler kv namespace create app_config`")
+        );
         assert!(out.status_lines[3].contains("runtime-managed via `wrangler secret put`"));
         // Manifest untouched.
         let after = fs::read_to_string(dir.path().join("wrangler.toml")).expect("read");

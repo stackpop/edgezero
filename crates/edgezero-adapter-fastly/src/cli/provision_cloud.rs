@@ -338,7 +338,7 @@ fn setup_block_present(path: &Path, kind: &str, id: &str) -> Result<bool, String
 /// server seeding moved to `config push --local` (config-stores
 /// only), so provision only owns the remote / setup half.
 fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> {
-    use toml_edit::{table, DocumentMut, Item};
+    use toml_edit::{DocumentMut, Item, table};
 
     let raw = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -377,8 +377,8 @@ fn append_fastly_setup(path: &Path, kind: &str, id: &str) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::run::synthesise_fastly_toml;
     use super::super::FastlyCliAdapter;
+    use super::super::run::synthesise_fastly_toml;
     use super::*;
     use edgezero_adapter::registry::{
         Adapter as _, ProvisionMode, ResolvedStoreId, TypedSecretEntry,
@@ -639,8 +639,10 @@ mod tests {
         // 1 KV + 1 config + 1 secret + 1 runtime-env = 4 status lines.
         assert_eq!(out.status_lines.len(), 4);
         assert!(out.status_lines[0].contains("would run `fastly kv-store create --name=sessions`"));
-        assert!(out.status_lines[1]
-            .contains("would run `fastly config-store create --name=app_config`"));
+        assert!(
+            out.status_lines[1]
+                .contains("would run `fastly config-store create --name=app_config`")
+        );
         assert!(
             out.status_lines[2].contains("would run `fastly secret-store create --name=default`")
         );

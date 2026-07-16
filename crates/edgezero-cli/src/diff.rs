@@ -495,10 +495,10 @@ mod tests {
         let changes = collect_changes(&remote, &local);
         let mut added: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         for entry in changes {
-            if matches!(entry.kind, DiffKind::Added) {
-                if let Some(val) = entry.to {
-                    added.insert(entry.path, val);
-                }
+            if matches!(entry.kind, DiffKind::Added)
+                && let Some(val) = entry.to
+            {
+                added.insert(entry.path, val);
             }
         }
         assert_eq!(
