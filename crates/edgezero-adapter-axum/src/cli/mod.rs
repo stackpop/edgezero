@@ -303,14 +303,30 @@ impl Adapter for AxumCliAdapter {
         // override to switch between them). The map is owned (rather
         // than borrowed) so we can merge old + new without lifetime
         // surgery on the slice.
+        // Only two cases legitimately yield an empty starting map: the
+        // file does not exist yet, or it exists but is blank. EVERY
+        // other read failure (invalid UTF-8, permission denied, a
+        // transient I/O error) MUST propagate -- a `_ => BTreeMap::new()`
+        // catch-all silently discards the operator's existing keys and
+        // the `fs::write` below then replaces the file with just this
+        // push's entries, losing every sibling blob (e.g. a previously
+        // pushed `app_config` when pushing `app_config_staging`).
         let mut map: BTreeMap<String, String> = match fs::read_to_string(&target) {
-            Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text).map_err(|err| {
+            Ok(text) if text.trim().is_empty() => BTreeMap::new(),
+            Ok(text) => serde_json::from_str(&text).map_err(|err| {
                 format!(
                     "failed to parse existing {}: {err} (expected a JSON object of key->envelope)",
                     target.display()
                 )
             })?,
-            _ => BTreeMap::new(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(err) => {
+                return Err(format!(
+                    "failed to read existing {}: {err} -- refusing to overwrite it, which would \
+                     drop any config keys it already holds",
+                    target.display()
+                ));
+            }
         };
         for (key, value) in entries {
             map.insert(key.clone(), value.clone());
@@ -640,6 +656,52 @@ mod tests {
             .expect("read written file");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
         assert_eq!(parsed, serde_json::json!({}));
+    }
+
+    #[test]
+    fn push_propagates_read_error_instead_of_clobbering_existing_keys() {
+        // Regression (PR #287 review round 9, blocking #4): the read
+        // arm used to be `_ => BTreeMap::new()`, which swallowed EVERY
+        // read failure -- not just NotFound. A local-config file that
+        // is unreadable (invalid UTF-8 here; permission-denied and
+        // transient I/O errors take the same arm) would silently reset
+        // the map, and the `fs::write` that follows would replace the
+        // file with only this push's entries -- destroying every
+        // sibling blob the operator had already pushed.
+        //
+        // Invalid UTF-8 is the portable way to force `read_to_string`
+        // to fail: a permission-based fixture would need root-less
+        // chmod semantics that differ across CI platforms.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local_dir = dir.path().join(".edgezero");
+        fs::create_dir_all(&local_dir).expect("mkdir .edgezero");
+        let target = local_dir.join("local-config-app_config.json");
+        fs::write(&target, [0x66, 0x6f, 0x6f, 0xff, 0xfe]).expect("seed invalid UTF-8");
+
+        let err = AxumCliAdapter
+            .push_config_entries(
+                dir.path(),
+                None,
+                None,
+                &ResolvedStoreId::from_logical("app_config"),
+                &[("app_config".to_owned(), "{}".to_owned())],
+                &AdapterPushContext::new(),
+                false,
+            )
+            .expect_err("an unreadable local-config file must abort the push");
+        assert!(
+            err.contains("failed to read existing"),
+            "error must name the read failure rather than silently resetting the store: {err}"
+        );
+
+        // The load-bearing assertion: the unreadable file is untouched,
+        // so no operator data was destroyed by the failed push.
+        let after = fs::read(&target).expect("file still present");
+        assert_eq!(
+            after,
+            vec![0x66, 0x6f, 0x6f, 0xff, 0xfe],
+            "push must not overwrite a local-config file it could not read"
+        );
     }
 
     // ---------- read_config_entry / read_config_entry_local ----------
