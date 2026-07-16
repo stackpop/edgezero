@@ -12,11 +12,18 @@ are content-addressed by the envelope hash:
 <root_key>.__edgezero_chunks.<envelope_sha256>.<idx>
 ```
 
-The push path is **upsert-only**. Both the cloud writer
-(`FastlyCliAdapter::push_config_entries`, `cli.rs:349`) and the local
-writer (`FastlyCliAdapter::push_config_entries_local`, `cli.rs:421` →
-`write_fastly_local_config_store`, `cli.rs:926`) insert-or-update
-physical entries and never delete anything.
+**The problem, as it stood before this spec:** the push path was
+**upsert-only** — both the cloud writer
+(`FastlyCliAdapter::push_config_entries`) and the local writer
+(`FastlyCliAdapter::push_config_entries_local` →
+`write_fastly_local_config_store`) inserted-or-updated physical entries
+and never deleted anything.
+
+> **As built, this is now true of the CLOUD writer only.** A cloud `config
+> push` still reclaims nothing (§4 explains why that cannot be made safe);
+> the LOCAL writer prunes the prior generation's chunks eagerly in the same
+> `fastly.toml` rewrite (§3), which is safe because it is a single file
+> Viceroy reads at startup — no propagation window, no POPs.
 
 Because a config change changes the envelope bytes, it changes
 `envelope_sha256`, which changes **every** chunk key. The new push
@@ -120,7 +127,11 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 5. **The operator's `--older-than` is the safety assertion, and it is REQUIRED
    for `--yes`.** The machine cannot know when a pointer stopped being served;
    the operator can. A destructive run must not guess it; a dry-run previews
-   every key and age so the assertion is reviewable.
+   every key and age so the assertion is reviewable. It is **store-wide** (it
+   covers every root in the swept store) and **may not be zero** — enforced at
+   the destructive boundary itself (`gc_config_entries`), not only in the CLI,
+   because the trait method is public and a rule that lives only in one caller
+   is not a rule.
 
 6. **`config gc` requires no concurrent `config push`.** No CAS means it cannot
    atomically observe-and-delete; the operator serialises it against pushes.
@@ -131,8 +142,22 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 8. **Local eager pruning is safe and stays.** One file, read at Viceroy startup:
    no propagation window, no POPs.
 
-7. **Push failure semantics are unchanged.** Reclamation is never part of a
+9. **Push failure semantics are unchanged.** Reclamation is never part of a
    push, so it can never fail one.
+
+10. **A root is never deleted, whatever its key looks like.** Key shape alone
+    does not prove an entry is ours; the value must not be root-like. Push-time
+    reserved-key rejection cannot protect entries that already exist.
+
+11. **A failed delete is always a failure.** There is no "already gone" stderr
+    special case: `not found`/`404` text cannot distinguish a missing key from a
+    missing store, an auth failure or a 500, and reporting those as reclamation
+    is worse than a retry. Retries are free — `gc` re-lists, so a key that is
+    genuinely gone never becomes a candidate again.
+
+12. **A diagnostic never quotes a stored value.** `serde_json`'s `Display`
+    embeds the offending input, and app config may hold credentials; parse
+    failures report position and category only.
 
 ## Two further invariants (PR #314 review)
 
@@ -206,15 +231,40 @@ Dry-run by default; deletes only with `--yes`.
    must carry string `item_key`, `item_value`, and `created_at`, or the whole
    run aborts. A missing/empty field is never skipped or defaulted — skipping a
    root would hide the chunks it references and get them deleted while live.
-2. Classify every non-chunk entry as a **root**; parse its value with
-   `prior_chunk_keys` → the **canonical** chunk keys that root's pointer
-   references. The union over all roots is the **live** set. (The listing
-   already carries `item_value`, so this costs no extra `describe` calls.)
-3. **Completeness guard (fail closed).** Every live-referenced key MUST appear in
+2. Classify every non-chunk entry as a **root** with `gc_classify_root` → the
+   **canonical** chunk keys that root's pointer references. The union over all
+   roots is the **live** set. (The listing already carries `item_value`, so this
+   costs no extra `describe` calls.)
+
+   **Not `prior_chunk_keys`.** That helper serves the push path, where an
+   unrecognised value legitimately means "nothing to prune", so it answers
+   `Ok([])`. On this path the same answer means "references nothing" and would
+   make the root's own **live** chunks look orphaned. `gc_classify_root` accepts
+   only a valid direct envelope or a valid pointer, and errors on everything else
+   — including an empty or truncated value.
+
+   A pointer must also be **internally consistent**, not merely well-typed: a
+   non-empty chunk list, one generation matching `envelope_sha256`, indexes
+   exactly `0..n-1` (no gaps, duplicates or reordering), non-zero lengths summing
+   to `envelope_len`. A pointer that parses but under-reports its chunks would
+   silently shrink the live set.
+
+3. **Never delete a root, whatever its key looks like.** Entries are grouped by
+   key shape, which is only trustworthy for a store we wrote. A store may predate
+   this feature or be shared, and push-time reserved-key rejection cannot protect
+   entries that already exist — so an ordinary root may sit at a chunk-shaped key.
+   Before deleting a candidate, confirm its **value** is not root-like (a complete
+   envelope or a pointer); an oversized envelope always splits into ≥ 2 pieces, so
+   no genuine chunk value is ever either. A root-like value aborts the run.
+
+4. **Duplicate keys fail closed.** A key is unique in a config store, so
+   duplicate rows mean the listing is not one consistent view of it; last-row-wins
+   could age a recent key into eligibility.
+5. **Completeness guard (fail closed).** Every live-referenced key MUST appear in
    the listing. If one is absent, the listing is incomplete (e.g. paginated) or
    the store is inconsistent — either way we cannot decide what is orphaned, so
    we delete nothing.
-4. **Supersession-age guard — best-effort defence in depth, NOT an independent
+6. **Supersession-age guard — best-effort defence in depth, NOT an independent
    safety proof.** For each root, the newest `created_at` among its *live* chunks
    approximates when its current config went live. When the live value **is** a
    chunked generation, that time is a real lower bound on when the root's orphans
@@ -232,15 +282,22 @@ Dry-run by default; deletes only with `--yes`.
    for any deletion.** Both ages must clear the window; the more restrictive
    (the minimum) wins.
 
-**`--older-than` is the operator's safety assertion** — *"I have not changed
-this config within this window, and no push is running, so nothing POPs may
-still be serving is deleted."* Only the operator can make it, so:
+**`--older-than` is the operator's safety assertion, and it is about the whole
+PHYSICAL STORE** — *"NO root in this store changed within this window, and no
+writer is targeting it, so nothing POPs may still be serving is deleted."*
+`config gc` sweeps **every** root in the selected store, so the assertion must
+cover every root in it, not just the config the operator has in mind. A sibling
+root re-pushed minutes ago is enough to make a wide window unsafe — especially
+if it changed to a value small enough to store directly, since that leaves no
+live chunk for the supersession-age guard to date it by (see its blind spots
+above). Only the operator can make this assertion, so:
 
 - it is **REQUIRED for `--yes`** (a destructive run must not guess it);
 - **`--older-than 0` is REJECTED for `--yes`.** A zero window asserts nothing: it
   makes every orphan eligible, including one superseded a second ago whose pointer
   POPs are still serving. Choose a window that is (a) at least Fastly's
-  propagation time and (b) no longer than the time since your last config change —
+  propagation time and (b) no longer than the time since ANY root in this store
+  last changed —
   so the window you assert is one you actually observed;
 - a **dry-run without it** previews *every* orphan and its age (threshold 0) so
   the operator can choose one from real data — previewing at zero is safe because
@@ -426,6 +483,13 @@ in the `cli.rs` test module.
 - **Dry-run** names every key + age it would delete, and deletes nothing.
 - **Fails closed on an unreadable `created_at`** — aborts, deletes nothing.
 - **Fails closed on an unclassifiable root** — aborts, deletes nothing.
+- **Fails closed on a root-like value at a chunk-shaped key** — never deletes a
+  root, whatever its key looks like.
+- **Fails closed on a pointer whose chunk list is internally inconsistent** —
+  an empty list, a gap/duplicate/reordering in the indexes, a mixed generation,
+  or lengths that do not sum to `envelope_len`.
+- **Fails closed on duplicate listing keys** — the listing is not one consistent
+  view of the store.
 - Delete argv passes `--key` + `--auto-yes` and **never** `--all`.
 - **A failed delete only reads as success when the CLI says THIS key is already
   gone** (so a re-run after a partial pass is idempotent). Store-level, auth, and

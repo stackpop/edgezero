@@ -62,9 +62,9 @@ cannot be used as a supersession clock.
 
 | File | What it holds |
 | --- | --- |
-| `crates/edgezero-adapter-fastly/src/chunked_config.rs` | `prior_chunk_keys` (validated, canonical, prefix-scoped), `gc_classify_root` (fail-closed GC classifier), `chunk_key_generation` (canonical-only, index must fit `usize`), unit tests |
+| `crates/edgezero-adapter-fastly/src/chunked_config.rs` | `prior_chunk_keys` (validated, canonical, prefix-scoped), `validate_pointer_chunks` (chunk list must be internally consistent), `gc_classify_root` (fail-closed GC classifier), `gc_reject_root_like_chunk` (never delete a root), `redact_json_err`, `chunk_key_parts` / `chunk_key_generation` (canonical-only, index must fit `usize`), unit tests |
 | `crates/edgezero-adapter-fastly/src/cli.rs` (push) | `reject_reserved_root_keys`, `reject_duplicate_root_keys`, `expand_root`; `write_fastly_local_config_store` (local eager prune); a cloud push writes only |
-| `crates/edgezero-adapter-fastly/src/cli.rs` (config gc) | `gc_config_entries` → `gc_fastly_config_store` → `plan_gc_reclamation`; `list_config_store_entries` (fail-closed parsing), `chunk_key_generation_any`, `parse_rfc3339_secs`, `unix_now_secs`, `delete_config_store_entry` (`--key --auto-yes`, never `--all`); `redact_describe_response` / `redact_stderr` |
+| `crates/edgezero-adapter-fastly/src/cli.rs` (config gc) | `gc_config_entries` → `gc_fastly_config_store` (rejects a zero window at the destructive boundary) → `plan_gc_reclamation`; `list_config_store_entries` (bare-array-only, non-empty fields, no duplicate keys), `chunk_key_generation_any`, `parse_rfc3339_secs`, `unix_now_secs`, `delete_config_store_entry` (`--key --auto-yes`, never `--all`; every failure is a failure); `redact_describe_response` / `redact_stderr` |
 | `crates/edgezero-adapter/src/registry.rs` | `Adapter::gc_config_entries` trait method (default `Err`) |
 | `crates/edgezero-cli/src/{args,config}.rs` | `ConfigGcArgs`, `run_config_gc` |
 | `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs` + `examples/app-demo/.../app-demo-cli/src/main.rs` | wire the `Gc` subcommand |
@@ -189,12 +189,18 @@ cannot be used as a supersession clock.
 ### Task 7 — Verification ✅
 
 - [x] `cargo test --workspace --all-targets` (20 suites), `cargo test -p
-  edgezero-adapter-fastly --features cli` (118), the two CLI gc tests.
+  edgezero-adapter-fastly --features cli` (132), the CLI gc gating tests.
 - [x] `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets
   --all-features -- -D warnings` (no per-site `#[expect]` for length).
 - [x] `cargo check --workspace --all-targets --features "fastly cloudflare spin"`;
   `cargo check -p edgezero-adapter-spin --target wasm32-wasip2 --features spin`;
   app-demo CLI builds.
+- [x] **`cargo clippy -p edgezero-adapter-fastly --target wasm32-wasip1 --features
+  fastly --all-targets -- -D warnings`.** Round 6 caught a real blocker here that
+  the host-target gates cannot see: a helper `#[cfg(any(feature = "cli", test))]`
+  but used only from `cli.rs` is DEAD in a test build without `cli`. Any new
+  `cli`-only helper needs a unit test in its own module, or a `cli`-only gate.
+  Run this gate before claiming the suite is green.
 
 ---
 

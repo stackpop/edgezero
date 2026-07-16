@@ -296,9 +296,11 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
         (true, None) => {
             return Err(
                 "`config gc --yes` requires an explicit `--older-than <dur>`: a destructive run \
-                 must not guess it. It asserts you have not changed this config within that window \
-                 (and that no push is running), so nothing POPs may still be serving is deleted. \
-                 Run without `--yes` first to preview every orphan and its age."
+                 must not guess it. It asserts that NO root in the selected store changed within \
+                 that window and that no writer is targeting the store, so nothing POPs may still \
+                 be serving is deleted -- `gc` sweeps the whole physical store, not just the \
+                 config you have in mind. Run without `--yes` first to preview every orphan and \
+                 its age."
                     .to_owned(),
             );
         }
@@ -313,7 +315,7 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
                     "`config gc --yes --older-than {raw}` resolves to 0 seconds, which asserts \
                      nothing: it would make every orphan eligible, including chunks a pointer POPs \
                      are still serving. Pass a window at least as long as Fastly's propagation \
-                     time and no longer than the time since your last config change."
+                     time and no longer than the time since ANY root in this store last changed."
                 ));
             }
             secs
@@ -384,10 +386,10 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
     if dry_run {
         match args.older_than.as_deref() {
             Some(dur) => log::info!(
-                "[edgezero] dry-run (no --yes): nothing was deleted. Re-run with `--yes` to apply. `--older-than {dur}` asserts you have not changed this config within that window and no push is running."
+                "[edgezero] dry-run (no --yes): nothing was deleted. Re-run with `--yes` to apply. `--older-than {dur}` asserts that NO root in this store changed within that window and that no writer is targeting it -- this sweeps the whole physical store, not just one config."
             ),
             None => log::info!(
-                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since your last config change, so the window you assert is one you actually observed. Then re-run with `--yes`."
+                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since ANY root in this store last changed -- gc sweeps every root here, so a sibling you re-pushed recently also constrains the window. Then re-run with `--yes`."
             ),
         }
     }

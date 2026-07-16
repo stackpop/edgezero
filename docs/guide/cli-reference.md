@@ -334,21 +334,29 @@ edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-
 - `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the manifest.
 - `--yes` — actually delete. **Without it, `config gc` is a dry run** that names every key and age it would delete and deletes nothing.
 
-**`--older-than` is an assertion only you can make.** Fastly's config store
-is eventually consistent and offers no compare-and-swap, so nothing in the
-API records _when a pointer stopped being served by every POP_ — which is
-the one fact needed to delete a chunk safely. You know it. `--older-than
-<dur>` says: _"I have not changed this config within this window, and no
-push is running."_ So:
+**`--older-than` is an assertion only you can make, and it covers the whole
+store.** Fastly's config store is eventually consistent and offers no
+compare-and-swap, so nothing in the API records _when a pointer stopped being
+served by every POP_ — which is the one fact needed to delete a chunk safely.
+You know it.
+
+`config gc` sweeps **every root in the selected physical store**, so
+`--older-than <dur>` asserts: _"no root in this store changed within this
+window, and no writer is targeting it."_ Not merely the one config you have in
+mind — a sibling root you re-pushed minutes ago is enough to make a wide window
+unsafe. So:
 
 - it is **required** for `--yes`, and **`--older-than 0` is rejected** there — a zero window asserts nothing;
-- pick a window that is **at least Fastly's propagation time** (so POPs have stopped serving the superseded pointer) and **no longer than the time since your last config change** (so it's a window you actually observed);
-- **do not run `config gc` alongside a `config push`** to the same store.
+- pick a window that is **at least Fastly's propagation time** (so POPs have stopped serving the superseded pointer) and **no longer than the time since _any_ root in this store last changed** (so it's a window you actually observed);
+- **do not run `config gc` alongside a `config push`** to the same store;
+- dry-run first on a store with many roots — it lists every orphan with its age.
 
-`config gc` fails closed: an unreadable or paginated listing, a root it
-cannot classify, an unreadable timestamp, or a live pointer referencing a
-key absent from the listing all abort with **nothing deleted**. It never
-deletes a chunk a live pointer references, however old.
+`config gc` fails closed: an unreadable, paginated, or duplicate-keyed
+listing; a root it cannot classify; a pointer whose chunk list is internally
+inconsistent; an unreadable timestamp; a live pointer referencing a key absent
+from the listing; or an entry whose key looks like a chunk but whose value is a
+root — all abort with **nothing deleted**. It never deletes a chunk a live
+pointer references, however old, and never deletes a root.
 
 ```bash
 # Dry run FIRST — previews every orphan and its age, deletes nothing.

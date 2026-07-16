@@ -25,8 +25,14 @@ pub enum Command {
     Auth(AuthArgs),
     /// Build the project for a target edge.
     Build(BuildArgs),
-    /// Inspect or mutate the typed `<name>.toml` app config.
-    #[command(subcommand, after_help = crate::args::STUB_POINTER_AFTER_HELP)]
+    /// Inspect or mutate the typed `<name>.toml` app config, or reclaim
+    /// orphaned config-store entries (`gc`).
+    ///
+    /// NOTE: no group-level typed-CLI after-help here. `push`/`diff`/`validate`
+    /// each carry their own, because they need a typed `C`; `gc` does NOT --
+    /// it inspects the store's physical entries and runs from this bundled
+    /// binary. A group-level notice would tell operators `gc` is unavailable.
+    #[command(subcommand)]
     Config(ConfigCmd),
     /// Run the bundled `app-demo` example locally (contributor-only).
     #[cfg(feature = "demo-example")]
@@ -63,8 +69,12 @@ pub enum ConfigCmd {
     /// store a chunk may only be deleted once the pointer that referenced it
     /// has stopped being served everywhere — and the platform may record no
     /// such timestamp (Fastly does not). Only YOU know your deploy history,
-    /// so `--older-than` is your assertion: "nothing created before this is
-    /// still being served".
+    /// so `--older-than` is your assertion — see its help: it covers EVERY
+    /// root in the selected store, not only the config you have in mind.
+    ///
+    /// UNTYPED: unlike `push`/`diff`/`validate`, `gc` inspects the store's
+    /// physical entries rather than your `AppConfig<C>`, so the bundled
+    /// `edgezero` binary can run it.
     ///
     /// SAFE BY DEFAULT: without `--yes` this only reports what it would
     /// delete. Nothing is removed until you pass `--yes`.
@@ -106,16 +116,26 @@ pub struct ConfigGcArgs {
     /// Path to `edgezero.toml`.
     #[arg(long, default_value = "edgezero.toml")]
     pub manifest: PathBuf,
-    /// Do not overlay `EDGEZERO__*` environment variables.
+    /// Do not overlay `EDGEZERO__*` environment variables when resolving which
+    /// PHYSICAL store to sweep. `gc` never loads the typed app config, so this
+    /// is not about app-config overlays: `EDGEZERO__STORES__CONFIG__<ID>` maps
+    /// a logical store id to a platform store name, and `--no-env` ignores that
+    /// mapping, falling back to the logical id. On a destructive command that
+    /// changes WHICH STORE IS SWEPT — check the reported store id before `--yes`.
     #[arg(long)]
     pub no_env: bool,
-    /// Only reclaim entries older than this. This is YOUR SAFETY ASSERTION:
-    /// "I have not changed this config within this window, and no push is
-    /// running" — so nothing superseded more recently (which POPs may still
-    /// serve) is deleted. Accepts `s`/`m`/`h`/`d` suffixes (e.g. `7d`, `24h`,
-    /// `90m`); a bare number means seconds. REQUIRED for `--yes` (a destructive
-    /// run must not guess it); a dry-run without it previews with a wide
-    /// default.
+    /// Only reclaim entries older than this. This is YOUR SAFETY ASSERTION,
+    /// and it is about the WHOLE PHYSICAL STORE, not just one config: `gc`
+    /// sweeps every root in the selected store, so you are asserting "NO root
+    /// in this store changed within this window, and no writer is targeting
+    /// it" — so nothing superseded more recently (which POPs may still serve)
+    /// is deleted. A sibling root you re-pushed minutes ago is enough to make
+    /// a wide window unsafe, especially if it changed to a value small enough
+    /// to store directly (that leaves no chunk for `gc` to date it by).
+    /// Accepts `s`/`m`/`h`/`d` suffixes (e.g. `7d`, `24h`, `90m`); a bare
+    /// number means seconds, and 0 is rejected for `--yes`. REQUIRED for
+    /// `--yes` (a destructive run must not guess it); a dry-run without it
+    /// previews every orphan and its age.
     #[arg(long)]
     pub older_than: Option<String>,
     /// Override the config-store id (defaults to the manifest's).

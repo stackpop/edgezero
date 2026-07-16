@@ -8,8 +8,8 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::chunked_config::{
-    CHUNK_KEY_INFIX, chunk_key_generation, gc_classify_root, prepare_fastly_config_entries,
-    prior_chunk_keys, resolve_fastly_config_value,
+    CHUNK_KEY_INFIX, chunk_key_generation, gc_classify_root, gc_reject_root_like_chunk,
+    prepare_fastly_config_entries, prior_chunk_keys, resolve_fastly_config_value,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -1386,6 +1386,26 @@ fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, Str
             item_value: field("item_value")?,
         });
     }
+
+    // DUPLICATE KEYS => fail closed. A key must appear once; a store cannot
+    // really hold two entries under one key, so duplicate rows mean we are not
+    // reading the store we think we are (a merged/paginated view, or a CLI
+    // change). Left alone, the last row silently wins for BOTH the live-set
+    // lookup and `created_at`, so conflicting rows could age a recent key into
+    // eligibility and schedule the same key for two deletes.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
+    if let Some(duplicate) = items
+        .iter()
+        .find(|item| !seen.insert(item.item_key.as_str()))
+    {
+        return Err(format!(
+            "refusing to reclaim: `fastly config-store-entry list` returned key `{}` more than \
+             once. A key is unique in a config store, so this listing does not describe one \
+             consistent view of it (nothing was deleted).",
+            duplicate.item_key
+        ));
+    }
+
     Ok(items)
 }
 
@@ -1410,6 +1430,20 @@ fn gc_fastly_config_store(
     older_than_secs: u64,
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
+    // THE destructive boundary enforces its own precondition. The CLI rejects a
+    // zero window too, but `gc_config_entries` is a public trait method any
+    // caller can reach directly -- a safety rule that lives only in the CLI is
+    // not a safety rule. A zero window asserts nothing: it makes every orphan
+    // eligible, including one superseded a second ago whose pointer POPs are
+    // still serving. (A dry-run may preview at zero; it deletes nothing.)
+    if !dry_run && older_than_secs == 0 {
+        return Err(
+            "refusing to reclaim: a destructive `config gc` requires a non-zero `--older-than` \
+             window. Zero asserts nothing -- it would make every orphan eligible, including \
+             chunks a pointer POPs are still serving. Nothing was deleted."
+                .to_owned(),
+        );
+    }
     let resolved_id = resolve_remote_config_store_id(store_name)?;
     let items = list_config_store_entries(&resolved_id)?;
     let plan = plan_gc_reclamation(&items, unix_now_secs(), older_than_secs)?;
@@ -1575,6 +1609,13 @@ fn plan_gc_reclamation(
         if live.contains(&item.item_key) {
             continue;
         }
+        // The key SHAPE says "chunk", but only the VALUE can confirm it. A store
+        // may predate this feature or be shared, and push-time reserved-key
+        // rejection cannot protect entries that already exist -- so an ordinary
+        // root could be sitting at a chunk-shaped key. Deleting it would destroy
+        // live config, so a root-like value aborts the run.
+        gc_reject_root_like_chunk(&item.item_key, &item.item_value)
+            .map_err(|err| format!("refusing to reclaim: {err}; nothing was deleted"))?;
         let created = *created_by_key.get(item.item_key.as_str()).unwrap_or(&0);
         let age = now.saturating_sub(created);
         // BOTH ages must clear the operator's window; neither substitutes for
@@ -1723,33 +1764,6 @@ fn create_config_store_entry(store_id: &str, key: &str, value: &str) -> Result<(
     ))
 }
 
-/// Should a FAILED `config-store-entry delete` be treated as success?
-///
-/// Only when the CLI is telling us **this key** is already gone -- a `gc` re-run
-/// after a partial pass should not fail on work it already did.
-///
-/// Deliberately narrow. A bare "not found" / "404" scan anywhere in stderr also
-/// matches STORE-level failures ("config store ... not found"), auth failures,
-/// and `fastly` itself being missing -- reporting "reclaimed" for a run that
-/// deleted nothing. Those are real failures and must surface, so we require the
-/// message to name the key AND to be about an entry/item rather than the store.
-fn delete_stderr_is_absent_key(stderr: &str, key: &str) -> bool {
-    let lower = stderr.to_ascii_lowercase();
-    let absent = lower.contains("not found") || lower.contains("does not exist");
-    if !absent || !lower.contains(&key.to_ascii_lowercase()) {
-        return false;
-    }
-    // "config store not found" names the store, not the entry: a wrong/deleted
-    // store id, which must NOT read as a successful reclamation.
-    !lower.contains("config store not found") && !lower.contains("store not found")
-}
-
-/// Shell `fastly config-store-entry delete --store-id=<id> --key=<key>
-/// --auto-yes` for a single orphan chunk. Only ever passes `--key`: the
-/// subcommand also accepts `-a/--all`, which wipes EVERY entry in the
-/// store — never construct that flag here. `--auto-yes` suppresses the
-/// interactive confirmation. A "not found" / "does not exist" / "404"
-/// stderr is treated as success (the entry is already gone).
 fn delete_config_store_entry(store_id: &str, key: &str) -> Result<(), String> {
     let store_arg = format!("--store-id={store_id}");
     let key_arg = format!("--key={key}");
@@ -1772,10 +1786,15 @@ fn delete_config_store_entry(store_id: &str, key: &str) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
+    // EVERY non-zero delete is a failure -- no "already gone" special case.
+    // Pattern-matching stderr for "not found"/"404" cannot reliably tell "this
+    // key is already gone" from "the store does not exist", an auth failure, or
+    // a 500: messages like `config store abc does not exist while deleting key
+    // <key>` name the key AND say "does not exist". Reporting those as a
+    // successful reclamation is strictly worse than a retry, and a retry is
+    // free: `config gc` re-lists the store, so a key that really is gone simply
+    // will not appear as a candidate next run.
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if delete_stderr_is_absent_key(&stderr, key) {
-        return Ok(());
-    }
     Err(format!(
         "`fastly config-store-entry delete --store-id={store_id} --key={key} --auto-yes` exited with status {}\nstderr: {}",
         output.status,
@@ -4471,7 +4490,7 @@ echo 'unexpected' >&2; exit 1
         let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
 
-        let out = run_gc(dir.path(), 0, false).expect("gc succeeds");
+        let out = run_gc(dir.path(), 1, false).expect("gc succeeds");
         let log = fs::read_to_string(&oplog).unwrap_or_default();
         for key in &live_chunks {
             assert!(
@@ -4555,39 +4574,118 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// PR #314 review [P2]: a bare "not found"/"404" scan of stderr also matches
-    /// STORE-level and auth failures -- a run that reclaimed nothing would report
-    /// success. Only THIS key being absent is benign (gc re-run after a partial
-    /// pass).
+    /// PR #314 round-6 [P1]: entries are classified as chunks by KEY SHAPE, but
+    /// a store may predate this feature (or be shared): an ordinary root can
+    /// already sit at a chunk-shaped key, and push-time reserved-key rejection
+    /// cannot protect what already exists. Deleting it would destroy live config.
+    #[cfg(unix)]
     #[test]
-    fn delete_absent_key_match_is_narrow() {
-        let key = "app_config.__edgezero_chunks.abc.0";
-        // Benign: the CLI says this key is already gone.
-        assert!(delete_stderr_is_absent_key(
-            &format!("Error: item '{key}' not found"),
-            key
+    fn gc_fails_closed_on_root_like_value_at_chunk_shaped_key() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 999_999)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 999_999));
+
+        // A pre-existing entry: chunk-shaped key, but its value is a complete
+        // config envelope -- i.e. somebody's root. Old enough to be "eligible".
+        let squatter_key = format!("{TEST_CONFIG_ID}{CHUNK_KEY_INFIX}{}.0", "b".repeat(64));
+        let squatter_value = gen_envelope("someones-real-config");
+        listing.push((
+            squatter_key.clone(),
+            stamp_secs_ago(31_536_000),
+            squatter_value,
         ));
-        assert!(delete_stderr_is_absent_key(
-            &format!("Error: key {key} does not exist"),
-            key
-        ));
-        // Real failures that must NOT read as a successful reclamation.
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
         assert!(
-            !delete_stderr_is_absent_key("Error: config store not found", key),
-            "a missing STORE deletes nothing and must surface"
+            err.contains("refusing to reclaim") && err.contains("destroy live config"),
+            "expected a refusal naming the root-like value, got: {err}"
         );
         assert!(
-            !delete_stderr_is_absent_key("Error: 404 Not Found", key),
-            "a bare 404 that never names the key must surface"
+            !oplog_has(&oplog, &format!("delete {squatter_key}")),
+            "an entry whose VALUE is a root must never be deleted, whatever its key looks like"
         );
         assert!(
-            !delete_stderr_is_absent_key("Error: token not found; run `fastly auth`", key),
-            "an auth failure must surface"
+            !fs::read_to_string(&oplog)
+                .unwrap_or_default()
+                .contains("delete "),
+            "a fail-closed run deletes nothing at all"
+        );
+    }
+
+    /// PR #314 round-6 [P2]: a key is unique in a config store, so duplicate rows
+    /// mean the listing is not one consistent view. Left alone, last-row-wins on
+    /// `created_at` could age a recent key into eligibility.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_duplicate_listing_keys() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let mut orphans = listed_generation(TEST_CONFIG_ID, &dead, 30);
+        // The same key twice, with conflicting ages: young (real) then ancient.
+        let (dup_key, _, dup_value) = orphans[0].clone();
+        orphans.push((dup_key.clone(), stamp_secs_ago(31_536_000), dup_value));
+        listing.extend(orphans);
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            err.contains("more than once"),
+            "expected a refusal naming the duplicate key, got: {err}"
         );
         assert!(
-            !delete_stderr_is_absent_key("Error: internal server error", key),
-            "a server error must surface"
+            !oplog_has(&oplog, &format!("delete {dup_key}")),
+            "a duplicated row must not let a recent key be aged into eligibility"
         );
+    }
+
+    /// PR #314 round-6 [P2]: `gc_config_entries` is a public trait method, so the
+    /// zero-window rule must live at the DESTRUCTIVE boundary, not only in the
+    /// CLI that usually calls it. Rejected before any `fastly` invocation.
+    #[cfg(unix)]
+    #[test]
+    fn gc_adapter_boundary_rejects_a_zero_window() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // Straight at the adapter, bypassing the CLI's own gate.
+        let err = run_gc(dir.path(), 0, false).expect_err("a destructive zero window must fail");
+        assert!(
+            err.contains("non-zero `--older-than`"),
+            "expected the boundary itself to reject zero, got: {err}"
+        );
+        assert!(
+            !fs::read_to_string(&oplog)
+                .unwrap_or_default()
+                .contains("delete "),
+            "nothing may be deleted under a zero window"
+        );
+        // A DRY-RUN at zero is still allowed: it previews and deletes nothing.
+        run_gc(dir.path(), 0, true).expect("a dry-run may preview at zero");
     }
 
     /// PR #314 review [P1]: a root whose value is TRUNCATED/unparseable must fail
@@ -4623,7 +4721,7 @@ echo 'unexpected' >&2; exit 1
         let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
 
-        let err = run_gc(dir.path(), 0, false).expect_err("must fail closed");
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
         assert!(
             err.contains("refusing to reclaim"),
             "expected a fail-closed refusal, got: {err}"
@@ -4658,7 +4756,7 @@ echo 'unexpected' >&2; exit 1
         let fake = fake_fastly_gc_raw_list(TEST_CONFIG_ID, &enveloped, &oplog);
         let _path = PathPrepend::new(fake.path());
 
-        let err = run_gc(dir.path(), 0, false).expect_err("must fail closed");
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
         assert!(
             err.contains("bare array") && err.contains("Nothing was deleted"),
             "expected a refusal naming the unsupported listing shape, got: {err}"
@@ -4693,7 +4791,7 @@ echo 'unexpected' >&2; exit 1
         let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
 
-        let err = run_gc(dir.path(), 0, false).expect_err("must fail closed");
+        let err = run_gc(dir.path(), 1, false).expect_err("must fail closed");
         assert!(
             err.contains("empty `item_value`"),
             "expected a refusal naming the empty field, got: {err}"
