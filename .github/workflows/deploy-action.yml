@@ -8,6 +8,7 @@ on:
       - .github/actions/deploy-fastly/**
       - .github/actions/healthcheck-fastly/**
       - .github/actions/rollback-fastly/**
+      - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
@@ -22,6 +23,7 @@ on:
       - .github/actions/deploy-fastly/**
       - .github/actions/healthcheck-fastly/**
       - .github/actions/rollback-fastly/**
+      - .github/actions/config-push-fastly/**
       - .github/workflows/deploy-action.yml
       - crates/edgezero-adapter/**
       - crates/edgezero-adapter-fastly/**
@@ -89,7 +91,8 @@ jobs:
             .github/actions/build-app-cli/scripts/*.sh \
             .github/actions/deploy-core/scripts/*.sh \
             .github/actions/deploy-core/tests/*.sh \
-            .github/actions/deploy-fastly/scripts/*.sh
+            .github/actions/deploy-fastly/scripts/*.sh \
+            .github/actions/config-push-fastly/scripts/*.sh
 
       - name: Bash contract tests
         run: .github/actions/deploy-core/tests/run.sh

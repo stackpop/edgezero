@@ -314,10 +314,13 @@ where
     // Build envelope.
     // Honour --key override (5.4): if the caller supplied an explicit key,
     // use it; otherwise fall back to the manifest's resolved logical store id.
-    let key = args
-        .key
-        .clone()
-        .unwrap_or_else(|| ctx.store.logical.clone());
+    // `--staging` (5.5) then writes the `<key>_staging` variant in the same store.
+    let key = resolve_config_key(
+        args.key
+            .clone()
+            .unwrap_or_else(|| ctx.store.logical.clone()),
+        args.staging,
+    );
     let body = build_config_envelope::<C>(&typed)?;
     let local_envelope: BlobEnvelope =
         serde_json::from_str(&body).map_err(|err| format!("local envelope parse failed: {err}"))?;
@@ -451,7 +454,9 @@ where
     let env_config = EnvConfig::from_env();
     let platform = env_config.store_name("config", &logical);
     let store = ResolvedStoreId::new(logical.clone(), platform);
-    let key = args.key.clone().unwrap_or(logical);
+    // `--staging` (5.5) diffs the `<key>_staging` variant, matching what
+    // `config push --staging` would write.
+    let key = resolve_config_key(args.key.clone().unwrap_or(logical), args.staging);
 
     // Resolve adapter paths for the read call.
     let manifest_root = ctx
@@ -922,6 +927,12 @@ fn write_envelope(
     for line in lines {
         log::info!("{line}");
     }
+    // Canonical machine-readable line (spec §5.5) — the config-push-fastly action
+    // greps `^pushed-key=<key>$` to thread the written key out as an output. The
+    // CLI logger routes log::info! to stdout, so this reaches the action's log.
+    if !args.dry_run {
+        log::info!("pushed-key={key}");
+    }
     Ok(())
 }
 
@@ -1073,6 +1084,19 @@ fn resolve_adapter_push_ctx(
     ResolvedAdapterPushContext {
         local: args.local,
         runtime_config_path: args.runtime_config.clone(),
+    }
+}
+
+/// Derive the config-store key a push or diff targets. When `staging` is set,
+/// the config is written under (or diffed against) the `<base>_staging` variant
+/// in the SAME store — never the production key the live service reads (spec
+/// §5.5). This mirrors the runtime-override store the Fastly adapter scaffolds,
+/// whose selector key chooses `app_config` vs `app_config_staging`.
+fn resolve_config_key(base: String, staging: bool) -> String {
+    if staging {
+        format!("{base}_staging")
+    } else {
+        base
     }
 }
 
@@ -1781,6 +1805,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
             yes: false,
         }
     }
@@ -1792,6 +1817,26 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         let _lock = manifest_guard().lock().expect("manifest guard");
         let (_dir, manifest, _) = setup_project(VALID_MANIFEST, VALID_APP_CONFIG);
         run_config_validate(&args_for(&manifest)).expect("valid project passes");
+    }
+
+    #[test]
+    fn staging_key_suffixes_only_when_staging() {
+        // Production: the key is untouched (base key, or an explicit --key).
+        assert_eq!(
+            resolve_config_key("app_config".to_owned(), false),
+            "app_config"
+        );
+        assert_eq!(resolve_config_key("custom".to_owned(), false), "custom");
+        // Staging: the same store, the `<key>_staging` variant.
+        assert_eq!(
+            resolve_config_key("app_config".to_owned(), true),
+            "app_config_staging"
+        );
+        // --key composes with --staging (the override is suffixed, not ignored).
+        assert_eq!(
+            resolve_config_key("custom".to_owned(), true),
+            "custom_staging"
+        );
     }
 
     #[test]
@@ -3670,6 +3715,7 @@ ids = ["default"]
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
         };
         let err = run_config_diff_typed::<FixtureConfig>(&diff_args)
             .expect_err("missing [component.*] must fail Spin's shared-check preflight in diff");
@@ -3748,6 +3794,7 @@ ids = ["default"]
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
         };
         // The nested empty secret must be rejected by the path-aware
         // typed_secret_checks before the remote-read step, naming the path.
@@ -3819,6 +3866,7 @@ ids = ["default"]
             no_env: true,
             runtime_config: None,
             store: None,
+            staging: false,
         };
         // typed_secret_checks must catch the empty `#[secret]` field
         // before the function reaches the remote-read step.

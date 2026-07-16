@@ -1,0 +1,197 @@
+name: EdgeZero config-push-fastly
+description: Push a checked-out EdgeZero application's typed config to a Fastly config store using a prebuilt app CLI artifact.
+
+inputs:
+  app-cli-artifact:
+    description: Name of the build-app-cli artifact to download and run.
+    required: true
+  app-cli-bin:
+    description: Binary name inside the artifact. Defaults to the artifact metadata.
+    required: false
+    default: ""
+  fastly-api-token:
+    description: Fastly API token. Injected only into the push step.
+    required: true
+  working-directory:
+    description: Application directory relative to github.workspace (holds the manifest + typed config).
+    required: false
+    default: .
+  manifest:
+    description: Optional edgezero.toml path relative to working-directory.
+    required: false
+    default: ""
+  app-config:
+    description: "Optional typed config file path (default: resolved from the manifest)."
+    required: false
+    default: ""
+  store:
+    description: "Optional logical config-store id (default: the manifest's resolved id)."
+    required: false
+    default: ""
+  key:
+    description: "Optional explicit base key (default: the logical store id)."
+    required: false
+    default: ""
+  deploy-to:
+    description: "'production' writes the base key; 'staging' writes the <key>_staging variant in the same store."
+    required: false
+    default: production
+
+outputs:
+  pushed-key:
+    description: The key that was written (the base key, or its _staging variant).
+    value: ${{ steps.push.outputs['pushed-key'] }}
+  store:
+    description: The logical config-store id, when supplied.
+    value: ${{ steps.push.outputs.store }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        EDGEZERO__FASTLY__API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
+        EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+      run: |
+        [[ "${EDGEZERO__FASTLY__API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
+        case "${EDGEZERO__DEPLOY__TO}" in
+          production | staging) ;;
+          *) echo "::error::input 'deploy-to' must be 'production' or 'staging'"; exit 1 ;;
+        esac
+
+    - name: Download CLI artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs['app-cli-artifact'] }}
+        path: ${{ runner.temp }}/edgezero-cli-download
+      env:
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+
+    - name: Extract CLI
+      id: cli
+      shell: bash
+      env:
+        EDGEZERO__APP__CLI__ARTIFACT_DIR: ${{ runner.temp }}/edgezero-cli-download
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        EDGEZERO__APP__CLI__BIN: ${{ inputs['app-cli-bin'] }}
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
+
+    - name: Install Fastly CLI
+      shell: bash
+      env:
+        EDGEZERO__ACTION__ROOT: ${{ github.action_path }}/../../..
+        EDGEZERO__FASTLY__VERSIONS_JSON: ${{ github.action_path }}/../deploy-fastly/versions.json
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/../deploy-fastly/scripts/install-fastly.sh
+
+    - name: Config push
+      id: push
+      shell: bash
+      env:
+        EDGEZERO__APP__CLI__BIN: ${{ steps.cli.outputs['app-cli-bin'] }}
+        EDGEZERO__PROJECT__WORKING_DIRECTORY: ${{ inputs['working-directory'] }}
+        EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
+        EDGEZERO__CONFIG_PUSH__STORE: ${{ inputs.store }}
+        EDGEZERO__CONFIG_PUSH__KEY: ${{ inputs.key }}
+        EDGEZERO__CONFIG_PUSH__MANIFEST: ${{ inputs.manifest }}
+        EDGEZERO__CONFIG_PUSH__APP_CONFIG: ${{ inputs['app-config'] }}
+        # Only the typed token reaches the CLI under the adapter's own convention
+        # (FASTLY_API_TOKEN, what `fastly config-store-entry update` reads); every
+        # other inherited FASTLY_* alias is blanked so none can redirect the push.
+        FASTLY_API_TOKEN: ${{ inputs['fastly-api-token'] }}
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/scripts/config-push.sh
+
+    - name: Cleanup
+      if: ${{ always() }}
+      shell: bash
+      env:
+        EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_HOME: ""
+      run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh

@@ -501,6 +501,63 @@ test_toolchain_boundary() {
 }
 
 # ---------------------------------------------------------------------------
+# config-push.sh — the staging key is a different key, driven by --staging
+# ---------------------------------------------------------------------------
+# Runs config-push.sh against a fake app CLI that records its argv and emits the
+# canonical pushed-key line. Returns the recorded argv (one arg per line).
+run_config_push_argv() {
+  local dir="$WORK_DIR/config-push"
+  rm -rf "$dir"
+  mkdir -p "$dir/bin" "$dir/app"
+  # A fake app CLI: record every argument, then emit the contract line so the
+  # wrapper's anchored parse succeeds.
+  cat >"$dir/bin/fake-cli" <<'CLI'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$FAKE_ARGV_OUT"
+echo "pushed-key=app_config_staging"
+CLI
+  chmod +x "$dir/bin/fake-cli"
+
+  PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" \
+    EDGEZERO__APP__CLI__BIN=fake-cli \
+    FASTLY_API_TOKEN=tok \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
+    EDGEZERO__DEPLOY__TO="${CP_DEPLOY_TO:-production}" \
+    EDGEZERO__CONFIG_PUSH__STORE="${CP_STORE:-}" \
+    EDGEZERO__CONFIG_PUSH__KEY="${CP_KEY:-}" \
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1
+  cat "$dir/argv.txt"
+}
+
+test_config_push_argv() {
+  section "config-push argv"
+
+  # Production: the base subcommand, non-interactive flags, and NO --staging.
+  local prod
+  prod=$(run_config_push_argv)
+  assert_equals "production drives 'config push --adapter fastly'" \
+    $'config\npush\n--adapter\nfastly\n--yes\n--no-diff' "$prod"
+
+  # Staging: same argv plus --staging (the CLI then writes <key>_staging).
+  local staged
+  staged=$(CP_DEPLOY_TO=staging run_config_push_argv)
+  assert_succeeds "staging appends --staging" grep -qx -- '--staging' <<<"$staged"
+  assert_fails "production does NOT pass --staging" grep -qx -- '--staging' <<<"$prod"
+
+  # Typed --store / --key are threaded through when supplied.
+  local with_store
+  with_store=$(CP_STORE=cfg CP_KEY=mykey run_config_push_argv)
+  assert_succeeds "--store is threaded" grep -qx -- 'cfg' <<<"$with_store"
+  assert_succeeds "--key is threaded" grep -qx -- 'mykey' <<<"$with_store"
+
+  # A bad deploy-to must fail closed, never silently push to production.
+  assert_fails "a non-{production,staging} deploy-to is rejected" \
+    env EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY="$WORK_DIR" EDGEZERO__DEPLOY__TO=Staging \
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
+}
+
+# ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
@@ -515,6 +572,7 @@ main() {
   test_deploy_args_prepend
   test_lifecycle_helpers
   test_toolchain_boundary
+  test_config_push_argv
 
   printf '\nPassed: %d  Failed: %d\n' "$tests_passed" "$tests_failed"
   [[ "$tests_failed" -eq 0 ]]

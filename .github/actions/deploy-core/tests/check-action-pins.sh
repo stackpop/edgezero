@@ -15,6 +15,7 @@ files=(
   "$REPO_ROOT/.github/actions/deploy-fastly/action.yml"
   "$REPO_ROOT/.github/actions/healthcheck-fastly/action.yml"
   "$REPO_ROOT/.github/actions/rollback-fastly/action.yml"
+  "$REPO_ROOT/.github/actions/config-push-fastly/action.yml"
 )
 
 status=0

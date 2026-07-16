@@ -307,6 +307,12 @@ pub enum DiffFormat {
 /// CLI at runtime.
 #[derive(clap::Args, Debug)]
 #[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "clap args struct: each bool is a distinct CLI flag \
+              (exit_code, local, no_env, staging); a state machine \
+              would be inappropriate here"
+)]
 pub struct ConfigDiffArgs {
     /// Target adapter name.
     #[arg(long, required = true)]
@@ -338,6 +344,11 @@ pub struct ConfigDiffArgs {
     /// Path to the adapter's runtime configuration file.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
+    /// Diff against the staging key (`<key>_staging`) in the same store,
+    /// so a staged diff compares what `config push --staging` would write
+    /// (spec §5.5).
+    #[arg(long)]
+    pub staging: bool,
     /// Logical config store id to diff against. Defaults to the
     /// `[stores.config].default` (or the only declared id when
     /// `[stores.config].ids` has length 1).
@@ -359,6 +370,7 @@ impl Default for ConfigDiffArgs {
             manifest: default_manifest_path(),
             no_env: false,
             runtime_config: None,
+            staging: false,
             store: None,
         }
     }
@@ -375,7 +387,7 @@ impl Default for ConfigDiffArgs {
 #[expect(
     clippy::struct_excessive_bools,
     reason = "clap args struct: each bool is a distinct CLI flag \
-              (dry_run, local, no_diff, no_env, yes); a state machine \
+              (dry_run, local, no_diff, no_env, staging, yes); a state machine \
               would be inappropriate here"
 )]
 pub struct ConfigPushArgs {
@@ -424,6 +436,12 @@ pub struct ConfigPushArgs {
     /// `runtime-config.toml` next to the adapter manifest.
     #[arg(long)]
     pub runtime_config: Option<PathBuf>,
+    /// Push to staging: write the config under the `<key>_staging` variant
+    /// in the SAME store, so it never overwrites the production key the live
+    /// service is reading (Fastly staging lifecycle, spec §5.5). The same
+    /// `--staging` verb `deploy`/`healthcheck`/`rollback` use.
+    #[arg(long)]
+    pub staging: bool,
     /// Logical config store id to push to. Defaults to the
     /// `[stores.config].default` (or the only declared id when
     /// `[stores.config].ids` has length 1).
@@ -448,6 +466,7 @@ impl Default for ConfigPushArgs {
             no_diff: false,
             no_env: false,
             runtime_config: None,
+            staging: false,
             store: None,
             yes: false,
         }

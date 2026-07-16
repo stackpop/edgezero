@@ -258,12 +258,8 @@ endpoints, or CLI flags — those, and the list of aliases to clear
 (`provider-env-clear`), all arrive from the wrapper. It invokes the application's
 CLI binary (`<app-cli-bin>`), not a hard-coded `edgezero`.
 
-The engine runs one of three modes: `build`, `deploy`, and `config-push` (§5.5).
-`config-push` reuses the same credential boundary as `deploy` — the token is
-delivered through `provider-env`, and the private `EDGEZERO__*` namespace is
-scrubbed before the CLI runs — but invokes the app CLI's `config push` subcommand
-(with the wrapper's typed `store`, `key`, and `--staging` flags) instead of
-`deploy`.
+The engine runs `build` or `deploy`. Config push (§5.5) does not go through this
+engine — like the other thin lifecycle wrappers it drives the app CLI directly.
 
 ### 5.3 Layer 3 — adapter wrappers (`deploy-fastly`, …)
 
@@ -426,12 +422,16 @@ app config to the provider's config store is a **separate** action,
 `config-push-fastly`, so a caller decides when config moves and can push it
 independently of a code deploy.
 
-It follows the deploy pattern exactly: it consumes the prebuilt `build-app-cli`
-artifact, takes typed provider credentials, and drives the **app's own CLI**
-(`<app-cli> config push --adapter fastly`). The engine adds a `config-push` mode
-alongside `build`/`deploy` (§5.2); the credential boundary (§10) is identical —
-the token reaches only this step, and the private namespace is scrubbed before
-the CLI runs.
+It is a thin wrapper like `healthcheck-fastly` / `rollback-fastly`, not the heavy
+`deploy` path: it consumes the prebuilt `build-app-cli` artifact, installs the
+pinned Fastly CLI (the push shells out to `fastly config-store-entry update`),
+and drives the **app's own CLI** (`<app-cli> config push --adapter fastly`)
+directly. The token reaches the CLI under the adapter's own convention —
+`FASTLY_API_TOKEN`, injected only into the push step — and every other `FASTLY_*`
+alias is blanked, so an inherited `FASTLY_ENDPOINT` or `FASTLY_TOKEN` cannot
+redirect or re-auth the push. (The heavier `provider-env` JSON boundary is for
+`deploy`, which spawns arbitrary manifest build/deploy commands; config-push,
+like the other lifecycle actions, does not.)
 
 #### 5.5.1 Staging model — same store, different key
 

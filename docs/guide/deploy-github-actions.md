@@ -196,6 +196,34 @@ your rollback on the step failing (`if: failure()`), not on the `healthy` output
 
 Outputs: `rolled-back-to` (production only — the version that was activated).
 
+### `config-push-fastly`
+
+Pushes your app's typed config to a Fastly config store. This is **separate from
+deploy** — deploy activates code, it never writes runtime config — so you run it
+as its own step, whenever config should move.
+
+| Input               | Required | Default         | Meaning                                                             |
+| ------------------- | -------- | --------------- | ------------------------------------------------------------------- |
+| `app-cli-artifact`  | Yes      | —               | The `build-app-cli` artifact to run.                                |
+| `fastly-api-token`  | Yes      | —               | Fastly API token. Injected only into the push step.                 |
+| `app-cli-bin`       | No       | artifact's name | Binary name inside the artifact.                                    |
+| `working-directory` | No       | `.`             | App directory (holds the manifest + typed config).                  |
+| `manifest`          | No       | empty           | `edgezero.toml` path relative to `working-directory`.               |
+| `app-config`        | No       | empty           | Typed config file path (default: resolved from the manifest).       |
+| `store`             | No       | empty           | Logical config-store id (default: the manifest's resolved id).      |
+| `key`               | No       | empty           | Explicit base key (default: the logical store id).                  |
+| `deploy-to`         | No       | `production`    | `staging` writes the `<key>_staging` variant in the **same** store. |
+
+Outputs: `pushed-key` (the key written — the base key, or its `_staging` variant)
+and `store` (the logical store id, when supplied).
+
+**Staging config is the same store, a different key.** Fastly config stores are
+not versioned like staged service versions, so `deploy-to: staging` writes your
+config under `<key>_staging` alongside the production key — never overwriting what
+the live service reads. Which key the service reads is decided separately by the
+runtime-override store (`edgezero provision` scaffolds it). A typo like
+`deploy-to: Staging` is rejected up front, never silently pushed to production.
+
 ## Strict lifecycle values (fail closed)
 
 `stage` and `deploy-to` are validated exactly, and a bad value **fails the run**

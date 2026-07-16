@@ -169,22 +169,22 @@ reference to port from. Most transfer with light changes:
      resolved store, different key). Mirror the derivation in `config diff` so a
      staged diff compares against the staged key. Colocated tests: production key
      unchanged, `--staging` suffixes, explicit `--key` + `--staging` composes.
-   - Engine (`deploy-core/scripts/run-app-cli.sh`): add a `config-push` mode
-     beside `build`/`deploy`. Same credential boundary — `provider-env` in, the
-     `EDGEZERO__*` namespace scrubbed before exec — invoking
-     `<cli> config push --adapter <adapter>` with the wrapper's typed flags
-     (`--store`, `--key`, `--staging`).
-   - `config-push-fastly` wrapper: thin composite mirroring `deploy-fastly`.
+   - CLI canonical line: after a successful non-dry-run write, `config.rs` emits
+     `pushed-key=<key>` (via `log::info!`, which the CLI routes to stdout) so the
+     wrapper can thread the written key out as an output.
+   - `config-push-fastly` wrapper: a **thin** composite mirroring
+     `healthcheck-fastly` / `rollback-fastly` (not the heavy `deploy` path).
      Inputs `app-cli-artifact`, `app-cli-bin`, `fastly-api-token`,
      `working-directory`, `manifest`, `app-config`, `store`, `key`, `deploy-to`
-     (`production`/`staging`, validated + fail-closed). Maps `fastly-api-token`
-     → `provider-env: {FASTLY_API_TOKEN: …}`; blanks the full alias list on every
-     step; installs the pinned Fastly CLI (the push shells out to
-     `fastly config-store-entry update`). Outputs `pushed-key`, `store`.
-   - Contract + smoke coverage: a `config-push` engine argv test; the lifecycle
-     smoke job's fake `fastly` gains `config-store list` / `config-store-entry
-update` handlers, and a staged push asserts the `<key>_staging` key reached
-     the store.
+     (`production`/`staging`, validated + fail-closed). Downloads the CLI artifact,
+     installs the pinned Fastly CLI (the push shells out to
+     `fastly config-store-entry update`), and calls the CLI directly with
+     `FASTLY_API_TOKEN` in the step env — the adapter's own convention — with
+     every other `FASTLY_*` alias blanked. Outputs `pushed-key`, `store`.
+   - Contract + smoke coverage: a `config-push.sh` argv test (staging appends
+     `--staging`; production does not); the smoke fixture's fake `fastly` gains
+     `config-store list` / `config-store-entry update` handlers, and a staged push
+     asserts the `<key>_staging` key reached the store.
 
 6. **Scripts layout**
    - Provider-neutral scripts under `deploy-core/`; the Fastly install + checksum
