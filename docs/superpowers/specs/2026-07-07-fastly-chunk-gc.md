@@ -1,4 +1,4 @@
-# Fastly chunked-config GC: reclaim orphaned chunk entries on re-push
+# Fastly chunked-config GC: reclaim orphaned chunk entries (operator-invoked)
 
 ## Motivation
 
@@ -214,30 +214,46 @@ Dry-run by default; deletes only with `--yes`.
    the listing. If one is absent, the listing is incomplete (e.g. paginated) or
    the store is inconsistent — either way we cannot decide what is orphaned, so
    we delete nothing.
-4. **Supersession-age guard (the sound clock).** For each root, the newest
-   `created_at` among its *live* chunks is when its current config went live —
-   the lower bound for when everything now orphaned under it was superseded. A
-   root's orphans are eligible only if that config has been live for at least
-   `--older-than`. (Directly defeats the design-3 counterexample: if B was
-   deployed seconds ago, the live generation is seconds old, so A's months-old
-   chunks are **not** eligible.) When a root's live value is *direct* (no live
-   chunks) or the root is gone, we fall back to the chunk's own `created_at`
-   under the operator's assertion.
-5. Candidates = canonical chunk entries not in the live set that clear the
-   age guard. Delete each with `--key --auto-yes` (never `--all`).
+4. **Supersession-age guard — best-effort defence in depth, NOT an independent
+   safety proof.** For each root, the newest `created_at` among its *live* chunks
+   approximates when its current config went live. When the live value **is** a
+   chunked generation, that time is a real lower bound on when the root's orphans
+   were superseded, so this catches the design-3 counterexample that a chunk's own
+   age cannot see (B deployed seconds ago ⇒ the live generation is seconds old ⇒
+   A's months-old chunks are retained).
+
+   **Where it is blind — read this before trusting it.** A root whose live value
+   is *direct* (or that is gone) has no live chunks and yields no signal at all;
+   and a re-push that reuses an existing content-address writes no new chunk, so
+   the newest live `created_at` can predate the transition. This guard therefore
+   applies only as an **additional restriction on top of the chunk's own age** —
+   never as a substitute for it, and never as grounds to relax `--older-than`.
+   **The operator's `--older-than` assertion (§4) remains the only sound basis
+   for any deletion.** Both ages must clear the window; the more restrictive
+   (the minimum) wins.
 
 **`--older-than` is the operator's safety assertion** — *"I have not changed
 this config within this window, and no push is running, so nothing POPs may
 still be serving is deleted."* Only the operator can make it, so:
 
 - it is **REQUIRED for `--yes`** (a destructive run must not guess it);
+- **`--older-than 0` is REJECTED for `--yes`.** A zero window asserts nothing: it
+  makes every orphan eligible, including one superseded a second ago whose pointer
+  POPs are still serving. Choose a window that is (a) at least Fastly's
+  propagation time and (b) no longer than the time since your last config change —
+  so the window you assert is one you actually observed;
 - a **dry-run without it** previews *every* orphan and its age (threshold 0) so
-  the operator can choose one from real data;
+  the operator can choose one from real data — previewing at zero is safe because
+  a dry-run deletes nothing;
 - a **dry-run with it** previews exactly what `--yes` would delete.
 
-**Fails closed** on: an unreadable listing, an unclassifiable root, a
-non-canonical referenced key, an unreadable `created_at`, or an incomplete
-listing — all abort with nothing deleted.
+**Fails closed** on: an unreadable listing, a listing that is not a bare JSON
+array (an `{"items":[...]}` envelope may carry pagination we do not follow, and a
+page that omitted a root would make its live chunks look orphaned), an empty
+`item_key`/`item_value`/`created_at`, a root value that is not *either* a valid
+direct envelope *or* a valid pointer (an empty or truncated pointer must not read
+as "references nothing"), a non-canonical referenced key, an unreadable
+`created_at`, or an incomplete listing — all abort with nothing deleted.
 
 **Non-zero exit on delete failure.** Every delete is attempted; if any fail, the
 command returns a non-zero exit naming the failed keys, so automation detects
@@ -399,12 +415,22 @@ in the `cli.rs` test module.
 
 - **Never deletes a live chunk**, however old it is (referenced by a root
   pointer ⇒ untouchable).
-- **Reclaims unreferenced chunks older than `--older-than`.**
-- **Retains unreferenced chunks younger than `--older-than`.**
+- **Reclaims unreferenced chunks older than `--older-than`** — where "older"
+  requires **BOTH** the chunk's own age **AND** (when known) its root's
+  live-config age to clear the window; the more restrictive wins.
+- **Retains unreferenced chunks younger than `--older-than`**, including a chunk
+  written seconds ago under a root that has been stable for a year (a concurrent
+  push may have written it and not yet committed its pointer). An old-looking root
+  never licenses deleting a young chunk.
+- **Rejects `--older-than 0` on `--yes`** — a zero window asserts nothing.
 - **Dry-run** names every key + age it would delete, and deletes nothing.
 - **Fails closed on an unreadable `created_at`** — aborts, deletes nothing.
 - **Fails closed on an unclassifiable root** — aborts, deletes nothing.
 - Delete argv passes `--key` + `--auto-yes` and **never** `--all`.
+- **A failed delete only reads as success when the CLI says THIS key is already
+  gone** (so a re-run after a partial pass is idempotent). Store-level, auth, and
+  server failures surface — a bare `not found`/`404` scan of stderr would report
+  "reclaimed" for a run that deleted nothing.
 
 ### Local (`push_config_entries_local` / `write_fastly_local_config_store`)
 

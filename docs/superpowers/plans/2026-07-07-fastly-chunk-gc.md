@@ -62,7 +62,7 @@ cannot be used as a supersession clock.
 
 | File | What it holds |
 | --- | --- |
-| `crates/edgezero-adapter-fastly/src/chunked_config.rs` | `prior_chunk_keys` (validated, canonical, prefix-scoped), `chunk_key_generation` (canonical-only), unit tests |
+| `crates/edgezero-adapter-fastly/src/chunked_config.rs` | `prior_chunk_keys` (validated, canonical, prefix-scoped), `gc_classify_root` (fail-closed GC classifier), `chunk_key_generation` (canonical-only, index must fit `usize`), unit tests |
 | `crates/edgezero-adapter-fastly/src/cli.rs` (push) | `reject_reserved_root_keys`, `reject_duplicate_root_keys`, `expand_root`; `write_fastly_local_config_store` (local eager prune); a cloud push writes only |
 | `crates/edgezero-adapter-fastly/src/cli.rs` (config gc) | `gc_config_entries` → `gc_fastly_config_store` → `plan_gc_reclamation`; `list_config_store_entries` (fail-closed parsing), `chunk_key_generation_any`, `parse_rfc3339_secs`, `unix_now_secs`, `delete_config_store_entry` (`--key --auto-yes`, never `--all`); `redact_describe_response` / `redact_stderr` |
 | `crates/edgezero-adapter/src/registry.rs` | `Adapter::gc_config_entries` trait method (default `Err`) |
@@ -131,30 +131,44 @@ cannot be used as a supersession clock.
 → `plan_gc_reclamation` (which owns every safety guard).
 
 - [x] `list_config_store_entries` — one `config-store-entry list --json`, parsed
-  **fail-closed**: every entry must carry string `item_key`/`item_value`/
-  `created_at`, else abort. A skipped/defaulted field would hide a root and get
-  its live chunks deleted.
-- [x] Live set — classify non-chunk entries as roots; `prior_chunk_keys` gives the
-  canonical keys each references; union = live. An unclassifiable root fails
-  closed.
+  **fail-closed**: the payload must be a BARE ARRAY (an `{"items":[...]}` envelope
+  may carry pagination we don't follow), and every entry must carry a NON-EMPTY
+  string `item_key`/`item_value`/`created_at`, else abort. A skipped, defaulted,
+  or empty field would hide a root and get its live chunks deleted.
+- [x] Live set — classify non-chunk entries as roots via `gc_classify_root`, which
+  accepts ONLY a valid direct envelope or a valid v1 pointer; union of referenced
+  canonical keys = live. Deliberately NOT the push-path `prior_chunk_keys`, which
+  answers `Ok([])` for a non-pointer value — on a destructive path an empty or
+  truncated pointer must fail, not read as "references nothing" and orphan its own
+  live chunks.
 - [x] **Completeness guard** — every live-referenced key must appear in the
   listing, else fail closed (guards against a paginated/incomplete list, where an
   unseen root could reference a chunk we'd wrongly delete).
-- [x] **Live-generation-age guard (the sound clock)** — per root, the newest
-  `created_at` among its *live* chunks is when its current config went live: the
-  lower bound for when everything now orphaned under it was superseded. A root's
-  orphans are eligible only if that config has been stable ≥ `--older-than`.
-  Directly defeats the design-3 counterexample. Falls back to the chunk's own
-  `created_at` only when the root's live value is direct / the root is gone.
+- [x] **Live-generation-age guard (best-effort defence in depth — NOT an
+  independent safety proof)** — per root, the newest `created_at` among its *live*
+  chunks approximates when its current config went live, a real lower bound on
+  when that root's orphans were superseded *when the live value is chunked*. It
+  catches the design-3 counterexample. It is blind when the live value is direct
+  (no signal) or when a re-push reuses a content-address (no new chunk). So it is
+  applied only as an ADDITIONAL restriction on top of the chunk's own age — both
+  must clear `--older-than`, more restrictive wins — and the operator's
+  `--older-than` assertion remains the only sound basis for any delete.
 - [x] Delete each candidate with `--key --auto-yes` (never `--all`).
   **Continue-then-fail**: attempt every delete, then return a **non-zero** error
   naming any that failed, so automation detects partial failure.
 - [x] `plan_gc_reclamation` extracted from `gc_fastly_config_store` so the guards
   read as one unit (no `#[expect(too_many_lines)]`).
 - [x] Tests: never-delete-live, reclaim-aged-orphan, **protect recently-superseded
-  gen with old chunks**, root-changed / suspicious / malformed-listing /
-  unreadable-timestamp fail-closed, non-canonical-not-deleted, delete argv shape,
-  delete-failure non-zero exit, list-path redaction.
+  gen with old chunks**, **retain young orphan under a long-stable root** (both
+  ages), fail-closed on truncated-root-pointer / empty-root-value /
+  enveloped-(paginated)-listing / unclassifiable-root / malformed-listing-entry /
+  unreadable-timestamp, non-canonical-not-deleted (fails closed), delete argv
+  shape, narrow absent-key match (store/auth/500 must surface), delete-failure
+  non-zero exit, list-path redaction.
+- [x] CLI gating tests: `--yes` requires `--older-than`; `--yes --older-than 0`
+  rejected; dry-run allows a missing threshold. Scaffold test asserts a generated
+  project wires `Gc(ConfigGcArgs)` → `edgezero_cli::run_config_gc` (verified live
+  by mutating the template).
 
 ### Task 6 — CLI wiring ✅
 

@@ -302,7 +302,22 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
                     .to_owned(),
             );
         }
-        (_, Some(raw)) => parse_duration_secs(raw)?,
+        (yes, Some(raw)) => {
+            let secs = parse_duration_secs(raw)?;
+            // `--older-than 0 --yes` asserts nothing: it makes EVERY orphan
+            // eligible, including one superseded a second ago whose pointer
+            // POPs are still serving. Dry-run may preview at zero; a delete
+            // may not run at it.
+            if yes && secs == 0 {
+                return Err(format!(
+                    "`config gc --yes --older-than {raw}` resolves to 0 seconds, which asserts \
+                     nothing: it would make every orphan eligible, including chunks a pointer POPs \
+                     are still serving. Pass a window at least as long as Fastly's propagation \
+                     time and no longer than the time since your last config change."
+                ));
+            }
+            secs
+        }
         // Dry-run with no threshold: preview EVERY orphan (age >= 0) with ages,
         // so the operator can choose `--older-than` from real data.
         (false, None) => 0,
@@ -372,7 +387,7 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
                 "[edgezero] dry-run (no --yes): nothing was deleted. Re-run with `--yes` to apply. `--older-than {dur}` asserts you have not changed this config within that window and no push is running."
             ),
             None => log::info!(
-                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose `--older-than <dur>` larger than the time since your last config change, then re-run with `--yes`."
+                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose an `--older-than <dur>` that is (a) at least Fastly's propagation window, so POPs have stopped serving the superseded pointer, and (b) no longer than the time since your last config change, so the window you assert is one you actually observed. Then re-run with `--yes`."
             ),
         }
     }
@@ -1765,6 +1780,28 @@ mod tests {
             err.contains("requires an explicit"),
             "must explain the requirement: {err}"
         );
+    }
+
+    /// PR #314 review [P1]: `--older-than 0 --yes` parses, but asserts NOTHING --
+    /// it makes every orphan eligible, including one superseded a second ago whose
+    /// pointer POPs still serve. A destructive run must reject it (a dry-run may
+    /// still preview at zero — see `config_gc_dry_run_allows_missing_older_than`).
+    #[test]
+    fn config_gc_yes_rejects_zero_older_than() {
+        for raw in ["0", "0s", "0d"] {
+            let args = ConfigGcArgs {
+                adapter: "fastly".to_owned(),
+                yes: true,
+                older_than: Some(raw.to_owned()),
+                ..ConfigGcArgs::default()
+            };
+            let err = run_config_gc(&args)
+                .expect_err("a zero window on a destructive run must be rejected");
+            assert!(
+                err.contains("resolves to 0 seconds"),
+                "`--older-than {raw}` must be rejected as a no-op assertion, got: {err}"
+            );
+        }
     }
 
     /// A dry-run (no `--yes`) is allowed without `--older-than`; it fails later,

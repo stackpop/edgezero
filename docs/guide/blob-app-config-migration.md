@@ -368,13 +368,20 @@ project's typed downstream CLI. The bundled binary intentionally cannot
 push (it has no typed `C` in scope). Run `<your-app>-cli config push`
 instead — `edgezero new` generates this CLI for you.
 
-### Local fastly.toml writer wipes old chunks on re-push
+### Local fastly.toml writer prunes old chunks on re-push
 
-The local writer wholesale-replaces the per-store contents block on
-every push so stale entries don't accumulate during dev work. This is
-intentional (and STRONGER than the remote behaviour, where orphan
-chunks remain inert). The runtime correctness property holds either
-way: a read after push B reconstructs envelope B, not A.
+The local writer **upserts the keys it is pushing and prunes exactly the
+chunks the prior generation of those roots referenced** — it does not
+wholesale-replace the per-store contents block, so keys it isn't pushing
+(including sibling roots and their chunks) are preserved. Pruning is safe
+here in a way it is not in the cloud: `fastly.toml` is a single file that
+Viceroy reads at startup, so there is no propagation window and no POP
+that could still be serving the prior pointer.
+
+This is STRONGER than the remote behaviour, where a `config push`
+reclaims nothing and orphan chunks remain inert until you run
+`config gc`. The runtime correctness property holds either way: a read
+after push B reconstructs envelope B, not A.
 
 ## Reference
 

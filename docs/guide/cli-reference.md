@@ -304,6 +304,65 @@ app-demo-cli config diff --adapter fastly --exit-code --format json
 
 **Exit codes:** `0` on success (or when there are no changes); with `--exit-code`, `0` when local and remote match and a non-zero code when they differ. Errors return non-zero with a one-line diagnostic.
 
+### edgezero config gc
+
+Reclaim orphaned **chunk entries** from a config store. Only Fastly needs
+this: its Config Store caps a value at 8 000 characters, so an oversized
+app-config envelope is split into content-addressed chunks plus a root
+pointer. Because the chunk keys are content-addressed, changing the config
+produces an entirely new set — and a cloud `config push` **deletes
+nothing**, so the previous generation is left orphaned (inert, but it
+accumulates). `config gc` is how you reclaim it.
+
+Unlike `push`/`validate`/`diff`, `config gc` is **untyped**: it inspects the
+store's physical entries, not your `AppConfig<C>`. The bundled `edgezero`
+binary can run it.
+
+Local (`fastly.toml`) pushes prune their own prior chunks eagerly and never
+need `gc`.
+
+```bash
+edgezero config gc --adapter fastly [--manifest <path>] [--store <id>] [--older-than <dur>] [--no-env] [--yes]
+```
+
+**Arguments:**
+
+- `--adapter <name>` — target adapter. Only `fastly` implements reclamation; others error.
+- `--manifest <path>` — manifest path (default: `edgezero.toml`).
+- `--store <id>` — logical config-store id to reclaim. Defaults to `[stores.config].default` (or the only declared id when `[stores.config].ids` has length 1).
+- `--older-than <dur>` — **your safety assertion** (see below). Accepts `7d`, `24h`, `90m`, `30s`, or a bare number of seconds.
+- `--no-env` — skip the `<APP_NAME>__…__<KEY>` env-var overlay when loading the manifest.
+- `--yes` — actually delete. **Without it, `config gc` is a dry run** that names every key and age it would delete and deletes nothing.
+
+**`--older-than` is an assertion only you can make.** Fastly's config store
+is eventually consistent and offers no compare-and-swap, so nothing in the
+API records _when a pointer stopped being served by every POP_ — which is
+the one fact needed to delete a chunk safely. You know it. `--older-than
+<dur>` says: _"I have not changed this config within this window, and no
+push is running."_ So:
+
+- it is **required** for `--yes`, and **`--older-than 0` is rejected** there — a zero window asserts nothing;
+- pick a window that is **at least Fastly's propagation time** (so POPs have stopped serving the superseded pointer) and **no longer than the time since your last config change** (so it's a window you actually observed);
+- **do not run `config gc` alongside a `config push`** to the same store.
+
+`config gc` fails closed: an unreadable or paginated listing, a root it
+cannot classify, an unreadable timestamp, or a live pointer referencing a
+key absent from the listing all abort with **nothing deleted**. It never
+deletes a chunk a live pointer references, however old.
+
+```bash
+# Dry run FIRST — previews every orphan and its age, deletes nothing.
+edgezero config gc --adapter fastly
+
+# Reclaim generations superseded more than 7 days ago.
+edgezero config gc --adapter fastly --older-than 7d --yes
+```
+
+**Exit codes:** `0` on success. Non-zero on any fail-closed refusal (nothing
+deleted) and non-zero if any delete failed — every delete is attempted, then
+the command reports the failed keys, so automation detects a partial pass. A
+failed delete is inert; re-run to retry.
+
 ### edgezero provision
 
 Create the platform resources backing the `[stores.<kind>].ids` the

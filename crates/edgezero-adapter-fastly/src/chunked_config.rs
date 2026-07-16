@@ -364,6 +364,52 @@ pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>,
     Ok(keys)
 }
 
+/// Classify a ROOT value for `config gc` — the live-set input on a DESTRUCTIVE
+/// path, so it is fail-closed. Unlike [`prior_chunk_keys`] (which is lenient for
+/// the push path and treats unrelated/empty JSON as "references nothing"), this
+/// accepts ONLY:
+///
+/// - a valid, integrity-checked direct `BlobEnvelope` → `Ok(vec![])` (no chunks);
+/// - a valid v1 chunk pointer → `Ok(<canonical chunk keys>)`.
+///
+/// Anything else — an empty string, a truncated/partial value, unrelated JSON,
+/// or a pointer that fails validation — is `Err`. A root we cannot classify has
+/// unknown references, so we must reclaim NOTHING rather than treat its live
+/// chunks as orphaned.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn gc_classify_root(root_key: &str, raw: &str) -> Result<Vec<String>, String> {
+    use edgezero_core::blob_envelope::BlobEnvelope;
+
+    if raw.trim().is_empty() {
+        return Err(format!(
+            "root `{root_key}` has an empty value; refusing to reclaim (cannot tell what it references)"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|err| {
+        format!("root `{root_key}` is not valid JSON ({err}); refusing to reclaim")
+    })?;
+    if value
+        .get("edgezero_kind")
+        .and_then(serde_json::Value::as_str)
+        == Some(POINTER_KIND)
+    {
+        // A chunk pointer: prior_chunk_keys validates + returns its canonical keys.
+        return prior_chunk_keys(root_key, raw);
+    }
+    // Otherwise it must be a valid, integrity-checked direct envelope.
+    let envelope: BlobEnvelope = serde_json::from_value(value).map_err(|err| {
+        format!(
+            "root `{root_key}` is neither a valid chunk pointer nor a valid config envelope ({err}); refusing to reclaim"
+        )
+    })?;
+    envelope.verify().map_err(|err| {
+        format!(
+            "root `{root_key}` envelope failed its integrity check ({err}); refusing to reclaim"
+        )
+    })?;
+    Ok(Vec::new())
+}
+
 /// Extract the content-address (envelope SHA) of the generation a chunk key
 /// belongs to, for `root_key`. Returns `None` when `key` is not a well-formed
 /// chunk key of that root.
@@ -407,7 +453,14 @@ fn is_canonical_index(index: &str) -> bool {
     if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
         return false;
     }
-    index == "0" || !index.starts_with('0')
+    if index != "0" && index.starts_with('0') {
+        return false;
+    }
+    // Must be an index this writer could actually have emitted: the chunk loop
+    // counts in `usize`, so a digit run that overflows it (or is absurdly long)
+    // is not ours. This is the destructive-delete gate -- accept only what
+    // `prepare_fastly_config_entries` can produce.
+    index.parse::<usize>().is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -416,9 +469,28 @@ fn is_canonical_index(index: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use std::collections::HashMap;
 
     use super::*;
+
+    /// PR #314 review [P3]: the index must be one this writer could emit. The
+    /// chunk loop counts in `usize`, so a digit run that overflows it is not
+    /// ours -- and this gate authorises DELETES.
+    #[test]
+    fn canonical_index_must_fit_usize() {
+        let sha = "a".repeat(64);
+        let root = "app_config";
+        assert!(chunk_key_generation(root, &format!("{root}.__edgezero_chunks.{sha}.0")).is_some());
+        assert!(chunk_key_generation(root, &format!("{root}.__edgezero_chunks.{sha}.7")).is_some());
+        // 40 digits: all-ASCII-digit and no leading zero, but not a usize.
+        let overflow = "9".repeat(40);
+        assert!(
+            chunk_key_generation(root, &format!("{root}.__edgezero_chunks.{sha}.{overflow}"))
+                .is_none(),
+            "an index that overflows usize is not a key we wrote"
+        );
+    }
 
     // ---- helpers ----
 
