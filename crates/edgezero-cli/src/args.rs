@@ -346,7 +346,7 @@ pub struct ConfigDiffArgs {
     pub runtime_config: Option<PathBuf>,
     /// Diff against the staging key (`<key>_staging`) in the same store,
     /// so a staged diff compares what `config push --staging` would write
-    /// (spec §5.5).
+    /// what a staging push would write.
     #[arg(long)]
     pub staging: bool,
     /// Logical config store id to diff against. Defaults to the
@@ -438,7 +438,7 @@ pub struct ConfigPushArgs {
     pub runtime_config: Option<PathBuf>,
     /// Push to staging: write the config under the `<key>_staging` variant
     /// in the SAME store, so it never overwrites the production key the live
-    /// service is reading (Fastly staging lifecycle, spec §5.5). The same
+    /// service is reading. The same
     /// `--staging` verb `deploy`/`healthcheck`/`rollback` use.
     #[arg(long)]
     pub staging: bool,

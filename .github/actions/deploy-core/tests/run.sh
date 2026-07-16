@@ -448,6 +448,18 @@ test_lifecycle_helpers() {
   assert_succeeds "a well-formed required input is accepted" \
     bash -c "source '$CORE_SCRIPTS/common.sh'; require_input_matching fastly-version '42' '^[0-9]+\$'"
 
+  # `fail` always exits 1, which erases a provider CLI's real status. Wrappers
+  # use fail_with so an operator's retry/branch logic sees the true code.
+  local rc=0
+  bash -c "$helpers; fail_with 3 'boom'" >/dev/null 2>&1 || rc=$?
+  assert_equals "fail_with preserves the tool's exit status" "3" "$rc"
+  rc=0
+  bash -c "$helpers; fail_with 0 'boom'" >/dev/null 2>&1 || rc=$?
+  assert_equals "fail_with never turns a failure into success (0 -> 1)" "1" "$rc"
+  rc=0
+  bash -c "$helpers; fail_with '' 'boom'" >/dev/null 2>&1 || rc=$?
+  assert_equals "fail_with rejects a blank status (-> 1)" "1" "$rc"
+
   # Provider CLIs print request URLs and service metadata; the log must not be
   # left behind in RUNNER_TEMP for later steps in the job to read.
   local leaked
@@ -515,18 +527,35 @@ run_config_push_argv() {
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$FAKE_ARGV_OUT"
 echo "pushed-key=app_config_staging"
+echo "pushed-store=app_config"
 CLI
   chmod +x "$dir/bin/fake-cli"
+  # An in-app file every call can reference (this helper recreates $dir, so the
+  # fixture must live here rather than being made by the caller).
+  printf 'x\n' >"$dir/app/real.toml"
 
   PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" \
     EDGEZERO__APP__CLI__BIN=fake-cli \
     FASTLY_API_TOKEN=tok \
-    EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
+    GITHUB_WORKSPACE="$dir" \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
     EDGEZERO__DEPLOY__TO="${CP_DEPLOY_TO:-production}" \
     EDGEZERO__CONFIG_PUSH__STORE="${CP_STORE:-}" \
     EDGEZERO__CONFIG_PUSH__KEY="${CP_KEY:-}" \
+    EDGEZERO__CONFIG_PUSH__MANIFEST="${CP_MANIFEST:-}" \
+    EDGEZERO__CONFIG_PUSH__APP_CONFIG="${CP_APP_CONFIG:-}" \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh" >/dev/null 2>&1
-  cat "$dir/argv.txt"
+  cat "$dir/argv.txt" 2>/dev/null
+}
+
+# Run config-push.sh with a caller-supplied path; used for confinement checks.
+config_push_rejects_path() {
+  local var="$1" value="$2"
+  local dir="$WORK_DIR/config-push"
+  env "$var=$value" PATH="$dir/bin:$PATH" FAKE_ARGV_OUT="$dir/argv.txt" \
+    EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
+    GITHUB_WORKSPACE="$dir" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
 }
 
 test_config_push_argv() {
@@ -553,8 +582,30 @@ test_config_push_argv() {
   # A bad deploy-to must fail closed, never silently push to production.
   assert_fails "a non-{production,staging} deploy-to is rejected" \
     env EDGEZERO__APP__CLI__BIN=fake-cli FASTLY_API_TOKEN=tok \
-    EDGEZERO__PROJECT__WORKING_DIRECTORY="$WORK_DIR" EDGEZERO__DEPLOY__TO=Staging \
+    GITHUB_WORKSPACE="$WORK_DIR/config-push" EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    EDGEZERO__DEPLOY__TO=Staging \
     "$ACTIONS_DIR/config-push-fastly/scripts/config-push.sh"
+
+  # Path confinement: manifest/app-config are caller strings handed to a
+  # credential-bearing CLI, so nothing may escape the app directory.
+  local dir="$WORK_DIR/config-push"
+  printf 'secret\n' >"$WORK_DIR/outside.toml"
+  ln -sf "$WORK_DIR/outside.toml" "$dir/app/escape.toml"
+
+  assert_fails "an absolute manifest path is rejected" \
+    config_push_rejects_path EDGEZERO__CONFIG_PUSH__MANIFEST "$WORK_DIR/outside.toml"
+  assert_fails "a traversal manifest path is rejected" \
+    config_push_rejects_path EDGEZERO__CONFIG_PUSH__MANIFEST "../outside.toml"
+  assert_fails "a symlink escaping the app dir is rejected" \
+    config_push_rejects_path EDGEZERO__CONFIG_PUSH__MANIFEST "escape.toml"
+  assert_fails "an absolute app-config path is rejected" \
+    config_push_rejects_path EDGEZERO__CONFIG_PUSH__APP_CONFIG "$WORK_DIR/outside.toml"
+
+  # Confinement must not over-reject: an in-app path still works.
+  local ok
+  ok=$(CP_MANIFEST=real.toml run_config_push_argv || true)
+  assert_succeeds "an in-app manifest path is accepted and threaded" \
+    grep -qx -- 'real.toml' <<<"$ok"
 }
 
 # ---------------------------------------------------------------------------
@@ -701,32 +752,80 @@ TOML
 }
 
 # ---------------------------------------------------------------------------
-# action.yml metadata — every declared output is actually produced
+# action.yml metadata — every declared output is produced by the step it names
 # ---------------------------------------------------------------------------
 # A declared output whose step never emits that name silently resolves to "".
-# This is exactly how the app-cli-artifact rename broke the deploy wiring: the
+# That is exactly how the app-cli-artifact rename broke the deploy wiring: the
 # consumers read an output the producer no longer wrote.
+#
+# This resolves each `steps.<id>.outputs.<name>` to the SPECIFIC script that step
+# runs, so a name emitted by some other action cannot vouch for this one. Both
+# `outputs['name']` and `outputs.name` spellings are recognised — GitHub accepts
+# either, so a test that only understood one would silently skip the rest.
+
+# Echo "<step-id> <script-path>" for every step in an action.yml that runs a
+# script, resolving $GITHUB_ACTION_PATH to the action's own directory.
+action_step_scripts() {
+  local action="$1" action_dir
+  action_dir=$(dirname "$action")
+  awk -v dir="$action_dir" '
+    /^[[:space:]]*-[[:space:]]*name:/ { id = "" }
+    /^[[:space:]]*id:[[:space:]]*/    { id = $2 }
+    /^[[:space:]]*run:.*\.sh/ {
+      if (id == "") next
+      line = $0
+      sub(/^[[:space:]]*run:[[:space:]]*/, "", line)
+      gsub(/\$GITHUB_ACTION_PATH/, dir, line)
+      gsub(/\$\{\{[^}]*\}\}/, "", line)
+      print id, line
+      id = ""
+    }
+  ' "$action"
+}
+
 test_action_output_contracts() {
   section "action output contracts"
-  # Every name a script writes via append_output, across all actions.
-  local produced
-  produced=$(grep -rhoE 'append_output [a-z0-9-]+' "$ACTIONS_DIR" | awk '{print $2}' | sort -u)
+  local action missing=0 checked=0
 
-  local action missing=0 name
   for action in "$ACTIONS_DIR"/*/action.yml; do
-    # Output names referenced as steps.<id>.outputs['<name>'] in the outputs block.
-    while IFS= read -r name; do
-      [[ -n "$name" ]] || continue
-      if ! grep -qx "$name" <<<"$produced"; then
-        fail "$(basename "$(dirname "$action")") declares output '$name' that no script emits"
+    local name_of; name_of=$(basename "$(dirname "$action")")
+    local scripts; scripts=$(action_step_scripts "$action")
+
+    local ref step_id out_name script emitted
+    # Both spellings: steps.<id>.outputs['<name>'] and steps.<id>.outputs.<name>
+    while IFS= read -r ref; do
+      [[ -n "$ref" ]] || continue
+      step_id=${ref%% *}
+      out_name=${ref##* }
+      checked=$((checked + 1))
+
+      script=$(awk -v want="$step_id" '$1 == want { $1 = ""; sub(/^ /, ""); print; exit }' <<<"$scripts")
+      if [[ -z "$script" ]]; then
+        fail "$name_of output '$out_name' names step '$step_id', which runs no script"
+        missing=$((missing + 1))
+        continue
+      fi
+      if [[ ! -f "$script" ]]; then
+        fail "$name_of step '$step_id' points at a missing script: $script"
+        missing=$((missing + 1))
+        continue
+      fi
+      # The named step's OWN script must emit it — not merely some other action.
+      emitted=$(grep -oE "append_output ${out_name}( |\$)" "$script" || true)
+      if [[ -z "$emitted" ]]; then
+        fail "$name_of output '$out_name' claims step '$step_id' ($(basename "$script")) emits it, but that script does not"
         missing=$((missing + 1))
       fi
     done < <(sed -n '/^outputs:/,/^runs:/p' "$action" |
-      grep -oE "steps\.[a-z-]+\.outputs\['[a-z0-9-]+'\]" |
-      sed -E "s/.*\['([a-z0-9-]+)'\]/\1/" | sort -u)
+      grep -oE "steps\.[a-z-]+\.outputs(\['[a-z0-9-]+'\]|\.[a-z0-9-]+)" |
+      sed -E "s/steps\.([a-z-]+)\.outputs\['([a-z0-9-]+)'\]/\1 \2/; s/steps\.([a-z-]+)\.outputs\.([a-z0-9-]+)/\1 \2/" |
+      sort -u)
   done
-  if [[ "$missing" -eq 0 ]]; then
-    pass "every declared action output is emitted by a script"
+
+  if [[ "$checked" -eq 0 ]]; then
+    fail "the output-contract test matched no outputs at all (it is not testing anything)"
+  elif [[ "$missing" -eq 0 ]]; then
+    pass "all $checked declared outputs are emitted by the step they name"
   fi
 }
 

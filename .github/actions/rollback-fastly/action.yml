@@ -51,6 +51,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
 
     - name: Extract CLI
@@ -74,6 +75,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
 
@@ -100,6 +102,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/scripts/rollback.sh
 
@@ -108,4 +111,20 @@ runs:
       shell: bash
       env:
         EDGEZERO__ACTION__TOOL_ROOT: ${{ runner.temp }}/edgezero-action-tools
+        FASTLY_API_TOKEN: ""
+        FASTLY_SERVICE_ID: ""
+        FASTLY_TOKEN: ""
+        FASTLY_KEY: ""
+        FASTLY_API_KEY: ""
+        FASTLY_AUTH_TOKEN: ""
+        FASTLY_API_ENDPOINT: ""
+        FASTLY_ENDPOINT: ""
+        FASTLY_API_URL: ""
+        FASTLY_PROFILE: ""
+        FASTLY_SERVICE_NAME: ""
+        FASTLY_DEBUG: ""
+        FASTLY_DEBUG_MODE: ""
+        FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
+        FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh

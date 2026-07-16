@@ -173,10 +173,18 @@ for a worked staging workflow).
 
 The deploy actions do not perform: internal application checkout; config
 expansion or JSON→provider config conversion. Config push and provisioning are
-explicit CLI subcommands (`edgezero config push`, `edgezero provision`) a
-consumer may run as separate steps, not deploy side effects. The generic engine
-stays provider-neutral — staging/health/rollback exist only as Fastly-specific
-actions (§4), not engine behavior.
+never deploy side effects — they are separate, explicit steps a consumer runs on
+their own schedule. Config push has its own action, `config-push-fastly`
+(including `deploy-to: staging`, which writes the `<key>_staging` variant in the
+same store); provisioning is a CLI subcommand (`<your-app>-cli provision`). The
+generic engine stays provider-neutral — staging/health/rollback exist only as
+Fastly-specific actions (§4), not engine behavior.
+
+> **Run config push through your own app CLI, not the bundled `edgezero`
+> binary.** `edgezero config push` is a stub that exits non-zero by design:
+> pushing typed config requires the app-config struct, which only your generated
+> CLI has. Use the `config-push-fastly` action (it drives the `build-app-cli`
+> artifact), or invoke `<your-app>-cli config push` directly.
 
 ## 6. Worked example — Trusted Server deployer migration
 

@@ -170,12 +170,12 @@ the application declares it, so the app owns adapter selection.
 
 **Outputs**
 
-| Output            | Meaning                                                        |
-| ----------------- | -------------------------------------------------------------- |
-| `app-cli-version` | CLI package version, read from `cargo metadata` at build time. |
-| `app-cli-package` | The application CLI package that was built.                    |
-| `app-cli-bin`     | The binary name inside the artifact.                           |
-| `artifact-name`   | Name of the uploaded CLI artifact for downstream `download`.   |
+| Output             | Meaning                                                        |
+| ------------------ | -------------------------------------------------------------- |
+| `app-cli-version`  | CLI package version, read from `cargo metadata` at build time. |
+| `app-cli-package`  | The application CLI package that was built.                    |
+| `app-cli-bin`      | The binary name inside the artifact.                           |
+| `app-cli-artifact` | Name of the uploaded CLI artifact for downstream `download`.   |
 
 **Behavior**
 

@@ -927,11 +927,15 @@ fn write_envelope(
     for line in lines {
         log::info!("{line}");
     }
-    // Canonical machine-readable line (spec §5.5) — the config-push-fastly action
-    // greps `^pushed-key=<key>$` to thread the written key out as an output. The
-    // CLI logger routes log::info! to stdout, so this reaches the action's log.
+    // Canonical machine-readable lines — the config-push-fastly action greps
+    // `^pushed-key=<key>$` / `^pushed-store=<id>$` to thread the written key and
+    // the RESOLVED store out as outputs. The store must come from here: the
+    // wrapper only has the optional raw input, which is empty on the default path
+    // where the id is resolved from the manifest. The CLI logger routes
+    // log::info! to stdout, so these reach the action's log.
     if !args.dry_run {
         log::info!("pushed-key={key}");
+        log::info!("pushed-store={}", ctx.store.logical);
     }
     Ok(())
 }
@@ -1089,9 +1093,11 @@ fn resolve_adapter_push_ctx(
 
 /// Derive the config-store key a push or diff targets. When `staging` is set,
 /// the config is written under (or diffed against) the `<base>_staging` variant
-/// in the SAME store — never the production key the live service reads (spec
-/// §5.5). This mirrors the runtime-override store the Fastly adapter scaffolds,
-/// whose selector key chooses `app_config` vs `app_config_staging`.
+/// in the SAME store — never the production key the live service reads. Fastly
+/// config stores are not versioned like staged service versions, so a different
+/// key is what isolates staged config. This mirrors the runtime-override store
+/// the Fastly adapter scaffolds, whose selector key chooses `app_config` vs
+/// `app_config_staging`.
 fn resolve_config_key(base: String, staging: bool) -> String {
     if staging {
         format!("{base}_staging")

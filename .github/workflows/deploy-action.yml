@@ -75,7 +75,8 @@ jobs:
             .github/actions/build-app-cli/action.yml \
             .github/actions/deploy-fastly/action.yml \
             .github/actions/healthcheck-fastly/action.yml \
-            .github/actions/rollback-fastly/action.yml
+            .github/actions/rollback-fastly/action.yml \
+            .github/actions/config-push-fastly/action.yml
 
       - name: Install ShellCheck
         run: |
@@ -88,11 +89,8 @@ jobs:
         # not a real defect. Everything else is checked.
         run: |
           shellcheck -e SC1091 \
-            .github/actions/build-app-cli/scripts/*.sh \
-            .github/actions/deploy-core/scripts/*.sh \
-            .github/actions/deploy-core/tests/*.sh \
-            .github/actions/deploy-fastly/scripts/*.sh \
-            .github/actions/config-push-fastly/scripts/*.sh
+            .github/actions/*/scripts/*.sh \
+            .github/actions/deploy-core/tests/*.sh
 
       - name: Bash contract tests
         run: .github/actions/deploy-core/tests/run.sh
@@ -147,6 +145,59 @@ jobs:
         env:
           EDGEZERO__TEST__FASTLY_VERSION: ${{ steps.deploy.outputs['fastly-version'] }}
         run: .github/actions/deploy-core/tests/assert-production-deploy.sh
+
+  # Config push: the real config-push-fastly wrapper against a fake `fastly`,
+  # proving the whole chain — artifact download, Fastly CLI install, the app
+  # CLI's TYPED `config push` (the bundled stub cannot do this), and the
+  # staging-key contract. Config push is deliberately NOT part of deploy, so it
+  # gets its own job.
+  config-push-smoke:
+    runs-on: ubuntu-24.04
+    # Inherited provider aliases the push MUST clear.
+    env:
+      FASTLY_ENDPOINT: https://inherited.invalid
+      FASTLY_HOME: /nonexistent/inherited
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Create fixture app (app-owned CLI with typed config)
+        run: .github/actions/deploy-core/tests/make-smoke-fixture.sh
+
+      - name: Build the APP's own CLI package
+        id: cli
+        uses: ./.github/actions/build-app-cli
+        with:
+          app-cli-package: fixture-app-cli
+          working-directory: fixture-app
+
+      - name: Install fake fastly + curl
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+
+      - name: Push config to staging
+        id: staged
+        uses: ./.github/actions/config-push-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+          deploy-to: staging
+
+      - name: Push config to production
+        id: prod
+        uses: ./.github/actions/config-push-fastly
+        with:
+          app-cli-artifact: ${{ steps.cli.outputs.app-cli-artifact }}
+          working-directory: fixture-app
+          fastly-api-token: dummy-token
+
+      - name: Assert the staging key, the production key, and the store calls
+        env:
+          EDGEZERO__TEST__STAGED_KEY: ${{ steps.staged.outputs['pushed-key'] }}
+          EDGEZERO__TEST__STAGED_STORE: ${{ steps.staged.outputs.store }}
+          EDGEZERO__TEST__PROD_KEY: ${{ steps.prod.outputs['pushed-key'] }}
+        run: .github/actions/deploy-core/tests/assert-config-push.sh
 
   # Staging path: the full lifecycle through the REAL wrappers — deploy-fastly
   # with `stage: true`, then healthcheck-fastly, then rollback-fastly — against

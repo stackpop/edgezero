@@ -49,7 +49,7 @@ main() {
   append_output rolled-back-to "$rolled"
 
   if [[ "$rc" -ne 0 ]]; then
-    fail "rollback failed (CLI exit $rc)"
+    fail_with "$rc" "rollback failed (CLI exit $rc)"
   fi
   if [[ "$EDGEZERO__DEPLOY__TO" == "production" && -z "$rolled" ]]; then
     fail "production rollback reported success but did not emit rolled-back-to"

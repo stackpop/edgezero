@@ -28,6 +28,23 @@ notice() {
   echo "::notice::$message" >&2
 }
 
+# Fail with the SAME exit status the underlying tool returned.
+#
+# `fail` always exits 1, which erases a provider CLI's exit code. Callers that
+# wrap a CLI must preserve it: an operator's `if: steps.x.outcome` logic and any
+# retry tooling keys off the real status, and a rollback that exited 3 is not the
+# same event as one that exited 1.
+fail_with() {
+  local code="$1"
+  shift
+  local message
+  message=$(escape_annotation "$*")
+  echo "::error::$message" >&2
+  # Guard against a 0/blank status turning a failure into a silent success.
+  [[ "$code" =~ ^[0-9]+$ ]] && ((code != 0)) || code=1
+  exit "$code"
+}
+
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "required command '$1' was not found"
 }

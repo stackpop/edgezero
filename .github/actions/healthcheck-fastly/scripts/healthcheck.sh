@@ -72,7 +72,7 @@ main() {
   append_output status-code "$status"
 
   if [[ "$rc" -ne 0 ]]; then
-    fail "health check failed (CLI exit $rc, healthy=${healthy:-<none>}, status=${status:-<none>})"
+    fail_with "$rc" "health check failed (CLI exit $rc, healthy=${healthy:-<none>}, status=${status:-<none>})"
   fi
   if [[ "$healthy" != "true" ]]; then
     fail "health check did not report healthy=true (got '${healthy:-<no verdict emitted>}')"

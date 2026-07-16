@@ -48,6 +48,17 @@ case "\${1:-} \${2:-}" in
   "compute deploy") echo "SUCCESS: Deployed package (service dummy-service, version 43)" ;;
   "service-version update") echo "Updated version comment" ;;
   "service-version stage") echo "Staged version" ;;
+  # config push resolves the store id by name from this list, reads the current
+  # entry to diff against, then upserts one entry per physical key.
+  "config-store list") echo '[{"id":"STOREID1","name":"app_config"}]' ;;
+  "config-store-entry describe")
+    # Report the key as absent so the push proceeds to a first write. The real
+    # CLI distinguishes "missing" from "unparseable" — returning nothing at all
+    # is a parse error, not an absent key.
+    echo "Error: config store entry not found" >&2
+    exit 1
+    ;;
+  "config-store-entry update") echo "SUCCESS: Updated config store entry" ;;
   *)
     case "\${1:-}" in
       version | --version) echo "Fastly CLI version v$version (fake)" ;;

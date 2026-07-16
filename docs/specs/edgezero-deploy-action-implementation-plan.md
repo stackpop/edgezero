@@ -57,7 +57,7 @@ reference to port from. Most transfer with light changes:
    - Required `app-cli-package` input: the Cargo package name of the CLI defined in
      the application's own workspace. Fail if missing or not found in the app
      workspace under `working-directory`.
-   - `working-directory`, `rust-toolchain`, `artifact-name` inputs (no `adapters`
+   - `working-directory`, `rust-toolchain`, `app-cli-artifact` inputs (no `adapters`
      input — the app's `Cargo.toml` pins adapters).
    - Optional `app-cli-bin` input (default = `app-cli-package`; the generated CLI names
      its bin after the package).
@@ -76,7 +76,7 @@ reference to port from. Most transfer with light changes:
      `app-cli-version`, `app-cli-package`) next to the binary and upload both as one
      **tar** so the executable bit survives `actions/upload-artifact` and the
      artifact is self-describing.
-   - Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `artifact-name`.
+   - Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`.
    - No provider credentials in scope. Never builds the EdgeZero monorepo CLI.
 
 2. **`deploy-core` shared engine scripts (provider-neutral)**

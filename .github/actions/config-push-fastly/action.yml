@@ -67,6 +67,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: |
         [[ "${EDGEZERO__FASTLY__API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
@@ -95,6 +96,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
 
     - name: Extract CLI
@@ -118,6 +120,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/download-app-cli.sh
 
@@ -140,6 +143,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-fastly/scripts/install-fastly.sh
 
@@ -171,6 +175,7 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/scripts/config-push.sh
 
@@ -193,5 +198,6 @@ runs:
         FASTLY_DEBUG: ""
         FASTLY_DEBUG_MODE: ""
         FASTLY_CONFIG_FILE: ""
+        FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: $GITHUB_ACTION_PATH/../deploy-core/scripts/cleanup.sh
