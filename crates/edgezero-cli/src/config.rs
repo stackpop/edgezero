@@ -21,6 +21,8 @@
 use crate::args::{ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs, DiffFormat};
 use crate::diff::{collect_changes, render_json, render_structured};
 use crate::ensure_adapter_defined;
+use crate::path_safety::{assert_provision_paths_contained, assert_provision_paths_safe};
+use crate::provision_lock::ProvisionLock;
 use edgezero_adapter::registry::{
     self as adapter_registry, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
 };
@@ -75,7 +77,7 @@ struct ResolvedAdapterPushContext {
 }
 
 /// Pre-loaded state shared by the raw and typed flows.
-struct ValidationContext {
+pub(crate) struct ValidationContext {
     /// Resolved app-config TOML path. Either the explicit
     /// `--app-config`, or `<app_name>.toml` next to the manifest.
     app_config_path: PathBuf,
@@ -97,8 +99,40 @@ struct ValidationContext {
 }
 
 impl ValidationContext {
-    fn manifest(&self) -> &Manifest {
+    // Accessors below are pub(crate) API for the provision flow. They
+    // are not called in production code in this crate yet so the
+    // dead_code lint fires for the lib target; we gate the suppression
+    // on `not(test)` so the expect is only active where the lint fires
+    // (production lib), and is absent when tests are compiled (where
+    // the methods are used and the expect would be unfulfilled).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "pub(crate) API surface for the provision flow; not yet called in production code in this crate"
+        )
+    )]
+    pub(crate) fn app_config_path(&self) -> &Path {
+        &self.app_config_path
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "pub(crate) API surface for the provision flow; not yet called in production code in this crate"
+        )
+    )]
+    pub(crate) fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    pub(crate) fn manifest(&self) -> &Manifest {
         self.manifest_loader.manifest()
+    }
+
+    pub(crate) fn manifest_path(&self) -> &Path {
+        &self.manifest_path
     }
 }
 
@@ -230,8 +264,7 @@ where
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
 
-    typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_typed_preflight(&typed, &ctx)?;
 
     log::info!(
         "[edgezero] config validate (typed): {} + {} OK{}",
@@ -285,8 +318,80 @@ pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String>
 where
     C: DeserializeOwned + Serialize + Validate + AppConfigMeta,
 {
+    // Cross-process advisory lock (shared with `provision`) --
+    // config push --local writes into `fastly.toml` / `.dev.vars` /
+    // spin's local SQLite key-value store, all of which provision
+    // also reads/writes. Cloud push writes to the remote store;
+    // hold the same lock so we don't race with a concurrent
+    // provision's edgezero.toml deployed writeback.
+    //
+    // Acquire BEFORE `load_push_context` -- that call reads
+    // edgezero.toml, the typed app-config, env overlay, adapter
+    // paths, and store context. A concurrent provision write could
+    // otherwise race with those reads before we start waiting on
+    // the lock. Derive the lock's manifest root from the CLI arg's
+    // parent (not from ctx, which we haven't loaded yet).
+    let _lock = if args.dry_run {
+        None
+    } else {
+        let manifest_root_for_lock = args
+            .manifest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        Some(ProvisionLock::acquire(manifest_root_for_lock)?)
+    };
+
     // Pre-flight: load + validate.
     let ctx = load_push_context(args)?;
+
+    // Path containment: reject `..` traversal and absolute paths in
+    // every declared adapter's manifest / crate strings BEFORE
+    // `run_shared_checks` dispatches per-adapter validation. Spin's
+    // `validate_adapter_manifest` does `fs::read_to_string(manifest_root
+    // .join(adapter_manifest_path))`, so a malicious path resolves
+    // outside the project unless we reject it here first. The spec
+    // ("Path containment (MUST)") requires the helper run BEFORE any
+    // manifest-path use — that means before shared checks, not just
+    // before adapter dispatch. Loop over every adapter because shared
+    // checks iterate every adapter, not just `ctx.adapter`.
+    // Spec §"Path containment (MUST)": absolute paths and `..`
+    // traversal in the adapter-declared manifest / crate are always
+    // rejected, regardless of `--local`. Cloud-mode `config push`
+    // still joins `manifest_root` with those strings and either
+    // hands the resolved path to the vendor CLI or reads it via
+    // `fs::read_to_string` for service-id lookup -- a poisoned
+    // `manifest = "/etc/passwd"` or `../outside/x.toml` in
+    // edgezero.toml must be rejected in EVERY config-push path.
+    //
+    // The stronger "manifest MUST sit inside the adapter crate dir"
+    // check (Step 2) is `--local`-only: existing cloud fixtures
+    // legitimately use e.g. `manifest = "wrangler.toml"` at the
+    // project root with `crate = "crates/demo-cf"`, and vendor-CLI
+    // dispatch doesn't create files -- so the strict-local rule
+    // doesn't apply.
+    let manifest_root_for_check = ctx
+        .validation
+        .manifest_path()
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for adapter_cfg in ctx.validation.manifest().adapters.values() {
+        if args.local {
+            assert_provision_paths_contained(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        } else {
+            assert_provision_paths_safe(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        }
+    }
+
     run_shared_checks(&ctx.validation)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
@@ -298,12 +403,15 @@ where
     .map_err(|err| format_app_config_error(&err))?;
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("typed app-config failed validation: {err}"))?;
-    typed_secret_checks(&typed, &ctx.validation)?;
-    run_adapter_typed_checks::<C>(&ctx.validation)?;
+    run_typed_preflight(&typed, &ctx.validation)?;
 
     // Resolve adapter paths.
-    let (manifest_root, adapter_manifest_path, component_selector, push_ctx) =
-        resolve_push_paths(&ctx)?;
+    let ResolvedPushPaths {
+        manifest_root,
+        adapter_manifest_path,
+        component_selector,
+        push_ctx,
+    } = resolve_push_paths(&ctx)?;
     let paths = PushPathRefs {
         manifest_root,
         adapter_manifest_path: adapter_manifest_path.as_deref(),
@@ -342,16 +450,15 @@ where
 
     // Pre-write re-fetch + skip-on-equal + concurrent-push detection.
     if !args.dry_run && !matches!(remote, ReadConfigEntry::Unsupported(_)) {
-        match recheck_before_write(
-            ctx.adapter,
+        let recheck_ctx = RecheckContext {
+            adapter: ctx.adapter,
             args,
-            &paths,
-            &ctx.store,
-            &key,
-            &local_sha,
-            &remote,
-            approved_remote_sha.as_deref(),
-        )? {
+            paths: &paths,
+            store: &ctx.store,
+            key: &key,
+            first_read: &remote,
+        };
+        match recheck_before_write(&recheck_ctx, &local_sha, approved_remote_sha.as_deref())? {
             RecheckOutcome::Skip => return Ok(()),
             RecheckOutcome::Write => {}
         }
@@ -366,13 +473,13 @@ where
 // -------------------------------------------------------------------
 
 /// Write a diff informational message to stderr.
-/// All non-error diff messages go here rather than using inline `#[expect]` blocks.
-#[expect(
-    clippy::print_stderr,
-    reason = "stream discipline: informational messages go to stderr, never stdout"
-)]
+/// All non-error diff messages go through this helper -- stream
+/// discipline: informational messages go to stderr, never stdout.
+/// Uses `writeln!` on a locked `io::stderr()` handle rather than
+/// `eprintln!` so the workspace `clippy::print_stderr` restriction
+/// still catches accidental stderr prints in other code paths.
 fn diff_info(msg: &str) {
-    eprintln!("{msg}");
+    write_to_stderr_line(msg);
 }
 
 /// Translate an outcome + `--exit-code` flag into a typed exit code
@@ -399,10 +506,6 @@ fn apply_exit_code(exit_code_flag: bool, outcome: DiffOutcome) -> DiffExit {
 /// # Errors
 /// Returns a human-readable error string on any load, parse, or
 /// envelope verification failure.
-#[expect(
-    clippy::too_many_lines,
-    reason = "config diff orchestration: 6 sequential steps (load + structural checks, envelope, adapter resolve, paths, read, branch) each with its own error handling — extracting sub-functions would just move the lines without reducing conceptual complexity"
-)]
 #[inline]
 pub fn run_config_diff_typed<C>(args: &ConfigDiffArgs) -> Result<DiffExit, String>
 where
@@ -418,6 +521,38 @@ where
         strict: false,
     };
     let ctx = load_validation_context(&validate_args)?;
+
+    // Path containment BEFORE any adapter path is joined with the
+    // manifest root and passed into an adapter read. Push runs the
+    // same guard (config.rs:356) before `run_shared_checks`; diff
+    // was previously unguarded on the argument that a read-only
+    // command can't corrupt the tree — but the adapter's
+    // `read_config_entry` / `read_config_entry_local` STILL joins
+    // `manifest_root` with `[adapters.<name>.adapter].manifest` and
+    // reads (and prints) the resulting file. Without this gate a
+    // poisoned `manifest = "../../etc/shadow"` would surface as a
+    // diff line rather than an early error.
+    let manifest_root_for_check = ctx
+        .manifest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for adapter_cfg in ctx.manifest().adapters.values() {
+        if args.local {
+            assert_provision_paths_contained(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        } else {
+            assert_provision_paths_safe(
+                manifest_root_for_check,
+                adapter_cfg.adapter.manifest.as_deref(),
+                adapter_cfg.adapter.crate_path.as_deref(),
+            )?;
+        }
+    }
+
     run_shared_checks(&ctx)?;
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = !args.no_env;
@@ -429,8 +564,7 @@ where
     .map_err(|err| format_app_config_error(&err))?;
     app_config::validate_excluding_secrets(&typed)
         .map_err(|err| format!("local validation failed: {err}"))?;
-    typed_secret_checks(&typed, &ctx)?;
-    run_adapter_typed_checks::<C>(&ctx)?;
+    run_typed_preflight(&typed, &ctx)?;
 
     // Build the local envelope.
     let local_data: serde_json::Value = serde_json::to_value(&typed)
@@ -484,7 +618,23 @@ where
     let remote = read_remote(adapter, args.local, &paths, &store, &key)?;
 
     // Branch per variant, render, determine outcome.
-    let outcome: DiffOutcome = match &remote {
+    let outcome = render_diff_for_remote_entry(&remote, &local_envelope, &local_sha, &key, args)?;
+
+    Ok(apply_exit_code(args.exit_code, outcome))
+}
+
+/// Render the diff (or absence) for a single remote-read result and
+/// return the appropriate `DiffOutcome`. Extracted from
+/// `run_config_diff_typed` so the orchestration fn stays under the
+/// workspace `too_many_lines` lint without a per-callsite suppression.
+fn render_diff_for_remote_entry(
+    remote: &ReadConfigEntry,
+    local_envelope: &BlobEnvelope,
+    local_sha: &str,
+    key: &str,
+    args: &ConfigDiffArgs,
+) -> Result<DiffOutcome, String> {
+    let outcome = match remote {
         ReadConfigEntry::Present(body) => {
             let remote_envelope: BlobEnvelope = serde_json::from_str(body)
                 .map_err(|err| format!("remote envelope parse failed: {err}"))?;
@@ -499,7 +649,7 @@ where
                     &remote_envelope.data,
                     &local_envelope.data,
                     &remote_envelope.sha256,
-                    &local_sha,
+                    local_sha,
                     &args.format,
                 );
                 DiffOutcome::DiffPresent
@@ -518,7 +668,7 @@ where
                 &serde_json::Value::Object(serde_json::Map::default()),
                 &local_envelope.data,
                 "(none)",
-                &local_sha,
+                local_sha,
                 &args.format,
             );
             DiffOutcome::RemoteAbsent
@@ -538,7 +688,7 @@ where
                 &serde_json::Value::Object(serde_json::Map::default()),
                 &local_envelope.data,
                 "(none)",
-                &local_sha,
+                local_sha,
                 &args.format,
             );
             DiffOutcome::RemoteAbsent
@@ -555,8 +705,7 @@ where
         // `ReadConfigEntry` is `#[non_exhaustive]`; forward-compat fallback.
         _ => DiffOutcome::Unsupported,
     };
-
-    Ok(apply_exit_code(args.exit_code, outcome))
+    Ok(outcome)
 }
 
 /// Dispatch the diff to the correct renderer based on `format`.
@@ -605,13 +754,9 @@ fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(),
                      non-interactive runs (the push writes unconditionally)"
                 ));
             }
-            #[expect(
-                clippy::print_stderr,
-                reason = "stream discipline: TTY consent prompt goes to stderr; eprint! (no newline) keeps the cursor on the prompt line"
-            )]
-            {
-                eprint!("cannot read remote on Spin Cloud ({reason}); write anyway? [y/N] ");
-            };
+            prompt_stderr(&format!(
+                "cannot read remote on Spin Cloud ({reason}); write anyway? [y/N] "
+            ));
             let mut buf = String::new();
             stdin()
                 .read_line(&mut buf)
@@ -628,12 +773,10 @@ fn handle_consent(args: &ConfigPushArgs, remote: &ReadConfigEntry) -> Result<(),
 
 /// Write an informational message to stderr. All push messages that are
 /// not errors go here.
-#[expect(
-    clippy::print_stderr,
-    reason = "stream discipline: informational messages go to stderr, never stdout"
-)]
+use crate::stream::{info_line as write_to_stderr_line, prompt as prompt_stderr};
+
 fn push_info(msg: &str) {
-    eprintln!("{msg}");
+    write_to_stderr_line(msg);
 }
 
 /// Dispatch a single read to either `read_config_entry_local` or
@@ -669,20 +812,30 @@ fn read_remote(
 
 /// Re-fetch right before the write to detect concurrent pushes
 /// and skip-on-equal.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "recheck needs adapter, local flag, all path refs, store, key, local_sha, first_read, and approved_remote_sha — each is distinct; a sub-struct would shift complexity without simplifying the call site"
-)]
+/// Bundles the four "identity + first-read" args `recheck_before_write`
+/// needs so the fn signature drops from 8 args to 4.
+struct RecheckContext<'ctx> {
+    adapter: &'ctx dyn adapter_registry::Adapter,
+    args: &'ctx ConfigPushArgs,
+    paths: &'ctx PushPathRefs<'ctx>,
+    store: &'ctx ResolvedStoreId,
+    key: &'ctx str,
+    first_read: &'ctx ReadConfigEntry,
+}
+
 fn recheck_before_write(
-    adapter: &dyn adapter_registry::Adapter,
-    args: &ConfigPushArgs,
-    paths: &PushPathRefs<'_>,
-    store: &ResolvedStoreId,
-    key: &str,
+    ctx: &RecheckContext<'_>,
     local_sha: &str,
-    first_read: &ReadConfigEntry,
     approved_remote_sha: Option<&str>,
 ) -> Result<RecheckOutcome, String> {
+    let RecheckContext {
+        adapter,
+        args,
+        paths,
+        store,
+        key,
+        first_read,
+    } = *ctx;
     let remote_now = read_remote(adapter, args.local, paths, store, key)?;
     if let ReadConfigEntry::Present(body_now) = remote_now {
         let remote_now_env: BlobEnvelope = serde_json::from_str(&body_now)
@@ -734,10 +887,6 @@ fn recheck_before_write(
 ///   (when `!no_diff`) and returns `ProceedFromMissingOrUnsupported`.
 /// - `Unsupported` → returns `ProceedFromMissingOrUnsupported` without
 ///   rendering.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "ReadConfigEntry is #[non_exhaustive]; wildcard covers future variants and the no_diff guard cases"
-)]
 fn render_first_read_diff(
     remote: &ReadConfigEntry,
     key: &str,
@@ -791,9 +940,18 @@ fn render_first_read_diff(
             );
             Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
         }
-        // Unsupported, MissingKey/MissingStore with no_diff, and future
-        // #[non_exhaustive] variants — fall through.
-        _ => Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported),
+        // `no_diff` variants + Unsupported: skip the diff render but
+        // still proceed. Explicit enumeration (not `_`) so a future
+        // `ReadConfigEntry` variant fails compilation and forces the
+        // reviewer to decide whether it should render or not. The
+        // trailing wildcard is required because `ReadConfigEntry` is
+        // `#[non_exhaustive]` -- named the pattern `_future` to make
+        // the intent explicit.
+        ReadConfigEntry::MissingKey | ReadConfigEntry::MissingStore => {
+            Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported)
+        }
+        ReadConfigEntry::Unsupported(_) => Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported),
+        _future => Ok(FirstReadOutcome::ProceedFromMissingOrUnsupported),
     }
 }
 
@@ -808,13 +966,7 @@ fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(),
         return Ok(());
     }
     if stdin().is_terminal() {
-        #[expect(
-            clippy::print_stderr,
-            reason = "stream discipline: TTY consent prompt goes to stderr"
-        )]
-        {
-            eprint!("Apply changes? [y/N] ");
-        };
+        prompt_stderr("Apply changes? [y/N] ");
         let mut buf = String::new();
         stdin()
             .read_line(&mut buf)
@@ -828,25 +980,18 @@ fn require_consent(args: &ConfigPushArgs, _read: &ReadConfigEntry) -> Result<(),
     }
 }
 
+/// Owned form of the resolved push paths -- the caller then borrows
+/// the `Option<String>`s into a [`PushPathRefs`] for adapter dispatch.
+struct ResolvedPushPaths<'ctx> {
+    manifest_root: &'ctx Path,
+    adapter_manifest_path: Option<String>,
+    component_selector: Option<String>,
+    push_ctx: adapter_registry::AdapterPushContext<'ctx>,
+}
+
 /// Resolve the adapter-manifest root, adapter manifest path, component
 /// selector, and `AdapterPushContext` from the push context.
-///
-/// Returns `(manifest_root, adapter_manifest_path, component_selector, push_ctx)`.
-#[expect(
-    clippy::type_complexity,
-    reason = "four-tuple return avoids a dedicated struct for a single call site; the items are immediately destructured by the caller"
-)]
-fn resolve_push_paths(
-    ctx: &PushContext,
-) -> Result<
-    (
-        &Path,
-        Option<String>,
-        Option<String>,
-        adapter_registry::AdapterPushContext<'_>,
-    ),
-    String,
-> {
+fn resolve_push_paths(ctx: &PushContext) -> Result<ResolvedPushPaths<'_>, String> {
     let manifest = ctx.validation.manifest();
     let (_canonical, adapter_cfg) =
         manifest.adapter_entry(ctx.adapter.name()).ok_or_else(|| {
@@ -871,12 +1016,12 @@ fn resolve_push_paths(
     }
     let adapter_manifest_path = adapter_cfg.adapter.manifest.clone();
     let component_selector = adapter_cfg.adapter.component.clone();
-    Ok((
+    Ok(ResolvedPushPaths {
         manifest_root,
         adapter_manifest_path,
         component_selector,
         push_ctx,
-    ))
+    })
 }
 
 /// Dry-run log + adapter write dispatch.
@@ -929,17 +1074,12 @@ fn write_envelope(
 /// unchanged when ≤ 8 bytes (the `"(none)"` sentinel is 6 bytes —
 /// avoids a panic on the `&sha[..8]` index).
 pub(crate) fn short_ref(sha: &str) -> &str {
-    if sha.len() <= 8 {
-        sha
-    } else {
-        #[expect(
-            clippy::string_slice,
-            reason = "checked: sha.len() > 8 ensures this 8-byte index is within ASCII hex bytes"
-        )]
-        {
-            &sha[..8]
-        }
-    }
+    // sha is ASCII hex (SHA-256 fingerprint), so `str::get(..8)`
+    // never returns None unless the string is shorter than 8 bytes,
+    // in which case we return the full string. Avoids the
+    // panic-on-byte-index that `&sha[..8]` would risk on a
+    // multi-byte prefix.
+    sha.get(..8).unwrap_or(sha)
 }
 
 /// Pretty-print a `serde_json::Value` with object keys sorted
@@ -1142,9 +1282,14 @@ fn generated_at_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContext, String> {
-    let manifest_loader = ManifestLoader::from_path(&args.manifest)
-        .map_err(|err| format!("failed to load {}: {err}", args.manifest.display()))?;
+pub(crate) fn load_validation_context_with_options(
+    manifest_path: &Path,
+    app_config_override: Option<&Path>,
+    strict: bool,
+    env_overlay: bool,
+) -> Result<ValidationContext, String> {
+    let manifest_loader = ManifestLoader::from_path(manifest_path)
+        .map_err(|err| format!("failed to load {}: {err}", manifest_path.display()))?;
 
     // Spec: every project carries a `[app].name`. Without it we
     // can't compute the env-overlay prefix or resolve the default
@@ -1152,18 +1297,19 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     let app_name = manifest_loader.manifest().app.name.clone().ok_or_else(|| {
         format!(
             "{} has no `[app].name` — required to resolve the typed app-config",
-            args.manifest.display()
+            manifest_path.display()
         )
     })?;
 
-    let app_config_path = resolve_app_config_path(args, &args.manifest, &app_name);
+    let app_config_path =
+        resolve_app_config_path_primitive(app_config_override, manifest_path, &app_name);
 
     // Load the raw root table once. The typed flow will re-load it
     // via `load_app_config_with_options::<C>` to drive deserialise +
     // validator; we keep this copy for shared checks (e.g. Spin
     // `[component.*]` discovery) that don't need `C`.
     let mut opts = AppConfigLoadOptions::default();
-    opts.env_overlay = !args.no_env;
+    opts.env_overlay = env_overlay;
     let raw_config =
         app_config::load_app_config_raw_with_options(&app_config_path, &app_name, &opts)
             .map_err(|err| format_app_config_error(&err))?;
@@ -1171,20 +1317,29 @@ fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContex
     Ok(ValidationContext {
         app_config_path,
         app_name,
-        args_strict: args.strict,
+        args_strict: strict,
         manifest_loader,
-        manifest_path: args.manifest.clone(),
+        manifest_path: manifest_path.to_path_buf(),
         raw_config,
     })
 }
 
-fn resolve_app_config_path(
-    args: &ConfigValidateArgs,
+fn load_validation_context(args: &ConfigValidateArgs) -> Result<ValidationContext, String> {
+    load_validation_context_with_options(
+        &args.manifest,
+        args.app_config.as_deref(),
+        args.strict,
+        !args.no_env,
+    )
+}
+
+pub(crate) fn resolve_app_config_path_primitive(
+    explicit: Option<&Path>,
     manifest_path: &Path,
     app_name: &str,
 ) -> PathBuf {
-    if let Some(explicit) = &args.app_config {
-        return explicit.clone();
+    if let Some(path) = explicit {
+        return path.to_path_buf();
     }
     let manifest_dir = manifest_path
         .parent()
@@ -1198,9 +1353,53 @@ fn resolve_app_config_path(
 
 fn run_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
     run_adapter_shared_checks(ctx)?;
+    validate_deployed_field_ownership(ctx.manifest())?;
     if ctx.args_strict {
         strict_capability_completeness(ctx.manifest())?;
         strict_handler_paths(ctx.manifest())?;
+    }
+    Ok(())
+}
+
+/// Cross-check: every populated field in a `[adapters.<name>.deployed]`
+/// block must be owned by the registered adapter for that name. If
+/// the adapter isn't registered in this build (feature disabled or
+/// typo in the section name), skip the check — `ensure_adapter_defined`
+/// surfaces the missing adapter separately.
+///
+/// **Case handling:** `adapter_registry::get_adapter` normalises the
+/// lookup key to `to_ascii_lowercase()` at registration and lookup
+/// time, so operator spellings like `[adapters.Fastly.deployed]`,
+/// `[adapters.FASTLY.deployed]`, and `[adapters.fastly.deployed]`
+/// all resolve to the same registered adapter and cross-check
+/// against the same `deployed_fields()` list.
+///
+/// Runs at manifest-shape validation time via `run_shared_checks`
+/// so `config validate --strict`, `provision`, `config push --local`,
+/// and `config diff` all see the same rejection.
+pub(crate) fn validate_deployed_field_ownership(manifest: &Manifest) -> Result<(), String> {
+    for (name, adapter_cfg) in &manifest.adapters {
+        let Some(deployed) = adapter_cfg.deployed.as_ref() else {
+            continue;
+        };
+        let populated = deployed.populated_fields();
+        if populated.is_empty() {
+            continue;
+        }
+        let Some(adapter) = adapter_registry::get_adapter(name) else {
+            // Not registered in this build; skip. Typo-detection
+            // is `ensure_adapter_defined`'s job.
+            continue;
+        };
+        let owned = adapter.deployed_fields();
+        for field in &populated {
+            if !owned.contains(field) {
+                return Err(format!(
+                    "[adapters.{name}.deployed].{field}: field is not owned by the `{name}` adapter (owned fields: [{}])",
+                    owned.join(", ")
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1230,6 +1429,23 @@ fn run_adapter_shared_checks(ctx: &ValidationContext) -> Result<(), String> {
         let Some(adapter) = adapter_registry::get_adapter(name) else {
             continue;
         };
+        // Absolute-path + `..`-traversal + under-project-root gate
+        // BEFORE the adapter joins `manifest_root` with the declared
+        // manifest path and reads whatever's there.
+        //
+        // Push and diff already run this loop upfront with the
+        // stricter contained variant (see `run_config_push_typed` /
+        // `run_config_diff_typed`), so this call is redundant on
+        // those paths — but it's the ONLY guard on `run_config_validate*`.
+        // Without it, Spin's `validate_adapter_manifest` reads
+        // `manifest_root.join(adapter_manifest_path)` unchecked and
+        // an absolute or traversing manifest string surfaces its
+        // file contents as the validation error message.
+        assert_provision_paths_safe(
+            manifest_root,
+            adapter_cfg.adapter.manifest.as_deref(),
+            adapter_cfg.adapter.crate_path.as_deref(),
+        )?;
         adapter.validate_app_config_keys(&key_refs)?;
         adapter.validate_adapter_manifest(
             manifest_root,
@@ -1387,19 +1603,23 @@ fn collect_secret_leaves<'raw>(
     Ok(out)
 }
 
-/// Typed-only adapter dispatch: feed each adapter the `#[secret]`
-/// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
-/// runtime store ids, not flat-namespace candidates) so adapters
-/// whose secret store has a flat-namespace constraint (Spin) can
-/// detect within-secrets collisions.
-fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+/// Build every `TypedSecretEntry` reachable from `C`'s
+/// `#[secret]` / `#[secret(store_ref)]` fields, walking nested +
+/// array secret paths via [`collect_secret_leaves`]. Consumed by
+/// `run_adapter_typed_checks` (validate / push / diff) AND by
+/// `run_provision_typed` (which hands the entries to each
+/// adapter's `provision_typed` for placeholder emission), so it
+/// stays `pub(crate)` at module scope rather than inlined.
+pub(crate) fn build_typed_secret_entries<'ctx, C: AppConfigMeta>(
+    ctx: &'ctx ValidationContext,
+) -> Result<Vec<TypedSecretEntry<'ctx>>, String> {
     let default_store_id = ctx
         .manifest()
         .stores
         .secrets
         .as_ref()
         .map(StoreDeclaration::default_id);
-    let mut entries: Vec<TypedSecretEntry<'_>> = Vec::new();
+    let mut entries: Vec<TypedSecretEntry<'ctx>> = Vec::new();
     for field in C::secret_fields() {
         for leaf in collect_secret_leaves(&ctx.raw_config, &field)? {
             match field.kind {
@@ -1421,6 +1641,25 @@ fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result
             }
         }
     }
+    Ok(entries)
+}
+
+pub(crate) fn run_typed_preflight<C: AppConfigMeta>(
+    typed: &C,
+    ctx: &ValidationContext,
+) -> Result<(), String> {
+    typed_secret_checks(typed, ctx)?;
+    run_adapter_typed_checks::<C>(ctx)?;
+    Ok(())
+}
+
+/// Typed-only adapter dispatch: feed each adapter the `#[secret]`
+/// (`KeyInDefault` and `KeyInNamedStore` — `StoreRef` values are
+/// runtime store ids, not flat-namespace candidates) so adapters
+/// whose secret store has a flat-namespace constraint (Spin) can
+/// detect within-secrets collisions.
+fn run_adapter_typed_checks<C: AppConfigMeta>(ctx: &ValidationContext) -> Result<(), String> {
+    let entries = build_typed_secret_entries::<C>(ctx)?;
 
     for name in ctx.manifest().adapters.keys() {
         if let Some(adapter) = adapter_registry::get_adapter(name) {
@@ -1622,11 +1861,6 @@ fn format_app_config_error(err: &AppConfigError) -> String {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::arbitrary_source_item_ordering,
-    clippy::default_numeric_fallback,
-    reason = "test module groups items by subject (PathPrepend co-located with its fake-spin consumers, fixtures with their tests) rather than by item kind; `range(min = 100, max = 60_000)` bounds default to the field's int type"
-)]
 mod tests {
     use super::*;
     use crate::test_support::{EnvOverride, manifest_guard};
@@ -1636,8 +1870,6 @@ mod tests {
     use std::borrow::Cow;
 
     use std::fs;
-    #[cfg(unix)]
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
     // ---------- shared fixtures ----------
@@ -1730,7 +1962,7 @@ source = "target/wasm32-wasip2/release/demo.wasm"
     #[derive(Debug, Deserialize, Serialize, Validate)]
     #[serde(deny_unknown_fields)]
     struct FixtureServiceConfig {
-        #[validate(range(min = 100, max = 60_000))]
+        #[validate(range(min = 100_u32, max = 60_000_u32))]
         timeout_ms: u32,
     }
 
@@ -1777,10 +2009,10 @@ source = "target/wasm32-wasip2/release/demo.wasm"
             key: None,
             local: false,
             manifest: manifest.to_path_buf(),
-            no_diff: false,
-            no_env: true,
             runtime_config: None,
             store: None,
+            no_diff: false,
+            no_env: true,
             yes: false,
         }
     }
@@ -1810,6 +2042,69 @@ source = "target/wasm32-wasip2/release/demo.wasm"
         assert!(
             err.contains(&app_config.display().to_string()),
             "error names the bad file: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_rejects_absolute_adapter_manifest_path_before_adapter_validators_run() {
+        // Regression (PR #287 review, blocking #1): pre-2026-07-09,
+        // `run_config_validate` -> `run_shared_checks` ->
+        // `run_adapter_shared_checks` called
+        // `adapter.validate_adapter_manifest(manifest_root, path, ...)`
+        // without first running `assert_provision_paths_safe`.
+        // Spin's validator then reads
+        // `manifest_root.join(adapter_manifest_path)` — an operator
+        // who poisoned the manifest string with an absolute path
+        // like `/etc/spin.toml` would surface that file's contents
+        // as a validation error message. The path-safety guard now
+        // fires per-adapter INSIDE `run_adapter_shared_checks`,
+        // covering validate as well as push/diff.
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "/etc/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, VALID_APP_CONFIG);
+        let err = run_config_validate(&args_for(&manifest_path)).expect_err(
+            "absolute [adapters.spin.adapter].manifest must be rejected before dispatch",
+        );
+        assert!(
+            err.contains("must be a project-relative path"),
+            "path-safety guard must fire before adapter.validate_adapter_manifest: {err}"
+        );
+    }
+
+    #[test]
+    fn raw_rejects_parent_traversal_adapter_manifest_before_adapter_validators_run() {
+        let _lock = manifest_guard().lock().expect("manifest guard");
+        let manifest = r#"
+[app]
+name = "demo-app"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "../../../outside/spin.toml"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+"#;
+        let (_dir, manifest_path, _) = setup_project(manifest, VALID_APP_CONFIG);
+        let err = run_config_validate(&args_for(&manifest_path))
+            .expect_err("`..` traversal in manifest must be rejected before dispatch");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "path-safety guard must fire before adapter.validate_adapter_manifest: {err}"
         );
     }
 
@@ -3116,6 +3411,127 @@ default = "one"
         );
     }
 
+    // ---------- push --local path containment ----------
+
+    #[test]
+    fn config_push_local_rejects_parent_traversal_in_adapter_manifest() {
+        let manifest_bad = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+manifest = "../outside/axum.toml"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_bad, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.local = true;
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("parent traversal in adapter manifest must be rejected");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "error must name the traversal violation: {err}"
+        );
+    }
+
+    #[test]
+    fn config_push_local_rejects_absolute_adapter_manifest() {
+        let manifest_bad = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+manifest = "/tmp/some.toml"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_bad, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.local = true;
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("absolute adapter manifest path must be rejected");
+        assert!(
+            err.contains("must be a project-relative path"),
+            "error must name the absolute-path violation: {err}"
+        );
+    }
+
+    /// Regression: the containment guard MUST fire before
+    /// `run_shared_checks`, which iterates every declared adapter and
+    /// calls `validate_adapter_manifest`. Spin's implementation does
+    /// `fs::read_to_string(manifest_root.join(rel))` — an ordering bug
+    /// would surface as a Spin "failed to read spin manifest" error
+    /// rather than the containment error. This test declares the
+    /// pushed adapter as axum but adds a poisoned `[adapters.spin]`
+    /// entry with a traversal path, and asserts the error names the
+    /// containment violation (proving the guard fired first).
+    #[test]
+    fn config_push_local_rejects_parent_traversal_in_sibling_spin_adapter() {
+        let manifest_bad = r#"
+[app]
+name = "demo-app"
+
+[adapters.axum.adapter]
+crate = "crates/demo-axum"
+manifest = "crates/demo-axum/axum.toml"
+
+[adapters.axum.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[adapters.spin.adapter]
+crate = "crates/demo-spin"
+manifest = "../outside/spin.toml"
+component = "demo"
+
+[adapters.spin.commands]
+build = "echo"
+deploy = "echo"
+serve = "echo"
+
+[stores.config]
+ids = ["app_config"]
+
+[stores.secrets]
+ids = ["default"]
+"#;
+        let (_dir, manifest, _) = setup_project(manifest_bad, FIXTURE_APP_CONFIG);
+        let mut args = push_args(&manifest, "axum");
+        args.local = true;
+        let err = run_config_push_typed::<FixtureConfig>(&args)
+            .expect_err("sibling adapter with traversal path must be rejected");
+        assert!(
+            err.contains("must not contain `..` traversal"),
+            "guard must fire before Spin's validate_adapter_manifest reads the poisoned path: {err}"
+        );
+        assert!(
+            !err.contains("failed to read spin manifest"),
+            "if this substring appears, the Spin fs::read escaped before the containment guard: {err}"
+        );
+    }
+
     // -------------------------------------------------------------------
     // run_config_push_typed — 8.2 consent rules + diff
     // -------------------------------------------------------------------
@@ -3322,11 +3738,7 @@ ids = ["default"]
     /// Process-wide mutex serialising PATH-mutating tests so parallel
     /// test threads don't race on the `$PATH` environment variable.
     #[cfg(unix)]
-    fn path_mutation_guard() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
-    }
+    use crate::shared_test_guards::path_mutation_guard;
 
     /// Build a tempdir containing a `spin` script that emits fixed
     /// stdout/stderr and exits with the given code. Payloads are written
@@ -3828,5 +4240,24 @@ ids = ["default"]
             err.contains("api_token") && err.contains("non-empty"),
             "error names the empty secret field: {err}"
         );
+    }
+
+    #[test]
+    fn run_typed_preflight_smoke_passes_for_valid_typed_config() {
+        let _lock = manifest_guard().lock().unwrap();
+        let (_dir, manifest, _) = setup_project(VALID_MANIFEST, FIXTURE_APP_CONFIG);
+        let ctx = load_validation_context_with_options(&manifest, None, false, false).unwrap();
+        let load_opts = {
+            let mut load_opts = AppConfigLoadOptions::default();
+            load_opts.env_overlay = false;
+            load_opts
+        };
+        let typed: FixtureConfig = app_config::deserialize_app_config_with_options(
+            ctx.app_config_path(),
+            ctx.app_name(),
+            &load_opts,
+        )
+        .unwrap();
+        run_typed_preflight(&typed, &ctx).unwrap();
     }
 }

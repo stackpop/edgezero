@@ -360,6 +360,13 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub commands: ManifestAdapterCommands,
+    /// Deploy-time identifiers returned by cloud CLIs and persisted in
+    /// `edgezero.toml` so teammates' `provision --local` can regenerate
+    /// adapter manifests with real ids. See spec §"Where durable
+    /// identifiers live".
+    #[serde(default)]
+    #[validate(nested)]
+    pub deployed: Option<ManifestAdapterDeployed>,
     /// Catch-all for any sub-table other than the four canonical ones
     /// (`adapter`, `build`, `commands`, `logging`). The pre-rewrite
     /// `[adapters.<name>.stores.*]` tables land here and are rejected by
@@ -369,6 +376,63 @@ pub struct ManifestAdapter {
     #[serde(default)]
     #[validate(nested)]
     pub logging: ManifestLoggingConfig,
+}
+
+/// Deploy-time identifiers returned by cloud CLIs and persisted
+/// in `edgezero.toml` so teammates' `provision --local` can
+/// regenerate adapter manifests with real ids. See spec
+/// §"Where durable identifiers live".
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ManifestAdapterDeployed {
+    /// Primary namespace ids, keyed by logical
+    /// `[stores.kv]` / `[stores.config]` id (Cloudflare only).
+    #[serde(default)]
+    pub kv_namespaces: BTreeMap<String, String>,
+    /// Preview-namespace ids, keyed by the SAME logical id.
+    /// Separate map so a legal store id like `sessions_preview`
+    /// cannot collide with a sibling-suffix convention.
+    #[serde(default)]
+    pub preview_kv_namespaces: BTreeMap<String, String>,
+    /// Fastly compute service id returned by `fastly compute deploy`.
+    #[serde(default)]
+    pub service_id: Option<String>,
+}
+
+impl ManifestAdapterDeployed {
+    /// Scalar field names in this schema. Consumed by the CLI writeback
+    /// path to reject adapter-emitted unknown scalar keys before they
+    /// land in `edgezero.toml`. Adding a new scalar field to the struct
+    /// above REQUIRES adding it here — the two arrays live in the same
+    /// impl block deliberately so the coupling is unmissable.
+    pub const SCALAR_FIELDS: &'static [&'static str] = &["service_id"];
+
+    /// Sub-table field names in this schema. Same rule as
+    /// [`Self::SCALAR_FIELDS`].
+    pub const SUB_TABLE_FIELDS: &'static [&'static str] =
+        &["kv_namespaces", "preview_kv_namespaces"];
+
+    /// Return the names of fields that are populated (non-empty
+    /// map, or `Some` value). Used by the CLI to cross-check
+    /// against `Adapter::deployed_fields` — but the mapping of
+    /// field-to-adapter lives in the adapter crates, NOT here.
+    /// Adding a new field to this struct requires adding a matching
+    /// arm below.
+    #[inline]
+    #[must_use]
+    pub fn populated_fields(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.kv_namespaces.is_empty() {
+            out.push("kv_namespaces");
+        }
+        if !self.preview_kv_namespaces.is_empty() {
+            out.push("preview_kv_namespaces");
+        }
+        if self.service_id.is_some() {
+            out.push("service_id");
+        }
+        out
+    }
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Validate)]
@@ -610,14 +674,6 @@ impl HttpMethod {
     }
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for HttpMethod {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -638,6 +694,15 @@ impl<'de> Deserialize<'de> for HttpMethod {
             ))),
         }
     }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
+    }
 }
 
 impl serde::Serialize for HttpMethod {
@@ -654,14 +719,6 @@ pub enum BodyMode {
     Stream,
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for BodyMode {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -674,6 +731,15 @@ impl<'de> Deserialize<'de> for BodyMode {
             "stream" => Ok(Self::Stream),
             other => Err(DeError::custom(format!("unsupported body mode `{other}`"))),
         }
+    }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
     }
 }
 
@@ -728,14 +794,6 @@ impl From<LogLevel> for LevelFilter {
     }
 }
 
-// Serde's `Deserialize` trait has an optional `deserialize_in_place` method
-// that defaults to `*place = Self::deserialize(deserializer)?`. For these
-// small Copy/clone enums there is nothing to gain from spelling out an
-// override — the default already does exactly the right thing.
-#[expect(
-    clippy::missing_trait_methods,
-    reason = "default deserialize_in_place is identical to what we would write manually"
-)]
 impl<'de> Deserialize<'de> for LogLevel {
     #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -754,6 +812,15 @@ impl<'de> Deserialize<'de> for LogLevel {
                 "logging level must be trace, debug, info, warn, error, or off (got `{other}`)"
             ))),
         }
+    }
+
+    #[inline]
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
     }
 }
 
@@ -1678,6 +1745,78 @@ manifest = "fastly.toml"
         assert_eq!(adapter.adapter.manifest.as_deref(), Some("fastly.toml"));
     }
 
+    // The manifest parser treats `[adapters.<name>.deployed]` as a
+    // shared schema — it doesn't branch on the adapter name. These
+    // tests name the fixture adapter `demo` so their coverage is
+    // read as "the shared struct captures each field kind" rather
+    // than "the parser knows about a specific adapter." Section 6
+    // is where individual adapters read the field subset they use.
+
+    #[test]
+    fn adapter_deployed_block_captures_kv_namespace_maps() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "crates/x"
+        manifest = "crates/x/manifest.toml"
+        [adapters.demo.deployed]
+        kv_namespaces.sessions = "abc123"
+        preview_kv_namespaces.sessions = "abc123_preview"
+        "#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        manifest.validate().unwrap();
+        let deployed = manifest.adapters["demo"].deployed.as_ref().unwrap();
+        assert_eq!(deployed.kv_namespaces["sessions"], "abc123");
+        assert_eq!(deployed.preview_kv_namespaces["sessions"], "abc123_preview");
+        assert!(deployed.service_id.is_none());
+    }
+
+    #[test]
+    fn adapter_deployed_block_captures_service_id() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "crates/x"
+        manifest = "crates/x/manifest.toml"
+        [adapters.demo.deployed]
+        service_id = "SVC1"
+        "#;
+        let manifest: Manifest = toml::from_str(toml).unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.adapters["demo"]
+                .deployed
+                .as_ref()
+                .unwrap()
+                .service_id
+                .as_deref(),
+            Some("SVC1")
+        );
+    }
+
+    #[test]
+    fn adapter_deployed_block_rejects_unknown_field() {
+        let toml = r#"
+        [app]
+        name = "demo"
+
+        [adapters.demo]
+        [adapters.demo.adapter]
+        crate = "x"
+        manifest = "x/manifest.toml"
+        [adapters.demo.deployed]
+        typo_field = "x"
+        "#;
+        let err = toml::from_str::<Manifest>(toml).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
     // Empty/minimal manifest tests
     #[test]
     fn empty_manifest_has_defaults() {
@@ -2172,5 +2311,47 @@ default = "feature__flags"
         ManifestLoader::try_load_from_str(manifest)
             .err()
             .expect("double-underscore store id must fail validation");
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_service_id_when_set() {
+        let deployed = ManifestAdapterDeployed {
+            service_id: Some("SVC1".to_owned()),
+            ..ManifestAdapterDeployed::default()
+        };
+        assert_eq!(deployed.populated_fields(), vec!["service_id"]);
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_kv_maps_when_non_empty() {
+        let mut deployed = ManifestAdapterDeployed::default();
+        deployed
+            .kv_namespaces
+            .insert("sessions".to_owned(), "abc".to_owned());
+        assert_eq!(deployed.populated_fields(), vec!["kv_namespaces"]);
+    }
+
+    #[test]
+    fn deployed_populated_fields_empty_when_all_defaults() {
+        let deployed = ManifestAdapterDeployed::default();
+        assert!(deployed.populated_fields().is_empty());
+    }
+
+    #[test]
+    fn deployed_populated_fields_reports_all_when_all_set() {
+        let mut deployed = ManifestAdapterDeployed {
+            service_id: Some("SVC1".to_owned()),
+            ..ManifestAdapterDeployed::default()
+        };
+        deployed
+            .kv_namespaces
+            .insert("sessions".to_owned(), "abc".to_owned());
+        deployed
+            .preview_kv_namespaces
+            .insert("sessions".to_owned(), "abc_preview".to_owned());
+        assert_eq!(
+            deployed.populated_fields(),
+            vec!["kv_namespaces", "preview_kv_namespaces", "service_id"]
+        );
     }
 }

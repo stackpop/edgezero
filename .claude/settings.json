@@ -21,7 +21,9 @@
       "Bash(tail:*)",
       "Bash(tree:*)",
       "Bash(wc:*)",
-      "Bash(which:*)"
+      "Bash(which:*)",
+      "WebFetch(domain:www.fastly.com)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   },
   "enabledPlugins": {

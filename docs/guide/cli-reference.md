@@ -312,23 +312,76 @@ manifest declares — KV namespaces, config stores, secret stores
 crate owns its own implementation, the CLI is a thin delegate.
 
 ```bash
-edgezero provision --adapter <name> [--manifest <path>] [--dry-run]
+edgezero provision --adapter <name> [--manifest <path>] [--local] [--dry-run]
 ```
 
-**Per-adapter behaviour:**
+**Arguments:**
+
+- `--adapter <name>` — target adapter (`axum`, `cloudflare`, `fastly`, `spin`). Case-insensitive.
+- `--manifest <path>` — manifest path (default: `edgezero.toml`).
+- `--local` — synthesise/refresh the adapter's local manifest
+  (Axum `axum.toml`, Cloudflare `wrangler.toml`, Fastly `fastly.toml`,
+  Spin `spin.toml` + `runtime-config.toml`) plus its companion `.env` /
+  `.dev.vars` / `.edgezero/.env` files, merging per-store bindings
+  from `edgezero.toml`. **No cloud shell-outs.** Safe to re-run:
+  bindings are upserted, existing operator edits are preserved.
+  `edgezero new` runs this for every selected adapter as part of
+  scaffolding, so fresh clones only need `provision --local` (not
+  the cloud-touching form) to get back to a runnable local state.
+- `--dry-run` — print what each adapter _would_ do without
+  performing it. Combines with `--local`: `provision --local
+--dry-run` stages every write into a tempdir and prints a diff
+  report; the worktree stays byte-identical. No file writes, no
+  shell-outs.
+
+All adapter manifests (`axum.toml`, `wrangler.toml`, `fastly.toml`,
+`spin.toml`, `runtime-config.toml`) are gitignored, so teammates
+regenerate them via `<app>-cli provision --adapter <name> --local`
+after cloning. The scaffold-time provision loop writes each on
+`edgezero new`, and the single source of truth for each generated
+file is the adapter's `synthesise_baseline_manifest` (no scaffold
+`.hbs` template for the manifest itself).
+
+**Per-adapter behaviour (cloud form — no `--local`):**
 
 | `--adapter`  | Behaviour                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `axum`       | Local-only — prints one note per declared store id and exits 0 (KV in-memory; config in `.edgezero/local-config-<id>.json`).                                                                                                                                                                                                                                                                                                                                                                                                |
 | `cloudflare` | For each KV id + config id: shells out to `wrangler kv namespace create <platform-name>` (where `<platform-name>` resolves from `EDGEZERO__STORES__<KIND>__<ID>__NAME` or falls back to the logical `<id>`), parses the namespace id from stdout, appends `[[kv_namespaces]] binding = "<platform-name>", id = "<extracted>"` to `wrangler.toml` (idempotent on the binding name; preserves existing entries and comments). Secrets are runtime-managed via `wrangler secret put` — no-op.                                  |
-| `fastly`     | For each KV / config / secret id: shells out to `fastly <kind>-store create --name=<platform-name>` (using the same `<platform-name>` resolution), then appends `[setup.<kind>_stores.<platform-name>]` and `[local_server.<kind>_stores.<platform-name>]` tables to `fastly.toml`. Idempotent: if the setup table is already present the id is skipped (no shell-out, no edit). Store IDs are not persisted — `config push` resolves them on demand.                                                                       |
+| `fastly`     | For each KV / config / secret id: shells out to `fastly <kind>-store create --name=<platform-name>` (using the same `<platform-name>` resolution), then appends `[setup.<kind>_stores.<platform-name>]` to `fastly.toml`. Idempotent: if the setup table is already present the id is skipped (no shell-out, no edit). Store IDs are not persisted — `config push` resolves them on demand. Viceroy `[local_server.*]` tables belong to the `--local` form.                                                                 |
 | `spin`       | Pure `spin.toml` editing — no shell-out (Spin KV stores are runtime-resolved). For each declared KV id AND each declared `[stores.config]` id (both KV-backed at runtime), appends the platform-resolved label to the resolved `[component.<component>].key_value_stores = [...]` array (idempotent on the label). Secret variables are still manual: `[stores.secrets]` ids get a `nothing to do here` status line and the operator declares `[variables].<name> = { secret = true }` + the per-component binding by hand. |
 
-**`--dry-run`** prints what each adapter _would_ do without
-performing it. For `axum` the output is identical to a real run
-(there's nothing to actually perform). For `cloudflare`,
-`fastly`, and `spin`, dry-run does not invoke any native CLI and
-does not edit the adapter manifest.
+**`--local` per-adapter behaviour:**
+
+`provision --local` has TWO layers, and this table splits them so
+operators know which entry point emits which side effects:
+
+- **Base (bundled `edgezero provision --local`)** synthesises
+  adapter manifests when missing, merges per-store bindings, and
+  writes the runtime env-label lines (`EDGEZERO__STORES__<KIND>__<ID>__NAME`
+  values) that the runtime needs to resolve stores. It does NOT
+  emit `#[secret]` / `[variables]` / `SPIN_VARIABLE_*` placeholders
+  — the bundled binary has no downstream typed app-config to walk.
+- **Typed (downstream `<app>-cli provision --local`, which routes
+  through `run_provision_typed::<AppConfig>`)** runs base first,
+  then additionally emits per-secret placeholder lines derived
+  from your typed `AppConfig`'s `#[secret]` / `#[secret(store_ref)]`
+  fields. The generated CLI dispatches this because it owns the
+  concrete `AppConfig` type; the bundled `edgezero` binary
+  intentionally does not.
+
+| `--adapter`  | Base `provision --local`                                                                                                                                                                                                                                                          | Typed additions (via `<app>-cli`)                                                                                                                                                      |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `axum`       | Synthesises `axum.toml` if missing (`crate` / `crate_dir` / `host` / `port` defaults) and writes `.edgezero/.env` with the `__NAME` env-label lines per declared store id so `run_serve` can source them. Merge path is a no-op on existing `axum.toml` (operator edits survive). | Appends `<key_value>=` placeholder lines to `.edgezero/.env` — one per `#[secret]` field on `AppConfig`.                                                                               |
+| `cloudflare` | Synthesises `wrangler.toml` if missing and merges `[[kv_namespaces]]` bindings per declared KV / config id.                                                                                                                                                                       | Writes `.dev.vars` with `<key_value>=""` placeholders — one per `#[secret]` field (the file `wrangler dev` reads for secret variables).                                                |
+| `fastly`     | Synthesises `fastly.toml` if missing and merges `[local_server.kv_stores.*]` + `[local_server.config_stores.*]` tables per declared id (Viceroy state — `[setup.*]` belongs to cloud provision).                                                                                  | Appends `[[local_server.secret_stores.<store_id>]]` entries — one per `#[secret]` field — so Viceroy resolves them locally.                                                            |
+| `spin`       | Synthesises `spin.toml` + `runtime-config.toml` if missing and merges `key_value_stores` labels into the resolved `[component.<id>]`.                                                                                                                                             | Appends lowercased `[variables]` + `[component.<id>.variables]` entries in `spin.toml` and `SPIN_VARIABLE_<NAME>` placeholder lines in `<spin_crate>/.env`. Operator edits stay local. |
+
+**`--dry-run`** works with either form: without `--local` it does
+not invoke any native CLI and does not edit the adapter manifest;
+with `--local` every write is staged into a tempdir and a diff
+report is printed instead of applied. The worktree stays
+byte-identical either way.
 
 The `cloudflare` flow requires `wrangler` on `PATH` and
 `[adapters.cloudflare.adapter].manifest` pointing at the project's

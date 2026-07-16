@@ -208,6 +208,26 @@ manifest reference.
 The `axum.toml` file is used by the Axum CLI helper to locate the crate and display the port.
 The runtime currently binds to `127.0.0.1:8787` regardless of the `axum.toml` port value.
 
+::: warning `axum.toml` is generated + gitignored
+Since the 2026-07 amendment, `axum.toml` is treated the same way as every other adapter
+manifest (`wrangler.toml`, `fastly.toml`, `spin.toml`, `runtime-config.toml`) — it is
+**provision-generated** and **gitignored**. `edgezero new` runs scaffold-time provision to
+write it, and a fresh clone will not have `axum.toml` on disk until you run:
+
+```bash
+<app>-cli provision --adapter axum --local
+```
+
+If you edit `axum.toml` (custom host / port / crate name) your changes are preserved on
+re-run — `provision --local`'s merge path is a no-op on operator edits. But because the
+file is not tracked, teammates need to run the command above (or a fresh `edgezero new`)
+to reproduce your local state; share durable settings via `edgezero.toml` instead.
+
+The Axum blueprint has NO scaffold `.hbs` template for `axum.toml`, so scaffold and
+clean-clone provision produce byte-identical output — the single writer is
+`AxumCliAdapter::synthesise_baseline_manifest`.
+:::
+
 ## Development Workflow
 
 A typical development workflow:

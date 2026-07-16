@@ -1,4 +1,5 @@
-use crate::args::NewArgs;
+use crate::args::{NewArgs, ProvisionArgs};
+use crate::provision::run_provision;
 use crate::scaffold::{
     ResolvedDependency, ScaffoldError, register_templates, resolve_dep_line, sanitize_crate_name,
     write_tmpl,
@@ -41,6 +42,19 @@ pub enum GeneratorError {
     /// The target output directory already exists; refusing to overwrite.
     #[error("directory '{}' already exists", .0.display())]
     OutputDirExists(PathBuf),
+    /// The scaffold's per-adapter local-provision step failed. Emitted
+    /// when [`generate_new`] calls [`crate::run_provision`] for each
+    /// adapter declared in the newly generated `edgezero.toml` and one
+    /// of those calls returns an error. Carries the failing adapter's
+    /// id so operators can tell WHICH adapter's synthesise / line
+    /// writer blew up without having to re-run the loop by hand.
+    ///
+    /// The wrapped payload is a `String` (matching `run_provision`'s
+    /// error type) rather than a `Box<dyn Error>`; that lets us name
+    /// it as a distinct field (`reason`, not `source`) so thiserror
+    /// doesn't try to treat it as a nested `std::error::Error`.
+    #[error("scaffold provision failed for adapter `{adapter}`: {reason}")]
+    ProvisionFailed { adapter: String, reason: String },
     /// A template under the workspace scaffold could not be rendered or
     /// written. Wraps [`ScaffoldError`] for context.
     #[error(transparent)]
@@ -234,6 +248,7 @@ pub fn generate_new(args: &NewArgs) -> Result<(), GeneratorError> {
     let data_value = Value::Object(data_map);
 
     render_templates(&layout, &adapter_artifacts.contexts, &data_value)?;
+    provision_all_selected_adapters(&layout.out_dir, &adapter_artifacts.adapter_ids)?;
     initialize_git_repo(&layout.out_dir);
 
     log::info!(
@@ -706,7 +721,7 @@ fn render_templates(
     data_value: &Value,
 ) -> Result<(), GeneratorError> {
     let mut hbs = Handlebars::new();
-    register_templates(&mut hbs);
+    register_templates(&mut hbs).map_err(ScaffoldError::from)?;
 
     log::info!("[edgezero] writing workspace files");
     write_root_files(&hbs, layout, data_value)?;
@@ -779,6 +794,48 @@ fn render_templates(
     Ok(())
 }
 
+/// Run `run_provision --local` once per adapter declared in the
+/// newly generated project's manifest.
+///
+/// This is the scaffold-time counterpart of the operator running
+/// `edgezero provision --adapter <id> --local` after the fact: it
+/// drives each adapter's `synthesise_baseline_manifest` +
+/// local-provision writers so a fresh `edgezero new` output has its
+/// per-adapter local files populated (wrangler.toml, .dev.vars,
+/// spin.toml, runtime-config.toml, spin's `.env`, axum's
+/// `.edgezero/.env`, fastly's `[local_server.*]` entries) without a
+/// second command.
+///
+/// Uses the UNTYPED [`run_provision`] on purpose. The generator has
+/// no downstream `C` type in scope — typed-secret placeholders
+/// (`SPIN_VARIABLE_*` etc.) land later, when the operator first runs
+/// the generated downstream CLI's `provision` (which routes through
+/// `run_provision_typed`).
+///
+/// `ProvisionArgs` is `#[non_exhaustive]`. We build it via
+/// `Default::default()` + per-field assignment (using `clone_from`
+/// where the source is a reference, per `assigning_clones`) rather
+/// than struct-update syntax so a future field addition doesn't
+/// silently regress the default-value contract.
+fn provision_all_selected_adapters(
+    project_root: &Path,
+    adapter_ids: &[String],
+) -> Result<(), GeneratorError> {
+    let manifest_path = project_root.join("edgezero.toml");
+    for adapter_id in adapter_ids {
+        let mut prov_args = ProvisionArgs::default();
+        prov_args.adapter.clone_from(adapter_id);
+        prov_args.local = true;
+        prov_args.dry_run = false;
+        prov_args.manifest.clone_from(&manifest_path);
+        run_provision(&prov_args).map_err(|reason| GeneratorError::ProvisionFailed {
+            adapter: adapter_id.clone(),
+            reason,
+        })?;
+    }
+    Ok(())
+}
+
 fn initialize_git_repo(out_dir: &Path) {
     log::info!("[edgezero] initializing git repository");
     match Command::new("git")
@@ -805,9 +862,11 @@ fn initialize_git_repo(out_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::shared_test_guards::path_mutation_guard;
     use edgezero_core::app_config::app_name_prefix;
     use edgezero_core::test_env::PathPrepend as PathOverride;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     // `super::*` re-exports `env` and `fs` from outer `use` lines, so they're
@@ -1124,7 +1183,7 @@ mod tests {
         );
     }
 
-    fn assert_scaffold_workspace(project_dir: &Path) {
+    fn assert_scaffold_workspace(project_dir: &Path, real_git: Option<&Path>) {
         let cargo_toml =
             fs::read_to_string(project_dir.join("Cargo.toml")).expect("read Cargo.toml");
         for member in [
@@ -1166,15 +1225,79 @@ mod tests {
         let gitignore =
             fs::read_to_string(project_dir.join(".gitignore")).expect("read .gitignore");
         assert!(gitignore.contains("target/"));
+
+        // Provision-owned manifests are regenerated by `provision
+        // --local`, so teammates must not commit somebody else's
+        // per-machine ids / operator-set defaults. All five adapter
+        // manifests are provision-generated; `axum.toml` joined the
+        // list when Axum's `synthesise_baseline_manifest` was wired
+        // up (2026-07 refactor).
+        for entry in [
+            "axum.toml",
+            "fastly.toml",
+            "spin.toml",
+            "wrangler.toml",
+            "runtime-config.toml",
+            ".edgezero/",
+            ".wrangler/",
+            ".spin/",
+            ".dev.vars",
+            ".env",
+        ] {
+            assert!(
+                gitignore.contains(entry),
+                ".gitignore missing provision-owned entry `{entry}`: {gitignore}"
+            );
+        }
+
+        // Regression: the scaffold's `bin/` pattern is broad enough
+        // to also match Cargo's `src/bin/` directories, which are
+        // LEGITIMATE Rust source (one file per binary target). The
+        // repo-root `.gitignore` re-includes them via
+        // `!**/src/bin/`; the scaffold-emitted `.gitignore` MUST do
+        // the same or a downstream project can't check in a
+        // `crates/<name>/src/bin/tool.rs`. Verify with
+        // `git check-ignore` against a real path so a future
+        // refactor of the pattern still exercises git's semantics
+        // (a substring check on the gitignore text is not enough —
+        // ordering matters, `!**/src/bin/**` must FOLLOW `bin/`).
+        assert!(
+            gitignore.contains("!**/src/bin/"),
+            ".gitignore must re-include Cargo `src/bin/` dirs \
+             (broad `bin/` pattern above blocks them otherwise): {gitignore}"
+        );
+        assert_scaffold_src_bin_not_ignored(project_dir, real_git);
+
         let clippy = fs::read_to_string(project_dir.join("clippy.toml")).expect("read clippy.toml");
         assert!(clippy.contains("allow-expect-in-tests = true"));
 
-        // The generated manifests must keep the package-metadata contract: the
-        // root declares the five shared fields once, and EVERY member inherits
-        // all five rather than hardcoding them. Asserted structurally (not with
-        // `contains`) so template drift cannot silently reintroduce a crate that
-        // pins its own `version`/`edition` or drops `publish`.
-        let root: toml::Value = toml::from_str(&cargo_toml).expect("parse root Cargo.toml");
+        // Regression: the pre-fix `fastly.toml.hbs` template shipped a
+        // literal `service_id = ""` line. `write_baseline_to_disk` skips
+        // existing files, so the scaffold-then-provision flow left the
+        // empty string in place — bypassing the synthesiser's "omit
+        // service_id until deployed" invariant. Assert no
+        // scaffolded/provisioned fastly.toml carries an empty
+        // `service_id` after `edgezero new`.
+        let fastly_toml_path = project_dir.join("crates/demo-app-adapter-fastly/fastly.toml");
+        if fastly_toml_path.exists() {
+            let fastly_toml = fs::read_to_string(&fastly_toml_path).expect("read fastly.toml");
+            assert!(
+                !fastly_toml.contains("service_id = \"\""),
+                "fastly.toml must not carry an empty service_id placeholder \
+                 (synthesise_fastly_toml omits it when None): {fastly_toml}"
+            );
+        }
+
+        assert_scaffold_package_metadata(project_dir, &cargo_toml);
+    }
+
+    /// The generated manifests must keep the package-metadata contract: the
+    /// root declares the five shared fields once, and EVERY member inherits
+    /// all five rather than hardcoding them. Asserted structurally (not with
+    /// `contains`) so template drift cannot silently reintroduce a crate that
+    /// pins its own `version`/`edition` or drops `publish`.
+    fn assert_scaffold_package_metadata(project_dir: &Path, cargo_toml: &str) {
+        let root: toml::Value = toml::from_str(cargo_toml).expect("parse root Cargo.toml");
         let shared = root
             .get("workspace")
             .and_then(|ws| ws.get("package"))
@@ -1240,6 +1363,77 @@ mod tests {
         }
     }
 
+    /// Init a temporary git repo in `project_dir`, plant a
+    /// `crates/demo-app-cli/src/bin/tool.rs` file, and check the git
+    /// verdict on it (via `git check-ignore -v` output parsing —
+    /// exit 0 means "matched a pattern" for BOTH ignores and
+    /// re-includes, so we inspect the printed rule and require it
+    /// to start with `!`, i.e. a negation / re-include). Passes
+    /// only when the scaffold `.gitignore`'s broad `bin/` pattern is
+    /// followed by an `!**/src/bin/` re-include that wins.
+    fn assert_scaffold_src_bin_not_ignored(project_dir: &Path, real_git: Option<&Path>) {
+        use std::process::Command;
+
+        // Skip only when we couldn't resolve real git in the test's
+        // pre-stub context. On CI runners git is always present, so
+        // this fallback exists purely for defensive local behaviour
+        // and is loudly noted via `eprintln!` so a silent skip
+        // doesn't hide the regression the test guards against.
+        let Some(git) = real_git else {
+            // Fall back to the string-match assertion above when the
+            // real git binary can't be resolved (defensive local
+            // behaviour; CI runners always ship git). No stderr /
+            // stdout emission here because the workspace-wide
+            // print_stderr / print_stdout restrictions apply to test
+            // code too, and the string-match already fires the
+            // regression signal if the re-include line is missing.
+            return;
+        };
+
+        let init = Command::new(git)
+            .args(["init", "--quiet"])
+            .current_dir(project_dir)
+            .status()
+            .expect("git init runs");
+        assert!(init.success(), "git init failed with status {init}");
+
+        // Plant the file so `git check-ignore` has a real path to
+        // reason about (it doesn't require the file to exist, but
+        // creating it makes the test scenario faithful).
+        let bin_dir = project_dir.join("crates/demo-app-cli/src/bin");
+        fs::create_dir_all(&bin_dir).expect("mkdir src/bin");
+        fs::write(bin_dir.join("tool.rs"), "fn main() {}\n").expect("plant tool.rs");
+
+        let probe = "crates/demo-app-cli/src/bin/tool.rs";
+        let output = Command::new(git)
+            .args(["check-ignore", "-v", probe])
+            .current_dir(project_dir)
+            .output()
+            .expect("git check-ignore runs");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Two outcomes count as "not ignored":
+        //   (a) exit=1 — no rule in .gitignore matched at all
+        //   (b) exit=0 with a `!`-prefixed re-include rule that
+        //       won. `git check-ignore -v` prints the matched rule
+        //       inline: `.gitignore:LINE:PATTERN\tPATH` — a
+        //       re-include's pattern begins with `!`.
+        // Anything else means the ignore pattern won.
+        let matched_line = stdout.lines().next().unwrap_or("");
+        let is_reinclude = matched_line
+            .split('\t')
+            .next()
+            .and_then(|prefix| prefix.rsplit(':').next())
+            .is_some_and(|pattern| pattern.starts_with('!'));
+
+        assert!(
+            !output.status.success() || is_reinclude,
+            "`git check-ignore {probe}` reports the path AS ignored by a non-negation \
+             rule — the scaffold .gitignore's `bin/` pattern is swallowing Cargo's \
+             `src/bin/` directories. Matched rule: {matched_line:?}"
+        );
+    }
+
     fn assert_scaffold_crate_lints(project_dir: &Path) {
         for crate_dir in [
             "crates/demo-app-core",
@@ -1299,9 +1493,113 @@ mod tests {
         );
     }
 
+    /// Walker regression guarding the class of bug that shipped
+    /// `service_id = ""` in `fastly.toml.hbs` for months undetected.
+    ///
+    /// Every `*.toml.hbs` scaffold template that goes through
+    /// `provision --local` is checked for empty-string placeholders on
+    /// keys that provision would upsert. A `key = ""` line at the top
+    /// of the template gets past `write_baseline_to_disk` (skips
+    /// existing files) and reaches the emitted project's manifest
+    /// unchanged -- the synthesiser's "omit key until real" invariant
+    /// is silently bypassed. Any template that intentionally ships a
+    /// blank value must comment the line (`# key = ""`) or add an
+    /// exception below with an explicit reason.
+    ///
+    /// Rule: for every non-comment, non-blank line of the form
+    /// `<key> = ""` (double or single quotes, optional whitespace),
+    /// flag it. `authors = [""]` (empty-string-in-array, standard Cargo
+    /// idiom) is allowed because `[...]` is the containing token, not
+    /// `""`.
+    #[test]
+    fn adapter_hbs_templates_have_no_empty_string_placeholders() {
+        // Resolve the workspace root from CARGO_MANIFEST_DIR
+        // (crates/edgezero-cli) -> ../..
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+
+        let mut offenders: Vec<String> = Vec::new();
+        let crates_dir = workspace_root.join("crates");
+        walk_toml_templates(&crates_dir, &mut |path, body| {
+            for (idx, raw_line) in body.lines().enumerate() {
+                let trimmed = raw_line.trim_start();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                // `key = ""` or `key = ''` (permit optional spaces
+                // around the =). Bail on any array / table forms.
+                let empty_double = trimmed.contains("= \"\"") || trimmed.ends_with("=\"\"");
+                let empty_single = trimmed.contains("= ''") || trimmed.ends_with("=''");
+                if empty_double || empty_single {
+                    offenders.push(format!(
+                        "{}:{} — `{}`",
+                        path.display(),
+                        idx + 1,
+                        raw_line.trim_end()
+                    ));
+                }
+            }
+        });
+
+        assert!(
+            offenders.is_empty(),
+            "Template hygiene violation: `key = \"\"` lines below would ship as empty placeholders through `provision --local` because write_baseline_to_disk skips existing files. Comment the line, remove it, or fill in a real default:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Depth-first walk of every `*.toml.hbs` file under `root`. Skips
+    /// `target/` and `.git/` on principle even though they shouldn't
+    /// contain templates. Reads each hit into memory and invokes
+    /// `visit(path, body)`. Non-toml `.hbs` files are ignored -- only
+    /// TOML has the "root scalar becomes nested under a header on
+    /// re-emit" class of bug and only TOML has empty-placeholder
+    /// semantics we care about.
+    fn walk_toml_templates(root: &Path, visit: &mut dyn FnMut(&Path, &str)) {
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if path.is_dir() {
+                if name_str == "target" || name_str == ".git" {
+                    continue;
+                }
+                walk_toml_templates(&path, visit);
+                continue;
+            }
+            if name_str.ends_with(".toml.hbs")
+                && let Ok(body) = fs::read_to_string(&path)
+            {
+                visit(&path, &body);
+            }
+        }
+    }
+
     #[test]
     fn generate_new_scaffolds_workspace_layout() {
+        // Serialise PATH mutation against config.rs's push-shim tests
+        // (both run in the same edgezero-cli test binary and mutate
+        // `$PATH`). The shared `PathPrepend` guard does its own
+        // `unsafe env::set_var`; holding this crate-wide mutex for the
+        // override's lifetime keeps the two callsites from interleaving
+        // their PATH restores.
+        #[cfg(unix)]
+        let _path_lock = path_mutation_guard()
+            .lock()
+            .expect("PATH mutation guard poisoned");
+
         let temp = TempDir::new().expect("temp dir");
+        // Resolve the REAL git binary BEFORE the PATH stub goes in
+        // so `assert_scaffold_workspace`'s git-check-ignore probe
+        // can bypass the stub script that swallows all git calls.
+        let real_git = resolve_real_git_path();
+
         let bin_dir = temp.path().join("bin");
         write_git_stub(&bin_dir);
         let _path_guard = PathOverride::new(&bin_dir);
@@ -1315,10 +1613,29 @@ mod tests {
 
         let project_dir = temp.path().join("demo-app");
         assert_scaffold_files(&project_dir);
-        assert_scaffold_workspace(&project_dir);
+        assert_scaffold_workspace(&project_dir, real_git.as_deref());
         assert_scaffold_app_config(&project_dir);
         assert_scaffold_crate_lints(&project_dir);
         assert_scaffold_cli_full_command_set(&project_dir);
+    }
+
+    /// Look up the current-PATH `git` binary and return an absolute
+    /// path. Returns None on platforms where `which` isn't available
+    /// or the lookup fails - the caller then skips the git-based
+    /// probe so the surrounding test still runs.
+    fn resolve_real_git_path() -> Option<PathBuf> {
+        use std::process::Command;
+        let output = Command::new("which").arg("git").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(output.stdout).ok()?;
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
     }
 
     /// The scaffolded `<name>-cli` must
@@ -1383,17 +1700,233 @@ mod tests {
         }
 
         // Typed dispatch — the whole reason a downstream CLI
-        // exists. Raw push/validate would defeat the point.
+        // exists. Raw push/validate would defeat the point. Provision
+        // routes through the typed variant so #[secret] fields on the
+        // downstream config reach adapter provision_typed impls.
         for call in [
             "run_config_push_typed::<DemoAppConfig>",
             "run_config_validate_typed::<DemoAppConfig>",
+            "run_provision_typed::<DemoAppConfig>",
             "edgezero_cli::run_auth",
-            "edgezero_cli::run_provision",
         ] {
             assert!(
                 main.contains(call),
                 "<name>-cli main.rs must dispatch via `{call}`: {main}"
             );
         }
+        // Negative: the untyped variant must not survive template
+        // regeneration — Task 30's whole point was to eliminate the
+        // bypass where scaffolded CLIs would silently skip typed
+        // secret writeback.
+        assert!(
+            !main.contains("edgezero_cli::run_provision(&args)"),
+            "<name>-cli main.rs must NOT call untyped run_provision: {main}"
+        );
+    }
+
+    /// Task 31: after `generate_new` returns, every adapter declared
+    /// in the generated `edgezero.toml` must have already run its
+    /// local-mode `provision`, so the Cloudflare and Spin per-crate
+    /// files (synthesised platform manifests + `.env`-style line
+    /// writers) exist on disk without a second command.
+    #[test]
+    fn generate_new_provisions_cloudflare_and_spin_scaffold_artifacts() {
+        let temp = TempDir::new().expect("temp dir");
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+        };
+
+        generate_new(&args).expect("scaffold succeeds");
+
+        let project_dir = temp.path().join("demo-app");
+        let cf_crate = project_dir.join("crates/demo-app-adapter-cloudflare");
+        let spin_crate = project_dir.join("crates/demo-app-adapter-spin");
+        let axum_crate = project_dir.join("crates/demo-app-adapter-axum");
+
+        assert!(
+            cf_crate.join("wrangler.toml").exists(),
+            "cloudflare wrangler.toml must be synthesised at scaffold time"
+        );
+        assert!(
+            cf_crate.join(".dev.vars").exists(),
+            "cloudflare .dev.vars must be created at scaffold time (line writer)"
+        );
+        assert!(
+            spin_crate.join("spin.toml").exists(),
+            "spin spin.toml must be synthesised at scaffold time"
+        );
+        assert!(
+            spin_crate.join("runtime-config.toml").exists(),
+            "spin runtime-config.toml must be synthesised at scaffold time"
+        );
+        assert!(
+            spin_crate.join(".env").exists(),
+            "spin per-crate .env must be created at scaffold time (line writer)"
+        );
+
+        // Regression: ALL FIVE adapter manifests are now generated
+        // ONLY by scaffold-time provision — the scaffold templates
+        // were removed to prevent divergence with the synthesisers
+        // (`write_baseline_to_disk` skips existing files, so a
+        // scaffold-written manifest would silently override the
+        // synth output at `edgezero new` while the synth output
+        // would win on a clean clone). Assert each manifest exists
+        // AND carries the `# edgezero-provision: v1` header the
+        // synthesiser emits (proving it came from provision and
+        // not a scaffold template).
+        for manifest in [
+            axum_crate.join("axum.toml"),
+            cf_crate.join("wrangler.toml"),
+            fastly_crate_path(&project_dir).join("fastly.toml"),
+            spin_crate.join("spin.toml"),
+            spin_crate.join("runtime-config.toml"),
+        ] {
+            let body = fs::read_to_string(&manifest)
+                .unwrap_or_else(|err| panic!("read {}: {err}", manifest.display()));
+            assert!(
+                body.starts_with("# edgezero-provision: v1\n"),
+                "scaffolded {} must carry the synthesiser's `# edgezero-provision: v1` \
+                 header, proving it came from provision and not a scaffold template: \
+                 {body}",
+                manifest.display()
+            );
+        }
+
+        // Byte-equality regression: for every generated manifest,
+        // deleting the scaffold artefact and re-running
+        // `provision --local` must reproduce the ORIGINAL bytes.
+        // That is exactly the "single source of truth" invariant:
+        // `edgezero new`'s provision loop and a clean-clone
+        // `provision --local` write identical output. The
+        // pre-2026-07 divergence — most severely on Spin, where
+        // the scaffold template pointed at `<crate>_adapter_spin.wasm`
+        // and the synth pointed at `<app>.wasm` (a non-existent
+        // artefact) — is exactly what this asserts against.
+        assert_regenerated_manifests_match_baseline(&project_dir);
+    }
+
+    fn fastly_crate_path(project_dir: &Path) -> PathBuf {
+        project_dir.join("crates/demo-app-adapter-fastly")
+    }
+
+    /// For each provision-generated adapter manifest, snapshot the
+    /// scaffold-time bytes, delete the file, re-run
+    /// `provision --adapter <id> --local`, and assert the bytes
+    /// come back byte-identical.
+    fn assert_regenerated_manifests_match_baseline(project_dir: &Path) {
+        let manifest_path = project_dir.join("edgezero.toml");
+
+        for (adapter_id, files) in [
+            ("axum", vec!["crates/demo-app-adapter-axum/axum.toml"]),
+            (
+                "cloudflare",
+                vec!["crates/demo-app-adapter-cloudflare/wrangler.toml"],
+            ),
+            ("fastly", vec!["crates/demo-app-adapter-fastly/fastly.toml"]),
+            (
+                "spin",
+                vec![
+                    "crates/demo-app-adapter-spin/spin.toml",
+                    "crates/demo-app-adapter-spin/runtime-config.toml",
+                ],
+            ),
+        ] {
+            let baselines: Vec<(PathBuf, String)> = files
+                .iter()
+                .map(|rel| {
+                    let full = project_dir.join(rel);
+                    let bytes = fs::read_to_string(&full)
+                        .unwrap_or_else(|err| panic!("read {}: {err}", full.display()));
+                    (full, bytes)
+                })
+                .collect();
+
+            for (full, _) in &baselines {
+                fs::remove_file(full)
+                    .unwrap_or_else(|err| panic!("delete {}: {err}", full.display()));
+            }
+
+            let mut prov_args = ProvisionArgs::default();
+            let owned_id = (*adapter_id).to_owned();
+            prov_args.adapter.clone_from(&owned_id);
+            prov_args.local = true;
+            prov_args.dry_run = false;
+            prov_args.manifest.clone_from(&manifest_path);
+            crate::run_provision(&prov_args).unwrap_or_else(|err| {
+                panic!("regenerate provision for `{adapter_id}` failed: {err}")
+            });
+
+            for (full, baseline) in &baselines {
+                let regenerated = fs::read_to_string(full)
+                    .unwrap_or_else(|err| panic!("re-read {}: {err}", full.display()));
+                assert_eq!(
+                    &regenerated,
+                    baseline,
+                    "clean-clone regenerated {} must match scaffold-time bytes exactly \
+                     (single-source invariant): scaffold={baseline:?} regenerated={regenerated:?}",
+                    full.display()
+                );
+            }
+        }
+    }
+
+    /// Task 31: after `generate_new` returns, the axum adapter's
+    /// local-state directory (`.edgezero/`) and its `.env`
+    /// placeholder file must already exist at the project root,
+    /// courtesy of the scaffold-time provision loop dispatching to
+    /// the axum adapter's local writer.
+    #[test]
+    fn generate_new_provisions_axum_dot_edgezero_env() {
+        let temp = TempDir::new().expect("temp dir");
+
+        let args = NewArgs {
+            name: "demo-app".into(),
+            dir: Some(temp.path().to_string_lossy().into_owned()),
+        };
+
+        generate_new(&args).expect("scaffold succeeds");
+
+        let project_dir = temp.path().join("demo-app");
+        assert!(
+            project_dir.join(".edgezero").is_dir(),
+            ".edgezero/ must exist post-scaffold when axum is in the adapter set"
+        );
+        assert!(
+            project_dir.join(".edgezero/.env").exists(),
+            ".edgezero/.env must be seeded by axum's local provision writer"
+        );
+    }
+
+    /// Task 31: when any adapter's provision call fails, the error
+    /// bubbles out of the loop with the failing adapter's id, so
+    /// operators can tell WHICH adapter blew up. Exercised via a
+    /// direct call to the helper with a project root that has no
+    /// `edgezero.toml` — `run_provision`'s manifest loader fails
+    /// immediately and the loop wraps the error in
+    /// `GeneratorError::ProvisionFailed { adapter, .. }`.
+    #[test]
+    fn provision_all_selected_adapters_surfaces_adapter_name_on_failure() {
+        let temp = TempDir::new().expect("temp dir");
+        let project_root = temp.path();
+        // Deliberately do NOT create edgezero.toml — `run_provision`
+        // will fail at `ManifestLoader::from_path`.
+        let err = provision_all_selected_adapters(project_root, &["axum".to_owned()])
+            .expect_err("provision must fail without a manifest");
+        let GeneratorError::ProvisionFailed { adapter, reason } = &err else {
+            panic!("expected ProvisionFailed, got {err:?}");
+        };
+        assert_eq!(adapter, "axum", "must name the failing adapter");
+        assert!(
+            !reason.is_empty(),
+            "wrapped reason must carry the underlying error"
+        );
+        // Display string also carries the adapter name.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("axum"),
+            "Display must surface failing adapter name: {msg}"
+        );
     }
 }

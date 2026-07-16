@@ -23,6 +23,17 @@ SERVER_PID=""
 DEV_VARS_FILE=""
 SMOKE_SECRET_NAME="SMOKE_SECRET"
 MISSING_SECRET_NAME="SMOKE_SECRET_MISSING"
+
+# Warm up per-adapter local state — provision --local synthesises
+# wrangler.toml / fastly.toml / spin.toml / runtime-config.toml
+# and writes .dev.vars / .env / .edgezero/.env. Fresh clones need
+# this because Task 33 gitignored those files. Crucial for this
+# smoke: the typed dispatch (Task 30b) writes SPIN_VARIABLE_* /
+# .dev.vars placeholders that the emulator boot reads.
+# shellcheck source=lib/smoke_warmup.sh
+. "$ROOT_DIR/scripts/lib/smoke_warmup.sh"
+echo "==> Warming up local state (provision --adapter $ADAPTER --local)..."
+smoke_warmup_provision_local "$ADAPTER"
 DISALLOWED_SECRET_NAME="API_KEY"
 SMOKE_SECRET_VALUE="smoke-secret-$(date +%s)-$$"
 PASS=0

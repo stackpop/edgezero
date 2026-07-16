@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -20,6 +20,67 @@ pub enum AdapterAction {
     Build,
     Deploy,
     Serve,
+}
+
+/// Provision dispatch mode. `Cloud` keeps today's cloud-CLI shell-out
+/// behaviour; `Local` writes adapter-local emulator state (no cloud
+/// calls). Threaded through `Adapter::provision` so each adapter
+/// branches once at the top of its impl. See spec §"CLI / trait
+/// surface".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProvisionMode {
+    Cloud,
+    Local,
+}
+
+/// Adapter-emitted deployed identifiers. Kept neutral (string-keyed
+/// maps only) so `edgezero-adapter` stays dep-free of
+/// `edgezero-core` -- the CLI maps this into the strongly typed
+/// `ManifestAdapterDeployed` shape when writing `edgezero.toml`.
+/// See spec §"Writeback ownership".
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct AdapterDeployedState {
+    pub fields: BTreeMap<String, String>,
+    pub sub_tables: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// Return value of `Adapter::provision` (and `provision_typed`).
+/// `status_lines` are operator-facing; `deployed`, when `Some`,
+/// records the cloud-returned identifiers the CLI persists into
+/// `edgezero.toml`'s `[adapters.<name>.deployed]` block. Local
+/// provision returns `deployed: None`.
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct ProvisionOutcome {
+    pub deployed: Option<AdapterDeployedState>,
+    pub status_lines: Vec<String>,
+}
+
+impl ProvisionOutcome {
+    /// Construct with status lines and no deployed writeback. This is
+    /// the common case for local-mode provision (spec §"Writeback
+    /// ownership": local returns `deployed: None`).
+    #[inline]
+    #[must_use]
+    pub fn from_status_lines(status_lines: Vec<String>) -> Self {
+        Self {
+            deployed: None,
+            status_lines,
+        }
+    }
+
+    /// Construct with status lines AND cloud-returned deployed
+    /// identifiers to persist into `edgezero.toml`.
+    #[inline]
+    #[must_use]
+    pub fn with_deployed(status_lines: Vec<String>, deployed: AdapterDeployedState) -> Self {
+        Self {
+            deployed: Some(deployed),
+            status_lines,
+        }
+    }
 }
 
 /// A single declared store id, paired with the platform name the
@@ -227,6 +288,20 @@ pub enum ReadConfigEntry {
 /// of `edgezero-core`. Defaults are no-ops; adapters override what
 /// they actually need.
 pub trait Adapter: Sync + Send {
+    /// Names of the `ManifestAdapterDeployed` fields this adapter
+    /// reads at provision time. Manifest-level cross-check
+    /// (`validate_deployed_field_ownership` in the CLI) rejects
+    /// `[adapters.<name>.deployed]` blocks whose populated fields
+    /// aren't in this list — catching operator typos and writeback
+    /// bugs before they corrupt the deployed state at next provision.
+    ///
+    /// Default is `&[]` — adapters that don't persist deployed state
+    /// (spin, axum today) inherit it.
+    #[inline]
+    fn deployed_fields(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Execute the requested action with optional adapter-specific args.
     ///
     /// `args` is a stringly-typed pass-through for arguments meant
@@ -275,23 +350,61 @@ pub trait Adapter: Sync + Send {
     /// (`wrangler.toml`, `fastly.toml`, `spin.toml`) relative to
     /// the root. `stores` carries the declared ids per kind.
     ///
-    /// Default: no-op (returns an empty `Vec`) so adapters that
-    /// don't own any platform resources don't need to override.
+    /// `deployed` carries the adapter's previously-persisted
+    /// deployed identifiers (e.g. Cloudflare KV namespace ids,
+    /// Fastly service id). Local-arm impls consult it for
+    /// precedence rules (spec §"CLI / trait surface"); cloud-arm
+    /// impls pass `None` — they produce, not consume, the deployed
+    /// state. `mode` selects cloud vs. local emulator paths
+    /// (spec §"CLI / trait surface", §"Writeback ownership").
+    ///
+    /// No default impl is provided — every adapter must update
+    /// explicitly so the compiler flags any missed call sites.
     ///
     /// # Errors
     /// Returns a human-readable error string if any platform
     /// invocation or manifest edit fails. `dry_run` impls should
     /// describe what they *would* do without performing it.
-    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "provision needs the manifest root, adapter manifest path, component selector, resolved stores, previously-deployed state (for local-arm precedence), dispatch mode (cloud vs local), and dry-run flag — 8 args. Each is distinct; an aggregate struct would be a larger ergonomic regression for adapter implementers."
+    )]
     fn provision(
+        &self,
+        manifest_root: &Path,
+        adapter_manifest_path: Option<&str>,
+        component_selector: Option<&str>,
+        stores: &ProvisionStores<'_>,
+        deployed: Option<&AdapterDeployedState>,
+        mode: ProvisionMode,
+        dry_run: bool,
+    ) -> Result<ProvisionOutcome, String>;
+
+    /// Typed-secret companion to `provision`. Runs ONLY in local mode
+    /// (`mode == Local`); cloud mode is a no-op by spec §"CLI / trait
+    /// surface". The CLI dispatches this AFTER `provision` on the same
+    /// `manifest_root`, so per-store bindings are already in place; this
+    /// method only adds adapter-specific per-secret placeholders sourced
+    /// from `C::SECRET_FIELDS` (the generic CLI walks them; bundled
+    /// `edgezero` cannot).
+    ///
+    /// The default impl is a no-op so existing adapters compile
+    /// untouched while the per-adapter overrides land in Section 5.
+    ///
+    /// # Errors
+    /// The default impl never errors. Adapter overrides may return
+    /// human-readable error strings if local placeholder setup fails.
+    #[inline]
+    fn provision_typed(
         &self,
         _manifest_root: &Path,
         _adapter_manifest_path: Option<&str>,
         _component_selector: Option<&str>,
-        _stores: &ProvisionStores<'_>,
+        _typed_secrets: &[TypedSecretEntry<'_>],
+        _mode: ProvisionMode,
         _dry_run: bool,
-    ) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+    ) -> Result<ProvisionOutcome, String> {
+        Ok(ProvisionOutcome::default())
     }
 
     /// Push config entries into the platform's config store backing
@@ -439,6 +552,42 @@ pub trait Adapter: Sync + Send {
         &[]
     }
 
+    /// First-run bootstrap synthesiser, called by the CLI ONLY when
+    /// `mode == Local` AND the adapter manifest (or related local
+    /// files like `runtime-config.toml`) is absent. All four
+    /// bundled adapters (axum, cloudflare, fastly, spin) override
+    /// this — the `Ok(Vec::new())` default is retained only for
+    /// downstream / experimental adapters that own no synthesised
+    /// local state. The 2026-07 amendment folded `axum.toml` into
+    /// the same gitignored / provision-generated model as the
+    /// other three, so the earlier "Axum has no synthesised local
+    /// state" carve-out no longer applies.
+    ///
+    /// Each `(relative_path, contents)` tuple is written by the CLI
+    /// under `manifest_root` BEFORE `validate_adapter_manifest`
+    /// runs, so a clean clone can pass validation.
+    ///
+    /// **Boundary contract (MUST):** signature uses only `std` +
+    /// types defined IN this crate. Adapters that need values from
+    /// the parent manifest receive them through the neutral
+    /// `Option<&AdapterDeployedState>` argument — the CLI translates
+    /// from `&Manifest` to `AdapterDeployedState` at the call site.
+    ///
+    /// # Errors
+    /// The default impl never errors. Adapter overrides may return
+    /// human-readable error strings if baseline synthesis fails.
+    #[inline]
+    fn synthesise_baseline_manifest(
+        &self,
+        _manifest_root: &Path,
+        _adapter_manifest_path: Option<&str>,
+        _component_selector: Option<&str>,
+        _app_name: &str,
+        _deployed: Option<&AdapterDeployedState>,
+    ) -> Result<Vec<(PathBuf, String)>, String> {
+        Ok(Vec::new())
+    }
+
     /// Adapter-specific manifest check — e.g. Spin's
     /// `[component.*]` discovery in `spin.toml`. The adapter
     /// resolves its own per-adapter manifest path relative to
@@ -567,6 +716,19 @@ mod tests {
         fn name(&self) -> &'static str {
             self.name
         }
+
+        fn provision(
+            &self,
+            _manifest_root: &Path,
+            _adapter_manifest_path: Option<&str>,
+            _component_selector: Option<&str>,
+            _stores: &ProvisionStores<'_>,
+            _deployed: Option<&AdapterDeployedState>,
+            _mode: ProvisionMode,
+            _dry_run: bool,
+        ) -> Result<ProvisionOutcome, String> {
+            Ok(ProvisionOutcome::default())
+        }
     }
 
     fn reset() {
@@ -629,6 +791,41 @@ mod tests {
             matches!(local_result, ReadConfigEntry::Unsupported(_)),
             "expected Unsupported variant from default local impl"
         );
+    }
+
+    #[test]
+    fn provision_outcome_default_is_empty() {
+        let outcome = ProvisionOutcome::default();
+        assert!(outcome.status_lines.is_empty());
+        assert!(outcome.deployed.is_none());
+    }
+
+    #[test]
+    fn adapter_deployed_state_round_trips_via_btreemap() {
+        use std::collections::BTreeMap;
+        let mut state = AdapterDeployedState::default();
+        state.fields.insert("service_id".into(), "SVC1".into());
+        let mut kv = BTreeMap::new();
+        kv.insert("sessions".into(), "abc123".into());
+        state.sub_tables.insert("kv_namespaces".into(), kv);
+        assert_eq!(state.fields["service_id"], "SVC1");
+        assert_eq!(state.sub_tables["kv_namespaces"]["sessions"], "abc123");
+    }
+
+    #[test]
+    fn provision_typed_default_impl_returns_empty_outcome() {
+        let outcome = FIRST
+            .provision_typed(
+                Path::new("/tmp"),
+                None,
+                None,
+                &[],
+                ProvisionMode::Local,
+                true,
+            )
+            .unwrap();
+        assert!(outcome.status_lines.is_empty());
+        assert!(outcome.deployed.is_none());
     }
 
     #[test]

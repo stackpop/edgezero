@@ -4,6 +4,7 @@
 fn main() {
     use clap::Parser as _;
     use edgezero_cli::args::{self, Args, Command, ConfigCmd};
+    use edgezero_cli::stream::info_line;
     use std::process;
 
     edgezero_cli::init_cli_logger();
@@ -15,14 +16,7 @@ fn main() {
         // invocation, prints the pointer text, and exits 2 so callers can
         // distinguish "wrong binary" from a runtime error (exit 1).
         Command::Config(ConfigCmd::Push(_) | ConfigCmd::Diff(_)) => {
-            #[expect(
-                clippy::print_stderr,
-                reason = "intentional: pointer text must reach the user even when \
-                          stdout is piped; this is the only stderr write in main"
-            )]
-            {
-                eprintln!("{}", args::STUB_POINTER_AFTER_HELP);
-            };
+            info_line(args::STUB_POINTER_AFTER_HELP);
             process::exit(2);
         }
         Command::Config(ConfigCmd::Validate(cmd_args)) => {

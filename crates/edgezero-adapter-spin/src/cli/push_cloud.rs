@@ -260,7 +260,7 @@ mod tests {
     #[cfg(unix)]
     use std::path::Path as StdPath;
     #[cfg(unix)]
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
     #[cfg(unix)]
     use tempfile::{TempDir, tempdir};
 
@@ -472,10 +472,12 @@ exit {exit}
 
     /// A process-wide mutex serialising `PATH`-mutating tests in
     /// this module so two parallel tests don't race on the env.
+    /// Delegates to the shared `cli::env_mutation_guard()` so this
+    /// suite also serialises against `provision_local`'s PATH-
+    /// mutating tests (both suites prepend a fake `spin` shim).
     #[cfg(unix)]
     fn path_mutation_guard() -> &'static Mutex<()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD.get_or_init(|| Mutex::new(()))
+        super::super::env_mutation_guard()
     }
 
     #[cfg(unix)]
@@ -672,6 +674,44 @@ exit {exit}
         assert!(
             err.contains("\"k0\""),
             "committed bucket must include at least `k0` from chunk 1: {err}"
+        );
+    }
+
+    // ---------- read_config_entry: Fermyon Cloud branch ----------
+
+    /// Branch 2: `read_config_entry` returns `Unsupported` when the
+    /// deploy command indicates Fermyon Cloud (no per-key `get` in
+    /// the cloud CLI as of v1).
+    #[test]
+    fn read_config_entry_returns_unsupported_for_fermyon_cloud_deploy_cmd() {
+        use crate::cli::SpinCliAdapter;
+        use edgezero_adapter::registry::{
+            Adapter as _, AdapterPushContext, ReadConfigEntry, ResolvedStoreId,
+        };
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("spin.toml"),
+            "spin_manifest_version = 2\n[application]\nname = \"x\"\nversion = \"0\"\n[component.demo]\nsource = \"a.wasm\"\n",
+        )
+        .expect("write spin.toml");
+        let mut ctx = AdapterPushContext::new();
+        ctx.manifest_adapter_deploy_cmd = Some("spin deploy");
+        let result = SpinCliAdapter
+            .read_config_entry(
+                dir.path(),
+                Some("spin.toml"),
+                None,
+                &ResolvedStoreId::new("app_config".to_owned(), "app_config".to_owned()),
+                "greeting",
+                &ctx,
+            )
+            .expect("cloud branch returns Ok(Unsupported)");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "Fermyon Cloud must return Unsupported"
         );
     }
 }

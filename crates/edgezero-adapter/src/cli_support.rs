@@ -97,6 +97,104 @@ pub fn run_native_cli(program: &str, args: &[&str], install_hint: &str) -> Resul
     }
 }
 
+/// Resolve the ADAPTER CRATE package name for the manifest being
+/// synthesised. Walks from the manifest's parent directory upward
+/// (toward `manifest_root`) looking for the nearest `Cargo.toml`,
+/// then reads its `[package].name`. The spec allows the adapter
+/// manifest to resolve anywhere inside the adapter crate — including
+/// nested paths like `crates/server/config/axum.toml` — so a
+/// parent-only lookup misses the crate's actual Cargo.toml when the
+/// operator organises manifests under a sub-directory (spec
+/// §"[adapters.<name>.adapter]").
+///
+/// Used by `Adapter::synthesise_baseline_manifest` impls to write
+/// runtime-authoritative fields — Axum's `[adapter].crate`, the
+/// Spin `[application].name` / wasm source path, Cloudflare's
+/// `wrangler.toml` `name`, Fastly's `fastly.toml` `name`. The
+/// synthesised value MUST match the Cargo package the adapter
+/// actually builds; hardcoding a `<app>-adapter-<id>` convention
+/// silently mispoints the wasm source path on any project that
+/// renames the adapter crate.
+///
+/// Returns `None` when:
+/// - `adapter_manifest_path` is `None` (no adapter manifest path
+///   declared in `edgezero.toml`), OR
+/// - no ancestor from the manifest's parent up to `manifest_root`
+///   (inclusive) has a readable `Cargo.toml` with `[package].name`.
+///
+/// Callers fall back to a scaffold-convention crate name in that
+/// case (e.g. `<app_name>-adapter-<id>`) so the synthesis is
+/// still deterministic on a fresh scaffold.
+#[inline]
+#[must_use]
+pub fn read_adapter_crate_name(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+) -> Option<String> {
+    let rel = adapter_manifest_path?;
+    let manifest_abs = manifest_root.join(rel);
+    let mut current = manifest_abs.parent()?;
+    // Walk up until we either find a Cargo.toml or step above
+    // `manifest_root`. The walk is inclusive at `manifest_root`
+    // (a root-level manifest at `edgezero.toml`-sibling path still
+    // gets to inspect the workspace root Cargo.toml if the adapter
+    // is unrolled at that level). Bounded by `manifest_root` so we
+    // never leak up into the user's home directory or workspace
+    // parents when the adapter manifest lives at a shallow depth.
+    let root_abs = manifest_root
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_root.to_path_buf());
+    loop {
+        if let Ok(name) = read_package_name(&current.join("Cargo.toml")) {
+            return Some(name);
+        }
+        // Stop after checking `manifest_root` itself.
+        let current_abs = current
+            .canonicalize()
+            .unwrap_or_else(|_| current.to_path_buf());
+        if current_abs == root_abs {
+            return None;
+        }
+        current = current.parent()?;
+    }
+}
+
+/// Walk from the manifest's parent up to `manifest_root` and
+/// return the first ancestor directory that carries a
+/// `Cargo.toml`. Mirrors [`read_adapter_crate_name`]'s traversal
+/// but returns the DIRECTORY instead of the parsed package name —
+/// callers use it to resolve fields like Axum's `[adapter].crate_dir`
+/// (a relative path FROM the adapter manifest's parent TO the
+/// crate root that carries `Cargo.toml`).
+///
+/// Returns `None` when the manifest path is unset OR no ancestor
+/// up to `manifest_root` (inclusive) carries a `Cargo.toml`.
+#[inline]
+#[must_use]
+pub fn read_adapter_crate_root(
+    manifest_root: &Path,
+    adapter_manifest_path: Option<&str>,
+) -> Option<PathBuf> {
+    let rel = adapter_manifest_path?;
+    let manifest_abs = manifest_root.join(rel);
+    let mut current = manifest_abs.parent()?;
+    let root_abs = manifest_root
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_root.to_path_buf());
+    loop {
+        if current.join("Cargo.toml").is_file() {
+            return Some(current.to_path_buf());
+        }
+        let current_abs = current
+            .canonicalize()
+            .unwrap_or_else(|_| current.to_path_buf());
+        if current_abs == root_abs {
+            return None;
+        }
+        current = current.parent()?;
+    }
+}
+
 /// Reads the crate name from a `Cargo.toml`, supporting both the inline and `[package]` forms.
 ///
 /// # Errors
@@ -130,6 +228,102 @@ pub fn read_package_name(manifest: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn read_adapter_crate_name_returns_package_name_from_sibling_cargo_toml() {
+        // The common case: `[adapters.axum.adapter].manifest =
+        // "crates/server/axum.toml"` with a package name of
+        // `server` at `crates/server/Cargo.toml`. The helper must
+        // return `Some("server")` so the synthesiser emits
+        // `crate = "server"` in the resulting axum.toml.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let crate_dir = root.join("crates/server");
+        fs::create_dir_all(&crate_dir).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let out = read_adapter_crate_name(root, Some("crates/server/axum.toml"));
+        assert_eq!(out.as_deref(), Some("server"));
+    }
+
+    #[test]
+    fn read_adapter_crate_name_walks_up_to_nested_manifest_crate_root() {
+        // The spec allows the adapter manifest to sit anywhere
+        // inside the adapter crate (spec §"[adapters.<name>.adapter]").
+        // A common shape is `crates/server/config/axum.toml` — the
+        // manifest's parent is `crates/server/config/`, which has NO
+        // Cargo.toml. The helper must walk upward and find
+        // `crates/server/Cargo.toml` with `[package].name = "server"`
+        // so the synthesiser emits `crate = "server"` (not the
+        // fallback `<app>-adapter-axum`).
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let crate_dir = root.join("crates/server");
+        fs::create_dir_all(crate_dir.join("config")).unwrap();
+        fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"server\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let out = read_adapter_crate_name(root, Some("crates/server/config/axum.toml"));
+        assert_eq!(
+            out.as_deref(),
+            Some("server"),
+            "helper must walk from the manifest parent up to the first Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn read_adapter_crate_name_stops_at_manifest_root() {
+        // Bound the walk at `manifest_root` — we must not leak up
+        // into the user's home directory or workspace parents when
+        // no Cargo.toml exists inside the project. The test seeds
+        // NO Cargo.toml under the tempdir but WOULD find one further
+        // up the real filesystem; the helper must return None
+        // regardless.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("crates/server/config")).unwrap();
+        // No Cargo.toml anywhere under `root`.
+
+        let out = read_adapter_crate_name(root, Some("crates/server/config/spin.toml"));
+        assert!(
+            out.is_none(),
+            "helper must not walk above manifest_root: {out:?}"
+        );
+    }
+
+    #[test]
+    fn read_adapter_crate_name_returns_none_when_cargo_toml_missing() {
+        // First-run scaffold path: the adapter manifest hasn't been
+        // laid down yet, so the synthesiser must fall back to its
+        // scaffold-convention default. Represented here by
+        // pointing at a nested manifest whose sibling Cargo.toml
+        // doesn't exist yet.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("crates/pending")).unwrap();
+        // No Cargo.toml written under crates/pending/.
+
+        let out = read_adapter_crate_name(root, Some("crates/pending/spin.toml"));
+        assert!(out.is_none(), "missing Cargo.toml must yield None: {out:?}");
+    }
+
+    #[test]
+    fn read_adapter_crate_name_returns_none_when_manifest_path_unset() {
+        // `[adapters.<name>.adapter].manifest` is optional in
+        // `edgezero.toml`. When omitted, the helper has nothing to
+        // read and must return `None` so the caller falls back to
+        // its scaffold convention.
+        let dir = tempdir().unwrap();
+        let out = read_adapter_crate_name(dir.path(), None);
+        assert!(out.is_none());
+    }
 
     #[test]
     fn workspace_root_defaults_to_dir_when_no_cargo_toml() {
