@@ -35,10 +35,12 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 
 - **Local** prunes eagerly, inside the same `fastly.toml` rewrite. Safe: one
   file, read by Viceroy at startup — no propagation window.
-- **Cloud** reclaims orphaned generations that are unreferenced by the live
-  pointer AND have been superseded for longer than a grace window, deriving
-  both facts from the store itself. It is **never** safe to delete the
-  just-superseded generation immediately (see "Cloud reclamation").
+- **Cloud** reclaims **nothing automatically** — a `config push` writes chunks
+  then the pointer and stops. On an eventually-consistent store there is no safe
+  automatic delete (three automatic designs were built and demolished; see
+  "Cloud reclamation"). Reclamation is a separate, **operator-invoked** `config
+  gc` that deletes only unreferenced chunks the operator has explicitly asserted
+  are old enough to be safe.
 
 > **Code-layout note.** This spec targets the layout on `main`, where
 > the Fastly adapter is monolithic (`cli.rs` + `chunked_config.rs`).
@@ -106,18 +108,27 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
    `prior_chunk_keys − new_keep_set`.
 
 3. **Only canonical, root-scoped keys are delete candidates.** A key must parse
-   as `<root>.__edgezero_chunks.<hex-sha>.<index>`. Deletes target the store's
-   ACTUAL keys — never keys re-derived from a content address.
+   as `<root>.__edgezero_chunks.<64-char-lowercase-sha>.<canonical-decimal-index>`
+   — nothing shorter, uppercased, or with a leading-zero index. Deletes target
+   the store's ACTUAL keys — never keys re-derived from a content address.
 
-4. **Destructive paths FAIL CLOSED.** If `config gc` cannot classify a root, or
-   cannot read an entry's `created_at`, it aborts and deletes **nothing**. An
-   unreadable state must never fail open into deletion.
+4. **Destructive paths FAIL CLOSED.** If `config gc` cannot read the listing
+   exactly (missing field), classify a root, validate a referenced key, read a
+   `created_at`, or confirm the listing is complete, it aborts and deletes
+   **nothing**. An unreadable state must never fail open into deletion.
 
-5. **The operator's `--older-than` is the safety assertion.** The machine cannot
-   know when a pointer stopped being served; the operator can. A `--dry-run`
-   prints every key and age it would delete so that assertion is reviewable.
+5. **The operator's `--older-than` is the safety assertion, and it is REQUIRED
+   for `--yes`.** The machine cannot know when a pointer stopped being served;
+   the operator can. A destructive run must not guess it; a dry-run previews
+   every key and age so the assertion is reviewable.
 
-6. **Local eager pruning is safe and stays.** One file, read at Viceroy startup:
+6. **`config gc` requires no concurrent `config push`.** No CAS means it cannot
+   atomically observe-and-delete; the operator serialises it against pushes.
+
+7. **A delete failure is a non-zero exit.** All deletes are attempted; if any
+   fail, the command exits non-zero naming them, so automation can detect it.
+
+8. **Local eager pruning is safe and stays.** One file, read at Viceroy startup:
    no propagation window, no POPs.
 
 7. **Push failure semantics are unchanged.** Reclamation is never part of a
@@ -186,30 +197,51 @@ is **not a regression**, and it is the only safe automatic behaviour.
 ### `config gc` (`Adapter::gc_config_entries`)
 
 ```
-config gc --adapter fastly [--older-than <dur>] [--dry-run]
+config gc --adapter fastly [--older-than <dur>] [--yes]
 ```
 
-1. One `config-store-entry list --json`.
+Dry-run by default; deletes only with `--yes`.
+
+1. One `config-store-entry list --json`, parsed **fail-closed**: every entry
+   must carry string `item_key`, `item_value`, and `created_at`, or the whole
+   run aborts. A missing/empty field is never skipped or defaulted — skipping a
+   root would hide the chunks it references and get them deleted while live.
 2. Classify every non-chunk entry as a **root**; parse its value with
-   `prior_chunk_keys` → the chunk keys that root's pointer **references**. The
-   union over all roots is the **live** set. (The listing already carries
-   `item_value`, so this costs no extra `describe` calls.)
-3. Candidates = chunk entries **not** in the live set, whose `created_at` is
-   older than `--older-than`.
-4. Delete them.
+   `prior_chunk_keys` → the **canonical** chunk keys that root's pointer
+   references. The union over all roots is the **live** set. (The listing
+   already carries `item_value`, so this costs no extra `describe` calls.)
+3. **Completeness guard (fail closed).** Every live-referenced key MUST appear in
+   the listing. If one is absent, the listing is incomplete (e.g. paginated) or
+   the store is inconsistent — either way we cannot decide what is orphaned, so
+   we delete nothing.
+4. **Supersession-age guard (the sound clock).** For each root, the newest
+   `created_at` among its *live* chunks is when its current config went live —
+   the lower bound for when everything now orphaned under it was superseded. A
+   root's orphans are eligible only if that config has been live for at least
+   `--older-than`. (Directly defeats the design-3 counterexample: if B was
+   deployed seconds ago, the live generation is seconds old, so A's months-old
+   chunks are **not** eligible.) When a root's live value is *direct* (no live
+   chunks) or the root is gone, we fall back to the chunk's own `created_at`
+   under the operator's assertion.
+5. Candidates = canonical chunk entries not in the live set that clear the
+   age guard. Delete each with `--key --auto-yes` (never `--all`).
 
-**`--older-than` is the operator's safety assertion**: *"nothing created before
-this is still being served."* Only they can make it.
+**`--older-than` is the operator's safety assertion** — *"I have not changed
+this config within this window, and no push is running, so nothing POPs may
+still be serving is deleted."* Only the operator can make it, so:
 
-**It fails CLOSED.** If a root's value cannot be classified, or an entry's
-`created_at` cannot be read, `config gc` **aborts and deletes nothing** — an
-unreadable state must never fail open on a destructive path.
+- it is **REQUIRED for `--yes`** (a destructive run must not guess it);
+- a **dry-run without it** previews *every* orphan and its age (threshold 0) so
+  the operator can choose one from real data;
+- a **dry-run with it** previews exactly what `--yes` would delete.
 
-**A `--dry-run` prints every key it would delete, with its age**, so the
-assertion is reviewable before it is acted on.
+**Fails closed** on: an unreadable listing, an unclassifiable root, a
+non-canonical referenced key, an unreadable `created_at`, or an incomplete
+listing — all abort with nothing deleted.
 
-Only ever `--key` on delete; the subcommand also accepts `-a/--all`, which would
-wipe the store — never construct that flag.
+**Non-zero exit on delete failure.** Every delete is attempted; if any fail, the
+command returns a non-zero exit naming the failed keys, so automation detects
+it. A failed delete is inert (idempotent) — re-run to retry.
 
 ### Local is different, and eager pruning there is correct
 
@@ -223,11 +255,17 @@ The config value is last-writer-wins: the root is one entry and `update --upsert
 means the push whose pointer lands last defines the live config. Concurrent
 pushes are supported.
 
-Because a push **never deletes**, there is no push-time reclamation race to
-reason about at all. `config gc` is a separate, operator-timed action; it deletes
-only what no live pointer references and what the operator has asserted is old
-enough. Running it concurrently with a push is still the operator's call — the
-`--older-than` assertion is what makes it safe.
+Because a push **never deletes**, there is no push-time reclamation race.
+
+**`config gc` requires that no `config push` runs against the same store while it
+runs.** This is an explicit operational contract, not a nicety: Fastly offers no
+compare-and-swap, so `config gc` cannot atomically observe-and-delete. It lists
+once and deletes from that snapshot; a concurrent rollback that repoints the root
+to old content-addressed chunks *after* the listing would leave `config gc`
+deleting keys that are live again. The supersession-age and completeness guards
+shrink this window sharply but cannot close it without CAS the platform does not
+provide. The operator serialises `config gc` against pushes — the same party who
+supplies `--older-than` is the one who knows a deploy is not in flight.
 
 ## `prior_chunk_keys` helper (`chunked_config.rs`)
 
@@ -415,7 +453,11 @@ in the `cli.rs` test module.
 | File | Change |
 | --- | --- |
 | `crates/edgezero-adapter-fastly/src/chunked_config.rs` | `prior_chunk_keys` (validated, prefix-scoped) and `chunk_key_generation` (parses/validates a chunk key into its content address) + unit tests |
-| `crates/edgezero-adapter-fastly/src/cli.rs` (cloud) | `reject_reserved_root_keys`, `reject_duplicate_root_keys`, `expand_root`, `list_config_store_entries`, `parse_rfc3339_secs`, `reclaim_orphan_generations`, `delete_config_store_entry` (`--key --auto-yes`, never `--all`), `gc_grace_secs` / `unix_now_secs` |
+| `crates/edgezero-adapter-fastly/src/cli.rs` (push) | `reject_reserved_root_keys`, `reject_duplicate_root_keys`, `expand_root` — a cloud push writes only, reclaiming nothing |
+| `crates/edgezero-adapter-fastly/src/cli.rs` (`config gc`) | `gc_config_entries` → `gc_fastly_config_store`, `list_config_store_entries` (fail-closed field parsing), `chunk_key_generation_any`, `parse_rfc3339_secs`, `unix_now_secs`, `delete_config_store_entry` (`--key --auto-yes`, never `--all`) |
+| `crates/edgezero-adapter/src/registry.rs` | `Adapter::gc_config_entries` trait method (default `Err`) |
+| `crates/edgezero-cli/src/{args,config}.rs` | `ConfigGcArgs` (`--older-than` optional, required for `--yes`), `run_config_gc` |
+| `crates/edgezero-cli/src/templates/cli/src/main.rs.hbs` | generated CLI wires the `Gc` subcommand |
 | `crates/edgezero-adapter-fastly/src/cli.rs` (local) | `write_fastly_local_config_store` takes exact per-root keep-sets and prunes in the same rewrite; `local_contents_table` + best-effort dry-run counts |
 | `crates/edgezero-adapter-fastly/src/cli.rs` (diagnostics) | `redact_describe_response` + `redact_stderr` — diagnostics never echo a config payload |
 | `crates/edgezero-adapter-fastly/Cargo.toml` | `handlebars` dev-dependency (fake-`fastly` test shim) |

@@ -306,16 +306,28 @@ Listing the orphans before deletion:
 # Cloudflare
 wrangler kv key list --namespace-id=<id> --remote | jq -r '.[].name'
 
-# Fastly
-fastly config-store-entry list --store-id=<id> --json | jq -r '.[].key'
+# Fastly (the JSON field is `item_key`, not `key`)
+fastly config-store-entry list --store-id=<id> --json | jq -r '.[].item_key'
 
 # Spin
 sqlite3 .spin/sqlite_key_value.db "SELECT key FROM spin_key_value WHERE store='<id>'"
 ```
 
-A future `config gc --adapter <name>` will automate this; v1 is
-manual on the rationale that orphan cleanup is best done with operator
-oversight.
+For Fastly, `config gc` automates this safely — it derives the live set from the
+store and deletes only unreferenced chunk entries you have asserted are old
+enough:
+
+```sh
+# Preview every orphan and its age (dry-run by default):
+<app>-cli config gc --adapter fastly
+
+# Delete, asserting nothing changed in the last 7 days and no push is running:
+<app>-cli config gc --adapter fastly --older-than 7d --yes
+```
+
+`--older-than` is REQUIRED for `--yes` and is YOUR safety assertion; do not run
+`config gc` while a `config push` to the same store is in flight (Fastly has no
+compare-and-swap). Cloudflare/Spin orphan cleanup remains manual.
 
 ### Fastly chunk-pointer hygiene
 
@@ -325,11 +337,11 @@ under 8,000 characters, the old chunks remain in the store unreferenced
 
 ```sh
 fastly config-store-entry list --store-id=<id> --json \
-  | jq -r '.[].key | select(contains(".__edgezero_chunks."))'
+  | jq -r '.[].item_key | select(contains(".__edgezero_chunks."))'
 ```
 
-They're safe to delete via the same per-key delete command above.
-A future `config gc` will sweep them automatically.
+`config gc --adapter fastly` (shown above) reclaims these safely — it will only
+delete chunk keys no live pointer references.
 
 ## Troubleshooting
 

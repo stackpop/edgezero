@@ -109,11 +109,15 @@ pub struct ConfigGcArgs {
     /// Do not overlay `EDGEZERO__*` environment variables.
     #[arg(long)]
     pub no_env: bool,
-    /// Only reclaim entries older than this. YOUR SAFETY ASSERTION: nothing
-    /// created before this is still being served. Accepts `s`/`m`/`h`/`d`
-    /// suffixes (e.g. `7d`, `24h`, `90m`); a bare number means seconds.
-    #[arg(long, default_value = "7d")]
-    pub older_than: String,
+    /// Only reclaim entries older than this. This is YOUR SAFETY ASSERTION:
+    /// "I have not changed this config within this window, and no push is
+    /// running" — so nothing superseded more recently (which POPs may still
+    /// serve) is deleted. Accepts `s`/`m`/`h`/`d` suffixes (e.g. `7d`, `24h`,
+    /// `90m`); a bare number means seconds. REQUIRED for `--yes` (a destructive
+    /// run must not guess it); a dry-run without it previews with a wide
+    /// default.
+    #[arg(long)]
+    pub older_than: Option<String>,
     /// Override the config-store id (defaults to the manifest's).
     #[arg(long)]
     pub store: Option<String>,
@@ -129,7 +133,7 @@ impl Default for ConfigGcArgs {
             adapter: String::new(),
             manifest: PathBuf::from("edgezero.toml"),
             no_env: false,
-            older_than: "7d".to_owned(),
+            older_than: None,
             store: None,
             yes: false,
         }

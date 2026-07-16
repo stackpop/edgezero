@@ -291,7 +291,22 @@ pub fn run_config_push(_args: &ConfigPushArgs) -> Result<(), String> {
 /// state).
 #[inline]
 pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
-    let older_than_secs = parse_duration_secs(&args.older_than)?;
+    // A destructive run must not invent the operator's safety assertion.
+    let older_than_secs = match (args.yes, args.older_than.as_deref()) {
+        (true, None) => {
+            return Err(
+                "`config gc --yes` requires an explicit `--older-than <dur>`: a destructive run \
+                 must not guess it. It asserts you have not changed this config within that window \
+                 (and that no push is running), so nothing POPs may still be serving is deleted. \
+                 Run without `--yes` first to preview every orphan and its age."
+                    .to_owned(),
+            );
+        }
+        (_, Some(raw)) => parse_duration_secs(raw)?,
+        // Dry-run with no threshold: preview EVERY orphan (age >= 0) with ages,
+        // so the operator can choose `--older-than` from real data.
+        (false, None) => 0,
+    };
 
     // Manifest-only resolution. Unlike `push`/`diff`, `gc` reclaims by
     // inspecting the STORE, so it must NOT require the typed app-config file to
@@ -352,10 +367,14 @@ pub fn run_config_gc(args: &ConfigGcArgs) -> Result<(), String> {
         log::info!("[edgezero] {line}");
     }
     if dry_run {
-        log::info!(
-            "[edgezero] dry-run (no --yes): nothing was deleted. `--older-than {}` asserts that nothing created before then is still being served.",
-            args.older_than
-        );
+        match args.older_than.as_deref() {
+            Some(dur) => log::info!(
+                "[edgezero] dry-run (no --yes): nothing was deleted. Re-run with `--yes` to apply. `--older-than {dur}` asserts you have not changed this config within that window and no push is running."
+            ),
+            None => log::info!(
+                "[edgezero] dry-run (no --yes): previewing ALL orphans and their ages. Choose `--older-than <dur>` larger than the time since your last config change, then re-run with `--yes`."
+            ),
+        }
     }
     Ok(())
 }
@@ -1727,6 +1746,45 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    // ---------- config gc argument gating ----------
+
+    /// A destructive `config gc --yes` MUST NOT invent the safety assertion: it
+    /// requires an explicit `--older-than`. The check runs before any manifest
+    /// or store access, so it is testable in isolation.
+    #[test]
+    fn config_gc_yes_requires_explicit_older_than() {
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            yes: true,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        let err = run_config_gc(&args).expect_err("--yes without --older-than must be rejected");
+        assert!(
+            err.contains("requires an explicit"),
+            "must explain the requirement: {err}"
+        );
+    }
+
+    /// A dry-run (no `--yes`) is allowed without `--older-than`; it fails later,
+    /// only because the fixture manifest/adapter is absent — NOT on the
+    /// threshold gate. (Proves the gate does not fire for a dry-run.)
+    #[test]
+    fn config_gc_dry_run_allows_missing_older_than() {
+        let args = ConfigGcArgs {
+            adapter: "fastly".to_owned(),
+            manifest: PathBuf::from("does-not-exist.toml"),
+            yes: false,
+            older_than: None,
+            ..ConfigGcArgs::default()
+        };
+        let err = run_config_gc(&args).expect_err("no manifest here");
+        assert!(
+            !err.contains("requires an explicit"),
+            "the threshold gate must not fire for a dry-run: {err}"
+        );
+    }
 
     // ---------- shared fixtures ----------
 

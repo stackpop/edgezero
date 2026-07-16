@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
@@ -144,6 +144,17 @@ enum ConfigStoreLookup {
     Found(String),
     NotFound,
     SchemaDrift(String),
+}
+
+/// The reclamation plan for `config gc`: the orphan chunk entries to delete
+/// (with their ages) plus the counts for the summary line. Produced by
+/// `plan_gc_reclamation` (which owns every safety guard); consumed by
+/// `gc_fastly_config_store` (which reports and deletes).
+struct GcPlan {
+    doomed: Vec<(String, u64)>,
+    live_count: usize,
+    retained_recent: usize,
+    roots: usize,
 }
 
 /// One `config-store-entry list` item.
@@ -1335,23 +1346,30 @@ fn list_config_store_entries(store_id: &str) -> Result<Vec<ConfigStoreItem>, Str
                 redact_describe_response(&stdout)
             )
         })?;
+    // FAIL CLOSED on any malformed entry. A missing/non-string field on a
+    // reclamation input must NEVER be silently skipped or defaulted to empty:
+    // skipping a root hides the chunks it references (they'd look orphaned and
+    // get deleted while live), and an empty `item_value` makes a real root
+    // parse as "references nothing" — same catastrophe. If we can't read the
+    // listing exactly, we delete nothing.
     let mut items = Vec::with_capacity(array.len());
-    for entry in array {
-        let Some(item_key) = entry.get("item_key").and_then(serde_json::Value::as_str) else {
-            continue;
+    for (idx, entry) in array.iter().enumerate() {
+        let field = |name: &str| -> Result<String, String> {
+            entry
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    format!(
+                        "`fastly config-store-entry list` entry #{idx} is missing a string `{name}` \
+                         field; refusing to reclaim on an unreadable listing (nothing deleted)"
+                    )
+                })
         };
-        let created_at = entry
-            .get("created_at")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let item_value = entry
-            .get("item_value")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
         items.push(ConfigStoreItem {
-            created_at: created_at.to_owned(),
-            item_key: item_key.to_owned(),
-            item_value: item_value.to_owned(),
+            created_at: field("created_at")?,
+            item_key: field("item_key")?,
+            item_value: field("item_value")?,
         });
     }
     Ok(items)
@@ -1380,13 +1398,78 @@ fn gc_fastly_config_store(
 ) -> Result<Vec<String>, String> {
     let resolved_id = resolve_remote_config_store_id(store_name)?;
     let items = list_config_store_entries(&resolved_id)?;
-    let now = unix_now_secs();
+    let plan = plan_gc_reclamation(&items, unix_now_secs(), older_than_secs)?;
+    let GcPlan {
+        doomed,
+        live_count,
+        retained_recent,
+        roots,
+    } = plan;
 
+    let mut out = vec![format!(
+        "fastly config-store `{store_name}` (id={resolved_id}): {} entries, {roots} root(s), {live_count} live chunk(s), {} orphan(s) older than {older_than_secs}s, {retained_recent} orphan(s) too recent",
+        items.len(),
+        doomed.len(),
+    )];
+    if doomed.is_empty() {
+        out.push("nothing to reclaim".to_owned());
+        return Ok(out);
+    }
+    for (key, age) in &doomed {
+        let verb = if dry_run { "would delete" } else { "deleting" };
+        out.push(format!("  {verb} `{key}` (age {age}s)"));
+    }
+    if dry_run {
+        out.push(format!(
+            "dry-run: {} orphan chunk(s) would be deleted; re-run with --yes to apply",
+            doomed.len()
+        ));
+        return Ok(out);
+    }
+    let mut deleted = 0_usize;
+    let mut failed: Vec<String> = Vec::new();
+    for (key, _) in &doomed {
+        match delete_config_store_entry(&resolved_id, key) {
+            Ok(()) => deleted = deleted.saturating_add(1),
+            Err(err) => {
+                out.push(format!("  FAILED to delete `{key}` ({err})"));
+                failed.push(key.clone());
+            }
+        }
+    }
+    out.push(format!(
+        "reclaimed {deleted} of {} orphan chunk entries",
+        doomed.len()
+    ));
+    if failed.is_empty() {
+        Ok(out)
+    } else {
+        // Partial/total failure must be a non-zero exit so automation can see it.
+        // Continue-then-fail: we attempted every delete first.
+        Err(format!(
+            "{}\nconfig gc: {} of {} deletes FAILED ({}); re-run to retry",
+            out.join("\n"),
+            failed.len(),
+            doomed.len(),
+            failed.join(", ")
+        ))
+    }
+}
+
+/// The reclamation plan for one store: which orphan chunk entries to delete, and
+/// the counts for the summary line. Deriving it is where every safety guard
+/// lives, so it is fail-closed throughout — any unreadable/incomplete state
+/// returns `Err` and the caller deletes nothing.
+fn plan_gc_reclamation(
+    items: &[ConfigStoreItem],
+    now: u64,
+    older_than_secs: u64,
+) -> Result<GcPlan, String> {
     // LIVE chunk keys = those named by any root pointer currently in the store.
     // A root is any entry that is not itself a chunk key.
     let mut live: HashSet<String> = HashSet::new();
     let mut roots = 0_usize;
-    for item in &items {
+    for item in items {
         if chunk_key_generation_any(&item.item_key).is_some() {
             continue; // a chunk, not a root
         }
@@ -1404,65 +1487,90 @@ fn gc_fastly_config_store(
         }
     }
 
-    // Candidates: chunk entries not referenced by any live pointer, older than
-    // the operator's threshold.
+    // COMPLETENESS GUARD (fail closed). Every chunk key a LIVE pointer
+    // references MUST appear in the listing. If one is missing, the listing is
+    // incomplete -- e.g. `config-store-entry list` paginated and we only saw a
+    // page, so a root we DIDN'T see could reference a chunk we're about to
+    // delete -- or the store is already inconsistent. Either way we cannot
+    // safely decide what is orphaned, so we delete nothing. (Since a store with
+    // many roots has many live chunks, any real truncation almost certainly
+    // drops one and trips this, which is why it also guards the harder
+    // missing-root case in practice.)
+    let mut created_by_key: HashMap<&str, u64> = HashMap::with_capacity(items.len());
+    for item in items {
+        let Some(created) = parse_rfc3339_secs(&item.created_at) else {
+            // Unparseable timestamp anywhere in the listing -> fail closed. On a
+            // DELETE path we will not guess an age.
+            return Err(format!(
+                "refusing to reclaim: entry `{}` has an unreadable `created_at`; nothing was deleted",
+                item.item_key
+            ));
+        };
+        created_by_key.insert(item.item_key.as_str(), created);
+    }
+    if let Some(key) = live
+        .iter()
+        .find(|key| !created_by_key.contains_key(key.as_str()))
+    {
+        return Err(format!(
+            "refusing to reclaim: a live pointer references `{key}`, which is absent from the \
+             store listing (the listing may be incomplete/paginated, or the store is already \
+             inconsistent); nothing was deleted"
+        ));
+    }
+
+    // When did each root's CURRENT config go live? = the newest creation time
+    // among its live chunks. This is the sound supersession lower bound: the
+    // live pointer replaced whatever was there, so everything now orphaned under
+    // that root was superseded no later than this. If the config went live less
+    // than `older_than_secs` ago, a recently-superseded generation may still be
+    // at POPs even if its chunks are old -> we must NOT delete that root's
+    // orphans. (Directly closes the "A superseded seconds ago, chunks months
+    // old" case.)
+    let root_live_since: HashMap<&str, u64> = live.iter().fold(HashMap::new(), |mut acc, key| {
+        if let Some((root, _)) = key.split_once(CHUNK_KEY_INFIX) {
+            let created = *created_by_key.get(key.as_str()).unwrap_or(&0);
+            let slot = acc.entry(root).or_insert(0);
+            *slot = (*slot).max(created);
+        }
+        acc
+    });
+
+    // Candidates: canonical chunk entries not referenced by any live pointer,
+    // whose root's config has been stable at least the operator's window.
     let mut doomed: Vec<(String, u64)> = Vec::new();
     let mut retained_recent = 0_usize;
-    for item in &items {
+    for item in items {
         if chunk_key_generation_any(&item.item_key).is_none() {
             continue;
         }
         if live.contains(&item.item_key) {
             continue;
         }
-        let Some(created) = parse_rfc3339_secs(&item.created_at) else {
-            // Unparseable timestamp on a DELETE path -> fail closed.
-            return Err(format!(
-                "refusing to reclaim: entry `{}` has an unreadable `created_at`; nothing was deleted",
-                item.item_key
-            ));
-        };
+        let created = *created_by_key.get(item.item_key.as_str()).unwrap_or(&0);
         let age = now.saturating_sub(created);
-        if age < older_than_secs {
+        // Prefer the root's live-config age (sound). Fall back to the chunk's
+        // own age only when the root has no live chunked generation (its live
+        // value is direct, or the root is gone) -- there the operator's
+        // `--older-than` assertion is the only signal.
+        let reference_age = item
+            .item_key
+            .split_once(CHUNK_KEY_INFIX)
+            .and_then(|(root, _)| root_live_since.get(root))
+            .map_or(age, |live_since| now.saturating_sub(*live_since));
+        if reference_age < older_than_secs {
             retained_recent = retained_recent.saturating_add(1);
             continue;
         }
         doomed.push((item.item_key.clone(), age));
     }
 
-    let mut out = vec![format!(
-        "fastly config-store `{store_name}` (id={resolved_id}): {} entries, {roots} root(s), {} live chunk(s), {} orphan(s) older than {older_than_secs}s, {retained_recent} orphan(s) too recent",
-        items.len(),
-        live.len(),
-        doomed.len(),
-    )];
-    if doomed.is_empty() {
-        out.push("nothing to reclaim".to_owned());
-        return Ok(out);
-    }
-    for (key, age) in &doomed {
-        let verb = if dry_run { "would delete" } else { "deleting" };
-        out.push(format!("  {verb} `{key}` (age {age}s)"));
-    }
-    if dry_run {
-        out.push(format!(
-            "dry-run: {} orphan chunk(s) would be deleted; re-run without --dry-run to apply",
-            doomed.len()
-        ));
-        return Ok(out);
-    }
-    let mut deleted = 0_usize;
-    for (key, _) in &doomed {
-        match delete_config_store_entry(&resolved_id, key) {
-            Ok(()) => deleted = deleted.saturating_add(1),
-            Err(err) => out.push(format!("  warning: could not delete `{key}` ({err})")),
-        }
-    }
-    out.push(format!(
-        "reclaimed {deleted} of {} orphan chunk entries",
-        doomed.len()
-    ));
-    Ok(out)
+    Ok(GcPlan {
+        doomed,
+        live_count: live.len(),
+        retained_recent,
+        roots,
+    })
 }
 
 /// Is this key a chunk key of ANY root? (`config gc` scans the whole store, so
@@ -3528,70 +3636,49 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// Same for the push path's GC prior-read, which runs on every cloud push.
+    /// `config gc` reads `item_value` for every entry (to classify roots). A
+    /// malformed listing whose values carry secrets must fail closed WITHOUT
+    /// echoing any value. (Replaces the old push prior-read redaction tests,
+    /// which are now vacuous: a cloud push performs no pre-commit read.)
     #[cfg(unix)]
     #[test]
-    fn push_config_entries_stderr_failure_does_not_leak_payload() {
-        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
-        const SENTINEL: &str = "SUPER_SECRET_TOKEN_stderr2";
+    fn gc_list_failure_does_not_leak_payload() {
+        const SENTINEL: &str = "SUPER_SECRET_TOKEN_gc_list";
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
-        let stderr = format!("Error: internal failure processing value {SENTINEL}");
-        let fake = fake_fastly_returning("", &stderr, 1);
-        let _path = PathPrepend::new(fake.path());
 
-        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        let result = FastlyCliAdapter.push_config_entries(
-            dir.path(),
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let good = entry_list_json(&listing);
+        // A valid entry whose VALUE contains the sentinel, plus a malformed
+        // sibling (no created_at) to trip the fail-closed path.
+        let mut array: serde_json::Value = serde_json::from_str(&good).unwrap();
+        let arr = array.as_array_mut().unwrap();
+        arr.push(serde_json::json!({
+            "item_key": "some.__edgezero_chunks.deadbeef.0",
+            "item_value": SENTINEL,
+        }));
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
             None,
-            None,
-            &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-            &[(TEST_CONFIG_ID.to_owned(), envelope)],
-            &AdapterPushContext::new(),
             false,
+            &dir.path().join("ops.log"),
         );
-        // Whether it errors or warns, the payload must never appear.
-        let rendered = match result {
-            Ok(lines) => lines.join("\n"),
-            Err(err) => err,
-        };
-        assert!(
-            !rendered.contains(SENTINEL),
-            "push output must not echo the stored value from stderr: {rendered}"
-        );
-    }
-
-    /// The GC prior-read runs on EVERY cloud push, so a drifted response must
-    /// not leak the previous config envelope into the push's status lines.
-    #[cfg(unix)]
-    #[test]
-    fn push_config_entries_prior_read_drift_does_not_leak_payload() {
-        use crate::chunked_config::FASTLY_CONFIG_ENTRY_LIMIT;
-        const SENTINEL: &str = "SUPER_SECRET_TOKEN_xyz789";
-        let _lock = path_mutation_guard().lock().expect("guard");
-        let dir = tempdir().expect("tempdir");
-        let drift = format!(r#"{{"value_moved_here":"{SENTINEL}"}}"#);
-        let fake = fake_fastly_returning(&drift, "", 0);
+        fs::write(
+            fake.path().join("entries.json"),
+            serde_json::to_string(&array).unwrap(),
+        )
+        .expect("overwrite entries");
         let _path = PathPrepend::new(fake.path());
 
-        let envelope = make_test_envelope(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
-        let out = FastlyCliAdapter
-            .push_config_entries(
-                dir.path(),
-                None,
-                None,
-                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
-                &[(TEST_CONFIG_ID.to_owned(), envelope)],
-                &AdapterPushContext::new(),
-                false,
-            )
-            .expect("push still succeeds; the prior read only warns");
-        for line in &out {
-            assert!(
-                !line.contains(SENTINEL),
-                "push status must not leak the prior config payload: {line}"
-            );
-        }
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            !err.contains(SENTINEL),
+            "the fail-closed error must not echo a stored value: {err}"
+        );
     }
 
     #[cfg(unix)]
@@ -4336,14 +4423,16 @@ echo 'unexpected' >&2; exit 1
         let (live_chunks, _) = chunked_parts(TEST_CONFIG_ID, &live);
         let (dead_chunks, _) = chunked_parts(TEST_CONFIG_ID, &dead);
 
-        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 3_600)];
-        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 3_600));
+        // The live config has been stable for 2 days; the operator asserts a 1-day
+        // window. So everything superseded (<= when live went live, i.e. >= 2
+        // days ago) is safely reclaimable.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
         listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800)); // a week old
 
         let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
 
-        // Operator asserts: nothing older than 1 day is still being served.
         let out = run_gc(dir.path(), 86_400, false).expect("gc succeeds");
         for key in &dead_chunks {
             assert!(
@@ -4359,31 +4448,38 @@ echo 'unexpected' >&2; exit 1
         }
     }
 
-    /// Orphans younger than the operator's threshold are retained.
+    /// THE soundness test (PR #314 review, design-3 counterexample): a root whose
+    /// current config was deployed seconds ago must NOT have its prior generation
+    /// reclaimed, even if that generation's chunks are ANCIENT. The clock is the
+    /// live config's age, not the orphan chunk's own creation time.
     #[cfg(unix)]
     #[test]
-    fn gc_retains_orphans_younger_than_threshold() {
+    fn gc_protects_recently_superseded_generation_with_old_chunks() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
 
         let live = gen_envelope("live");
-        let recent = gen_envelope("recent");
-        let (recent_chunks, _) = chunked_parts(TEST_CONFIG_ID, &recent);
+        let prior = gen_envelope("prior");
+        let (prior_chunks, _) = chunked_parts(TEST_CONFIG_ID, &prior);
 
-        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 60)];
-        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 60));
-        listing.extend(listed_generation(TEST_CONFIG_ID, &recent, 120)); // 2 min old
+        // Live config went live 30s ago; the prior generation's chunks are a year
+        // old but were superseded only 30s ago -> POPs may still serve them.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 30)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 30));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &prior, 31_536_000)); // ~1 year
 
         let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
         let _path = PathPrepend::new(fake.path());
 
+        // Even a generous 1-day threshold must NOT delete the prior generation,
+        // because the live config has only been stable for 30 seconds.
         run_gc(dir.path(), 86_400, false).expect("gc succeeds");
         let log = fs::read_to_string(&oplog).unwrap_or_default();
-        for key in &recent_chunks {
+        for key in &prior_chunks {
             assert!(
                 !oplog_has(&oplog, &format!("delete {key}")),
-                "orphan `{key}` is younger than the threshold and must be retained; log:\n{log}"
+                "a generation superseded 30s ago must be retained despite old chunks: `{key}`; log:\n{log}"
             );
         }
     }
@@ -4400,8 +4496,8 @@ echo 'unexpected' >&2; exit 1
         let dead = gen_envelope("dead");
         let (dead_chunks, _) = chunked_parts(TEST_CONFIG_ID, &dead);
 
-        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 3_600)];
-        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 3_600));
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
         listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
 
         let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
@@ -4484,6 +4580,154 @@ echo 'unexpected' >&2; exit 1
             !log.lines().any(|line| line.starts_with("delete ")),
             "nothing may be deleted when a root is unclassifiable; log:\n{log}"
         );
+    }
+
+    /// A listing entry missing a required field fails CLOSED — a defaulted/empty
+    /// field could make a real root look like it references nothing, deleting
+    /// live chunks.
+    #[cfg(unix)]
+    #[test]
+    fn gc_fails_closed_on_malformed_listing_entry() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let good = entry_list_json(&listing);
+        // Inject an entry with NO item_value (drop that field entirely).
+        let mut array: serde_json::Value = serde_json::from_str(&good).unwrap();
+        array.as_array_mut().unwrap().push(serde_json::json!({
+            "item_key": "some.__edgezero_chunks.deadbeef.0",
+            "created_at": stamp_secs_ago(1000),
+        }));
+        // Serve that hand-built listing.
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        fs::write(
+            fake.path().join("entries.json"),
+            serde_json::to_string(&array).unwrap(),
+        )
+        .expect("overwrite entries");
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("must fail closed");
+        assert!(
+            err.contains("missing a string") && err.contains("item_value"),
+            "must name the missing field: {err}"
+        );
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("delete ")),
+            "nothing may be deleted on a malformed listing; log:\n{log}"
+        );
+    }
+
+    /// A failed delete is a non-zero exit that names the failed key(s), so
+    /// automation can detect partial failure.
+    #[cfg(unix)]
+    #[test]
+    fn gc_delete_failure_is_non_zero_exit() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let (dead_chunks, _) = chunked_parts(TEST_CONFIG_ID, &dead);
+        let fail_key = dead_chunks.first().expect("a chunk").clone();
+
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(
+            TEST_CONFIG_ID,
+            &[],
+            &listing,
+            Some(&fail_key),
+            false,
+            &oplog,
+        );
+        let _path = PathPrepend::new(fake.path());
+
+        let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete must be non-zero");
+        assert!(
+            err.contains("deletes FAILED") && err.contains(&fail_key),
+            "error names the failed key: {err}"
+        );
+    }
+
+    /// Every reclamation delete passes `--key` + `--auto-yes` and NEVER `--all`.
+    #[cfg(unix)]
+    #[test]
+    fn gc_delete_uses_key_and_auto_yes_never_all() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        listing.extend(listed_generation(TEST_CONFIG_ID, &dead, 604_800));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        let argv_lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.starts_with("delete-argv "))
+            .collect();
+        assert!(!argv_lines.is_empty(), "a delete happened: {log}");
+        for line in argv_lines {
+            assert!(
+                line.contains("--auto-yes"),
+                "delete passes --auto-yes: {line}"
+            );
+            assert!(line.contains("--key="), "delete targets a --key: {line}");
+            assert!(
+                !line.contains("--all"),
+                "delete must NEVER pass --all: {line}"
+            );
+        }
+    }
+
+    /// A non-canonical chunk-like key (short/uppercase SHA, leading-zero index)
+    /// is NOT a delete candidate — the destructive validator is canonical-only.
+    #[cfg(unix)]
+    #[test]
+    fn gc_never_deletes_non_canonical_keys() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        // Foreign-shaped keys under the reserved infix but not canonical.
+        let noncanonical = [
+            format!("{TEST_CONFIG_ID}.__edgezero_chunks.abc123.0"), // short sha
+            format!("{TEST_CONFIG_ID}.__edgezero_chunks.{}.00", "a".repeat(64)), // leading-zero idx
+            format!("{TEST_CONFIG_ID}.__edgezero_chunks.{}.0", "A".repeat(64)), // uppercase
+        ];
+        for key in &noncanonical {
+            listing.push((key.clone(), stamp_secs_ago(604_800), "X".to_owned()));
+        }
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &noncanonical {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a non-canonical key must never be deleted: `{key}`; log:\n{log}"
+            );
+        }
     }
 
     // ---------- local chunk GC ----------

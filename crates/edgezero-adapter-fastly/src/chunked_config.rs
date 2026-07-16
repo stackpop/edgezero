@@ -347,13 +347,15 @@ pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>,
         ));
     }
 
-    // 3. Prefix-scope every referenced key to this root's own namespace.
-    let prefix = format!("{root_key}{CHUNK_KEY_INFIX}");
+    // 3. Every referenced key must be a CANONICAL chunk key of this root — the
+    //    same validator that gates deletion. These keys are pruned locally and
+    //    protected as "live" in the cloud, so a non-canonical or foreign key is
+    //    a hard error, not a silently-kept key.
     let mut keys = Vec::with_capacity(pointer.chunks.len());
     for chunk_ref in pointer.chunks {
-        if !chunk_ref.key.starts_with(&prefix) {
+        if chunk_key_generation(root_key, &chunk_ref.key).is_none() {
             return Err(format!(
-                "prior chunk pointer at `{root_key}` references chunk key `{}` outside expected prefix `{prefix}`; skipping chunk GC",
+                "prior chunk pointer at `{root_key}` references a non-canonical chunk key `{}`; skipping chunk GC",
                 chunk_ref.key
             ));
         }
@@ -371,16 +373,41 @@ pub(crate) fn prior_chunk_keys(root_key: &str, raw: &str) -> Result<Vec<String>,
 /// than trusting it: a hand-edited or foreign key never becomes a delete target.
 #[cfg(any(feature = "cli", test))]
 pub(crate) fn chunk_key_generation(root_key: &str, key: &str) -> Option<String> {
+    if root_key.is_empty() {
+        return None;
+    }
     let prefix = format!("{root_key}{CHUNK_KEY_INFIX}");
     let rest = key.strip_prefix(&prefix)?;
     let (sha, index) = rest.rsplit_once('.')?;
-    if sha.is_empty() || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return None;
-    }
-    if index.is_empty() || !index.chars().all(|ch| ch.is_ascii_digit()) {
+    // Canonical shape ONLY — this gates a destructive delete, so it must match
+    // exactly what `prepare_fastly_config_entries` emits and nothing else:
+    // - a 64-char LOWERCASE hex SHA-256 (`format!("{:x}", Sha256::digest(..))`),
+    // - a canonical decimal index (no leading zeros; `usize` `Display`).
+    // Anything else (short/uppercase hash, `00`, `007`) is foreign or
+    // hand-edited and must never become a delete candidate.
+    if !is_canonical_sha256_hex(sha) || !is_canonical_index(index) {
         return None;
     }
     Some(sha.to_owned())
+}
+
+/// Exactly 64 lowercase hex characters.
+#[cfg(any(feature = "cli", test))]
+fn is_canonical_sha256_hex(sha: &str) -> bool {
+    sha.len() == 64
+        && sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A canonical decimal index: all ASCII digits, and no leading zero unless the
+/// value is exactly `0`.
+#[cfg(any(feature = "cli", test))]
+fn is_canonical_index(index: &str) -> bool {
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    index == "0" || !index.starts_with('0')
 }
 
 // ---------------------------------------------------------------------------
@@ -808,10 +835,10 @@ mod tests {
         let raw = serde_json::to_string(&pointer).unwrap();
 
         let err = prior_chunk_keys("app_config", &raw).expect_err("foreign chunk should warn");
-        assert!(err.contains("outside"), "{err}");
+        assert!(err.contains("non-canonical"), "{err}");
     }
 
-    // ---- chunk_key_generation ----
+    // ---- chunk_key_generation (canonical only) ----
 
     #[test]
     fn chunk_key_generation_extracts_the_sha() {
@@ -819,28 +846,53 @@ mod tests {
         let entries = prepare_fastly_config_entries("app_config", &envelope).unwrap();
         let (chunk_key, _) = &entries[0];
         let sha = chunk_key_generation("app_config", chunk_key).expect("a chunk key");
-        assert_eq!(sha.len(), 64, "sha256 hex");
+        assert_eq!(sha.len(), 64, "64-char sha256 hex");
         assert!(chunk_key.contains(&sha));
     }
 
     #[test]
-    fn chunk_key_generation_rejects_foreign_and_malformed_keys() {
-        // Different root.
-        assert!(chunk_key_generation("app_config", "other.__edgezero_chunks.abc123.0").is_none());
-        // The root key itself.
+    fn chunk_key_generation_requires_canonical_shape() {
+        let good = "a".repeat(64);
+        let base = format!("app_config.__edgezero_chunks.{good}");
+        // Canonical.
+        assert!(chunk_key_generation("app_config", &format!("{base}.0")).is_some());
+        assert!(chunk_key_generation("app_config", &format!("{base}.17")).is_some());
+
+        // Different root / the root itself.
+        assert!(
+            chunk_key_generation("app_config", &format!("other.__edgezero_chunks.{good}.0"))
+                .is_none()
+        );
         assert!(chunk_key_generation("app_config", "app_config").is_none());
-        // Non-hex content address.
+        // Empty root.
+        assert!(chunk_key_generation("", &format!(".__edgezero_chunks.{good}.0")).is_none());
+        // Short SHA (< 64).
         assert!(
-            chunk_key_generation("app_config", "app_config.__edgezero_chunks.zzzz.0").is_none()
+            chunk_key_generation("app_config", "app_config.__edgezero_chunks.abc123.0").is_none()
         );
-        // Non-numeric index.
+        // Uppercase SHA.
+        let upper = "A".repeat(64);
         assert!(
-            chunk_key_generation("app_config", "app_config.__edgezero_chunks.abc123.x").is_none()
+            chunk_key_generation(
+                "app_config",
+                &format!("app_config.__edgezero_chunks.{upper}.0")
+            )
+            .is_none()
         );
-        // Missing index.
+        // Non-hex SHA of the right length.
+        let nonhex = "z".repeat(64);
         assert!(
-            chunk_key_generation("app_config", "app_config.__edgezero_chunks.abc123").is_none()
+            chunk_key_generation(
+                "app_config",
+                &format!("app_config.__edgezero_chunks.{nonhex}.0")
+            )
+            .is_none()
         );
+        // Leading-zero / non-numeric / missing index.
+        assert!(chunk_key_generation("app_config", &format!("{base}.00")).is_none());
+        assert!(chunk_key_generation("app_config", &format!("{base}.007")).is_none());
+        assert!(chunk_key_generation("app_config", &format!("{base}.x")).is_none());
+        assert!(chunk_key_generation("app_config", &base).is_none());
     }
 
     // Regression for the Value-first rule: a value that IS pointer-kind but
