@@ -2324,10 +2324,16 @@ caveat (harvest-order false 504s) is **not** within this capability — that one
 `send-all-slot-isolation` (footnote 4), so each label means exactly one thing.
 
 ² Fastly has no guest primitive to preempt a stalled `stream.next().await` while feeding
-a streamed REQUEST body via `send_async_streaming` (§4.3). Once chunks start flowing,
-the host's `between-bytes-timeout` still bounds inter-chunk gaps, but a source stream
-that never yields the next chunk is unbounded on the guest side. This is `BestEffort` —
-no documented preemption bound — and is exposed as the separate
+a streamed REQUEST body via `send_async_streaming` (§4.3). **Both phases are unbounded
+on Fastly:** (a) the *source pull* — a source stream that never yields the next chunk
+cannot be preempted; and (b) the *host write* — `between_bytes_timeout` is documented as
+**receive-side only** (it bounds the gap between bytes *received from origin*) and does
+**not** bound guest-to-origin writes, so it gives no inter-chunk guarantee on the upload
+path. (An earlier draft of this footnote claimed `between-bytes-timeout` still bounds
+upload inter-chunk gaps — that is wrong; §4.3 and §8 risk 7 are correct.) The only
+adapter-side bound is the cooperative `budget.deadline.is_expired()` check **between**
+chunks. This is `BestEffort` — no documented preemption bound — and is exposed as the
+separate
 `streamed-upload-deadlines` capability so apps that need real-time enforcement on this
 specific path declare it required and get a hard build failure on Fastly per §3.5.3.
 Apps that buffer their request bodies before calling `send` are unaffected — buffered
@@ -2491,41 +2497,73 @@ gate must therefore branch on the action, not gate unconditionally).
 > means "the shared gated operation behind both the typed and bundled entry points."
 
 ```rust
-// 1. crates/edgezero-cli/src/adapter.rs — first statement of execute(..)
+// 1. crates/edgezero-cli/src/adapter.rs — inside execute(..), BEFORE manifest_command
+//    and BEFORE the registry lookup. NOT unconditional: auth is EXEMPT (credential
+//    class), so the gate branches on the action.
 pub fn execute(
     adapter_name: &str,
     action: Action,
     manifest_loader: Option<&ManifestLoader>,
     adapter_args: &[String],
 ) -> Result<(), String> {
-    ensure_capabilities(adapter_name, manifest_loader)?;   // ← gate site 1
+    // Runtime-producing actions only. Auth* is exempt — a runtime capability
+    // mismatch must never block credential login/logout/status.
+    if matches!(action, Action::Build | Action::Serve | Action::Deploy) {
+        ensure_capabilities(adapter_name, manifest_loader.map(|l| l.manifest()))?;  // site 1
+    }
     // …existing shell-command / registry dispatch follows…
 }
 
-// 2–5. Sibling gates on the PR-#269 entry points that don't flow through execute(..):
+// 2. crates/edgezero-cli/src/provision.rs
 pub fn run_provision(args: &ProvisionArgs) -> Result<(), String> {
-    ensure_capabilities(&args.adapter, args.manifest_loader())?;        // ← site 2
+    ensure_capabilities(&args.adapter, load_manifest(args)?.as_ref())?;             // site 2
     // …existing provision dispatch follows…
 }
-pub fn run_config_push(args: &ConfigPushArgs) -> Result<(), String> {
-    ensure_capabilities(&args.adapter, args.manifest_loader())?;        // ← site 3
-    /* … */
+
+// 3. crates/edgezero-cli/src/config.rs — gate the TYPED path (the bundled
+//    `run_config_push` is a v1 stub that returns Err; gating it enforces nothing).
+pub fn run_config_push_typed<C>(args: &ConfigPushArgs) -> Result<(), String>
+where C: DeserializeOwned + Serialize + Validate + AppConfigMeta {
+    ensure_capabilities(&args.adapter, load_manifest(args)?.as_ref())?;             // site 3
+    /* …existing typed push… */
+}
+
+// 4. config validate is ADAPTER-LESS: `ConfigValidateArgs` has NO `adapter` field.
+//    It validates against EVERY adapter declared in [adapters]. Both public entries
+//    (bundled + typed) must route through ONE shared gated op, or the typed path —
+//    which generated CLIs call directly — silently skips enforcement.
+fn gated_validate(ctx: &ValidationContext) -> Result<(), String> {
+    for adapter_name in ctx.manifest().configured_adapter_names() {
+        ensure_capabilities(adapter_name, Some(ctx.manifest()))?;                   // site 4
+    }
+    do_validation_work(ctx)
 }
 pub fn run_config_validate(args: &ConfigValidateArgs) -> Result<(), String> {
-    ensure_capabilities(&args.adapter, args.manifest_loader())?;        // ← site 4
-    /* … */
+    gated_validate(&load_validation_context(args)?)
 }
+pub fn run_config_validate_typed<C>(args: &ConfigValidateArgs) -> Result<(), String>
+where C: DeserializeOwned + Serialize + Validate + AppConfigMeta {
+    gated_validate(&load_validation_context(args)?)?;   // SAME shared gate
+    /* …typed-specific validation… */
+    Ok(())
+}
+
+// 5. crates/edgezero-cli/src/demo_server.rs — no manifest FILE exists; read the
+//    manifest baked in by `app!` (Hooks::manifest()).
 #[cfg(feature = "demo-example")]
 pub fn run_demo() -> Result<(), String> {
-    ensure_capabilities("axum", manifest_loader())?;                    // ← site 5
+    ensure_capabilities("axum", <App as Hooks>::manifest())?;                       // site 5
     /* …Axum runner… */
 }
+
+// NOT A GATE SITE — `config diff` is read-only (diagnostic class) and EXEMPT.
+// pub fn run_config_diff_typed<C>(..) { /* no ensure_capabilities */ }
 ```
 
-`run_demo` is feature-gated (`demo-example`) and always selects Axum implicitly,
-so its gate is a sibling that hardcodes the adapter name rather than reading it
-from args. Sites 1–5 are exhaustive: every PR-#269 command that selects an
-adapter enters through one of them.
+`run_demo` is feature-gated (`demo-example`) and always selects Axum implicitly, so its
+gate hardcodes the adapter name and reads the **baked** manifest rather than a file.
+Sites 1–5 are exhaustive **for the gated classes**; `config diff` and `auth *` are
+deliberately absent (§3.5.3 command-class table).
 
 `ensure_capabilities` itself reads from the **registry** (not from `Adapter::execute`)
 because capability metadata is the trait fact `capability(Capability) ->
@@ -3181,9 +3219,12 @@ async fn send_all(
   semantics: the SDK signals only "this name is taken in this session," and its
   documented recovery (`Backend::from_str(name)`) returns a handle without
   exposing the registered properties. EdgeZero therefore owns the entire
-  uniqueness story **at the guest layer**: an adapter-local cache
-  (`Mutex<HashMap<String, (BackendIdentity, Backend)>>` on
-  `FastlyOutboundClient`) holds the identity → backend mapping, and a hit
+  uniqueness story **at the guest layer**: a **session-scoped** adapter-local cache
+  (a `thread_local!` `RefCell<HashMap<String, (BackendIdentity, Backend)>>` — **not**
+  a field on `FastlyOutboundClient`, which is rebuilt per inbound request while
+  backend names are session-global; see *Cache ownership* below for the full
+  rationale and the no-`Mutex` single-threaded-guest model) holds the identity →
+  backend mapping, and a hit
   reuses the cached `Backend` while a miss calls `Backend::builder(..).finish()`
   exactly once. Because EdgeZero hashes every relevant property into the
   backend name (`ez_{sha256_128(identity)}`), distinct identities map to
@@ -3318,13 +3359,39 @@ async fn send_all(
   absolute-deadline enforcement on the dispatch+headers phase target a different
   adapter (Axum/CF/Spin all use `budget.deadline.remaining()` at arming time —
   see §4.1 / §4.2 / §4.4 step 3). **Collision detection** is
-  belt-and-suspenders. The collision-detection map lives on the
-  `FastlyOutboundClient` itself, not per call. Because `OutboundHttpClient` methods
-  take `&self` and the trait is `Send + Sync`, the field is
-  `Mutex<HashMap<String, (BackendIdentity, Backend)>>` — interior mutability with
-  thread-safe access. The simplest race-free protocol:
+  belt-and-suspenders.
 
-  1. Acquire the outer lock.
+  **Cache ownership — SESSION-scoped `thread_local!`, NOT a field on the client.**
+  This is the single authoritative statement; it governs the protocol below and the
+  §4.3 *Dynamic backends* discussion. Fastly dynamic-backend **names are
+  session-global** (registered for the whole Compute session, across inbound
+  requests), but `FastlyOutboundClient` is **constructed per inbound request**
+  (`crates/edgezero-adapter-fastly/src/request.rs` inserts a fresh one into each
+  request's extensions). A map held *as a field on the client* would therefore start
+  **empty on every request**, so request #2 to the same host would rebuild the name,
+  hit `NameInUse`, have no cached identity to verify against, and **fail closed**. The
+  map must outlive the client:
+
+  ```rust
+  thread_local! {
+      static BACKENDS: RefCell<HashMap<String, (BackendIdentity, Backend)>> =
+          RefCell::new(HashMap::new());
+  }
+  ```
+
+  **No `Mutex`, no `Send + Sync` requirement:** the Fastly guest is single-threaded
+  WASM, so a `thread_local!` + `RefCell` is sufficient and is the whole
+  synchronization model. (Earlier drafts specified a
+  `Mutex<HashMap<..>>` field on `FastlyOutboundClient` "one per request context" —
+  that is **wrong on both counts**: wrong lifetime, and an unnecessary lock.) Each
+  per-request `FastlyOutboundClient` **reads/writes this shared session map** rather
+  than owning one. The **test seam** (§5.5) therefore exposes the *thread-local* map,
+  not a client field.
+
+  The race-free protocol below reads "acquire the lock" as "take the `RefCell`
+  borrow"; it is uncontended by construction on a single-threaded guest:
+
+  1. Borrow the session map (`BACKENDS.with_borrow_mut(..)`).
   2. If the name maps to a stored entry `(stored_identity, cached)`:
      - **`stored_identity == identity`**: clone the cached `Backend`, drop the
        lock, dispatch.
@@ -3712,7 +3779,14 @@ service — this distinction is explicit so a green capability check is not misr
       send_res.map_err(map_spin_send_err) // else the send outcome (transport → §4.4 Errors)
   };
 
-  match select(pin!(exchange), pin!(spin_sdk::time::sleep(budget.deadline.remaining()?))).await {
+  // `remaining()` is Option<Duration>, NOT Result — `?` here would not compile in a
+  // Result-returning fn. An already-expired budget must become gateway_timeout
+  // explicitly, matching the "expiry before dispatch" contract above.
+  let Some(remaining) = budget.deadline.remaining() else {
+      return Err(EdgeError::gateway_timeout("deadline expired before upload dispatch"));
+  };
+
+  match select(pin!(exchange), pin!(spin_sdk::time::sleep(remaining))).await {
       Either::Left((resp, _)) => resp,    // resp is already Result<Response, EdgeError>
       Either::Right(_) => Err(EdgeError::gateway_timeout("deadline expired during upload")),
   }
