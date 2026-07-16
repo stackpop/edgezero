@@ -184,6 +184,23 @@ jobs:
           fastly-api-token: dummy-token
           deploy-to: staging
 
+      # Asserted before the re-seed below, which truncates the call log.
+      - name: Assert staging wrote the _staging key and never the production key
+        env:
+          EDGEZERO__TEST__EXPECT_KEY: app_config_staging
+          EDGEZERO__TEST__REJECT_KEY: app_config
+          EDGEZERO__TEST__PUSHED_KEY: ${{ steps.staged.outputs['pushed-key'] }}
+          EDGEZERO__TEST__PUSHED_STORE: ${{ steps.staged.outputs.store }}
+        run: .github/actions/deploy-core/tests/assert-config-push.sh
+
+      # Each action's cleanup runs with `if: always()` and removes the SHARED
+      # action-owned tool root, so a second tool-installing action in the same
+      # job reinstalls the Fastly CLI from scratch. A real job re-downloads it;
+      # this job re-seeds the fake instead, keeping the test hermetic (and this
+      # resets the call log, so each push is asserted against its own).
+      - name: Re-seed fake fastly (the previous push's cleanup removed the tool root)
+        run: .github/actions/deploy-core/tests/make-fake-fastly-env.sh
+
       - name: Push config to production
         id: prod
         uses: ./.github/actions/config-push-fastly
@@ -192,11 +209,12 @@ jobs:
           working-directory: fixture-app
           fastly-api-token: dummy-token
 
-      - name: Assert the staging key, the production key, and the store calls
+      - name: Assert production wrote the base key and never the staging key
         env:
-          EDGEZERO__TEST__STAGED_KEY: ${{ steps.staged.outputs['pushed-key'] }}
-          EDGEZERO__TEST__STAGED_STORE: ${{ steps.staged.outputs.store }}
-          EDGEZERO__TEST__PROD_KEY: ${{ steps.prod.outputs['pushed-key'] }}
+          EDGEZERO__TEST__EXPECT_KEY: app_config
+          EDGEZERO__TEST__REJECT_KEY: app_config_staging
+          EDGEZERO__TEST__PUSHED_KEY: ${{ steps.prod.outputs['pushed-key'] }}
+          EDGEZERO__TEST__PUSHED_STORE: ${{ steps.prod.outputs.store }}
         run: .github/actions/deploy-core/tests/assert-config-push.sh
 
   # Staging path: the full lifecycle through the REAL wrappers — deploy-fastly
