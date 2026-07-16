@@ -558,6 +558,179 @@ test_config_push_argv() {
 }
 
 # ---------------------------------------------------------------------------
+# run-app-cli.sh — the CLI's exit status is the step's exit status
+# ---------------------------------------------------------------------------
+# A deploy that fails must fail the step. If the engine swallowed the exit code,
+# a broken deploy would report success and the caller would never roll back.
+test_exit_propagation() {
+  section "exit propagation"
+  local dir="$WORK_DIR/exit-prop"
+  mkdir -p "$dir/bin" "$dir/app"
+  cat >"$dir/bin/exit-cli" <<'CLI'
+#!/usr/bin/env bash
+exit "${FAKE_EXIT_CODE:-0}"
+CLI
+  chmod +x "$dir/bin/exit-cli"
+
+  run_with_exit() {
+    PATH="$dir/bin:$PATH" FAKE_EXIT_CODE="$1" \
+      EDGEZERO__APP__CLI__BIN=exit-cli EDGEZERO__ADAPTER=fastly \
+      EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
+      "$CORE_SCRIPTS/run-app-cli.sh" build >/dev/null 2>&1
+  }
+
+  # NB: capture with `|| rc=$?` — a trailing `|| true` would reset $? to 0 and
+  # make this test vacuously pass.
+  local rc=0
+  run_with_exit 0 || rc=$?
+  assert_equals "a succeeding CLI exits 0" "0" "$rc"
+  rc=0
+  run_with_exit 42 || rc=$?
+  assert_equals "a failing CLI's exit code reaches the step (42, not 1)" "42" "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# resolve-project.sh — deploys require committed source
+# ---------------------------------------------------------------------------
+# The dirty-source guard is what makes `source-revision` honest: it is the
+# revision that was DEPLOYED, so an uncommitted edit must not ship under a clean
+# SHA. Modified, staged, and untracked all count as dirty.
+test_dirty_source_guard() {
+  section "dirty-source guard"
+  local repo="$WORK_DIR/dirty-src"
+  mkdir -p "$repo"
+  git -C "$repo" init -q 2>/dev/null || return 0
+  git -C "$repo" config user.email t@t.invalid
+  git -C "$repo" config user.name t
+  echo one >"$repo/file.txt"
+  git -C "$repo" add -A && git -C "$repo" commit -qm init
+
+  # resolve-project.sh guards its own main(), so sourcing it just exposes the
+  # guard function (no project resolution, no cargo).
+  local guard="source '$CORE_SCRIPTS/resolve-project.sh'"
+
+  assert_succeeds "a clean tree passes" \
+    bash -c "$guard; assert_committed_source '$repo' app"
+
+  echo two >>"$repo/file.txt"
+  assert_fails "an unstaged modification is dirty" \
+    bash -c "$guard; assert_committed_source '$repo' app"
+
+  git -C "$repo" add -A
+  assert_fails "a staged-but-uncommitted change is dirty" \
+    bash -c "$guard; assert_committed_source '$repo' app"
+
+  git -C "$repo" commit -qm two
+  echo x >"$repo/untracked.txt"
+  assert_fails "an untracked file is dirty (it would ship unbuilt)" \
+    bash -c "$guard; assert_committed_source '$repo' app"
+}
+
+# ---------------------------------------------------------------------------
+# resolve-project.sh — the cache key is exact
+# ---------------------------------------------------------------------------
+# The cache key decides whether a build reuses target/. If it omits an input that
+# changes the artifacts, CI silently ships a stale build. Cargo.lock is only
+# hashed (never parsed), so a minimal fixture proves the composition offline.
+cache_key_for() {
+  local ws="$WORK_DIR/cache-key"
+  # NB: the output file lives OUTSIDE the fixture repo — inside it, it would be
+  # an untracked file and the dirty-source guard would (correctly) reject it.
+  local out="$WORK_DIR/cache-key-out.txt"
+  : >"$out"
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
+    GITHUB_WORKSPACE="$ws" \
+    GITHUB_OUTPUT="$out" \
+    RUNNER_OS=Linux RUNNER_ARCH=X64 \
+    EDGEZERO__ACTION__ROOT="$REPO_ROOT" \
+    EDGEZERO__PROJECT__WORKING_DIRECTORY=app \
+    EDGEZERO__PROJECT__RUST_TOOLCHAIN="${CK_TOOLCHAIN:-1.95.0}" \
+    EDGEZERO__PROJECT__TARGET="${CK_TARGET:-wasm32-wasip1}" \
+    EDGEZERO__APP__CLI__VERSION="${CK_CLI_VERSION:-1.0.0}" \
+    EDGEZERO__BUILD__CACHE="${CK_CACHE:-false}" \
+    bash "$CORE_SCRIPTS/resolve-project.sh" >/dev/null 2>&1 || return $?
+  grep -oE '^cache-key=.*$' "$out" | tail -n 1 | cut -d= -f2-
+}
+
+test_cache_key() {
+  section "cache key"
+  local ws="$WORK_DIR/cache-key"
+  mkdir -p "$ws/app/src"
+  cat >"$ws/app/Cargo.toml" <<'TOML'
+[package]
+name = "ck-fixture"
+version = "0.1.0"
+edition = "2021"
+TOML
+  echo 'fn main() {}' >"$ws/app/src/main.rs"
+  printf 'version = 3\n' >"$ws/app/Cargo.lock"
+  git -C "$ws" init -q 2>/dev/null || return 0
+  git -C "$ws" config user.email t@t.invalid
+  git -C "$ws" config user.name t
+  git -C "$ws" add -A && git -C "$ws" commit -qm init
+
+  local base
+  base=$(cache_key_for) || { fail "resolve-project could not produce a cache key"; return 0; }
+  [[ -n "$base" ]] || { fail "cache key is empty"; return 0; }
+
+  assert_succeeds "the key is namespaced and carries OS+arch" \
+    grep -qE '^edgezero-deploy-Linux-X64-' <<<"$base"
+
+  # Each input that changes the artifacts must change the key.
+  assert_fails "a different toolchain changes the key" \
+    bash -c "[[ '$(CK_TOOLCHAIN=1.60.0 cache_key_for)' == '$base' ]]"
+  assert_fails "a different target changes the key" \
+    bash -c "[[ '$(CK_TARGET=wasm32-unknown-unknown cache_key_for)' == '$base' ]]"
+  assert_fails "a different app-CLI version changes the key" \
+    bash -c "[[ '$(CK_CLI_VERSION=2.0.0 cache_key_for)' == '$base' ]]"
+
+  # The lockfile hash is the point: new deps must not reuse an old target/.
+  printf 'version = 3\n# changed\n' >"$ws/app/Cargo.lock"
+  git -C "$ws" add -A && git -C "$ws" commit -qm lockfile-change
+  assert_fails "a changed Cargo.lock busts the key (no stale target/ reuse)" \
+    bash -c "[[ '$(cache_key_for)' == '$base' ]]"
+
+  # cache: true with no lockfile cannot key exactly — fail rather than guess.
+  rm -f "$ws/app/Cargo.lock"
+  git -C "$ws" add -A && git -C "$ws" commit -qm drop-lockfile
+  if CK_CACHE=true cache_key_for >/dev/null 2>&1; then
+    fail "cache=true without Cargo.lock was accepted (cannot key exactly)"
+  else
+    pass "cache=true without Cargo.lock is rejected"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# action.yml metadata — every declared output is actually produced
+# ---------------------------------------------------------------------------
+# A declared output whose step never emits that name silently resolves to "".
+# This is exactly how the app-cli-artifact rename broke the deploy wiring: the
+# consumers read an output the producer no longer wrote.
+test_action_output_contracts() {
+  section "action output contracts"
+  # Every name a script writes via append_output, across all actions.
+  local produced
+  produced=$(grep -rhoE 'append_output [a-z0-9-]+' "$ACTIONS_DIR" | awk '{print $2}' | sort -u)
+
+  local action missing=0 name
+  for action in "$ACTIONS_DIR"/*/action.yml; do
+    # Output names referenced as steps.<id>.outputs['<name>'] in the outputs block.
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      if ! grep -qx "$name" <<<"$produced"; then
+        fail "$(basename "$(dirname "$action")") declares output '$name' that no script emits"
+        missing=$((missing + 1))
+      fi
+    done < <(sed -n '/^outputs:/,/^runs:/p' "$action" |
+      grep -oE "steps\.[a-z-]+\.outputs\['[a-z0-9-]+'\]" |
+      sed -E "s/.*\['([a-z0-9-]+)'\]/\1/" | sort -u)
+  done
+  if [[ "$missing" -eq 0 ]]; then
+    pass "every declared action output is emitted by a script"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 main() {
   test_validate_inputs
   test_artifact_name
@@ -573,6 +746,10 @@ main() {
   test_lifecycle_helpers
   test_toolchain_boundary
   test_config_push_argv
+  test_exit_propagation
+  test_dirty_source_guard
+  test_cache_key
+  test_action_output_contracts
 
   printf '\nPassed: %d  Failed: %d\n' "$tests_passed" "$tests_failed"
   [[ "$tests_failed" -eq 0 ]]

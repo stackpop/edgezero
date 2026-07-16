@@ -130,15 +130,15 @@ workspace may be the subdirectory itself), so a monorepo caches the right
 
 ### `build-app-cli`
 
-| Input               | Required | Default         | Meaning                                                          |
-| ------------------- | -------- | --------------- | ---------------------------------------------------------------- |
-| `app-cli-package`   | Yes      | —               | Cargo package name of the CLI, in your app's workspace.          |
-| `app-cli-bin`       | No       | `<cli-package>` | Binary name the package produces.                                |
-| `working-directory` | No       | `.`             | App directory (relative to `github.workspace`).                  |
-| `rust-toolchain`    | No       | `auto`          | Explicit toolchain, or `auto` (rustup files → `.tool-versions`). |
-| `app-cli-artifact`  | No       | `edgezero-cli`  | Uploaded artifact name.                                          |
+| Input               | Required | Default             | Meaning                                                          |
+| ------------------- | -------- | ------------------- | ---------------------------------------------------------------- |
+| `app-cli-package`   | Yes      | —                   | Cargo package name of the CLI, in your app's workspace.          |
+| `app-cli-bin`       | No       | `<app-cli-package>` | Binary name the package produces.                                |
+| `working-directory` | No       | `.`                 | App directory (relative to `github.workspace`).                  |
+| `rust-toolchain`    | No       | `auto`              | Explicit toolchain, or `auto` (rustup files → `.tool-versions`). |
+| `app-cli-artifact`  | No       | `edgezero-cli`      | Uploaded artifact name.                                          |
 
-Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `artifact-name`.
+Outputs: `app-cli-version`, `app-cli-package`, `app-cli-bin`, `app-cli-artifact`.
 
 ### `deploy-fastly`
 

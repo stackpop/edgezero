@@ -177,4 +177,8 @@ main() {
   append_output cache-path "$target_dir"
 }
 
-main "$@"
+# Sourcing this file exposes its functions without resolving a project, so the
+# contract tests can exercise the dirty-source guard directly.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
