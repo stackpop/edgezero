@@ -332,6 +332,10 @@ where
         match render_first_read_diff(&remote, &key, &local_envelope, &local_sha, args.no_diff)? {
             FirstReadOutcome::NoChange => {
                 push_info(&format!("# no changes (sha256 matches: {local_sha})"));
+                // A no-op push still SUCCEEDED at putting `key` in the store, so
+                // it reports the same outputs a writing push does. Config push is
+                // idempotent; re-running it must not fail the caller.
+                emit_push_outputs(args, &key, &ctx.store.logical);
                 return Ok(());
             }
             FirstReadOutcome::ProceedFromPresent {
@@ -355,13 +359,39 @@ where
             &remote,
             approved_remote_sha.as_deref(),
         )? {
-            RecheckOutcome::Skip => return Ok(()),
+            RecheckOutcome::Skip => {
+                // A concurrent push already landed the same content — the store
+                // holds what we wanted, so this is a success with the same
+                // outputs, not a silent no-output exit.
+                emit_push_outputs(args, &key, &ctx.store.logical);
+                return Ok(());
+            }
             RecheckOutcome::Write => {}
         }
     }
 
     // Write.
-    write_envelope(ctx.adapter, args, &ctx, &paths, &key, body)
+    write_envelope(ctx.adapter, args, &ctx, &paths, &key, body)?;
+    emit_push_outputs(args, &key, &ctx.store.logical);
+    Ok(())
+}
+
+/// Emit the canonical machine-readable lines the config-push-fastly action greps
+/// (`^pushed-key=<key>$` / `^pushed-store=<id>$`) to thread the written key and
+/// the resolved store out as outputs.
+///
+/// Every SUCCESSFUL push emits these — including the idempotent no-op paths,
+/// where the store already holds the desired content. The action treats their
+/// absence as a failure, so a push that changed nothing must still report what
+/// key it put there. The store must come from here: the wrapper only has the
+/// optional raw input, which is empty on the default path where the id is
+/// resolved from the manifest. The CLI logger routes `log::info!` to stdout, so
+/// these reach the action's log.
+fn emit_push_outputs(args: &ConfigPushArgs, key: &str, store: &str) {
+    if !args.dry_run {
+        log::info!("pushed-key={key}");
+        log::info!("pushed-store={store}");
+    }
 }
 
 // -------------------------------------------------------------------
@@ -927,16 +957,8 @@ fn write_envelope(
     for line in lines {
         log::info!("{line}");
     }
-    // Canonical machine-readable lines — the config-push-fastly action greps
-    // `^pushed-key=<key>$` / `^pushed-store=<id>$` to thread the written key and
-    // the RESOLVED store out as outputs. The store must come from here: the
-    // wrapper only has the optional raw input, which is empty on the default path
-    // where the id is resolved from the manifest. The CLI logger routes
-    // log::info! to stdout, so these reach the action's log.
-    if !args.dry_run {
-        log::info!("pushed-key={key}");
-        log::info!("pushed-store={}", ctx.store.logical);
-    }
+    // The canonical `pushed-*` lines are emitted by the caller, so that the
+    // idempotent no-op paths (which never reach this function) report them too.
     Ok(())
 }
 

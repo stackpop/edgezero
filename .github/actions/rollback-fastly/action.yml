@@ -31,6 +31,16 @@ outputs:
 runs:
   using: composite
   steps:
+    # GitHub does not enforce `required: true` on composite inputs, and an empty
+    # artifact name makes actions/download-artifact fetch EVERY artifact in the
+    # run — so the CLI we execute would be arbitrary. Check before downloading.
+    - name: Validate inputs
+      shell: bash
+      env:
+        EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
+      run: |
+        [[ "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT}" == "true" ]] || { echo "::error::missing required input 'app-cli-artifact'"; exit 1; }
+
     - name: Download CLI artifact
       uses: actions/download-artifact@v4
       with:

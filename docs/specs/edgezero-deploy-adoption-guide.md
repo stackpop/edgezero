@@ -248,8 +248,9 @@ Workflow shape:
 - Read the version from `steps.<deploy>.outputs.fastly-version` (same concept as
   the legacy `fastly-version`).
 - Audit `TRUSTED_SERVER_CONFIG`; if still needed, keep config expansion in the
-  deployer workflow or run `edgezero config push` as an explicit step before or
-  after deploy.
+  deployer workflow, or push config as its own explicit step before/after deploy
+  with the `config-push-fastly` action (or `<your-app>-cli config push`). Not the
+  bundled `edgezero config push` — that stub exits non-zero by design (§5).
 - Confirm the canonical Trusted Server repository/ref has a `Cargo.lock` at the
   CLI package's Cargo workspace root, plus `Cargo.toml`, `fastly.toml`, and
   preferably `edgezero.toml`.

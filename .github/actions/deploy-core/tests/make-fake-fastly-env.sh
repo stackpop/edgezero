@@ -106,7 +106,9 @@ main() {
   local action_dir
   action_dir=$(cd -- "$SCRIPT_DIR/../../deploy-fastly" && pwd)
   local path_dir="$workspace/fake-bin"
-  local tool_bin="$runner_temp/edgezero-action-tools/bin"
+  # install-fastly.sh keeps the provider CLI in its own dir (never the app
+  # CLI's bin/), so seed the fake where that adoption check looks.
+  local tool_bin="$runner_temp/edgezero-action-tools/provider-bin"
   local log="$workspace/fake-calls.log"
 
   mkdir -p "$path_dir" "$tool_bin"

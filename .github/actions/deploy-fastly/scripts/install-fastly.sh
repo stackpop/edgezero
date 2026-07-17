@@ -25,11 +25,19 @@ require_linux_x86_64() {
   esac
 }
 
+# The provider CLI gets its OWN directory, never the app CLI's `bin/`. The app
+# names its own binary, and `fastly` is a legal app-CLI name -- sharing one
+# directory would let this install silently overwrite the very CLI we are about
+# to run. Both dirs live under the action-owned tool root, so cleanup still
+# removes them together.
+provider_bin_dir() { printf '%s\n' "$1/provider-bin"; }
+
 # Whether the action-owned tool root already holds an executable `fastly`
 # reporting the pinned version.
 tool_root_has_pinned_fastly() {
   local tool_root="$1" version="$2"
-  local bin="$tool_root/bin/fastly"
+  local bin
+  bin="$(provider_bin_dir "$tool_root")/fastly"
 
   [[ -x "$bin" ]] || return 1
   local reported
@@ -50,7 +58,9 @@ main() {
   require_linux_x86_64
   require_cmd jq
   require_cmd curl
-  mkdir -p "$tool_root/bin" "$tool_root/downloads"
+  local provider_bin
+  provider_bin=$(provider_bin_dir "$tool_root")
+  mkdir -p "$provider_bin" "$tool_root/downloads"
 
   # The pinned version must agree with the repository .tool-versions policy.
   local version tool_version
@@ -77,12 +87,12 @@ main() {
     actual=$(sha256_file "$archive")
     [[ "$actual" == "$sha256" ]] || fail "Fastly CLI checksum mismatch for version $version"
 
-    tar -xzf "$archive" -C "$tool_root/bin" fastly
-    chmod +x "$tool_root/bin/fastly"
+    tar -xzf "$archive" -C "$provider_bin" fastly
+    chmod +x "$provider_bin/fastly"
   fi
 
-  printf '%s\n' "$tool_root/bin" >>"${GITHUB_PATH:-/dev/null}"
-  export PATH="$tool_root/bin:$PATH"
+  printf '%s\n' "$provider_bin" >>"${GITHUB_PATH:-/dev/null}"
+  export PATH="$provider_bin:$PATH"
 
   local provider_cli_version
   provider_cli_version=$(fastly version 2>/dev/null || fastly --version 2>/dev/null || true)

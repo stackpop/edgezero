@@ -421,6 +421,42 @@ test_deploy_args_prepend() {
 # ---------------------------------------------------------------------------
 # common.sh — anchored version parsing, required inputs, private logs
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# run-app-cli.sh — provider values must survive the Bash boundary intact
+# ---------------------------------------------------------------------------
+# `export NAME=value` truncates at the first NUL, so a NUL-bearing credential
+# would be silently altered rather than rejected. The guard must reject NUL and
+# still accept ordinary values — a NUL check that also rejects spaces would break
+# every real token.
+test_provider_env_nul() {
+  section "provider-env NUL rejection"
+  local dir="$WORK_DIR/nul"
+  mkdir -p "$dir/bin" "$dir/app"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$dir/bin/nul-cli"
+  chmod +x "$dir/bin/nul-cli"
+  printf 'FASTLY_API_TOKEN\0' >"$dir/clear.nul"
+
+  run_with_env() {
+    PATH="$dir/bin:$PATH" \
+      EDGEZERO__APP__CLI__BIN=nul-cli EDGEZERO__ADAPTER=fastly \
+      EDGEZERO__PROJECT__WORKING_DIRECTORY="$dir/app" \
+      EDGEZERO__PROVIDER__ENV_CLEAR_FILE="$dir/clear.nul" \
+      EDGEZERO__PROVIDER__ENV="$1" \
+      "$CORE_SCRIPTS/run-app-cli.sh" deploy >/dev/null 2>&1
+  }
+
+  # jq builds the NUL: a raw NUL cannot survive argv, which is the whole point.
+  local nul_json
+  nul_json=$(jq -nc '{FASTLY_API_TOKEN: "abc\u0000def"}')
+  assert_fails "a NUL-bearing provider value is rejected" run_with_env "$nul_json"
+
+  # A NUL check must not become a space check.
+  assert_succeeds "an ordinary value containing spaces is accepted" \
+    run_with_env '{"FASTLY_API_TOKEN":"tok with spaces"}'
+  assert_succeeds "a plain token is accepted" \
+    run_with_env '{"FASTLY_API_TOKEN":"abc123"}'
+}
+
 test_lifecycle_helpers() {
   section "lifecycle helpers"
   # NB: sourced in subshells only — common.sh defines its own `fail`, which would
@@ -783,6 +819,68 @@ action_step_scripts() {
   ' "$action"
 }
 
+# ---------------------------------------------------------------------------
+# action.yml metadata — public surface is well-formed
+# ---------------------------------------------------------------------------
+# Pure Bash/awk (no Python, per the project's tooling rule). actionlint only
+# parses composite metadata it reaches through a `uses:`, and these wrappers are
+# also consumed directly by callers — so check every action.yml on its own.
+#
+# The duplicate-env-key case is not hypothetical: a bad edit on this branch
+# defined the same key twice in one step, which YAML resolves silently to the
+# last value.
+test_action_metadata() {
+  section "action metadata"
+  local action bad=0
+
+  for action in "$ACTIONS_DIR"/*/action.yml; do
+    local who; who=$(basename "$(dirname "$action")")
+
+    # Required top-level keys.
+    local key
+    for key in name description runs; do
+      grep -qE "^${key}:" "$action" ||
+        { fail "$who action.yml has no top-level '$key:'"; bad=$((bad + 1)); }
+    done
+
+    # Every declared input needs a description — it is the public contract.
+    local undescribed
+    undescribed=$(awk '
+      /^inputs:/ { in_inputs = 1; next }
+      /^[a-z]+:/ && !/^inputs:/ { in_inputs = 0 }
+      in_inputs && /^  [a-z][a-z0-9-]*:/ {
+        if (name != "" && !described) print name
+        name = $1; sub(/:$/, "", name); described = 0
+      }
+      in_inputs && /^    description:/ { described = 1 }
+      END { if (name != "" && !described) print name }
+    ' "$action")
+    if [[ -n "$undescribed" ]]; then
+      fail "$who has inputs without a description: $(tr '\n' ' ' <<<"$undescribed")"
+      bad=$((bad + 1))
+    fi
+
+    # A key defined twice in ONE step's env: YAML keeps the last silently.
+    local dupes
+    dupes=$(awk '
+      /^    - name:/ { delete seen; next }
+      /^      env:/ { in_env = 1; next }
+      /^      [a-z]+:/ { in_env = 0 }
+      in_env && /^        [A-Za-z_][A-Za-z0-9_]*:/ {
+        k = $1; sub(/:$/, "", k)
+        if (k in seen) print k
+        seen[k] = 1
+      }
+    ' "$action" | sort -u)
+    if [[ -n "$dupes" ]]; then
+      fail "$who defines the same env key twice in one step: $(tr '\n' ' ' <<<"$dupes")"
+      bad=$((bad + 1))
+    fi
+  done
+
+  [[ "$bad" -eq 0 ]] && pass "every action.yml declares a well-formed public surface"
+}
+
 test_action_output_contracts() {
   section "action output contracts"
   local action missing=0 checked=0
@@ -842,12 +940,14 @@ main() {
   test_cleanup_confinement
   test_action_env_scrub
   test_deploy_args_prepend
+  test_provider_env_nul
   test_lifecycle_helpers
   test_toolchain_boundary
   test_config_push_argv
   test_exit_propagation
   test_dirty_source_guard
   test_cache_key
+  test_action_metadata
   test_action_output_contracts
 
   printf '\nPassed: %d  Failed: %d\n' "$tests_passed" "$tests_failed"

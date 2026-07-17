@@ -75,6 +75,7 @@ runs:
         EDGEZERO__DEPLOY__STAGE: ${{ inputs.stage }}
         EDGEZERO__DEPLOY__FLAGS: ${{ inputs.stage == 'true' && format('["--service-id","{0}","--stage"]', inputs['fastly-service-id']) || format('["--service-id","{0}"]', inputs['fastly-service-id']) }}
         EDGEZERO__PROVIDER__ENV_CLEAR: '["FASTLY_API_TOKEN","FASTLY_SERVICE_ID","FASTLY_TOKEN","FASTLY_KEY","FASTLY_API_KEY","FASTLY_AUTH_TOKEN","FASTLY_API_ENDPOINT","FASTLY_ENDPOINT","FASTLY_API_URL","FASTLY_PROFILE","FASTLY_SERVICE_NAME","FASTLY_DEBUG","FASTLY_DEBUG_MODE","FASTLY_CONFIG_FILE","FASTLY_CARGO_PROFILE","FASTLY_HOME"]'
+        EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
         EDGEZERO__FASTLY__API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
         EDGEZERO__FASTLY__SERVICE_ID: ${{ inputs['fastly-service-id'] }}
         EDGEZERO__RUNNER__OS: ${{ runner.os }}
@@ -97,6 +98,13 @@ runs:
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: |
+        # An empty artifact name makes actions/download-artifact fetch EVERY artifact
+        # in the run, so the CLI we execute with credentials would be arbitrary.
+        [[ "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT}" == "true" ]] || { echo "::error::missing required input 'app-cli-artifact'"; exit 1; }
+        # GitHub does not enforce `required: true` on composite inputs. An empty
+        # artifact name makes actions/download-artifact fetch EVERY artifact in
+        # the run, so the CLI we then execute with credentials would be arbitrary.
+        [[ "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT}" == "true" ]] || { echo "::error::missing required input 'app-cli-artifact'"; exit 1; }
         [[ "${EDGEZERO__FASTLY__API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
         [[ -n "${EDGEZERO__FASTLY__SERVICE_ID}" ]] || { echo "::error::missing required input 'fastly-service-id'"; exit 1; }
         [[ "${EDGEZERO__FASTLY__SERVICE_ID}" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::input 'fastly-service-id' must match ^[A-Za-z0-9_-]+$"; exit 1; }

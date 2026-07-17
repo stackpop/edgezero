@@ -22,10 +22,25 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-# Locate the single CLI tar produced by build-app-cli within the downloaded artifact.
+# Locate the single CLI tar produced by build-app-cli within the downloaded
+# artifact.
+#
+# Refuses to guess. `actions/download-artifact` with an empty `name:` downloads
+# EVERY artifact in the run, so silently taking the first tar could execute an
+# unrelated binary — with provider credentials in scope. Exactly one tar is the
+# only unambiguous case; zero or many is a caller error, not a coin toss.
 find_cli_tarball() {
   local artifact_dir="$1"
-  find "$artifact_dir" -maxdepth 2 -type f -name '*.tar' | head -n 1
+  local -a tarballs=()
+  while IFS= read -r found; do
+    tarballs+=("$found")
+  done < <(find "$artifact_dir" -maxdepth 2 -type f -name '*.tar' | sort)
+
+  case "${#tarballs[@]}" in
+    1) printf '%s\n' "${tarballs[0]}" ;;
+    0) fail "no CLI tar found in the downloaded artifact ($artifact_dir); check the 'app-cli-artifact' input names a build-app-cli artifact" ;;
+    *) fail "expected exactly 1 CLI tar in the downloaded artifact, found ${#tarballs[@]} — refusing to guess which CLI to run: ${tarballs[*]}" ;;
+  esac
 }
 
 main() {

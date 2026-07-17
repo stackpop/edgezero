@@ -84,6 +84,11 @@ import_provider_env() {
     fail "EDGEZERO__PROVIDER__ENV must be a JSON object of string values"
   printf '%s' "$json" | jq -e 'all(.[]; type == "string")' >/dev/null 2>&1 ||
     fail "every EDGEZERO__PROVIDER__ENV value must be a string"
+  # A NUL cannot survive the Bash boundary: `export NAME=value` truncates at the
+  # first NUL, so a value carrying one would be silently altered — a credential
+  # that is quietly wrong is worse than one that is rejected.
+  printf '%s' "$json" | jq -e 'all(.[]; contains("\u0000") | not)' >/dev/null 2>&1 ||
+    fail "EDGEZERO__PROVIDER__ENV values must not contain NUL bytes"
 
   # One "NAME BASE64VALUE" line per entry. Base64 keeps values line-safe
   # (newlines, spaces, quotes cannot break the read loop) and opaque.

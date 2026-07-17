@@ -51,6 +51,7 @@ runs:
     - name: Validate inputs
       shell: bash
       env:
+        EDGEZERO__APP__CLI__ARTIFACT_PRESENT: ${{ inputs['app-cli-artifact'] != '' && 'true' || 'false' }}
         EDGEZERO__FASTLY__API_TOKEN_PRESENT: ${{ inputs['fastly-api-token'] != '' && 'true' || 'false' }}
         EDGEZERO__DEPLOY__TO: ${{ inputs['deploy-to'] }}
         FASTLY_API_TOKEN: ""
@@ -70,6 +71,9 @@ runs:
         FASTLY_CARGO_PROFILE: ""
         FASTLY_HOME: ""
       run: |
+        # An empty artifact name makes actions/download-artifact fetch EVERY artifact
+        # in the run, so the CLI we execute with credentials would be arbitrary.
+        [[ "${EDGEZERO__APP__CLI__ARTIFACT_PRESENT}" == "true" ]] || { echo "::error::missing required input 'app-cli-artifact'"; exit 1; }
         [[ "${EDGEZERO__FASTLY__API_TOKEN_PRESENT}" == "true" ]] || { echo "::error::missing required input 'fastly-api-token'"; exit 1; }
         case "${EDGEZERO__DEPLOY__TO}" in
           production | staging) ;;
