@@ -5,9 +5,9 @@ use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
-    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
-    register_adapter,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterExecContext, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -139,7 +139,12 @@ impl Adapter for CloudflareCliAdapter {
         &["kv_namespaces", "preview_kv_namespaces"]
     }
 
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(
+        &self,
+        action: AdapterAction,
+        args: &[String],
+        ctx: &AdapterExecContext<'_>,
+    ) -> Result<(), String> {
         match action {
             // `wrangler` is the native sign-in surface for Cloudflare
             // Workers. EdgeZero stores no credentials — this is a thin
@@ -153,14 +158,14 @@ impl Adapter for CloudflareCliAdapter {
             AdapterAction::AuthStatus => {
                 run_native_cli("wrangler", &["whoami"], WRANGLER_INSTALL_HINT)
             }
-            AdapterAction::Build => run::build(args).map(|artifact| {
+            AdapterAction::Build => run::build(args, ctx).map(|artifact| {
                 log::info!(
                     "[edgezero] Cloudflare build artifact -> {}",
                     artifact.display()
                 );
             }),
-            AdapterAction::Deploy => run::deploy(args),
-            AdapterAction::Serve => run::serve(args),
+            AdapterAction::Deploy => run::deploy(args, ctx),
+            AdapterAction::Serve => run::serve(args, ctx),
             other => Err(format!("cloudflare adapter does not support {other:?}")),
         }
     }

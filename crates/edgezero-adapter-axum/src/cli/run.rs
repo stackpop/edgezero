@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
+    self, find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::registry::AdapterExecContext;
 use edgezero_core::addr;
 use edgezero_core::manifest::ManifestLoader;
 use toml::Value;
@@ -60,27 +61,32 @@ pub(super) fn synthesise_axum_toml(crate_name: &str, crate_dir: &str) -> String 
     )
 }
 
-pub(super) fn build(extra_args: &[String]) -> Result<(), String> {
-    let project = locate_project()?;
-    run_cargo(&project, "build", extra_args)
+pub(super) fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let project = locate_project(ctx)?;
+    run_cargo(&project, "build", extra_args, ctx)
 }
 
-pub(super) fn serve(extra_args: &[String]) -> Result<(), String> {
-    let project = locate_project()?;
-    run_cargo(&project, "run", extra_args)
+pub(super) fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let project = locate_project(ctx)?;
+    run_cargo(&project, "run", extra_args, ctx)
 }
 
 pub(super) fn deploy(_extra_args: &[String]) -> Result<(), String> {
     Err("Axum adapter does not define a deploy command. Extend your workspace manifest with one if needed.".into())
 }
 
-fn locate_project() -> Result<AxumProject, String> {
-    let cwd = env::current_dir().map_err(|err| err.to_string())?;
-    let manifest = find_axum_manifest(&cwd)?;
+fn locate_project(ctx: &AdapterExecContext<'_>) -> Result<AxumProject, String> {
+    let base = cli_support::discovery_base(ctx)?;
+    let manifest = find_axum_manifest(&base)?;
     read_axum_project(&manifest)
 }
 
-fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> Result<(), String> {
+fn run_cargo(
+    project: &AxumProject,
+    subcommand: &str,
+    extra_args: &[String],
+    ctx: &AdapterExecContext<'_>,
+) -> Result<(), String> {
     let resolution = resolve_subprocess_addr(project)?;
     for warning in &resolution.warnings {
         log::warn!("[edgezero] {warning}");
@@ -103,6 +109,15 @@ fn run_cargo(project: &AxumProject, subcommand: &str, extra_args: &[String]) -> 
     );
     command.args(extra_args);
     command.current_dir(&project.crate_dir);
+    // Child env from the registry-fallback context (the provision-
+    // written `.env` overlay + manifest `[environment.variables]`).
+    // Applied BEFORE the canonical HOST/PORT below so this adapter's
+    // richer address resolution (which reads axum.toml + edgezero.toml)
+    // wins on those two keys. Empty when dispatched via the manifest
+    // `commands.serve` shell path, so behaviour there is unchanged.
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
     // Canonical env vars. The runtime's `EnvConfig` reads only the
     // `EDGEZERO__*` form (see `crates/edgezero-core/src/env_config.rs`);
     // setting the legacy `EDGEZERO_HOST` / `EDGEZERO_PORT` here would be a

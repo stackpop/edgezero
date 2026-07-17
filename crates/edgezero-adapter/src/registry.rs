@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 static REGISTRY: LazyLock<RwLock<HashMap<String, &'static dyn Adapter>>> =
@@ -208,6 +209,101 @@ impl ProvisionStores<'_> {
     }
 }
 
+/// Execution context passed to [`Adapter::execute`] carrying the
+/// manifest-derived working directory and child environment.
+///
+/// Exists because the CLI has two dispatch paths for
+/// `build` / `deploy` / `serve` / `auth`:
+///
+/// * `[adapters.<name>.commands].<action>` is set -> the CLI spawns
+///   that shell command itself, applying the manifest root as cwd and
+///   the resolved environment (bind hints, `[environment.variables]`,
+///   the provision-written `.env` overlay) to the child.
+/// * the command is unset -> the CLI falls back to the registered
+///   adapter's `execute`, which spawns its own vendor CLI.
+///
+/// The fallback used to receive only the action and passthrough args,
+/// so everything the first path applies was silently dropped: a
+/// `serve` would start the app with none of the secrets from its
+/// `.env` file and resolve its manifest from the process cwd rather
+/// than the project root (PR #287 review round 9, blocking #3). This
+/// struct is how the second path receives the same context as the
+/// first.
+///
+/// The env pairs are fully resolved by the CLI -- precedence between
+/// parent env, manifest variables, bind hints and the `.env` overlay
+/// is already applied, and entries the parent process already exports
+/// are already dropped. Adapters MUST apply them verbatim
+/// (`cmd.envs(ctx.env())`) rather than re-deriving precedence.
+///
+/// Built via [`Self::new`] + the `with_*` setters; `#[non_exhaustive]`
+/// keeps construction inside the builder so future fields don't break
+/// out-of-tree adapters that only RECEIVE it.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct AdapterExecContext<'ctx> {
+    cwd: Option<&'ctx Path>,
+    env: &'ctx [(String, String)],
+}
+
+impl<'ctx> AdapterExecContext<'ctx> {
+    /// Empty context: no cwd override, no env overrides. Adapters
+    /// behave exactly as they did before the context existed.
+    #[must_use]
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            cwd: None,
+            env: &[],
+        }
+    }
+
+    /// Directory the adapter's spawned CLI should run in -- the
+    /// manifest root, NOT the process cwd.
+    #[must_use]
+    #[inline]
+    pub fn with_cwd(mut self, cwd: &'ctx Path) -> Self {
+        self.cwd = Some(cwd);
+        self
+    }
+
+    /// Fully-resolved `(key, value)` pairs to set on the child.
+    #[must_use]
+    #[inline]
+    pub fn with_env(mut self, env: &'ctx [(String, String)]) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// The manifest root, when the CLI resolved one. `None` means the
+    /// adapter should keep its existing cwd behaviour.
+    #[must_use]
+    #[inline]
+    pub fn cwd(&self) -> Option<&'ctx Path> {
+        self.cwd
+    }
+
+    /// Resolved child-env pairs. Apply verbatim; see the type docs.
+    #[must_use]
+    #[inline]
+    pub fn env(&self) -> &'ctx [(String, String)] {
+        self.env
+    }
+
+    /// Apply this context to a [`Command`] the adapter is about to
+    /// spawn. Adapters should prefer this over reading the accessors
+    /// so cwd/env handling stays identical across every adapter.
+    #[inline]
+    pub fn apply(&self, command: &mut Command) {
+        if let Some(cwd) = self.cwd {
+            command.current_dir(cwd);
+        }
+        for (key, value) in self.env {
+            command.env(key, value);
+        }
+    }
+}
+
 /// Context passed to [`Adapter::push_config_entries`] and
 /// [`Adapter::push_config_entries_local`] carrying already-resolved
 /// `config push` overlay values.
@@ -366,9 +462,22 @@ pub trait Adapter: Sync + Send {
     /// typed parameter structs (e.g. `BuildArgs { manifest_root,
     /// extra_args }`) mirroring the rest of the trait.
     ///
+    /// `ctx` carries the manifest root and the fully-resolved child
+    /// environment. Adapters that spawn a vendor CLI MUST apply it
+    /// (`ctx.apply(&mut cmd)`) so the registry-fallback dispatch
+    /// behaves like the `[adapters.<name>.commands]` shell path --
+    /// see [`AdapterExecContext`]. Actions with no working-directory
+    /// or environment component (the `auth` arms shell out to a
+    /// globally-scoped vendor login) may ignore it.
+    ///
     /// # Errors
     /// Returns an error string if the requested adapter action fails.
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String>;
+    fn execute(
+        &self,
+        action: AdapterAction,
+        args: &[String],
+        ctx: &AdapterExecContext<'_>,
+    ) -> Result<(), String>;
 
     /// Store kinds whose logical-id namespaces the adapter merges into
     /// a single backend at runtime — declaring the SAME logical id
@@ -743,6 +852,43 @@ mod tests {
     }
 
     #[test]
+    fn exec_context_apply_sets_cwd_and_env_on_command() {
+        let env = vec![("EDGEZERO_TEST_CTX".to_owned(), "value".to_owned())];
+        let cwd = Path::new("/tmp/edgezero-ctx-test");
+        let ctx = AdapterExecContext::new().with_cwd(cwd).with_env(&env);
+
+        let mut command = Command::new("true");
+        ctx.apply(&mut command);
+
+        assert_eq!(command.get_current_dir(), Some(cwd));
+        let applied: Vec<(String, String)> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((key.to_str()?.to_owned(), value?.to_str()?.to_owned()))
+            })
+            .collect();
+        assert_eq!(
+            applied,
+            vec![("EDGEZERO_TEST_CTX".to_owned(), "value".to_owned())]
+        );
+    }
+
+    #[test]
+    fn exec_context_default_is_inert() {
+        // An empty context must not touch a command -- this is what
+        // keeps the manifest-`commands` shell path (which builds its
+        // own command) behaving exactly as before.
+        let ctx = AdapterExecContext::new();
+        assert!(ctx.cwd().is_none());
+        assert!(ctx.env().is_empty());
+
+        let mut command = Command::new("true");
+        ctx.apply(&mut command);
+        assert_eq!(command.get_current_dir(), None);
+        assert_eq!(command.get_envs().count(), 0);
+    }
+
+    #[test]
     fn case_collision_check_passes_for_distinct_ids() {
         let kv = ids(&["sessions", "cache"]);
         ProvisionStores {
@@ -828,7 +974,12 @@ mod tests {
         reason = "TestAdapter only exercises register / get / execute; the validation methods inherit the trait defaults (no-ops)"
     )]
     impl Adapter for TestAdapter {
-        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+        fn execute(
+            &self,
+            _action: AdapterAction,
+            _args: &[String],
+            _ctx: &AdapterExecContext<'_>,
+        ) -> Result<(), String> {
             HIT.store(self.hit_value, Ordering::SeqCst);
             Ok(())
         }
@@ -864,7 +1015,7 @@ mod tests {
         register_adapter(&FIRST);
         let adapter = get_adapter("dummy").expect("adapter present");
         adapter
-            .execute(AdapterAction::Build, &[])
+            .execute(AdapterAction::Build, &[], &AdapterExecContext::new())
             .expect("execute succeeds");
         assert_eq!(HIT.load(Ordering::SeqCst), 1);
     }
@@ -877,7 +1028,7 @@ mod tests {
         register_adapter(&SECOND);
         let adapter = get_adapter("dummy").expect("adapter present");
         adapter
-            .execute(AdapterAction::Deploy, &[])
+            .execute(AdapterAction::Deploy, &[], &AdapterExecContext::new())
             .expect("execute succeeds");
         assert_eq!(HIT.load(Ordering::SeqCst), 2);
     }

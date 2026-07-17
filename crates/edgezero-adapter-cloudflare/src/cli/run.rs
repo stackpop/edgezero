@@ -4,24 +4,28 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
+    self, find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::registry::AdapterExecContext;
 use walkdir::WalkDir;
 
 use super::TARGET_TRIPLE;
 
 /// # Errors
 /// Returns an error if the Cloudflare wrangler build command fails.
-pub(super) fn build(extra_args: &[String]) -> Result<PathBuf, String> {
-    let manifest =
-        find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+pub(super) fn build(
+    extra_args: &[String],
+    ctx: &AdapterExecContext<'_>,
+) -> Result<PathBuf, String> {
+    let manifest = find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args([
             "build",
             "--release",
@@ -32,7 +36,11 @@ pub(super) fn build(extra_args: &[String]) -> Result<PathBuf, String> {
                 .to_str()
                 .ok_or("invalid Cargo manifest path")?,
         ])
-        .args(extra_args)
+        .args(extra_args);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|err| format!("failed to run cargo build: {err}"))?;
     if !status.success() {
@@ -53,9 +61,8 @@ pub(super) fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 
 /// # Errors
 /// Returns an error if the Cloudflare wrangler deploy command fails.
-pub(super) fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest =
-        find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+pub(super) fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let manifest = find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
@@ -63,10 +70,15 @@ pub(super) fn deploy(extra_args: &[String]) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "invalid wrangler config path".to_owned())?;
 
-    let status = Command::new("wrangler")
+    let mut command = Command::new("wrangler");
+    command
         .args(["deploy", "--config", config])
         .args(extra_args)
-        .current_dir(manifest_dir)
+        .current_dir(manifest_dir);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
     if !status.success() {
@@ -78,9 +90,8 @@ pub(super) fn deploy(extra_args: &[String]) -> Result<(), String> {
 
 /// # Errors
 /// Returns an error if the Cloudflare wrangler dev command fails.
-pub(super) fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest =
-        find_wrangler_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+pub(super) fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let manifest = find_wrangler_manifest(cli_support::discovery_base(ctx)?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "wrangler manifest has no parent directory".to_owned())?;
@@ -88,10 +99,15 @@ pub(super) fn serve(extra_args: &[String]) -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "invalid wrangler config path".to_owned())?;
 
-    let status = Command::new("wrangler")
+    let mut command = Command::new("wrangler");
+    command
         .args(["dev", "--config", config])
         .args(extra_args)
-        .current_dir(manifest_dir)
+        .current_dir(manifest_dir);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|err| format!("failed to run wrangler CLI: {err}"))?;
     if !status.success() {

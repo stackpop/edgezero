@@ -1462,7 +1462,8 @@ mod tests {
     use crate::args::ProvisionArgs;
     use crate::test_support::{EnvOverride, PROVISION_MANIFEST, manifest_guard};
     use edgezero_adapter::registry::{
-        Adapter, AdapterAction, ProvisionMode, ProvisionOutcome, get_adapter, register_adapter,
+        Adapter, AdapterAction, AdapterExecContext, ProvisionMode, ProvisionOutcome, get_adapter,
+        register_adapter,
     };
     use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
     use std::borrow::Cow;
@@ -1563,7 +1564,12 @@ serve = "echo"
             &["service_id"]
         }
 
-        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+        fn execute(
+            &self,
+            _action: AdapterAction,
+            _args: &[String],
+            _ctx: &AdapterExecContext<'_>,
+        ) -> Result<(), String> {
             Ok(())
         }
 
@@ -1660,7 +1666,12 @@ serve = "echo"
         reason = "the no-fields fake overrides execute/name/provision (required by the trait) and inherits every defaulted method — including deployed_fields, whose default `&[]` is the intent this fake exercises"
     )]
     impl Adapter for NoFieldsFakeAdapter {
-        fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+        fn execute(
+            &self,
+            _action: AdapterAction,
+            _args: &[String],
+            _ctx: &AdapterExecContext<'_>,
+        ) -> Result<(), String> {
             Ok(())
         }
 

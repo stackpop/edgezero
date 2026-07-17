@@ -1,4 +1,4 @@
-use edgezero_adapter::registry::{self as adapter_registry, AdapterAction};
+use edgezero_adapter::registry::{self as adapter_registry, AdapterAction, AdapterExecContext};
 use edgezero_core::manifest::{Manifest, ManifestLoader, ResolvedEnvironment};
 
 use std::env;
@@ -46,36 +46,96 @@ impl From<Action> for AdapterAction {
     }
 }
 
-fn apply_environment(
+/// Resolve every env override for a spawned child into an owned
+/// `(key, value)` list, then assert the adapter's required secrets
+/// are actually reachable.
+///
+/// Single source of truth for BOTH dispatch paths -- `run_shell`
+/// (manifest `[adapters.<name>.commands].<action>`) and the registry
+/// fallback that hands the result to `Adapter::execute` via
+/// `AdapterExecContext`. Before this was extracted, only `run_shell`
+/// applied any of it and the fallback silently ran with none of it
+/// (PR #287 review round 9, blocking #3).
+///
+/// Precedence, high to low:
+///   1. Parent env -- an operator's `KEY=v edgezero serve` wins over
+///      everything. `Command` has no inherit-then-override per key, so
+///      a parent-set key is simply never pushed here and the child
+///      inherits it untouched.
+///   2. The `.env` overlay (Spin's `<spin_dir>/.env`, Axum's
+///      `.edgezero/.env`).
+///   3. Manifest `[environment.variables]` -- a DEFAULT, not an
+///      override.
+///   4. Manifest `[adapters.<name>.adapter]` host/port bind hint.
+///
+/// Pushed low-to-high with last-wins so the ordering above reads
+/// directly off the call order below.
+fn build_child_env(
     adapter_name: &str,
-    environment: &ResolvedEnvironment,
-    command: &mut Command,
-) -> Result<(), String> {
-    // Precedence: a `[environment.variables].value` in the manifest
-    // is a DEFAULT, not an override. If the parent process already
-    // exported the same env var (e.g. an operator ran
-    // `EDGEZERO__ADAPTER__HOST=parent-env edgezero build`), the
-    // parent value must reach the child command unchanged. Calling
-    // `cmd.env(...)` unconditionally would shadow the parent value;
-    // `Command` doesn't inherit-then-override per key, so we check
-    // `env::var_os` first and skip the explicit set when the parent
-    // already has one. This mirrors the precedence the plan + the
-    // typed-config env-overlay docs both promise.
-    for binding in &environment.variables {
-        if let Some(value) = &binding.value {
-            if env::var_os(&binding.env).is_some() {
-                continue;
+    environment: Option<&ResolvedEnvironment>,
+    adapter_bind: (Option<String>, Option<u16>),
+    env_overlay: &[(String, String)],
+) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |key: &str, value: String| {
+        // Parent wins: never shadow a key the operator exported.
+        if env::var_os(key).is_some() {
+            return;
+        }
+        out.retain(|(existing, _)| existing != key);
+        out.push((key.to_owned(), value));
+    };
+
+    let (manifest_host, manifest_port) = adapter_bind;
+    if let Some(host) = manifest_host {
+        push("EDGEZERO__ADAPTER__HOST", host);
+    }
+    if let Some(port) = manifest_port {
+        push("EDGEZERO__ADAPTER__PORT", port.to_string());
+    }
+
+    if let Some(env) = environment {
+        for binding in &env.variables {
+            if let Some(value) = &binding.value {
+                push(&binding.env, value.clone());
             }
-            command.env(&binding.env, value);
         }
     }
 
-    let mut missing = Vec::new();
-    for binding in &environment.secrets {
-        if env::var_os(&binding.env).is_none() {
-            missing.push(format!("{} (env `{}`)", binding.name, binding.env));
-        }
+    for (key, value) in env_overlay {
+        push(key, value.clone());
     }
+
+    if let Some(env) = environment {
+        assert_required_secrets_present(adapter_name, env, &out)?;
+    }
+    Ok(out)
+}
+
+/// Every `[environment.secrets]` binding must resolve to a value the
+/// child will actually see.
+///
+/// The check used to consult ONLY the parent process env, and ran
+/// before the `.env` overlay was applied to the command -- so a secret
+/// the provision-written `.env` file supplied was still reported
+/// missing, and `edgezero serve` refused to start on a correctly
+/// provisioned project (PR #287 review round 9, #7). Resolution order
+/// is now the same one the child sees: parent env, or anything
+/// `build_child_env` resolved for it.
+fn assert_required_secrets_present(
+    adapter_name: &str,
+    environment: &ResolvedEnvironment,
+    resolved: &[(String, String)],
+) -> Result<(), String> {
+    let missing: Vec<String> = environment
+        .secrets
+        .iter()
+        .filter(|binding| {
+            env::var_os(&binding.env).is_none()
+                && !resolved.iter().any(|(key, _)| key == &binding.env)
+        })
+        .map(|binding| format!("{} (env `{}`)", binding.name, binding.env))
+        .collect();
 
     if !missing.is_empty() {
         return Err(format!(
@@ -153,7 +213,32 @@ pub(crate) fn execute_with_env_overlay(
         }
     })?;
 
-    adapter.execute(AdapterAction::from(action), adapter_args)
+    // Registry fallback: no manifest `commands.<action>`, so the
+    // adapter spawns its own vendor CLI. Hand it the SAME cwd + child
+    // env the shell path above would have applied, otherwise a `serve`
+    // here starts with none of the `.env` secrets and resolves its
+    // manifest from the process cwd (PR #287 review round 9, #3).
+    let (cwd, child_env): (Option<&Path>, Vec<(String, String)>) = match manifest_loader {
+        Some(loader) => {
+            let root = loader.manifest().root();
+            let env = loader.manifest().environment_for(adapter_name);
+            let adapter_bind = adapter_bind_from_manifest(loader.manifest(), adapter_name);
+            let resolved = build_child_env(adapter_name, Some(&env), adapter_bind, env_overlay)?;
+            (root, resolved)
+        }
+        // No manifest at all: still forward any overlay the caller
+        // passed (today `run_serve` only builds one from a manifest, so
+        // this is empty in practice, but the plumbing stays honest).
+        None => (
+            None,
+            build_child_env(adapter_name, None, (None, None), env_overlay)?,
+        ),
+    };
+    let mut ctx = AdapterExecContext::new().with_env(&child_env);
+    if let Some(root) = cwd {
+        ctx = ctx.with_cwd(root);
+    }
+    adapter.execute(AdapterAction::from(action), adapter_args, &ctx)
 }
 
 fn manifest_command<'manifest>(
@@ -223,47 +308,16 @@ fn run_shell(
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(&full_command).current_dir(cwd);
 
-    // Precedence (high to low) for `EDGEZERO__ADAPTER__HOST/PORT` on the
-    // subprocess:
-    //   1. Parent env — propagated through std::process::Command's default
-    //      inheritance unless we explicitly `cmd.env()` over it.
-    //   2. Manifest `[environment.variables].<EDGEZERO__ADAPTER__...>` —
-    //      `apply_environment` writes the explicit per-adapter value.
-    //   3. Manifest `[adapters.<name>.adapter] host`/`port` — adapter-
-    //      specific bind hint.
-    // We inject the bind hint FIRST so `apply_environment` (manifest
-    // variable) can overwrite it, then skip the bind injection entirely
-    // when the parent env already has the canonical variable so the
-    // user's CLI-invocation override wins over everything.
-    let (manifest_host, manifest_port) = adapter_bind;
-    if let Some(host) = manifest_host
-        && env::var_os("EDGEZERO__ADAPTER__HOST").is_none()
-    {
-        cmd.env("EDGEZERO__ADAPTER__HOST", host);
-    }
-    if let Some(port) = manifest_port
-        && env::var_os("EDGEZERO__ADAPTER__PORT").is_none()
-    {
-        cmd.env("EDGEZERO__ADAPTER__PORT", port.to_string());
-    }
-
-    if let Some(env) = environment {
-        apply_environment(adapter_name, &env, &mut cmd)?;
-    }
-
-    // `.env` file overlay (Spin's `<spin_dir>/.env`, Axum's
-    // `.edgezero/.env`). Threaded through `Command::env` — the
-    // child inherits these values at exec time; the parent's
-    // shared `environ` is untouched. Existing-env-wins: the
-    // parent process already exported KEY, keep the parent
-    // value (same rule as the manifest `[environment.variables]`
-    // block above and the adapter bind hint above).
-    for (key, value) in env_overlay {
-        if env::var_os(key.as_str()).is_some() {
-            continue;
-        }
-        cmd.env(key, value);
-    }
+    // Precedence + the required-secrets assertion both live in
+    // `build_child_env` so this path and the registry fallback in
+    // `execute_with_env_overlay` cannot drift apart.
+    let child_env = build_child_env(
+        adapter_name,
+        environment.as_ref(),
+        adapter_bind,
+        env_overlay,
+    )?;
+    cmd.envs(child_env);
 
     let status = cmd
         .status()
@@ -300,14 +354,19 @@ fn shell_join(args: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResolvedEnvironment, apply_environment};
+    use super::{ResolvedEnvironment, build_child_env};
     use crate::test_support::manifest_guard;
     use edgezero_core::manifest::ResolvedEnvironmentBinding;
     use edgezero_core::test_env::EnvOverride;
-    use std::process::Command;
+
+    fn value_for<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter()
+            .find(|(existing, _)| existing == key)
+            .map(|(_, value)| value.as_str())
+    }
 
     #[test]
-    fn apply_environment_sets_defaults_and_checks_secrets() {
+    fn build_child_env_sets_defaults_and_checks_secrets() {
         let _lock = manifest_guard().lock().expect("env lock");
         // Unset for the missing-secret path; restores the parent value on drop.
         let _unset = EnvOverride::remove("EDGEZERO_TEST_SECRET");
@@ -329,28 +388,54 @@ mod tests {
 
         let adapter_name = "test-adapter";
 
-        let result = apply_environment(adapter_name, &env, &mut Command::new("echo"));
+        // Neither parent env nor overlay supplies the secret -> error.
+        let result = build_child_env(adapter_name, Some(&env), (None, None), &[]);
         assert!(result.is_err());
 
         let _secret = EnvOverride::set("EDGEZERO_TEST_SECRET", "set");
-        let mut cmd = Command::new("echo");
-        apply_environment(adapter_name, &env, &mut cmd).expect("environment applied");
-        let has_var = cmd.get_envs().any(|(key, value)| {
-            key.to_str() == Some("EDGEZERO_TEST_BASE")
-                && value.and_then(|val| val.to_str()) == Some("https://demo")
-        });
-        assert!(has_var);
+        let resolved =
+            build_child_env(adapter_name, Some(&env), (None, None), &[]).expect("env resolved");
+        assert_eq!(
+            value_for(&resolved, "EDGEZERO_TEST_BASE"),
+            Some("https://demo")
+        );
     }
 
     #[test]
-    fn apply_environment_defers_to_parent_env_when_already_set() {
+    fn build_child_env_treats_env_overlay_as_a_secret_source() {
+        // Regression (PR #287 review round 9, #7): required secrets
+        // were checked against the parent env only, BEFORE the `.env`
+        // overlay was applied -- so a secret supplied purely by the
+        // provision-written `.env` file was falsely reported missing
+        // and `edgezero serve` refused to start.
+        const SECRET: &str = "EDGEZERO_TEST_OVERLAY_SECRET";
+        let _lock = manifest_guard().lock().expect("env lock");
+        let _unset = EnvOverride::remove(SECRET);
+
+        let env = ResolvedEnvironment {
+            secrets: vec![ResolvedEnvironmentBinding {
+                description: None,
+                env: SECRET.into(),
+                name: "Overlay-Secret".into(),
+                value: None,
+            }],
+            variables: vec![],
+        };
+        let overlay = vec![(SECRET.to_owned(), "from_dotenv".to_owned())];
+
+        let resolved = build_child_env("test-adapter", Some(&env), (None, None), &overlay)
+            .expect("overlay must satisfy the required secret");
+        assert_eq!(value_for(&resolved, SECRET), Some("from_dotenv"));
+    }
+
+    #[test]
+    fn build_child_env_defers_to_parent_env_when_already_set() {
         // Manifest `[environment.variables].value` is a DEFAULT.
         // When the operator exports the same env var in the parent
         // shell (e.g. `EDGEZERO__ADAPTER__HOST=parent edgezero build`),
-        // the parent value must win -- the manifest default must
-        // not stomp it. Without the precedence guard, `cmd.env(...)`
-        // would inject the manifest value and the parent override
-        // would be lost.
+        // the parent value must win -- the manifest default must not
+        // stomp it. The resolved list must therefore NOT carry the key
+        // (the child inherits the parent value via the OS env).
         const KEY: &str = "EDGEZERO_TEST_PARENT_WINS";
         let _lock = manifest_guard().lock().expect("env lock");
         let _parent = EnvOverride::set(KEY, "from_parent_shell");
@@ -365,24 +450,17 @@ mod tests {
             }],
         };
 
-        let mut cmd = Command::new("echo");
-        apply_environment("test-adapter", &env, &mut cmd).expect("apply env");
-
-        // The child's explicitly-set envs are what `Command::env`
-        // recorded. We DID NOT call it for this key, so it should
-        // not appear in `get_envs`. Instead the child inherits the
-        // parent's value via the OS env (verified separately by
-        // env::var_os in the production path).
-        let injected = cmd.get_envs().any(|(key, _)| key.to_str() == Some(KEY));
+        let resolved =
+            build_child_env("test-adapter", Some(&env), (None, None), &[]).expect("env resolved");
         assert!(
-            !injected,
+            value_for(&resolved, KEY).is_none(),
             "manifest default must NOT be injected when parent env is already set; \
              parent value would otherwise be shadowed"
         );
     }
 
     #[test]
-    fn apply_environment_uses_manifest_default_when_parent_env_unset() {
+    fn build_child_env_uses_manifest_default_when_parent_env_unset() {
         // Mirror of the above: when the parent shell has NOT set the
         // env var, the manifest default fills it in.
         const KEY: &str = "EDGEZERO_TEST_MANIFEST_FILLS";
@@ -399,15 +477,11 @@ mod tests {
             }],
         };
 
-        let mut cmd = Command::new("echo");
-        apply_environment("test-adapter", &env, &mut cmd).expect("apply env");
-
-        let injected = cmd.get_envs().any(|(key, value)| {
-            key.to_str() == Some(KEY)
-                && value.and_then(|val| val.to_str()) == Some("from_manifest_default")
-        });
-        assert!(
-            injected,
+        let resolved =
+            build_child_env("test-adapter", Some(&env), (None, None), &[]).expect("env resolved");
+        assert_eq!(
+            value_for(&resolved, KEY),
+            Some("from_manifest_default"),
             "manifest default must fill the slot when parent env is unset"
         );
     }

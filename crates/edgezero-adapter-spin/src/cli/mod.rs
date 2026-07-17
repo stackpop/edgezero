@@ -7,9 +7,9 @@ use ctor::ctor;
 use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
-    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
-    register_adapter,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterExecContext, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -119,7 +119,12 @@ const SPIN_INSTALL_HINT: &str = "install the Spin CLI (https://spinframework.dev
 struct SpinCliAdapter;
 
 impl Adapter for SpinCliAdapter {
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(
+        &self,
+        action: AdapterAction,
+        args: &[String],
+        ctx: &AdapterExecContext<'_>,
+    ) -> Result<(), String> {
         match action {
             // `spin cloud {login|logout|info}` is the native sign-in
             // surface for Fermyon Cloud. EdgeZero stores no
@@ -134,12 +139,12 @@ impl Adapter for SpinCliAdapter {
                 run_native_cli("spin", &["cloud", "info"], SPIN_INSTALL_HINT)
             }
             AdapterAction::Build => {
-                let artifact = run::build(args)?;
+                let artifact = run::build(args, ctx)?;
                 log::info!("[edgezero] Spin build complete -> {}", artifact.display());
                 Ok(())
             }
-            AdapterAction::Deploy => run::deploy(args),
-            AdapterAction::Serve => run::serve(args),
+            AdapterAction::Deploy => run::deploy(args, ctx),
+            AdapterAction::Serve => run::serve(args, ctx),
             other => Err(format!("spin adapter does not support {other:?}")),
         }
     }
@@ -1010,7 +1015,12 @@ mod tests {
             reason = "StubAdapter exercises only the trait default for validate_typed_secrets"
         )]
         impl Adapter for StubAdapter {
-            fn execute(&self, _action: AdapterAction, _args: &[String]) -> Result<(), String> {
+            fn execute(
+                &self,
+                _action: AdapterAction,
+                _args: &[String],
+                _ctx: &AdapterExecContext<'_>,
+            ) -> Result<(), String> {
                 Ok(())
             }
             fn name(&self) -> &'static str {

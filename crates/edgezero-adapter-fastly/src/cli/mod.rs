@@ -4,9 +4,9 @@ use ctor::ctor;
 use edgezero_adapter::cli_support;
 use edgezero_adapter::cli_support::run_native_cli;
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
-    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
-    register_adapter,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterExecContext, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -166,7 +166,12 @@ impl Adapter for FastlyCliAdapter {
         &["service_id"]
     }
 
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(
+        &self,
+        action: AdapterAction,
+        args: &[String],
+        ctx: &AdapterExecContext<'_>,
+    ) -> Result<(), String> {
         match action {
             // `fastly profile {create|delete|list}` is the native
             // sign-in surface for Fastly Compute. EdgeZero stores no
@@ -181,12 +186,12 @@ impl Adapter for FastlyCliAdapter {
                 run_native_cli("fastly", &["profile", "list"], FASTLY_INSTALL_HINT)
             }
             AdapterAction::Build => {
-                let artifact = run::build(args)?;
+                let artifact = run::build(args, ctx)?;
                 log::info!("[edgezero] Fastly build complete -> {}", artifact.display());
                 Ok(())
             }
-            AdapterAction::Deploy => run::deploy(args),
-            AdapterAction::Serve => run::serve(args),
+            AdapterAction::Deploy => run::deploy(args, ctx),
+            AdapterAction::Serve => run::serve(args, ctx),
             other => Err(format!("fastly adapter does not support {other:?}")),
         }
     }

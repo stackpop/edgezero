@@ -3,10 +3,33 @@
     reason = "helpers consumed conditionally via the `cli` feature in adapter crates"
 )]
 
+use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::registry::AdapterExecContext;
+
+/// Directory an adapter's manifest discovery should start from.
+///
+/// When the CLI reached the registry fallback with a manifest loaded,
+/// [`AdapterExecContext::cwd`] carries the project root; the adapter
+/// must seed discovery there rather than from the process cwd, or a
+/// `serve`/`build` invoked from elsewhere resolves the wrong project
+/// (PR #287 review round 9, blocking #3). With no context (empty ctx
+/// / no manifest) it falls back to the process cwd, preserving the
+/// pre-context behaviour.
+///
+/// # Errors
+/// Propagates a failure to read the process cwd.
+#[inline]
+pub fn discovery_base(ctx: &AdapterExecContext<'_>) -> Result<PathBuf, String> {
+    match ctx.cwd() {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => env::current_dir().map_err(|err| err.to_string()),
+    }
+}
 
 /// Walks up the directory tree looking for `manifest_name` alongside a `Cargo.toml`.
 #[inline]

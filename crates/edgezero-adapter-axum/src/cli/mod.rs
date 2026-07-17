@@ -7,9 +7,9 @@ use ctor::ctor;
 use edgezero_adapter::cli_support;
 use edgezero_adapter::env_file::{EDGEZERO_PROVISION_HEADER, append_lines_dedup_with_header};
 use edgezero_adapter::registry::{
-    Adapter, AdapterAction, AdapterDeployedState, AdapterPushContext, ProvisionMode,
-    ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId, TypedSecretEntry,
-    register_adapter,
+    Adapter, AdapterAction, AdapterDeployedState, AdapterExecContext, AdapterPushContext,
+    ProvisionMode, ProvisionOutcome, ProvisionStores, ReadConfigEntry, ResolvedStoreId,
+    TypedSecretEntry, register_adapter,
 };
 use edgezero_adapter::scaffold::{
     AdapterBlueprint, AdapterFileSpec, CommandTemplates, DependencySpec, LoggingDefaults,
@@ -109,7 +109,12 @@ static AXUM_ADAPTER: AxumCliAdapter = AxumCliAdapter;
 struct AxumCliAdapter;
 
 impl Adapter for AxumCliAdapter {
-    fn execute(&self, action: AdapterAction, args: &[String]) -> Result<(), String> {
+    fn execute(
+        &self,
+        action: AdapterAction,
+        args: &[String],
+        ctx: &AdapterExecContext<'_>,
+    ) -> Result<(), String> {
         match action {
             // The axum adapter is the in-process native dev server —
             // there is no remote auth provider to sign in/out of.
@@ -120,9 +125,9 @@ impl Adapter for AxumCliAdapter {
                 );
                 Ok(())
             }
-            AdapterAction::Build => run::build(args),
+            AdapterAction::Build => run::build(args, ctx),
             AdapterAction::Deploy => run::deploy(args),
-            AdapterAction::Serve => run::serve(args),
+            AdapterAction::Serve => run::serve(args, ctx),
             other => Err(format!("axum adapter does not support {other:?}")),
         }
     }

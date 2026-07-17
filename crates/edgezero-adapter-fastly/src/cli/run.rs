@@ -4,23 +4,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use edgezero_adapter::cli_support::{
-    find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
+    self, find_manifest_upwards, find_workspace_root, path_distance, read_package_name,
 };
+use edgezero_adapter::registry::AdapterExecContext;
 use walkdir::WalkDir;
 
 /// # Errors
 /// Returns an error if the Fastly CLI build command fails.
 #[inline]
-pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
-    let manifest =
-        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+pub fn build(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<PathBuf, String> {
+    let manifest = find_fastly_manifest(cli_support::discovery_base(ctx)?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
     let cargo_manifest = manifest_dir.join("Cargo.toml");
     let crate_name = read_package_name(&cargo_manifest)?;
 
-    let status = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args([
             "build",
             "--release",
@@ -31,7 +32,11 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
                 .to_str()
                 .ok_or("invalid Cargo manifest path")?,
         ])
-        .args(extra_args)
+        .args(extra_args);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|err| format!("failed to run cargo build: {err}"))?;
     if !status.success() {
@@ -53,17 +58,21 @@ pub fn build(extra_args: &[String]) -> Result<PathBuf, String> {
 /// # Errors
 /// Returns an error if the Fastly CLI deploy command fails.
 #[inline]
-pub fn deploy(extra_args: &[String]) -> Result<(), String> {
-    let manifest =
-        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+pub fn deploy(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let manifest = find_fastly_manifest(cli_support::discovery_base(ctx)?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
 
-    let status = Command::new("fastly")
+    let mut command = Command::new("fastly");
+    command
         .args(["compute", "deploy"])
         .args(extra_args)
-        .current_dir(manifest_dir)
+        .current_dir(manifest_dir);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
@@ -76,17 +85,21 @@ pub fn deploy(extra_args: &[String]) -> Result<(), String> {
 /// # Errors
 /// Returns an error if the Fastly CLI serve command (Viceroy) fails.
 #[inline]
-pub fn serve(extra_args: &[String]) -> Result<(), String> {
-    let manifest =
-        find_fastly_manifest(env::current_dir().map_err(|err| err.to_string())?.as_path())?;
+pub fn serve(extra_args: &[String], ctx: &AdapterExecContext<'_>) -> Result<(), String> {
+    let manifest = find_fastly_manifest(cli_support::discovery_base(ctx)?.as_path())?;
     let manifest_dir = manifest
         .parent()
         .ok_or_else(|| "fastly manifest has no parent directory".to_owned())?;
 
-    let status = Command::new("fastly")
+    let mut command = Command::new("fastly");
+    command
         .args(["compute", "serve"])
         .args(extra_args)
-        .current_dir(manifest_dir)
+        .current_dir(manifest_dir);
+    for (key, value) in ctx.env() {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|err| format!("failed to run fastly CLI: {err}"))?;
     if !status.success() {
