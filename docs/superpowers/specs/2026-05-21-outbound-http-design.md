@@ -1160,6 +1160,12 @@ pub struct DispatchBudget {
 // must stay independently unit-testable and free of platform-shaped code.) The
 // pseudocode below reads `let inputs = req.budget_inputs();` then `inputs.timeout` /
 // `inputs.deadline` — **never** `req.timeout` (field) or `req.timeout()` (setter).
+// Lint contract (workspace denies `clippy::restriction`): public items need
+// `#[inline]` (`missing_inline_in_public_items`); no single-char idents
+// (`min_ident_chars`) — hence `duration`/`candidate`, never `d`; no bare arithmetic
+// (`arithmetic_side_effects`) — hence `checked_add`; no `expect`/`unwrap`
+// (`expect_used`/`unwrap_used`); items alphabetical (`arbitrary_source_item_ordering`).
+#[inline]
 pub fn dispatch_budget(
     req: &OutboundRequest,
     now: web_time::Instant,
@@ -1181,8 +1187,8 @@ pub fn dispatch_budget(
     //     *before* the add, so the addition itself never overflows in practice
     //     (now + 7 days is well within Instant range). checked_add on the
     //     clamped value is belt-and-suspenders.
-    let saturating = |dur: Duration| -> Deadline {
-        let clamped = dur.min(DEADLINE_FAR_FUTURE);
+    let saturating = |duration: Duration| -> Deadline {
+        let clamped = duration.min(DEADLINE_FAR_FUTURE);
         let inst = now.checked_add(clamped).unwrap_or(now);   // last-resort: now (immediate)
         Deadline::at_instant(inst)
     };
@@ -2530,9 +2536,20 @@ gate must therefore branch on the action, not gate unconditionally).
 > gate placed only on the bundled path is silently skipped by every typed CLI. The gate
 > must be a **shared inner operation** both entry points call (e.g. a private
 > `gated_validate(..)` invoked by both `run_config_validate` and
-> `run_config_validate_typed`), not a check bolted onto one. The same applies to
-> push/diff (typed vs bundled). Any bare `run_config_*` reference below or in §5.4 / §7
-> means "the shared gated operation behind both the typed and bundled entry points."
+> `run_config_validate_typed`), not a check bolted onto one.
+>
+> **The three config commands are NOT symmetric — do not generalize the shared-op rule
+> to all of them.** Per-command, precisely:
+>
+> | Command | Bundled entry | Typed entry | Gate |
+> | --- | --- | --- | --- |
+> | `config push` | `run_config_push` — a **v1 stub that returns `Err`**; it performs no writeback, so there is nothing to gate | `run_config_push_typed` — the real writeback | **Gate the TYPED path only.** No shared op is needed: gating an erroring stub enforces nothing. |
+> | `config validate` | `run_config_validate` | `run_config_validate_typed` — **called directly by generated CLIs** | **Shared inner op** (`gated_validate`) that BOTH entries call — this is the only command where a shared op is required, because both paths really validate. |
+> | `config diff` | — | `run_config_diff_typed` | **Never gated** (read-only, exempt by class). |
+>
+> So a bare `run_config_push` reference in §5.4 / §7 means **`run_config_push_typed`**;
+> a bare `run_config_validate` reference means **the shared `gated_validate` op behind
+> both entries**; `config diff` is never a gate site.
 
 ```rust
 // 1. crates/edgezero-cli/src/adapter.rs — inside execute(..), BEFORE manifest_command
@@ -2571,7 +2588,11 @@ where C: DeserializeOwned + Serialize + Validate + AppConfigMeta {
 //    (bundled + typed) must route through ONE shared gated op, or the typed path —
 //    which generated CLIs call directly — silently skips enforcement.
 fn gated_validate(ctx: &ValidationContext) -> Result<(), String> {
-    for adapter_name in ctx.manifest().configured_adapter_names() {
+    // `Manifest::adapters` is a `BTreeMap<String, ManifestAdapter>` (manifest.rs) —
+    // iterate its keys directly. (An earlier draft called a
+    // `configured_adapter_names()` accessor that does not exist anywhere.) BTreeMap
+    // keys are ordered, so the failure reported is deterministic across runs.
+    for adapter_name in ctx.manifest().adapters.keys() {
         ensure_capabilities(adapter_name, Some(ctx.manifest()))?;                   // site 4
     }
     do_validation_work(ctx)
@@ -2665,7 +2686,7 @@ pub trait Hooks {
 
     /// Parsed + finalized, cached view of the above.
     ///
-    /// **The default MUST be `None` — it must NOT hold a cache.** A `static` declared
+    /// **The default MUST be `Absent` — it must NOT hold a cache.** A `static` declared
     /// inside a trait default method body is **one item shared by every implementor**,
     /// not one per `Self` (items in generic fns are not monomorphized — Rust Reference).
     /// A caching default would therefore let the FIRST app to call `manifest()`
@@ -2673,31 +2694,82 @@ pub trait Hooks {
     /// manifest. Proven: two impls relying on such a default both returned the first
     /// impl's value. The cache lives in each **macro-generated impl** instead (below),
     /// where the `static` is a distinct item per impl.
-    fn manifest() -> Option<&'static Manifest> { None }
+    fn manifest() -> BakedManifest { BakedManifest::Absent }
+}
+
+// edgezero-core/src/manifest.rs
+//
+// THREE states, not `Option`. `Option<&Manifest>` conflates "this app has no baked
+// manifest" (legitimate: a hand-written `Hooks`, no macro → no capability contract →
+// proceed) with "the baked manifest is CORRUPT" (an adapter/macro contract bug). If
+// both collapse to `None` and `ensure_capabilities` treats `None` as permission to
+// proceed, a malformed contract **silently disables required-capability enforcement**
+// — it fails OPEN. This enum makes that unrepresentable.
+#[derive(Debug, Clone, Copy)]
+pub enum BakedManifest {
+    /// No `app!`-baked manifest (hand-written `Hooks`). No capability contract.
+    Absent,
+    /// Successfully parsed + finalized.
+    Present(&'static Manifest),
+    /// `manifest_json()` returned Some, but it did not parse/finalize. An
+    /// adapter/macro contract bug: the JSON came from `serde_json::to_string` on an
+    /// already-validated `Manifest`, so this is unreachable unless the macro is broken.
+    Malformed(&'static str),   // static reason, for the diagnostic
+}
+
+impl Manifest {
+    /// Parse baked JSON and rebuild derived state (`finalize`). Returns
+    /// `BakedManifest::Malformed` — never `Absent` — on failure, so a corrupt
+    /// contract can never be mistaken for "no contract".
+    pub fn from_baked_json(json: &'static str) -> BakedManifest { /* … */ }
 }
 
 // What `app!` GENERATES per app — each impl gets its OWN `manifest()` fn, hence its
-// OWN `static`, hence a genuinely per-app cache:
-impl Hooks for MyApp {
+// OWN `static`, hence a genuinely per-app cache.
+//
+// TWO requirements on the generated code:
+//  1. FULLY-QUALIFIED PATHS. This expands in the DOWNSTREAM crate, which may not have
+//     `Manifest` or `OnceLock` in scope (or may shadow them). Macro output must name
+//     `::edgezero_core::manifest::Manifest`, `::std::sync::OnceLock`, etc. — never a
+//     bare `Manifest`/`OnceLock`. (The snippet below is written qualified for exactly
+//     this reason; do not "tidy" it into short paths.)
+//  2. FAIL CLOSED on a malformed baked contract — see `BakedManifest` below.
+impl ::edgezero_core::app::Hooks for MyApp {
     fn manifest_json() -> Option<&'static str> { Some(r#"{…baked…}"#) }
-    fn manifest() -> Option<&'static Manifest> {
-        static CACHE: OnceLock<Option<Manifest>> = OnceLock::new();   // per-IMPL: distinct item
-        CACHE.get_or_init(|| Manifest::from_baked_json(Self::manifest_json()?)).as_ref()
+
+    fn manifest() -> ::edgezero_core::manifest::BakedManifest {
+        // per-IMPL: a distinct static item, because this fn is generated per impl.
+        static CACHE: ::std::sync::OnceLock<::edgezero_core::manifest::BakedManifest> =
+            ::std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| {
+            match <Self as ::edgezero_core::app::Hooks>::manifest_json() {
+                None => ::edgezero_core::manifest::BakedManifest::Absent,
+                Some(json) => ::edgezero_core::manifest::Manifest::from_baked_json(json),
+            }
+        })
     }
     // …routes/stores/etc…
 }
 
 // edgezero-core/src/manifest.rs — the accessor CANNOT parse+finalize itself, because
 // `Manifest::finalize()` is `pub(crate)` and the `app!`-generated `manifest()` lives in
-// the DOWNSTREAM crate, which can't reach it. Core exposes a public constructor:
+// the DOWNSTREAM crate, which can't reach it. Core owns the parse+finalize:
 impl Manifest {
-    /// Parse baked JSON and rebuild derived state (`finalize`). Returns `None` on a
-    /// parse failure (an adapter/macro contract bug — the JSON came from
-    /// `serde_json::to_string` on an already-validated Manifest).
-    pub fn from_baked_json(json: &'static str) -> Option<Manifest> {
-        let mut m: Manifest = serde_json::from_str(json).ok()?;
-        m.finalize();   // pub(crate) — reachable here, inside core
-        Some(m)
+    /// Parse baked JSON and rebuild derived state (`finalize`).
+    /// Returns `Malformed` — NEVER `Absent` — on failure, so a corrupt contract can
+    /// never be mistaken for "no contract" (fail closed, see `ensure_capabilities`).
+    pub fn from_baked_json(json: &'static str) -> BakedManifest {
+        // Leaked into a 'static: the parse happens once per process behind the
+        // generated per-impl OnceLock, and the result must outlive the call.
+        match serde_json::from_str::<Manifest>(json) {
+            Ok(mut manifest) => {
+                manifest.finalize();   // pub(crate) — reachable here, inside core
+                BakedManifest::Present(Box::leak(Box::new(manifest)))
+            }
+            Err(_) => BakedManifest::Malformed(
+                "baked manifest JSON did not parse (app! contract bug)",
+            ),
+        }
     }
 }
 ```
@@ -2728,10 +2800,16 @@ impl Manifest {
   is `None`, and a single core-global `OnceLock` is likewise rejected. *(This is a second,
   independent reason the macro must emit `manifest()` explicitly — beyond the denied
   `clippy::missing_trait_methods`.)*
-- **Failure mode:** `from_baked_json` returning `None` on parse failure is an
-  adapter/macro contract bug. `manifest()` returning `None` (hand-written `Hooks`, no
-  macro) means *no capability contract*, and `ensure_capabilities` short-circuits `Ok(())`
-  — the same "no manifest" policy already used in §3.5.3.
+- **Failure mode — FAIL CLOSED, and the two failures are distinct.** `manifest()`
+  returns a three-state `BakedManifest`, never an `Option`, because `Option` conflates
+  two opposite situations: `Absent` (hand-written `Hooks`, no macro → genuinely *no
+  capability contract* → `ensure_capabilities` short-circuits `Ok(())`, the same "no
+  manifest" policy as §3.5.3) versus `Malformed` (the JSON was baked but doesn't
+  parse → an `app!`/core contract bug). If both were `None` and `None` meant "proceed",
+  **a corrupt baked contract would silently disable required-capability enforcement** —
+  the gate would report success precisely when it can no longer verify anything.
+  `Malformed` therefore **hard-fails** with an actionable message. A gate that fails
+  open on unreadable input is worse than no gate.
 - **Test seam:** capability-gate failure tests drive `demo` with a **test-only `Hooks`
   impl** overriding `manifest_json()` to return crafted JSON (which then flows through
   the real `from_baked_json` + `finalize`) — no file, no macro re-expansion. This is why
@@ -2742,10 +2820,10 @@ impl Manifest {
 Commands **not** covered (and why):
 - `edgezero new` — generates source files; no adapter is selected, so capabilities
   cannot be checked. The scaffold itself is identical across adapters.
-- `edgezero auth status` when no manifest is present — `ensure_capabilities`
-  short-circuits `Ok(())` if `manifest_loader.is_none()`, which is the same
-  policy the registry-lookup path already uses for "no manifest, no capability
-  contract." Documented in the rustdoc.
+- `edgezero auth *` — **exempt by command class** (credential; §3.5.3 table), so the
+  gate never runs for it regardless of manifest presence. (Independently, a genuinely
+  absent manifest is `BakedManifest::Absent` ⇒ no capability contract ⇒ `Ok(())`; a
+  *malformed* one hard-fails. Documented in the rustdoc.)
 
 **Historical (pre-#269) shape — now superseded (PR #269 has merged to main):**
 Before #269 landed, `Command::{Build, Serve, Deploy, Dev}` all dispatched through
@@ -2757,16 +2835,33 @@ above, which is now the active topology. The wording in rounds 1–43 of the
 appendices reflects that pre-#269 shape and is retained as history.
 
 ```rust
-// NOTE: takes an already-parsed `&Manifest`, NOT a `ManifestLoader`. The `demo` gate
-// has no manifest *file* to load — it reads the manifest baked in by `app!` via
+// NOTE: takes an already-parsed manifest, NOT a `ManifestLoader`. The `demo` gate has
+// no manifest *file* to load — it reads the manifest baked in by `app!` via
 // `<App as Hooks>::manifest()` (see the demo row above). File-backed callers pass
-// `loader.map(|l| l.manifest())`; `demo` passes the baked one. `None` = no manifest,
-// hence no capability contract → `Ok(())`.
+// `Present`/`Absent` from their loader; `demo` passes the baked `BakedManifest`.
+//
+// FAIL CLOSED. `Absent` (no contract) proceeds; `Malformed` MUST NOT — an earlier
+// draft used `Option` and treated `None` as permission to proceed, so a corrupt baked
+// contract silently disabled required-capability enforcement. A capability gate that
+// fails open on malformed input is worse than no gate: it reports success.
 fn ensure_capabilities(
     adapter_name: &str,
-    manifest: Option<&Manifest>,
+    manifest: BakedManifest,
 ) -> Result<(), String> {
-    let Some(manifest) = manifest else { return Ok(()) };
+    let manifest = match manifest {
+        // No manifest ⇒ no capability contract to enforce. Legitimate.
+        BakedManifest::Absent => return Ok(()),
+        // Corrupt contract ⇒ we cannot know what was required. Refuse.
+        BakedManifest::Malformed(reason) => {
+            return Err(format!(
+                "capability check aborted: {reason}. This is an EdgeZero/app! contract \
+                 bug — the baked manifest is unreadable, so required capabilities \
+                 cannot be verified. Refusing to proceed rather than silently skipping \
+                 enforcement."
+            ));
+        }
+        BakedManifest::Present(manifest) => manifest,
+    };
     let caps = &manifest.capabilities;
     let Some(adapter) = registry::get_adapter(adapter_name) else {
         // Missing-from-registry policy (see §3.5.3 table). If the manifest
@@ -3448,8 +3543,10 @@ async fn send_all(
   than owning one. The **test seam** (§5.5) therefore exposes the *thread-local* map,
   not a client field.
 
-  The race-free protocol below reads "acquire the lock" as "take the `RefCell`
-  borrow"; it is uncontended by construction on a single-threaded guest:
+  The protocol below is written directly in terms of the session-map borrow. There is
+  no lock and no contention: the guest is single-threaded, so the borrow is uncontended
+  by construction. (Read any surviving "lock" phrasing in the appendices as the
+  superseded `Mutex` design.)
 
   1. Borrow the session map (`BACKENDS.with_borrow_mut(..)`).
   2. If the name maps to a stored entry `(stored_identity, cached)`:
@@ -3486,11 +3583,14 @@ async fn send_all(
      and **does not expose the registered backend's properties** to the guest
      for comparison.
 
-     Because the outer lock is held continuously through steps 2–4, no other
-     thread under this `FastlyOutboundClient` can have registered the name
-     without showing up in step 2. A `NameInUse` here therefore means the name
-     is registered by an **external party** (another component, a prior
-     session) — and since the SDK does not let us inspect that external
+     Because the session map is borrowed continuously through steps 2–4 — and the
+     Fastly guest is **single-threaded**, so nothing else can run in between — any
+     name *we* registered in this session necessarily showed up in step 2. A
+     `NameInUse` here therefore means the name was registered by an **external
+     party in this same session**: a static service backend, or another component
+     of this instance (**not** a prior session — dynamic-backend names are
+     session-scoped and a fresh session starts with a clean namespace). Since the
+     SDK does not let us inspect that external
      backend's properties, we cannot prove its identity matches ours. Fail
      closed with `EdgeError::internal("Fastly Backend::builder returned
      NameInUse for a name not in this adapter's collision map; the SDK does
@@ -3548,12 +3648,28 @@ async fn send_all(
   `pending.wait()` / `poll()` in the harvest loop and on the single-`send` path,
   replacing today's blanket `EdgeError::internal(..)` on `wait()` failure:
 
-  **Exhaustive per-variant policy — no catch-all.** The variant names below are the
-  real `fastly` 0.12.1 enums (`backend::builder::BackendCreationError`,
-  `http::request::SendErrorCause`); match them exhaustively so a future SDK variant is
-  a compile error rather than a silent 502. **A blanket "anything else → 502" is
-  wrong**: several variants mean *EdgeZero* violated its own invariant, and reporting
-  those as an upstream gateway failure hides an adapter bug behind a plausible 502.
+  **Per-variant policy.** The variant names below are the real `fastly` 0.12.1 enums
+  (`backend::builder::BackendCreationError`, `http::request::SendErrorCause`). **A
+  blanket "anything else → 502" is wrong**: several variants mean *EdgeZero* violated
+  its own invariant, and reporting those as an upstream gateway failure hides an adapter
+  bug behind a plausible 502.
+
+  > **⚠️ The two enums have OPPOSITE properties — verified against the SDK source, and
+  > this drives both the code and the tests:**
+  >
+  > | | `BackendCreationError` | `SendErrorCause` |
+  > | --- | --- | --- |
+  > | `#[non_exhaustive]`? | **No** | **Yes** |
+  > | Exhaustively matchable by us? | **Yes** — omit a `_` arm so a future SDK variant is a **compile error** | **No** — a `_` arm is *mandatory*; new variants silently fall through |
+  > | Constructible in a test? | **Yes** (`PartialEq` too) | **No** |
+  >
+  > So: match `BackendCreationError` exhaustively (no `_`). For `SendErrorCause` an
+  > exhaustive match is **impossible** — an earlier draft's instruction to "match them
+  > exhaustively so a future variant is a compile error" is unachievable there, and the
+  > mandatory `_` arm is exactly why its default must be the *narrow* `Custom`-style
+  > 502 rather than a blanket. `SendError` is likewise unconstructible (private fields,
+  > no public ctor), though `SendError::root_cause() -> &SendErrorCause` lets the
+  > adapter read the cause. See *Send-stage test seam* below for how this is tested.
 
   **Stage 1 — `BackendCreationError` (registration):**
 
@@ -3579,14 +3695,47 @@ async fn send_all(
   | `InternalError(..)` | **`internal`** | **500** — SDK-internal runtime fault, not an upstream gateway failure. |
   | `Custom(..)` | `bad_gateway` | 502 — unknown/extension cause; the only defensible default, and it is *narrow* rather than a blanket. |
 
+  **Send-stage test seam — classification must NOT take `SendError`/`SendErrorCause`.**
+  Because neither type is constructible outside the SDK, a test cannot fabricate one, so
+  a §5.4 row demanding "one test per `SendErrorCause`" is **unwritable** against the SDK
+  types directly. Split classification in two:
+
+  ```rust
+  // 1. A locally-defined, CONSTRUCTIBLE classification of what went wrong.
+  //    Unit tests build these directly — no SDK types involved.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub(crate) enum SendFailure {
+      Timeout,           // DnsTimeout | ConnectionTimeout | HttpResponseTimeout
+      Transport,         // DnsError | Destination* | Connection{Refused,Terminated,LimitReached} | Tls*
+      UpstreamProtocol,  // HttpIncompleteResponse | Http*TooLarge | HttpStatusInvalid | Http2StreamError | ...
+      LocalInvariant,    // HttpRequestUriInvalid | HttpRequestCacheKeyInvalid | HttpCache* | InternalError
+      Unknown,           // Custom, and any future #[non_exhaustive] variant
+  }
+
+  // 2. The POLICY: pure, total, unit-testable, zero SDK dependency. This is what the
+  //    §5.4 rows assert — one case per SendFailure, constructed directly.
+  pub(crate) fn classify(failure: SendFailure) -> EdgeError { /* per the table above */ }
+
+  // 3. The BOUNDARY: the only code that touches the un-constructible SDK enum. A `_`
+  //    arm is MANDATORY (#[non_exhaustive]); it maps to `Unknown` -> narrow 502.
+  //    Thin and mechanical by design, because it is the one part unit tests can't reach.
+  fn cause_to_failure(cause: &SendErrorCause) -> SendFailure { /* match … , _ => Unknown */ }
+  ```
+
+  The §5.4 send-stage rows therefore assert **`classify(SendFailure::X)`** (Tier 1 —
+  pure, no adapter runtime needed), plus a Tier 3 Viceroy check that a *real* failure
+  produces the expected status end-to-end. The `cause_to_failure` map is covered only by
+  Tier 3 / review — that is an accepted, documented gap forced by `#[non_exhaustive]`,
+  not an oversight.
+
   **Consequence for the "internal is legal on only three paths" assertion (§5.4):** that
   claim is now **wrong** and must be widened — `internal` is also correct for the
   invariant-violation variants above. The §5.4 row asserts `internal` appears **only**
   for: (a) `BATCH_DISPATCH_SLACK_MAX` overshoot, (b) the unfilled-slot harvest
   invariant, (c) the `NameInUse` external-registration case, **(d) the
-  clamp/name/encoding `BackendCreationError` variants, and (e) the locally-invalid-request
-  / `InternalError` `SendErrorCause` variants** — all of which are EdgeZero-invariant
-  violations, which is exactly what `internal` is reserved for.
+  clamp/name/encoding `BackendCreationError` variants, and (e) `SendFailure::LocalInvariant`**
+  — all of which are EdgeZero-invariant violations, which is exactly what `internal` is
+  reserved for.
 
   **`DnsTimeout` is 504, not 502** — the one genuinely ambiguous cause. It names DNS
   (transport-shaped, which reads 502) but it **is a fired timer**, and the whole point
@@ -3607,12 +3756,14 @@ async fn send_all(
   `EdgeError::bad_gateway("Fastly dynamic backends are disabled on this service; enable them or declare static backends — see §4.3 'Service prerequisite'")`,
   so the operator gets an actionable message instead of a generic bad-gateway.
 
-  There is no `BackendSlot::Building` / `Failed` variant and no condvar — holding
-  the outer lock through the build means no other thread can observe an
-  intermediate state, so the race the round-34 review flagged is structurally
-  impossible. A per-name reservation with finer-grained locking is more
-  concurrent but only matters on multi-threaded hosts where the Fastly adapter
-  isn't used. It applies to:
+  There is no `BackendSlot::Building` / `Failed` variant, no condvar, and no lock —
+  the Fastly guest is **single-threaded**, so there is no concurrency for a state
+  machine to guard: nothing can observe an intermediate state because nothing else
+  runs while the borrow is held. The race the round-34 review flagged is structurally
+  impossible for that reason, not because of any synchronization. (Earlier drafts
+  reasoned about holding a `Mutex` across the host call and about finer-grained
+  per-name reservations; both are moot — see *Cache ownership*.) The protocol applies
+  to:
 
   - **`send_all`** — each slot looks up its name; if the name already maps to its own
     identity, reuse; if it maps to a *different* identity, fail closed with
@@ -3882,7 +4033,8 @@ service — this distinction is explicit so a green capability check is not misr
           if sent.checked_add(chunk.len()).is_none_or(|n| n > max_req) {
               return Err(EdgeError::bad_request("request body exceeded max_request_body_bytes"));
           }
-          sent += chunk.len();
+          // checked: bare `+=` trips `clippy::arithmetic_side_effects` (denied).
+          sent = sent.saturating_add(chunk.len());
           let unwritten = writer.write_all(chunk.to_vec()).await; // backpressure; cancellable
           if !unwritten.is_empty() {                              // reader gone (send failed/cancelled)
               return Err(EdgeError::bad_gateway("outbound upload stream closed by peer"));
@@ -4166,7 +4318,7 @@ async fn send_all_runs_requests_concurrently() {
 | `RequestContext::into_request()` after `body_bytes` poison: returns `Err(stored_err)`, not `Ok(Request<Body::empty()>)` — a permissive proxy-forward cannot mask a stricter middleware's poisoned read | yes | — | — |
 | Fastly + `outbound-http = required`: `ensure_capabilities` emits the dynamic-backends informational log | yes | — | — |
 | **Fastly stage 1 — `BackendCreationError` (registration).** `Backend::builder().finish()` returns a non-`NameInUse` creation error (dynamic backends `Disallowed` on the service; invalid/rejected backend config): adapter maps to **`bad_gateway` (502)**, NOT `internal`; the `Disallowed` branch carries the dedicated "enable dynamic backends" diagnostic (§4.3). **Only creation errors are asserted here** — a fake *builder* cannot produce DNS/TLS/connect branches, which do not occur at registration (see the stage-2 row) | — | yes | yes |
-| **Fastly stage 2 — `SendErrorCause` (the exchange).** DNS resolution failure, TLS/certificate failure, connection refused/reset, and any other transport cause → **`bad_gateway` (502)**; **timeout causes** (connect / first-byte / between-bytes timer fired) → **`gateway_timeout` (504)**. `internal` is **never** correct for a send-stage failure. Asserted against the `SendErrorCause` variants (host-side fake / Viceroy), **not** against the builder. Table-drive one case per cause so the 502-vs-504 split is pinned | — | yes | yes |
+| **Fastly stage 2 — send-failure policy, via the constructible `SendFailure` enum (§4.3).** Table-drive **one case per `SendFailure`**: `Timeout` → `gateway_timeout` (504); `Transport` and `UpstreamProtocol` → `bad_gateway` (502); **`LocalInvariant` → `internal` (500)** (an EdgeZero bug — mapping it to 502 would disguise it as an upstream failure); `Unknown` → `bad_gateway` (502). **Tier 1, pure** — `classify(SendFailure::X)` takes no SDK types, so no adapter runtime or fake is needed. This is deliberately NOT asserted against `SendErrorCause`/`SendError`: both are unconstructible outside the SDK (`#[non_exhaustive]` / private fields), so such a test cannot be written. The `cause_to_failure` boundary map is covered by Tier 3 only — a documented gap forced by `#[non_exhaustive]` | yes | — | yes |
 | **`DnsTimeout` is a TIMEOUT cause → 504, not 502** (§4.3 send-stage table). Explicit row because it is the one ambiguous cause: it names DNS (transport, 502-ish) but *is* a fired timer, and the fan-out caller retries timeouts differently from unreachable upstreams. Pinned so the mapping cannot drift | — | yes | yes |
 | Fastly `EdgeError::internal` is reserved for **EdgeZero-invariant violations only** — never for a genuine upstream/service failure. The test inspects the error chain for each Fastly `Err` and asserts `internal` appears **exactly** for: (a) `BATCH_DISPATCH_SLACK_MAX` overshoot, (b) `NameInUse` external-registration collision, (c) the unfilled-slot harvest invariant, (d) the clamp/name/encoding `BackendCreationError` variants (`ConnectTimeoutTooLarge`, `FirstByteTimeoutTooLarge`, `BetweenBytesTimeoutTooLarge`, `NameTooLong`, `EncodingError` — each means **our** clamp or naming scheme is broken), and (e) the locally-invalid-request / SDK-internal `SendErrorCause` variants (`HttpRequestUriInvalid`, `HttpRequestCacheKeyInvalid`, `HttpCacheApiUnsupported`, `HttpCacheLimitExceeded`, `InternalError`). Every other Fastly path is `bad_gateway`, `gateway_timeout`, or `bad_request`. **Regression guard:** an earlier draft mapped (d)/(e) to `bad_gateway`, which disguises an EdgeZero bug as an upstream 502 — the test must fail if any of them regresses to 502 | — | yes | yes |
 | `Deadline::after(Duration::MAX)` clamps to `DEADLINE_FAR_FUTURE = 7 days` (round 24, down from 365 d to stay under Fastly's u32-ms ceiling); subsequent `dispatch_budget` round-trip still produces a usable budget; no panic | yes | — | — |
@@ -4282,6 +4434,14 @@ seams for their own Tier 2 rows):
   and single-`send` `BATCH_DISPATCH_SLACK_MAX` rows. Without it the slack guard is
   **untestable**: a handler-side `sleep` runs *before* `batch_now` is captured and
   cannot exercise the guard.
+- **Fastly — send-failure classification needs NO seam (by design).** Neither
+  `SendError` (private fields, no public ctor) nor `SendErrorCause` (`#[non_exhaustive]`)
+  can be constructed in a test, so no injectable "send-result provider" can hand a test a
+  real one. Instead the policy is a **pure function over a locally-defined constructible
+  `SendFailure` enum** (§4.3), unit-tested directly; only the thin
+  `SendErrorCause -> SendFailure` boundary match is untestable by unit tests, and it is
+  covered by Tier 3. Do not spec a fake that fabricates SDK error types — it is
+  impossible.
 - **All adapters — dispatch counters.** `did_dispatch()` / chunk-write count behind
   `test-utils`, so "deadline expired during drain → 504 **and** no upstream send" and
   the partial-upload rows can assert the *absence* of a dispatch.
@@ -4473,17 +4633,23 @@ Other changes:
 - `src/manifest.rs` — add `Capability` / `CapabilitySupport` (inline; §3.5.1),
   `ManifestCapabilities` + `ManifestOutboundCapability` (with `hosts: Option<Vec<String>>`
   — §3.5.4, so *absent* is distinguishable from explicit `["*"]`), and
-  `Manifest::capabilities`. Also add **`pub fn Manifest::from_baked_json(&'static str)
-  -> Option<Manifest>`** — parse **plus `finalize()`** — because the `app!`-generated
-  `manifest()` accessor lives downstream and cannot call the `pub(crate)` `finalize()`
-  itself (§3.5.3).
+  `Manifest::capabilities`. Also add the **three-state `pub enum BakedManifest
+  { Absent, Present(&'static Manifest), Malformed(&'static str) }`** and **`pub fn
+  Manifest::from_baked_json(&'static str) -> BakedManifest`** — parse **plus
+  `finalize()`** — because the `app!`-generated `manifest()` accessor lives downstream
+  and cannot call the `pub(crate)` `finalize()` itself (§3.5.3). **Not `Option`:** it
+  must keep "no contract" (`Absent`) distinct from "corrupt contract" (`Malformed`), or
+  the gate fails **open** on malformed input.
 - `src/app.rs` — extend the `Hooks` trait with the **baked-manifest accessors** the
   `demo` capability gate depends on (§3.5.3): `fn manifest_json() -> Option<&'static str>`
-  (defaulted `None`) and `fn manifest() -> Option<&'static Manifest>` (per-impl
-  function-local `OnceLock` calling `Manifest::from_baked_json`). **Not "free because
-  defaulted":** `app!` and every hand-written `Hooks` impl must **emit both** — the macro
-  crate denies `clippy::missing_trait_methods`, so relying on a trait default is a hard
-  error (verified).
+  (defaulted `None`) and `fn manifest() -> BakedManifest` (defaulted **`Absent`**, with
+  the per-impl function-local `OnceLock` living in each *generated* impl and calling
+  `Manifest::from_baked_json`). **Two independent reasons the macro must emit both
+  explicitly:** (1) the workspace denies `clippy::missing_trait_methods`, so relying on
+  a trait default is a hard error; (2) a `static` in a trait **default** body is **one
+  item shared by all implementors** (proven), so a caching default would serve app A's
+  manifest to app B. `ensure_capabilities` takes `BakedManifest` and **fails closed** on
+  `Malformed`.
 - `src/lib.rs` — re-export new modules; drop proxy re-exports.
 - `Cargo.toml` — `MockOutboundClient` under the existing `test-utils` feature.
 
@@ -4643,7 +4809,9 @@ change lands here whether intended or not)*
     `connect_timeout` / `first_byte_timeout` / `between_bytes_timeout` with the
     §3.3.4 phase split (1/4 connect, 3/4 first-byte, full budget between-bytes;
     degenerate to `both = total_ms` for sub-4 ms budgets); HTTPS → `.enable_ssl()`
-    plus `.check_certificate(req.cert_host().unwrap())` (`cert_host()` is `Some`
+    plus `.check_certificate(cert)` where `cert` came from an explicit
+    `if let Some(cert) = req.cert_host()` (**not** `.unwrap()` — `clippy::unwrap_used`
+    is denied in production) (`cert_host()` is `Some`
     on any HTTPS scheme and pre-strips brackets); `.sni_hostname(sni)` is called
     **only when `req.sni_hostname()` is `Some(sni)`** (DNS-name hosts); IP-literal
     hosts return `sni_hostname() == None` per RFC 6066 §3, so the adapter omits
@@ -5293,7 +5461,7 @@ prior entry; the index note here is the disclaimer for the whole history.
 
 | Review finding | Resolution |
 | --- | --- |
-| Fastly backend caching had a same-identity race (loser sees `NameInUse`, looks in map, doesn't find name yet, false external) | §4.3: lookup/build protocol redesigned around a `BackendSlot { Building \| Ready(Backend) }`. The outer lock is held **through** `Backend::builder.finish()` (the lock-across-host-call note from round 20 is reversed — Fastly's host call is short and never blocks on guest I/O, so holding the lock is safe). Concurrent same-identity callers serialize on the slot; `NameInUse` under that protocol is unambiguously external |
+| Fastly backend caching had a same-identity race (loser sees `NameInUse`, looks in map, doesn't find name yet, false external) | §4.3: lookup/build protocol redesigned around a `BackendSlot { Building \| Ready(Backend) }`. The outer lock is held **through** `Backend::builder.finish()` (the lock-across-host-call note from round 20 is reversed — Fastly's host call is short and never blocks on guest I/O, so holding the lock is safe). Concurrent same-identity callers serialize on the slot; `NameInUse` under that protocol is unambiguously external. **[SUPERSEDED — no `Mutex`/slot/serialization: the map is a session-scoped `thread_local!` `RefCell` and the guest is single-threaded, so there is no race to serialize. See §4.3 *Cache ownership*.]** |
 | Sub-4 ms exception not carried through normative guarantees | §4.3 "Net guarantee" rewritten with **two explicit branches**: `total_ms ≥ 4` keeps `BATCH_DISPATCH_SLACK_MAX + ms_rounding` (the common case); `total_ms < 4` is `BATCH_DISPATCH_SLACK_MAX + total_ms + ms_rounding` (≤ ~28 ms — sub-4 ms is a degenerate input where ms-rounding already dominates). Test row already asserts the 2× sub-4 ms bound |
 | Stale "same `t` value and `tls_mode` are folded into identity" sentence | §3.3.4 prose updated: the identity tuple is `scheme + host + resolved_port + tls_mode + budget_ms`, where `tls_mode` is derived from `req.uri().scheme_str()` and `budget_ms` drives the deterministic phase split. Cached and freshly-built backends match because both are deterministic functions of the same tuple |
 | Appendix bookkeeping: index said A–AG but file had AH, and AD/round-30 was skipped | New **Appendix AD — Review round 30 resolutions** inserted between AC and AE (reconstructed from the round-30 review). Index note updated to "A–AH (and counting)" with the same self-pointer to the last `## Appendix` heading |
