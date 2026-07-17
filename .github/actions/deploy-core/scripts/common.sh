@@ -149,7 +149,13 @@ assert_safe_tarball() {
       /* | *..*) fail "refusing unsafe CLI archive member '$member'" ;;
     esac
   done < <(tar -tf "$tarball")
-  if tar -tvf "$tarball" | grep -qE '^[lh]'; then
+  # NOT `tar -tvf … | grep -q …`. Under `set -o pipefail`, grep -q exits on the
+  # FIRST match, tar takes SIGPIPE, and the pipeline reports tar's failure — so
+  # the `if` would be false exactly when a link WAS found, letting the unsafe
+  # archive through. Capture first, then match.
+  local listing
+  listing=$(tar -tvf "$tarball")
+  if grep -qE '^[lh]' <<<"$listing"; then
     fail "refusing CLI archive containing a symlink or hardlink member"
   fi
 }
