@@ -46,6 +46,26 @@ assert_comment_precedes_stage() {
     fail "the comment was applied after staging; it must precede it"
 }
 
+# The staged draft must be re-pointed at the STAGING selector store, or it reads
+# production config and `config push --staging` writes a key nothing reads. The
+# link name stays `edgezero_runtime_env` (what the runtime opens); only the store
+# behind it changes.
+assert_relinked_to_staging_selector() {
+  local log="$1"
+  grep -qE '^fastly resource-link delete .*--id=LINK_ENV( |$)' "$log" ||
+    fail "the staged deploy never dropped the inherited 'edgezero_runtime_env' link"
+  grep -qE '^fastly resource-link create .*--resource-id=STAGESEL1 .*--name=edgezero_runtime_env( |$)' "$log" ||
+    fail "the staged deploy never linked the staging selector store as 'edgezero_runtime_env'"
+
+  # Both must land while the version is still an editable draft.
+  local create_line stage_line
+  create_line=$(grep -n '^fastly resource-link create ' "$log" | head -n 1 | cut -d: -f1)
+  stage_line=$(grep -n '^fastly service-version stage ' "$log" | head -n 1 | cut -d: -f1)
+  if [[ -n "$create_line" && -n "$stage_line" ]] && ((create_line >= stage_line)); then
+    fail "the staging relink must happen BEFORE the version is staged"
+  fi
+}
+
 main() {
   local log="${FAKE_CALL_LOG:?FAKE_CALL_LOG is required}"
   local staged_version="${EDGEZERO__TEST__STAGED_VERSION:-}"
@@ -60,6 +80,7 @@ main() {
   assert_update_flags "$update"
   assert_no_comment_on_update "$log"
   assert_comment_precedes_stage "$log"
+  assert_relinked_to_staging_selector "$log"
 
   # The staged version must thread out of deploy-fastly, or the healthcheck and
   # rollback that follow have nothing to act on.

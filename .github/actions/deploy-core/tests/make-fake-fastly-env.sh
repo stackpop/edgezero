@@ -50,7 +50,15 @@ case "\${1:-} \${2:-}" in
   "service-version stage") echo "Staged version" ;;
   # config push resolves the store id by name from this list, reads the current
   # entry to diff against, then upserts one entry per physical key.
-  "config-store list") echo '[{"id":"STOREID1","name":"app_config"}]' ;;
+  # Both the app's config store and the STAGING SELECTOR store a staged deploy
+  # re-links its draft to. Without the latter, deploy_staged fails closed rather
+  # than stage a version that would serve production config.
+  "config-store list") echo '[{"id":"STOREID1","name":"app_config"},{"id":"STAGESEL1","name":"edgezero_runtime_env_staging"}]' ;;
+  # A cloned draft inherits the active version's links; the staged deploy drops
+  # this one and re-links the staging store under the same name.
+  "resource-link list") echo '[{"id":"LINK_ENV","name":"edgezero_runtime_env"}]' ;;
+  "resource-link delete") echo "SUCCESS: Deleted resource link" ;;
+  "resource-link create") echo "SUCCESS: Created resource link" ;;
   "config-store-entry describe")
     # Report the key as absent so the push proceeds to a first write. The real
     # CLI distinguishes "missing" from "unparseable" — returning nothing at all
