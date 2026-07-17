@@ -147,10 +147,12 @@ Every chunked re-push leaks one generation of chunks. This spec reclaims them:
 9. **Push failure semantics are unchanged.** Reclamation is never part of a
    push, so it can never fail one.
 
-10. **A root is never deleted, whatever its key looks like.** Key shape alone
-    does not prove an entry is ours; the entries must round-trip to this
-    writer's exact output. Push-time reserved-key rejection cannot protect
-    entries that already exist.
+10. **A root is never deleted, whatever its key looks like — and root-vs-chunk
+    is decided by VALUE, not key shape.** GC classifies any entry whose value is
+    a pointer as a root, so a pointer parked at a chunk-shaped key still has its
+    references counted live (round 9). Delete candidates must additionally
+    round-trip to this writer's exact output. Push-time reserved-key rejection
+    cannot protect entries that already exist.
 
 11. **A generation is deleted whole or not at all, and a failure stops it.** A
     generation is provable only as a unit, so a half-deleted one can never be
@@ -253,10 +255,20 @@ Dry-run by default; deletes only with `--yes`.
    must carry string `item_key`, `item_value`, and `created_at`, or the whole
    run aborts. A missing/empty field is never skipped or defaulted — skipping a
    root would hide the chunks it references and get them deleted while live.
-2. Classify every non-chunk entry as a **root** with `gc_classify_root` → the
-   **canonical** chunk keys that root's pointer references. The union over all
-   roots is the **live** set. (The listing already carries `item_value`, so this
-   costs no extra `describe` calls.)
+2. Classify entries as roots by their **VALUE, not their key shape**: any entry
+   whose value is a chunk pointer is a root, wherever it happens to live.
+   `gc_classify_root` yields the **canonical** chunk keys that pointer references,
+   and the union over all roots is the **live** set. (The listing already carries
+   `item_value`, so this costs no extra `describe` calls.)
+
+   **Key shape is not authoritative for roots either** (round 9). The runtime
+   resolver follows whatever pointer it is handed, so a valid pointer parked at a
+   chunk-SHAPED key (`shadow.__edgezero_chunks.<sha>.0`) still makes its
+   references live. Excluding chunk-shaped keys from the root scan up front —
+   symmetric with the mistake this module already rejects for delete candidates —
+   would leave those references looking orphaned and delete config that reads
+   depend on. A chunk PAYLOAD is a raw envelope fragment and does not announce
+   `edgezero_kind`, so it is never mistaken for a root.
 
    **Not `prior_chunk_keys`.** That helper serves the push path, where an
    unrecognised value legitimately means "nothing to prune", so it answers
@@ -353,9 +365,15 @@ direct envelope *or* a valid pointer (an empty or truncated pointer must not rea
 as "references nothing"), a non-canonical referenced key, an unreadable
 `created_at`, or an incomplete listing — all abort with nothing deleted.
 
-**Non-zero exit on delete failure.** Every delete is attempted; if any fail, the
-command returns a non-zero exit naming the failed keys, so automation detects
-it. A failed delete is inert (idempotent) — re-run to retry.
+**Non-zero exit on delete failure.** Independent generations are all attempted,
+but deletion STOPS within a generation at its first failure (a half-deleted
+generation can never be proved again). If any delete fails the command exits
+non-zero naming the failed keys, so automation detects it. A failed remote delete
+has an UNKNOWN outcome — Fastly may have committed it before returning an error —
+so the command does not promise idempotent retry: it reports each affected
+generation as either uncertain (re-run may reclaim it, or surface it as an
+unprovable fragment) or definitely stranded (a confirmed sibling was already
+deleted; manual removal only), with shell-safe recovery commands.
 
 ### Local is different, and eager pruning there is correct
 

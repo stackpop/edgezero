@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::chunked_config::{
     CHUNK_KEY_INFIX, GcPointer, GcRootValue, chunk_key_generation, gc_classify_root,
     gc_verify_generation, prepare_fastly_config_entries, prior_chunk_keys,
-    resolve_fastly_config_value, sha256_hex,
+    resolve_fastly_config_value, sha256_hex, value_is_pointer_kind,
 };
 use ctor::ctor;
 use edgezero_adapter::cli_support::{
@@ -168,13 +168,21 @@ struct GcPlan {
 
 /// What one pass of `config gc`'s delete loop actually did.
 struct GcDeleteOutcome {
-    /// Entries removed.
+    /// Entries whose delete returned success.
     deleted: usize,
     /// Keys whose delete returned non-zero.
     failed: Vec<String>,
-    /// Keys left behind in a generation that was already part-deleted, so they
-    /// can never be proved (and therefore never reclaimed) again.
+    /// Survivors of a generation in which an earlier sibling's delete had
+    /// ALREADY succeeded before a later one failed. These are definitely an
+    /// incomplete generation now, so they can never be proved (or reclaimed)
+    /// again -- manual removal only.
     stranded: Vec<String>,
+    /// Members of a generation whose ONLY failure was on a delete with no
+    /// confirmed prior sibling success. A failed remote delete has UNKNOWN
+    /// outcome (Fastly may have committed it before returning an error), so we
+    /// cannot say whether the generation is still whole. A re-run reclaims it if
+    /// it is, or reports it as an unprovable fragment if it is not.
+    uncertain: Vec<String>,
 }
 
 /// One `config-store-entry list` item.
@@ -750,8 +758,24 @@ impl Adapter for FastlyCliAdapter {
                             Ok(Some(chunk_val.to_owned()))
                         }
                         None => Ok(None),
-                    })?;
-                Ok(ReadConfigEntry::Present(resolved))
+                    });
+                match resolved {
+                    Ok(body) => Ok(ReadConfigEntry::Present(body)),
+                    // A corrupt/invalid prior value must NOT block a local push.
+                    // The whole point of `config push --local` here is to
+                    // OVERWRITE that broken state, and the local writer already
+                    // fail-soft handles a suspicious prior pointer (overwrite,
+                    // warn, prune nothing). Reporting `Unsupported` — "cannot
+                    // diff against this" — lets the write proceed to that path
+                    // instead of aborting the whole command on the diff read.
+                    // (Local only: a single file we are about to replace. The
+                    // cloud read keeps erroring, since we must not overwrite
+                    // remote state we could not read.)
+                    Err(_reason) => Ok(ReadConfigEntry::Unsupported(
+                        "local prior value could not be resolved (corrupt or incomplete chunk \
+                         state); it will be overwritten by this push",
+                    )),
+                }
             }
             None => Ok(ReadConfigEntry::MissingKey),
         }
@@ -1508,6 +1532,7 @@ fn gc_fastly_config_store(
         deleted,
         failed,
         stranded,
+        uncertain,
     } = execute_gc_deletes(&resolved_id, &doomed, &mut out);
     out.push(format!(
         "reclaimed {deleted} of {doomed_count} orphan chunk entries"
@@ -1522,34 +1547,62 @@ fn gc_fastly_config_store(
         failed.len(),
         failed.join(", ")
     );
-    if stranded.is_empty() {
-        diagnostic.push_str(
-            ". Every affected generation was left whole, so re-running `config gc` will retry them.",
-        );
-    } else {
-        // Be honest: these cannot be reclaimed by a re-run, ever.
-        let recovery = stranded
-            .iter()
-            .map(|key| {
-                format!(
-                    "  fastly config-store-entry delete --store-id={resolved_id} --key={key} --auto-yes"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+    // A generation whose only failure was on an unconfirmed delete: the outcome
+    // is UNKNOWN (Fastly may have committed it), so a re-run is worth trying but
+    // may find a fragment.
+    if !uncertain.is_empty() {
+        write!(
+            diagnostic,
+            ".\nNOTE: a failed remote delete has an unknown outcome -- Fastly may have applied it \
+             before returning an error. Re-run `config gc`: it reclaims each affected generation \
+             if it is still whole, or reports it as an unprovable fragment (\"left untouched\") if \
+             a delete did commit. If reported as a fragment, remove the survivors by hand:\n{}",
+            recovery_commands(&resolved_id, &uncertain)
+        )
+        .map_err(|err| format!("failed to format the gc diagnostic: {err}"))?;
+    }
+    // A generation with a CONFIRMED prior delete: definitely a fragment now.
+    if !stranded.is_empty() {
         write!(
             diagnostic,
             ".\nWARNING: {} entr(ies) are now an INCOMPLETE generation because a sibling was \
              already deleted before the failure: {}. `config gc` proves a generation by \
              reassembling it, so it can no longer prove these and will never reclaim them -- \
              re-running will NOT help. They are inert (no pointer references them). Remove them \
-             by hand once you are satisfied they are unreferenced:\n{recovery}",
+             by hand once you are satisfied they are unreferenced:\n{}",
             stranded.len(),
             stranded.join(", "),
+            recovery_commands(&resolved_id, &stranded),
         )
         .map_err(|err| format!("failed to format the gc diagnostic: {err}"))?;
     }
     Err(diagnostic)
+}
+
+/// Render copy-pasteable `fastly config-store-entry delete` commands, one per
+/// key, with EVERY interpolated value single-quoted for POSIX shells.
+///
+/// Root keys are free-form (`--key <override>`), and a chunk key preserves its
+/// root, so a key can contain `$(...)`, spaces, or `;`. Pasting an unquoted
+/// command could execute or misparse it, so this is not cosmetic.
+fn recovery_commands(store_id: &str, keys: &[String]) -> String {
+    keys.iter()
+        .map(|key| {
+            format!(
+                "  fastly config-store-entry delete --store-id={} --key={} --auto-yes",
+                shell_single_quote(store_id),
+                shell_single_quote(key),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Single-quote a value for a POSIX shell: wrap in `'...'` and rewrite each
+/// embedded `'` as `'\''`. Inside single quotes every other byte -- `$`, spaces,
+/// `;`, `$(...)`, backticks -- is literal, so this neutralises any hostile key.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Delete each doomed generation, stopping a generation at its FIRST failure.
@@ -1574,6 +1627,7 @@ fn execute_gc_deletes(
         deleted: 0,
         failed: Vec::new(),
         stranded: Vec::new(),
+        uncertain: Vec::new(),
     };
     for generation in doomed {
         let mut deleted_here: Vec<&str> = Vec::new();
@@ -1586,15 +1640,24 @@ fn execute_gc_deletes(
                 Err(err) => {
                     out.push(format!("  FAILED to delete `{key}` ({err})"));
                     outcome.failed.push(key.clone());
-                    if !deleted_here.is_empty() {
-                        // A sibling is already gone: what remains is a fragment
-                        // no future run can prove.
-                        outcome.stranded.extend(
-                            generation
-                                .iter()
-                                .map(|(survivor, _)| survivor.clone())
-                                .filter(|survivor| !deleted_here.contains(&survivor.as_str())),
-                        );
+                    // Everything in this generation we have NOT confirmed deleted
+                    // -- the failed key itself, plus the ones we never reached.
+                    let unconfirmed: Vec<String> = generation
+                        .iter()
+                        .map(|(member, _)| member.clone())
+                        .filter(|member| !deleted_here.contains(&member.as_str()))
+                        .collect();
+                    if deleted_here.is_empty() {
+                        // No sibling is CONFIRMED gone. The failed delete's
+                        // outcome is unknown: if it did not commit, the
+                        // generation is whole and a re-run reclaims it; if it
+                        // did, the re-run finds a fragment and reports it. Either
+                        // way we must not claim clean retryability.
+                        outcome.uncertain.extend(unconfirmed);
+                    } else {
+                        // A sibling is CONFIRMED gone, so this generation is
+                        // definitely a fragment no future run can prove.
+                        outcome.stranded.extend(unconfirmed);
                     }
                     break; // stop THIS generation; the others are independent
                 }
@@ -1602,6 +1665,64 @@ fn execute_gc_deletes(
         }
     }
     outcome
+}
+
+/// The proven live set for a store, plus the number of true roots.
+///
+/// LIVE = the chunk keys every root pointer currently references, each verified
+/// against its content-address. Root-vs-chunk is decided by VALUE, not key shape.
+///
+/// Round 9: excluding chunk-shaped keys from the root scan was the same mistake
+/// this module rejects for delete candidates -- key shape is not authoritative.
+/// The runtime resolver follows whatever pointer it is handed, so a valid pointer
+/// parked at a chunk-shaped key (`shadow.__edgezero_chunks.<sha>.0`) still makes
+/// its references LIVE. Skipping it left those chunks looking orphaned, and GC
+/// deleted config that reads depended on. A chunk PAYLOAD is a raw fragment of
+/// envelope JSON, so it does not announce `edgezero_kind` and is never a root.
+fn compute_live_set(
+    items: &[ConfigStoreItem],
+    value_by_key: &HashMap<&str, &str>,
+) -> Result<(HashSet<String>, usize), String> {
+    let mut live: HashSet<String> = HashSet::new();
+    let mut roots = 0_usize;
+    for item in items {
+        let is_chunk_shaped = chunk_key_generation_any(&item.item_key).is_some();
+        if is_chunk_shaped && !value_is_pointer_kind(&item.item_value) {
+            continue; // a chunk payload: a delete candidate, not a root
+        }
+        if !is_chunk_shaped {
+            roots = roots.saturating_add(1);
+        }
+        // gc_classify_root (NOT prior_chunk_keys): on this destructive path an
+        // empty/truncated/unrelated value must FAIL, not read as "references
+        // nothing" -- that would make its live chunks look orphaned.
+        let classified = gc_classify_root(&item.item_key, &item.item_value).map_err(|err| {
+            format!(
+                "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
+                item.item_key
+            )
+        })?;
+        let GcRootValue::Chunked(pointer) = classified else {
+            continue; // A direct envelope references no chunks.
+        };
+        // The pointer's METADATA is self-consistent by here. That is not proof
+        // that it honestly describes its generation: a pointer can drop its last
+        // chunk ref AND restate `envelope_len` as the remaining sum, and every
+        // metadata check still passes while the dropped chunk silently leaves
+        // the live set and becomes deletable. So reassemble what it references
+        // and hold the bytes against its content-address.
+        let assembled = assemble_pointer_chunks(&item.item_key, &pointer, value_by_key)?;
+        gc_verify_generation(&pointer.envelope_sha256, &assembled).map_err(|err| {
+            format!(
+                "refusing to reclaim: root `{}` names a chunk set that does not reconstruct the \
+                 envelope it claims ({err}). Its chunk list is therefore not a trustworthy live \
+                 set, and treating it as one could delete a live chunk. Nothing was deleted.",
+                item.item_key
+            )
+        })?;
+        live.extend(pointer.chunks.into_iter().map(|chunk| chunk.key));
+    }
+    Ok((live, roots))
 }
 
 /// The reclamation plan for one store: which orphan chunk entries to delete, and
@@ -1636,42 +1757,7 @@ fn plan_gc_reclamation(
     }
 
     // ---- 1. LIVE set: what the roots currently reference, PROVEN ----
-    let mut live: HashSet<String> = HashSet::new();
-    let mut roots = 0_usize;
-    for item in items {
-        if chunk_key_generation_any(&item.item_key).is_some() {
-            continue; // a chunk-shaped key, not a root
-        }
-        roots = roots.saturating_add(1);
-        // gc_classify_root (NOT prior_chunk_keys): on this destructive path an
-        // empty/truncated/unrelated value must FAIL, not read as "references
-        // nothing" -- that would make its live chunks look orphaned.
-        let classified = gc_classify_root(&item.item_key, &item.item_value).map_err(|err| {
-            format!(
-                "refusing to reclaim: could not classify root `{}` ({err}); nothing was deleted",
-                item.item_key
-            )
-        })?;
-        let GcRootValue::Chunked(pointer) = classified else {
-            continue; // A direct envelope references no chunks.
-        };
-        // The pointer's METADATA is self-consistent by here. That is not proof
-        // that it honestly describes its generation: a pointer can drop its last
-        // chunk ref AND restate `envelope_len` as the remaining sum, and every
-        // metadata check still passes while the dropped chunk silently leaves
-        // the live set and becomes deletable. So reassemble what it references
-        // and hold the bytes against its content-address.
-        let assembled = assemble_pointer_chunks(&item.item_key, &pointer, &value_by_key)?;
-        gc_verify_generation(&pointer.envelope_sha256, &assembled).map_err(|err| {
-            format!(
-                "refusing to reclaim: root `{}` names a chunk set that does not reconstruct the \
-                 envelope it claims ({err}). Its chunk list is therefore not a trustworthy live \
-                 set, and treating it as one could delete a live chunk. Nothing was deleted.",
-                item.item_key
-            )
-        })?;
-        live.extend(pointer.chunks.into_iter().map(|chunk| chunk.key));
-    }
+    let (live, roots) = compute_live_set(items, &value_by_key)?;
 
     // ---- 2. Per-root live-config age (best-effort; see the guard below) ----
     let root_live_since: HashMap<&str, u64> = live.iter().fold(HashMap::new(), |mut acc, key| {
@@ -4619,6 +4705,48 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
+    /// PR #314 round-9 [P2]: a corrupt/invalid prior value must NOT abort the
+    /// local read, or the CLI push aborts on the diff read before the writer's
+    /// fail-soft ("overwrite, warn, prune nothing") can repair the state.
+    /// `config push --local` is how an operator recovers, so the read reports
+    /// `Unsupported` ("cannot diff") and lets the write proceed.
+    #[test]
+    fn read_config_entry_local_degrades_corrupt_prior_to_unsupported() {
+        use crate::chunked_config::{CHUNK_KEY_INFIX, POINTER_KIND};
+        let dir = tempdir().expect("tempdir");
+        let fastly_toml = dir.path().join("fastly.toml");
+
+        // A pointer-KIND value that is invalid (missing the chunks it needs).
+        // The resolver would error on this; the local read must NOT propagate
+        // that as `Err`.
+        let broken_pointer = format!(
+            r#"{{"edgezero_kind":"{POINTER_KIND}","version":1,"chunks":[{{"key":"cfg{CHUNK_KEY_INFIX}{sha}.0","len":10,"sha256":"x"}}],"data_sha256":"","envelope_len":10,"envelope_sha256":"{sha}"}}"#,
+            sha = "a".repeat(64),
+        );
+        write_fastly_local_config_store(
+            &fastly_toml,
+            TEST_CONFIG_ID,
+            &[("cfg".to_owned(), broken_pointer)],
+            &[],
+        )
+        .expect("write");
+
+        let result = FastlyCliAdapter
+            .read_config_entry_local(
+                dir.path(),
+                Some("fastly.toml"),
+                None,
+                &ResolvedStoreId::from_logical(TEST_CONFIG_ID),
+                "cfg",
+                &AdapterPushContext::new(),
+            )
+            .expect("a corrupt local prior must NOT abort the read");
+        assert!(
+            matches!(result, ReadConfigEntry::Unsupported(_)),
+            "a corrupt prior value must degrade to Unsupported so the push can overwrite it"
+        );
+    }
+
     /// Spec 12.3 + 9.3: a second oversized push must converge the
     /// runtime on the NEW envelope — chunk keys are content-addressed
     /// by the full-envelope SHA, so push B writes a new chunk-set and
@@ -4982,13 +5110,15 @@ echo 'unexpected' >&2; exit 1
         );
     }
 
-    /// PR #314 round-8 [P2]: a delete that fails on a generation's FIRST key
-    /// leaves that generation whole -- so it stays provable and a re-run really
-    /// does retry it. The old loop ploughed on through the siblings, which is
-    /// what turned a retryable error into permanent litter.
+    /// PR #314 round-9 [P2]: a delete that fails on a generation's FIRST key has
+    /// an UNKNOWN outcome -- Fastly may have committed it before returning an
+    /// error. Round 8 called this "whole and retryable", which is unsound: if the
+    /// failed delete did commit, a re-run finds a fragment. The honest report is
+    /// a NOTE that the outcome is uncertain, NOT a clean-retry promise. We still
+    /// stop the generation so a CONFIRMED partial delete cannot happen.
     #[cfg(unix)]
     #[test]
-    fn gc_first_delete_failure_leaves_the_generation_whole_and_retryable() {
+    fn gc_first_delete_failure_is_reported_as_uncertain_not_clean_retry() {
         let _lock = path_mutation_guard().lock().expect("guard");
         let dir = tempdir().expect("tempdir");
         let oplog = dir.path().join("ops.log");
@@ -5014,22 +5144,61 @@ echo 'unexpected' >&2; exit 1
 
         let err = run_gc(dir.path(), 86_400, false).expect_err("a failed delete is a failure");
         assert!(
-            err.contains("re-running `config gc` will retry"),
-            "a whole generation is genuinely retryable and should say so: {err}"
+            err.contains("unknown outcome"),
+            "a failed delete's outcome is unknown and must be reported as such: {err}"
         );
         assert!(
-            !err.contains("WARNING"),
-            "nothing was stranded, so there must be no manual-recovery warning: {err}"
+            !err.contains("will retry them"),
+            "the disproven clean-retry promise must be gone: {err}"
         );
-        // The siblings must NOT have been deleted -- that is what keeps the
-        // generation provable next time.
+        // The siblings must NOT have been ATTEMPTED -- stopping is what prevents a
+        // CONFIRMED partial delete.
         for key in dead_chunks.iter().skip(1) {
             assert!(
                 !oplog_has(&oplog, &format!("delete {key}")),
-                "after the first failure this generation must be left alone, or its survivors \
-                 become an unprovable fragment: `{key}`"
+                "after the first failure the generation must be left alone: `{key}`"
             );
         }
+    }
+
+    /// PR #314 round-9 [P2]: the stateful case. A remote delete that COMMITS but
+    /// still reports failure leaves a real fragment. On the SECOND run that
+    /// missing key makes the generation unprovable, so it must be reported as
+    /// left-untouched (surfaced), never silently dropped.
+    #[cfg(unix)]
+    #[test]
+    fn gc_committed_but_failed_delete_surfaces_as_unprovable_next_run() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        let live = gen_envelope("live");
+        let dead = gen_envelope("dead");
+        let dead_chunks = chunk_keys_of(TEST_CONFIG_ID, &dead);
+        assert!(dead_chunks.len() >= 2, "need a multi-chunk generation");
+
+        // SECOND run's world: the first chunk's delete committed last time, so it
+        // is gone. The generation is now a fragment.
+        let mut listing = vec![listed_root(TEST_CONFIG_ID, &live, 172_800)];
+        listing.extend(listed_generation(TEST_CONFIG_ID, &live, 172_800));
+        let mut dead_gen = listed_generation(TEST_CONFIG_ID, &dead, 604_800);
+        let survivor = dead_gen[1].0.clone();
+        dead_gen.remove(0); // the committed-deleted chunk is absent now
+        listing.extend(dead_gen);
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        let out = run_gc(dir.path(), 86_400, false).expect("gc succeeds");
+        assert!(
+            !oplog_has(&oplog, &format!("delete {survivor}")),
+            "an unprovable fragment survivor must not be deleted: `{survivor}`"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("not byte-identical to what this writer would produce")),
+            "the surviving fragment must be SURFACED as left-untouched, not silently dropped: {out:?}"
+        );
     }
 
     /// PR #314 round-8 [P2]: if a delete fails PART-WAY through a generation, the
@@ -5084,6 +5253,98 @@ echo 'unexpected' >&2; exit 1
             assert!(
                 !oplog_has(&oplog, &format!("delete {key}")),
                 "deletion must stop at the first failure in a generation: `{key}`"
+            );
+        }
+    }
+
+    /// PR #314 round-9 [P2]: root keys are free-form, so a chunk key can hold
+    /// shell metacharacters. Manual-recovery commands must render them so that
+    /// pasting cannot execute or misparse -- single-quoted, with embedded quotes
+    /// escaped.
+    #[test]
+    fn recovery_commands_are_shell_safe() {
+        // A key crafted to run `id` and to break argument parsing if unquoted.
+        let hostile = "app$(id).__edgezero_chunks.'; rm -rf /'.0".to_owned();
+        let keys = [hostile.clone()];
+        let rendered = recovery_commands("store-abc", &keys);
+
+        // The dangerous substring is not sitting there unquoted.
+        assert!(
+            !rendered.contains("$(id)") || rendered.contains("'app$(id)"),
+            "shell-active text must be inside single quotes: {rendered}"
+        );
+        // Every embedded single quote is closed-escaped-reopened, so no quote
+        // context leaks.
+        assert!(
+            rendered.contains(r"'\''"),
+            "embedded single quotes must be escaped as '\\'': {rendered}"
+        );
+        // Sanity: what a POSIX shell would parse back out of our --key argument
+        // is EXACTLY the original key (round-trip through `sh`).
+        let key_arg = rendered
+            .split("--key=")
+            .nth(1)
+            .and_then(|rest| rest.split(" --auto-yes").next())
+            .expect("a --key argument");
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {key_arg}"))
+            .output()
+            .expect("run sh");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            hostile,
+            "the shell must parse the quoted argument back to the exact key"
+        );
+    }
+
+    /// RED (round-9 [P1]): key shape is not authoritative for ROOTS either.
+    ///
+    /// A valid pointer stored at a chunk-SHAPED key (`shadow.__edgezero_chunks.
+    /// <sha>.0`) is skipped by the live-set scan, which excludes chunk-shaped
+    /// keys up front. The runtime resolver follows any pointer it is given, so
+    /// that pointer's references ARE live -- but GC never sees them, calls the
+    /// generation orphaned, and deletes it.
+    #[cfg(unix)]
+    #[test]
+    fn red_pointer_at_chunk_shaped_key_keeps_its_references_live() {
+        let _lock = path_mutation_guard().lock().expect("guard");
+        let dir = tempdir().expect("tempdir");
+        let oplog = dir.path().join("ops.log");
+
+        // `app_config`'s CURRENT config is small enough to store directly, so
+        // its own root references no chunks at all.
+        let live_direct = gen_envelope_padded("live-direct", 100);
+        let mut listing = vec![(
+            TEST_CONFIG_ID.to_owned(),
+            stamp_secs_ago(999_999),
+            live_direct,
+        )];
+
+        // An older chunked generation of `app_config` still exists...
+        let referenced = gen_envelope("still-referenced");
+        let referenced_chunks = chunk_keys_of(TEST_CONFIG_ID, &referenced);
+        listing.extend(listed_generation(TEST_CONFIG_ID, &referenced, 604_800));
+
+        // ...and a pointer at a CHUNK-SHAPED key references it. The resolver
+        // would happily follow this, so those chunks are LIVE.
+        let (_, referenced_pointer) = chunked_parts(TEST_CONFIG_ID, &referenced);
+        let shadow_key = format!("shadow{CHUNK_KEY_INFIX}{}.0", "d".repeat(64));
+        listing.push((shadow_key, stamp_secs_ago(604_800), referenced_pointer));
+
+        let fake = fake_fastly_gc(TEST_CONFIG_ID, &[], &listing, None, false, &oplog);
+        let _path = PathPrepend::new(fake.path());
+
+        // The RESULT does not matter here (it may Err after the fix if the
+        // shadow pointer's own chunks are incomplete); the invariant is purely
+        // that no LIVE-referenced chunk is deleted, which the oplog proves.
+        drop(run_gc(dir.path(), 86_400, false));
+        let log = fs::read_to_string(&oplog).unwrap_or_default();
+        for key in &referenced_chunks {
+            assert!(
+                !oplog_has(&oplog, &format!("delete {key}")),
+                "a chunk a live pointer references must never be deleted, whatever the KEY of \
+                 the entry holding that pointer looks like: `{key}`; log:\n{log}"
             );
         }
     }

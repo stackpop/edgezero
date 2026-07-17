@@ -32,9 +32,12 @@ impl FastlyConfigStore {
     /// Returns `Ok(Some(value))`, `Ok(None)` (missing), or `Err(message)`.
     fn get_sync(&self, key: &str) -> Result<Option<String>, String> {
         match &self.inner {
-            FastlyConfigStoreBackend::Fastly(inner) => inner
-                .try_get(key)
-                .map_err(|err| format!("config store lookup failed for `{key}`: {err}")),
+            FastlyConfigStoreBackend::Fastly(inner) => inner.try_get(key).map_err(|err| {
+                // The `key` here is a pointer-controlled chunk key; the resolver
+                // adds a safe position locator, so it is not echoed. The platform
+                // `err` is a fastly SDK type that does not embed the stored value.
+                format!("config store lookup failed: {err}")
+            }),
             #[cfg(test)]
             FastlyConfigStoreBackend::InMemory(data) => Ok(data.get(key).cloned()),
         }

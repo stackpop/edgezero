@@ -286,9 +286,18 @@ where
     // below could reject it. Grow from the bytes we actually fetch instead.
     let mut reconstructed = String::new();
     for (position, chunk_ref) in pointer.chunks.iter().enumerate() {
-        let chunk_value = fetch(&chunk_ref.key)?.ok_or_else(|| {
-            format!("missing chunk {position} referenced by pointer at `{root_key}`")
-        })?;
+        let chunk_value = fetch(&chunk_ref.key)
+            .map_err(|_err| {
+                // The callback's error carries the chunk KEY (pointer-controlled),
+                // so it is not propagated verbatim. Position locates the fault.
+                format!(
+                    "chunk {position} referenced by pointer at `{root_key}` could not be fetched \
+                     (details redacted)"
+                )
+            })?
+            .ok_or_else(|| {
+                format!("missing chunk {position} referenced by pointer at `{root_key}`")
+            })?;
 
         // Verify length.
         if chunk_value.len() != chunk_ref.len {
@@ -325,10 +334,13 @@ where
     // Verify total envelope SHA.
     let actual_env_sha = sha256_hex(reconstructed.as_bytes());
     if actual_env_sha != pointer.envelope_sha256 {
+        // Neither SHA is echoed: the expected one is `pointer.envelope_sha256`,
+        // a stored, value-controlled string that a malformed pointer can set to
+        // anything (a secret), and this runs on the read path where diagnostics
+        // are logged.
         return Err(format!(
-            "reconstructed envelope for `{root_key}` SHA mismatch: \
-             expected `{}`, got `{actual_env_sha}`",
-            pointer.envelope_sha256,
+            "reconstructed envelope for `{root_key}` does not match the pointer's \
+             `envelope_sha256` (hashes redacted)"
         ));
     }
 
@@ -517,6 +529,23 @@ fn validate_pointer_chunks(root_key: &str, pointer: &FastlyChunkPointer) -> Resu
     Ok(())
 }
 
+/// Does this value announce itself as a chunk pointer?
+///
+/// A cheap discriminant for "this entry is a ROOT, wherever it happens to live".
+/// GC must not decide root-vs-chunk by KEY SHAPE: the runtime resolver follows
+/// whatever pointer it is handed, so a pointer parked at a chunk-shaped key
+/// still makes its references live. Chunk payloads are raw envelope fragments
+/// and essentially never parse as JSON, let alone carry `edgezero_kind`.
+#[cfg(any(feature = "cli", test))]
+pub(crate) fn value_is_pointer_kind(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw).is_ok_and(|value| {
+        value
+            .get("edgezero_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some(POINTER_KIND)
+    })
+}
+
 /// Classify a ROOT value for `config gc` — the live-set input on a DESTRUCTIVE
 /// path, so it is fail-closed. Unlike [`prior_chunk_keys`] (which is lenient for
 /// the push path and treats unrelated/empty JSON as "references nothing"), this
@@ -634,9 +663,11 @@ pub(crate) fn gc_verify_generation(generation_sha: &str, assembled: &str) -> Res
              keys name (`{generation_sha}`), so these chunks are not the generation they claim"
         ));
     }
-    // Content-addressing already proves authorship; parsing proves the bytes are
-    // a config envelope rather than an unrelated blob that happens to hash right
-    // (which SHA-256 makes infeasible anyway -- this is belt and braces).
+    // Content-addressing proves the bytes are SELF-CONSISTENT, not that EdgeZero
+    // wrote them (a forger can content-address their own envelope -- see this
+    // function's doc comment). Parsing here just confirms the reassembled bytes
+    // are a config envelope at all; the authorship-adjacent decision (delete or
+    // not) is `prove_generation`'s round-trip against the writer, in cli.rs.
     let envelope: BlobEnvelope = serde_json::from_str(assembled).map_err(|err| {
         format!(
             "the chunk set reassembles to its content-address but does not parse as a config \
@@ -1005,9 +1036,11 @@ mod tests {
             .expect("the complete chunk set must verify");
     }
 
-    /// Round-7 [P1]: an entry that merely LOOKS like a chunk key is not a chunk.
-    /// Only reassembling to the content-address the key names proves authorship,
-    /// and nothing but our writer can produce that without a SHA-256 preimage.
+    /// Round-7/9 [P1]: an entry that merely LOOKS like a chunk key is not a chunk.
+    /// Reassembling to the content-address its keys name is NECESSARY but not
+    /// sufficient (a forger can content-address their own data with no preimage);
+    /// `prove_generation` adds the writer round-trip. Here we check the necessary
+    /// half: a value that does not even hash to its generation is never ours.
     #[test]
     fn only_a_real_generation_verifies() {
         let root = "app_config";
@@ -1077,6 +1110,30 @@ mod tests {
             prior_chunk_keys(root, &oversized).is_err(),
             "a chunk larger than the writer's payload target must be rejected"
         );
+    }
+
+    /// Round 9 [P1]: root-vs-chunk is decided by VALUE. A pointer value is a
+    /// root wherever it lives; a chunk payload (raw envelope fragment) is not.
+    #[test]
+    fn value_is_pointer_kind_detects_pointers_only() {
+        let root = "app_config";
+        let (pointer_json, _) = pointer_fixture(root);
+        assert!(
+            value_is_pointer_kind(&pointer_json),
+            "a real pointer value must be recognised as pointer-kind"
+        );
+
+        // A genuine chunk PAYLOAD: a raw fragment of envelope JSON.
+        let entries =
+            prepare_fastly_config_entries(root, &make_envelope_json(20_000)).expect("expand");
+        assert!(
+            !value_is_pointer_kind(&entries[0].1),
+            "a chunk payload must NOT be mistaken for a pointer"
+        );
+        // Direct envelopes, unrelated JSON and non-JSON are not pointers either.
+        assert!(!value_is_pointer_kind(&make_envelope_json(200)));
+        assert!(!value_is_pointer_kind(r#"{"some":"value"}"#));
+        assert!(!value_is_pointer_kind("not json at all"));
     }
 
     // ---- helpers ----
@@ -1367,9 +1424,11 @@ mod tests {
             .cloned()
             .collect();
 
-        // Tamper with envelope_sha256 in the pointer JSON.
+        // Round 9 [P1]: `envelope_sha256` is a stored, value-controlled string.
+        // Set it to a SENTINEL secret and require the diagnostic not to echo it.
+        let sentinel = "SUPER_SECRET_ENVELOPE_HASH";
         let mut pointer: FastlyChunkPointer = serde_json::from_str(&pointer_json).unwrap();
-        pointer.envelope_sha256 = "ff".repeat(32);
+        pointer.envelope_sha256 = sentinel.to_owned();
         let tampered_pointer_json = serde_json::to_string(&pointer).unwrap();
 
         let err = resolve_fastly_config_value(&root_key, tampered_pointer_json, |chunk_key| {
@@ -1377,10 +1436,46 @@ mod tests {
         })
         .expect_err("envelope hash mismatch must error");
         assert!(
-            err.contains("SHA mismatch") || err.contains("mismatch"),
-            "error must mention hash mismatch: {err}"
+            err.contains("does not match the pointer's"),
+            "error must say what failed: {err}"
+        );
+        assert!(
+            !err.contains(sentinel),
+            "the stored envelope_sha256 must never reach a diagnostic: {err}"
         );
         assert!(err.contains("root"), "error must name the root key: {err}");
+    }
+
+    /// Round 9 [P1]: a fetch-callback failure carries the pointer-controlled
+    /// chunk KEY. The resolver must locate the fault by position, not echo it.
+    #[test]
+    fn resolver_fetch_error_does_not_leak_chunk_key() {
+        const SENTINEL: &str = "SUPER_SECRET_IN_A_CHUNK_KEY";
+        let envelope = make_envelope_json(FASTLY_CONFIG_ENTRY_LIMIT.saturating_add(1));
+        let entries = prepare_fastly_config_entries("root", &envelope).unwrap();
+        let (root_key, pointer_json) = entries.last().unwrap().clone();
+
+        // Point the first chunk ref at a secret-bearing key, then have the
+        // callback fail while naming that key (as the real store lookup would).
+        let mut pointer: FastlyChunkPointer = serde_json::from_str(&pointer_json).unwrap();
+        pointer.chunks[0].key = format!("root{CHUNK_KEY_INFIX}{}.0", "a".repeat(64));
+        let secret_key = pointer.chunks[0].key.clone();
+        let tampered = serde_json::to_string(&pointer).unwrap();
+
+        let err = resolve_fastly_config_value(&root_key, tampered, |chunk_key| {
+            Err(format!(
+                "config store lookup failed for `{chunk_key}` -- {SENTINEL}"
+            ))
+        })
+        .expect_err("a fetch failure must error");
+        assert!(
+            !err.contains(SENTINEL) && !err.contains(&secret_key),
+            "a fetch failure must not echo the pointer-controlled chunk key: {err}"
+        );
+        assert!(
+            err.contains("chunk 0") && err.contains("could not be fetched"),
+            "the error must locate the fault by position: {err}"
+        );
     }
 
     #[test]

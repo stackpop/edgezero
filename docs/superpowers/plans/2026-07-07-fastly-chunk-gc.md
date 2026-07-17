@@ -153,9 +153,13 @@ cannot be used as a supersession clock.
   applied only as an ADDITIONAL restriction on top of the chunk's own age — both
   must clear `--older-than`, more restrictive wins — and the operator's
   `--older-than` assertion remains the only sound basis for any delete.
-- [x] Delete each candidate with `--key --auto-yes` (never `--all`).
-  **Continue-then-fail**: attempt every delete, then return a **non-zero** error
-  naming any that failed, so automation detects partial failure.
+- [x] Delete whole GENERATIONS with `--key --auto-yes` (never `--all`), stopping
+  each generation at its FIRST failure so a confirmed partial delete cannot strand
+  it. Independent generations are all attempted; a **non-zero** error names the
+  failed keys. A failed remote delete's outcome is treated as UNKNOWN, so the
+  error distinguishes uncertain generations from definitely-stranded ones and
+  prints shell-safe manual-recovery commands rather than claiming idempotent
+  retry.
 - [x] `plan_gc_reclamation` extracted from `gc_fastly_config_store` so the guards
   read as one unit (no `#[expect(too_many_lines)]`).
 - [x] Tests: never-delete-live, reclaim-aged-orphan, **protect recently-superseded
